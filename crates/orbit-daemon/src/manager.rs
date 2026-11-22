@@ -179,8 +179,34 @@ pub struct AgentOrchestrator {
     /// suppressing automatic queue drain for that transition.
     suppress_auto_drain: RwLock<std::collections::HashSet<String>>,
     /// In-flight AI organizer / summarizer locks keyed by `sum:<agent_id>` or `org:<project_root>`.
-    organizing_locks: RwLock<std::collections::HashSet<String>>,
+    /// Uses a synchronous `std::sync::Mutex` (never held across `.await`) so RAII `OrganizerLockGuard`
+    /// always releases the lock and marks `keep_awake` idle on cancellation or panic.
+    organizing_locks: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Bounded concurrency limiter for background Turn-1 AI auto-naming & summary tasks
+    /// so bursts of completing sessions never saturate local CPU or provider API rate limits.
+    auto_name_semaphore: Arc<tokio::sync::Semaphore>,
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
+}
+
+/// RAII guard for an organizer/summarizer lock key that guarantees lock release and
+/// `keep_awake.mark_idle` even if the owning async task is cancelled or panics.
+pub(crate) struct OrganizerLockGuard {
+    locks: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    keep_awake: Arc<KeepAwakeManager>,
+    key: String,
+}
+
+impl Drop for OrganizerLockGuard {
+    fn drop(&mut self) {
+        let removed = self
+            .locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+        if removed {
+            self.keep_awake.mark_idle(&format!("workflow:{}", self.key));
+        }
+    }
 }
 
 impl AgentOrchestrator {
@@ -217,7 +243,8 @@ impl AgentOrchestrator {
             roster_fingerprints: RwLock::new(HashMap::new()),
             conflict_cooldowns: RwLock::new(HashMap::new()),
             suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
-            organizing_locks: RwLock::new(std::collections::HashSet::new()),
+            organizing_locks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            auto_name_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             broadcast_tx,
         })
     }
@@ -226,21 +253,29 @@ impl AgentOrchestrator {
         &self.keep_awake
     }
 
+    pub(crate) fn auto_name_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.auto_name_semaphore
+    }
+
     pub(crate) fn store(&self) -> &OrbitStore {
         &self.store
     }
 
-    pub(crate) async fn try_acquire_organizer_lock(&self, key: &str) -> bool {
-        let acquired = self.organizing_locks.write().await.insert(key.to_string());
+    pub(crate) fn try_acquire_organizer_lock(&self, key: &str) -> Option<OrganizerLockGuard> {
+        let acquired = self
+            .organizing_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string());
         if acquired {
             self.keep_awake.mark_busy(format!("workflow:{key}"));
-        }
-        acquired
-    }
-
-    pub(crate) async fn release_organizer_lock(&self, key: &str) {
-        if self.organizing_locks.write().await.remove(key) {
-            self.keep_awake.mark_idle(&format!("workflow:{key}"));
+            Some(OrganizerLockGuard {
+                locks: Arc::clone(&self.organizing_locks),
+                keep_awake: Arc::clone(&self.keep_awake),
+                key: key.to_string(),
+            })
+        } else {
+            None
         }
     }
 
@@ -1922,13 +1957,21 @@ impl AgentOrchestrator {
         task_summary: Option<String>,
     ) -> anyhow::Result<AgentSummary> {
         let clean_handle = handle.map(|h| sanitize_handle(&h));
+        let mut effective_labels = labels;
+        // Explicit user/API title edits automatically lock the title against future AI auto-naming
+        // unless the caller explicitly sets `orbit.title_locked` (e.g. `""` to unlock).
+        if title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+            let map = effective_labels.get_or_insert_with(HashMap::new);
+            map.entry("orbit.title_locked".into())
+                .or_insert_with(|| "1".into());
+        }
         self.store.update_agent_fields(
             agent_id,
             title.as_deref(),
             model.as_deref().map(Some),
             effort.map(Some),
             mode.as_ref(),
-            labels.as_ref(),
+            effective_labels.as_ref(),
             clean_handle.as_deref(),
             task_summary.as_deref(),
         )?;
@@ -3394,10 +3437,14 @@ impl AgentOrchestrator {
         let mut should_check_auto_archive = false;
         let mut should_drain_queued_prompt = false;
         let mut should_mark_finished = false;
+        let mut completed_running_turn = false;
         let payload = match evt {
             DriverEvent::StatusChanged(status) => {
                 self.keep_awake.notify_agent_status(agent_id, &status);
                 let prev = self.store.get_agent(agent_id).ok().flatten();
+                let was_running_turn = prev
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.status, AgentStatus::Running { .. }));
                 let was_foreground_busy =
                     prev.as_ref().is_some_and(|a| a.status.is_foreground_busy());
                 let was_awaiting_permission = prev
@@ -3412,6 +3459,9 @@ impl AgentOrchestrator {
                         let suppressed = self.suppress_auto_drain.write().await.remove(agent_id);
                         if (was_foreground_busy || was_awaiting_permission) && !suppressed {
                             should_drain_queued_prompt = true;
+                        }
+                        if was_running_turn {
+                            completed_running_turn = true;
                         }
                         if was_foreground_busy {
                             let _ = self.store.touch_agent_activity(agent_id, Utc::now());
@@ -3609,7 +3659,9 @@ impl AgentOrchestrator {
             let ag_handle = ag.handle.clone();
             let ag_bg = ag.background;
             let ag_is_subagent = ag.parent_agent_id.is_some();
-            let ag_needs_summary = ag.task_summary.is_none() && !ag_is_subagent;
+            let ag_needs_auto_naming = completed_running_turn
+                && !ag_is_subagent
+                && !crate::workspace_organizer::is_auto_named(&ag.labels);
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
 
             if finished_idle && !ag_bg {
@@ -3651,13 +3703,16 @@ impl AgentOrchestrator {
                     }
                 }
 
-                // Non-blocking Turn-1 AI semantic summary (title/handle/1-line summary only).
-                // Workspace classification is strictly user-triggered (`待归类` until user clicks AI 归类 or assigns manually).
-                if ag_needs_summary && drained_prompt.is_none() && !auto_arch {
+                // Bounded non-blocking Turn-1 AI auto-naming & semantic summary
+                // (respects `orbit.title_locked = "1"` and `orbit.auto_named = "1"`).
+                if ag_needs_auto_naming && drained_prompt.is_none() && !auto_arch {
                     let mgr_bg = Arc::clone(self);
                     let aid_bg = agent_id.to_string();
                     tokio::spawn(async move {
-                        let _ = mgr_bg.summarize_agent(&aid_bg).await;
+                        let _ = crate::workspace_organizer::auto_name_agent_after_first_turn(
+                            &mgr_bg, &aid_bg,
+                        )
+                        .await;
                     });
                 }
             }

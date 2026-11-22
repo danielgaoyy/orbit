@@ -511,34 +511,75 @@ impl OrbitStore {
         handle: Option<&str>,
         task_summary: Option<&str>,
     ) -> Result<(), StoreError> {
-        let mut current = match self.get_agent(agent_id)? {
-            Some(a) => a,
-            None => return Ok(()),
+        struct EditableAgentFields {
+            title: String,
+            model: Option<String>,
+            effort_json: Option<String>,
+            mode_json: String,
+            labels_json: String,
+            handle: Option<String>,
+            task_summary: Option<String>,
+        }
+
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        let row_opt: Option<EditableAgentFields> = tx
+            .query_row(
+                "SELECT title, model, effort_json, mode_json, labels_json, handle, task_summary
+                 FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |r| {
+                    Ok(EditableAgentFields {
+                        title: r.get(0)?,
+                        model: r.get(1)?,
+                        effort_json: r.get(2)?,
+                        mode_json: r.get(3)?,
+                        labels_json: r.get(4)?,
+                        handle: r.get(5)?,
+                        task_summary: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(EditableAgentFields {
+            title: mut cur_title,
+            model: mut cur_model,
+            effort_json: mut cur_effort_json,
+            mode_json: mut cur_mode_json,
+            labels_json: cur_labels_json,
+            handle: mut cur_handle,
+            task_summary: mut cur_task_summary,
+        }) = row_opt
+        else {
+            return Ok(());
         };
+
         if let Some(t) = title {
-            current.title = t.to_string();
+            cur_title = t.to_string();
         }
         if let Some(m) = model {
-            current.model = m.map(ToOwned::to_owned);
+            cur_model = m.map(ToOwned::to_owned);
         }
         if let Some(e) = effort {
-            current.effort = e;
+            cur_effort_json = e.as_ref().map(serde_json::to_string).transpose()?;
         }
         if let Some(md) = mode {
-            current.mode = md.clone();
+            cur_mode_json = serde_json::to_string(md)?;
         }
+        let mut cur_labels: HashMap<String, String> =
+            serde_json::from_str(&cur_labels_json).unwrap_or_default();
         if let Some(lbls) = labels {
             for (k, v) in lbls {
                 if v.is_empty() {
-                    current.labels.remove(k);
+                    cur_labels.remove(k);
                 } else {
-                    current.labels.insert(k.clone(), v.clone());
+                    cur_labels.insert(k.clone(), v.clone());
                 }
             }
         }
         if let Some(h) = handle {
             let trimmed = h.trim();
-            current.handle = if trimmed.is_empty() {
+            cur_handle = if trimmed.is_empty() {
                 None
             } else {
                 Some(trimmed.to_string())
@@ -546,14 +587,39 @@ impl OrbitStore {
         }
         if let Some(ts) = task_summary {
             let trimmed = ts.trim();
-            current.task_summary = if trimmed.is_empty() {
+            cur_task_summary = if trimmed.is_empty() {
                 None
             } else {
                 Some(trimmed.to_string())
             };
         }
-        current.updated_at = Utc::now();
-        self.upsert_agent(&current, None)
+
+        let next_labels_json = serde_json::to_string(&cur_labels)?;
+        tx.execute(
+            "UPDATE agents
+             SET title = ?1,
+                 model = ?2,
+                 effort_json = ?3,
+                 mode_json = ?4,
+                 labels_json = ?5,
+                 handle = ?6,
+                 task_summary = ?7,
+                 updated_at = ?8
+             WHERE agent_id = ?9",
+            params![
+                cur_title,
+                cur_model,
+                cur_effort_json,
+                cur_mode_json,
+                next_labels_json,
+                cur_handle,
+                cur_task_summary,
+                Utc::now().to_rfc3339(),
+                agent_id,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Return the most recent assistant message text for finish-notification summaries without loading a provider.

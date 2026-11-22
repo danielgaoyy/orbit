@@ -267,6 +267,32 @@ export interface ConversationSearchHit {
   updated_at_rfc3339: string;
 }
 
+export type ExportFormat = "markdown" | "json" | "html";
+
+export interface ExportOptions {
+  format: ExportFormat;
+  include_thinking: boolean;
+  include_tool_calls: boolean;
+  include_timestamps: boolean;
+}
+
+export interface ExportedTranscript {
+  suggested_filename: string;
+  mime_type: string;
+  content: string;
+  turn_count: number;
+  byte_len: number;
+}
+
+export interface ExtractedCodeBlock {
+  index: number;
+  turn_index: number;
+  language: string;
+  preview: string;
+  line_count: number;
+  code: string;
+}
+
 export type ActiveTurnBehavior = "steer" | "queue" | "interrupt";
 export type AttentionState = "none" | "finished" | "error" | "permission" | "manual_unread";
 export type WorkspaceIsolation = "local" | "worktree";
@@ -2981,6 +3007,61 @@ export const orbitIpc = {
     return invoke<ConversationSearchHit[]>("search_messages", {
       query: trimmed,
       limit,
+    });
+  },
+
+  exportAgentTranscript: async (
+    hostId: string,
+    agentId: string,
+    options?: Partial<ExportOptions>,
+  ): Promise<ExportedTranscript> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Transcript export requires the Orbit desktop runtime");
+    }
+    return invoke<ExportedTranscript>("export_agent_transcript", {
+      hostId,
+      agentId,
+      options: options
+        ? {
+            format: options.format ?? "markdown",
+            include_thinking: options.include_thinking ?? true,
+            include_tool_calls: options.include_tool_calls ?? true,
+            include_timestamps: options.include_timestamps ?? true,
+          }
+        : null,
+    });
+  },
+
+  saveExportedTranscript: async (
+    hostId: string,
+    agentId: string,
+    options?: Partial<ExportOptions>,
+    initialDir?: string | null,
+  ): Promise<string | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<string | null>("save_exported_transcript", {
+      hostId,
+      agentId,
+      options: options
+        ? {
+            format: options.format ?? "markdown",
+            include_thinking: options.include_thinking ?? true,
+            include_tool_calls: options.include_tool_calls ?? true,
+            include_timestamps: options.include_timestamps ?? true,
+          }
+        : null,
+      initialDir: initialDir ?? null,
+    });
+  },
+
+  listAgentCodeBlocks: async (
+    hostId: string,
+    agentId: string,
+  ): Promise<ExtractedCodeBlock[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ExtractedCodeBlock[]>("list_agent_code_blocks", {
+      hostId,
+      agentId,
     });
   },
 };

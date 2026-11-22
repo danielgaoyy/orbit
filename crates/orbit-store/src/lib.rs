@@ -7,7 +7,7 @@ pub mod search;
 pub mod workspace_sync;
 pub use orchestration::*;
 pub use search::{FtsBackfillProgress, MessageSearchHit, build_fts5_match_query};
-pub use workspace_sync::AgentContextSnippet;
+pub use workspace_sync::{AgentContextSnippet, SemanticIdentityOptions};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1538,6 +1538,45 @@ impl OrbitStore {
         )?;
         let rows = stmt.query_map(params![agent_id, limit as i64], |row| {
             let seq = row.get::<_, i64>(0)? as u64;
+            let epoch = row.get::<_, u32>(1)?;
+            let ag_id: String = row.get(2)?;
+            let turn_id: Option<String> = row.get(3)?;
+            let ts_str: String = row.get(4)?;
+            let payload_str: String = row.get(5)?;
+            Ok((seq, epoch, ag_id, turn_id, ts_str, payload_str))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = r?;
+            if let Ok(payload) = serde_json::from_str::<TimelinePayload>(&payload_str) {
+                out.push(TimelineEvent {
+                    seq,
+                    epoch,
+                    agent_id: ag_id,
+                    turn_id,
+                    timestamp: parse_ts(&ts_str),
+                    payload,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch the entire locally replicated timeline for an agent without an artificial row cap
+    /// (used for full-fidelity conversation export and code-block extraction).
+    pub fn fetch_replica_timeline_all(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<TimelineEvent>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+             FROM client_replica_events
+             WHERE agent_id = ?1
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![agent_id], |row| {
+            let seq = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
             let epoch = row.get::<_, u32>(1)?;
             let ag_id: String = row.get(2)?;
             let turn_id: Option<String> = row.get(3)?;

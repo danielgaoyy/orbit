@@ -2,10 +2,14 @@
 //! `schedule`, `heartbeat`, `profile`, `host`, `permit`, `config`, `skill`, plus `wait`,
 //! `stop`, `inspect`, `archive`, `unarchive`, `detach`, `delete`, `mode`).
 
-use std::path::Path;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Subcommand, ValueEnum};
+use orbit_client_core::export::{
+    ExportAgentMeta, ExportFormat, ExportOptions, export_timeline_transcript, write_file_atomically,
+};
 use orbit_client_core::{ClientInboundEvent, HostSessionHandle};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentProfile, AgentStatus, McpToolPolicy, ProviderKind, ReasoningEffort,
@@ -68,6 +72,47 @@ impl From<CliWorktreeMode> for WorktreeCreateMode {
             CliWorktreeMode::CheckoutPr => WorktreeCreateMode::CheckoutPr,
         }
     }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum CliExportFormat {
+    #[value(alias = "markdown")]
+    Md,
+    Json,
+    Html,
+}
+
+impl From<CliExportFormat> for ExportFormat {
+    fn from(v: CliExportFormat) -> Self {
+        match v {
+            CliExportFormat::Md => ExportFormat::Markdown,
+            CliExportFormat::Json => ExportFormat::Json,
+            CliExportFormat::Html => ExportFormat::Html,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum AgentAction {
+    /// Export an agent conversation transcript to Markdown, JSON, or self-contained HTML.
+    Export {
+        agent_id: String,
+        /// Output format: `md` (default), `json`, or `html`.
+        #[arg(short = 'f', long, value_enum, default_value = "md")]
+        format: CliExportFormat,
+        /// Exclude assistant thinking / reasoning blocks.
+        #[arg(long)]
+        no_thinking: bool,
+        /// Exclude tool call details.
+        #[arg(long)]
+        no_tools: bool,
+        /// Exclude timestamps from the exported transcript.
+        #[arg(long)]
+        no_timestamps: bool,
+        /// Output file path (writes atomically; omit to write to stdout).
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1898,6 +1943,137 @@ pub async fn cmd_skill(
                         skills.iter().filter(|s| s.installed).count()
                     ),
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_agent(server: &str, via_relay: bool, action: AgentAction) -> anyhow::Result<()> {
+    let client = connect_cli_server(server, via_relay).await?;
+    match action {
+        AgentAction::Export {
+            agent_id,
+            format,
+            no_thinking,
+            no_tools,
+            no_timestamps,
+            output,
+        } => {
+            let agents_req = Uuid::new_v4();
+            let agents_resp = send_rpc(
+                &client,
+                agents_req,
+                WireMessage::ListAgents {
+                    request_id: agents_req,
+                    workspace_id: None,
+                    include_archived: true,
+                    include_background: true,
+                    parent_agent_id: None,
+                },
+                15,
+            )
+            .await?;
+            let agent = if let WireMessage::AgentsSnapshot { agents, .. } = agents_resp {
+                agents
+                    .into_iter()
+                    .find(|a| a.agent_id == agent_id)
+                    .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?
+            } else {
+                anyhow::bail!("unexpected response when fetching agent metadata");
+            };
+
+            let ws_title = {
+                let ws_req = Uuid::new_v4();
+                match send_rpc(
+                    &client,
+                    ws_req,
+                    WireMessage::ListWorkspaces {
+                        request_id: ws_req,
+                        include_archived: true,
+                        include_background: true,
+                    },
+                    10,
+                )
+                .await
+                {
+                    Ok(WireMessage::WorkspacesSnapshot { workspaces, .. }) => workspaces
+                        .into_iter()
+                        .find(|w| w.workspace_id == agent.workspace_id)
+                        .map(|w| w.title),
+                    _ => None,
+                }
+            };
+
+            let mut all_events = Vec::new();
+            let mut since_seq = 0u64;
+            loop {
+                let tl_req = Uuid::new_v4();
+                let resp = send_rpc(
+                    &client,
+                    tl_req,
+                    WireMessage::SubscribeTimeline {
+                        request_id: tl_req,
+                        agent_id: agent_id.clone(),
+                        since_seq,
+                    },
+                    20,
+                )
+                .await?;
+                match resp {
+                    WireMessage::TimelineCatchup {
+                        events, has_more, ..
+                    } => {
+                        let last_seq = events.last().map(|e| e.seq).unwrap_or(since_seq);
+                        all_events.extend(events);
+                        if !has_more || last_seq <= since_seq {
+                            break;
+                        }
+                        since_seq = last_seq;
+                    }
+                    _ => anyhow::bail!("unexpected response when fetching timeline"),
+                }
+            }
+
+            let meta = ExportAgentMeta {
+                host_id: client
+                    .welcome_host
+                    .as_ref()
+                    .map(|h| h.host_id.clone())
+                    .unwrap_or_default(),
+                host_name: client.welcome_host.as_ref().map(|h| h.hostname.clone()),
+                agent_id: agent.agent_id.clone(),
+                title: agent.title.clone(),
+                provider: Some(agent.provider),
+                model: agent.model.clone(),
+                cwd: Some(agent.cwd.clone()),
+                workspace_title: ws_title,
+                task_summary: agent.task_summary.clone(),
+                created_at: Some(agent.created_at),
+                exported_at: None,
+            };
+            let opts = ExportOptions {
+                format: format.into(),
+                include_thinking: !no_thinking,
+                include_tool_calls: !no_tools,
+                include_timestamps: !no_timestamps,
+            };
+            let exported = export_timeline_transcript(&meta, &all_events, &opts);
+
+            if let Some(path) = output {
+                write_file_atomically(&path, exported.content.as_bytes())
+                    .map_err(anyhow::Error::msg)?;
+                eprintln!(
+                    "[✓] Exported {} ({} turns, {} bytes) -> {}",
+                    exported.suggested_filename,
+                    exported.turn_count,
+                    exported.byte_len,
+                    path.display()
+                );
+            } else {
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(exported.content.as_bytes())?;
+                stdout.flush()?;
             }
         }
     }

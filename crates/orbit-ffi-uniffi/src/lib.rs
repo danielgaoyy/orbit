@@ -36,6 +36,9 @@ use orbit_client_core::contract::{
 use orbit_client_core::diagram::{
     DiagramKind, DiagramTheme, detect_diagram_kind as core_detect_diagram_kind,
 };
+use orbit_client_core::export::{
+    ExportFormat, ExportOptions, ExportedTranscript, ExtractedCodeBlock,
+};
 use orbit_client_core::render::{
     DiffFileView, DiffLineKind, DiffLineView, HighlightedLineView, HighlightedTokenView,
     InlineSpanView, RichBlockView, TableAlignmentView, TableCellView, TableRowView,
@@ -99,6 +102,96 @@ impl From<ConversationSearchHit> for FfiConversationSearchHit {
             project_name: v.project_name,
             snippet: v.snippet,
             updated_at_rfc3339: v.updated_at_rfc3339,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiExportFormat {
+    Markdown,
+    Json,
+    Html,
+}
+
+impl From<FfiExportFormat> for ExportFormat {
+    fn from(v: FfiExportFormat) -> Self {
+        match v {
+            FfiExportFormat::Markdown => Self::Markdown,
+            FfiExportFormat::Json => Self::Json,
+            FfiExportFormat::Html => Self::Html,
+        }
+    }
+}
+
+impl From<ExportFormat> for FfiExportFormat {
+    fn from(v: ExportFormat) -> Self {
+        match v {
+            ExportFormat::Markdown => Self::Markdown,
+            ExportFormat::Json => Self::Json,
+            ExportFormat::Html => Self::Html,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiExportOptions {
+    pub format: FfiExportFormat,
+    pub include_thinking: bool,
+    pub include_tool_calls: bool,
+    pub include_timestamps: bool,
+}
+
+impl From<FfiExportOptions> for ExportOptions {
+    fn from(v: FfiExportOptions) -> Self {
+        Self {
+            format: v.format.into(),
+            include_thinking: v.include_thinking,
+            include_tool_calls: v.include_tool_calls,
+            include_timestamps: v.include_timestamps,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiExportedTranscript {
+    pub suggested_filename: String,
+    pub mime_type: String,
+    pub content: String,
+    pub turn_count: u64,
+    pub byte_len: u64,
+}
+
+impl From<ExportedTranscript> for FfiExportedTranscript {
+    fn from(v: ExportedTranscript) -> Self {
+        Self {
+            suggested_filename: v.suggested_filename,
+            mime_type: v.mime_type,
+            content: v.content,
+            turn_count: v.turn_count as u64,
+            byte_len: v.byte_len as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiExtractedCodeBlock {
+    pub index: u64,
+    pub turn_index: u64,
+    pub language: String,
+    pub preview: String,
+    pub line_count: u64,
+    pub code: String,
+}
+
+impl From<ExtractedCodeBlock> for FfiExtractedCodeBlock {
+    fn from(v: ExtractedCodeBlock) -> Self {
+        Self {
+            index: v.index as u64,
+            turn_index: v.turn_index as u64,
+            language: v.language,
+            preview: v.preview,
+            line_count: v.line_count as u64,
+            code: v.code,
         }
     }
 }
@@ -3860,6 +3953,30 @@ impl OrbitMobileCore {
             .into_iter()
             .map(Into::into)
             .collect()
+    }
+
+    pub fn export_agent_transcript(
+        &self,
+        host_id: String,
+        agent_id: String,
+        options: FfiExportOptions,
+    ) -> Result<FfiExportedTranscript, FfiOrbitError> {
+        let core_opts: ExportOptions = options.into();
+        self.inner
+            .export_agent_transcript(&host_id, &agent_id, &core_opts)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn list_agent_code_blocks(
+        &self,
+        host_id: String,
+        agent_id: String,
+    ) -> Result<Vec<FfiExtractedCodeBlock>, FfiOrbitError> {
+        self.inner
+            .list_agent_code_blocks(&host_id, &agent_id)
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
     pub fn fleet_sidebar_request(&self, req: FfiFleetSidebarRequest) -> FfiFleetSidebar {

@@ -1189,6 +1189,205 @@ pub fn pick_local_directory(initial_dir: Option<&str>) -> Result<Option<String>,
     }
 }
 
+/// Extract a safe basename for native OS save dialogs, blocking path traversal (`..`, `/`, `\`),
+/// control characters, and leading `-` characters that CLI dialogs (`kdialog`/`zenity`) could parse as flags.
+fn sanitize_save_dialog_filename(raw: &str) -> String {
+    let base = raw.trim().rsplit(['/', '\\']).next().unwrap_or("").trim();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '\0'))
+        .collect();
+    let trimmed = cleaned.trim_start_matches(['-', '.']).trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "orbit-conversation.md".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Open the native OS save-file sheet (`NSSavePanel` via `osascript` on macOS, `zenity`/`kdialog`
+/// on Linux, `SaveFileDialog` on Windows). Returns `Ok(None)` cleanly when the user cancels.
+pub fn pick_local_save_file(
+    default_filename: &str,
+    extension: &str,
+    initial_dir: Option<&str>,
+) -> Result<Option<String>, String> {
+    let start_dir = resolve_folder_picker_start_dir(initial_dir);
+    let effective_name = sanitize_save_dialog_filename(default_filename);
+    let clean_ext: String = extension
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("/usr/bin/osascript");
+        if let Some(ref dir) = start_dir {
+            cmd.args([
+                "-e",
+                "on run argv",
+                "-e",
+                "set defName to item 1 of argv",
+                "-e",
+                "try",
+                "-e",
+                "set startAlias to POSIX file (item 2 of argv) as alias",
+                "-e",
+                "return POSIX path of (choose file name with prompt \"Export Conversation\" default name defName default location startAlias)",
+                "-e",
+                "on error errMsg number errNum",
+                "-e",
+                "if errNum is -128 then error number -128",
+                "-e",
+                "return POSIX path of (choose file name with prompt \"Export Conversation\" default name defName)",
+                "-e",
+                "end try",
+                "-e",
+                "end run",
+                "--",
+            ])
+            .arg(&effective_name)
+            .arg(dir);
+        } else {
+            cmd.args([
+                "-e",
+                "on run argv",
+                "-e",
+                "set defName to item 1 of argv",
+                "-e",
+                "return POSIX path of (choose file name with prompt \"Export Conversation\" default name defName)",
+                "-e",
+                "end run",
+                "--",
+            ])
+            .arg(&effective_name);
+        }
+
+        let _ = clean_ext;
+        let out = cmd
+            .output()
+            .map_err(|e| format!("failed to open macOS save dialog: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let lower = stderr.to_ascii_lowercase();
+            if stderr.contains("(-128)")
+                || lower.contains("canceled")
+                || lower.contains("cancelled")
+            {
+                return Ok(None);
+            }
+            return Err(format!("save dialog failed: {}", stderr.trim()));
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let trimmed = stdout.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let initial_target = match start_dir {
+            Some(ref dir) => dir.join(&effective_name),
+            None => PathBuf::from(&effective_name),
+        };
+        if binary_exists_on_path("zenity") {
+            let mut cmd = Command::new("zenity");
+            cmd.args([
+                "--file-selection",
+                "--save",
+                "--confirm-overwrite",
+                "--title=Export Conversation",
+                &format!("--filename={}", initial_target.to_string_lossy()),
+            ]);
+            if !clean_ext.is_empty() {
+                cmd.arg(format!("--file-filter=*.{clean_ext}"));
+            }
+            let out = cmd
+                .output()
+                .map_err(|e| format!("failed to launch zenity: {e}"))?;
+            if !out.status.success() {
+                return Ok(None);
+            }
+            let trimmed = String::from_utf8_lossy(&out.stdout)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            return Ok((!trimmed.is_empty()).then_some(trimmed));
+        }
+
+        if binary_exists_on_path("kdialog") {
+            let mut cmd = Command::new("kdialog");
+            cmd.arg("--getsavefilename").arg("--").arg(&initial_target);
+            if !clean_ext.is_empty() {
+                cmd.arg(format!("*.{clean_ext}"));
+            }
+            let out = cmd
+                .output()
+                .map_err(|e| format!("failed to launch kdialog: {e}"))?;
+            if !out.status.success() {
+                return Ok(None);
+            }
+            let trimmed = String::from_utf8_lossy(&out.stdout)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            return Ok((!trimmed.is_empty()).then_some(trimmed));
+        }
+
+        Err("Install `zenity` or `kdialog` to open the native Linux save dialog".into())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let filter = if clean_ext.is_empty() {
+            "All files (*.*)|*.*".to_string()
+        } else {
+            format!(
+                "{} (*.{clean_ext})|*.{clean_ext}|All files (*.*)|*.*",
+                clean_ext.to_ascii_uppercase()
+            )
+        };
+        const SCRIPT: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$d = New-Object System.Windows.Forms.SaveFileDialog
+$d.Title = 'Export Conversation'
+$d.FileName = $env:ORBIT_SAVE_NAME
+$d.Filter = $env:ORBIT_SAVE_FILTER
+if ($env:ORBIT_SAVE_DIR) { $d.InitialDirectory = $env:ORBIT_SAVE_DIR }
+if ($d.ShowDialog() -eq 'OK') { [Console]::Out.WriteLine($d.FileName) }
+"#;
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-Sta", "-Command", SCRIPT])
+            .env("ORBIT_SAVE_NAME", &effective_name)
+            .env("ORBIT_SAVE_FILTER", &filter);
+        if let Some(ref dir) = start_dir {
+            cmd.env("ORBIT_SAVE_DIR", dir);
+        } else {
+            cmd.env_remove("ORBIT_SAVE_DIR");
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("failed to open Windows save dialog: {e}"))?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let trimmed = String::from_utf8_lossy(&out.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        Ok((!trimmed.is_empty()).then_some(trimmed))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (start_dir, effective_name, clean_ext);
+        Err("Native save dialog is not supported on this platform".into())
+    }
+}
+
 /// Launch the requested external editor or OS tool at `cwd` (either locally or via SSH remote URI).
 pub fn open_in_external_editor(
     editor: ExternalEditorKind,
@@ -1885,6 +2084,26 @@ mod tests {
         );
         assert_eq!(normalize_picked_posix_path("/\n"), Some("/".into()));
         assert_eq!(normalize_picked_posix_path("   "), None);
+    }
+
+    #[test]
+    fn sanitize_save_dialog_filename_strips_paths_flags_and_control_chars() {
+        assert_eq!(
+            sanitize_save_dialog_filename("../../etc/passwd.md"),
+            "passwd.md"
+        );
+        assert_eq!(
+            sanitize_save_dialog_filename("--option-injection.html"),
+            "option-injection.html"
+        );
+        assert_eq!(
+            sanitize_save_dialog_filename("C:\\Users\\evil\\notes\n.json"),
+            "notes.json"
+        );
+        assert_eq!(
+            sanitize_save_dialog_filename("...---"),
+            "orbit-conversation.md"
+        );
     }
 
     #[test]

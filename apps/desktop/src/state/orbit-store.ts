@@ -42,6 +42,7 @@ import {
   type CoreNotification,
   type ExternalEditorInfo,
   type ExternalEditorKind,
+  type ExtractedCodeBlock,
   type FleetOverviewView,
   type FleetSidebarView,
   type GitHubDeviceFlowStartView,
@@ -432,6 +433,12 @@ export interface OrbitUiState {
   pairDialogOpen: boolean;
   relayDialogOpen: boolean;
   remoteFolderPickerHostId: string | null;
+  exportDialogTarget: { hostId: string; agentId: string } | null;
+  copyCodeBlocksTarget: {
+    hostId: string;
+    agentId: string;
+    blocks: ExtractedCodeBlock[];
+  } | null;
   sshHosts: SshHostItem[];
   externalEditors: ExternalEditorInfo[];
   toastNotice: string | null;
@@ -782,6 +789,8 @@ const defaultInitialState: OrbitUiState = {
   pairDialogOpen: false,
   relayDialogOpen: false,
   remoteFolderPickerHostId: null,
+  exportDialogTarget: null,
+  copyCodeBlocksTarget: null,
   sshHosts: [],
   externalEditors: [],
   toastNotice: null,
@@ -895,6 +904,7 @@ const hostSyncGates = new Map<string, SimpleSyncGate>();
 const fleetSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const sidebarSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const lastReportedSeenSeq = new Map<string, number>();
+let copyBlocksReqSeq = 0;
 const pendingSeenTimers = new Map<
   string,
   { hostId: string; agentId: string; seq: number; timerId: number }
@@ -4135,7 +4145,124 @@ export const orbitActions = {
     });
   },
 
+  openExportDialog(hostId: string, agentId: string): void {
+    setState((s) => ({
+      ...s,
+      exportDialogTarget: { hostId, agentId },
+    }));
+  },
+
+  closeExportDialog(): void {
+    setState((s) => (s.exportDialogTarget ? { ...s, exportDialogTarget: null } : s));
+  },
+
+  async openCopyCodeBlocksModal(hostId: string, agentId: string): Promise<void> {
+    const reqSeq = ++copyBlocksReqSeq;
+    let blocks: ExtractedCodeBlock[] = [];
+    try {
+      blocks = await orbitIpc.listAgentCodeBlocks(hostId, agentId);
+    } catch {
+      blocks = [];
+    }
+    if (
+      reqSeq !== copyBlocksReqSeq ||
+      state.selectedHostId !== hostId ||
+      state.selectedAgentId !== agentId
+    ) {
+      return;
+    }
+
+    if (blocks.length > 0) {
+      setState((s) => ({
+        ...s,
+        copyCodeBlocksTarget: { hostId, agentId, blocks },
+      }));
+      return;
+    }
+
+    // Fallback when 0 code blocks exist: copy the latest assistant reply directly.
+    const tKey = threadScopeKey(hostId, agentId);
+    let lastReply = "";
+    const cachedStage = state.stages[tKey];
+    if (cachedStage && cachedStage.turns.length > 0) {
+      for (let t = cachedStage.turns.length - 1; t >= 0 && !lastReply; t -= 1) {
+        const segs = cachedStage.turns[t]?.live_segments ?? [];
+        for (let sIdx = segs.length - 1; sIdx >= 0; sIdx -= 1) {
+          const seg = segs[sIdx];
+          if (seg?.kind === "assistant_message" && seg.item.item_type === "assistant_message") {
+            const trimmed = seg.item.text.trim();
+            if (trimmed) {
+              lastReply = trimmed;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (!lastReply) {
+      try {
+        const full = await orbitIpc.getAgentTimeline(hostId, agentId);
+        if (
+          reqSeq !== copyBlocksReqSeq ||
+          state.selectedHostId !== hostId ||
+          state.selectedAgentId !== agentId
+        ) {
+          return;
+        }
+        for (let i = full.items.length - 1; i >= 0; i -= 1) {
+          const item = full.items[i];
+          if (item?.item_type === "assistant_message") {
+            const trimmed = item.text.trim();
+            if (trimmed) {
+              lastReply = trimmed;
+              break;
+            }
+          }
+        }
+      } catch {
+        // ignore fallback fetch errors
+      }
+    }
+
+    if (
+      reqSeq !== copyBlocksReqSeq ||
+      state.selectedHostId !== hostId ||
+      state.selectedAgentId !== agentId
+    ) {
+      return;
+    }
+    if (!lastReply) {
+      notifyToast("No assistant reply or code block to copy");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(lastReply);
+      notifyToast("Copied last assistant reply");
+    } catch {
+      notifyToast("Failed to copy reply");
+    }
+  },
+
+  closeCopyCodeBlocksModal(): void {
+    copyBlocksReqSeq += 1;
+    setState((s) => (s.copyCodeBlocksTarget ? { ...s, copyCodeBlocksTarget: null } : s));
+  },
+
   async copyThread(hostId: string, agentId: string): Promise<void> {
+    try {
+      const exported = await orbitIpc.exportAgentTranscript(hostId, agentId, {
+        format: "markdown",
+        include_thinking: false,
+        include_tool_calls: false,
+        include_timestamps: false,
+      });
+      await navigator.clipboard.writeText(exported.content);
+      notifyToast("Copied conversation");
+      return;
+    } catch {
+      // Fallback for non-Tauri browser preview
+    }
+
     const tKey = threadScopeKey(hostId, agentId);
     const sections: string[] = [];
     const cachedStage = state.stages[tKey];

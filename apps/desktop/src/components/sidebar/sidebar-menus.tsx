@@ -5,6 +5,7 @@ import {
   Circle,
   Columns2,
   Copy,
+  Download,
   FileText,
   FolderInput,
   FolderOpen,
@@ -411,6 +412,19 @@ export function SharedConversationMenu({
             </DropdownMenuItem>
 
             <DropdownMenuSeparator className="my-1" />
+
+            <DropdownMenuItem
+              onSelect={() => {
+                onClose();
+                orbitActions.openExportDialog(host.host_id, agent.agent_id);
+              }}
+              className={COMPACT_MENU_ITEM_CLASS}
+            >
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <Download className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                <span>Export…</span>
+              </span>
+            </DropdownMenuItem>
 
             <DropdownMenuItem
               onSelect={() => {

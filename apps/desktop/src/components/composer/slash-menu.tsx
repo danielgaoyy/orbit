@@ -1,5 +1,7 @@
 import { useEffect, useRef } from "react";
 import {
+  Copy,
+  Download,
   FileSearch,
   FoldVertical,
   FolderTree,
@@ -42,6 +44,10 @@ function resolveSlashCommandIcon(cmd: SlashCommandView): LucideIcon {
       return Globe;
     case "compact":
       return FoldVertical;
+    case "export":
+      return Download;
+    case "copy":
+      return Copy;
     case "orbit":
       return Layers;
     case "orbit-handoff":

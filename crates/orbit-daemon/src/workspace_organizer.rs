@@ -22,7 +22,7 @@ use orbit_providers::{
     find_provider_executable, has_any_provider_override, is_provider_overridden,
     run_ephemeral_text_prompt,
 };
-use orbit_store::AgentContextSnippet;
+use orbit_store::{AgentContextSnippet, SemanticIdentityOptions};
 use serde::Deserialize;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -37,6 +37,24 @@ use crate::workspace_cluster::{
 const MAX_AGENTS_PER_ORGANIZE_BATCH: usize = 16;
 const LLM_SUMMARY_TIMEOUT_SECS: u64 = 35;
 const LLM_ORGANIZE_TIMEOUT_SECS: u64 = 55;
+const MAX_CONCISE_TITLE_CHARS: usize = 48;
+
+pub const LABEL_TITLE_LOCKED: &str = "orbit.title_locked";
+pub const LABEL_AUTO_NAMED: &str = "orbit.auto_named";
+
+pub fn is_title_locked(labels: &HashMap<String, String>) -> bool {
+    labels
+        .get(LABEL_TITLE_LOCKED)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+pub fn is_auto_named(labels: &HashMap<String, String>) -> bool {
+    labels
+        .get(LABEL_AUTO_NAMED)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct LlmSummaryPayload {
@@ -91,9 +109,9 @@ fn pick_organizer_providers(preferred: Option<ProviderKind>) -> Vec<ProviderKind
         return Vec::new();
     }
     let force_llm = mode == "llm" || mode == "force_llm";
-    // When in-process mock provider overrides are active (unit/CI E2E tests), never invoke real
-    // host CLIs accidentally unless explicitly forced via `ORBIT_ORGANIZER_MODE=llm`.
-    if !force_llm && has_any_provider_override() {
+    // When running unit tests or when in-process mock provider overrides are active, never invoke
+    // real host CLIs accidentally unless explicitly forced via `ORBIT_ORGANIZER_MODE=llm`.
+    if !force_llm && (cfg!(test) || has_any_provider_override()) {
         return Vec::new();
     }
 
@@ -168,8 +186,11 @@ fn compact_snippet(raw: Option<&str>, max_chars: usize) -> String {
 }
 
 fn strip_orbit_workspace_xml(raw: &str) -> &str {
-    if let Some(end_idx) = raw.find("</orbit-workspace>") {
-        let after = &raw[end_idx + "</orbit-workspace>".len()..];
+    let trimmed = raw.trim_start();
+    if trimmed.starts_with("<orbit-workspace")
+        && let Some(end_idx) = trimmed.find("</orbit-workspace>")
+    {
+        let after = &trimmed[end_idx + "</orbit-workspace>".len()..];
         return after.trim_start();
     }
     raw
@@ -203,13 +224,353 @@ fn clean_summary_line(raw: Option<&str>) -> Option<String> {
     }
 }
 
+fn clean_concise_title(raw: Option<&str>) -> Option<String> {
+    let text = raw?;
+    let trimmed = text
+        .trim()
+        .trim_matches(['"', '\'', '`', '“', '”', '‘', '’']);
+    let collapsed: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        None
+    } else {
+        Some(truncate_title_smart(&collapsed, MAX_CONCISE_TITLE_CHARS))
+    }
+}
+
+fn truncate_title_smart(raw: &str, max_chars: usize) -> String {
+    if raw.chars().count() <= max_chars {
+        return raw.to_string();
+    }
+    let budget = max_chars.saturating_sub(1);
+    let prefix: String = raw.chars().take(budget).collect();
+    // Prefer breaking at an ASCII word boundary when there is a late space so English titles don't cut mid-word.
+    let candidate = if let Some(last_space) = prefix.rfind(' ')
+        && prefix[..last_space].chars().count() >= budget / 2
+    {
+        prefix[..last_space].trim_end()
+    } else {
+        prefix.trim_end()
+    };
+    let clean = candidate.trim_end_matches([',', ';', ':', '-', '—', '·']);
+    if clean.is_empty() {
+        let mut s: String = raw.chars().take(budget).collect();
+        s.push('…');
+        s
+    } else {
+        format!("{clean}…")
+    }
+}
+
+fn strip_markdown_fenced_blocks(raw: &str) -> String {
+    let mut kept = Vec::new();
+    let mut active_fence: Option<(char, usize)> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if let Some((fch, flen)) = active_fence {
+            let run = trimmed.chars().take_while(|&c| c == fch).count();
+            if run >= flen && trimmed[run..].trim().is_empty() {
+                active_fence = None;
+            }
+            continue;
+        }
+        if let Some(first) = trimmed.chars().next()
+            && (first == '`' || first == '~')
+        {
+            let run = trimmed.chars().take_while(|&c| c == first).count();
+            if run >= 3 {
+                active_fence = Some((first, run));
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+fn strip_markdown_links(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(open) = rest.find('[') {
+        let is_img = open > 0 && rest.as_bytes().get(open - 1) == Some(&b'!');
+        let prefix_end = if is_img { open - 1 } else { open };
+        out.push_str(&rest[..prefix_end]);
+        let after_open = &rest[open + 1..];
+        if let Some(close_bracket) = after_open.find("](") {
+            let label = &after_open[..close_bracket];
+            let after_mid = &after_open[close_bracket + 2..];
+            if let Some(close_paren) = after_mid.find(')') {
+                out.push_str(label);
+                rest = &after_mid[close_paren + 1..];
+                continue;
+            }
+        }
+        out.push_str(&rest[prefix_end..=open]);
+        rest = after_open;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_leading_slash_directive(raw: &str) -> &str {
+    let trimmed = raw.trim_start();
+    if !trimmed.starts_with('/') {
+        return trimmed;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in [
+        "/orbit-committee",
+        "/orbit-handoff",
+        "/orbit-advisor",
+        "/orbit",
+        "/plan",
+        "/review",
+        "/compact",
+        "/btw",
+    ] {
+        if let Some(after) = trimmed.get(prefix.len()..)
+            && lower.starts_with(prefix)
+            && (after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            return after.trim_start();
+        }
+    }
+    trimmed
+}
+
+fn strip_markdown_line_prefix(line: &str) -> &str {
+    let mut s = line.trim();
+    loop {
+        let prev = s;
+        s = s.trim_start_matches(['#', '>', ' ', '\t']);
+        if let Some(rest) = s
+            .strip_prefix("- ")
+            .or_else(|| s.strip_prefix("* "))
+            .or_else(|| s.strip_prefix("• "))
+            .or_else(|| s.strip_prefix("+ "))
+        {
+            s = rest.trim_start();
+        } else {
+            let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+            if digits > 0
+                && digits <= 3
+                && let Some(after_digits) = s.get(digits..)
+                && (after_digits.starts_with(". ") || after_digits.starts_with(") "))
+            {
+                s = after_digits[2..].trim_start();
+            }
+        }
+        if s == prev {
+            break;
+        }
+    }
+    s
+}
+
+/// Lightweight deterministic fallback title extractor used when the ephemeral LLM call is
+/// unavailable or times out. Strips `<orbit-workspace>` XML, fenced code blocks, markdown syntax,
+/// `@mentions`, slash directives, and newlines to produce a crisp title (`<= 48` chars).
+pub fn extract_fallback_title(prompt: &str) -> String {
+    let no_xml = strip_orbit_workspace_xml(prompt);
+    let no_fences = strip_markdown_fenced_blocks(no_xml);
+    let no_links = strip_markdown_links(&no_fences);
+
+    // Pick the first substantive non-empty line (or join short consecutive prose lines).
+    let mut prose_lines: Vec<String> = Vec::new();
+    for raw_line in no_links.lines() {
+        let cleaned_line = strip_markdown_line_prefix(strip_leading_slash_directive(raw_line));
+        if cleaned_line.is_empty() {
+            if !prose_lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+        prose_lines.push(cleaned_line.to_string());
+        let joined_chars: usize = prose_lines.iter().map(|l| l.chars().count()).sum();
+        if joined_chars >= 64 || prose_lines.len() >= 2 {
+            break;
+        }
+    }
+
+    let combined = prose_lines.join(" ");
+    // Remove markdown emphasis/code delimiters while keeping inner text intact.
+    let mut stripped = String::with_capacity(combined.len());
+    for ch in combined.chars() {
+        if matches!(ch, '`' | '*' | '~') {
+            continue;
+        }
+        stripped.push(ch);
+    }
+    let stripped = stripped.replace("__", "");
+
+    // Strip `@mention` / `@path/to/file` tokens when enough substantive prose remains;
+    // otherwise shorten `@path/to/file.rs` -> `file.rs`.
+    let tokens: Vec<&str> = stripped.split_whitespace().collect();
+    let without_mentions: Vec<&str> = tokens
+        .iter()
+        .copied()
+        .filter(|tok| !tok.starts_with('@') || tok.len() <= 1)
+        .collect();
+    let non_mention_chars: usize = without_mentions.iter().map(|t| t.chars().count()).sum();
+    let normalized = if non_mention_chars >= 4 {
+        without_mentions.join(" ")
+    } else {
+        tokens
+            .iter()
+            .map(|tok| {
+                if let Some(rest) = tok.strip_prefix('@') {
+                    let base = rest.rsplit('/').next().unwrap_or(rest);
+                    base.trim_matches([',', ';', ':', ')'])
+                } else {
+                    tok
+                }
+            })
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let clean = normalized
+        .trim()
+        .trim_matches(['"', '\'', ':', '-', '—', '·', ',', ';']);
+    if clean.is_empty() {
+        let raw_collapsed: String = no_xml.split_whitespace().collect::<Vec<_>>().join(" ");
+        if raw_collapsed.is_empty() {
+            return "New Conversation".to_string();
+        }
+        return truncate_title_smart(&raw_collapsed, MAX_CONCISE_TITLE_CHARS);
+    }
+
+    // If a crisp first sentence ends before our budget, stop cleanly at the sentence boundary.
+    let mut sentence_end: Option<(usize, bool)> = None;
+    for (idx, ch) in clean.char_indices() {
+        let char_pos = clean[..idx].chars().count();
+        if char_pos < 8 {
+            continue;
+        }
+        if char_pos >= MAX_CONCISE_TITLE_CHARS {
+            break;
+        }
+        match ch {
+            '。' | '！' | '？' => {
+                let keep_punct = ch == '？';
+                sentence_end = Some((idx + ch.len_utf8(), keep_punct));
+                break;
+            }
+            '.' | '!' | '?' => {
+                let next_is_space = clean[idx + 1..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace);
+                if next_is_space {
+                    let keep_punct = ch == '?';
+                    sentence_end = Some((idx + 1, keep_punct));
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let focused = if let Some((end_byte, keep_punct)) = sentence_end {
+        let slice = &clean[..end_byte];
+        if keep_punct {
+            slice.trim()
+        } else {
+            slice.trim().trim_end_matches(['.', '。', '!', '！']).trim()
+        }
+    } else {
+        clean
+    };
+
+    truncate_title_smart(focused, MAX_CONCISE_TITLE_CHARS)
+}
+
+fn raw_default_prompt_title(prompt: &str) -> String {
+    let first_line = prompt
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("New Session");
+    let trimmed = first_line.trim();
+    if trimmed.chars().count() <= 48 {
+        trimmed.to_string()
+    } else {
+        let mut s: String = trimmed.chars().take(48).collect();
+        s.push('…');
+        s
+    }
+}
+
+/// Returns `true` when `agent.title` is still a placeholder or raw truncated prompt default
+/// (and NOT locked via `orbit.title_locked = "1"`), meaning auto-naming may safely refine it
+/// without clobbering an explicit user title.
+pub fn is_auto_nameable_title(agent: &AgentSummary, first_user_prompt: Option<&str>) -> bool {
+    if is_title_locked(&agent.labels) {
+        return false;
+    }
+    let title = agent.title.trim();
+    if title.is_empty()
+        || title.eq_ignore_ascii_case("new thread")
+        || title.eq_ignore_ascii_case("new session")
+        || title.eq_ignore_ascii_case("new conversation")
+        || title.eq_ignore_ascii_case("conversation")
+        || title == "新会话"
+    {
+        return true;
+    }
+
+    let Some(raw_prompt) = first_user_prompt else {
+        return false;
+    };
+    let stripped_prompt = strip_orbit_workspace_xml(raw_prompt);
+    for candidate in [raw_prompt, stripped_prompt] {
+        let default_title = raw_default_prompt_title(candidate);
+        if title == default_title {
+            return true;
+        }
+        let first_line = candidate
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(str::trim)
+            .unwrap_or("");
+        if first_line.is_empty() {
+            continue;
+        }
+        let title_stem = title.trim_end_matches('…').trim_end_matches("...").trim();
+        if !title_stem.is_empty() && first_line.starts_with(title_stem) {
+            // Exact match or truncated prefix of the raw first user prompt line
+            if title_stem == first_line
+                || title.ends_with('…')
+                || title.ends_with("...")
+                || title_stem.chars().count() >= 24
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn derive_heuristic_identity(
     agent: &AgentSummary,
     snippet: &AgentContextSnippet,
+    allow_title_update: bool,
 ) -> (Option<String>, Option<String>, String) {
     let first = compact_snippet(snippet.first_user_prompt.as_deref(), 160);
     let latest = compact_snippet(snippet.latest_user_prompt.as_deref(), 160);
     let reply = compact_snippet(snippet.latest_assistant_message.as_deref(), 140);
+    let raw_seed = snippet
+        .first_user_prompt
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            snippet
+                .latest_user_prompt
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(agent.title.as_str());
     let seed = if !first.is_empty() {
         first.as_str()
     } else if !latest.is_empty() {
@@ -221,6 +582,7 @@ fn derive_heuristic_identity(
     let handle = derive_semantic_handle_from_prompt(seed)
         .or_else(|| derive_semantic_handle_from_prompt(&agent.title));
 
+    let fallback_title = extract_fallback_title(raw_seed);
     let summary_text = if !snippet.edited_files.is_empty() {
         let files_preview: Vec<&str> = snippet
             .edited_files
@@ -228,7 +590,9 @@ fn derive_heuristic_identity(
             .take(2)
             .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
             .collect();
-        let base = if !first.is_empty() {
+        let base = if !fallback_title.is_empty() && fallback_title != "New Conversation" {
+            truncate_chars(&fallback_title, 48)
+        } else if !first.is_empty() {
             truncate_chars(&first, 56)
         } else {
             truncate_chars(&agent.title, 56)
@@ -242,8 +606,8 @@ fn derive_heuristic_identity(
         truncate_chars(&agent.title, 76)
     };
 
-    let title = if agent.title.trim().is_empty() || agent.title.eq_ignore_ascii_case("new thread") {
-        Some(truncate_chars(seed, 48))
+    let title = if allow_title_update {
+        Some(fallback_title)
     } else {
         None
     };
@@ -265,7 +629,7 @@ fn build_summarize_prompt(agent: &AgentSummary, snippet: &AgentContextSnippet) -
         "You are Orbit's ultra-fast conversation identity summarizer.\n\
          Given the coding conversation context below, return ONLY a valid JSON object (no markdown, no explanation) with keys:\n\
          - \"handle\": ultra-concise semantic tab label (2-8 Chinese chars or 1-2 short English words, e.g. \"跨端同步\", \"剪贴板修复\", \"oauth-fix\", \"rate-limiter\"). NEVER use generic tool/model names like agy, claude, codex, peer, lead, agent, chat.\n\
-         - \"title\": concise thread title (<= 36 chars, matching the user's language).\n\
+         - \"title\": crisp concise thread title (<= 48 chars, matching the user's language, plain text with no surrounding quotes or markdown).\n\
          - \"task_summary\": single crisp sentence summarizing what this conversation is doing or achieved (<= 48 Chinese chars or <= 84 English chars, matching the user's language).\n\
          Do NOT call any tools or read any files.\n\n\
          Current Title: {}\n\
@@ -285,99 +649,214 @@ fn build_summarize_prompt(agent: &AgentSummary, snippet: &AgentContextSnippet) -
     )
 }
 
-/// Generate and persist a semantic tab handle + 1-line `task_summary` for one conversation.
+/// Bounded automatic naming + summary triggered once after a conversation completes its first
+/// foreground turn (`Running -> Idle` with at least 1 user message + 1 assistant reply).
+///
+/// Strictly respects:
+/// - `orbit.title_locked = "1"` (never overwrites locked titles)
+/// - `orbit.auto_named = "1"` (runs at most once per conversation across daemon restarts)
+/// - explicit non-default titles (only updates empty / `"New thread"` / raw truncated prompt defaults)
+/// - bounded concurrency via `AgentOrchestrator::auto_name_semaphore`
+pub async fn auto_name_agent_after_first_turn(
+    mgr: &Arc<AgentOrchestrator>,
+    agent_id: &str,
+) -> anyhow::Result<Option<AgentSummary>> {
+    let lock_key = format!("sum:{agent_id}");
+    let Some(_guard) = mgr.try_acquire_organizer_lock(&lock_key) else {
+        return Ok(None);
+    };
+    auto_name_agent_after_first_turn_inner(mgr, agent_id).await
+}
+
+async fn auto_name_agent_after_first_turn_inner(
+    mgr: &Arc<AgentOrchestrator>,
+    agent_id: &str,
+) -> anyhow::Result<Option<AgentSummary>> {
+    let Some(agent) = mgr.store().get_agent(agent_id)? else {
+        return Ok(None);
+    };
+    if agent.archived_at.is_some()
+        || agent.background
+        || agent.parent_agent_id.is_some()
+        || is_auto_named(&agent.labels)
+    {
+        return Ok(None);
+    }
+
+    let snippet = mgr.store().agent_context_snippet(agent_id)?;
+    let has_user_prompt = snippet
+        .first_user_prompt
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_assistant_reply = snippet
+        .latest_assistant_message
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    if !has_user_prompt || !has_assistant_reply {
+        return Ok(None);
+    }
+
+    let allow_title = is_auto_nameable_title(&agent, snippet.first_user_prompt.as_deref());
+    let updated = run_agent_summary_pipeline(
+        mgr,
+        &agent,
+        &snippet,
+        allow_title,
+        SemanticIdentityOptions {
+            mark_auto_named: true,
+            force_title: false,
+        },
+        true,
+    )
+    .await?;
+    Ok(Some(updated))
+}
+
+/// Generate and persist a semantic tab handle, concise title (when unlocked), and 1-line
+/// `task_summary` for one conversation. Always respects `orbit.title_locked = "1"` unless
+/// `force_regenerate_title` is explicitly requested.
 pub async fn summarize_agent_context(
     mgr: &Arc<AgentOrchestrator>,
     agent_id: &str,
 ) -> anyhow::Result<AgentSummary> {
+    summarize_agent_context_with_options(mgr, agent_id, false).await
+}
+
+pub async fn summarize_agent_context_with_options(
+    mgr: &Arc<AgentOrchestrator>,
+    agent_id: &str,
+    force_regenerate_title: bool,
+) -> anyhow::Result<AgentSummary> {
     let lock_key = format!("sum:{agent_id}");
-    if !mgr.try_acquire_organizer_lock(&lock_key).await {
+    let Some(_guard) = mgr.try_acquire_organizer_lock(&lock_key) else {
         return mgr
             .store()
             .get_agent(agent_id)?
             .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"));
-    }
-    let result = summarize_agent_context_inner(mgr, agent_id).await;
-    mgr.release_organizer_lock(&lock_key).await;
-    result
+    };
+    summarize_agent_context_inner(mgr, agent_id, force_regenerate_title).await
 }
 
 async fn summarize_agent_context_inner(
     mgr: &Arc<AgentOrchestrator>,
     agent_id: &str,
+    force_regenerate_title: bool,
 ) -> anyhow::Result<AgentSummary> {
     let agent = mgr
         .store()
         .get_agent(agent_id)?
         .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
     let snippet = mgr.store().agent_context_snippet(agent_id)?;
+    let allow_title = force_regenerate_title || !is_title_locked(&agent.labels);
+    run_agent_summary_pipeline(
+        mgr,
+        &agent,
+        &snippet,
+        allow_title,
+        SemanticIdentityOptions {
+            mark_auto_named: true,
+            force_title: force_regenerate_title,
+        },
+        false,
+    )
+    .await
+}
 
+async fn run_agent_summary_pipeline(
+    mgr: &Arc<AgentOrchestrator>,
+    agent: &AgentSummary,
+    snippet: &AgentContextSnippet,
+    allow_title: bool,
+    identity_opts: SemanticIdentityOptions,
+    throttle_llm: bool,
+) -> anyhow::Result<AgentSummary> {
+    let agent_id = agent.agent_id.as_str();
     let (mut desired_handle, mut desired_title, mut desired_summary) =
-        derive_heuristic_identity(&agent, &snippet);
+        derive_heuristic_identity(agent, snippet, allow_title);
 
     let providers = pick_organizer_providers(Some(agent.provider));
     if !providers.is_empty() {
-        let prompt = build_summarize_prompt(&agent, &snippet);
-        for provider in providers.into_iter().take(2) {
-            match run_ephemeral_text_prompt(
-                provider,
-                PathBuf::from(&agent.cwd),
-                None,
-                prompt.clone(),
-                LLM_SUMMARY_TIMEOUT_SECS,
-            )
-            .await
-            {
-                Ok(raw) => {
-                    if let Some(json_str) = extract_json_object(&raw)
-                        && let Ok(parsed) = serde_json::from_str::<LlmSummaryPayload>(json_str)
-                    {
-                        if let Some(h) = clean_semantic_handle(parsed.handle.as_deref()) {
-                            desired_handle = Some(h);
-                        }
-                        if let Some(t) = parsed
-                            .title
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
+        // Acquire bounded concurrency permit lazily right around the ephemeral LLM call
+        // so ineligible/fast-path sessions never queue on the semaphore.
+        let _llm_permit = if throttle_llm {
+            mgr.auto_name_semaphore().clone().acquire_owned().await.ok()
+        } else {
+            None
+        };
+        if !throttle_llm || _llm_permit.is_some() {
+            let prompt = build_summarize_prompt(agent, snippet);
+            for provider in providers.into_iter().take(2) {
+                match run_ephemeral_text_prompt(
+                    provider,
+                    PathBuf::from(&agent.cwd),
+                    None,
+                    prompt.clone(),
+                    LLM_SUMMARY_TIMEOUT_SECS,
+                )
+                .await
+                {
+                    Ok(raw) => {
+                        if let Some(json_str) = extract_json_object(&raw)
+                            && let Ok(parsed) = serde_json::from_str::<LlmSummaryPayload>(json_str)
                         {
-                            desired_title = Some(truncate_chars(t, 56));
+                            if let Some(h) = clean_semantic_handle(parsed.handle.as_deref()) {
+                                desired_handle = Some(h);
+                            }
+                            if allow_title
+                                && let Some(t) = clean_concise_title(parsed.title.as_deref())
+                            {
+                                desired_title = Some(t);
+                            }
+                            if let Some(ts) = clean_summary_line(parsed.task_summary.as_deref()) {
+                                desired_summary = ts;
+                            }
+                            break;
                         }
-                        if let Some(ts) = clean_summary_line(parsed.task_summary.as_deref()) {
-                            desired_summary = ts;
-                        }
-                        break;
+                        warn!(
+                            agent_id = %agent_id,
+                            provider = ?provider,
+                            "Organizer summary response was not parseable JSON; trying fallback"
+                        );
                     }
-                    warn!(
-                        agent_id = %agent_id,
-                        provider = ?provider,
-                        "Organizer summary response was not parseable JSON; trying fallback"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        agent_id = %agent_id,
-                        provider = ?provider,
-                        error = %err,
-                        "Organizer ephemeral summary call failed; trying fallback"
-                    );
+                    Err(err) => {
+                        warn!(
+                            agent_id = %agent_id,
+                            provider = ?provider,
+                            error = %err,
+                            "Organizer ephemeral summary call failed; trying fallback"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    if !allow_title {
+        desired_title = None;
+    }
+
+    // Re-check latest persisted agent before committing so a concurrent manual rename
+    // while the ephemeral LLM call was in flight is NEVER clobbered.
+    let latest_agent = mgr
+        .store()
+        .get_agent(agent_id)?
+        .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
+    if !identity_opts.force_title && is_title_locked(&latest_agent.labels) {
+        desired_title = None;
     }
 
     // Ensure uniqueness inside the agent's workspace if we're updating its handle
     let final_handle = if let Some(h) = desired_handle {
         let peers: Vec<AgentSummary> = mgr
             .store()
-            .list_agents_filtered(Some(&agent.workspace_id), false, false, None)
+            .list_agents_filtered(Some(&latest_agent.workspace_id), false, false, None)
             .unwrap_or_default()
             .into_iter()
             .filter(|p| p.agent_id != agent_id)
             .collect();
         Some(allocate_unique_handle(
             Some(&h),
-            agent.provider,
+            latest_agent.provider,
             None,
             None,
             &peers,
@@ -388,11 +867,12 @@ async fn summarize_agent_context_inner(
 
     let updated = mgr
         .store()
-        .set_agent_semantic_identity(
+        .set_agent_semantic_identity_with_options(
             agent_id,
             final_handle.as_deref(),
             desired_title.as_deref(),
             Some(desired_summary.as_str()),
+            identity_opts,
         )?
         .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
     let _ = mgr
@@ -515,7 +995,8 @@ fn build_heuristic_decisions(
     let mut token_sets: Vec<HashSet<String>> = Vec::with_capacity(targets.len());
 
     for (idx, (ag, snip)) in targets.iter().enumerate() {
-        let (handle, title, summary) = derive_heuristic_identity(ag, snip);
+        let allow_title = is_auto_nameable_title(ag, snip.first_user_prompt.as_deref());
+        let (handle, title, summary) = derive_heuristic_identity(ag, snip, allow_title);
         let combined = format!(
             "{} {} {} {}",
             ag.title,
@@ -642,19 +1123,19 @@ pub async fn organize_project_workspaces(
 ) -> anyhow::Result<WorkspaceOrganizeEvent> {
     let norm_root = normalize_root_path(project_root);
     let lock_key = format!("org:{norm_root}");
-    let mut acquired = mgr.try_acquire_organizer_lock(&lock_key).await;
-    if !acquired && request_id.is_some() {
+    let mut lock_guard = mgr.try_acquire_organizer_lock(&lock_key);
+    if lock_guard.is_none() && request_id.is_some() {
         // Explicit user-triggered AI organize waits briefly for any in-flight background Turn-1 triage
         // instead of silently dropping the user's click.
         for _ in 0..300 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if mgr.try_acquire_organizer_lock(&lock_key).await {
-                acquired = true;
+            if let Some(g) = mgr.try_acquire_organizer_lock(&lock_key) {
+                lock_guard = Some(g);
                 break;
             }
         }
     }
-    if !acquired {
+    let Some(_guard) = lock_guard else {
         return Ok(WorkspaceOrganizeEvent {
             request_id,
             project_root: project_root.to_string(),
@@ -664,7 +1145,7 @@ pub async fn organize_project_workspaces(
             grouped_agents: 0,
             summarized_agents: 0,
         });
-    }
+    };
 
     let emit = |event: WorkspaceOrganizeEvent| {
         let _ = mgr
@@ -692,7 +1173,7 @@ pub async fn organize_project_workspaces(
         auto_apply,
     )
     .await;
-    mgr.release_organizer_lock(&lock_key).await;
+    drop(_guard);
 
     match res {
         Ok(done_ev) => Ok(emit(done_ev)),
@@ -863,16 +1344,15 @@ async fn organize_project_workspaces_inner(
             continue;
         }
 
+        let allow_title = is_auto_nameable_title(agent, snippet.first_user_prompt.as_deref());
         let (fallback_handle, fallback_title, fallback_summary) =
-            derive_heuristic_identity(agent, snippet);
+            derive_heuristic_identity(agent, snippet, allow_title);
         let sem_handle = clean_semantic_handle(dec.handle.as_deref()).or(fallback_handle);
-        let sem_title = dec
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|t| truncate_chars(t, 56))
-            .or(fallback_title);
+        let sem_title = if allow_title {
+            clean_concise_title(dec.title.as_deref()).or(fallback_title)
+        } else {
+            None
+        };
         let sem_summary =
             clean_summary_line(dec.task_summary.as_deref()).unwrap_or(fallback_summary);
 
@@ -1097,5 +1577,314 @@ mod tests {
             clean_semantic_handle(Some("@跨端同步")).as_deref(),
             Some("跨端同步")
         );
+    }
+
+    #[test]
+    fn fallback_title_extractor_cleans_markdown_mentions_fences_and_newlines() {
+        let prompt = "/plan # Fix `auth_middleware.rs` login bug @crates/orbit-daemon/src/lib.rs\n\n```rust\nfn panic_here() {}\n```\nMore details follow.";
+        let title = extract_fallback_title(prompt);
+        assert!(title.chars().count() <= MAX_CONCISE_TITLE_CHARS);
+        assert!(!title.contains("```"));
+        assert!(!title.contains('\n'));
+        assert!(!title.starts_with("/plan"));
+        assert!(!title.starts_with('#'));
+        assert!(!title.contains("@crates/"));
+        assert!(title.contains("Fix auth_middleware.rs login bug"));
+
+        let cjk = "<orbit-workspace><peers/></orbit-workspace>\n\n- **修复** [导出模块](https://example.com) 的暗色模式样式问题。顺便加上单元测试。";
+        let cjk_title = extract_fallback_title(cjk);
+        assert!(cjk_title.chars().count() <= MAX_CONCISE_TITLE_CHARS);
+        assert_eq!(cjk_title, "修复 导出模块 的暗色模式样式问题");
+
+        let only_mention = "@src/components/export-modal.tsx";
+        assert_eq!(extract_fallback_title(only_mention), "export-modal.tsx");
+    }
+
+    async fn make_test_orchestrator() -> (Arc<AgentOrchestrator>, Arc<orbit_store::OrbitStore>) {
+        let store = Arc::new(orbit_store::OrbitStore::open_in_memory().expect("store"));
+        let dir = std::env::temp_dir().join(format!("orbit-autoname-{}", Uuid::new_v4().simple()));
+        let _ = std::fs::create_dir_all(&dir);
+        let orch_cfg = Arc::new(tokio::sync::RwLock::new(
+            orbit_protocol::OrchestrationConfig::default(),
+        ));
+        let listen_port = Arc::new(tokio::sync::RwLock::new(0u16));
+        let scripts = crate::workspace_runtime::WorkspaceScriptRegistry::new();
+        let keep_awake = Arc::new(crate::keep_awake::KeepAwakeManager::new(false));
+        let mgr = AgentOrchestrator::new(
+            dir,
+            "host_test".into(),
+            "tok".into(),
+            listen_port,
+            orch_cfg,
+            Arc::clone(&store),
+            scripts,
+            keep_awake,
+        )
+        .await;
+        (mgr, store)
+    }
+
+    fn seed_agent(
+        store: &orbit_store::OrbitStore,
+        agent_id: &str,
+        title: &str,
+        labels: HashMap<String, String>,
+    ) {
+        let now = chrono::Utc::now();
+        let ws = WorkspaceSummary {
+            workspace_id: "ws_test".into(),
+            title: "Test WS".into(),
+            cwd: "/tmp/repo".into(),
+            git_branch: None,
+            is_worktree: false,
+            updated_at: now,
+            source_cwd: None,
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: None,
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+            mission_goal: None,
+            project_root: Some("/tmp/repo".into()),
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
+            is_curated: false,
+        };
+        store.upsert_workspace(&ws).expect("upsert ws");
+        let agent = AgentSummary {
+            agent_id: agent_id.into(),
+            workspace_id: "ws_test".into(),
+            cwd: "/tmp/repo".into(),
+            title: title.into(),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            mode: orbit_protocol::SessionMode::Default,
+            status: orbit_protocol::AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels,
+            attention: orbit_protocol::AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: Some("claude".into()),
+            cluster_suggestion: None,
+            task_summary: None,
+        };
+        store.upsert_agent(&agent, None).expect("upsert agent");
+    }
+
+    #[tokio::test]
+    async fn auto_naming_runs_once_after_first_completed_turn_and_never_clobbers_locked_titles() {
+        let (mgr, store) = make_test_orchestrator().await;
+
+        // 1. Agent with raw markdown prompt default: should skip before assistant reply, then auto-name once.
+        let prompt = "/plan # Refactor `export.rs` HTML escaping\n\n```rs\nfn x(){}\n```";
+        seed_agent(&store, "ag_auto_1", "New thread", HashMap::new());
+        store
+            .append_timeline_event(
+                "ag_auto_1",
+                1,
+                Some("t1"),
+                orbit_protocol::TimelinePayload::UserPrompt {
+                    message_id: "m1".into(),
+                    text: prompt.into(),
+                    badges: vec![],
+                },
+            )
+            .expect("append user");
+
+        // No assistant reply yet -> must NOT trigger or mark orbit.auto_named
+        let before_reply = auto_name_agent_after_first_turn(&mgr, "ag_auto_1")
+            .await
+            .expect("auto name before reply");
+        assert!(before_reply.is_none());
+        let ag_check = store.get_agent("ag_auto_1").expect("get").expect("exists");
+        assert!(!is_auto_named(&ag_check.labels));
+
+        // Assistant reply arrives -> first turn complete
+        store
+            .append_timeline_event(
+                "ag_auto_1",
+                1,
+                Some("t1"),
+                orbit_protocol::TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
+                    text: "Done refactoring HTML escaping.".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append assistant");
+
+        let first_run = auto_name_agent_after_first_turn(&mgr, "ag_auto_1")
+            .await
+            .expect("auto name first run")
+            .expect("updated agent");
+        assert_eq!(first_run.title, "Refactor export.rs HTML escaping");
+        assert!(first_run.task_summary.is_some());
+        assert_eq!(
+            first_run.labels.get(LABEL_AUTO_NAMED).map(String::as_str),
+            Some("1")
+        );
+
+        // Second invocation must be a no-op because `orbit.auto_named = "1"` is persisted.
+        let second_run = auto_name_agent_after_first_turn(&mgr, "ag_auto_1")
+            .await
+            .expect("auto name second run");
+        assert!(second_run.is_none());
+
+        // 2. Agent with `orbit.title_locked = "1"` must NEVER have its title overwritten.
+        let mut locked_labels = HashMap::new();
+        locked_labels.insert(LABEL_TITLE_LOCKED.into(), "1".into());
+        seed_agent(&store, "ag_locked", "My Custom Title", locked_labels);
+        store
+            .append_timeline_event(
+                "ag_locked",
+                1,
+                Some("t1"),
+                orbit_protocol::TimelinePayload::UserPrompt {
+                    message_id: "m2".into(),
+                    text: "Investigate websocket timeout in relay".into(),
+                    badges: vec![],
+                },
+            )
+            .expect("append user");
+        store
+            .append_timeline_event(
+                "ag_locked",
+                1,
+                Some("t1"),
+                orbit_protocol::TimelinePayload::AssistantMessage {
+                    item_id: "a2".into(),
+                    text: "Found missing keepalive frame.".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append assistant");
+
+        let locked_auto = auto_name_agent_after_first_turn(&mgr, "ag_locked")
+            .await
+            .expect("auto name locked")
+            .expect("summary persisted");
+        assert_eq!(locked_auto.title, "My Custom Title");
+        assert!(locked_auto.task_summary.is_some());
+
+        // Manual summarize must also respect `orbit.title_locked = "1"`.
+        let locked_manual = summarize_agent_context(&mgr, "ag_locked")
+            .await
+            .expect("manual summarize locked");
+        assert_eq!(locked_manual.title, "My Custom Title");
+
+        // 3. Explicit user rename via `update_agent` locks title automatically.
+        seed_agent(&store, "ag_renamed", "New thread", HashMap::new());
+        let renamed = mgr
+            .update_agent(
+                "ag_renamed",
+                Some("Pinned Release Plan".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("rename agent");
+        assert!(is_title_locked(&renamed.labels));
+        assert_eq!(renamed.title, "Pinned Release Plan");
+
+        // 4. Raw truncated prompt default IS eligible for auto-naming, whereas an unrelated custom title is NOT.
+        let long_prompt = "### Implement end-to-end encrypted transcript export with strict XSS protection across desktop and CLI";
+        let truncated_default = raw_default_prompt_title(long_prompt);
+        seed_agent(&store, "ag_trunc", &truncated_default, HashMap::new());
+        let ag_trunc = store.get_agent("ag_trunc").expect("get").expect("exists");
+        assert!(is_auto_nameable_title(&ag_trunc, Some(long_prompt)));
+
+        seed_agent(
+            &store,
+            "ag_explicit_unlocked",
+            "Q4 Security Audit",
+            HashMap::new(),
+        );
+        let ag_explicit = store
+            .get_agent("ag_explicit_unlocked")
+            .expect("get")
+            .expect("exists");
+        assert!(!is_auto_nameable_title(&ag_explicit, Some(long_prompt)));
+
+        // 5. Atomic semantic identity & update_agent_fields never overwrite concurrent lifecycle fields
+        //    (`status`, `is_pinned`, `attention`, `archived_at`).
+        seed_agent(&store, "ag_atomic", "New thread", HashMap::new());
+        store
+            .set_agent_pinned("ag_atomic", true, Some(42))
+            .expect("pin");
+        store
+            .set_agent_attention("ag_atomic", orbit_protocol::AttentionState::Finished)
+            .expect("attention");
+        store
+            .set_agent_semantic_identity_with_options(
+                "ag_atomic",
+                Some("atomic-fix"),
+                Some("Atomic Title"),
+                Some("Atomic summary"),
+                SemanticIdentityOptions {
+                    mark_auto_named: true,
+                    force_title: false,
+                },
+            )
+            .expect("atomic semantic update");
+        let after_sem = store.get_agent("ag_atomic").expect("get").expect("exists");
+        assert_eq!(after_sem.title, "Atomic Title");
+        assert!(after_sem.is_pinned);
+        assert_eq!(after_sem.pinned_order, 42);
+        assert_eq!(
+            after_sem.attention,
+            orbit_protocol::AttentionState::Finished
+        );
+
+        mgr.update_agent(
+            "ag_atomic",
+            Some("User Locked Title".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("update_agent");
+        let after_upd = store.get_agent("ag_atomic").expect("get").expect("exists");
+        assert_eq!(after_upd.title, "User Locked Title");
+        assert!(is_title_locked(&after_upd.labels));
+        assert!(after_upd.is_pinned);
+        assert_eq!(
+            after_upd.attention,
+            orbit_protocol::AttentionState::Finished
+        );
+
+        // 6. RAII OrganizerLockGuard releases lock and clears keep-awake on drop
+        {
+            let guard = mgr.try_acquire_organizer_lock("sum:test_raii");
+            assert!(guard.is_some());
+            assert!(mgr.try_acquire_organizer_lock("sum:test_raii").is_none());
+        }
+        assert!(mgr.try_acquire_organizer_lock("sum:test_raii").is_some());
+
+        // 7. strip_orbit_workspace_xml only strips leading `<orbit-workspace...>` wrapper
+        let prose_mention = "Please inspect </orbit-workspace> parser edge case";
+        assert_eq!(strip_orbit_workspace_xml(prose_mention), prose_mention);
     }
 }

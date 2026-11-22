@@ -37,6 +37,13 @@ pub struct AgentContextSnippet {
     pub edited_files: Vec<String>,
 }
 
+/// Options controlling atomic semantic identity updates (`set_agent_semantic_identity_with_options`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SemanticIdentityOptions {
+    pub mark_auto_named: bool,
+    pub force_title: bool,
+}
+
 pub(crate) fn migrate_sync_and_mission_schema(
     conn: &rusqlite::Connection,
 ) -> Result<(), StoreError> {
@@ -366,16 +373,46 @@ impl OrbitStore {
         title: Option<&str>,
         task_summary: Option<&str>,
     ) -> Result<Option<AgentSummary>, StoreError> {
-        let Some(mut current) = self.get_agent(agent_id)? else {
+        self.set_agent_semantic_identity_with_options(
+            agent_id,
+            handle,
+            title,
+            task_summary,
+            SemanticIdentityOptions::default(),
+        )
+    }
+
+    /// Atomically apply AI-derived semantic handle, title, and/or live `task_summary` inside a
+    /// single SQLite transaction using a targeted `UPDATE` (never touching `status_json`,
+    /// `archived_at`, `attention_state`, `is_pinned`, or other concurrent lifecycle columns).
+    pub fn set_agent_semantic_identity_with_options(
+        &self,
+        agent_id: &str,
+        handle: Option<&str>,
+        title: Option<&str>,
+        task_summary: Option<&str>,
+        options: SemanticIdentityOptions,
+    ) -> Result<Option<AgentSummary>, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        let row_opt: Option<(Option<String>, String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT handle, title, task_summary, labels_json FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((mut cur_handle, mut cur_title, mut cur_summary, labels_json)) = row_opt else {
             return Ok(None);
         };
-        let handle_locked = current
-            .labels
+        let mut labels: std::collections::HashMap<String, String> =
+            serde_json::from_str(&labels_json).unwrap_or_default();
+
+        let handle_locked = labels
             .get("orbit.handle_locked")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let title_locked = current
-            .labels
+        let title_locked = labels
             .get("orbit.title_locked")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -383,29 +420,55 @@ impl OrbitStore {
         let mut changed = false;
         if !handle_locked
             && let Some(h) = handle.map(str::trim).filter(|s| !s.is_empty())
-            && current.handle.as_deref() != Some(h)
+            && cur_handle.as_deref() != Some(h)
         {
-            current.handle = Some(h.to_string());
+            cur_handle = Some(h.to_string());
             changed = true;
         }
-        if !title_locked
+        if (options.force_title || !title_locked)
             && let Some(t) = title.map(str::trim).filter(|s| !s.is_empty())
-            && current.title != t
+            && cur_title != t
         {
-            current.title = t.to_string();
+            cur_title = t.to_string();
             changed = true;
         }
         if let Some(ts) = task_summary.map(str::trim).filter(|s| !s.is_empty())
-            && current.task_summary.as_deref() != Some(ts)
+            && cur_summary.as_deref() != Some(ts)
         {
-            current.task_summary = Some(ts.to_string());
+            cur_summary = Some(ts.to_string());
+            changed = true;
+        }
+        if options.mark_auto_named
+            && labels.get("orbit.auto_named").map(String::as_str) != Some("1")
+        {
+            labels.insert("orbit.auto_named".into(), "1".into());
             changed = true;
         }
         if changed {
-            current.updated_at = Utc::now();
-            self.upsert_agent(&current, None)?;
+            let next_labels_json = serde_json::to_string(&labels)?;
+            tx.execute(
+                "UPDATE agents
+                 SET handle = ?1,
+                     title = ?2,
+                     task_summary = ?3,
+                     labels_json = ?4,
+                     updated_at = ?5
+                 WHERE agent_id = ?6",
+                params![
+                    cur_handle,
+                    cur_title,
+                    cur_summary,
+                    next_labels_json,
+                    Utc::now().to_rfc3339(),
+                    agent_id,
+                ],
+            )?;
         }
-        Ok(Some(current))
+        let updated = query_agent_with_queue(&tx, agent_id)?;
+        if changed {
+            tx.commit()?;
+        }
+        Ok(updated)
     }
 
     /// Extract a compact conversation context snippet (first user prompt, latest user prompt,

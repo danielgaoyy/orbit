@@ -14,6 +14,7 @@ pub mod composer;
 pub mod contract;
 pub mod desktop_ops;
 pub mod diagram;
+pub mod export;
 pub mod logging;
 pub mod render;
 pub mod sidebar;

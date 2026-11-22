@@ -2059,8 +2059,132 @@ impl OrbitAppCore {
                 "rewind".into(),
                 "native_diagrams".into(),
                 "fts5_search".into(),
+                "transcript_export".into(),
             ],
         }
+    }
+
+    fn load_full_agent_export_context(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<(crate::export::ExportAgentMeta, Vec<TimelineEvent>), String> {
+        let mut meta = crate::export::ExportAgentMeta {
+            host_id: host_id.to_string(),
+            agent_id: agent_id.to_string(),
+            title: String::new(),
+            ..Default::default()
+        };
+        let mut mem_events: Vec<TimelineEvent> = Vec::new();
+        let mut found_agent = false;
+
+        if let Ok(guard) = self.hosts.read()
+            && let Some(host_state) = guard.get(host_id)
+        {
+            let hname = host_state.profile.effective_display_name();
+            if !hname.trim().is_empty() {
+                meta.host_name = Some(hname);
+            }
+            if let Some(ag) = host_state.agents.get(agent_id) {
+                found_agent = true;
+                meta.title = ag.title.clone();
+                meta.provider = Some(ag.provider);
+                meta.model = ag.model.clone();
+                meta.cwd = Some(ag.cwd.clone());
+                meta.task_summary = ag.task_summary.clone();
+                meta.created_at = Some(ag.created_at);
+                meta.workspace_title = host_state
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace_id == ag.workspace_id)
+                    .map(|w| w.title.clone());
+            }
+            if let Some(list) = host_state.timelines.get(agent_id) {
+                mem_events = list.clone();
+            }
+        }
+
+        // Fall back to persisted replica metadata if this host/agent is not yet hydrated in memory.
+        if !found_agent
+            && let Ok(replica_agents) = self.store.list_replica_agents(host_id)
+            && let Some(ag) = replica_agents.into_iter().find(|a| a.agent_id == agent_id)
+        {
+            found_agent = true;
+            meta.title = ag.title.clone();
+            meta.provider = Some(ag.provider);
+            meta.model = ag.model.clone();
+            meta.cwd = Some(ag.cwd.clone());
+            meta.task_summary = ag.task_summary.clone();
+            meta.created_at = Some(ag.created_at);
+            if let Ok(ws_list) = self.store.list_replica_workspaces(host_id) {
+                meta.workspace_title = ws_list
+                    .into_iter()
+                    .find(|w| w.workspace_id == ag.workspace_id)
+                    .map(|w| w.title);
+            }
+            if meta.host_name.is_none()
+                && let Ok(saved_hosts) = self.store.list_client_hosts()
+                && let Some(h) = saved_hosts.into_iter().find(|h| h.host_id == host_id)
+            {
+                let label = h
+                    .meta
+                    .custom_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        h.meta
+                            .ssh_alias
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or(h.display_name.trim());
+                if !label.is_empty() {
+                    meta.host_name = Some(label.to_string());
+                }
+            }
+        }
+
+        // Strict multi-host isolation: NEVER query replica events unless this `host_id` owns `agent_id`.
+        if !found_agent && mem_events.is_empty() {
+            return Err(format!(
+                "conversation `{agent_id}` not found on host `{host_id}`"
+            ));
+        }
+
+        // Read the complete persisted local replica timeline so long virtualized conversations export in full.
+        let persisted = self
+            .store
+            .fetch_replica_timeline_all(agent_id)
+            .map_err(|e| format!("failed to load replica timeline for `{agent_id}`: {e}"))?;
+
+        let combined = merge_persisted_and_memory_timeline(persisted, mem_events);
+        Ok((meta, combined))
+    }
+
+    /// Export a complete conversation transcript (Markdown, JSON, or self-contained HTML5)
+    /// directly from the local SQLite replica + live in-memory tail so virtualized threads never truncate.
+    pub fn export_agent_transcript(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        opts: &crate::export::ExportOptions,
+    ) -> Result<crate::export::ExportedTranscript, String> {
+        let (meta, events) = self.load_full_agent_export_context(host_id, agent_id)?;
+        Ok(crate::export::export_timeline_transcript(
+            &meta, &events, opts,
+        ))
+    }
+
+    /// Extract all fenced code blocks from assistant replies in reverse-chronological order.
+    pub fn list_agent_code_blocks(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<crate::export::ExtractedCodeBlock>, String> {
+        let (_meta, events) = self.load_full_agent_export_context(host_id, agent_id)?;
+        Ok(crate::export::extract_code_blocks_from_timeline(&events))
     }
 
     /// Cross-conversation full-text search across all locally replicated timeline messages,
@@ -9331,6 +9455,101 @@ fn record_agent_rpc_error(
 
 fn is_pending_optimistic_prompt(ev: &TimelineEvent) -> bool {
     ev.seq == 0 && matches!(ev.payload, TimelinePayload::UserPrompt { .. })
+}
+
+pub(crate) fn coalesce_timeline_slice(events: &[TimelineEvent]) -> Vec<TimelineEvent> {
+    let mut coalesced = Vec::with_capacity(events.len());
+    for ev in events {
+        coalesce_or_push_timeline(&mut coalesced, ev.clone());
+    }
+    coalesced
+}
+
+/// Merge persisted replica events with live in-memory events without dropping unpersisted middle
+/// sequence numbers or duplicating optimistic `seq == 0` user prompts already persisted on disk.
+pub(crate) fn merge_persisted_and_memory_timeline(
+    persisted: Vec<TimelineEvent>,
+    mem_events: Vec<TimelineEvent>,
+) -> Vec<TimelineEvent> {
+    if persisted.is_empty() {
+        return mem_events;
+    }
+    if mem_events.is_empty() {
+        return persisted;
+    }
+
+    let max_epoch = persisted
+        .iter()
+        .chain(mem_events.iter())
+        .filter(|e| e.seq > 0)
+        .map(|e| e.epoch)
+        .max()
+        .unwrap_or(0);
+
+    let mut positive: Vec<TimelineEvent> = Vec::with_capacity(persisted.len() + mem_events.len());
+    let mut persisted_seqs: HashSet<u64> = HashSet::with_capacity(persisted.len());
+    let mut persisted_prompt_ids: HashSet<String> = HashSet::new();
+    let mut persisted_prompt_texts: HashSet<String> = HashSet::new();
+
+    for ev in persisted {
+        if ev.seq > 0 {
+            if max_epoch > 0 && ev.epoch < max_epoch {
+                continue;
+            }
+            persisted_seqs.insert(ev.seq);
+            if let TimelinePayload::UserPrompt {
+                message_id, text, ..
+            } = &ev.payload
+            {
+                if !message_id.is_empty() {
+                    persisted_prompt_ids.insert(message_id.clone());
+                }
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    persisted_prompt_texts.insert(trimmed.to_string());
+                }
+            }
+            positive.push(ev);
+        }
+    }
+
+    let mut optimistic: Vec<TimelineEvent> = Vec::new();
+    for ev in mem_events {
+        if ev.seq > 0 {
+            if max_epoch > 0 && ev.epoch < max_epoch {
+                continue;
+            }
+            if persisted_seqs.insert(ev.seq) {
+                if let TimelinePayload::UserPrompt {
+                    message_id, text, ..
+                } = &ev.payload
+                {
+                    if !message_id.is_empty() {
+                        persisted_prompt_ids.insert(message_id.clone());
+                    }
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        persisted_prompt_texts.insert(trimmed.to_string());
+                    }
+                }
+                positive.push(ev);
+            }
+        } else {
+            let is_dup_prompt = matches!(
+                &ev.payload,
+                TimelinePayload::UserPrompt { message_id, text, .. }
+                    if (!message_id.is_empty() && persisted_prompt_ids.contains(message_id))
+                        || (!text.trim().is_empty() && persisted_prompt_texts.contains(text.trim()))
+            );
+            if !is_dup_prompt {
+                optimistic.push(ev);
+            }
+        }
+    }
+
+    positive.sort_by_key(|e| e.seq);
+    positive.extend(optimistic);
+    positive
 }
 
 fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: TimelineEvent) -> usize {

@@ -34,10 +34,11 @@ use orbit_shim::{ShimSpawnSpec, run_shim};
 use uuid::Uuid;
 
 use crate::orchestration_cli::{
-    CliBehavior, CliEffort, ConfigAction, HeartbeatAction, HostAction, PermitAction, ProfileAction,
-    ScheduleAction, ScriptAction, SkillAction, TerminalAction, WorkspaceAction, cmd_config,
-    cmd_heartbeat, cmd_host, cmd_inspect, cmd_permit, cmd_profile, cmd_schedule, cmd_script,
-    cmd_simple_agent_op, cmd_skill, cmd_terminal, cmd_wait, cmd_workspace, resolve_server_url,
+    AgentAction, CliBehavior, CliEffort, ConfigAction, HeartbeatAction, HostAction, PermitAction,
+    ProfileAction, ScheduleAction, ScriptAction, SkillAction, TerminalAction, WorkspaceAction,
+    cmd_agent, cmd_config, cmd_heartbeat, cmd_host, cmd_inspect, cmd_permit, cmd_profile,
+    cmd_schedule, cmd_script, cmd_simple_agent_op, cmd_skill, cmd_terminal, cmd_wait,
+    cmd_workspace, resolve_server_url,
 };
 use crate::service::{
     PortOwnership, RelayProbeOutcome, ServiceRole, check_local_health, default_daemon_listen,
@@ -398,6 +399,12 @@ enum Commands {
 
     /// Read timeline history of an agent from an Orbit Daemon.
     Logs { agent_id: String },
+
+    /// Agent conversation utilities (`orbit agent export <agent_id>`).
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
 
     /// Manage workspaces and isolated git worktrees.
     Workspace {
@@ -1454,6 +1461,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
+        Commands::Agent { action } => {
+            cmd_agent(&server, via_relay, action).await?;
+        }
         Commands::Workspace { action } => {
             cmd_workspace(&server, via_relay, json_mode, action).await?;
         }

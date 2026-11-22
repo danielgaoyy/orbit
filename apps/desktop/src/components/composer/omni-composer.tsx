@@ -568,6 +568,20 @@ export const OmniComposer = memo(function OmniComposer({
           orbitActions.showToast("Start an active session first to compact context");
         }
         break;
+      case "export":
+        if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
+          orbitActions.openExportDialog(selectedHostId, selectedAgentId);
+          return;
+        }
+        orbitActions.showToast("Start an active session first to export");
+        break;
+      case "copy":
+        if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
+          void orbitActions.openCopyCodeBlocksModal(selectedHostId, selectedAgentId);
+          return;
+        }
+        orbitActions.showToast("Start an active session first to copy");
+        break;
       case "orbit":
       case "orbit-handoff":
       case "orbit-committee":

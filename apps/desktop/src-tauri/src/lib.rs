@@ -45,8 +45,11 @@ use orbit_client_core::contract::{
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
     detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
-    open_external_url, open_in_external_editor, pick_local_directory, provision_relay_over_ssh,
-    resolve_user_home, upgrade_remote_daemon_over_ssh,
+    open_external_url, open_in_external_editor, pick_local_directory, pick_local_save_file,
+    provision_relay_over_ssh, resolve_user_home, upgrade_remote_daemon_over_ssh,
+};
+use orbit_client_core::export::{
+    ExportOptions, ExportedTranscript, ExtractedCodeBlock, write_file_atomically,
 };
 use orbit_client_core::render::{RichBlockView, parse_markdown_blocks};
 use orbit_client_core::sidebar::FleetSidebarView;
@@ -115,6 +118,62 @@ async fn search_messages(
     tauri::async_runtime::spawn_blocking(move || core.search_messages(&query, max_hits))
         .await
         .map_err(|e| format!("search messages task error: {e}"))
+}
+
+#[tauri::command]
+async fn export_agent_transcript(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    options: Option<ExportOptions>,
+) -> Result<ExportedTranscript, String> {
+    let core = Arc::clone(&state.core);
+    let opts = options.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        core.export_agent_transcript(&host_id, &agent_id, &opts)
+    })
+    .await
+    .map_err(|e| format!("export transcript task error: {e}"))?
+}
+
+#[tauri::command]
+async fn save_exported_transcript(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    options: Option<ExportOptions>,
+    initial_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    let core = Arc::clone(&state.core);
+    let opts = options.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let exported = core.export_agent_transcript(&host_id, &agent_id, &opts)?;
+        let Some(chosen) = pick_local_save_file(
+            &exported.suggested_filename,
+            opts.format.extension(),
+            initial_dir.as_deref(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let target_path = PathBuf::from(&chosen);
+        write_file_atomically(&target_path, exported.content.as_bytes())?;
+        Ok(Some(chosen))
+    })
+    .await
+    .map_err(|e| format!("save exported transcript task error: {e}"))?
+}
+
+#[tauri::command]
+async fn list_agent_code_blocks(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> Result<Vec<ExtractedCodeBlock>, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.list_agent_code_blocks(&host_id, &agent_id))
+        .await
+        .map_err(|e| format!("list code blocks task error: {e}"))?
 }
 
 #[tauri::command]
@@ -2180,6 +2239,9 @@ pub fn run() {
             list_external_editors,
             open_in_editor,
             pick_project_folder,
+            export_agent_transcript,
+            save_exported_transcript,
+            list_agent_code_blocks,
             get_workspace_files,
             read_workspace_file,
             ask_side_question,

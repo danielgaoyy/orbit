@@ -26,6 +26,7 @@ use orbit_client_core::diagram::{
     DiagramKind, detect_diagram_kind as core_detect_diagram_kind,
     render_diagram as core_render_diagram,
 };
+use orbit_client_core::export::ExportOptions;
 use orbit_client_core::sidebar::{SidebarProjectSort, SidebarThreadFilter};
 use orbit_client_core::stage::describe_tool_step;
 use orbit_protocol::{
@@ -261,6 +262,32 @@ impl OhosCoreFacade {
     pub fn search_messages_json(&self, query: &str, limit: Option<u32>) -> Result<String, String> {
         serde_json::to_string(&self.inner.search_messages(query, limit.unwrap_or(20)))
             .map_err(|e| e.to_string())
+    }
+
+    pub fn export_agent_transcript_json(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        options_json: &str,
+    ) -> Result<String, String> {
+        let opts: ExportOptions = if options_json.trim().is_empty() {
+            ExportOptions::default()
+        } else {
+            serde_json::from_str(options_json).map_err(|e| e.to_string())?
+        };
+        let exported = self
+            .inner
+            .export_agent_transcript(host_id, agent_id, &opts)?;
+        serde_json::to_string(&exported).map_err(|e| e.to_string())
+    }
+
+    pub fn list_agent_code_blocks_json(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<String, String> {
+        let blocks = self.inner.list_agent_code_blocks(host_id, agent_id)?;
+        serde_json::to_string(&blocks).map_err(|e| e.to_string())
     }
 
     pub fn fleet_sidebar_by_request_json(&self, req_json: &str) -> Result<String, String> {
@@ -1236,6 +1263,29 @@ mod ohos_napi {
         pub fn search_messages_json(&self, query: String, limit: Option<u32>) -> Result<String> {
             self.facade
                 .search_messages_json(&query, limit)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn export_agent_transcript_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+            options_json: String,
+        ) -> Result<String> {
+            self.facade
+                .export_agent_transcript_json(&host_id, &agent_id, &options_json)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn list_agent_code_blocks_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+        ) -> Result<String> {
+            self.facade
+                .list_agent_code_blocks_json(&host_id, &agent_id)
                 .map_err(Error::from_reason)
         }
 

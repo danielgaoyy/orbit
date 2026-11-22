@@ -57,6 +57,7 @@ import {
   type CloudSyncResultView,
   type CloudSyncStatusView,
   type ComposerContextInput,
+  type ContextOccupancyBreakdown,
   type CoreNotification,
   type MatchedPathRulesView,
   type PathRulesSnapshotView,
@@ -89,6 +90,7 @@ import {
   type SpawnWorkspacePeerRequest,
   type SshHostItem,
   type UpsertExternalMcpServerRequest,
+  type UsageInsightsSnapshot,
   type WorkspaceFileConflict,
   type WorktreeHandoffDirection,
   type WorktreeHandoffMode,
@@ -7073,6 +7075,17 @@ export const orbitActions = {
       if (lspServersSeqByKey.get(scopeKey) !== seq) return;
       notifyToast(`Restart failed: ${String(err)}`);
     }
+  },
+
+  async getUsageInsights(hostId: string, days = 7): Promise<UsageInsightsSnapshot> {
+    return orbitIpc.getUsageInsights(hostId, days);
+  },
+
+  async getContextOccupancy(
+    hostId: string,
+    agentId: string,
+  ): Promise<ContextOccupancyBreakdown> {
+    return orbitIpc.getContextOccupancy(hostId, agentId);
   },
 
   async loadFileDiagnostics(

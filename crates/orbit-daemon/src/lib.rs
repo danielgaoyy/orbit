@@ -28,6 +28,7 @@ pub mod skills;
 pub mod skills_manager;
 pub mod symbols;
 pub mod tools;
+pub mod usage;
 pub mod workspace_board;
 pub mod workspace_cluster;
 pub mod workspace_files;
@@ -4112,10 +4113,18 @@ async fn handle_wire_rpc(
 
         // Quotas & Provider Model Catalogs (spawned off-loop so slow CLI probes never block RPC or PTY!)
         WireMessage::RefreshQuotas { request_id } => {
+            let rt = Arc::clone(runtime);
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             tokio::spawn(async move {
                 let snapshots = probe_all_provider_quotas().await;
+                let samples = crate::usage::quota_snapshots_to_samples(&snapshots);
+                if !samples.is_empty() {
+                    let store = Arc::clone(&rt.store);
+                    let _ =
+                        tokio::task::spawn_blocking(move || store.record_quota_samples(&samples))
+                            .await;
+                }
                 let _ = tx
                     .send(SessionFrame::Wire {
                         msg: WireMessage::QuotaReport {
@@ -4125,6 +4134,63 @@ async fn handle_wire_rpc(
                         zstd,
                     })
                     .await;
+            });
+            None
+        }
+        WireMessage::GetUsageInsights { request_id, days } => {
+            let store = Arc::clone(&runtime.store);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::usage::build_usage_insights_snapshot(&store, days, chrono::Utc::now())
+                })
+                .await
+                {
+                    Ok(Ok(snapshot)) => WireMessage::UsageInsightsResponse {
+                        request_id,
+                        snapshot,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "usage_insights_failed", e),
+                    Err(e) => rpc_err(request_id, "usage_insights_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GetContextOccupancy {
+            request_id,
+            agent_id,
+        } => {
+            let store = Arc::clone(&runtime.store);
+            let orchestrator = Arc::clone(&runtime.orchestrator);
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let single_call_prompt = orchestrator
+                    .latest_single_call_prompt_tokens(&agent_id)
+                    .await;
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::usage::compute_context_occupancy(
+                        &store,
+                        &orbit_home,
+                        &user_home,
+                        &agent_id,
+                        single_call_prompt,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(breakdown)) => WireMessage::ContextOccupancyResponse {
+                        request_id,
+                        breakdown,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "context_occupancy_failed", e),
+                    Err(e) => rpc_err(request_id, "context_occupancy_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
             None
         }

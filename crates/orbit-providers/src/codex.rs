@@ -503,6 +503,7 @@ async fn run_codex_actor(
     let mut pending_approvals: HashMap<String, PendingCodexApproval> = HashMap::new();
     let mut pending_questions: HashMap<String, PendingCodexQuestion> = HashMap::new();
     let mut queued_prompts: VecDeque<(String, String)> = VecDeque::new();
+    let mut usage_tracker = CodexTurnUsageTracker::default();
 
     loop {
         tokio::select! {
@@ -714,6 +715,7 @@ async fn run_codex_actor(
                                 &mut msg_accum,
                                 &mut thought_accum,
                                 &mut file_change_cache,
+                                &mut usage_tracker,
                                 &evt_tx,
                             )
                             .await;
@@ -891,6 +893,165 @@ async fn dispatch_codex_turn(
     shim.write_stdin_line(req.to_string()).await.map_err(|_| ())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CodexUsageBreakdown {
+    /// Total prompt/input tokens reported by Codex (includes cached input tokens).
+    raw_input_tokens: u64,
+    /// Output tokens reported by Codex (already includes reasoning output tokens).
+    output_tokens: u64,
+    /// Cached portion of `raw_input_tokens`.
+    cache_read_tokens: u64,
+}
+
+impl CodexUsageBreakdown {
+    fn from_value(u: &Value) -> Option<Self> {
+        let raw_input_tokens = u
+            .get("inputTokens")
+            .or_else(|| u.get("input_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let output_tokens = u
+            .get("outputTokens")
+            .or_else(|| u.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_read_tokens = u
+            .get("cachedInputTokens")
+            .or_else(|| u.get("cached_input_tokens"))
+            .or_else(|| u.get("cache_read_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if raw_input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 {
+            return None;
+        }
+        Some(Self {
+            raw_input_tokens,
+            output_tokens,
+            cache_read_tokens,
+        })
+    }
+
+    fn is_non_zero(self) -> bool {
+        self.raw_input_tokens > 0 || self.output_tokens > 0 || self.cache_read_tokens > 0
+    }
+
+    fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            raw_input_tokens: self.raw_input_tokens.saturating_add(rhs.raw_input_tokens),
+            output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_add(rhs.cache_read_tokens),
+        }
+    }
+
+    fn delta_since(self, prev: Self) -> Self {
+        if self.raw_input_tokens < prev.raw_input_tokens || self.output_tokens < prev.output_tokens
+        {
+            return self;
+        }
+        Self {
+            raw_input_tokens: self.raw_input_tokens.saturating_sub(prev.raw_input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(prev.output_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_sub(prev.cache_read_tokens),
+        }
+    }
+
+    fn uncached_input_tokens(self) -> u64 {
+        self.raw_input_tokens.saturating_sub(self.cache_read_tokens)
+    }
+}
+
+/// Tracks Codex per-turn token usage across multi-step tool loops so exactly one
+/// `DriverEvent::TurnUsage` is emitted per completed turn with accurate turn delta
+/// and instantaneous single-call prompt occupancy.
+#[derive(Debug, Default)]
+struct CodexTurnUsageTracker {
+    prev_total: Option<CodexUsageBreakdown>,
+    latest_total: Option<CodexUsageBreakdown>,
+    accum_last: CodexUsageBreakdown,
+    last_call_prompt_tokens: Option<u64>,
+    model: Option<String>,
+}
+
+impl CodexTurnUsageTracker {
+    fn on_token_usage_updated(&mut self, params: &Value) {
+        if let Some(m) = params
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        {
+            self.model = Some(m.to_string());
+        }
+        let total = params
+            .pointer("/tokenUsage/total")
+            .or_else(|| params.pointer("/token_usage/total"))
+            .or_else(|| params.get("total"))
+            .and_then(CodexUsageBreakdown::from_value);
+        let last = params
+            .pointer("/tokenUsage/last")
+            .or_else(|| params.pointer("/token_usage/last"))
+            .or_else(|| params.get("last"))
+            .and_then(CodexUsageBreakdown::from_value);
+
+        if let Some(l) = last {
+            if l.raw_input_tokens > 0 {
+                self.last_call_prompt_tokens = Some(l.raw_input_tokens);
+            }
+            if total.is_none() {
+                self.accum_last = self.accum_last.saturating_add(l);
+            }
+        }
+        if let Some(t) = total {
+            self.latest_total = Some(t);
+        }
+    }
+
+    fn finalize_turn(&mut self, params: &Value) -> Option<DriverEvent> {
+        let completed_usage = params
+            .pointer("/turn/usage")
+            .or_else(|| params.get("usage"))
+            .and_then(CodexUsageBreakdown::from_value);
+        let model = params
+            .pointer("/turn/model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| self.model.take());
+
+        let latest_total = self.latest_total.take();
+        let accum_last = std::mem::take(&mut self.accum_last);
+        let last_call_prompt_tokens = self.last_call_prompt_tokens.take();
+
+        let breakdown = if let Some(u) = completed_usage {
+            if let Some(t) = latest_total {
+                self.prev_total = Some(t);
+            }
+            Some(u)
+        } else if let Some(t) = latest_total {
+            let delta = match self.prev_total {
+                Some(prev) => t.delta_since(prev),
+                None => t,
+            };
+            self.prev_total = Some(t);
+            delta.is_non_zero().then_some(delta)
+        } else if accum_last.is_non_zero() {
+            Some(accum_last)
+        } else {
+            None
+        }?;
+
+        Some(DriverEvent::TurnUsage {
+            input_tokens: breakdown.uncached_input_tokens(),
+            output_tokens: breakdown.output_tokens,
+            cache_read_tokens: breakdown.cache_read_tokens,
+            cache_write_tokens: 0,
+            last_call_prompt_tokens,
+            model,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_codex_notification(
     parent_agent_id: &str,
@@ -901,6 +1062,7 @@ async fn handle_codex_notification(
     msg_accum: &mut HashMap<String, String>,
     thought_accum: &mut HashMap<String, String>,
     file_change_cache: &mut HashMap<String, ToolCallDetail>,
+    usage_tracker: &mut CodexTurnUsageTracker,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) -> bool {
     match method {
@@ -1172,9 +1334,15 @@ async fn handle_codex_notification(
                 _ => {}
             }
         }
+        "thread/tokenUsage/updated" => {
+            usage_tracker.on_token_usage_updated(params);
+        }
         "turn/completed" => {
             *native_turn_id = None;
             *client_turn_id = None;
+            if let Some(usage_evt) = usage_tracker.finalize_turn(params) {
+                let _ = evt_tx.send(usage_evt).await;
+            }
             let status_str = params
                 .pointer("/turn/status")
                 .and_then(|v| v.as_str())
@@ -2633,5 +2801,85 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn codex_turn_usage_tracker_emits_once_per_turn_without_reasoning_double_count() {
+        let mut tracker = CodexTurnUsageTracker::default();
+
+        // Turn 1: 3 tool-call steps. `outputTokens` ALREADY includes `reasoningOutputTokens`.
+        // `tokenUsage.total` is cumulative across the thread; `tokenUsage.last` is the single call.
+        tracker.on_token_usage_updated(&json!({
+            "model": "gpt-5.4",
+            "tokenUsage": {
+                "last": { "inputTokens": 20000, "cachedInputTokens": 12000, "outputTokens": 800, "reasoningOutputTokens": 500 },
+                "total": { "inputTokens": 20000, "cachedInputTokens": 12000, "outputTokens": 800, "reasoningOutputTokens": 500 }
+            }
+        }));
+        tracker.on_token_usage_updated(&json!({
+            "tokenUsage": {
+                "last": { "inputTokens": 28000, "cachedInputTokens": 20000, "outputTokens": 1100, "reasoningOutputTokens": 700 },
+                "total": { "inputTokens": 48000, "cachedInputTokens": 32000, "outputTokens": 1900, "reasoningOutputTokens": 1200 }
+            }
+        }));
+        tracker.on_token_usage_updated(&json!({
+            "tokenUsage": {
+                "last": { "inputTokens": 35000, "cachedInputTokens": 30000, "outputTokens": 900, "reasoningOutputTokens": 400 },
+                "total": { "inputTokens": 83000, "cachedInputTokens": 62000, "outputTokens": 2800, "reasoningOutputTokens": 1600 }
+            }
+        }));
+
+        // Emit once on `turn/completed` (without inline turn.usage -> uses total delta)
+        let ev1 = tracker
+            .finalize_turn(&json!({ "turn": { "status": "completed" } }))
+            .expect("turn 1 usage");
+        match ev1 {
+            DriverEvent::TurnUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                last_call_prompt_tokens,
+                model,
+            } => {
+                // Uncached input = 83000 - 62000 = 21000
+                assert_eq!(input_tokens, 21_000);
+                // Output is 2800 (NOT 2800 + 1600!)
+                assert_eq!(output_tokens, 2_800);
+                assert_eq!(cache_read_tokens, 62_000);
+                assert_eq!(cache_write_tokens, 0);
+                // Instantaneous single-call prompt occupancy is 35000 (NOT 83000!)
+                assert_eq!(last_call_prompt_tokens, Some(35_000));
+                assert_eq!(model.as_deref(), Some("gpt-5.4"));
+            }
+            other => panic!("expected TurnUsage, got {other:?}"),
+        }
+
+        // Turn 2: `total` continues growing cumulatively; tracker must emit ONLY the delta for Turn 2.
+        tracker.on_token_usage_updated(&json!({
+            "tokenUsage": {
+                "last": { "inputTokens": 42000, "cachedInputTokens": 36000, "outputTokens": 600, "reasoningOutputTokens": 200 },
+                "total": { "inputTokens": 125000, "cachedInputTokens": 98000, "outputTokens": 3400, "reasoningOutputTokens": 1800 }
+            }
+        }));
+        let ev2 = tracker
+            .finalize_turn(&json!({ "turn": { "status": "completed" } }))
+            .expect("turn 2 usage");
+        match ev2 {
+            DriverEvent::TurnUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                last_call_prompt_tokens,
+                ..
+            } => {
+                // Delta total input = 125000 - 83000 = 42000; delta cache = 98000 - 62000 = 36000; uncached = 6000
+                assert_eq!(input_tokens, 6_000);
+                assert_eq!(output_tokens, 600);
+                assert_eq!(cache_read_tokens, 36_000);
+                assert_eq!(last_call_prompt_tokens, Some(42_000));
+            }
+            other => panic!("expected TurnUsage, got {other:?}"),
+        }
     }
 }

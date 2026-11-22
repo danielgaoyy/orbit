@@ -10,6 +10,7 @@ pub mod media;
 pub mod orchestration;
 pub mod rules;
 pub mod skills;
+pub mod usage;
 pub use acp::*;
 pub use artifacts::*;
 pub use handoff::*;
@@ -20,6 +21,7 @@ pub use media::*;
 pub use orchestration::*;
 pub use rules::*;
 pub use skills::*;
+pub use usage::*;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -39,6 +41,10 @@ fn wire_default_symbol_limit() -> u32 {
 
 fn wire_default_lsp_limit() -> u32 {
     50
+}
+
+fn wire_default_usage_days() -> u32 {
+    7
 }
 
 /// First-class supported coding agent CLIs in Orbit (native drivers + Universal ACP).
@@ -2214,6 +2220,25 @@ pub enum WireMessage {
         server_id: String,
     },
 
+    // Usage Insights, Cost Ledger & Context Occupancy Telemetry
+    GetUsageInsights {
+        request_id: Uuid,
+        #[serde(default = "wire_default_usage_days")]
+        days: u32,
+    },
+    UsageInsightsResponse {
+        request_id: Uuid,
+        snapshot: UsageInsightsSnapshot,
+    },
+    GetContextOccupancy {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    ContextOccupancyResponse {
+        request_id: Uuid,
+        breakdown: ContextOccupancyBreakdown,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -3474,6 +3499,104 @@ mod tests {
         for msg in messages {
             let encoded = msg.encode_zstd(3).expect("encode external mcp wire msg");
             let decoded = WireMessage::decode_zstd(&encoded).expect("decode external mcp wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn usage_insights_and_context_occupancy_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let messages = vec![
+            WireMessage::GetUsageInsights {
+                request_id: req_id,
+                days: 30,
+            },
+            WireMessage::UsageInsightsResponse {
+                request_id: req_id,
+                snapshot: UsageInsightsSnapshot {
+                    days: 30,
+                    total_cost_usd: 12.45,
+                    total_cache_savings_usd: 4.18,
+                    total_input_tokens: 1_250_000,
+                    total_output_tokens: 185_000,
+                    total_cache_read_tokens: 920_000,
+                    total_turns: 42,
+                    daily: vec![UsageDailyPoint {
+                        date: "2026-11-22".into(),
+                        input_tokens: 120_000,
+                        output_tokens: 24_000,
+                        cache_read_tokens: 80_000,
+                        cost_usd: 1.42,
+                        turns: 5,
+                    }],
+                    by_model: vec![UsageModelBreakdown {
+                        provider: "claude_code".into(),
+                        model: "claude-sonnet-4-5".into(),
+                        input_tokens: 800_000,
+                        output_tokens: 120_000,
+                        cache_read_tokens: 600_000,
+                        cost_usd: 4.38,
+                        turns: 25,
+                    }],
+                    by_project: vec![UsageProjectBreakdown {
+                        workspace_cwd: "/workspace/orbit".into(),
+                        cost_usd: 12.45,
+                        total_tokens: 2_355_000,
+                        turns: 42,
+                    }],
+                    forecasts: vec![QuotaDepletionForecast {
+                        provider: "claude_code".into(),
+                        window_label: "5h window".into(),
+                        remaining_percent: 42.0,
+                        burn_rate_pct_per_hour: 12.5,
+                        estimated_depletion_secs: Some(12_096),
+                        resets_in_secs: Some(14_400),
+                        likely_to_exhaust_before_reset: true,
+                    }],
+                },
+            },
+            WireMessage::GetContextOccupancy {
+                request_id: req_id,
+                agent_id: "ag_ctx".into(),
+            },
+            WireMessage::ContextOccupancyResponse {
+                request_id: req_id,
+                breakdown: ContextOccupancyBreakdown {
+                    agent_id: "ag_ctx".into(),
+                    model: "claude-opus-4-6".into(),
+                    context_window_tokens: 200_000,
+                    total_used_tokens: 68_000,
+                    occupancy_percent: 34.0,
+                    segments: vec![
+                        ContextSegment {
+                            category: "instructions".into(),
+                            label: "Instructions".into(),
+                            tokens: 4_000,
+                            percent: 2.0,
+                        },
+                        ContextSegment {
+                            category: "history".into(),
+                            label: "History".into(),
+                            tokens: 64_000,
+                            percent: 32.0,
+                        },
+                        ContextSegment {
+                            category: "free".into(),
+                            label: "Free".into(),
+                            tokens: 132_000,
+                            percent: 66.0,
+                        },
+                    ],
+                },
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode usage wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode usage wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

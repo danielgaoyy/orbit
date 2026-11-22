@@ -29,6 +29,7 @@ import {
   normalizePermissionMode,
 } from "@/components/composer/composer-constants";
 import { ComposerFastToggle } from "@/components/composer/composer-fast-toggle";
+import { ContextOccupancyPill } from "@/components/composer/context-occupancy-pill";
 import { ComposerHeroHeader } from "@/components/composer/composer-hero-header";
 import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
 import { ComposerModelPicker } from "@/components/composer/composer-model-picker";
@@ -1578,8 +1579,9 @@ export const OmniComposer = memo(function OmniComposer({
                 <ComposerFastToggle iconOnly={isCompactBar} />
               </div>
 
-              {/* Right Cluster: Isolated Access Permissions Selector + `34×34` Primary Action Circle */}
+              {/* Right Cluster: Context Occupancy Pill + Access Permissions Selector + `34×34` Primary Action Circle */}
               <div className="flex shrink-0 items-center gap-1.5">
+                <ContextOccupancyPill compact={isCompactBar} />
                 <ComposerModePicker
                   mode={activeMode}
                   onSelectMode={handleSelectMode}

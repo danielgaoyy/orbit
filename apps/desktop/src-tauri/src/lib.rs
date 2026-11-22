@@ -69,12 +69,12 @@ use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
-    ArtifactDetail, ArtifactSummary, ExternalMcpServerRecord, LspDiagnostic, LspLocation,
-    LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, OrchestrationConfig,
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort,
-    ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope, WorkspaceBoardSnapshot,
-    WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome,
-    WorktreeHandoffPreview,
+    ArtifactDetail, ArtifactSummary, ContextOccupancyBreakdown, ExternalMcpServerRecord,
+    LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult,
+    OrchestrationConfig, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
+    ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope,
+    UsageInsightsSnapshot, WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation,
+    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -2044,6 +2044,30 @@ async fn restart_lsp_server(
 }
 
 #[tauri::command]
+async fn get_usage_insights(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    days: Option<u32>,
+) -> Result<UsageInsightsSnapshot, String> {
+    state
+        .core
+        .get_usage_insights_on_host(&host_id, days.unwrap_or(7))
+        .await
+}
+
+#[tauri::command]
+async fn get_context_occupancy(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> Result<ContextOccupancyBreakdown, String> {
+    state
+        .core
+        .get_context_occupancy_on_host(&host_id, &agent_id)
+        .await
+}
+
+#[tauri::command]
 async fn highlight_workspace_code(
     language: String,
     content: String,
@@ -2911,6 +2935,8 @@ pub fn run() {
             lsp_get_diagnostics,
             lsp_goto_definition,
             restart_lsp_server,
+            get_usage_insights,
+            get_context_occupancy,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

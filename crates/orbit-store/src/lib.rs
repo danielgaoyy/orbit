@@ -5,6 +5,7 @@
 pub mod artifacts;
 pub mod orchestration;
 pub mod search;
+pub mod usage;
 pub mod workspace_sync;
 pub use artifacts::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ID_LEN, MAX_ARTIFACT_REVISIONS, UpsertArtifactInput,
@@ -12,6 +13,7 @@ pub use artifacts::{
 };
 pub use orchestration::*;
 pub use search::{FtsBackfillProgress, MessageSearchHit, build_fts5_match_query};
+pub use usage::{QUOTA_SAMPLES_RETENTION_MS, QuotaSampleRecord, USAGE_LEDGER_RETENTION_MS};
 pub use workspace_sync::{AgentContextSnippet, SemanticIdentityOptions};
 
 use std::collections::{HashMap, HashSet};
@@ -438,6 +440,7 @@ impl OrbitStore {
             ensure_table_column(&conn, table, col, col_type)?;
         }
         artifacts::migrate_artifacts_schema(&conn)?;
+        usage::migrate_usage_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

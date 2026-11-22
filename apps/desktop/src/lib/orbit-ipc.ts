@@ -1967,6 +1967,72 @@ export interface ComposedPromptView {
   is_empty: boolean;
 }
 
+export interface UsageDailyPoint {
+  date: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  turns: number;
+}
+
+export interface UsageModelBreakdown {
+  provider: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  turns: number;
+}
+
+export interface UsageProjectBreakdown {
+  workspace_cwd: string;
+  cost_usd: number;
+  total_tokens: number;
+  turns: number;
+}
+
+export interface QuotaDepletionForecast {
+  provider: string;
+  window_label: string;
+  remaining_percent: number;
+  burn_rate_pct_per_hour: number;
+  estimated_depletion_secs?: number | null;
+  resets_in_secs?: number | null;
+  likely_to_exhaust_before_reset: boolean;
+}
+
+export interface ContextSegment {
+  category: string;
+  label: string;
+  tokens: number;
+  percent: number;
+}
+
+export interface ContextOccupancyBreakdown {
+  agent_id: string;
+  model: string;
+  context_window_tokens: number;
+  total_used_tokens: number;
+  occupancy_percent: number;
+  segments: ContextSegment[];
+}
+
+export interface UsageInsightsSnapshot {
+  days: number;
+  total_cost_usd: number;
+  total_cache_savings_usd: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  total_turns: number;
+  daily: UsageDailyPoint[];
+  by_model: UsageModelBreakdown[];
+  by_project: UsageProjectBreakdown[];
+  forecasts: QuotaDepletionForecast[];
+}
+
 export interface WorkspaceSymbolEntry {
   name: string;
   kind: string;
@@ -4238,6 +4304,58 @@ export const orbitIpc = {
   ): Promise<ExtractedCodeBlock[]> => {
     if (!isTauriRuntime()) return [];
     return invoke<ExtractedCodeBlock[]>("list_agent_code_blocks", {
+      hostId,
+      agentId,
+    });
+  },
+
+  getUsageInsights: async (
+    hostId: string,
+    days = 7,
+  ): Promise<UsageInsightsSnapshot> => {
+    if (!isTauriRuntime()) {
+      return {
+        days,
+        total_cost_usd: 0,
+        total_cache_savings_usd: 0,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cache_read_tokens: 0,
+        total_turns: 0,
+        daily: [],
+        by_model: [],
+        by_project: [],
+        forecasts: [],
+      };
+    }
+    return invoke<UsageInsightsSnapshot>("get_usage_insights", {
+      hostId,
+      days,
+    });
+  },
+
+  getContextOccupancy: async (
+    hostId: string,
+    agentId: string,
+  ): Promise<ContextOccupancyBreakdown> => {
+    if (!isTauriRuntime()) {
+      return {
+        agent_id: agentId,
+        model: "default",
+        context_window_tokens: 200_000,
+        total_used_tokens: 0,
+        occupancy_percent: 0,
+        segments: [
+          {
+            category: "free",
+            label: "Free",
+            tokens: 200_000,
+            percent: 100,
+          },
+        ],
+      };
+    }
+    return invoke<ContextOccupancyBreakdown>("get_context_occupancy", {
       hostId,
       agentId,
     });

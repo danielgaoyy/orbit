@@ -154,6 +154,17 @@ pub enum DriverEvent {
     /// Settle stale historical `Running` background-task tool calls in place without appending
     /// out-of-order cards to the latest turn.
     ReconcileBackgroundTasks(Vec<(String, ToolCallStatus)>),
+    /// Provider-reported token telemetry for a completed turn.
+    TurnUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        /// Instantaneous prompt token count of the most recent single LLM API call in the turn
+        /// (distinct from cumulative multi-step turn sums).
+        last_call_prompt_tokens: Option<u64>,
+        model: Option<String>,
+    },
     Exited {
         code: Option<i32>,
     },

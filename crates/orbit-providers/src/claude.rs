@@ -640,6 +640,7 @@ async fn run_claude_actor(
     let mut active_msg_id: String = "claude_msg_0".into();
     let mut streamed_blocks: HashMap<u64, (String, String)> = HashMap::new(); // index -> (kind, accum)
     let mut emitted_text_in_turn = false;
+    let mut last_call_prompt_tokens: Option<u64> = None;
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingClaudePerm> = HashMap::new();
     let mut queued_prompts: VecDeque<(String, String)> = VecDeque::new();
@@ -724,6 +725,7 @@ async fn run_claude_actor(
                         active_turn_id = Some(turn_id.clone());
                         streamed_blocks.clear();
                         emitted_text_in_turn = false;
+                        last_call_prompt_tokens = None;
                         let _ = evt_tx
                             .send(DriverEvent::StatusChanged(AgentStatus::Running {
                                 turn_id: turn_id.clone(),
@@ -1296,6 +1298,9 @@ async fn run_claude_actor(
                                     }
                                     continue;
                                 }
+                                if let Some(call_prompt) = extract_claude_message_prompt_tokens(&val) {
+                                    last_call_prompt_tokens = Some(call_prompt);
+                                }
                                 let mid = val
                                     .pointer("/message/id")
                                     .and_then(|v| v.as_str())
@@ -1486,6 +1491,42 @@ async fn run_claude_actor(
                             }
                             "result" => {
                                 active_turn_id = None;
+                                let single_call_prompt = last_call_prompt_tokens.take();
+                                if let Some(usage) = val.get("usage") {
+                                    let input_tokens = usage
+                                        .get("input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let output_tokens = usage
+                                        .get("output_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let cache_read_tokens = usage
+                                        .get("cache_read_input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let cache_write_tokens = usage
+                                        .get("cache_creation_input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    if input_tokens > 0
+                                        || output_tokens > 0
+                                        || cache_read_tokens > 0
+                                        || cache_write_tokens > 0
+                                    {
+                                        let reported_model = select_dominant_claude_model(&val);
+                                        let _ = evt_tx
+                                            .send(DriverEvent::TurnUsage {
+                                                input_tokens,
+                                                output_tokens,
+                                                cache_read_tokens,
+                                                cache_write_tokens,
+                                                last_call_prompt_tokens: single_call_prompt,
+                                                model: reported_model,
+                                            })
+                                            .await;
+                                    }
+                                }
                                 let is_err = val
                                     .get("is_error")
                                     .and_then(|v| v.as_bool())
@@ -1537,6 +1578,7 @@ async fn run_claude_actor(
                                     active_turn_id = Some(next_tid.clone());
                                     streamed_blocks.clear();
                                     emitted_text_in_turn = false;
+                                    last_call_prompt_tokens = None;
                                     let _ = evt_tx
                                         .send(DriverEvent::StatusChanged(AgentStatus::Running {
                                             turn_id: next_tid,
@@ -1574,6 +1616,71 @@ async fn run_claude_actor(
             }
         }
     }
+}
+
+/// Extract instantaneous single-call prompt token count from a top-level Claude `"assistant"` event.
+fn extract_claude_message_prompt_tokens(val: &Value) -> Option<u64> {
+    let usage = val.pointer("/message/usage")?;
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_write = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total = input.saturating_add(cache_read).saturating_add(cache_write);
+    (total > 0).then_some(total)
+}
+
+/// Select the dominant model from Claude Code's `result.modelUsage` map by highest total token volume
+/// (never alphabetical key order, so an Opus turn with a small Haiku helper is priced as Opus).
+fn select_dominant_claude_model(val: &Value) -> Option<String> {
+    if let Some(map) = val.get("modelUsage").and_then(|v| v.as_object()) {
+        let best = map
+            .iter()
+            .filter(|(k, _)| !k.trim().is_empty())
+            .max_by(|(k_a, v_a), (k_b, v_b)| {
+                let total = |v: &Value| -> u64 {
+                    let inp = v
+                        .get("inputTokens")
+                        .or_else(|| v.get("input_tokens"))
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    let out = v
+                        .get("outputTokens")
+                        .or_else(|| v.get("output_tokens"))
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    let cr = v
+                        .get("cacheReadInputTokens")
+                        .or_else(|| v.get("cache_read_input_tokens"))
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    let cw = v
+                        .get("cacheCreationInputTokens")
+                        .or_else(|| v.get("cache_creation_input_tokens"))
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    inp.saturating_add(out)
+                        .saturating_add(cr)
+                        .saturating_add(cw)
+                };
+                total(v_a).cmp(&total(v_b)).then_with(|| k_a.cmp(k_b))
+            })
+            .map(|(k, _)| k.clone());
+        if best.is_some() {
+            return best;
+        }
+    }
+    val.get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn wait_claude_init_response(
@@ -2947,5 +3054,47 @@ mod tests {
                 payload: TimelinePayload::AssistantMessage { text, .. }
             } if subagent_id == "sub_pre_restart_99" && text.contains("Review complete")
         ));
+    }
+
+    #[test]
+    fn select_dominant_claude_model_picks_highest_token_volume_not_alphabetical() {
+        // "claude-haiku-4-5" sorts alphabetically before "claude-opus-4-6",
+        // but Opus dominates token volume and must be chosen for pricing.
+        let result_val = json!({
+            "type": "result",
+            "modelUsage": {
+                "claude-haiku-4-5": {
+                    "inputTokens": 400,
+                    "outputTokens": 120,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 0
+                },
+                "claude-opus-4-6": {
+                    "inputTokens": 12000,
+                    "outputTokens": 3500,
+                    "cacheReadInputTokens": 45000,
+                    "cacheCreationInputTokens": 2000
+                }
+            }
+        });
+        assert_eq!(
+            select_dominant_claude_model(&result_val).as_deref(),
+            Some("claude-opus-4-6")
+        );
+
+        let assistant_ev = json!({
+            "type": "assistant",
+            "message": {
+                "usage": {
+                    "input_tokens": 1200,
+                    "cache_read_input_tokens": 38000,
+                    "cache_creation_input_tokens": 800
+                }
+            }
+        });
+        assert_eq!(
+            extract_claude_message_prompt_tokens(&assistant_ev),
+            Some(40_000)
+        );
     }
 }

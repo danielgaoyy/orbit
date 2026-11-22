@@ -568,7 +568,9 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::LspServersSnapshot { request_id, .. }
         | WireMessage::LspSymbolsResponse { request_id, .. }
         | WireMessage::LspDiagnosticsResponse { request_id, .. }
-        | WireMessage::LspLocationsResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::LspLocationsResponse { request_id, .. }
+        | WireMessage::UsageInsightsResponse { request_id, .. }
+        | WireMessage::ContextOccupancyResponse { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

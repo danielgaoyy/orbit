@@ -227,6 +227,12 @@ pub struct AgentOrchestrator {
     /// Agents whose next idle transition was caused by explicit interrupt or flush-now,
     /// suppressing automatic queue drain for that transition.
     suppress_auto_drain: RwLock<std::collections::HashSet<String>>,
+    /// Agents that already persisted provider-reported `DriverEvent::TurnUsage` for the active turn,
+    /// avoiding double-counting when the turn settles to `Idle`.
+    turn_usage_recorded: RwLock<std::collections::HashSet<String>>,
+    /// Most recent provider-reported instantaneous single-call prompt token count `(tokens, recorded_at_ms)`
+    /// per `agent_id` for accurate context occupancy without multi-step turn-sum inflation.
+    last_call_prompt_occupancy: RwLock<HashMap<String, (u64, i64)>>,
     /// In-flight AI organizer / summarizer locks keyed by `sum:<agent_id>` or `org:<project_root>`.
     /// Uses a synchronous `std::sync::Mutex` (never held across `.await`) so RAII `OrganizerLockGuard`
     /// always releases the lock and marks `keep_awake` idle on cancellation or panic.
@@ -295,6 +301,8 @@ impl AgentOrchestrator {
             roster_fingerprints: RwLock::new(HashMap::new()),
             conflict_cooldowns: RwLock::new(HashMap::new()),
             suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
+            turn_usage_recorded: RwLock::new(std::collections::HashSet::new()),
+            last_call_prompt_occupancy: RwLock::new(HashMap::new()),
             organizing_locks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             auto_name_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             broadcast_tx,
@@ -4595,6 +4603,67 @@ impl AgentOrchestrator {
                 }
                 return;
             }
+            DriverEvent::TurnUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                last_call_prompt_tokens,
+                model,
+            } => {
+                let recorded_at_ms = Utc::now().timestamp_millis();
+                self.turn_usage_recorded
+                    .write()
+                    .await
+                    .insert(agent_id.to_string());
+                if let Some(prompt_toks) = last_call_prompt_tokens
+                    && prompt_toks > 0
+                {
+                    self.last_call_prompt_occupancy
+                        .write()
+                        .await
+                        .insert(agent_id.to_string(), (prompt_toks, recorded_at_ms));
+                }
+                let store_bg = Arc::clone(&self.store);
+                let aid_bg = agent_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(Some(ag)) = store_bg.get_agent(&aid_bg) {
+                        let provider_slug = ag.provider.slug().to_string();
+                        let effective_model = model
+                            .as_deref()
+                            .filter(|m| !m.trim().is_empty())
+                            .or(ag.model.as_deref())
+                            .filter(|m| !m.trim().is_empty())
+                            .unwrap_or(&provider_slug)
+                            .to_string();
+                        let (estimated_cost_usd, cache_savings_usd) =
+                            crate::usage::estimate_turn_cost_usd(
+                                &provider_slug,
+                                &effective_model,
+                                input_tokens,
+                                output_tokens,
+                                cache_read_tokens,
+                                cache_write_tokens,
+                            );
+                        let entry = orbit_protocol::UsageLedgerEntry {
+                            id: format!("ul_{}", Uuid::new_v4().simple()),
+                            agent_id: aid_bg,
+                            workspace_cwd: ag.cwd,
+                            provider: provider_slug,
+                            model: effective_model,
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            cache_write_tokens,
+                            estimated_cost_usd,
+                            cache_savings_usd,
+                            recorded_at_ms,
+                        };
+                        let _ = store_bg.record_usage_entry(&entry);
+                    }
+                });
+                return;
+            }
             _ => {}
         }
 
@@ -4659,6 +4728,7 @@ impl AgentOrchestrator {
                         recoverable,
                     } => {
                         self.suppress_auto_drain.write().await.remove(agent_id);
+                        self.turn_usage_recorded.write().await.remove(agent_id);
                         tracing::warn!(
                             agent_id = %agent_id,
                             recoverable,
@@ -4682,6 +4752,7 @@ impl AgentOrchestrator {
                     }
                     AgentStatus::Running { .. } => {
                         self.suppress_auto_drain.write().await.remove(agent_id);
+                        self.turn_usage_recorded.write().await.remove(agent_id);
                         let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                     }
                     _ => {}
@@ -4821,6 +4892,7 @@ impl AgentOrchestrator {
                     );
                 }
                 self.clear_pending_requests(agent_id).await;
+                self.turn_usage_recorded.write().await.remove(agent_id);
                 self.keep_awake
                     .notify_agent_status(agent_id, &AgentStatus::Closed);
                 should_check_auto_archive = true;
@@ -4831,7 +4903,8 @@ impl AgentOrchestrator {
             DriverEvent::SessionInitialized { .. }
             | DriverEvent::ProviderSubagentUpsert(_)
             | DriverEvent::ProviderSubagentTimeline { .. }
-            | DriverEvent::ReconcileBackgroundTasks(_) => unreachable!(),
+            | DriverEvent::ReconcileBackgroundTasks(_)
+            | DriverEvent::TurnUsage { .. } => unreachable!(),
         };
 
         let is_status_change = matches!(payload, TimelinePayload::StatusChanged { .. });
@@ -4876,6 +4949,53 @@ impl AgentOrchestrator {
             let ag_needs_auto_naming = completed_running_turn
                 && !ag_is_subagent
                 && !crate::workspace_organizer::is_auto_named(&ag.labels);
+            if completed_running_turn {
+                let already_recorded = self.turn_usage_recorded.write().await.remove(agent_id);
+                if !already_recorded {
+                    let store_bg = Arc::clone(&self.store);
+                    let aid_bg = agent_id.to_string();
+                    let cwd_bg = ag.cwd.clone();
+                    let provider_slug = ag.provider.slug().to_string();
+                    let effective_model = ag
+                        .model
+                        .as_deref()
+                        .filter(|m| !m.trim().is_empty())
+                        .unwrap_or(&provider_slug)
+                        .to_string();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(events) = store_bg.fetch_recent_timeline(&aid_bg, 400) {
+                            let (input_tokens, output_tokens) =
+                                crate::usage::estimate_fallback_turn_tokens(&events);
+                            if input_tokens > 0 || output_tokens > 0 {
+                                let (estimated_cost_usd, cache_savings_usd) =
+                                    crate::usage::estimate_turn_cost_usd(
+                                        &provider_slug,
+                                        &effective_model,
+                                        input_tokens,
+                                        output_tokens,
+                                        0,
+                                        0,
+                                    );
+                                let entry = orbit_protocol::UsageLedgerEntry {
+                                    id: format!("ul_{}", Uuid::new_v4().simple()),
+                                    agent_id: aid_bg,
+                                    workspace_cwd: cwd_bg,
+                                    provider: provider_slug,
+                                    model: effective_model,
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_read_tokens: 0,
+                                    cache_write_tokens: 0,
+                                    estimated_cost_usd,
+                                    cache_savings_usd,
+                                    recorded_at_ms: Utc::now().timestamp_millis(),
+                                };
+                                let _ = store_bg.record_usage_entry(&entry);
+                            }
+                        }
+                    });
+                }
+            }
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
 
             if finished_idle && !ag_bg {
@@ -4979,6 +5099,16 @@ impl AgentOrchestrator {
     }
 
     // --- Detached PTY Terminals ---
+
+    /// Return the latest provider-reported single-call prompt token count `(tokens, recorded_at_ms)`
+    /// observed in-memory for `agent_id`, if available.
+    pub async fn latest_single_call_prompt_tokens(&self, agent_id: &str) -> Option<(u64, i64)> {
+        self.last_call_prompt_occupancy
+            .read()
+            .await
+            .get(agent_id)
+            .copied()
+    }
 
     pub async fn list_live_terminals(&self) -> Vec<TerminalSummary> {
         let mut live: Vec<TerminalSummary> = self

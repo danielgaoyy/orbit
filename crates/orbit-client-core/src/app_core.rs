@@ -16,18 +16,19 @@ use orbit_crypto::PairingOffer;
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
-    BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject,
-    ExternalMcpServerRecord, GitStatusSnapshot, HostProjectEntry, HostSyncState, KeepAwakeStatus,
-    LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult,
-    ModelOption, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
-    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
+    BackgroundTaskInfo, ConnectedHostSummary, ContextOccupancyBreakdown, DirectoryEntry,
+    DiscoveredProject, ExternalMcpServerRecord, GitStatusSnapshot, HostProjectEntry, HostSyncState,
+    KeepAwakeStatus, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    ManagedSkillRecord, McpProbeResult, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
+    PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
     QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord,
     ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame,
-    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage,
-    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
-    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
-    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
+    UsageInsightsSnapshot, WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
+    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
+    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome,
+    WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -677,6 +678,10 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspDiagnostic>, String>>>,
     pending_lsp_locations:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspLocation>, String>>>,
+    pending_usage_insights:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<UsageInsightsSnapshot, String>>>,
+    pending_context_occupancy:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ContextOccupancyBreakdown, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -794,6 +799,8 @@ impl HostMemoryState {
             pending_lsp_symbols: HashMap::new(),
             pending_lsp_diagnostics: HashMap::new(),
             pending_lsp_locations: HashMap::new(),
+            pending_usage_insights: HashMap::new(),
+            pending_context_occupancy: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -5155,6 +5162,22 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(locations));
                     }
                 }
+                WireMessage::UsageInsightsResponse {
+                    request_id,
+                    snapshot,
+                } => {
+                    if let Some(tx) = state.pending_usage_insights.remove(&request_id) {
+                        let _ = tx.send(Ok(snapshot));
+                    }
+                }
+                WireMessage::ContextOccupancyResponse {
+                    request_id,
+                    breakdown,
+                } => {
+                    if let Some(tx) = state.pending_context_occupancy.remove(&request_id) {
+                        let _ = tx.send(Ok(breakdown));
+                    }
+                }
                 WireMessage::SideQuestionDelta {
                     request_id,
                     text_delta,
@@ -5370,6 +5393,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_lsp_locations.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_usage_insights.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_context_occupancy.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -11399,6 +11430,162 @@ impl OrbitAppCore {
             .map_err(|_| "LSP goto-definition task cancelled".to_string())?
     }
 
+    /// Fetch host-wide cost/token usage insights and quota depletion forecasts for any connected host.
+    pub async fn get_usage_insights_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        days: u32,
+    ) -> Result<UsageInsightsSnapshot, String> {
+        let host_id = host_id.to_string();
+        let days = days.clamp(1, 90);
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to inspect usage insights".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_usage_insights.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before fetching usage insights".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::GetUsageInsights {
+                    request_id: req_id,
+                    days,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_usage_insights.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send usage insights request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while fetching usage insights".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_usage_insights.remove(&req_id);
+                    }
+                    Err("Timed out waiting for usage insights".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "usage insights task cancelled".to_string())?
+    }
+
+    /// Fetch live context-window occupancy breakdown for an agent on any connected host.
+    pub async fn get_context_occupancy_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<ContextOccupancyBreakdown, String> {
+        let host_id = host_id.to_string();
+        let agent_id = agent_id.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to inspect context occupancy".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_context_occupancy.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => {
+                        Some("Host disconnected before fetching context occupancy".to_string())
+                    }
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::GetContextOccupancy {
+                    request_id: req_id,
+                    agent_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_context_occupancy.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!(
+                    "failed to send context occupancy request: {e}"
+                )));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while fetching context occupancy".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_context_occupancy.remove(&req_id);
+                    }
+                    Err("Timed out waiting for context occupancy".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "context occupancy task cancelled".to_string())?
+    }
+
     async fn dispatch_workspace_entry_mutation_on_host(
         self: &Arc<Self>,
         host_id: String,
@@ -13002,6 +13189,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_lsp_locations.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_usage_insights.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_context_occupancy.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {

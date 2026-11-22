@@ -85,6 +85,7 @@ export class OrbitHarmonyCore {
     cwd: string,
     extraDirsJson: string | null | undefined,
     provider: string,
+    acpAgentId: string | null | undefined,
     model: string | null | undefined,
     effort: string | null | undefined,
     mode: string,
@@ -121,14 +122,18 @@ export class OrbitHarmonyCore {
     model?: string | null,
     effort?: string | null
   ): void;
+  setAgentFastMode(hostId: string, agentId: string, fastMode: boolean): void;
   switchAgentProvider(
     hostId: string,
     agentId: string,
     provider: string,
     model?: string | null,
-    effort?: string | null
+    effort?: string | null,
+    acpAgentId?: string | null
   ): void;
   archiveAgent(hostId: string, agentId: string): void;
+  unarchiveAgent(hostId: string, agentId: string): void;
+  deleteAgent(hostId: string, agentId: string): void;
   resolvePermission(
     hostId: string,
     agentId: string,
@@ -175,4 +180,63 @@ export class OrbitHarmonyCore {
   onAppForeground(): void;
   onAppBackground(): void;
   onNetworkChanged(): void;
+  searchMessagesJson(query: string, limit?: number | null): string;
+  exportAgentTranscriptJson(hostId: string, agentId: string, optionsJson: string): string;
+  listAgentCodeBlocksJson(hostId: string, agentId: string): string;
+  forkAgentJson(reqJson: string): Promise<string>;
+  previewWorktreeHandoffJson(reqJson: string): Promise<string>;
+  executeWorktreeHandoffJson(reqJson: string): Promise<string>;
+  writeWorkspaceFileJson(reqJson: string): Promise<string>;
+  createWorkspaceEntryJson(reqJson: string): Promise<string>;
+  renameWorkspaceEntryJson(reqJson: string): Promise<string>;
+  deleteWorkspaceEntryJson(reqJson: string): Promise<string>;
+  cloudSyncStatusJson(): string;
+  cloudSyncGeneratePassphrase(): string;
+  cloudSyncSetGithubClientIdJson(clientId?: string | null): string;
+  cloudSyncSetAutoSyncJson(enabled: boolean): string;
+  cloudSyncStartGithubDeviceFlowJson(clientIdOverride?: string | null): Promise<string>;
+  cloudSyncPollGithubDeviceFlowJson(deviceCode: string, clientIdOverride?: string | null): Promise<string>;
+  cloudSyncLoginWithTokenJson(token: string): Promise<string>;
+  cloudSyncUnlockWithPassphraseJson(passphrase: string): Promise<string>;
+  cloudSyncNowJson(): Promise<string>;
+  cloudSyncLogoutJson(clearLocalHosts: boolean): string;
+  cloudSyncGetPreferencesJson(): string;
+  cloudSyncUpdatePreferencesJson(patchJson: string): void;
+  listArtifactsJson(hostId: string, workspaceId?: string | null, agentId?: string | null): Promise<string>;
+  getArtifactJson(hostId: string, artifactId: string, version?: number | null): Promise<string>;
+  upsertArtifactJson(reqJson: string): Promise<string>;
+  deleteArtifact(hostId: string, artifactId: string): Promise<string>;
+  fetchWorkspaceBoard(hostId: string, workspaceId: string): void;
+  workspaceBoardJson(hostId: string, workspaceId: string): string;
+  updateWorkspaceBoard(
+    hostId: string,
+    workspaceId: string,
+    content: string,
+    section?: string | null,
+    updatedBy?: string | null
+  ): void;
+  fetchWorkspaceEvents(hostId: string, workspaceId: string, limit?: number | null): void;
+  workspaceEventsJson(hostId: string, workspaceId: string): string;
+  spawnWorkspacePeerJson(reqJson: string): string;
+  createScheduleJson(reqJson: string): void;
+  updateScheduleJson(reqJson: string): void;
+  pauseSchedule(hostId: string, scheduleId: string): void;
+  resumeSchedule(hostId: string, scheduleId: string): void;
+  runScheduleOnce(hostId: string, scheduleId: string): void;
+  deleteSchedule(hostId: string, scheduleId: string): void;
+  fetchScheduleRuns(hostId: string, scheduleId: string, limit?: number | null): void;
+  scheduleRunsJson(hostId: string, scheduleId: string): string;
+  listConditionalTimersJson(
+    hostId: string,
+    agentId: string | null | undefined,
+    includeResolved: boolean
+  ): Promise<string>;
+  cancelConditionalTimerJson(hostId: string, timerId: string): Promise<string>;
+  fireConditionalTimerNowJson(hostId: string, timerId: string): Promise<string>;
+  listGoalRunsJson(hostId: string, agentId?: string | null): Promise<string>;
+  controlGoalRunJson(reqJson: string): Promise<string>;
+  listMonitorWatchesJson(hostId: string, agentId?: string | null): Promise<string>;
+  stopMonitorWatchJson(reqJson: string): Promise<string>;
+  listWorkflowRunsJson(hostId: string, includeCompleted: boolean): Promise<string>;
+  cancelWorkflowRunJson(reqJson: string): Promise<string>;
 }

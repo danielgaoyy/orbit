@@ -27,6 +27,10 @@ import { GitDiffSheet } from '../sheets/GitDiffSheet';
 import { PtyTerminalSheet } from '../sheets/PtyTerminalSheet';
 import { HostSettingsSheet } from '../sheets/HostSettingsSheet';
 import { DirectoryBrowserSheet } from '../sheets/DirectoryBrowserSheet';
+import { AutomationsSheet } from '../sheets/AutomationsSheet';
+import { WorkspaceBoardSheet } from '../sheets/WorkspaceBoardSheet';
+import { SideQuestionSheet } from '../sheets/SideQuestionSheet';
+import { ArchivedSessionsSheet } from '../sheets/ArchivedSessionsSheet';
 
 @ComponentV2
 export struct AdaptiveWorkspace {
@@ -204,6 +208,26 @@ export struct AdaptiveWorkspace {
   }
 
   @Builder
+  private buildAutomationsSheet() {
+    AutomationsSheet()
+  }
+
+  @Builder
+  private buildWorkspaceBoardSheet() {
+    WorkspaceBoardSheet()
+  }
+
+  @Builder
+  private buildSideQuestionSheet() {
+    SideQuestionSheet()
+  }
+
+  @Builder
+  private buildArchivedSessionsSheet() {
+    ArchivedSessionsSheet()
+  }
+
+  @Builder
   private renderTitleMenu() {
     Menu() {
       MenuItem({
@@ -264,10 +288,64 @@ export struct AdaptiveWorkspace {
           .onClick(() => {
             this.store.openPtyTerminal();
           })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.doc_text'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Board & Peers'
+        })
+          .onClick(() => {
+            this.store.openWorkspaceBoard();
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.message'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Side Question (/btw)'
+        })
+          .onClick(() => {
+            this.store.openSideQuestionSheet();
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.clock'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Automations'
+        })
+          .onClick(() => {
+            this.store.openAutomationsSheet();
+          })
       }
 
       if (this.hasActiveConversation()) {
         MenuItemGroup() {
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_triangle_divide'))
+              .fontColor([this.store.palette.iconPrimary]),
+            content: 'Fork Conversation'
+          })
+            .onClick(() => {
+              this.store.forkCurrentSession(false);
+            })
+
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_triangle_divide'))
+              .fontColor([this.store.palette.iconPrimary]),
+            content: 'Fork in Worktree'
+          })
+            .onClick(() => {
+              this.store.forkCurrentSession(true);
+            })
+
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.square_and_square'))
+              .fontColor([this.store.palette.iconPrimary]),
+            content: 'Export Markdown'
+          })
+            .onClick(() => {
+              this.store.exportCurrentSessionMarkdown();
+            })
+
           MenuItem({
             symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.archivebox'))
               .fontColor([this.store.palette.statusDanger]),
@@ -280,6 +358,17 @@ export struct AdaptiveWorkspace {
               }
             })
         }
+      }
+
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.archivebox'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Archived Sessions'
+        })
+          .onClick(() => {
+            this.store.openArchivedSessions();
+          })
       }
     }
   }
@@ -630,6 +719,54 @@ export struct AdaptiveWorkspace {
           [SheetSize.LARGE, SheetSize.MEDIUM],
           () => {
             this.store.showDirBrowser = false;
+          },
+          this.store.palette.drawer
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showAutomationsSheet, this.buildAutomationsSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
+            this.store.showAutomationsSheet = false;
+          },
+          this.store.palette.drawer
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showWorkspaceBoardSheet, this.buildWorkspaceBoardSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
+            this.store.showWorkspaceBoardSheet = false;
+          },
+          this.store.palette.drawer
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showSideQuestionSheet, this.buildSideQuestionSheet(), this.buildSheetOptions(
+          [SheetSize.MEDIUM, SheetSize.LARGE],
+          () => {
+            this.store.showSideQuestionSheet = false;
+          },
+          this.store.palette.drawer
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showArchivedSessionsSheet, this.buildArchivedSessionsSheet(), this.buildSheetOptions(
+          [SheetSize.MEDIUM, SheetSize.LARGE],
+          () => {
+            this.store.showArchivedSessionsSheet = false;
           },
           this.store.palette.drawer
         ))

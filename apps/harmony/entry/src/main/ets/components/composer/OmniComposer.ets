@@ -70,7 +70,7 @@ export struct OmniComposer {
 
   private permissionModeIcon(mode: string): Resource {
     const slug = normalizeModeSlug(mode);
-    if (slug === 'accept_edits') {
+    if (slug === 'auto' || slug === 'accept_edits') {
       return $r('app.media.ic_shield_check');
     }
     if (slug === 'full_access') {
@@ -310,6 +310,20 @@ export struct OmniComposer {
           .labelFontColor(this.store.palette.fgMuted)
           .onClick(() => {
             this.store.setSessionMode('default');
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.checkmark_shield'))
+            .fontColor([this.store.palette.accentPrimary]),
+          content: 'Auto',
+          labelInfo: 'Guardian policy',
+          symbolEndIcon: normalizeModeSlug(this.store.composerMode) === 'auto'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .labelFontColor(this.store.palette.fgMuted)
+          .onClick(() => {
+            this.store.setSessionMode('auto');
           })
 
         MenuItem({
@@ -861,6 +875,30 @@ export struct OmniComposer {
           }
           .height(OrbitTokens.HIT_COMPACT)
           .layoutWeight(1)
+
+          // Fast Mode Toggle Button
+          Button({ type: ButtonType.Circle, stateEffect: true }) {
+            SymbolGlyph($r('sys.symbol.bolt'))
+              .fontSize(16)
+              .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+              .fontColor([
+                this.store.composerFastMode
+                  ? this.store.palette.accentPrimary
+                  : this.store.palette.iconSecondary
+              ])
+          }
+          .width(OrbitTokens.HIT_COMPACT)
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding(0)
+          .backgroundColor(
+            this.store.composerFastMode
+              ? this.store.palette.accentPrimarySoft
+              : Color.Transparent
+          )
+          .accessibilityText(this.store.composerFastMode ? 'Fast Mode on' : 'Fast Mode off')
+          .onClick(() => {
+            this.store.toggleFastMode();
+          })
 
           // Access Permissions Shield Button + Native Menu
           Button({ type: ButtonType.Circle, stateEffect: true }) {

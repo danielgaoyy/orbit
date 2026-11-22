@@ -1,5 +1,14 @@
 import { memo } from "react";
-import { ArrowLeftRight, Code2, Copy, Download, FileText, MoreHorizontal, Sparkles } from "lucide-react";
+import {
+  ArrowLeftRight,
+  Blocks,
+  Code2,
+  Copy,
+  Download,
+  FileText,
+  MoreHorizontal,
+  Sparkles,
+} from "lucide-react";
 import { isAgentBackgroundWaiting, isMacDesktop } from "@/lib/orbit-ipc";
 import { modSymbol } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
@@ -118,6 +127,21 @@ export const TopBar = memo(function TopBar() {
     return ag?.title || "New Conversation";
   });
 
+  const workspaceArtifactCount = useOrbitSelector((s) => {
+    if (!s.selectedHostId) return 0;
+    const detail = s.hostDetails[s.selectedHostId];
+    const all = detail?.artifacts ?? [];
+    if (all.length === 0) return 0;
+    const ag =
+      !s.isDraftNewSession && s.selectedAgentId
+        ? detail?.agents.find((a) => a.agent_id === s.selectedAgentId)
+        : null;
+    if (ag?.workspace_id) {
+      return all.filter((a) => a.workspace_id === ag.workspace_id).length;
+    }
+    return all.length;
+  });
+
   const mod = modSymbol();
   const isMac = isMacDesktop();
 
@@ -197,6 +221,21 @@ export const TopBar = memo(function TopBar() {
                 >
                   <ArrowLeftRight className="h-[12px] w-[12px] shrink-0 stroke-[1.75] opacity-75" />
                   <span>Apply to Local</span>
+                </button>
+              </SimpleTooltip>
+            )}
+            {workspaceArtifactCount > 0 && (
+              <SimpleTooltip label="Artifacts">
+                <button
+                  type="button"
+                  aria-label={`Artifacts (${workspaceArtifactCount})`}
+                  onClick={() => orbitActions.openArtifactsTab({ hostId: selectedHostId })}
+                  className="text-foreground/70 hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-[7px] px-2 text-[12px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+                >
+                  <Blocks className="h-[14px] w-[14px] stroke-[1.75]" />
+                  <span className="tabular-nums text-[11px] opacity-80">
+                    {workspaceArtifactCount}
+                  </span>
                 </button>
               </SimpleTooltip>
             )}

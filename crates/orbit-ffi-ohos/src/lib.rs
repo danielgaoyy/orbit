@@ -23,7 +23,7 @@ use orbit_client_core::contract::{
     DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, FleetSidebarRequest,
     ForkAgentRequest, MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest,
     RenameWorkspaceEntryRequest, RenderDiagramRequest, SendPromptRequest, UpdateHostConfigRequest,
-    WriteWorkspaceFileRequest,
+    UpsertArtifactRequest, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, detect_diagram_kind as core_detect_diagram_kind,
@@ -1212,6 +1212,43 @@ impl OhosCoreFacade {
             .inner
             .refresh_acp_registry_blocking(host_id, registry_url)?;
         serde_json::to_string(&agents).map_err(|e| e.to_string())
+    }
+
+    // --- First-Class Artifacts & SEP-1865 MCP Apps ---
+
+    pub fn list_artifacts_json(
+        &self,
+        host_id: &str,
+        workspace_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<String, String> {
+        let artifacts = self
+            .inner
+            .list_artifacts_blocking(host_id, workspace_id, agent_id)?;
+        serde_json::to_string(&artifacts).map_err(|e| e.to_string())
+    }
+
+    pub fn get_artifact_json(
+        &self,
+        host_id: &str,
+        artifact_id: &str,
+        version: Option<u32>,
+    ) -> Result<String, String> {
+        let detail = self
+            .inner
+            .get_artifact_blocking(host_id, artifact_id, version)?;
+        serde_json::to_string(&detail).map_err(|e| e.to_string())
+    }
+
+    pub fn upsert_artifact_json(&self, req_json: &str) -> Result<String, String> {
+        let req: UpsertArtifactRequest =
+            serde_json::from_str(req_json).map_err(|e| e.to_string())?;
+        let summary = self.inner.upsert_artifact_blocking(req)?;
+        serde_json::to_string(&summary).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_artifact(&self, host_id: &str, artifact_id: &str) -> Result<String, String> {
+        self.inner.delete_artifact_blocking(host_id, artifact_id)
     }
 }
 
@@ -2437,6 +2474,44 @@ mod ohos_napi {
         pub fn cloud_sync_update_preferences_json(&self, patch_json: String) -> Result<()> {
             self.facade
                 .cloud_sync_update_preferences_json(&patch_json)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn list_artifacts_json(
+            &self,
+            host_id: String,
+            workspace_id: Option<String>,
+            agent_id: Option<String>,
+        ) -> Result<String> {
+            self.facade
+                .list_artifacts_json(&host_id, workspace_id, agent_id)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn get_artifact_json(
+            &self,
+            host_id: String,
+            artifact_id: String,
+            version: Option<u32>,
+        ) -> Result<String> {
+            self.facade
+                .get_artifact_json(&host_id, &artifact_id, version)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn upsert_artifact_json(&self, req_json: String) -> Result<String> {
+            self.facade
+                .upsert_artifact_json(&req_json)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn delete_artifact(&self, host_id: String, artifact_id: String) -> Result<String> {
+            self.facade
+                .delete_artifact(&host_id, &artifact_id)
                 .map_err(Error::from_reason)
         }
     }

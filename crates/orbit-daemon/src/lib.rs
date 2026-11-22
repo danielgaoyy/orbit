@@ -6,6 +6,7 @@
 //! Daemon-to-Daemon Connected Host links, and optionally registers outbound to Relay with full
 //! `Noise_NK_25519_ChaChaPoly_SHA256` end-to-end encryption.
 
+pub mod artifacts;
 pub mod attachments;
 pub mod connected_hosts;
 pub mod cron;
@@ -1047,6 +1048,18 @@ async fn run_client_session_loop(
                             request_id: Uuid::nil(),
                             agents,
                             warning: None,
+                        })
+                    }
+                    DaemonBroadcast::ArtifactUpdated(artifact) => {
+                        Some(WireMessage::ArtifactUpdated {
+                            request_id: None,
+                            artifact,
+                        })
+                    }
+                    DaemonBroadcast::ArtifactDeleted(artifact_id) => {
+                        Some(WireMessage::ArtifactDeleted {
+                            request_id: None,
+                            artifact_id,
                         })
                     }
                 };
@@ -2778,6 +2791,137 @@ async fn handle_wire_rpc(
                 }
                 Err(e) => Some(rpc_err(request_id, "refresh_acp_registry_failed", e)),
             }
+        }
+
+        // First-Class Artifacts & SEP-1865 MCP Apps (offloaded via spawn_blocking)
+        WireMessage::ListArtifacts {
+            request_id,
+            workspace_id,
+            agent_id,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    orch.list_artifacts(workspace_id.as_deref(), agent_id.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(artifacts)) => WireMessage::ArtifactsSnapshot {
+                        request_id,
+                        artifacts,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "list_artifacts_failed", e),
+                    Err(e) => rpc_err(request_id, "list_artifacts_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GetArtifact {
+            request_id,
+            artifact_id,
+            version,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let id_for_err = artifact_id.clone();
+                let reply = match tokio::task::spawn_blocking(move || {
+                    orch.get_artifact(&artifact_id, version)
+                })
+                .await
+                {
+                    Ok(Ok(Some(artifact))) => WireMessage::ArtifactContent {
+                        request_id,
+                        artifact,
+                    },
+                    Ok(Ok(None)) => rpc_err(
+                        request_id,
+                        "artifact_not_found",
+                        format!("artifact `{id_for_err}` not found"),
+                    ),
+                    Ok(Err(e)) => rpc_err(request_id, "get_artifact_failed", e),
+                    Err(e) => rpc_err(request_id, "get_artifact_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertArtifact {
+            request_id,
+            artifact_id,
+            workspace_id,
+            agent_id,
+            title,
+            kind,
+            language,
+            mime_type,
+            resource_uri,
+            content,
+            summary_note,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    orch.upsert_artifact(orbit_store::UpsertArtifactInput {
+                        artifact_id,
+                        workspace_id,
+                        agent_id,
+                        title,
+                        kind,
+                        language,
+                        mime_type,
+                        resource_uri,
+                        content,
+                        summary_note,
+                    })
+                })
+                .await
+                {
+                    Ok(Ok(artifact)) => WireMessage::ArtifactUpdated {
+                        request_id: Some(request_id),
+                        artifact,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "upsert_artifact_failed", e),
+                    Err(e) => rpc_err(request_id, "upsert_artifact_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteArtifact {
+            request_id,
+            artifact_id,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let id_for_reply = artifact_id.clone();
+                let reply =
+                    match tokio::task::spawn_blocking(move || orch.delete_artifact(&artifact_id))
+                        .await
+                    {
+                        Ok(Ok(true)) => WireMessage::ArtifactDeleted {
+                            request_id: Some(request_id),
+                            artifact_id: id_for_reply,
+                        },
+                        Ok(Ok(false)) => rpc_err(
+                            request_id,
+                            "artifact_not_found",
+                            format!("artifact `{id_for_reply}` not found"),
+                        ),
+                        Ok(Err(e)) => rpc_err(request_id, "delete_artifact_failed", e),
+                        Err(e) => rpc_err(request_id, "delete_artifact_failed", e),
+                    };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
         }
 
         // Schedules & Heartbeats

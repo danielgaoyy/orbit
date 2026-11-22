@@ -550,10 +550,13 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ProviderSubagentsSnapshot { request_id, .. }
         | WireMessage::ProviderSubagentTimelineCatchup { request_id, .. }
         | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }
-        | WireMessage::WorktreeHandoffExecuted { request_id, .. } => Some(*request_id),
-        WireMessage::QuotaReport { request_id, .. } | WireMessage::RpcError { request_id, .. } => {
-            *request_id
-        }
+        | WireMessage::WorktreeHandoffExecuted { request_id, .. }
+        | WireMessage::ArtifactsSnapshot { request_id, .. }
+        | WireMessage::ArtifactContent { request_id, .. } => Some(*request_id),
+        WireMessage::QuotaReport { request_id, .. }
+        | WireMessage::ArtifactUpdated { request_id, .. }
+        | WireMessage::ArtifactDeleted { request_id, .. }
+        | WireMessage::RpcError { request_id, .. } => *request_id,
         _ => None,
     }
 }

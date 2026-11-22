@@ -21,6 +21,7 @@ import {
 import {
   AlertTriangle,
   ArrowDown,
+  Blocks,
   Check,
   ChevronRight,
   Copy,
@@ -54,6 +55,7 @@ import {
 } from "lucide-react";
 import {
   type AgentCardView,
+  type ArtifactSummary,
   type DiffFileView,
   type DiffLineView,
   type InlineSpanView,
@@ -76,6 +78,7 @@ import {
   stripWorkspacePrefix,
 } from "@/lib/timeline-coalesce";
 import { OmniComposer } from "@/components/composer/omni-composer";
+import { extractInlineArtifactDirectives } from "@/components/artifacts/mcp-app-bridge";
 import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { openOrbitLink } from "@/lib/file-links";
 import {
@@ -2636,6 +2639,139 @@ const EMPTY_WORK_COUNTS: WorkSummaryResultView["counts"] = {
  *   post-turn autonomous wakeups.
  * - Notices (API warnings, stream interruptions, errors) and wakeup boundaries render in place.
  */
+interface InlineArtifactRef {
+  key: string;
+  artifactId?: string;
+  title: string;
+  version?: number;
+  kindLabel?: string;
+}
+
+function parseArtifactRefsFromMessage(
+  text: string,
+  knownArtifacts: readonly ArtifactSummary[],
+): InlineArtifactRef[] {
+  const directives = extractInlineArtifactDirectives(text);
+  if (directives.length === 0) {
+    return [];
+  }
+  const refs: InlineArtifactRef[] = [];
+  const seen = new Set<string>();
+  for (const dir of directives) {
+    const explicitId = dir.id;
+    const rawTitle = dir.title;
+    const rawUri = dir.resourceUri;
+
+    const matched =
+      (explicitId ? knownArtifacts.find((a) => a.artifact_id === explicitId) : undefined) ??
+      (rawUri ? knownArtifacts.find((a) => a.resource_uri === rawUri) : undefined) ??
+      (rawTitle
+        ? knownArtifacts.find((a) => a.title.toLowerCase() === rawTitle.toLowerCase())
+        : undefined);
+
+    const key = matched?.artifact_id || explicitId || rawTitle || rawUri || `idx_${dir.index}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    refs.push({
+      key,
+      artifactId: matched?.artifact_id ?? explicitId,
+      title: matched?.title ?? rawTitle ?? "Artifact",
+      version: matched?.version,
+      kindLabel: matched?.kind,
+    });
+  }
+  return refs;
+}
+
+function parseArtifactRefsFromTurnTools(
+  turn: StageTurnView,
+  knownArtifacts: readonly ArtifactSummary[],
+): InlineArtifactRef[] {
+  const refs: InlineArtifactRef[] = [];
+  const seen = new Set<string>();
+  const inspectItems = (items: readonly TimelineItemView[]) => {
+    for (const item of items) {
+      if (item.item_type !== "tool_call") continue;
+      if (item.detail.kind !== "generic") continue;
+      const toolName = item.detail.tool_name.toLowerCase();
+      if (!toolName.endsWith("publish_artifact")) continue;
+      try {
+        const parsed = JSON.parse(item.detail.arguments_json) as Record<string, unknown>;
+        const explicitId =
+          typeof parsed.artifact_id === "string" && parsed.artifact_id.trim()
+            ? parsed.artifact_id.trim()
+            : undefined;
+        const rawTitle =
+          typeof parsed.title === "string" && parsed.title.trim()
+            ? parsed.title.trim()
+            : undefined;
+        const matched =
+          (explicitId ? knownArtifacts.find((a) => a.artifact_id === explicitId) : undefined) ??
+          (rawTitle
+            ? knownArtifacts.find((a) => a.title.toLowerCase() === rawTitle.toLowerCase())
+            : undefined);
+        const key = matched?.artifact_id || explicitId || rawTitle || item.call_id;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        refs.push({
+          key,
+          artifactId: matched?.artifact_id ?? explicitId,
+          title: matched?.title ?? rawTitle ?? "Artifact",
+          version: matched?.version,
+          kindLabel: matched?.kind ?? (typeof parsed.kind === "string" ? parsed.kind : undefined),
+        });
+      } catch {
+        // Ignore unparseable partial tool arguments while streaming
+      }
+    }
+  };
+  inspectItems(turn.folded_steps);
+  for (const seg of turn.live_segments) {
+    if (seg.kind === "step_group") {
+      inspectItems(seg.items);
+    }
+  }
+  return refs;
+}
+
+const InlineArtifactCard = memo(function InlineArtifactCard({
+  hostId,
+  artifact,
+}: {
+  hostId: string;
+  artifact: InlineArtifactRef;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() =>
+        orbitActions.openArtifactsTab({
+          hostId,
+          artifactId: artifact.artifactId,
+        })
+      }
+      className="border-border/80 bg-elevated/45 hover:bg-elevated/85 group inline-flex max-w-full cursor-pointer items-center gap-2 rounded-xl border px-3 py-1.5 text-left text-[12.5px] transition-colors"
+    >
+      <Blocks className="text-muted-foreground group-hover:text-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+      <span className="text-muted-foreground shrink-0 text-[11.5px]">Artifact</span>
+      <span className="text-muted-foreground/55 shrink-0">·</span>
+      <span className="text-foreground truncate font-medium">{artifact.title}</span>
+      {artifact.version != null && (
+        <>
+          <span className="text-muted-foreground/55 shrink-0">·</span>
+          <span className="text-muted-foreground shrink-0 font-mono text-[11.5px]">
+            v{artifact.version}
+          </span>
+        </>
+      )}
+      <ChevronRight className="text-muted-foreground/55 group-hover:text-foreground h-[13px] w-[13px] shrink-0 transition-transform group-hover:translate-x-0.5" />
+    </button>
+  );
+});
+
+const EMPTY_ARTIFACTS: readonly ArtifactSummary[] = [];
+
 export const TurnStageSection = memo(function TurnStageSection({
   turn,
   isTurnActive,
@@ -2678,6 +2814,13 @@ export const TurnStageSection = memo(function TurnStageSection({
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
   const rawSegments = turn.live_segments;
+  const hostArtifacts = useOrbitSelector(
+    (s) => s.hostDetails[hostId]?.artifacts ?? EMPTY_ARTIFACTS,
+  );
+  const turnToolArtifactRefs = useMemo(
+    () => parseArtifactRefsFromTurnTools(turn, hostArtifacts),
+    [turn, hostArtifacts],
+  );
   const lastRawSeg = rawSegments[rawSegments.length - 1] ?? null;
 
   // Exclude transient `Waiting for ...` and internal `Resumed from background task` wakeup rows
@@ -2812,13 +2955,25 @@ export const TurnStageSection = memo(function TurnStageSection({
 
               if (seg.kind === "assistant_message") {
                 if (seg.item.item_type !== "assistant_message") return null;
+                const msgArtifacts = !seg.item.streaming
+                  ? parseArtifactRefsFromMessage(seg.item.text, hostArtifacts)
+                  : [];
                 return (
-                  <MarkdownLinkProvider key={seg.key} cwd={cwd}>
-                    <MarkdownBlocksView
-                      blocks={seg.item.blocks}
-                      streaming={seg.item.streaming}
-                    />
-                  </MarkdownLinkProvider>
+                  <div key={seg.key} className="space-y-2">
+                    <MarkdownLinkProvider cwd={cwd}>
+                      <MarkdownBlocksView
+                        blocks={seg.item.blocks}
+                        streaming={seg.item.streaming}
+                      />
+                    </MarkdownLinkProvider>
+                    {msgArtifacts.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                        {msgArtifacts.map((ref) => (
+                          <InlineArtifactCard key={ref.key} hostId={hostId} artifact={ref} />
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 );
               }
 
@@ -2894,6 +3049,14 @@ export const TurnStageSection = memo(function TurnStageSection({
                 />
               );
             })}
+
+            {turnToolArtifactRefs.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                {turnToolArtifactRefs.map((ref) => (
+                  <InlineArtifactCard key={ref.key} hostId={hostId} artifact={ref} />
+                ))}
+              </div>
+            )}
 
             {needsTrailingActivity && (() => {
               const trailingLabel =

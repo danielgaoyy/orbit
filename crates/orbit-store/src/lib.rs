@@ -2,9 +2,14 @@
 //!
 //! Replaces Paseo's scattered JSON files with ACID event-sourced timelines and `< 1ms` cursor catch-up.
 
+pub mod artifacts;
 pub mod orchestration;
 pub mod search;
 pub mod workspace_sync;
+pub use artifacts::{
+    MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ID_LEN, MAX_ARTIFACT_REVISIONS, UpsertArtifactInput,
+    validate_artifact_id,
+};
 pub use orchestration::*;
 pub use search::{FtsBackfillProgress, MessageSearchHit, build_fts5_match_query};
 pub use workspace_sync::{AgentContextSnippet, SemanticIdentityOptions};
@@ -415,6 +420,7 @@ impl OrbitStore {
         ] {
             ensure_table_column(&conn, table, col, col_type)?;
         }
+        artifacts::migrate_artifacts_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

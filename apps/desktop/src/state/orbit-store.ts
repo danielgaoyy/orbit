@@ -211,7 +211,8 @@ export type SidePanelTabKind =
   | "side_question"
   | "subagent"
   | "board"
-  | "peer";
+  | "peer"
+  | "artifacts";
 
 export interface SidePanelTab {
   id: string;
@@ -232,6 +233,7 @@ export interface SidePanelTab {
   parentAgentId?: string | null;
   workspaceId?: string;
   peerAgentId?: string;
+  artifactId?: string;
 }
 
 export interface FileViewCacheEntry {
@@ -3274,6 +3276,24 @@ export const orbitActions = {
     }));
     orbitActions.refreshSidebarView();
     orbitActions.focusComposer();
+  },
+
+  appendToComposerDraft(text: string): void {
+    const clean = text.trim();
+    if (!clean) return;
+    const key = composerScopeKey(state);
+    setState((s) => {
+      const existing = (s.composerDrafts[key] ?? "").trimEnd();
+      const nextText = existing ? `${existing}\n\n${clean}` : clean;
+      return {
+        ...s,
+        composerDrafts: {
+          ...s.composerDrafts,
+          [key]: nextText,
+        },
+      };
+    });
+    orbitActions.refreshSidebarView();
   },
 
   removeDiffQuote(id: string): void {
@@ -7532,6 +7552,61 @@ export const orbitActions = {
       true,
     );
     notifyToast(`已归档 ${targets.length} 个已完成子代理`);
+  },
+
+  openArtifactsTab(opts?: {
+    hostId?: string;
+    workspaceId?: string;
+    artifactId?: string;
+  }): void {
+    const resolvedHostId = opts?.hostId || state.selectedHostId || "";
+    const detail = resolvedHostId ? state.hostDetails[resolvedHostId] : null;
+    const activeAgent =
+      !state.isDraftNewSession && state.selectedAgentId
+        ? detail?.agents.find((a) => a.agent_id === state.selectedAgentId) ?? null
+        : null;
+    const resolvedWorkspaceId = opts?.workspaceId ?? activeAgent?.workspace_id ?? "";
+    const tabId = "tab:artifacts";
+    const nonce = Date.now();
+
+    setState((s) => {
+      const exists = s.sidePanelTabs.some((t) => t.id === tabId);
+      const nextTab: SidePanelTab = {
+        id: tabId,
+        kind: "artifacts",
+        title: "Artifacts",
+        hostId: resolvedHostId || undefined,
+        workspaceId: resolvedWorkspaceId || undefined,
+        artifactId: opts?.artifactId,
+        focusNonce: nonce,
+      };
+      const nextTabs = exists
+        ? s.sidePanelTabs.map((t) =>
+            t.id === tabId
+              ? {
+                  ...t,
+                  hostId: resolvedHostId || t.hostId,
+                  workspaceId: resolvedWorkspaceId || t.workspaceId,
+                  artifactId: opts?.artifactId ?? t.artifactId,
+                  focusNonce: nonce,
+                }
+              : t,
+          )
+        : [...s.sidePanelTabs, nextTab];
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: tabId,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+    if (resolvedHostId) {
+      void orbitIpc.listArtifacts(resolvedHostId, null, null).catch(() => {});
+    }
   },
 
   openWorkspaceBoardTab(hostId: string, workspaceId: string, title?: string): void {

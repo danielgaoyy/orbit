@@ -1,9 +1,11 @@
 //! Core wire types, state machines, timeline events, git/worktree models, orchestration models, and binary terminal framing.
 
 pub mod acp;
+pub mod artifacts;
 pub mod handoff;
 pub mod orchestration;
 pub use acp::*;
+pub use artifacts::*;
 pub use handoff::*;
 pub use orchestration::*;
 
@@ -1844,6 +1846,62 @@ pub enum WireMessage {
     WorktreeHandoffExecuted {
         request_id: Uuid,
         outcome: WorktreeHandoffOutcome,
+    },
+
+    // First-Class Artifacts & SEP-1865 MCP Apps
+    ListArtifacts {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+    },
+    ArtifactsSnapshot {
+        request_id: Uuid,
+        artifacts: Vec<ArtifactSummary>,
+    },
+    GetArtifact {
+        request_id: Uuid,
+        artifact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u32>,
+    },
+    ArtifactContent {
+        request_id: Uuid,
+        artifact: ArtifactDetail,
+    },
+    UpsertArtifact {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_id: Option<String>,
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        title: String,
+        kind: ArtifactKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource_uri: Option<String>,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_note: Option<String>,
+    },
+    ArtifactUpdated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<Uuid>,
+        artifact: ArtifactSummary,
+    },
+    DeleteArtifact {
+        request_id: Uuid,
+        artifact_id: String,
+    },
+    ArtifactDeleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<Uuid>,
+        artifact_id: String,
     },
 
     RpcError {

@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef } from "react";
 import {
+  Blocks,
   Columns2,
   File,
   FileCode2,
@@ -12,6 +13,7 @@ import {
   SquareTerminal,
   X,
 } from "lucide-react";
+import { ArtifactsTab } from "@/components/artifacts/artifacts-tab";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { BrowserTab } from "@/components/side-panel/browser-tab";
 import { FileViewerTab } from "@/components/side-panel/file-viewer-tab";
@@ -57,6 +59,8 @@ function SidePanelTabIcon({ tab }: { tab: SidePanelTab }) {
       return <FileText className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
     case "peer":
       return <Columns2 className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
+    case "artifacts":
+      return <Blocks className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
   }
 }
 
@@ -112,6 +116,20 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
     (s) => s.terminalTabs.filter((t) => t.hostId === selectedHostId).length,
   );
   const totalTerminalCount = useOrbitSelector((s) => s.terminalTabs.length);
+  const artifactCount = useOrbitSelector((s) => {
+    const detail = s.hostDetails[selectedHostId];
+    const all = detail?.artifacts ?? [];
+    if (all.length === 0) return 0;
+    const activeAg =
+      !s.isDraftNewSession && s.selectedAgentId
+        ? detail?.agents.find((a) => a.agent_id === s.selectedAgentId)
+        : null;
+    if (activeAg?.workspace_id) {
+      const wsCount = all.filter((a) => a.workspace_id === activeAg.workspace_id).length;
+      if (wsCount > 0) return wsCount;
+    }
+    return all.length;
+  });
 
   const resizeCleanupRef = useRef<(() => void) | null>(null);
   const mod = modSymbol();
@@ -280,6 +298,11 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                       className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
                     />
                   )}
+                  {tab.kind === "artifacts" && artifactCount > 0 && (
+                    <span className="text-muted-foreground/80 shrink-0 rounded-full bg-black/[0.05] px-1.5 text-[10px] tabular-nums dark:bg-white/[0.08]">
+                      {artifactCount}
+                    </span>
+                  )}
                   {showPulseDot && (
                     <span
                       className={cn(
@@ -361,6 +384,9 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
           <WorkspaceBoardTab key={activeTab.id} tab={activeTab} />
         )}
         {activeTab?.kind === "peer" && <PeerSplitTab key={activeTab.id} tab={activeTab} />}
+        {activeTab?.kind === "artifacts" && (
+          <ArtifactsTab key={activeTab.id} tab={activeTab} />
+        )}
 
         {!activeTab && (
           <SidePanelLaunchpad

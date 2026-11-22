@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, ForkTarget, McpToolPolicy, ProviderKind, ReasoningEffort,
-    ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode, TimelinePayload,
-    ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection,
-    WorktreeHandoffMode,
+    ActiveTurnBehavior, AgentMessageKind, ArtifactKind, ForkTarget, McpToolPolicy, ProviderKind,
+    ReasoningEffort, ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode,
+    TimelinePayload, ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode,
+    WorktreeHandoffDirection, WorktreeHandoffMode,
 };
-use orbit_store::ReceiptOutcome;
+use orbit_store::{ReceiptOutcome, UpsertArtifactInput};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -1876,6 +1876,230 @@ async fn execute_tool_inner(
             }))
         }
 
+        // ==================== ARTIFACTS & SEP-1865 MCP APPS ====================
+        "publish_artifact" => {
+            let title = str_arg(args, "title")?;
+            let kind_raw = str_arg(args, "kind")?;
+            let kind = ArtifactKind::from_slug(&kind_raw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported artifact kind `{kind_raw}` (expected: markdown, html, code, svg, mermaid, mcp_app)"
+                )
+            })?;
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `content`"))?
+                .to_string();
+            let artifact_id = opt_str(args, "artifact_id");
+            let language = opt_str(args, "language");
+            let mime_type = opt_str(args, "mime_type");
+            let resource_uri = opt_str(args, "resource_uri");
+            let summary_note = opt_str(args, "summary_note");
+            let agent_id = opt_str(args, "agent_id").or_else(|| {
+                if target_host.is_none() {
+                    caller_agent_id.map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            });
+
+            let artifact = if let Some(ref remote_host_id) = target_host {
+                let workspace_id = opt_str(args, "workspace_id").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "remote `publish_artifact` requires `workspace_id` on host `{remote_host_id}`"
+                    )
+                })?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::UpsertArtifact {
+                            request_id: req_id,
+                            artifact_id,
+                            workspace_id,
+                            agent_id,
+                            title,
+                            kind,
+                            language,
+                            mime_type,
+                            resource_uri,
+                            content,
+                            summary_note,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::ArtifactUpdated { artifact, .. } => artifact,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to publish_artifact"),
+                }
+            } else {
+                let workspace_id = opt_str(args, "workspace_id")
+                    .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`workspace_id` is required when called outside an agent session"
+                        )
+                    })?;
+                let orch = Arc::clone(&rt.orchestrator);
+                tokio::task::spawn_blocking(move || {
+                    orch.upsert_artifact(UpsertArtifactInput {
+                        artifact_id,
+                        workspace_id,
+                        agent_id,
+                        title,
+                        kind,
+                        language,
+                        mime_type,
+                        resource_uri,
+                        content,
+                        summary_note,
+                    })
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("publish_artifact worker failed: {e}"))??
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "artifact": artifact,
+            }))
+        }
+
+        "list_artifacts" => {
+            let workspace_id = opt_str(args, "workspace_id");
+            let agent_id = opt_str(args, "agent_id");
+            let artifacts = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ListArtifacts {
+                            request_id: req_id,
+                            workspace_id,
+                            agent_id,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?
+                {
+                    WireMessage::ArtifactsSnapshot { artifacts, .. } => artifacts,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to list_artifacts"),
+                }
+            } else {
+                let orch = Arc::clone(&rt.orchestrator);
+                tokio::task::spawn_blocking(move || {
+                    orch.list_artifacts(workspace_id.as_deref(), agent_id.as_deref())
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("list_artifacts worker failed: {e}"))??
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "artifacts": artifacts,
+            }))
+        }
+
+        "read_artifact" => {
+            let artifact_id = str_arg(args, "artifact_id")?;
+            let version = match args.get("version") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let raw = v
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("`version` must be a positive integer"))?;
+                    if raw == 0 {
+                        anyhow::bail!("`version` must be >= 1");
+                    }
+                    let parsed = u32::try_from(raw)
+                        .map_err(|_| anyhow::anyhow!("`version` exceeds u32 range"))?;
+                    Some(parsed)
+                }
+            };
+            let artifact = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::GetArtifact {
+                            request_id: req_id,
+                            artifact_id: artifact_id.clone(),
+                            version,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?
+                {
+                    WireMessage::ArtifactContent { artifact, .. } => artifact,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to read_artifact"),
+                }
+            } else {
+                let orch = Arc::clone(&rt.orchestrator);
+                let aid_owned = artifact_id.clone();
+                tokio::task::spawn_blocking(move || orch.get_artifact(&aid_owned, version))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read_artifact worker failed: {e}"))??
+                    .ok_or_else(|| anyhow::anyhow!("artifact `{artifact_id}` not found"))?
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "artifact": artifact,
+            }))
+        }
+
+        "delete_artifact" => {
+            let artifact_id = str_arg(args, "artifact_id")?;
+            let deleted = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::DeleteArtifact {
+                            request_id: req_id,
+                            artifact_id: artifact_id.clone(),
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?
+                {
+                    WireMessage::ArtifactDeleted { .. } => true,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to delete_artifact"),
+                }
+            } else {
+                let orch = Arc::clone(&rt.orchestrator);
+                let aid_owned = artifact_id.clone();
+                tokio::task::spawn_blocking(move || orch.delete_artifact(&aid_owned))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("delete_artifact worker failed: {e}"))??
+            };
+            Ok(json!({
+                "ok": true,
+                "deleted": deleted,
+                "artifact_id": artifact_id,
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+            }))
+        }
+
         other => anyhow::bail!("unknown Orbit tool `{other}`"),
     }
 }
@@ -2682,6 +2906,65 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "target_workspace_id": { "type": "string" },
                     "new_workspace_title": { "type": "string" }
                 }
+            }),
+        },
+        // --- First-Class Artifacts & SEP-1865 MCP Apps (4) ---
+        ToolDefinition {
+            name: "publish_artifact",
+            description: "Publish or update a versioned Artifact (Markdown, interactive sandboxed HTML, Code, SVG, Mermaid diagram, or SEP-1865 MCP App) in a workspace.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": { "type": "string", "description": "Optional existing artifact ID to update (increments revision)." },
+                    "workspace_id": { "type": "string", "description": "Target workspace ID (defaults to calling agent's workspace on local host)." },
+                    "agent_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["markdown", "html", "code", "svg", "mermaid", "mcp_app"] },
+                    "content": { "type": "string" },
+                    "language": { "type": "string" },
+                    "mime_type": { "type": "string" },
+                    "resource_uri": { "type": "string", "description": "Optional SEP-1865 MCP App URI (e.g. `ui://dashboard/metrics`)." },
+                    "summary_note": { "type": "string", "description": "Short revision note describing this update." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["title", "kind", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "list_artifacts",
+            description: "List versioned Artifacts on this host or a connected remote host, optionally filtered by workspace or agent.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": { "type": "string" },
+                    "agent_id": { "type": "string" },
+                    "host_id": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "read_artifact",
+            description: "Read the full content and revision history of an Artifact (optionally at a specific historical version).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": { "type": "string" },
+                    "version": { "type": "integer", "description": "Optional specific revision number to inspect." },
+                    "host_id": { "type": "string" }
+                },
+                "required": ["artifact_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "delete_artifact",
+            description: "Permanently delete an Artifact and all of its stored revisions.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": { "type": "string" },
+                    "host_id": { "type": "string" }
+                },
+                "required": ["artifact_id"]
             }),
         },
     ]

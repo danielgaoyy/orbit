@@ -15,13 +15,13 @@ use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
-    AgentProfile, AgentStatus, AgentSummary, AttentionState, BackgroundTaskInfo,
-    ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot, HostProjectEntry,
-    HostSyncState, KeepAwakeStatus, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
-    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord, ScheduleSpec,
-    ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
+    AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
+    BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot,
+    HostProjectEntry, HostSyncState, KeepAwakeStatus, ModelOption, OrchestrationConfig,
+    OrchestrationSkillInfo, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge,
+    ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor,
+    ProviderSubagentEvent, QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord,
+    ScheduleSpec, ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
     TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceBoardSnapshot,
     WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
     WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
@@ -45,8 +45,8 @@ use crate::cloud_sync::{
 pub use crate::contract::{
     ConversationSearchHit, CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest,
     ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
-    PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest, WorkspaceEntryMutationResultView,
-    WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest, UpsertArtifactRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
@@ -304,6 +304,8 @@ pub struct HostDetailView {
     pub host_sync_state: HostSyncState,
     #[serde(default)]
     pub acp_agents: Vec<AcpAgentAvailability>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,6 +540,11 @@ struct CachedAgentStage {
     latest_seq: u64,
 }
 
+type PendingArtifactListEntry = (
+    bool,
+    tokio::sync::oneshot::Sender<Result<Vec<ArtifactSummary>, String>>,
+);
+
 struct HostMemoryState {
     profile: SavedHostProfile,
     is_local: bool,
@@ -586,6 +593,13 @@ struct HostMemoryState {
         Uuid,
         tokio::sync::oneshot::Sender<Result<crate::contract::AcpRegistryRefreshView, String>>,
     >,
+    pending_artifact_lists: HashMap<Uuid, PendingArtifactListEntry>,
+    unsolicited_unfiltered_artifact_reqs: HashSet<Uuid>,
+    pending_artifact_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ArtifactDetail, String>>>,
+    pending_artifact_upserts:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ArtifactSummary, String>>>,
+    pending_artifact_deletes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -632,6 +646,7 @@ struct HostMemoryState {
     provider_subagents: HashMap<String, Vec<ProviderSubagentDescriptor>>,
     provider_subagent_timelines: HashMap<(String, String), Vec<ProviderSubagentEvent>>,
     acp_agents: Vec<AcpAgentAvailability>,
+    artifacts: Vec<ArtifactSummary>,
 }
 
 impl HostMemoryState {
@@ -676,6 +691,11 @@ impl HostMemoryState {
             pending_git_repo_inspections: HashMap::new(),
             pending_acp_probes: HashMap::new(),
             pending_acp_snapshots: HashMap::new(),
+            pending_artifact_lists: HashMap::new(),
+            unsolicited_unfiltered_artifact_reqs: HashSet::new(),
+            pending_artifact_reads: HashMap::new(),
+            pending_artifact_upserts: HashMap::new(),
+            pending_artifact_deletes: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -722,6 +742,7 @@ impl HostMemoryState {
             provider_subagents: HashMap::new(),
             provider_subagent_timelines: HashMap::new(),
             acp_agents: Vec::new(),
+            artifacts: Vec::new(),
         }
     }
 
@@ -1302,6 +1323,7 @@ impl OrbitAppCore {
             workspace_organize_status: state.workspace_organize_status.clone(),
             host_sync_state: state.host_sync_state.clone(),
             acp_agents: state.acp_agents.clone(),
+            artifacts: state.artifacts.clone(),
         })
     }
 
@@ -3390,6 +3412,23 @@ impl OrbitAppCore {
                         request_id: Uuid::new_v4(),
                     })
                     .await;
+                let list_artifacts_req_id = Uuid::new_v4();
+                if let Ok(mut hosts) = self.hosts.write()
+                    && let Some(h) = hosts.get_mut(host_id)
+                {
+                    if h.unsolicited_unfiltered_artifact_reqs.len() >= 64 {
+                        h.unsolicited_unfiltered_artifact_reqs.clear();
+                    }
+                    h.unsolicited_unfiltered_artifact_reqs
+                        .insert(list_artifacts_req_id);
+                }
+                let _ = handle
+                    .send_wire(WireMessage::ListArtifacts {
+                        request_id: list_artifacts_req_id,
+                        workspace_id: None,
+                        agent_id: None,
+                    })
+                    .await;
                 let _ = handle
                     .send_wire(WireMessage::ListSchedules {
                         request_id: Uuid::new_v4(),
@@ -4058,6 +4097,82 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(result));
                     }
                 }
+                WireMessage::ArtifactsSnapshot {
+                    request_id,
+                    artifacts,
+                } => {
+                    let pending = state.pending_artifact_lists.remove(&request_id);
+                    let was_unsolicited_unfiltered = state
+                        .unsolicited_unfiltered_artifact_reqs
+                        .remove(&request_id);
+                    let is_unfiltered = pending.as_ref().is_some_and(|(unfiltered, _)| *unfiltered)
+                        || was_unsolicited_unfiltered;
+                    if is_unfiltered {
+                        state.artifacts = artifacts.clone();
+                    } else {
+                        for item in &artifacts {
+                            upsert_cached_artifact(&mut state.artifacts, item.clone());
+                        }
+                    }
+                    state.artifacts.sort_by(|a, b| {
+                        b.updated_at
+                            .cmp(&a.updated_at)
+                            .then_with(|| a.artifact_id.cmp(&b.artifact_id))
+                    });
+                    if let Some((_, tx)) = pending {
+                        let _ = tx.send(Ok(artifacts));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ArtifactContent {
+                    request_id,
+                    artifact,
+                } => {
+                    let latest_rev = artifact
+                        .revisions
+                        .first()
+                        .map(|r| r.version)
+                        .unwrap_or(artifact.summary.version);
+                    let cached_ver = state
+                        .artifacts
+                        .iter()
+                        .find(|a| a.artifact_id == artifact.summary.artifact_id)
+                        .map(|a| a.version)
+                        .unwrap_or(0);
+                    if artifact.summary.version >= latest_rev
+                        && artifact.summary.version >= cached_ver
+                    {
+                        upsert_cached_artifact(&mut state.artifacts, artifact.summary.clone());
+                    }
+                    if let Some(tx) = state.pending_artifact_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(artifact));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ArtifactUpdated {
+                    request_id,
+                    artifact,
+                } => {
+                    upsert_cached_artifact(&mut state.artifacts, artifact.clone());
+                    if let Some(rid) = request_id
+                        && let Some(tx) = state.pending_artifact_upserts.remove(&rid)
+                    {
+                        let _ = tx.send(Ok(artifact));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ArtifactDeleted {
+                    request_id,
+                    artifact_id,
+                } => {
+                    state.artifacts.retain(|a| a.artifact_id != artifact_id);
+                    if let Some(rid) = request_id
+                        && let Some(tx) = state.pending_artifact_deletes.remove(&rid)
+                    {
+                        let _ = tx.send(Ok(artifact_id));
+                    }
+                    notify_host = true;
+                }
                 WireMessage::SchedulesSnapshot { schedules, .. } => {
                     state.schedules = schedules;
                     notify_host = true;
@@ -4655,6 +4770,22 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
+                        && let Some((_, tx)) = state.pending_artifact_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_artifact_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_artifact_upserts.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_artifact_deletes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_side_questions.remove(&req_id)
                     {
                         let _ = tx.send(SideQuestionStreamEvent::Done {
@@ -5208,6 +5339,24 @@ impl OrbitAppCore {
             host_id,
             WireMessage::ListAcpAgents {
                 request_id: Uuid::new_v4(),
+            },
+        );
+        let list_artifacts_req_id = Uuid::new_v4();
+        if let Ok(mut hosts) = self.hosts.write()
+            && let Some(h) = hosts.get_mut(host_id)
+        {
+            if h.unsolicited_unfiltered_artifact_reqs.len() >= 64 {
+                h.unsolicited_unfiltered_artifact_reqs.clear();
+            }
+            h.unsolicited_unfiltered_artifact_reqs
+                .insert(list_artifacts_req_id);
+        }
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListArtifacts {
+                request_id: list_artifacts_req_id,
+                workspace_id: None,
+                agent_id: None,
             },
         );
         self.dispatch_wire(
@@ -6852,6 +7001,421 @@ impl OrbitAppCore {
             revision,
             host_id: host_id.to_string(),
         });
+    }
+
+    // --- First-Class Artifacts & SEP-1865 MCP Apps ---
+
+    pub fn cached_artifacts(
+        &self,
+        host_id: &str,
+        workspace_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Vec<ArtifactSummary> {
+        let ws = workspace_id.map(str::trim).filter(|s| !s.is_empty());
+        let ag = agent_id.map(str::trim).filter(|s| !s.is_empty());
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.get(host_id).map(|h| {
+                    h.artifacts
+                        .iter()
+                        .filter(|a| ws.is_none_or(|w| a.workspace_id == w))
+                        .filter(|a| ag.is_none_or(|id| a.agent_id.as_deref() == Some(id)))
+                        .cloned()
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    pub async fn list_artifacts_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<Vec<ArtifactSummary>, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Ok(self.cached_artifacts(
+                host_id,
+                workspace_id.as_deref(),
+                agent_id.as_deref(),
+            ));
+        };
+
+        let unfiltered = workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+            && agent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none();
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_lists
+                            .insert(req_id, (unfiltered, ack_tx));
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListArtifacts {
+                    request_id: req_id,
+                    workspace_id,
+                    agent_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListArtifacts: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(list))) => Ok(list),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while listing artifacts".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for artifacts snapshot".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "list_artifacts task cancelled".to_string())?
+    }
+
+    pub fn list_artifacts_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<Vec<ArtifactSummary>, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        self.runtime.block_on(async move {
+            core.list_artifacts_async(&host, workspace_id, agent_id)
+                .await
+        })
+    }
+
+    pub async fn get_artifact_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+        version: Option<u32>,
+    ) -> Result<ArtifactDetail, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_id = artifact_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_reads.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::GetArtifact {
+                    request_id: req_id,
+                    artifact_id: owned_id,
+                    version,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send GetArtifact: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(detail))) => Ok(detail),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while loading artifact".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_reads.remove(&req_id);
+                    }
+                    Err("Timed out waiting for artifact content".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "get_artifact task cancelled".to_string())?
+    }
+
+    pub fn get_artifact_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+        version: Option<u32>,
+    ) -> Result<ArtifactDetail, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        let aid = artifact_id.to_string();
+        self.runtime
+            .block_on(async move { core.get_artifact_async(&host, &aid, version).await })
+    }
+
+    pub async fn upsert_artifact_async(
+        self: &Arc<Self>,
+        req: UpsertArtifactRequest,
+    ) -> Result<ArtifactSummary, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = req.host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_upserts.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::UpsertArtifact {
+                    request_id: req_id,
+                    artifact_id: req.artifact_id,
+                    workspace_id: req.workspace_id,
+                    agent_id: req.agent_id,
+                    title: req.title,
+                    kind: req.kind,
+                    language: req.language,
+                    mime_type: req.mime_type,
+                    resource_uri: req.resource_uri,
+                    content: req.content,
+                    summary_note: req.summary_note,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_upserts.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send UpsertArtifact: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(Ok(summary))) => Ok(summary),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while saving artifact".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_upserts.remove(&req_id);
+                    }
+                    Err("Timed out waiting for artifact update".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "upsert_artifact task cancelled".to_string())?
+    }
+
+    pub fn upsert_artifact_blocking(
+        self: &Arc<Self>,
+        req: UpsertArtifactRequest,
+    ) -> Result<ArtifactSummary, String> {
+        let core = Arc::clone(self);
+        self.runtime
+            .block_on(async move { core.upsert_artifact_async(req).await })
+    }
+
+    pub async fn delete_artifact_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+    ) -> Result<String, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_id = artifact_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_deletes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::DeleteArtifact {
+                    request_id: req_id,
+                    artifact_id: owned_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_deletes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send DeleteArtifact: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(deleted_id))) => Ok(deleted_id),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while deleting artifact".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_deletes.remove(&req_id);
+                    }
+                    Err("Timed out waiting for artifact deletion".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "delete_artifact task cancelled".to_string())?
+    }
+
+    pub fn delete_artifact_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+    ) -> Result<String, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        let aid = artifact_id.to_string();
+        self.runtime
+            .block_on(async move { core.delete_artifact_async(&host, &aid).await })
     }
 
     // --- Universal ACP Agent Registry & Live Probing ---
@@ -10117,6 +10681,22 @@ fn clear_pending_queue_op_by_req(
     changed
 }
 
+fn upsert_cached_artifact(list: &mut Vec<ArtifactSummary>, artifact: ArtifactSummary) {
+    if let Some(slot) = list
+        .iter_mut()
+        .find(|existing| existing.artifact_id == artifact.artifact_id)
+    {
+        *slot = artifact;
+    } else {
+        list.insert(0, artifact);
+    }
+    list.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.artifact_id.cmp(&b.artifact_id))
+    });
+}
+
 fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_attachment_acks.drain() {
         let _ = tx.send(Err(reason.to_string()));
@@ -10149,6 +10729,19 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_acp_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, (_, tx)) in h.pending_artifact_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.unsolicited_unfiltered_artifact_reqs.clear();
+    for (_, tx) in h.pending_artifact_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_artifact_upserts.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_artifact_deletes.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {
@@ -14769,6 +15362,119 @@ mod tests {
             counter.timeline.load(Ordering::Relaxed),
             0,
             "metadata-only update_agent_full must not force TimelineChanged"
+        );
+    }
+
+    #[test]
+    fn historical_artifact_read_never_downgrades_cache_and_unknown_snapshot_merges() {
+        use orbit_protocol::{ArtifactDetail, ArtifactKind, ArtifactRevisionMeta, ArtifactSummary};
+
+        let core = OrbitAppCore::open_in_memory().expect("open");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = orbit_crypto::PairingOffer {
+            host_id: "host_art".into(),
+            hostname: "art-box".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "secret".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let now = Utc::now();
+        let art_a_v5 = ArtifactSummary {
+            artifact_id: "art_a".into(),
+            workspace_id: "ws_1".into(),
+            agent_id: Some("ag_1".into()),
+            title: "Dashboard".into(),
+            kind: ArtifactKind::Html,
+            language: Some("html".into()),
+            mime_type: Some("text/html".into()),
+            resource_uri: None,
+            version: 5,
+            byte_len: 100,
+            created_at: now,
+            updated_at: now,
+        };
+        let art_b_v1 = ArtifactSummary {
+            artifact_id: "art_b".into(),
+            workspace_id: "ws_2".into(),
+            agent_id: Some("ag_2".into()),
+            title: "Spec".into(),
+            kind: ArtifactKind::Markdown,
+            language: None,
+            mime_type: Some("text/markdown".into()),
+            resource_uri: None,
+            version: 1,
+            byte_len: 50,
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Seed host cache via registered unsolicited unfiltered ListArtifacts request
+        let init_req_id = Uuid::new_v4();
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            hosts
+                .get_mut("host_art")
+                .expect("host")
+                .unsolicited_unfiltered_artifact_reqs
+                .insert(init_req_id);
+        }
+        core.handle_inbound_wire(
+            "host_art",
+            WireMessage::ArtifactsSnapshot {
+                request_id: init_req_id,
+                artifacts: vec![art_a_v5.clone(), art_b_v1.clone()],
+            },
+        );
+        assert_eq!(core.cached_artifacts("host_art", None, None).len(), 2);
+
+        // 1. Reading historical v1 of art_a (latest is v5) must NOT downgrade cache to v1
+        let mut art_a_v1_summary = art_a_v5.clone();
+        art_a_v1_summary.version = 1;
+        core.handle_inbound_wire(
+            "host_art",
+            WireMessage::ArtifactContent {
+                request_id: Uuid::new_v4(),
+                artifact: ArtifactDetail {
+                    summary: art_a_v1_summary,
+                    content: "<div>old v1</div>".into(),
+                    revisions: vec![
+                        ArtifactRevisionMeta {
+                            version: 5,
+                            created_at: now,
+                            summary_note: None,
+                            byte_len: 100,
+                        },
+                        ArtifactRevisionMeta {
+                            version: 1,
+                            created_at: now,
+                            summary_note: None,
+                            byte_len: 17,
+                        },
+                    ],
+                },
+            },
+        );
+        let after_hist = core.cached_artifacts("host_art", Some("ws_1"), None);
+        assert_eq!(after_hist.len(), 1);
+        assert_eq!(after_hist[0].version, 5);
+
+        // 2. Late/unknown timed-out filtered snapshot for ws_1 must merge, NOT wipe ws_2!
+        core.handle_inbound_wire(
+            "host_art",
+            WireMessage::ArtifactsSnapshot {
+                request_id: Uuid::new_v4(),
+                artifacts: vec![art_a_v5],
+            },
+        );
+        let after_late = core.cached_artifacts("host_art", None, None);
+        assert_eq!(
+            after_late.len(),
+            2,
+            "unknown/late filtered snapshot must not wipe other workspaces' cached artifacts"
         );
     }
 }

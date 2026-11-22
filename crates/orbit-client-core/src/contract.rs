@@ -4,8 +4,8 @@
 //! - HarmonyOS N-API (`crates/orbit-ffi-ohos`)
 
 use orbit_protocol::{
-    AcpAgentAvailability, ForkTarget, NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort,
-    SessionMode, WorkspaceSummary, WorktreeHandoffDirection, WorktreeHandoffMode,
+    AcpAgentAvailability, ArtifactKind, ForkTarget, NestedGitRepo, PromptBadge, ProviderKind,
+    ReasoningEffort, SessionMode, WorkspaceSummary, WorktreeHandoffDirection, WorktreeHandoffMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -326,4 +326,25 @@ pub struct ExecuteWorktreeHandoffRequest {
     pub branch: Option<String>,
     #[serde(default)]
     pub allow_three_way_conflicts: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertArtifactRequest {
+    pub host_id: String,
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    pub workspace_id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    pub title: String,
+    pub kind: ArtifactKind,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub resource_uri: Option<String>,
+    pub content: String,
+    #[serde(default)]
+    pub summary_note: Option<String>,
 }

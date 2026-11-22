@@ -42,7 +42,7 @@ use orbit_client_core::contract::{
     DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, FleetSidebarRequest,
     ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, MentionRankRequest,
     ModelSelectionRequest, PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest,
-    RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
+    RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest, UpsertArtifactRequest,
     WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
@@ -61,10 +61,10 @@ use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
-    OrchestrationConfig, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
-    ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode, WorkspaceBoardSnapshot,
-    WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome,
-    WorktreeHandoffPreview,
+    ArtifactDetail, ArtifactSummary, OrchestrationConfig, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
+    ScheduleTarget, SessionMode, WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation,
+    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -1084,6 +1084,52 @@ fn upsert_profile(state: State<'_, DesktopAppState>, host_id: String, profile: A
 #[tauri::command]
 fn delete_profile(state: State<'_, DesktopAppState>, host_id: String, profile_id: String) {
     state.core.delete_profile(&host_id, &profile_id);
+}
+
+#[tauri::command]
+async fn list_artifacts(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: Option<String>,
+    agent_id: Option<String>,
+) -> Result<Vec<ArtifactSummary>, String> {
+    state
+        .core
+        .list_artifacts_async(&host_id, workspace_id, agent_id)
+        .await
+}
+
+#[tauri::command]
+async fn get_artifact(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    artifact_id: String,
+    version: Option<u32>,
+) -> Result<ArtifactDetail, String> {
+    state
+        .core
+        .get_artifact_async(&host_id, &artifact_id, version)
+        .await
+}
+
+#[tauri::command]
+async fn upsert_artifact(
+    state: State<'_, DesktopAppState>,
+    request: UpsertArtifactRequest,
+) -> Result<ArtifactSummary, String> {
+    state.core.upsert_artifact_async(request).await
+}
+
+#[tauri::command]
+async fn delete_artifact(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    artifact_id: String,
+) -> Result<String, String> {
+    state
+        .core
+        .delete_artifact_async(&host_id, &artifact_id)
+        .await
 }
 
 #[tauri::command]
@@ -2394,6 +2440,10 @@ pub fn run() {
             stop_workspace_script,
             upsert_profile,
             delete_profile,
+            list_artifacts,
+            get_artifact,
+            upsert_artifact,
+            delete_artifact,
             list_acp_agents,
             refresh_acp_agents,
             upsert_custom_acp_agent,

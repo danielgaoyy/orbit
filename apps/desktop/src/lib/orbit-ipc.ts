@@ -103,6 +103,50 @@ export interface AcpProbeResult {
   latency_ms: number;
   error?: string | null;
 }
+
+export type ArtifactKind = "markdown" | "html" | "code" | "svg" | "mermaid" | "mcp_app";
+
+export interface ArtifactSummary {
+  artifact_id: string;
+  workspace_id: string;
+  agent_id?: string | null;
+  title: string;
+  kind: ArtifactKind;
+  language?: string | null;
+  mime_type?: string | null;
+  resource_uri?: string | null;
+  version: number;
+  byte_len: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ArtifactRevisionMeta {
+  version: number;
+  created_at: string;
+  summary_note?: string | null;
+  byte_len: number;
+}
+
+export interface ArtifactDetail {
+  summary: ArtifactSummary;
+  content: string;
+  revisions: ArtifactRevisionMeta[];
+}
+
+export interface UpsertArtifactRequest {
+  host_id: string;
+  artifact_id?: string | null;
+  workspace_id: string;
+  agent_id?: string | null;
+  title: string;
+  kind: ArtifactKind;
+  language?: string | null;
+  mime_type?: string | null;
+  resource_uri?: string | null;
+  content: string;
+  summary_note?: string | null;
+}
 export type ReasoningEffort =
   | "off"
   | "low"
@@ -924,6 +968,7 @@ export interface HostDetailView {
   workspace_organize_status?: Record<string, WorkspaceOrganizeEvent>;
   host_sync_state?: HostSyncState | null;
   acp_agents?: AcpAgentAvailability[];
+  artifacts?: ArtifactSummary[];
 }
 
 export interface InlineSpanView {
@@ -2644,6 +2689,48 @@ export const orbitIpc = {
   deleteProfile: async (hostId: string, profileId: string): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("delete_profile", { hostId, profileId });
+  },
+
+  listArtifacts: async (
+    hostId: string,
+    workspaceId?: string | null,
+    agentId?: string | null,
+  ): Promise<ArtifactSummary[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ArtifactSummary[]>("list_artifacts", {
+      hostId,
+      workspaceId: workspaceId ?? null,
+      agentId: agentId ?? null,
+    });
+  },
+
+  getArtifact: async (
+    hostId: string,
+    artifactId: string,
+    version?: number | null,
+  ): Promise<ArtifactDetail> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<ArtifactDetail>("get_artifact", {
+      hostId,
+      artifactId,
+      version: version ?? null,
+    });
+  },
+
+  upsertArtifact: async (request: UpsertArtifactRequest): Promise<ArtifactSummary> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<ArtifactSummary>("upsert_artifact", { request });
+  },
+
+  deleteArtifact: async (hostId: string, artifactId: string): Promise<string> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<string>("delete_artifact", { hostId, artifactId });
   },
 
   listAcpAgents: async (hostId: string): Promise<AcpAgentAvailability[]> => {

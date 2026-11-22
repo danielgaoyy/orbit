@@ -123,6 +123,8 @@ pub enum DaemonBroadcast {
     WorkspaceOrganizeProgress(WorkspaceOrganizeEvent),
     KeepAwakeStatusUpdated(KeepAwakeStatus),
     AcpAgentsUpdated(Vec<orbit_protocol::AcpAgentAvailability>),
+    ArtifactUpdated(orbit_protocol::ArtifactSummary),
+    ArtifactDeleted(String),
 }
 
 struct LiveAgentEntry {
@@ -4610,22 +4612,66 @@ impl AgentOrchestrator {
                 item_id,
                 text,
                 streaming,
-            } => TimelinePayload::AssistantMessage {
-                item_id,
-                text,
-                streaming,
-            },
+            } => {
+                if !streaming {
+                    let mgr = Arc::clone(self);
+                    let aid = agent_id.to_string();
+                    let text_clone = text.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = mgr.auto_extract_artifacts_from_message(&aid, &text_clone);
+                    });
+                }
+                TimelinePayload::AssistantMessage {
+                    item_id,
+                    text,
+                    streaming,
+                }
+            }
             DriverEvent::ToolCall {
                 call_id,
                 status,
                 detail,
                 background_task,
             } => {
-                if status == ToolCallStatus::Completed
-                    && let ToolCallDetail::FileEdit { ref path, .. } = detail
-                {
-                    self.record_file_edit_and_check_conflict(agent_id, path)
-                        .await;
+                if status == ToolCallStatus::Completed {
+                    match &detail {
+                        ToolCallDetail::FileEdit { path, .. } => {
+                            self.record_file_edit_and_check_conflict(agent_id, path)
+                                .await;
+                        }
+                        ToolCallDetail::Generic {
+                            tool_name,
+                            arguments_json,
+                        } if !crate::artifacts::is_orbit_artifact_mcp_tool(tool_name)
+                            && arguments_json.contains("ui://") =>
+                        {
+                            let mgr = Arc::clone(self);
+                            let aid = agent_id.to_string();
+                            let tname = tool_name.clone();
+                            let payload_json = arguments_json.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = mgr.auto_extract_artifacts_from_tool_call(
+                                    &aid,
+                                    &tname,
+                                    &payload_json,
+                                );
+                            });
+                        }
+                        ToolCallDetail::Shell {
+                            output_preview: Some(out),
+                            ..
+                        } if out.contains("ui://") => {
+                            let mgr = Arc::clone(self);
+                            let aid = agent_id.to_string();
+                            let out_clone = out.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = mgr.auto_extract_artifacts_from_tool_call(
+                                    &aid, "shell", &out_clone,
+                                );
+                            });
+                        }
+                        _ => {}
+                    }
                 }
                 TimelinePayload::ToolCall {
                     call_id,

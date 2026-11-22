@@ -35,7 +35,8 @@ use orbit_client_core::contract::{
     MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest,
     ReadWorkspaceFileRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest, RenderDiagramView,
     RewindAgentRequest, SendPromptRequest, SpawnWorkspacePeerRequest, UpdateHostConfigRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    UpsertArtifactRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WriteWorkspaceFileRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, DiagramTheme, detect_diagram_kind as core_detect_diagram_kind,
@@ -63,9 +64,10 @@ use orbit_client_core::stage::{
 use orbit_client_core::{HostConnectionState, HostRouteMode};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSource, AcpAgentSpec, AcpProbeResult, AgentMessageKind,
-    AttentionState, DirectoryEntry, DiscoveredProject, ForkTarget, HandoffFileChange,
-    NestedGitRepo, PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog,
-    ProviderModelSpec, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    ArtifactDetail, ArtifactKind, ArtifactRevisionMeta, ArtifactSummary, AttentionState,
+    DirectoryEntry, DiscoveredProject, ForkTarget, HandoffFileChange, NestedGitRepo,
+    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
     ProviderSubagentStatus, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
     ScheduleNewAgentConfig, ScheduleRunRecord, ScheduleRunStatus, ScheduleSpec, ScheduleStatus,
     ScheduleTarget, SessionMode, TerminalSummary, ThinkingOptionSpec, TimelinePayload,
@@ -1475,6 +1477,7 @@ pub struct FfiHostDetail {
     pub workspace_events: HashMap<String, Vec<FfiWorkspaceEvent>>,
     pub workspace_organize_status: HashMap<String, FfiWorkspaceOrganizeStatus>,
     pub acp_agents: Vec<FfiAcpAgentAvailability>,
+    pub artifacts: Vec<FfiArtifactSummary>,
 }
 
 impl From<HostDetailView> for FfiHostDetail {
@@ -1538,6 +1541,147 @@ impl From<HostDetailView> for FfiHostDetail {
                 .map(|(k, val)| (k, val.into()))
                 .collect(),
             acp_agents: v.acp_agents.into_iter().map(Into::into).collect(),
+            artifacts: v.artifacts.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiArtifactKind {
+    Markdown,
+    Html,
+    Code,
+    Svg,
+    Mermaid,
+    McpApp,
+}
+
+impl From<ArtifactKind> for FfiArtifactKind {
+    fn from(v: ArtifactKind) -> Self {
+        match v {
+            ArtifactKind::Markdown => Self::Markdown,
+            ArtifactKind::Html => Self::Html,
+            ArtifactKind::Code => Self::Code,
+            ArtifactKind::Svg => Self::Svg,
+            ArtifactKind::Mermaid => Self::Mermaid,
+            ArtifactKind::McpApp => Self::McpApp,
+        }
+    }
+}
+
+impl From<FfiArtifactKind> for ArtifactKind {
+    fn from(v: FfiArtifactKind) -> Self {
+        match v {
+            FfiArtifactKind::Markdown => Self::Markdown,
+            FfiArtifactKind::Html => Self::Html,
+            FfiArtifactKind::Code => Self::Code,
+            FfiArtifactKind::Svg => Self::Svg,
+            FfiArtifactKind::Mermaid => Self::Mermaid,
+            FfiArtifactKind::McpApp => Self::McpApp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiArtifactSummary {
+    pub artifact_id: String,
+    pub workspace_id: String,
+    pub agent_id: Option<String>,
+    pub title: String,
+    pub kind: FfiArtifactKind,
+    pub language: Option<String>,
+    pub mime_type: Option<String>,
+    pub resource_uri: Option<String>,
+    pub version: u32,
+    pub byte_len: u64,
+    pub created_at_rfc3339: String,
+    pub updated_at_rfc3339: String,
+}
+
+impl From<ArtifactSummary> for FfiArtifactSummary {
+    fn from(v: ArtifactSummary) -> Self {
+        Self {
+            artifact_id: v.artifact_id,
+            workspace_id: v.workspace_id,
+            agent_id: v.agent_id,
+            title: v.title,
+            kind: v.kind.into(),
+            language: v.language,
+            mime_type: v.mime_type,
+            resource_uri: v.resource_uri,
+            version: v.version,
+            byte_len: v.byte_len as u64,
+            created_at_rfc3339: v.created_at.to_rfc3339(),
+            updated_at_rfc3339: v.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiArtifactRevisionMeta {
+    pub version: u32,
+    pub created_at_rfc3339: String,
+    pub summary_note: Option<String>,
+    pub byte_len: u64,
+}
+
+impl From<ArtifactRevisionMeta> for FfiArtifactRevisionMeta {
+    fn from(v: ArtifactRevisionMeta) -> Self {
+        Self {
+            version: v.version,
+            created_at_rfc3339: v.created_at.to_rfc3339(),
+            summary_note: v.summary_note,
+            byte_len: v.byte_len as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiArtifactDetail {
+    pub summary: FfiArtifactSummary,
+    pub content: String,
+    pub revisions: Vec<FfiArtifactRevisionMeta>,
+}
+
+impl From<ArtifactDetail> for FfiArtifactDetail {
+    fn from(v: ArtifactDetail) -> Self {
+        Self {
+            summary: v.summary.into(),
+            content: v.content,
+            revisions: v.revisions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiUpsertArtifactRequest {
+    pub host_id: String,
+    pub artifact_id: Option<String>,
+    pub workspace_id: String,
+    pub agent_id: Option<String>,
+    pub title: String,
+    pub kind: FfiArtifactKind,
+    pub language: Option<String>,
+    pub mime_type: Option<String>,
+    pub resource_uri: Option<String>,
+    pub content: String,
+    pub summary_note: Option<String>,
+}
+
+impl From<FfiUpsertArtifactRequest> for UpsertArtifactRequest {
+    fn from(v: FfiUpsertArtifactRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            artifact_id: v.artifact_id,
+            workspace_id: v.workspace_id,
+            agent_id: v.agent_id,
+            title: v.title,
+            kind: v.kind.into(),
+            language: v.language,
+            mime_type: v.mime_type,
+            resource_uri: v.resource_uri,
+            content: v.content,
+            summary_note: v.summary_note,
         }
     }
 }
@@ -5566,6 +5710,52 @@ impl OrbitMobileCore {
         self.inner
             .git_repos_inspection(&host_id, &path)
             .map(Into::into)
+    }
+
+    // --- First-Class Artifacts & SEP-1865 MCP Apps ---
+
+    pub fn list_artifacts(
+        &self,
+        host_id: String,
+        workspace_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<Vec<FfiArtifactSummary>, FfiOrbitError> {
+        self.inner
+            .list_artifacts_blocking(&host_id, workspace_id, agent_id)
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn get_artifact(
+        &self,
+        host_id: String,
+        artifact_id: String,
+        version: Option<u32>,
+    ) -> Result<FfiArtifactDetail, FfiOrbitError> {
+        self.inner
+            .get_artifact_blocking(&host_id, &artifact_id, version)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn upsert_artifact(
+        &self,
+        req: FfiUpsertArtifactRequest,
+    ) -> Result<FfiArtifactSummary, FfiOrbitError> {
+        self.inner
+            .upsert_artifact_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn delete_artifact(
+        &self,
+        host_id: String,
+        artifact_id: String,
+    ) -> Result<String, FfiOrbitError> {
+        self.inner
+            .delete_artifact_blocking(&host_id, &artifact_id)
+            .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
     // --- Universal ACP Agent Registry & Probing ---

@@ -1,5 +1,9 @@
 import { useSyncExternalStore } from "react";
 import {
+  createDraftPersistenceController,
+  hasNonEmptyScopeDraft,
+} from "@/lib/draft-persistence";
+import {
   normalizeLineRange,
   normalizeWorkspacePathCandidate,
   registerOrbitLinkOpener,
@@ -641,6 +645,7 @@ interface OrbitStoreHmrData {
   state?: OrbitUiState;
   terminalChannels?: Map<string, TerminalStreamChannel>;
   wasInitialized?: boolean;
+  draftUpdatedAtByScope?: Record<string, number>;
 }
 
 const viteHot = (
@@ -652,6 +657,12 @@ const viteHot = (
   }
 ).hot;
 const hmrData = viteHot?.data;
+
+const draftPersistence = createDraftPersistenceController(() => state);
+const initialDrafts = draftPersistence.hydrate(initialPrefs.archivedThreads);
+if (hmrData?.draftUpdatedAtByScope) {
+  draftPersistence.restoreUpdatedAtByScope(hmrData.draftUpdatedAtByScope);
+}
 
 const defaultInitialState: OrbitUiState = {
   fleet: { revision: 0, total_pending_approvals: 0, hosts: [], projects: [] },
@@ -682,12 +693,12 @@ const defaultInitialState: OrbitUiState = {
   draftWorkspaceId: null,
   gitReposCache: {},
 
-  composerDrafts: {},
-  slashDirectives: {},
+  composerDrafts: initialDrafts.composerDrafts,
+  slashDirectives: initialDrafts.slashDirectives,
   inlineMentions: {},
   contextItems: {},
-  pastedAttachments: {},
-  diffQuotes: {},
+  pastedAttachments: initialDrafts.pastedAttachments,
+  diffQuotes: initialDrafts.diffQuotes,
   queuedPrompts: {},
   workspaceFilesCache: {},
   promptHistory: initialPrefs.promptHistory ?? [],
@@ -704,7 +715,7 @@ const defaultInitialState: OrbitUiState = {
   activeSidePanelTabId: null,
   fileViewCache: {},
   sideQuestionsByScope: {},
-  sideQuestionDrafts: {},
+  sideQuestionDrafts: initialDrafts.sideQuestionDrafts,
   sideQuestionFocusNonce: 0,
   sidePanelLaunchpadFocusNonce: 0,
 
@@ -811,6 +822,7 @@ let state: OrbitUiState = hmrData?.state
 
 const listeners = new Set<() => void>();
 const composerDraftListeners = new Set<() => void>();
+const draftPresenceListeners = new Set<() => void>();
 const composerFocusListeners = new Set<() => void>();
 
 const autoUpgradeAttempted = new Map<string, string>();
@@ -992,6 +1004,75 @@ function emitComposerDraftChange(): void {
   }
 }
 
+function emitDraftPresenceChange(): void {
+  if (disposed) return;
+  for (const l of draftPresenceListeners) {
+    l();
+  }
+}
+
+function collectChangedRecordKeys<T>(
+  prev: Record<string, T>,
+  next: Record<string, T>,
+  out: Set<string>,
+): void {
+  if (prev === next) return;
+  for (const k of Object.keys(next)) {
+    if (prev[k] !== next[k]) out.add(k);
+  }
+  for (const k of Object.keys(prev)) {
+    if (!(k in next)) out.add(k);
+  }
+}
+
+function syncDraftMutations(prev: OrbitUiState, next: OrbitUiState): void {
+  if (
+    prev.composerDrafts === next.composerDrafts &&
+    prev.pastedAttachments === next.pastedAttachments &&
+    prev.diffQuotes === next.diffQuotes &&
+    prev.slashDirectives === next.slashDirectives &&
+    prev.sideQuestionDrafts === next.sideQuestionDrafts
+  ) {
+    return;
+  }
+
+  const changedKeys = new Set<string>();
+  collectChangedRecordKeys(prev.composerDrafts, next.composerDrafts, changedKeys);
+  collectChangedRecordKeys(prev.pastedAttachments, next.pastedAttachments, changedKeys);
+  collectChangedRecordKeys(prev.diffQuotes, next.diffQuotes, changedKeys);
+  collectChangedRecordKeys(prev.slashDirectives, next.slashDirectives, changedKeys);
+  collectChangedRecordKeys(prev.sideQuestionDrafts, next.sideQuestionDrafts, changedKeys);
+
+  if (changedKeys.size === 0) return;
+
+  const dirtyKeys: string[] = [];
+  const clearedKeys: string[] = [];
+  let presenceChanged = false;
+
+  for (const key of changedKeys) {
+    const hadDraft = hasNonEmptyScopeDraft(prev, key);
+    const hasDraft = hasNonEmptyScopeDraft(next, key);
+    if (hadDraft !== hasDraft) {
+      presenceChanged = true;
+    }
+    if (hasDraft) {
+      dirtyKeys.push(key);
+    } else {
+      clearedKeys.push(key);
+    }
+  }
+
+  if (dirtyKeys.length > 0) {
+    draftPersistence.markDirty(dirtyKeys);
+  }
+  if (clearedKeys.length > 0) {
+    draftPersistence.removeScopes(clearedKeys, false);
+  }
+  if (presenceChanged) {
+    emitDraftPresenceChange();
+  }
+}
+
 function setState(updater: (prev: OrbitUiState) => OrbitUiState, persist = false): void {
   if (disposed) return;
   const prev = state;
@@ -1001,6 +1082,7 @@ function setState(updater: (prev: OrbitUiState) => OrbitUiState, persist = false
   if (persist) {
     scheduleSavePrefs();
   }
+  syncDraftMutations(prev, next);
   if (next.composerDrafts !== prev.composerDrafts) {
     emitComposerDraftChange();
   }
@@ -2866,6 +2948,7 @@ export const orbitActions = {
   setComposerDraft(text: string): void {
     const key = composerScopeKey(state);
     if ((state.composerDrafts[key] ?? "") === text) return;
+    const prev = state;
     // Update draft slice without broadcasting global `emitChange()` across unrelated components
     state = {
       ...state,
@@ -2874,6 +2957,16 @@ export const orbitActions = {
         [key]: text,
       },
     };
+    const hadDraft = hasNonEmptyScopeDraft(prev, key);
+    const hasDraft = hasNonEmptyScopeDraft(state, key);
+    if (hasDraft) {
+      draftPersistence.markDirty(key);
+    } else {
+      draftPersistence.removeScopes([key], false);
+    }
+    if (hadDraft !== hasDraft) {
+      emitDraftPresenceChange();
+    }
     emitComposerDraftChange();
   },
 
@@ -3351,6 +3444,7 @@ export const orbitActions = {
         ...s,
         composerDrafts: { ...s.composerDrafts, [key]: "" },
       }));
+      draftPersistence.flushNow();
       orbitActions.openSideQuestionTab();
       if (composed.btw_question) {
         void orbitActions.submitSideQuestion(composed.btw_question);
@@ -3368,6 +3462,7 @@ export const orbitActions = {
         composerDrafts: { ...s.composerDrafts, [key]: "" },
         slashDirectives: { ...s.slashDirectives, [key]: null },
       }));
+      draftPersistence.flushNow();
       await orbitIpc.sendPrompt(hostId, state.selectedAgentId, composed.wire_prompt, {
         displayPrompt: composed.display_prompt,
         badges: composed.badges,
@@ -3443,6 +3538,7 @@ export const orbitActions = {
       }),
       true,
     );
+    draftPersistence.flushNow();
 
     if (state.isDraftNewSession || !state.selectedAgentId) {
       const hostDetailForCreate = state.hostDetails[hostId];
@@ -4107,6 +4203,7 @@ export const orbitActions = {
       fallbackAgentId = nextCandidate?.agent_id ?? null;
     }
 
+    const archivedKeySet = new Set([tKey]);
     setState(
       (s) => ({
         ...s,
@@ -4119,6 +4216,11 @@ export const orbitActions = {
             archivedAtMs: Date.now(),
           },
         },
+        composerDrafts: omitRecordKeys(s.composerDrafts, archivedKeySet),
+        slashDirectives: omitRecordKeys(s.slashDirectives, archivedKeySet),
+        pastedAttachments: omitRecordKeys(s.pastedAttachments, archivedKeySet),
+        diffQuotes: omitRecordKeys(s.diffQuotes, archivedKeySet),
+        sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, archivedKeySet),
         ...(wasSelected && !fallbackAgentId
           ? {
               selectedAgentId: null,
@@ -4128,6 +4230,7 @@ export const orbitActions = {
       }),
       true,
     );
+    draftPersistence.removeScopes(archivedKeySet, true);
 
     void orbitIpc.archiveAgent(hostId, agentId);
     orbitActions.refreshSidebarView();
@@ -4215,11 +4318,13 @@ export const orbitActions = {
           diffQuotes: omitRecordKeys(s.diffQuotes, deletedThreadKeys),
           queuedPrompts: omitRecordKeys(s.queuedPrompts, deletedThreadKeys),
           sideQuestionsByScope: omitRecordKeys(s.sideQuestionsByScope, deletedThreadKeys),
+          sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, deletedThreadKeys),
           rewoundSessions: omitRecordKeys(s.rewoundSessions, deletedThreadKeys),
         };
       },
       true,
     );
+    draftPersistence.removeScopes(deletedThreadKeys, true);
 
     for (const tKey of deletedThreadKeys) {
       lastReportedSeenSeq.delete(tKey);
@@ -4289,6 +4394,8 @@ export const orbitActions = {
         delete nextQueued[tKey];
         const nextSideQ = { ...s.sideQuestionsByScope };
         delete nextSideQ[tKey];
+        const nextSideQDrafts = { ...s.sideQuestionDrafts };
+        delete nextSideQDrafts[tKey];
         const nextRewound = { ...s.rewoundSessions };
         delete nextRewound[tKey];
         return {
@@ -4304,12 +4411,14 @@ export const orbitActions = {
           diffQuotes: nextQuotes,
           queuedPrompts: nextQueued,
           sideQuestionsByScope: nextSideQ,
+          sideQuestionDrafts: nextSideQDrafts,
           rewoundSessions: nextRewound,
           ...(wasSelected ? { selectedAgentId: null, isDraftNewSession: true } : {}),
         };
       },
       true,
     );
+    draftPersistence.removeScopes([tKey], true);
 
     lastReportedSeenSeq.delete(tKey);
     stagePullGates.delete(tKey);
@@ -4670,8 +4779,10 @@ export const orbitActions = {
           pastedAttachments: omitRecordKeys(s.pastedAttachments, deletedThreadKeys),
           diffQuotes: omitRecordKeys(s.diffQuotes, deletedThreadKeys),
           queuedPrompts: omitRecordKeys(s.queuedPrompts, deletedThreadKeys),
+          sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, deletedThreadKeys),
         };
       }, true);
+      draftPersistence.removeScopes(deletedThreadKeys, true);
 
       await orbitActions.reloadFleetOnly();
       await orbitActions.reloadHostDetail(hostId, false);
@@ -5434,6 +5545,7 @@ export const orbitActions = {
         [scope]: [...(s.sideQuestionsByScope[scope] ?? []), newEntry],
       },
     }));
+    draftPersistence.flushNow();
 
     let accumText = "";
     let parseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -6735,6 +6847,10 @@ if (hmrData?.wasInitialized) {
 
 if (viteHot) {
   viteHot.dispose((data) => {
+    draftPersistence.flushNow();
+    data.draftUpdatedAtByScope = draftPersistence.exportUpdatedAtByScope();
+    draftPersistence.dispose();
+
     disposed = true;
     data.state = state;
     data.terminalChannels = terminalChannels;
@@ -6797,6 +6913,17 @@ function subscribeComposerDraft(onDraftChange: () => void): () => void {
   };
 }
 
+function subscribeDraftPresence(onPresenceChange: () => void): () => void {
+  draftPresenceListeners.add(onPresenceChange);
+  return () => {
+    draftPresenceListeners.delete(onPresenceChange);
+  };
+}
+
+function noopSubscribe(): () => void {
+  return () => {};
+}
+
 export function useOrbitSelector<T>(selector: (s: OrbitUiState) => T): T {
   return useSyncExternalStore(subscribeStore, () => selector(state));
 }
@@ -6809,5 +6936,17 @@ export function useComposerDraft(scopeKey: string): string {
   return useSyncExternalStore(
     subscribeComposerDraft,
     () => state.composerDrafts[scopeKey] ?? "",
+  );
+}
+
+/**
+ * Ultra-lightweight boolean subscription for sidebar thread rows:
+ * Fires ONLY when a scope transitions between empty and non-empty unsent draft (never per-keystroke),
+ * and skips subscription completely while a row is `selected` (`enabled = false`).
+ */
+export function useHasThreadDraft(scopeKey: string, enabled = true): boolean {
+  return useSyncExternalStore(
+    enabled ? subscribeDraftPresence : noopSubscribe,
+    () => (enabled ? hasNonEmptyScopeDraft(state, scopeKey) : false),
   );
 }

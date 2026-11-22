@@ -49,9 +49,9 @@ use orbit_client_core::contract::{
     RenderDiagramView, SaveInstructionFileRequest, SearchWorkspaceSymbolsRequest,
     SpawnWorkspacePeerRequest, UpsertArtifactRequest, UpsertExternalMcpServerRequest,
     UpsertPathRuleRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
-    WorkspaceSymbolsView,
-    WriteWorkspaceFileRequest,
+    WorkspaceSymbolsView, WriteWorkspaceFileRequest,
 };
+use orbit_client_core::app_core::LifecycleHooksSnapshotView;
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
     detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
@@ -70,11 +70,12 @@ use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnVie
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
     ArtifactDetail, ArtifactSummary, ContextOccupancyBreakdown, ExternalMcpServerRecord,
-    LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult,
-    OrchestrationConfig, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
-    ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope,
-    UsageInsightsSnapshot, WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation,
-    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    HookExecutionRecord, HookScope, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus,
+    LspSymbolInfo, ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge,
+    ProviderKind, ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
+    ScheduleTarget, SessionMode, SkillWriteScope, UsageInsightsSnapshot, WorkspaceBoardSnapshot,
+    WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome,
+    WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -2068,6 +2069,69 @@ async fn get_context_occupancy(
 }
 
 #[tauri::command]
+async fn list_lifecycle_hooks(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+) -> Result<LifecycleHooksSnapshotView, String> {
+    state.core.list_lifecycle_hooks_on_host(&host_id, cwd).await
+}
+
+#[tauri::command]
+async fn upsert_lifecycle_hook(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+    hook: LifecycleHookRule,
+) -> Result<LifecycleHooksSnapshotView, String> {
+    state
+        .core
+        .upsert_lifecycle_hook_on_host(&host_id, cwd, hook)
+        .await
+}
+
+#[tauri::command]
+async fn delete_lifecycle_hook(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+    hook_id: String,
+    scope: HookScope,
+) -> Result<LifecycleHooksSnapshotView, String> {
+    state
+        .core
+        .delete_lifecycle_hook_on_host(&host_id, cwd, hook_id, scope)
+        .await
+}
+
+#[tauri::command]
+async fn set_project_hooks_trust(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    trusted: bool,
+) -> Result<LifecycleHooksSnapshotView, String> {
+    state
+        .core
+        .set_project_hooks_trust_on_host(&host_id, cwd, trusted)
+        .await
+}
+
+#[tauri::command]
+async fn test_lifecycle_hook(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+    hook_id: String,
+    sample_payload: serde_json::Value,
+) -> Result<HookExecutionRecord, String> {
+    state
+        .core
+        .test_lifecycle_hook_on_host(&host_id, cwd, hook_id, sample_payload)
+        .await
+}
+
+#[tauri::command]
 async fn highlight_workspace_code(
     language: String,
     content: String,
@@ -2937,6 +3001,11 @@ pub fn run() {
             restart_lsp_server,
             get_usage_insights,
             get_context_occupancy,
+            list_lifecycle_hooks,
+            upsert_lifecycle_hook,
+            delete_lifecycle_hook,
+            set_project_hooks_trust,
+            test_lifecycle_hook,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

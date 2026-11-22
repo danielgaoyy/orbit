@@ -1620,6 +1620,7 @@ mod tests {
         let listen_port = Arc::new(tokio::sync::RwLock::new(0u16));
         let scripts = crate::workspace_runtime::WorkspaceScriptRegistry::new();
         let keep_awake = Arc::new(crate::keep_awake::KeepAwakeManager::new(false));
+        let hooks = crate::hooks::HooksEngine::new(dir.clone());
         let mgr = AgentOrchestrator::new(
             dir,
             "host_test".into(),
@@ -1630,6 +1631,7 @@ mod tests {
             scripts,
             keep_awake,
             Arc::new(tokio::sync::RwLock::new(None)),
+            hooks,
         )
         .await;
         (mgr, store)

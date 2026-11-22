@@ -2169,6 +2169,67 @@ export function timelineItemLogicalKey(item: TimelineItemView): string {
   }
 }
 
+export type HookEventKind =
+  | "session_start"
+  | "pre_prompt_submit"
+  | "pre_tool_use"
+  | "post_tool_use"
+  | "post_file_edit"
+  | "notification"
+  | "turn_stop"
+  | "session_end";
+
+export type HookScope = "user_global" | "project_orbit";
+
+export type HookDecision = "allow" | "block" | "modify";
+
+export type HookAction =
+  | {
+      type: "command";
+      command: string;
+      args: string[];
+      env: Record<string, string>;
+    }
+  | {
+      type: "http_webhook";
+      url: string;
+      headers: Record<string, string>;
+    };
+
+export interface LifecycleHookRule {
+  id: string;
+  name: string;
+  scope: HookScope;
+  event: HookEventKind;
+  matcher?: string | null;
+  action: HookAction;
+  timeout_ms: number;
+  enabled: boolean;
+  trusted: boolean;
+  description?: string | null;
+}
+
+export interface HookExecutionRecord {
+  id: string;
+  hook_id: string;
+  hook_name: string;
+  event: HookEventKind;
+  matched_target?: string | null;
+  decision: HookDecision;
+  reason?: string | null;
+  exit_code?: number | null;
+  duration_ms: number;
+  stdout_preview: string;
+  stderr_preview: string;
+  executed_at_ms: number;
+}
+
+export interface LifecycleHooksSnapshotView {
+  hooks: LifecycleHookRule[];
+  recent_executions: HookExecutionRecord[];
+  project_hooks_trusted: boolean;
+}
+
 export const orbitIpc = {
   async subscribe(onNotification: (ev: CoreNotification) => void): Promise<void> {
     if (!isTauriRuntime()) return;
@@ -4358,6 +4419,83 @@ export const orbitIpc = {
     return invoke<ContextOccupancyBreakdown>("get_context_occupancy", {
       hostId,
       agentId,
+    });
+  },
+
+  listLifecycleHooks: async (
+    hostId: string,
+    cwd: string | null,
+  ): Promise<LifecycleHooksSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { hooks: [], recent_executions: [], project_hooks_trusted: false };
+    }
+    return invoke<LifecycleHooksSnapshotView>("list_lifecycle_hooks", {
+      hostId,
+      cwd,
+    });
+  },
+
+  upsertLifecycleHook: async (
+    hostId: string,
+    cwd: string | null,
+    hook: LifecycleHookRule,
+  ): Promise<LifecycleHooksSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { hooks: [hook], recent_executions: [], project_hooks_trusted: false };
+    }
+    return invoke<LifecycleHooksSnapshotView>("upsert_lifecycle_hook", {
+      hostId,
+      cwd,
+      hook,
+    });
+  },
+
+  deleteLifecycleHook: async (
+    hostId: string,
+    cwd: string | null,
+    hookId: string,
+    scope: HookScope,
+  ): Promise<LifecycleHooksSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { hooks: [], recent_executions: [], project_hooks_trusted: false };
+    }
+    return invoke<LifecycleHooksSnapshotView>("delete_lifecycle_hook", {
+      hostId,
+      cwd,
+      hookId,
+      scope,
+    });
+  },
+
+  setProjectHooksTrust: async (
+    hostId: string,
+    cwd: string,
+    trusted: boolean,
+  ): Promise<LifecycleHooksSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { hooks: [], recent_executions: [], project_hooks_trusted: trusted };
+    }
+    return invoke<LifecycleHooksSnapshotView>("set_project_hooks_trust", {
+      hostId,
+      cwd,
+      trusted,
+    });
+  },
+
+  testLifecycleHook: async (
+    hostId: string,
+    cwd: string | null,
+    hookId: string,
+    samplePayload: Record<string, unknown>,
+  ): Promise<HookExecutionRecord> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Hook testing requires the Orbit desktop runtime");
+    }
+    return invoke<HookExecutionRecord>("test_lifecycle_hook", {
+      hostId,
+      cwd,
+      hookId,
+      samplePayload,
     });
   },
 };

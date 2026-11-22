@@ -570,7 +570,9 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::LspDiagnosticsResponse { request_id, .. }
         | WireMessage::LspLocationsResponse { request_id, .. }
         | WireMessage::UsageInsightsResponse { request_id, .. }
-        | WireMessage::ContextOccupancyResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::ContextOccupancyResponse { request_id, .. }
+        | WireMessage::LifecycleHooksSnapshot { request_id, .. }
+        | WireMessage::HookTestResultResponse { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

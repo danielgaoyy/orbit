@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod fast_copy;
 pub mod finish_subscriptions;
 pub mod git;
+pub mod hooks;
 pub mod idle_cleanup;
 pub mod instructions;
 pub mod keep_awake;
@@ -80,6 +81,7 @@ use crate::git::{
     compute_git_diff, inspect_git_status, list_workspace_files,
     read_workspace_file_with_attachments_dir,
 };
+use crate::hooks::HooksEngine;
 use crate::idle_cleanup::IdleRuntimeCleanup;
 use crate::instructions::{
     discover_instruction_hierarchy, read_instruction_file, save_instruction_file,
@@ -222,6 +224,7 @@ pub struct DaemonRuntime {
     pub keep_awake: Arc<KeepAwakeManager>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
     pub lsp: Arc<LspManager>,
+    pub hooks: Arc<HooksEngine>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
     pub mcp_config_lock: Arc<AsyncMutex<()>>,
@@ -268,6 +271,7 @@ impl DaemonRuntime {
         let scripts = WorkspaceScriptRegistry::new();
         let keep_awake = Arc::new(KeepAwakeManager::new(keep_awake_enabled));
         let provider_catalogs = Arc::new(RwLock::new(None));
+        let hooks = HooksEngine::new(home_dir.to_path_buf());
         let orchestrator = AgentOrchestrator::new(
             home_dir.to_path_buf(),
             host_id.clone(),
@@ -278,6 +282,7 @@ impl DaemonRuntime {
             scripts,
             keep_awake.clone(),
             provider_catalogs.clone(),
+            hooks.clone(),
         )
         .await;
         let ka_bcast_tx = orchestrator.broadcast_tx.clone();
@@ -357,6 +362,7 @@ impl DaemonRuntime {
                 crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
             ))),
             lsp,
+            hooks,
             provider_catalogs,
             mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
             mcp_config_lock: Arc::new(AsyncMutex::new(())),
@@ -1707,6 +1713,7 @@ async fn handle_wire_rpc(
             let store = runtime.store.clone();
             let symbol_index = runtime.symbol_index.clone();
             let lsp = Arc::clone(&runtime.lsp);
+            let hooks = Arc::clone(&runtime.hooks);
             tokio::spawn(async move {
                 let resolved_cwd = expand_host_path(&cwd);
                 let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
@@ -1727,6 +1734,24 @@ async fn handle_wire_rpc(
                                 let lsp_content = content.clone();
                                 tokio::spawn(async move {
                                     lsp.notify_file_saved(&lsp_cwd, &lsp_path, &lsp_content)
+                                        .await;
+                                });
+                                let hook_cwd = authorized_cwd.clone();
+                                let hook_path = path.clone();
+                                let hook_payload = serde_json::json!({
+                                    "event": "post_file_edit",
+                                    "cwd": hook_cwd.to_string_lossy().to_string(),
+                                    "path": &hook_path,
+                                    "source": "workspace_editor",
+                                });
+                                tokio::spawn(async move {
+                                    let _ = hooks
+                                        .dispatch_event(
+                                            orbit_protocol::HookEventKind::PostFileEdit,
+                                            Some(&hook_cwd),
+                                            Some(&hook_path),
+                                            hook_payload,
+                                        )
                                         .await;
                                 });
                             }
@@ -3692,6 +3717,155 @@ async fn handle_wire_rpc(
             None
         }
 
+        // Deterministic Lifecycle Hooks (`$ORBIT_HOME/hooks.json` & `<cwd>/.orbit/hooks.json`)
+        WireMessage::ListLifecycleHooks { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = authorize_optional_hooks_cwd(&store, cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => {
+                        match hooks.list_snapshot(authorized_cwd.as_deref()).await {
+                            Ok(snap) => WireMessage::LifecycleHooksSnapshot {
+                                request_id,
+                                hooks: snap.hooks,
+                                recent_executions: snap.recent_executions,
+                                project_hooks_trusted: snap.project_hooks_trusted,
+                            },
+                            Err(e) => rpc_err(request_id, "list_lifecycle_hooks_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "list_lifecycle_hooks_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertLifecycleHook {
+            request_id,
+            cwd,
+            hook,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = authorize_optional_hooks_cwd(&store, cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => {
+                        match hooks.upsert_hook(authorized_cwd.as_deref(), hook).await {
+                            Ok(snap) => WireMessage::LifecycleHooksSnapshot {
+                                request_id,
+                                hooks: snap.hooks,
+                                recent_executions: snap.recent_executions,
+                                project_hooks_trusted: snap.project_hooks_trusted,
+                            },
+                            Err(e) => rpc_err(request_id, "upsert_lifecycle_hook_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "upsert_lifecycle_hook_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteLifecycleHook {
+            request_id,
+            cwd,
+            hook_id,
+            scope,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = authorize_optional_hooks_cwd(&store, cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match hooks
+                        .delete_hook(authorized_cwd.as_deref(), &hook_id, scope)
+                        .await
+                    {
+                        Ok(snap) => WireMessage::LifecycleHooksSnapshot {
+                            request_id,
+                            hooks: snap.hooks,
+                            recent_executions: snap.recent_executions,
+                            project_hooks_trusted: snap.project_hooks_trusted,
+                        },
+                        Err(e) => rpc_err(request_id, "delete_lifecycle_hook_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "delete_lifecycle_hook_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::SetProjectHooksTrust {
+            request_id,
+            cwd,
+            trusted,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = match authorize_optional_hooks_cwd(&store, Some(cwd)).await {
+                    Ok(Some(dir)) => Ok(dir),
+                    Ok(None) => Err(
+                        "A valid workspace directory is required to update project hook trust"
+                            .to_string(),
+                    ),
+                    Err(e) => Err(e),
+                };
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => {
+                        match hooks.set_project_trust(&authorized_cwd, trusted).await {
+                            Ok(snap) => WireMessage::LifecycleHooksSnapshot {
+                                request_id,
+                                hooks: snap.hooks,
+                                recent_executions: snap.recent_executions,
+                                project_hooks_trusted: snap.project_hooks_trusted,
+                            },
+                            Err(e) => rpc_err(request_id, "set_project_hooks_trust_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "set_project_hooks_trust_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::TestLifecycleHook {
+            request_id,
+            cwd,
+            hook_id,
+            sample_payload,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = authorize_optional_hooks_cwd(&store, cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match hooks
+                        .test_hook(authorized_cwd.as_deref(), &hook_id, sample_payload)
+                        .await
+                    {
+                        Ok(record) => WireMessage::HookTestResultResponse { request_id, record },
+                        Err(e) => rpc_err(request_id, "test_lifecycle_hook_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "test_lifecycle_hook_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
         // Schedules & Heartbeats
         WireMessage::ListSchedules {
             request_id,
@@ -4786,6 +4960,30 @@ async fn authorize_optional_mcp_cwd(
     cwd: Option<String>,
 ) -> Result<Option<PathBuf>, String> {
     let Some(raw) = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let expanded = expand_host_path(raw);
+    if expanded
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("Workspace path must not contain `..` traversal segments".to_string());
+    }
+    let authorized = authorize_workspace_mutation_cwd(store, &expanded).await?;
+    Ok(Some(authorized))
+}
+
+/// Authorize an optional Lifecycle Hooks workspace `cwd` against registered/discovered host
+/// workspaces (`None`, `""`, or `"~"` maps to user-global hooks only).
+async fn authorize_optional_hooks_cwd(
+    store: &Arc<OrbitStore>,
+    cwd: Option<String>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "~")
+    else {
         return Ok(None);
     };
     let expanded = expand_host_path(raw);

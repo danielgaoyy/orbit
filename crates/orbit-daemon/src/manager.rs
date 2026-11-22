@@ -210,6 +210,7 @@ pub struct AgentOrchestrator {
     pub scripts: Arc<WorkspaceScriptRegistry>,
     keep_awake: Arc<KeepAwakeManager>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
+    hooks: Arc<crate::hooks::HooksEngine>,
     pub worktree_pool: Arc<WorktreePool>,
     live_agents: RwLock<HashMap<String, LiveAgentEntry>>,
     /// Per-agent mutex serializing driver startup (e.g. concurrent eager fork startup and
@@ -276,6 +277,7 @@ impl AgentOrchestrator {
         scripts: Arc<WorkspaceScriptRegistry>,
         keep_awake: Arc<KeepAwakeManager>,
         provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
+        hooks: Arc<crate::hooks::HooksEngine>,
     ) -> Arc<Self> {
         let orbit_exe = resolve_orbit_exe();
         let (broadcast_tx, _) = broadcast::channel(2048);
@@ -291,6 +293,7 @@ impl AgentOrchestrator {
             scripts,
             keep_awake,
             provider_catalogs,
+            hooks,
             worktree_pool,
             live_agents: RwLock::new(HashMap::new()),
             driver_start_locks: RwLock::new(HashMap::new()),
@@ -1650,6 +1653,45 @@ impl AgentOrchestrator {
         let agent_id = format!("ag_{}", Uuid::new_v4().simple());
         let final_cwd = agent_cwd_override.unwrap_or_else(|| ws.cwd.clone());
 
+        // Evaluate PrePromptSubmit lifecycle hooks BEFORE persisting the agent, acquiring
+        // keep-awake, emitting PeerJoined, or broadcasting AgentUpdated so a blocked initial
+        // prompt leaves zero DB rows or ghost UI state behind.
+        let mut initial_prompt = spec.initial_prompt;
+        if !initial_prompt.trim().is_empty() {
+            let hook_outcome = self
+                .hooks
+                .dispatch_event(
+                    orbit_protocol::HookEventKind::PrePromptSubmit,
+                    Some(Path::new(&final_cwd)),
+                    Some(provider.slug()),
+                    serde_json::json!({
+                        "event": "pre_prompt_submit",
+                        "agent_id": &agent_id,
+                        "workspace_id": &ws.workspace_id,
+                        "cwd": &final_cwd,
+                        "provider": provider.slug(),
+                        "prompt": &initial_prompt,
+                    }),
+                )
+                .await;
+            if hook_outcome.decision == orbit_protocol::HookDecision::Block {
+                let hook_name = hook_outcome
+                    .blocking_hook_name
+                    .as_deref()
+                    .unwrap_or("lifecycle hook");
+                let reason = hook_outcome
+                    .reason
+                    .as_deref()
+                    .unwrap_or("blocked by policy");
+                anyhow::bail!("Prompt blocked by hook `{hook_name}`: {reason}");
+            }
+            if hook_outcome.decision == orbit_protocol::HookDecision::Modify
+                && let Some(updated) = hook_outcome.updated_text
+            {
+                initial_prompt = updated;
+            }
+        }
+
         let existing_peers = self
             .store
             .list_agents_filtered(Some(&ws.workspace_id), false, false, None)
@@ -1746,7 +1788,32 @@ impl AgentOrchestrator {
             .send(DaemonBroadcast::AgentUpdated(summary.clone()));
         let launch_gen = self.bump_generation(&agent_id).await;
 
-        let initial_prompt = spec.initial_prompt;
+        // Fire SessionStart lifecycle hooks asynchronously (non-blocking).
+        {
+            let hooks = Arc::clone(&self.hooks);
+            let cwd_hook = PathBuf::from(&summary.cwd);
+            let prov_slug = summary.provider.slug().to_string();
+            let payload = serde_json::json!({
+                "event": "session_start",
+                "agent_id": &summary.agent_id,
+                "workspace_id": &summary.workspace_id,
+                "cwd": &summary.cwd,
+                "provider": &prov_slug,
+                "model": &summary.model,
+                "title": &summary.title,
+            });
+            tokio::spawn(async move {
+                let _ = hooks
+                    .dispatch_event(
+                        orbit_protocol::HookEventKind::SessionStart,
+                        Some(&cwd_hook),
+                        Some(&prov_slug),
+                        payload,
+                    )
+                    .await;
+            });
+        }
+
         let initial_rule_badges = spec.initial_badges.clone();
         // Persist the initial user prompt IMMEDIATELY (`< 1ms`) so `AgentCreated` returns right away
         // and the user sees their clean message + badges at 0ms without blocking the socket!
@@ -2433,14 +2500,50 @@ impl AgentOrchestrator {
     pub async fn send_prompt_with_options(
         self: &Arc<Self>,
         agent_id: &str,
-        prompt: String,
+        mut prompt: String,
         display_prompt: Option<String>,
         badges: Vec<PromptBadge>,
         behavior: ActiveTurnBehavior,
         message_id: Option<String>,
     ) -> anyhow::Result<()> {
+        let existing_agent = self.store.get_agent(agent_id).ok().flatten();
+        if let Some(ref ag) = existing_agent {
+            let hook_outcome = self
+                .hooks
+                .dispatch_event(
+                    orbit_protocol::HookEventKind::PrePromptSubmit,
+                    Some(Path::new(&ag.cwd)),
+                    Some(ag.provider.slug()),
+                    serde_json::json!({
+                        "event": "pre_prompt_submit",
+                        "agent_id": agent_id,
+                        "workspace_id": &ag.workspace_id,
+                        "cwd": &ag.cwd,
+                        "provider": ag.provider.slug(),
+                        "prompt": &prompt,
+                    }),
+                )
+                .await;
+            if hook_outcome.decision == orbit_protocol::HookDecision::Block {
+                let hook_name = hook_outcome
+                    .blocking_hook_name
+                    .as_deref()
+                    .unwrap_or("lifecycle hook");
+                let reason = hook_outcome
+                    .reason
+                    .as_deref()
+                    .unwrap_or("blocked by policy");
+                anyhow::bail!("Prompt blocked by hook `{hook_name}`: {reason}");
+            }
+            if hook_outcome.decision == orbit_protocol::HookDecision::Modify
+                && let Some(updated) = hook_outcome.updated_text
+            {
+                prompt = updated;
+            }
+        }
+
         // Sending a human prompt acknowledges unread attention and unarchives if needed
-        if let Ok(Some(ag)) = self.store.get_agent(agent_id)
+        if let Some(ref ag) = existing_agent
             && ag.archived_at.is_some()
         {
             let _ = self.unarchive_agent(agent_id).await;
@@ -3198,6 +3301,29 @@ impl AgentOrchestrator {
 
             // 3. Soft-archive record in SQLite & broadcast
             self.store.archive_agent_soft(agent_id)?;
+            if let Some(ref ag) = existing {
+                let hooks = Arc::clone(&self.hooks);
+                let cwd_hook = PathBuf::from(&ag.cwd);
+                let prov_slug = ag.provider.slug().to_string();
+                let payload = serde_json::json!({
+                    "event": "session_end",
+                    "agent_id": agent_id,
+                    "workspace_id": &ag.workspace_id,
+                    "cwd": &ag.cwd,
+                    "provider": &prov_slug,
+                    "reason": "archived",
+                });
+                tokio::spawn(async move {
+                    let _ = hooks
+                        .dispatch_event(
+                            orbit_protocol::HookEventKind::SessionEnd,
+                            Some(&cwd_hook),
+                            Some(&prov_slug),
+                            payload,
+                        )
+                        .await;
+                });
+            }
             if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
                 let wt_src = updated.labels.get("orbit.worktree_source_cwd").cloned();
                 let wt_branch = updated.labels.get("orbit.worktree_branch").cloned();
@@ -4792,6 +4918,29 @@ impl AgentOrchestrator {
                         ToolCallDetail::FileEdit { path, .. } => {
                             self.record_file_edit_and_check_conflict(agent_id, path)
                                 .await;
+                            if let Ok(Some(ag)) = self.store.get_agent(agent_id) {
+                                let hooks = Arc::clone(&self.hooks);
+                                let cwd_hook = PathBuf::from(&ag.cwd);
+                                let target_path = path.clone();
+                                let payload = serde_json::json!({
+                                    "event": "post_file_edit",
+                                    "agent_id": agent_id,
+                                    "workspace_id": &ag.workspace_id,
+                                    "cwd": &ag.cwd,
+                                    "path": &target_path,
+                                    "source": "agent_tool",
+                                });
+                                tokio::spawn(async move {
+                                    let _ = hooks
+                                        .dispatch_event(
+                                            orbit_protocol::HookEventKind::PostFileEdit,
+                                            Some(&cwd_hook),
+                                            Some(&target_path),
+                                            payload,
+                                        )
+                                        .await;
+                                });
+                            }
                         }
                         ToolCallDetail::Generic {
                             tool_name,
@@ -4895,6 +5044,30 @@ impl AgentOrchestrator {
                 self.turn_usage_recorded.write().await.remove(agent_id);
                 self.keep_awake
                     .notify_agent_status(agent_id, &AgentStatus::Closed);
+                if let Ok(Some(ag)) = self.store.get_agent(agent_id) {
+                    let hooks = Arc::clone(&self.hooks);
+                    let cwd_hook = PathBuf::from(&ag.cwd);
+                    let prov_slug = ag.provider.slug().to_string();
+                    let payload = serde_json::json!({
+                        "event": "session_end",
+                        "agent_id": agent_id,
+                        "workspace_id": &ag.workspace_id,
+                        "cwd": &ag.cwd,
+                        "provider": &prov_slug,
+                        "reason": "exited",
+                        "exit_code": code,
+                    });
+                    tokio::spawn(async move {
+                        let _ = hooks
+                            .dispatch_event(
+                                orbit_protocol::HookEventKind::SessionEnd,
+                                Some(&cwd_hook),
+                                Some(&prov_slug),
+                                payload,
+                            )
+                            .await;
+                    });
+                }
                 should_check_auto_archive = true;
                 TimelinePayload::StatusChanged {
                     status: AgentStatus::Closed,
@@ -4995,6 +5168,27 @@ impl AgentOrchestrator {
                         }
                     });
                 }
+                let hooks = Arc::clone(&self.hooks);
+                let cwd_hook = PathBuf::from(&ag.cwd);
+                let prov_slug = ag.provider.slug().to_string();
+                let payload = serde_json::json!({
+                    "event": "turn_stop",
+                    "agent_id": agent_id,
+                    "workspace_id": &ag.workspace_id,
+                    "cwd": &ag.cwd,
+                    "provider": &prov_slug,
+                    "title": &ag.title,
+                });
+                tokio::spawn(async move {
+                    let _ = hooks
+                        .dispatch_event(
+                            orbit_protocol::HookEventKind::TurnStop,
+                            Some(&cwd_hook),
+                            Some(&prov_slug),
+                            payload,
+                        )
+                        .await;
+                });
             }
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
 
@@ -5714,6 +5908,7 @@ mod streaming_buffer_tests {
         let store = Arc::new(OrbitStore::open_in_memory().expect("open mem store"));
         let scripts = Arc::new(WorkspaceScriptRegistry::default());
         let keep_awake = Arc::new(KeepAwakeManager::new(false));
+        let hooks = crate::hooks::HooksEngine::new(home_dir.to_path_buf());
         let orch = AgentOrchestrator::new(
             home_dir.to_path_buf(),
             "host_test".into(),
@@ -5724,6 +5919,7 @@ mod streaming_buffer_tests {
             scripts,
             keep_awake,
             Arc::new(RwLock::new(None)),
+            hooks,
         )
         .await;
         (orch, store)
@@ -6198,6 +6394,7 @@ mod fast_mode_orchestrator_tests {
         let scripts = WorkspaceScriptRegistry::new();
         let keep_awake = Arc::new(KeepAwakeManager::new(false));
         let provider_catalogs = Arc::new(RwLock::new(None));
+        let hooks = crate::hooks::HooksEngine::new(dir.clone());
         let orch = AgentOrchestrator::new(
             dir.clone(),
             "host_test".into(),
@@ -6208,6 +6405,7 @@ mod fast_mode_orchestrator_tests {
             scripts,
             keep_awake,
             provider_catalogs,
+            hooks,
         )
         .await;
         (dir, store, orch)

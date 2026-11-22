@@ -498,3 +498,10 @@ pub struct MatchedPathRulesView {
     pub injected_markdown: String,
     pub total_tokens: u32,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleHooksSnapshotView {
+    pub hooks: Vec<orbit_protocol::LifecycleHookRule>,
+    pub recent_executions: Vec<orbit_protocol::HookExecutionRecord>,
+    pub project_hooks_trusted: bool,
+}

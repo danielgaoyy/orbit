@@ -3,6 +3,7 @@
 pub mod acp;
 pub mod artifacts;
 pub mod handoff;
+pub mod hooks;
 pub mod instructions;
 pub mod lsp;
 pub mod mcp_servers;
@@ -14,6 +15,7 @@ pub mod usage;
 pub use acp::*;
 pub use artifacts::*;
 pub use handoff::*;
+pub use hooks::*;
 pub use instructions::*;
 pub use lsp::*;
 pub use mcp_servers::*;
@@ -2237,6 +2239,51 @@ pub enum WireMessage {
     ContextOccupancyResponse {
         request_id: Uuid,
         breakdown: ContextOccupancyBreakdown,
+    },
+
+    // Deterministic Lifecycle Hooks (`$ORBIT_HOME/hooks.json` & `<cwd>/.orbit/hooks.json`)
+    ListLifecycleHooks {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    LifecycleHooksSnapshot {
+        request_id: Uuid,
+        hooks: Vec<LifecycleHookRule>,
+        #[serde(default)]
+        recent_executions: Vec<HookExecutionRecord>,
+        #[serde(default)]
+        project_hooks_trusted: bool,
+    },
+    UpsertLifecycleHook {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        hook: LifecycleHookRule,
+    },
+    DeleteLifecycleHook {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        hook_id: String,
+        scope: HookScope,
+    },
+    SetProjectHooksTrust {
+        request_id: Uuid,
+        cwd: String,
+        trusted: bool,
+    },
+    TestLifecycleHook {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        hook_id: String,
+        #[serde(default)]
+        sample_payload: serde_json::Value,
+    },
+    HookTestResultResponse {
+        request_id: Uuid,
+        record: HookExecutionRecord,
     },
 
     RpcError {

@@ -68,6 +68,10 @@ import {
   type ExtractedCodeBlock,
   type FleetOverviewView,
   type FleetSidebarView,
+  type HookExecutionRecord,
+  type HookScope,
+  type LifecycleHookRule,
+  type LifecycleHooksSnapshotView,
   type LspDiagnostic,
   type LspLocation,
   type LspServerStatus,
@@ -386,6 +390,7 @@ export type HostSettingsTab =
   | "acp"
   | "mcp"
   | "rules"
+  | "hooks"
   | "lsp"
   | "usage"
   | "connection";
@@ -631,6 +636,17 @@ export interface OrbitUiState {
     {
       status: "idle" | "loading" | "ready" | "error";
       diagnostics: LspDiagnostic[];
+    }
+  >;
+  // Deterministic Lifecycle Hooks (UserGlobal + ProjectOrbit)
+  lifecycleHooksByScope: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      hooks: LifecycleHookRule[];
+      recentExecutions: HookExecutionRecord[];
+      projectHooksTrusted: boolean;
+      error?: string | null;
     }
   >;
 
@@ -958,6 +974,7 @@ const defaultInitialState: OrbitUiState = {
   gitReviews: {},
   lspServersByWorkspace: {},
   lspDiagnosticsByFile: {},
+  lifecycleHooksByScope: {},
 
   overviewDesktopOpenPref: initialPrefs.overviewDesktopOpenPref ?? true,
   overviewPopoverOpen: false,
@@ -7088,6 +7105,223 @@ export const orbitActions = {
     return orbitIpc.getContextOccupancy(hostId, agentId);
   },
 
+  async loadLifecycleHooks(
+    hostId: string,
+    cwd: string | null,
+  ): Promise<LifecycleHooksSnapshotView | null> {
+    if (!hostId) return null;
+    const normalizedCwd = cwd && cwd.trim() && cwd.trim() !== "~" ? cwd.trim() : null;
+    const scopeKey = `${hostId}::${normalizedCwd ?? "__global__"}`;
+    const seq = (lifecycleHooksSeqByKey.get(scopeKey) ?? 0) + 1;
+    lifecycleHooksSeqByKey.set(scopeKey, seq);
+    setState((s) => {
+      const prev = s.lifecycleHooksByScope[scopeKey];
+      return {
+        ...s,
+        lifecycleHooksByScope: upsertLruRecord(
+          s.lifecycleHooksByScope,
+          scopeKey,
+          {
+            status: "loading",
+            hooks: prev?.hooks ?? [],
+            recentExecutions: prev?.recentExecutions ?? [],
+            projectHooksTrusted: prev?.projectHooksTrusted ?? false,
+            error: null,
+          },
+          MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+        ),
+      };
+    });
+    try {
+      const snap = await orbitIpc.listLifecycleHooks(hostId, normalizedCwd);
+      if (lifecycleHooksSeqByKey.get(scopeKey) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        lifecycleHooksByScope: upsertLruRecord(
+          s.lifecycleHooksByScope,
+          scopeKey,
+          {
+            status: "ready",
+            hooks: snap.hooks,
+            recentExecutions: snap.recent_executions,
+            projectHooksTrusted: snap.project_hooks_trusted,
+            error: null,
+          },
+          MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+        ),
+      }));
+      return snap;
+    } catch (err) {
+      if (lifecycleHooksSeqByKey.get(scopeKey) !== seq) return null;
+      setState((s) => {
+        const prev = s.lifecycleHooksByScope[scopeKey];
+        return {
+          ...s,
+          lifecycleHooksByScope: upsertLruRecord(
+            s.lifecycleHooksByScope,
+            scopeKey,
+            {
+              status: "error",
+              hooks: prev?.hooks ?? [],
+              recentExecutions: prev?.recentExecutions ?? [],
+              projectHooksTrusted: prev?.projectHooksTrusted ?? false,
+              error: String(err),
+            },
+            MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+          ),
+        };
+      });
+      return null;
+    }
+  },
+
+  async upsertLifecycleHook(
+    hostId: string,
+    cwd: string | null,
+    hook: LifecycleHookRule,
+  ): Promise<LifecycleHooksSnapshotView> {
+    const normalizedCwd = cwd && cwd.trim() && cwd.trim() !== "~" ? cwd.trim() : null;
+    const scopeKey = `${hostId}::${normalizedCwd ?? "__global__"}`;
+    const seq = (lifecycleHooksSeqByKey.get(scopeKey) ?? 0) + 1;
+    lifecycleHooksSeqByKey.set(scopeKey, seq);
+    try {
+      const snap = await orbitIpc.upsertLifecycleHook(hostId, normalizedCwd, hook);
+      if (lifecycleHooksSeqByKey.get(scopeKey) === seq) {
+        setState((s) => ({
+          ...s,
+          lifecycleHooksByScope: upsertLruRecord(
+            s.lifecycleHooksByScope,
+            scopeKey,
+            {
+              status: "ready",
+              hooks: snap.hooks,
+              recentExecutions: snap.recent_executions,
+              projectHooksTrusted: snap.project_hooks_trusted,
+              error: null,
+            },
+            MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+          ),
+        }));
+      }
+      return snap;
+    } catch (err) {
+      notifyToast(`Hook update failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async deleteLifecycleHook(
+    hostId: string,
+    cwd: string | null,
+    hookId: string,
+    scope: HookScope,
+  ): Promise<LifecycleHooksSnapshotView> {
+    const normalizedCwd = cwd && cwd.trim() && cwd.trim() !== "~" ? cwd.trim() : null;
+    const scopeKey = `${hostId}::${normalizedCwd ?? "__global__"}`;
+    const seq = (lifecycleHooksSeqByKey.get(scopeKey) ?? 0) + 1;
+    lifecycleHooksSeqByKey.set(scopeKey, seq);
+    const snap = await orbitIpc.deleteLifecycleHook(hostId, normalizedCwd, hookId, scope);
+    if (lifecycleHooksSeqByKey.get(scopeKey) === seq) {
+      setState((s) => ({
+        ...s,
+        lifecycleHooksByScope: upsertLruRecord(
+          s.lifecycleHooksByScope,
+          scopeKey,
+          {
+            status: "ready",
+            hooks: snap.hooks,
+            recentExecutions: snap.recent_executions,
+            projectHooksTrusted: snap.project_hooks_trusted,
+            error: null,
+          },
+          MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+        ),
+      }));
+    }
+    notifyToast("Hook deleted");
+    return snap;
+  },
+
+  async setProjectHooksTrust(
+    hostId: string,
+    cwd: string,
+    trusted: boolean,
+  ): Promise<LifecycleHooksSnapshotView> {
+    const scopeKey = `${hostId}::${cwd}`;
+    const seq = (lifecycleHooksSeqByKey.get(scopeKey) ?? 0) + 1;
+    lifecycleHooksSeqByKey.set(scopeKey, seq);
+    try {
+      const snap = await orbitIpc.setProjectHooksTrust(hostId, cwd, trusted);
+      if (lifecycleHooksSeqByKey.get(scopeKey) === seq) {
+        setState((s) => ({
+          ...s,
+          lifecycleHooksByScope: upsertLruRecord(
+            s.lifecycleHooksByScope,
+            scopeKey,
+            {
+              status: "ready",
+              hooks: snap.hooks,
+              recentExecutions: snap.recent_executions,
+              projectHooksTrusted: snap.project_hooks_trusted,
+              error: null,
+            },
+            MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+          ),
+        }));
+      }
+      notifyToast(trusted ? "Project hooks trusted" : "Project hook trust revoked");
+      return snap;
+    } catch (err) {
+      notifyToast(`Trust update failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async testLifecycleHook(
+    hostId: string,
+    cwd: string | null,
+    hookId: string,
+    samplePayload: Record<string, unknown>,
+  ): Promise<HookExecutionRecord> {
+    const normalizedCwd = cwd && cwd.trim() && cwd.trim() !== "~" ? cwd.trim() : null;
+    const scopeKey = `${hostId}::${normalizedCwd ?? "__global__"}`;
+    try {
+      const record = await orbitIpc.testLifecycleHook(
+        hostId,
+        normalizedCwd,
+        hookId,
+        samplePayload,
+      );
+      setState((s) => {
+        const prev = s.lifecycleHooksByScope[scopeKey];
+        if (!prev) return s;
+        const nextRuns = [
+          record,
+          ...prev.recentExecutions.filter((r) => r.id !== record.id),
+        ].slice(0, 100);
+        return {
+          ...s,
+          lifecycleHooksByScope: upsertLruRecord(
+            s.lifecycleHooksByScope,
+            scopeKey,
+            {
+              ...prev,
+              recentExecutions: nextRuns,
+            },
+            MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+          ),
+        };
+      });
+      notifyToast(
+        `${record.hook_name}: ${record.decision.toUpperCase()} (${record.duration_ms}ms)`,
+      );
+      return record;
+    } catch (err) {
+      notifyToast(`Hook test failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
   async loadFileDiagnostics(
     hostId: string,
     cwd: string,
@@ -9363,9 +9597,11 @@ async function pushCloudPrefPatch(patch: Record<string, unknown>): Promise<void>
 let nextFileFocusNonce = 1;
 const MAX_LSP_DIAGNOSTICS_CACHE_ENTRIES = 40;
 const MAX_LSP_SERVERS_CACHE_ENTRIES = 16;
+const MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES = 16;
 let nextLspGotoSeq = 0;
 const lspDiagSeqByKey = new Map<string, number>();
 const lspServersSeqByKey = new Map<string, number>();
+const lifecycleHooksSeqByKey = new Map<string, number>();
 
 function upsertLruRecord<T>(
   record: Record<string, T>,

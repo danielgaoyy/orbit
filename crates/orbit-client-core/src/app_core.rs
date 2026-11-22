@@ -17,18 +17,18 @@ use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
     BackgroundTaskInfo, ConnectedHostSummary, ContextOccupancyBreakdown, DirectoryEntry,
-    DiscoveredProject, ExternalMcpServerRecord, GitStatusSnapshot, HostProjectEntry, HostSyncState,
-    KeepAwakeStatus, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
-    ManagedSkillRecord, McpProbeResult, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
-    PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord,
-    ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame,
-    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
-    UsageInsightsSnapshot, WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
-    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
-    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome,
-    WorktreeHandoffPreview,
+    DiscoveredProject, ExternalMcpServerRecord, GitStatusSnapshot, HookExecutionRecord, HookScope,
+    HostProjectEntry, HostSyncState, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic,
+    LspLocation, LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption,
+    OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary,
+    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem,
+    QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
+    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
+    TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot,
+    WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
+    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
+    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -49,11 +49,12 @@ pub use crate::contract::{
     ConversationSearchHit, CreateWorkspaceEntryRequest, DeletePathRuleRequest,
     DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, ForkAgentRequest,
     ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
-    InstructionFilesSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
-    MatchedPathRulesView, PathRulesSnapshotView, PreviewWorktreeHandoffRequest,
-    ReadInstructionFileRequest, RenameWorkspaceEntryRequest, SaveInstructionFileRequest,
-    UpsertArtifactRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
+    MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
+    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
+    SaveInstructionFileRequest, UpsertArtifactRequest, UpsertExternalMcpServerRequest,
+    UpsertPathRuleRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
@@ -682,6 +683,10 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<UsageInsightsSnapshot, String>>>,
     pending_context_occupancy:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ContextOccupancyBreakdown, String>>>,
+    pending_lifecycle_hooks:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<LifecycleHooksSnapshotView, String>>>,
+    pending_lifecycle_hook_tests:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<HookExecutionRecord, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -801,6 +806,8 @@ impl HostMemoryState {
             pending_lsp_locations: HashMap::new(),
             pending_usage_insights: HashMap::new(),
             pending_context_occupancy: HashMap::new(),
+            pending_lifecycle_hooks: HashMap::new(),
+            pending_lifecycle_hook_tests: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -5178,6 +5185,25 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(breakdown));
                     }
                 }
+                WireMessage::LifecycleHooksSnapshot {
+                    request_id,
+                    hooks,
+                    recent_executions,
+                    project_hooks_trusted,
+                } => {
+                    if let Some(tx) = state.pending_lifecycle_hooks.remove(&request_id) {
+                        let _ = tx.send(Ok(LifecycleHooksSnapshotView {
+                            hooks,
+                            recent_executions,
+                            project_hooks_trusted,
+                        }));
+                    }
+                }
+                WireMessage::HookTestResultResponse { request_id, record } => {
+                    if let Some(tx) = state.pending_lifecycle_hook_tests.remove(&request_id) {
+                        let _ = tx.send(Ok(record));
+                    }
+                }
                 WireMessage::SideQuestionDelta {
                     request_id,
                     text_delta,
@@ -5401,6 +5427,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_context_occupancy.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lifecycle_hooks.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lifecycle_hook_tests.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -10934,6 +10968,246 @@ impl OrbitAppCore {
             .map_err(|_| format!("{op_label} task cancelled"))?
     }
 
+    async fn dispatch_lifecycle_hooks_snapshot_on_host<F>(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: F,
+        op_label: &'static str,
+    ) -> Result<LifecycleHooksSnapshotView, String>
+    where
+        F: FnOnce(Uuid) -> WireMessage + Send + 'static,
+    {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_lifecycle_hooks.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lifecycle_hooks.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lifecycle_hooks.remove(&req_id);
+                    }
+                    Err(format!(
+                        "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                    ))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn list_lifecycle_hooks_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+    ) -> Result<LifecycleHooksSnapshotView, String> {
+        self.dispatch_lifecycle_hooks_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::ListLifecycleHooks { request_id, cwd },
+            "list lifecycle hooks",
+        )
+        .await
+    }
+
+    pub async fn upsert_lifecycle_hook_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+        hook: LifecycleHookRule,
+    ) -> Result<LifecycleHooksSnapshotView, String> {
+        self.dispatch_lifecycle_hooks_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::UpsertLifecycleHook {
+                request_id,
+                cwd,
+                hook,
+            },
+            "save lifecycle hook",
+        )
+        .await
+    }
+
+    pub async fn delete_lifecycle_hook_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+        hook_id: String,
+        scope: HookScope,
+    ) -> Result<LifecycleHooksSnapshotView, String> {
+        self.dispatch_lifecycle_hooks_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::DeleteLifecycleHook {
+                request_id,
+                cwd,
+                hook_id,
+                scope,
+            },
+            "delete lifecycle hook",
+        )
+        .await
+    }
+
+    pub async fn set_project_hooks_trust_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: String,
+        trusted: bool,
+    ) -> Result<LifecycleHooksSnapshotView, String> {
+        self.dispatch_lifecycle_hooks_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::SetProjectHooksTrust {
+                request_id,
+                cwd,
+                trusted,
+            },
+            "update project hooks trust",
+        )
+        .await
+    }
+
+    pub async fn test_lifecycle_hook_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+        hook_id: String,
+        sample_payload: serde_json::Value,
+    ) -> Result<HookExecutionRecord, String> {
+        let host_id = host_id.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to test lifecycle hook".to_string());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_lifecycle_hook_tests.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before test lifecycle hook".to_string()),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::TestLifecycleHook {
+                    request_id: req_id,
+                    cwd,
+                    hook_id,
+                    sample_payload,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lifecycle_hook_tests.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to test lifecycle hook: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(35), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => {
+                    Err("Host disconnected while waiting for hook dry-run test".to_string())
+                }
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lifecycle_hook_tests.remove(&req_id);
+                    }
+                    Err("Timed out waiting for lifecycle hook test result".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "test lifecycle hook task cancelled".to_string())?
+    }
+
     pub async fn list_path_rules_on_host(
         self: &Arc<Self>,
         host_id: String,
@@ -13195,6 +13469,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_context_occupancy.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lifecycle_hooks.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lifecycle_hook_tests.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {

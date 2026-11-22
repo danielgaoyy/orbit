@@ -1194,8 +1194,9 @@ pub async fn spawn_detached_shim(
 
     let _child = std_cmd.spawn()?;
 
-    // Poll up to 3s for UDS listener readiness
-    for _ in 0..150 {
+    // Poll for shim listener readiness (Windows cold process + ConPTY startup can exceed 3s under AV scanning).
+    let max_polls = if cfg!(windows) { 500 } else { 250 };
+    for _ in 0..max_polls {
         if socket_path.exists()
             && let Ok(client) = ShimClient::connect(socket_path).await
         {

@@ -165,7 +165,7 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
                 mission_goal: None,
                 project_root: None,
             },
-            Duration::from_secs(5),
+            Duration::from_secs(20),
             |w| matches!(w, WireMessage::WorkspaceCreated { request_id, .. } if *request_id == ws_req),
         )
         .await

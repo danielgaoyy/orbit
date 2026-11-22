@@ -167,7 +167,7 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
                 cols: 80,
                 rows: 24,
             },
-            Duration::from_secs(5),
+            Duration::from_secs(20),
             |w| matches!(w, WireMessage::TerminalAttached { request_id, .. } if *request_id == term_req),
         )
         .await

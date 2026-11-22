@@ -526,7 +526,8 @@ fn should_retry_gemini_acp_flag(provider: ProviderKind, err: &str) -> bool {
 
 fn resolve_acp_mode_id(mode: &SessionMode, available_modes: &[String]) -> Option<String> {
     let candidates: &[&str] = match mode {
-        SessionMode::Default => &["default", "ask", "standard"],
+        // Auto (Guardian) maps to approval-gating mode so Orbit's daemon receives permission requests.
+        SessionMode::Default | SessionMode::Auto => &["default", "ask", "standard"],
         SessionMode::Plan => &["plan", "architect", "readonly", "read-only"],
         SessionMode::AcceptEdits => &[
             "accept-edits",
@@ -1983,6 +1984,7 @@ async fn handle_acp_session_update(
                 .or_else(|| update.get("modeId"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
+                && !matches!(*mode, SessionMode::Auto)
             {
                 *mode = parse_acp_mode_id(mode_id);
             }
@@ -3170,5 +3172,34 @@ done
         let _ = tokio::time::timeout(Duration::from_secs(2), actor2).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn current_mode_update_preserves_guardian_auto_mode() {
+        let mut mode = SessionMode::Auto;
+        let mut seg_state = AcpStreamSegmentState::default();
+        let mut tool_cache = HashMap::new();
+        let (evt_tx, _evt_rx) = mpsc::channel(8);
+
+        for mode_id in ["default", "code", "accept-edits", "bypassPermissions"] {
+            let update = json!({
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": mode_id,
+            });
+            handle_acp_session_update(
+                "opencode",
+                &update,
+                &mut mode,
+                &mut seg_state,
+                &mut tool_cache,
+                &evt_tx,
+            )
+            .await;
+            assert_eq!(
+                mode,
+                SessionMode::Auto,
+                "ACP server mode echo `{mode_id}` must never overwrite SessionMode::Auto"
+            );
+        }
     }
 }

@@ -35,7 +35,7 @@ import {
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-type PresetPermissionMode = "default" | "accept_edits" | "full_access";
+type PresetPermissionMode = "default" | "auto" | "accept_edits" | "full_access";
 
 const PREFIX_OPTIONS: SettingSelectOption<string>[] = [
   { value: "auto", label: "Auto", description: "Infer from thread topic" },
@@ -50,6 +50,11 @@ const PERMISSION_OPTIONS: SettingSelectOption<PresetPermissionMode>[] = [
     value: "default",
     label: "Always Ask",
     description: "Confirm file edits and shell commands",
+  },
+  {
+    value: "auto",
+    label: "Auto",
+    description: "Guardian risk filter",
   },
   {
     value: "accept_edits",
@@ -110,7 +115,9 @@ export function GeneralSection() {
   }, [releaseUpdateInfo, checkingUpdate, isBrowserOffline]);
 
   const activePermissionMode: PresetPermissionMode =
-    draftMode === "accept_edits" || draftMode === "full_access" ? draftMode : "default";
+    draftMode === "auto" || draftMode === "accept_edits" || draftMode === "full_access"
+      ? draftMode
+      : "default";
 
   const activePrefix = PREFIX_OPTIONS.some((o) => o.value === worktreeBranchPrefix)
     ? worktreeBranchPrefix

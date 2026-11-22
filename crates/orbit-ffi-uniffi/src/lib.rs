@@ -434,12 +434,14 @@ pub enum FfiSessionMode {
     AcceptEdits,
     FullAccess,
     Custom { name: String },
+    Auto,
 }
 
 impl From<SessionMode> for FfiSessionMode {
     fn from(v: SessionMode) -> Self {
         match v {
             SessionMode::Default => Self::Default,
+            SessionMode::Auto => Self::Auto,
             SessionMode::Plan => Self::Plan,
             SessionMode::AcceptEdits => Self::AcceptEdits,
             SessionMode::FullAccess => Self::FullAccess,
@@ -452,6 +454,7 @@ impl From<FfiSessionMode> for SessionMode {
     fn from(v: FfiSessionMode) -> Self {
         match v {
             FfiSessionMode::Default => Self::Default,
+            FfiSessionMode::Auto => Self::Auto,
             FfiSessionMode::Plan => Self::Plan,
             FfiSessionMode::AcceptEdits => Self::AcceptEdits,
             FfiSessionMode::FullAccess => Self::FullAccess,
@@ -2466,6 +2469,7 @@ impl From<TimelineItemView> for FfiTimelineItem {
                 allowed_decisions,
                 resolved_decision,
                 timestamp_ms,
+                ..
             } => {
                 let command_or_path = tool_primary_target(&detail);
                 Self::PermissionRequest {

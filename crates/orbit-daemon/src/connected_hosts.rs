@@ -575,7 +575,8 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::HookTestResultResponse { request_id, .. }
         | WireMessage::ConditionalTimerCreated { request_id, .. }
         | WireMessage::ConditionalTimersSnapshot { request_id, .. }
-        | WireMessage::ConditionalTimerUpdated { request_id, .. } => Some(*request_id),
+        | WireMessage::ConditionalTimerUpdated { request_id, .. }
+        | WireMessage::GuardianConfigSnapshot { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

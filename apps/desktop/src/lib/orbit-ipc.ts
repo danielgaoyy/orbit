@@ -220,10 +220,51 @@ export type ReasoningEffort =
   | "ultra";
 export type SessionMode =
   | "default"
+  | "auto"
   | "plan"
   | "accept_edits"
   | "full_access"
   | { custom: string };
+
+export type GuardianRiskLevel = "low" | "medium" | "high" | "critical";
+
+export type GuardianDecision = "auto_allow" | "require_human" | "auto_deny";
+
+export interface GuardianPolicyConfig {
+  enabled: boolean;
+  auto_approve_max_risk: GuardianRiskLevel;
+  use_ai_classifier_for_medium: boolean;
+  classifier_timeout_ms: number;
+  allow_read_only_tools: boolean;
+  allow_workspace_tests: boolean;
+  blocked_command_patterns: string[];
+  trusted_command_prefixes: string[];
+}
+
+export interface GuardianAssessment {
+  risk_level: GuardianRiskLevel;
+  decision: GuardianDecision;
+  confidence: number;
+  classifier_tier: "deterministic" | "ai_rubric" | "fail_closed" | string;
+  reason: string;
+  signals: string[];
+  latency_ms: number;
+}
+
+export interface GuardianAuditEntry {
+  id: string;
+  agent_id: string;
+  request_id: string;
+  tool_name: string;
+  target_summary: string;
+  assessment: GuardianAssessment;
+  decided_at_ms: number;
+}
+
+export interface GuardianConfigSnapshotView {
+  config: GuardianPolicyConfig;
+  recent_audits: GuardianAuditEntry[];
+}
 
 export type HostConnectionState =
   | "disconnected"
@@ -641,6 +682,7 @@ export interface PendingPermissionSummary {
   title: string;
   detail: ToolCallDetail;
   allowed_decisions: string[];
+  guardian_assessment?: GuardianAssessment | null;
   created_at: string;
 }
 
@@ -1309,6 +1351,7 @@ export type TimelineItemView =
       detail: ToolCallDetail;
       allowed_decisions: string[];
       resolved_decision: string | null;
+      guardian_assessment?: GuardianAssessment | null;
       timestamp_ms?: number | null;
     }
   | {
@@ -4145,6 +4188,35 @@ export const orbitIpc = {
       hostId,
       timerId,
     });
+  },
+
+  getGuardianConfig: async (hostId: string): Promise<GuardianConfigSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return {
+        config: {
+          enabled: true,
+          auto_approve_max_risk: "low",
+          use_ai_classifier_for_medium: true,
+          classifier_timeout_ms: 4000,
+          allow_read_only_tools: true,
+          allow_workspace_tests: true,
+          blocked_command_patterns: [],
+          trusted_command_prefixes: [],
+        },
+        recent_audits: [],
+      };
+    }
+    return invoke<GuardianConfigSnapshotView>("get_guardian_config", { hostId });
+  },
+
+  updateGuardianConfig: async (
+    hostId: string,
+    config: GuardianPolicyConfig,
+  ): Promise<GuardianConfigSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { config, recent_audits: [] };
+    }
+    return invoke<GuardianConfigSnapshotView>("update_guardian_config", { hostId, config });
   },
   highlightWorkspaceCode: async (
     language: string,

@@ -26,9 +26,9 @@ use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
     AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest, ClientProjectView,
     ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest, FleetOverviewView,
-    GitReviewView, HostCardView, HostDetailView, ImportManagedSkillRequest,
-    ManagedSkillContentView, OrbitAppCore, RewindAgentResultView, SideQuestionStreamEvent,
-    SubscribeOptions, UpsertManagedSkillRequest, WorkspaceFileView,
+    GitReviewView, GuardianConfigSnapshotView, HostCardView, HostDetailView,
+    ImportManagedSkillRequest, ManagedSkillContentView, OrbitAppCore, RewindAgentResultView,
+    SideQuestionStreamEvent, SubscribeOptions, UpsertManagedSkillRequest, WorkspaceFileView,
 };
 use orbit_client_core::catalog::ResolvedModelSelectionView;
 use orbit_client_core::cloud_sync::{
@@ -70,11 +70,12 @@ use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnVie
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
     ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
-    ExternalMcpServerRecord, HookExecutionRecord, HookScope, LifecycleHookRule, LspDiagnostic,
-    LspLocation, LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult,
-    OrchestrationConfig, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
-    ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope,
-    TimerCondition, UsageInsightsSnapshot, WorkspaceBoardSnapshot,
+    ExternalMcpServerRecord, GuardianPolicyConfig, HookExecutionRecord, HookScope,
+    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
+    ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
+    WorkspaceBoardSnapshot,
     WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome,
     WorktreeHandoffPreview,
 };
@@ -2185,6 +2186,26 @@ async fn test_lifecycle_hook(
 }
 
 #[tauri::command]
+async fn get_guardian_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<GuardianConfigSnapshotView, String> {
+    state.core.get_guardian_config_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn update_guardian_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    config: GuardianPolicyConfig,
+) -> Result<GuardianConfigSnapshotView, String> {
+    state
+        .core
+        .update_guardian_config_on_host(&host_id, config)
+        .await
+}
+
+#[tauri::command]
 async fn highlight_workspace_code(
     language: String,
     content: String,
@@ -3063,6 +3084,8 @@ pub fn run() {
             list_conditional_timers,
             cancel_conditional_timer,
             fire_conditional_timer_now,
+            get_guardian_config,
+            update_guardian_config,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

@@ -1090,6 +1090,9 @@ async fn run_agy_actor(
                             let mode_str = match mode {
                                 SessionMode::AcceptEdits => "accept-edits",
                                 SessionMode::Plan => "plan",
+                                // Auto (Guardian) uses approval-gating `default` mode so Orbit's
+                                // daemon evaluates every permission request through Guardian.
+                                SessionMode::Auto => "default",
                                 _ => "default",
                             };
                             let id = next_rpc_id;

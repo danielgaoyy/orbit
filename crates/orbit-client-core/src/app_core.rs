@@ -18,8 +18,9 @@ use orbit_protocol::{
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
     BackgroundTaskInfo, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
     ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, ExternalMcpServerRecord,
-    GitStatusSnapshot, HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState,
-    KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    GitStatusSnapshot, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
+    HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, KeepAwakeStatus,
+    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
     ManagedSkillRecord, McpProbeResult, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
     PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
@@ -404,6 +405,8 @@ pub enum TimelineItemView {
         detail: ToolCallDetail,
         allowed_decisions: Vec<String>,
         resolved_decision: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guardian_assessment: Option<GuardianAssessment>,
         #[serde(default)]
         timestamp_ms: Option<i64>,
     },
@@ -441,6 +444,12 @@ pub enum TimelineItemView {
         #[serde(default)]
         timestamp_ms: Option<i64>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardianConfigSnapshotView {
+    pub config: GuardianPolicyConfig,
+    pub recent_audits: Vec<GuardianAuditEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -697,6 +706,8 @@ struct HostMemoryState {
     pending_timer_updates:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ConditionalTimerRecord, String>>>,
     background_timer_list_reqs: HashSet<Uuid>,
+    pending_guardian_configs:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GuardianConfigSnapshotView, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -823,6 +834,7 @@ impl HostMemoryState {
             pending_timer_lists: HashMap::new(),
             pending_timer_updates: HashMap::new(),
             background_timer_list_reqs: HashSet::new(),
+            pending_guardian_configs: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -5265,6 +5277,18 @@ impl OrbitAppCore {
                     upsert_conditional_timer_record(&mut state.conditional_timers, timer);
                     notify_host = true;
                 }
+                WireMessage::GuardianConfigSnapshot {
+                    request_id,
+                    config,
+                    recent_audits,
+                } => {
+                    if let Some(tx) = state.pending_guardian_configs.remove(&request_id) {
+                        let _ = tx.send(Ok(GuardianConfigSnapshotView {
+                            config,
+                            recent_audits,
+                        }));
+                    }
+                }
                 WireMessage::SideQuestionDelta {
                     request_id,
                     text_delta,
@@ -5515,6 +5539,10 @@ impl OrbitAppCore {
                         && state.background_timer_list_reqs.remove(&req_id)
                     {
                         // Ignore unsupported/transient background timer list errors on older daemons.
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_guardian_configs.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_side_questions.remove(&req_id)
                     {
@@ -11698,6 +11726,104 @@ impl OrbitAppCore {
             .map_err(|_| format!("{op_label} task cancelled"))?
     }
 
+    /// Fetch Guardian auto-approval policy and recent audit entries from any connected host.
+    pub async fn get_guardian_config_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<GuardianConfigSnapshotView, String> {
+        self.dispatch_guardian_config_rpc(
+            host_id.to_string(),
+            |request_id| WireMessage::GetGuardianConfig { request_id },
+            "load Guardian configuration",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Persist updated Guardian auto-approval policy on any connected host.
+    pub async fn update_guardian_config_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        config: GuardianPolicyConfig,
+    ) -> Result<GuardianConfigSnapshotView, String> {
+        self.dispatch_guardian_config_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::UpdateGuardianConfig { request_id, config },
+            "update Guardian configuration",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    async fn dispatch_guardian_config_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+        timeout: Duration,
+    ) -> Result<GuardianConfigSnapshotView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_guardian_configs.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_guardian_configs.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_guardian_configs.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for daemon to {op_label}"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
     /// List discovered and active LSP language servers for a workspace on any connected host.
     pub async fn list_lsp_servers_on_host(
         self: &Arc<Self>,
@@ -13838,6 +13964,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     h.background_timer_list_reqs.clear();
+    for (_, tx) in h.pending_guardian_configs.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (req_id, tx) in h.pending_side_questions.drain() {
         let _ = tx.send(SideQuestionStreamEvent::Done {
             request_id: req_id.to_string(),
@@ -14851,6 +14980,7 @@ fn render_timeline_event_view(
             title,
             detail,
             allowed_decisions,
+            guardian_assessment,
         } => Some(TimelineItemView::PermissionRequest {
             seq: ev.seq,
             request_id: request_id.clone(),
@@ -14858,6 +14988,7 @@ fn render_timeline_event_view(
             detail: detail.clone(),
             allowed_decisions: allowed_decisions.clone(),
             resolved_decision: all_resolved_perms.get(request_id).cloned(),
+            guardian_assessment: guardian_assessment.clone(),
             timestamp_ms: ts_ms,
         }),
         TimelinePayload::QuestionRequest {
@@ -16179,6 +16310,7 @@ mod tests {
                                 output_preview: None,
                             },
                             allowed_decisions: vec!["allow_once".into()],
+                            guardian_assessment: None,
                         },
                     },
                     TimelineEvent {

@@ -83,6 +83,9 @@ import {
   type PromptBadge,
   PROVIDER_LIST,
   formatProviderLabel,
+  type GuardianAuditEntry,
+  type GuardianConfigSnapshotView,
+  type GuardianPolicyConfig,
   type ProviderKind,
   type ReasoningEffort,
   type ReleaseUpdateInfo,
@@ -386,6 +389,7 @@ export type ActiveViewMode = "workspace" | "settings";
 export type WorkspacePanelMode = "conversation" | "automations";
 export type HostSettingsTab =
   | "agents"
+  | "guardian"
   | "skills"
   | "acp"
   | "mcp"
@@ -646,6 +650,16 @@ export interface OrbitUiState {
       hooks: LifecycleHookRule[];
       recentExecutions: HookExecutionRecord[];
       projectHooksTrusted: boolean;
+      error?: string | null;
+    }
+  >;
+  guardianByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      config: GuardianPolicyConfig | null;
+      recentAudits: GuardianAuditEntry[];
+      saving?: boolean;
       error?: string | null;
     }
   >;
@@ -975,6 +989,7 @@ const defaultInitialState: OrbitUiState = {
   lspServersByWorkspace: {},
   lspDiagnosticsByFile: {},
   lifecycleHooksByScope: {},
+  guardianByHost: {},
 
   overviewDesktopOpenPref: initialPrefs.overviewDesktopOpenPref ?? true,
   overviewPopoverOpen: false,
@@ -3667,7 +3682,7 @@ export const orbitActions = {
   },
 
   cycleActiveMode(): void {
-    const cycle: SessionMode[] = ["default", "accept_edits", "full_access"];
+    const cycle: SessionMode[] = ["default", "auto", "accept_edits", "full_access"];
     if (state.isDraftNewSession || !state.selectedHostId || !state.selectedAgentId) {
       const idx = cycle.findIndex((m) => m === state.draftMode);
       const next = cycle[(idx + 1) % cycle.length];
@@ -7020,6 +7035,117 @@ export const orbitActions = {
     }
   },
 
+  async loadGuardianConfig(hostId: string): Promise<GuardianConfigSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (guardianReqSeqByHost.get(hostId) ?? 0) + 1;
+    guardianReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      guardianByHost: {
+        ...s.guardianByHost,
+        [hostId]: {
+          status: "loading",
+          config: s.guardianByHost[hostId]?.config ?? null,
+          recentAudits: s.guardianByHost[hostId]?.recentAudits ?? [],
+          saving: s.guardianByHost[hostId]?.saving ?? false,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.getGuardianConfig(hostId);
+      if (guardianReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        guardianByHost: {
+          ...s.guardianByHost,
+          [hostId]: {
+            status: "ready",
+            config: snap.config,
+            recentAudits: snap.recent_audits,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (guardianReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        guardianByHost: {
+          ...s.guardianByHost,
+          [hostId]: {
+            status: "error",
+            config: s.guardianByHost[hostId]?.config ?? null,
+            recentAudits: s.guardianByHost[hostId]?.recentAudits ?? [],
+            saving: false,
+            error: String(err),
+          },
+        },
+      }));
+      return null;
+    }
+  },
+
+  async updateGuardianConfig(
+    hostId: string,
+    config: GuardianPolicyConfig,
+  ): Promise<GuardianConfigSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (guardianReqSeqByHost.get(hostId) ?? 0) + 1;
+    guardianReqSeqByHost.set(hostId, seq);
+    const prevConfig = state.guardianByHost[hostId]?.config ?? null;
+    setState((s) => ({
+      ...s,
+      guardianByHost: {
+        ...s.guardianByHost,
+        [hostId]: {
+          status: s.guardianByHost[hostId]?.status ?? "ready",
+          config,
+          recentAudits: s.guardianByHost[hostId]?.recentAudits ?? [],
+          saving: true,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.updateGuardianConfig(hostId, config);
+      if (guardianReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        guardianByHost: {
+          ...s.guardianByHost,
+          [hostId]: {
+            status: "ready",
+            config: snap.config,
+            recentAudits: snap.recent_audits,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (guardianReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        guardianByHost: {
+          ...s.guardianByHost,
+          [hostId]: {
+            status: "error",
+            config: prevConfig,
+            recentAudits: s.guardianByHost[hostId]?.recentAudits ?? [],
+            saving: false,
+            error: String(err),
+          },
+        },
+      }));
+      notifyToast(`Guardian update failed: ${String(err)}`);
+      return null;
+    }
+  },
+
   async loadLspServers(hostId: string, cwd: string): Promise<LspServerStatus[]> {
     if (!hostId || !cwd || cwd === "~") return [];
     const scopeKey = `${hostId}::${cwd}`;
@@ -9436,6 +9562,7 @@ export const orbitActions = {
               : s.draftUseWorktree,
           draftMode:
             prefs.draftMode === "default" ||
+            prefs.draftMode === "auto" ||
             prefs.draftMode === "plan" ||
             prefs.draftMode === "accept_edits" ||
             prefs.draftMode === "full_access"
@@ -9715,6 +9842,7 @@ let nextLspGotoSeq = 0;
 const lspDiagSeqByKey = new Map<string, number>();
 const lspServersSeqByKey = new Map<string, number>();
 const lifecycleHooksSeqByKey = new Map<string, number>();
+const guardianReqSeqByHost = new Map<string, number>();
 
 function upsertLruRecord<T>(
   record: Record<string, T>,

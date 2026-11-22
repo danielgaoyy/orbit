@@ -818,6 +818,8 @@ fn codex_thread_mode_strings(mode: &SessionMode) -> (&'static str, &'static str)
     match mode {
         SessionMode::FullAccess => ("never", "danger-full-access"),
         SessionMode::Plan => ("on-request", "read-only"),
+        // Auto (Guardian) keeps approval policy `on-request` so Orbit's daemon classifies requests.
+        SessionMode::Auto => ("on-request", "workspace-write"),
         _ => ("on-request", "workspace-write"),
     }
 }
@@ -830,7 +832,10 @@ fn codex_turn_policies(mode: &SessionMode, extra_dirs: &[PathBuf]) -> (&'static 
     match mode {
         SessionMode::FullAccess => ("never", json!({ "type": "dangerFullAccess" })),
         SessionMode::Plan => ("on-request", json!({ "type": "readOnly" })),
-        _ => (
+        SessionMode::Auto
+        | SessionMode::Default
+        | SessionMode::AcceptEdits
+        | SessionMode::Custom(_) => (
             "on-request",
             json!({
                 "type": "workspaceWrite",

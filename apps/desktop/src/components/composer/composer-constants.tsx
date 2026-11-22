@@ -1,4 +1,4 @@
-import { Shield, ShieldCheck, ShieldOff } from "lucide-react";
+import { FilePenLine, Shield, ShieldCheck, ShieldOff } from "lucide-react";
 import { defaultEffortDescription, formatEffortLabel } from "@/lib/model-catalog";
 import {
   PROVIDER_LIST,
@@ -39,6 +39,11 @@ export const PERMISSION_MODES: {
     desc: "Require approval before file edits and commands",
   },
   {
+    id: "auto",
+    label: "Auto",
+    desc: "Guardian risk filter",
+  },
+  {
     id: "accept_edits",
     label: "Accept Edits",
     desc: "Auto-approve file edits, ask before commands",
@@ -61,6 +66,8 @@ export function modeLabel(mode: SessionMode): string {
     case "plan":
     case "default":
       return "Always Ask";
+    case "auto":
+      return "Auto";
     case "accept_edits":
       return "Accept Edits";
     case "full_access":
@@ -77,8 +84,10 @@ export function ModeIcon({ mode, className }: { mode: SessionMode; className?: s
     case "plan":
     case "default":
       return <Shield className={cn("size-[15px] stroke-[1.75]", className)} />;
-    case "accept_edits":
+    case "auto":
       return <ShieldCheck className={cn("size-[15px] stroke-[1.75]", className)} />;
+    case "accept_edits":
+      return <FilePenLine className={cn("size-[15px] stroke-[1.75]", className)} />;
     case "full_access":
       return <ShieldOff className={cn("size-[15px] stroke-[1.75]", className)} />;
   }

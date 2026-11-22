@@ -16,6 +16,7 @@ import {
   Plus,
   Server,
   Settings2,
+  ShieldCheck,
   Sparkles,
   Webhook,
   Wifi,
@@ -30,6 +31,7 @@ import { InstructionsSection } from "@/components/settings/instructions-section"
 import { HostAcpSection } from "@/components/settings/host-acp-section";
 import { HostAgentsSection } from "@/components/settings/host-agents-section";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
+import { HostGuardianSection } from "@/components/settings/host-guardian-section";
 import { HostHooksSection } from "@/components/settings/host-hooks-section";
 import { HostLspSection } from "@/components/settings/host-lsp-section";
 import { HostMcpSection } from "@/components/settings/host-mcp-section";
@@ -85,6 +87,7 @@ const HOST_TABS: {
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   { id: "agents", label: "Agents", icon: Cpu },
+  { id: "guardian", label: "Guardian", icon: ShieldCheck },
   { id: "skills", label: "Skills", icon: Sparkles },
   { id: "acp", label: "ACP Agents", icon: Plug },
   { id: "mcp", label: "MCP Servers", icon: Server },
@@ -105,6 +108,7 @@ function parseHostSection(
   const tab = section.slice(lastColon + 1) as HostSettingsTab;
   if (
     tab !== "agents" &&
+    tab !== "guardian" &&
     tab !== "skills" &&
     tab !== "acp" &&
     tab !== "mcp" &&
@@ -520,6 +524,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               {parsedHost && !resolvedHost && <AddHostSection />}
               {resolvedHost?.tab === "agents" && (
                 <HostAgentsSection hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "guardian" && (
+                <HostGuardianSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
               )}
               {resolvedHost?.tab === "skills" && (
                 <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />

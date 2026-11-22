@@ -94,6 +94,8 @@ pub struct PendingPermissionSummary {
     pub title: String,
     pub detail: ToolCallDetail,
     pub allowed_decisions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_assessment: Option<crate::GuardianAssessment>,
     pub created_at: DateTime<Utc>,
 }
 

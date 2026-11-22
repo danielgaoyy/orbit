@@ -2,6 +2,7 @@
 
 pub mod acp;
 pub mod artifacts;
+pub mod guardian;
 pub mod handoff;
 pub mod hooks;
 pub mod instructions;
@@ -15,6 +16,7 @@ pub mod timers;
 pub mod usage;
 pub use acp::*;
 pub use artifacts::*;
+pub use guardian::*;
 pub use handoff::*;
 pub use hooks::*;
 pub use instructions::*;
@@ -294,11 +296,13 @@ impl ProviderKind {
     }
 }
 
-/// Normalized permission/execution mode across all three providers.
+/// Normalized permission/execution mode across all providers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
     Default,
+    #[serde(rename = "auto")]
+    Auto,
     Plan,
     AcceptEdits,
     FullAccess,
@@ -780,6 +784,8 @@ pub enum TimelinePayload {
         title: String,
         detail: ToolCallDetail,
         allowed_decisions: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guardian_assessment: Option<GuardianAssessment>,
     },
     PermissionResolved {
         request_id: String,
@@ -2328,6 +2334,21 @@ pub enum WireMessage {
         timer: ConditionalTimerRecord,
     },
 
+    // Guardian AI Risk-Assessment Auto-Approval Policy & Audit Log
+    GetGuardianConfig {
+        request_id: Uuid,
+    },
+    UpdateGuardianConfig {
+        request_id: Uuid,
+        config: GuardianPolicyConfig,
+    },
+    GuardianConfigSnapshot {
+        request_id: Uuid,
+        config: GuardianPolicyConfig,
+        #[serde(default)]
+        recent_audits: Vec<GuardianAuditEntry>,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -3752,6 +3773,64 @@ mod tests {
                 .expect("encode conditional timer wire msg");
             let decoded =
                 WireMessage::decode_zstd(&encoded).expect("decode conditional timer wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn guardian_session_mode_auto_and_wire_roundtrip() {
+        let mode_json = serde_json::to_string(&SessionMode::Auto).expect("serialize auto mode");
+        assert_eq!(mode_json, "\"auto\"");
+        let parsed_mode: SessionMode =
+            serde_json::from_str(&mode_json).expect("deserialize auto mode");
+        assert_eq!(parsed_mode, SessionMode::Auto);
+
+        let req_id = Uuid::new_v4();
+        let cfg = GuardianPolicyConfig {
+            enabled: true,
+            auto_approve_max_risk: GuardianRiskLevel::Low,
+            use_ai_classifier_for_medium: true,
+            classifier_timeout_ms: 4_000,
+            allow_read_only_tools: true,
+            allow_workspace_tests: true,
+            blocked_command_patterns: vec!["rm -rf".into()],
+            trusted_command_prefixes: vec!["just test".into()],
+        };
+        let audit = GuardianAuditEntry {
+            id: "ga_1".into(),
+            agent_id: "ag_1".into(),
+            request_id: "perm_1".into(),
+            tool_name: "shell".into(),
+            target_summary: "cargo test".into(),
+            assessment: GuardianAssessment {
+                risk_level: GuardianRiskLevel::Low,
+                decision: GuardianDecision::AutoAllow,
+                confidence: 0.99,
+                classifier_tier: "deterministic".into(),
+                reason: "Safe workspace test command".into(),
+                signals: vec!["workspace_test".into()],
+                latency_ms: 0,
+            },
+            decided_at_ms: 1_760_000_000_000,
+        };
+        let messages = vec![
+            WireMessage::GetGuardianConfig { request_id: req_id },
+            WireMessage::UpdateGuardianConfig {
+                request_id: req_id,
+                config: cfg.clone(),
+            },
+            WireMessage::GuardianConfigSnapshot {
+                request_id: req_id,
+                config: cfg,
+                recent_audits: vec![audit],
+            },
+        ];
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode guardian wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode guardian wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

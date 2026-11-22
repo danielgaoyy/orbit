@@ -3,6 +3,7 @@
 //! Replaces Paseo's scattered JSON files with ACID event-sourced timelines and `< 1ms` cursor catch-up.
 
 pub mod artifacts;
+pub mod guardian;
 pub mod orchestration;
 pub mod search;
 pub mod timers;
@@ -443,6 +444,7 @@ impl OrbitStore {
         artifacts::migrate_artifacts_schema(&conn)?;
         usage::migrate_usage_schema(&conn)?;
         timers::migrate_conditional_timers_schema(&conn)?;
+        guardian::migrate_guardian_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -4870,6 +4872,7 @@ mod tests {
                         arguments_json: "{\"command\":\"rm -rf\"}".into(),
                     },
                     allowed_decisions: vec!["allow".into(), "deny".into()],
+                    guardian_assessment: None,
                 },
             )
             .expect("perm req");

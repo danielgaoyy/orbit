@@ -171,9 +171,10 @@ const PROVIDER_OPTIONS: SettingSelectOption<ProviderKind>[] = PROVIDER_LIST.map(
   label: p.label,
 }));
 
-type SimpleSessionMode = "accept_edits" | "full_access" | "plan" | "default";
+type SimpleSessionMode = "auto" | "accept_edits" | "full_access" | "plan" | "default";
 
 const PERMISSION_OPTIONS: SettingSelectOption<SimpleSessionMode>[] = [
+  { value: "auto", label: "Auto", description: "Guardian risk filter" },
   { value: "accept_edits", label: "Accept Edits", description: "Auto-approve file edits" },
   { value: "full_access", label: "Full Access", description: "Unattended edits & commands" },
   { value: "plan", label: "Plan (Read-only)", description: "Inspect without modifying files" },
@@ -192,6 +193,8 @@ function shortWorkspaceName(cwd: string): string {
 function formatModeLabel(mode: SessionMode): string {
   if (typeof mode !== "string") return mode.custom;
   switch (mode) {
+    case "auto":
+      return "Auto";
     case "accept_edits":
       return "Accept Edits";
     case "full_access":

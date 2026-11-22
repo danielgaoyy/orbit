@@ -1733,6 +1733,9 @@ async fn wait_claude_init_response(
 fn claude_mode_flag(mode: &SessionMode) -> &'static str {
     match mode {
         SessionMode::Default => "default",
+        // Auto (Guardian) maps to Claude's approval-gating mode so Orbit's daemon receives
+        // `can_use_tool` control requests and evaluates them through Guardian.
+        SessionMode::Auto => "default",
         SessionMode::AcceptEdits => "acceptEdits",
         SessionMode::Plan => "plan",
         SessionMode::FullAccess => "bypassPermissions",

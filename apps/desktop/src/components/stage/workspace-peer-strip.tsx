@@ -970,6 +970,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       onChange={(e) => setCustomMode(e.target.value as SessionMode)}
                       className="border-border bg-canvas text-foreground rounded-md border px-1.5 py-0.5 text-[11.5px]"
                     >
+                      <option value="auto">Auto (Guardian)</option>
                       <option value="accept_edits">Accept Edits</option>
                       <option value="plan">Plan</option>
                       <option value="full_access">Full Access</option>

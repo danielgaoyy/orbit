@@ -695,7 +695,7 @@ export const OmniComposer = memo(function OmniComposer({
         orbitActions.setSlashDirective("plan");
         break;
       case "auto":
-        handleSelectMode("accept_edits");
+        handleSelectMode("auto");
         break;
       case "supervised":
         handleSelectMode("default");

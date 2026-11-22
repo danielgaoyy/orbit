@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod fast_copy;
 pub mod finish_subscriptions;
 pub mod git;
+pub mod guardian;
 pub mod hooks;
 pub mod idle_cleanup;
 pub mod instructions;
@@ -3442,6 +3443,26 @@ async fn handle_wire_rpc(
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
             None
+        }
+
+        // Guardian AI Risk-Assessment Auto-Approval Policy & Audit Log
+        WireMessage::GetGuardianConfig { request_id } => {
+            let (config, recent_audits) = runtime.orchestrator.guardian.snapshot().await;
+            Some(WireMessage::GuardianConfigSnapshot {
+                request_id,
+                config,
+                recent_audits,
+            })
+        }
+        WireMessage::UpdateGuardianConfig { request_id, config } => {
+            match runtime.orchestrator.guardian.update_config(config).await {
+                Ok((saved, recent_audits)) => Some(WireMessage::GuardianConfigSnapshot {
+                    request_id,
+                    config: saved,
+                    recent_audits,
+                }),
+                Err(e) => Some(rpc_err(request_id, "update_guardian_config_failed", e)),
+            }
         }
 
         // First-Class Artifacts & SEP-1865 MCP Apps (offloaded via spawn_blocking)

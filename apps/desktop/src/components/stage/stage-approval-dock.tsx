@@ -11,6 +11,7 @@ import {
   PenLine,
   Search,
   Shield,
+  ShieldAlert,
   Terminal,
   X,
   type LucideIcon,
@@ -364,6 +365,30 @@ function PermissionApprovalCard({
       </div>
 
       <div className="px-4 py-3">
+        {perm.guardian_assessment && (
+          <div
+            className={cn(
+              "mb-2 flex items-center gap-1.5 rounded-[8px] px-2.5 py-1 text-[11.5px] leading-snug",
+              perm.guardian_assessment.risk_level === "critical" ||
+                perm.guardian_assessment.risk_level === "high"
+                ? "bg-rose-500/[0.08] text-rose-700 dark:bg-rose-500/[0.12] dark:text-rose-300"
+                : "bg-amber-500/[0.08] text-amber-800 dark:bg-amber-500/[0.12] dark:text-amber-200",
+            )}
+          >
+            <ShieldAlert className="size-3.5 shrink-0 stroke-[1.8]" />
+            <span className="shrink-0 whitespace-nowrap font-medium">
+              {perm.guardian_assessment.risk_level === "critical"
+                ? "Critical risk"
+                : perm.guardian_assessment.risk_level === "high"
+                  ? "High risk"
+                  : perm.guardian_assessment.risk_level === "medium"
+                    ? "Medium risk"
+                    : "Low risk"}
+            </span>
+            <span className="shrink-0 opacity-45">·</span>
+            <span className="min-w-0 truncate opacity-90">{perm.guardian_assessment.reason}</span>
+          </div>
+        )}
         <div className="rounded-[10px] bg-black/[0.028] px-3 py-2 dark:bg-white/[0.035]">
           <div className="selectable-text text-foreground/88 line-clamp-2 font-mono text-[12.5px] leading-[1.5] break-all">
             {target.isShell && (

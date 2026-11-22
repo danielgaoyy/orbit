@@ -135,6 +135,7 @@ impl From<CliProvider> for ProviderKind {
 #[derive(Clone, Copy, ValueEnum)]
 pub enum CliMode {
     Default,
+    Auto,
     AcceptEdits,
     Plan,
     FullAccess,
@@ -144,6 +145,7 @@ impl From<CliMode> for SessionMode {
     fn from(v: CliMode) -> Self {
         match v {
             CliMode::Default => SessionMode::Default,
+            CliMode::Auto => SessionMode::Auto,
             CliMode::AcceptEdits => SessionMode::AcceptEdits,
             CliMode::Plan => SessionMode::Plan,
             CliMode::FullAccess => SessionMode::FullAccess,

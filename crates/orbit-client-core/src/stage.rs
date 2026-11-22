@@ -3320,6 +3320,7 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 resolved_decision: None,
+                guardian_assessment: None,
                 timestamp_ms: Some(23_000),
             },
             TimelineItemView::QuestionRequest {

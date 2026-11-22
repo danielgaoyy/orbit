@@ -255,7 +255,8 @@ fn resolve_wire_mode_id(mode: &SessionMode, available_modes: &[String]) -> Optio
         return (!trimmed.is_empty()).then(|| trimmed.to_string());
     }
     let candidates: &[&str] = match mode {
-        SessionMode::Default => &["default", "ask", "code", "normal"],
+        // Auto (Guardian) maps to approval-gating mode so Orbit's daemon receives permission requests.
+        SessionMode::Default | SessionMode::Auto => &["default", "ask", "code", "normal"],
         SessionMode::Plan => &["plan", "architect", "read-only", "readonly"],
         SessionMode::AcceptEdits => &[
             "accept-edits",
@@ -1727,7 +1728,7 @@ async fn handle_generic_session_update(
                 .or_else(|| update.get("modeId"))
                 .and_then(Value::as_str)
             {
-                *mode = match mode_id.to_ascii_lowercase().as_str() {
+                let parsed = match mode_id.to_ascii_lowercase().as_str() {
                     "default" | "ask" => SessionMode::Default,
                     "plan" | "architect" => SessionMode::Plan,
                     "accept-edits" | "accept_edits" | "acceptedits" | "auto-edit" => {
@@ -1738,6 +1739,9 @@ async fn handle_generic_session_update(
                     }
                     _ => SessionMode::Custom(mode_id.to_string()),
                 };
+                if !matches!(*mode, SessionMode::Auto) {
+                    *mode = parsed;
+                }
             }
         }
         "config_option_update" => {

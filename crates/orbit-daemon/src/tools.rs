@@ -1458,7 +1458,7 @@ async fn execute_tool_inner(
                         "display_name": p.kind.display_name(),
                         "binary": p.executable_path,
                         "transport": p.protocol_transport,
-                        "modes": ["default", "plan", "accept_edits", "full_access"],
+                        "modes": ["default", "auto", "plan", "accept_edits", "full_access"],
                     })
                 })
                 .collect();
@@ -2473,6 +2473,7 @@ fn parse_provider_and_model(raw: &str) -> anyhow::Result<(ProviderKind, Option<S
 fn parse_session_mode(raw: &str) -> SessionMode {
     match raw.trim().to_ascii_lowercase().as_str() {
         "default" => SessionMode::Default,
+        "auto" | "guardian" => SessionMode::Auto,
         "plan" => SessionMode::Plan,
         "accept_edits" | "accept-edits" => SessionMode::AcceptEdits,
         "full_access" | "full-access" | "bypass" => SessionMode::FullAccess,
@@ -2609,7 +2610,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
                     "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
-                    "mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
+                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
                     "profile_id": { "type": "string", "description": "Optional saved profile ID or name from `list_profiles`." },
                     "workspace_id": { "type": "string", "description": "Existing workspace ID from `create_workspace` or `list_workspaces`." },
                     "cwd": { "type": "string", "description": "Working directory (defaults to caller's directory on local host)." },
@@ -2653,7 +2654,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "agent_id": { "type": "string" },
                     "prompt": { "type": "string" },
                     "active_turn_behavior": { "type": "string", "enum": ["steer", "queue", "interrupt"], "default": "steer" },
-                    "session_mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
+                    "session_mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
                     "notify_on_finish": { "type": "boolean", "default": true },
                     "host_id": { "type": "string" },
                     "message_id": { "type": "string" }
@@ -3239,7 +3240,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
                     "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
-                    "mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
+                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
                     "profile_id": { "type": "string" },
                     "cwd": { "type": "string" },
                     "worktree": { "type": "boolean", "description": "Isolate this peer in its own git worktree while staying in the same Mission Workspace." },

@@ -209,6 +209,7 @@ pub struct AgentOrchestrator {
     orch_config: Arc<RwLock<OrchestrationConfig>>,
     store: Arc<OrbitStore>,
     pub scripts: Arc<WorkspaceScriptRegistry>,
+    pub guardian: Arc<crate::guardian::GuardianManager>,
     keep_awake: Arc<KeepAwakeManager>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     hooks: Arc<crate::hooks::HooksEngine>,
@@ -222,6 +223,9 @@ pub struct AgentOrchestrator {
     live_terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
     /// Pending permissions keyed by `(agent_id, request_id)`
     pending_permissions: RwLock<HashMap<(String, String), PendingPermissionSummary>>,
+    /// Recently Guardian-auto-resolved `(agent_id, request_id)` pairs so trailing
+    /// `StatusChanged::AwaitingPermission` events do not flash stale `AttentionState::Permission`.
+    guardian_auto_resolved_requests: RwLock<std::collections::HashSet<(String, String)>>,
     /// Last `<orbit-workspace>` roster fingerprint injected per `agent_id` to avoid redundant XML bloat.
     roster_fingerprints: RwLock<HashMap<String, String>>,
     /// Conflict radar cooldown keyed by `(workspace_id, canonical_file_path)`.
@@ -284,6 +288,8 @@ impl AgentOrchestrator {
         let orbit_exe = resolve_orbit_exe();
         let (broadcast_tx, _) = broadcast::channel(2048);
         let worktree_pool = WorktreePool::with_default_config(home_dir.clone());
+        let guardian =
+            crate::guardian::GuardianManager::new(home_dir.clone(), Some(Arc::clone(&store)));
         Arc::new(Self {
             home_dir,
             orbit_exe,
@@ -293,6 +299,7 @@ impl AgentOrchestrator {
             orch_config,
             store,
             scripts,
+            guardian,
             keep_awake,
             provider_catalogs,
             hooks,
@@ -303,6 +310,7 @@ impl AgentOrchestrator {
             pending_questions: RwLock::new(HashMap::new()),
             live_terminals: RwLock::new(HashMap::new()),
             pending_permissions: RwLock::new(HashMap::new()),
+            guardian_auto_resolved_requests: RwLock::new(std::collections::HashSet::new()),
             roster_fingerprints: RwLock::new(HashMap::new()),
             conflict_cooldowns: RwLock::new(HashMap::new()),
             suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
@@ -3257,6 +3265,10 @@ impl AgentOrchestrator {
             .write()
             .await
             .retain(|(aid, _), _| aid != agent_id);
+        self.guardian_auto_resolved_requests
+            .write()
+            .await
+            .retain(|(aid, _)| aid != agent_id);
         self.pending_questions.write().await.remove(agent_id);
     }
 
@@ -4976,7 +4988,18 @@ impl AgentOrchestrator {
                         }
                         should_check_auto_archive = true;
                     }
-                    AgentStatus::AwaitingPermission { .. } => {
+                    AgentStatus::AwaitingPermission { request_id, .. } => {
+                        let key = (agent_id.to_string(), request_id.clone());
+                        let was_auto_resolved = self
+                            .guardian_auto_resolved_requests
+                            .write()
+                            .await
+                            .remove(&key);
+                        if was_auto_resolved
+                            && !self.pending_permissions.read().await.contains_key(&key)
+                        {
+                            return;
+                        }
                         if prev.as_ref().is_some_and(|a| !a.background) {
                             let _ = self
                                 .store
@@ -5096,7 +5119,166 @@ impl AgentOrchestrator {
                 detail,
                 allowed_decisions,
             } => {
-                if let Ok(Some(ag)) = self.store.get_agent(agent_id) {
+                let agent_opt = self.store.get_agent(agent_id).ok().flatten();
+                let mut guardian_assessment = None;
+
+                if let Some(ref ag) = agent_opt
+                    && matches!(ag.mode, SessionMode::Auto)
+                {
+                    let eval_req = crate::guardian::GuardianEvalRequest {
+                        agent_id,
+                        request_id: &request_id,
+                        title: &title,
+                        detail: &detail,
+                        workspace_cwd: &ag.cwd,
+                    };
+                    let assessment = self.guardian.assess_and_record(&eval_req).await;
+                    // Re-verify generation and current mode after async classification (TOCTOU guard).
+                    if self.current_generation(agent_id).await != expected_gen {
+                        return;
+                    }
+                    let still_auto = self
+                        .store
+                        .get_agent(agent_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|fresh| matches!(fresh.mode, SessionMode::Auto));
+                    let (_, target_summary) =
+                        crate::guardian::summarize_tool_request(&detail, &title);
+
+                    if !still_auto {
+                        let mut escalated = assessment;
+                        escalated.decision = orbit_protocol::GuardianDecision::RequireHuman;
+                        escalated.classifier_tier = "fail_closed".into();
+                        escalated.reason =
+                            "Session mode changed during Guardian evaluation; requires approval"
+                                .into();
+                        guardian_assessment = Some(escalated);
+                    } else {
+                        match assessment.decision {
+                            orbit_protocol::GuardianDecision::AutoAllow => {
+                                let allow_decision =
+                                    crate::guardian::pick_auto_allow_decision(&allowed_decisions);
+                                let resolved_key = (agent_id.to_string(), request_id.clone());
+                                {
+                                    let mut set =
+                                        self.guardian_auto_resolved_requests.write().await;
+                                    if set.len() > 512 {
+                                        set.clear();
+                                    }
+                                    set.insert(resolved_key.clone());
+                                }
+                                if let Some(tx) = self.live_agent_tx(agent_id).await
+                                    && tx
+                                        .send(DriverCommand::ResolvePermission {
+                                            request_id: request_id.clone(),
+                                            decision: allow_decision,
+                                        })
+                                        .await
+                                        .is_ok()
+                                {
+                                    if !self.has_pending_permissions(agent_id).await {
+                                        let _ = self
+                                            .store
+                                            .set_agent_attention(agent_id, AttentionState::None);
+                                    }
+                                    let notice = TimelinePayload::Notice {
+                                        level: "info".into(),
+                                        message: format!(
+                                            "Guardian auto-approved ({}): {target_summary}",
+                                            assessment.risk_level.as_str()
+                                        ),
+                                    };
+                                    if let Ok((saved_ev, mutated)) = self
+                                        .store
+                                        .append_timeline_event_deduped(agent_id, 1, None, notice)
+                                        && mutated
+                                    {
+                                        let _ = self
+                                            .broadcast_tx
+                                            .send(DaemonBroadcast::TimelineLive(saved_ev));
+                                    }
+                                    return;
+                                }
+                                self.guardian_auto_resolved_requests
+                                    .write()
+                                    .await
+                                    .remove(&resolved_key);
+                                // Fail-closed: if auto-resolve dispatch failed, escalate to human.
+                                let mut escalated = assessment;
+                                escalated.decision = orbit_protocol::GuardianDecision::RequireHuman;
+                                escalated.classifier_tier = "fail_closed".into();
+                                escalated.reason =
+                                    "Auto-approval dispatch unavailable; requires human approval"
+                                        .into();
+                                guardian_assessment = Some(escalated);
+                            }
+                            orbit_protocol::GuardianDecision::AutoDeny => {
+                                let deny_decision =
+                                    crate::guardian::pick_auto_deny_decision(&allowed_decisions);
+                                let resolved_key = (agent_id.to_string(), request_id.clone());
+                                {
+                                    let mut set =
+                                        self.guardian_auto_resolved_requests.write().await;
+                                    if set.len() > 512 {
+                                        set.clear();
+                                    }
+                                    set.insert(resolved_key.clone());
+                                }
+                                if let Some(tx) = self.live_agent_tx(agent_id).await
+                                    && tx
+                                        .send(DriverCommand::ResolvePermission {
+                                            request_id: request_id.clone(),
+                                            decision: deny_decision,
+                                        })
+                                        .await
+                                        .is_ok()
+                                {
+                                    if !self.has_pending_permissions(agent_id).await {
+                                        let _ = self
+                                            .store
+                                            .set_agent_attention(agent_id, AttentionState::None);
+                                    }
+                                    let notice = TimelinePayload::Notice {
+                                        level: "warning".into(),
+                                        message: format!(
+                                            "Guardian denied ({}): {}",
+                                            assessment.risk_level.as_str(),
+                                            assessment.reason
+                                        ),
+                                    };
+                                    if let Ok((saved_ev, mutated)) = self
+                                        .store
+                                        .append_timeline_event_deduped(agent_id, 1, None, notice)
+                                        && mutated
+                                    {
+                                        let _ = self
+                                            .broadcast_tx
+                                            .send(DaemonBroadcast::TimelineLive(saved_ev));
+                                    }
+                                    return;
+                                }
+                                self.guardian_auto_resolved_requests
+                                    .write()
+                                    .await
+                                    .remove(&resolved_key);
+                                // Fail-closed: mirror AutoAllow dispatch fallback for AutoDeny.
+                                let mut escalated = assessment;
+                                escalated.decision = orbit_protocol::GuardianDecision::RequireHuman;
+                                escalated.classifier_tier = "fail_closed".into();
+                                escalated.reason =
+                                    "Auto-deny dispatch unavailable; requires human approval"
+                                        .into();
+                                guardian_assessment = Some(escalated);
+                            }
+                            orbit_protocol::GuardianDecision::RequireHuman => {
+                                guardian_assessment = Some(assessment);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ag) = agent_opt {
                     self.pending_permissions.write().await.insert(
                         (agent_id.to_string(), request_id.clone()),
                         PendingPermissionSummary {
@@ -5107,6 +5289,7 @@ impl AgentOrchestrator {
                             title: title.clone(),
                             detail: detail.clone(),
                             allowed_decisions: allowed_decisions.clone(),
+                            guardian_assessment: guardian_assessment.clone(),
                             created_at: Utc::now(),
                         },
                     );
@@ -5116,6 +5299,7 @@ impl AgentOrchestrator {
                     title,
                     detail,
                     allowed_decisions,
+                    guardian_assessment,
                 }
             }
             DriverEvent::QuestionRequest {
@@ -7174,5 +7358,189 @@ mod fast_mode_orchestrator_tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn guardian_auto_resolve_suppresses_stale_awaiting_permission_and_mirrors_deny_fallback()
+    {
+        let home_dir = std::env::temp_dir().join(format!(
+            "orbit-guardian-mgr-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("create ws");
+        let store = Arc::new(OrbitStore::open_in_memory().expect("store"));
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_test".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            crate::hooks::HooksEngine::new(home_dir.clone()),
+        )
+        .await;
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_g1".into(),
+                title: "Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_g1".into(),
+                    workspace_id: "ws_g1".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Guardian Agent".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Auto,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        // 1. Live driver receives AutoAllow resolve, and trailing AwaitingPermission does NOT set Permission attention
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let agent_gen = orch.bump_generation("ag_g1").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_g1".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        orch.ingest_driver_event(
+            "ag_g1",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_low_1".into(),
+                title: "Run tests".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+            },
+        )
+        .await;
+        match cmd_rx.try_recv().expect("auto allow dispatched") {
+            DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "perm_low_1");
+                assert_eq!(decision, "allow");
+            }
+            other => panic!("unexpected driver command: {other:?}"),
+        }
+        // Trailing StatusChanged(AwaitingPermission) for the auto-resolved request must be suppressed
+        orch.ingest_driver_event(
+            "ag_g1",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::AwaitingPermission {
+                turn_id: "t1".into(),
+                request_id: "perm_low_1".into(),
+            }),
+        )
+        .await;
+        let ag_after = store.get_agent("ag_g1").expect("get").expect("exists");
+        assert_eq!(ag_after.attention, AttentionState::None);
+
+        // 2. AutoDeny dispatch failure (no live driver) falls back to fail_closed RequireHuman
+        let _ = orch
+            .guardian
+            .update_config(orbit_protocol::GuardianPolicyConfig {
+                blocked_command_patterns: vec!["deny:cargo test".into()],
+                ..orbit_protocol::GuardianPolicyConfig::default()
+            })
+            .await
+            .expect("update cfg");
+        orch.live_agents.write().await.remove("ag_g1");
+        orch.ingest_driver_event(
+            "ag_g1",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_deny_fail".into(),
+                title: "Run tests".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+            },
+        )
+        .await;
+        let pending = orch.list_pending_permissions(Some("ag_g1")).await;
+        assert_eq!(pending.len(), 1);
+        let assess = pending[0]
+            .guardian_assessment
+            .as_ref()
+            .expect("guardian assessment attached");
+        assert_eq!(
+            assess.decision,
+            orbit_protocol::GuardianDecision::RequireHuman
+        );
+        assert_eq!(assess.classifier_tier, "fail_closed");
+
+        let _ = std::fs::remove_dir_all(&home_dir);
     }
 }

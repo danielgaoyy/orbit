@@ -451,6 +451,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
                 onChange={(e) => setProfMode(e.target.value as SessionMode)}
                 className="border-border bg-canvas rounded-lg border px-2 py-1.5"
               >
+                <option value="auto">Auto (Guardian)</option>
                 <option value="accept_edits">Accept Edits</option>
                 <option value="plan">Plan (Read-only)</option>
                 <option value="full_access">Full Access</option>

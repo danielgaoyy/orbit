@@ -45,6 +45,7 @@ fn parse_provider_str(raw: &str) -> ProviderKind {
 fn parse_mode_str(raw: &str) -> SessionMode {
     match raw.trim() {
         "default" | "" => SessionMode::Default,
+        "auto" => SessionMode::Auto,
         "plan" => SessionMode::Plan,
         "accept_edits" => SessionMode::AcceptEdits,
         "full_access" => SessionMode::FullAccess,

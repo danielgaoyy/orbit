@@ -545,6 +545,11 @@ private fun extractAssistantReplyText(reply: FfiTimelineItem.AssistantMessage): 
                         appendLine(row.cells.joinToString(" | ") { cell -> cell.spans.joinToString("") { it.text } })
                     }
                 }
+                is FfiRichBlock.MathBlock -> {
+                    appendLine("$$")
+                    appendLine(block.tex)
+                    appendLine("$$")
+                }
                 FfiRichBlock.HorizontalRule -> appendLine("---")
             }
         }

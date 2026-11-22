@@ -1,9 +1,15 @@
 package dev.orbit.android.ui.sheets
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -29,9 +35,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.CloudSync
 import androidx.compose.material.icons.outlined.Contrast
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.LightMode
+import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.AlertDialog
@@ -46,11 +54,15 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -62,6 +74,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.orbit.android.BuildConfig
+import dev.orbit.android.notifications.OrbitNotificationHelper
 import dev.orbit.android.store.OrbitFormatters
 import dev.orbit.android.ui.theme.OrbitAppearanceMode
 import dev.orbit.android.ui.theme.OrbitCopyIcon
@@ -71,10 +84,13 @@ import dev.orbit.android.ui.theme.OrbitTheme
 import java.time.Duration
 import java.time.Instant
 import java.time.OffsetDateTime
+import uniffi.orbit_ffi_uniffi.FfiCloudSyncState
+import uniffi.orbit_ffi_uniffi.FfiCloudSyncStatus
 import uniffi.orbit_ffi_uniffi.FfiConnectionState
 import uniffi.orbit_ffi_uniffi.FfiHostCard
 import uniffi.orbit_ffi_uniffi.FfiHostRouteMode
 import uniffi.orbit_ffi_uniffi.FfiProviderQuota
+import uniffi.orbit_ffi_uniffi.FfiPushRegistrationStatus
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -84,9 +100,12 @@ fun SettingsSheet(
     hosts: List<FfiHostCard>,
     selectedHostId: String?,
     quotas: List<FfiProviderQuota>,
+    cloudSyncStatus: FfiCloudSyncStatus? = null,
+    pushRegistrationStatus: FfiPushRegistrationStatus? = null,
     onSelectAppearance: (OrbitAppearanceMode) -> Unit,
     onSelectHost: (String) -> Unit,
     onOpenPairHost: () -> Unit,
+    onOpenCloudSync: () -> Unit = {},
     onReconnectHost: (String) -> Unit,
     onSaveHostConfig: (
         hostId: String,
@@ -219,11 +238,17 @@ fun SettingsSheet(
                     hosts = hosts,
                     selectedHostId = selectedHostId,
                     quotas = quotas,
+                    cloudSyncStatus = cloudSyncStatus,
+                    pushRegistrationStatus = pushRegistrationStatus,
                     onSelectAppearance = onSelectAppearance,
                     onInspectHost = { inspectedHostId = it },
                     onOpenPairHost = {
                         onDismiss()
                         onOpenPairHost()
+                    },
+                    onOpenCloudSync = {
+                        onDismiss()
+                        onOpenCloudSync()
                     },
                     onRefreshQuotas = onRefreshQuotas,
                     modifier = Modifier.weight(1f),
@@ -240,15 +265,19 @@ private fun SettingsRootPane(
     hosts: List<FfiHostCard>,
     selectedHostId: String?,
     quotas: List<FfiProviderQuota>,
+    cloudSyncStatus: FfiCloudSyncStatus?,
+    pushRegistrationStatus: FfiPushRegistrationStatus?,
     onSelectAppearance: (OrbitAppearanceMode) -> Unit,
     onInspectHost: (String) -> Unit,
     onOpenPairHost: () -> Unit,
+    onOpenCloudSync: () -> Unit,
     onRefreshQuotas: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
     val haptics = LocalHapticFeedback.current
+    val context = LocalContext.current
     val cardShape = RoundedCornerShape(14.dp)
 
     Column(
@@ -314,6 +343,184 @@ private fun SettingsRootPane(
                             )
                         }
                     }
+                }
+            }
+        }
+
+        // 1b. Cloud Sync & Notifications
+        Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs + 2.dp)) {
+            Text(
+                text = "Sync & Notifications",
+                style = typography.metaMedium,
+                color = colors.fgMuted,
+                modifier = Modifier.padding(horizontal = OrbitSpacing.xs),
+            )
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(colors.elevated, cardShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, cardShape),
+            ) {
+                val syncSubtitle = when (cloudSyncStatus?.state) {
+                    FfiCloudSyncState.READY ->
+                        "Synced · @${cloudSyncStatus.accountLogin ?: "github"} · rev #${cloudSyncStatus.lastVaultRevision}"
+                    FfiCloudSyncState.LOCKED ->
+                        "Locked · @${cloudSyncStatus.accountLogin ?: "github"} — tap to unlock"
+                    FfiCloudSyncState.SYNCING -> "Syncing encrypted vault…"
+                    FfiCloudSyncState.ERROR -> cloudSyncStatus.lastError ?: "Sync error"
+                    else -> "GitHub Secret Gist · E2EE (Signed out)"
+                }
+                val syncDotColor = when (cloudSyncStatus?.state) {
+                    FfiCloudSyncState.READY -> colors.directAdded
+                    FfiCloudSyncState.LOCKED, FfiCloudSyncState.SYNCING -> colors.warning
+                    FfiCloudSyncState.ERROR -> colors.dangerRemoved
+                    else -> colors.fgMuted
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 54.dp)
+                        .clickable {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onOpenCloudSync()
+                        }
+                        .padding(horizontal = OrbitSpacing.md, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(modifier = Modifier.size(20.dp), contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Outlined.CloudSync,
+                            contentDescription = null,
+                            tint = syncDotColor,
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text(
+                            text = "Cloud Sync (GitHub E2EE)",
+                            style = typography.subheadMedium,
+                            color = colors.fgPrimary,
+                        )
+                        Text(
+                            text = syncSubtitle,
+                            style = typography.meta,
+                            color = colors.fgMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+                        contentDescription = null,
+                        tint = colors.fgMuted,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+
+                HorizontalDivider(
+                    thickness = OrbitSpacing.hairline,
+                    color = colors.hairline,
+                    modifier = Modifier.padding(start = 42.dp),
+                )
+
+                val lifecycleOwner = LocalLifecycleOwner.current
+                var notifEnabled by remember(context) {
+                    mutableStateOf(OrbitNotificationHelper.hasNotificationPermission(context))
+                }
+                var requestedNotifOnce by remember { mutableStateOf(false) }
+
+                DisposableEffect(lifecycleOwner, context) {
+                    val observer = LifecycleEventObserver { _, event ->
+                        if (event == Lifecycle.Event.ON_RESUME) {
+                            notifEnabled = OrbitNotificationHelper.hasNotificationPermission(context)
+                        }
+                    }
+                    lifecycleOwner.lifecycle.addObserver(observer)
+                    onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+                }
+
+                fun openAppNotificationSettings() {
+                    runCatching {
+                        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                            putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                        }
+                        context.startActivity(intent)
+                    }
+                }
+
+                val notifPermissionLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestPermission(),
+                ) { granted ->
+                    notifEnabled = granted || OrbitNotificationHelper.hasNotificationPermission(context)
+                    if (!notifEnabled) {
+                        openAppNotificationSettings()
+                    }
+                }
+
+                val pushLabel = when {
+                    pushRegistrationStatus?.tokenRegistered == true ->
+                        "FCM registered (${pushRegistrationStatus.tokenPreview.orEmpty()})"
+                    notifEnabled -> "Approvals · Completed · Errors"
+                    else -> "Notifications disabled — tap to enable"
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 54.dp)
+                        .clickable {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            if (!notifEnabled &&
+                                !requestedNotifOnce &&
+                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                            ) {
+                                requestedNotifOnce = true
+                                notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                openAppNotificationSettings()
+                            }
+                        }
+                        .padding(horizontal = OrbitSpacing.md, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(modifier = Modifier.size(20.dp), contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Outlined.Notifications,
+                            contentDescription = null,
+                            tint = if (notifEnabled) colors.fgSecondary else colors.warning,
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text(
+                            text = "Notifications & Push",
+                            style = typography.subheadMedium,
+                            color = colors.fgPrimary,
+                        )
+                        Text(
+                            text = pushLabel,
+                            style = typography.meta,
+                            color = colors.fgMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+                        contentDescription = null,
+                        tint = colors.fgMuted,
+                        modifier = Modifier.size(16.dp),
+                    )
                 }
             }
         }

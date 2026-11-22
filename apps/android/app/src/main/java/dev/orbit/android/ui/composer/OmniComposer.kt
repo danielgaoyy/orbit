@@ -38,10 +38,14 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.CallSplit
 import androidx.compose.material.icons.automirrored.outlined.PlaylistAdd
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Archive
 import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.AttachFile
+import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Checklist
 import androidx.compose.material.icons.outlined.Close
@@ -52,11 +56,15 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.FindInPage
 import androidx.compose.material.icons.outlined.FormatQuote
+import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.GppMaybe
+import androidx.compose.material.icons.outlined.IosShare
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.Layers
 import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Stop
@@ -153,7 +161,15 @@ private fun slashCommandIcon(id: String): ImageVector = when (id) {
     "review" -> Icons.Outlined.FindInPage
     "diff" -> Icons.Outlined.Difference
     "compact" -> Icons.Outlined.ContentCut
-    "ask" -> Icons.Outlined.Shield
+    "btw" -> Icons.Outlined.Forum
+    "fast" -> Icons.Outlined.Bolt
+    "fork" -> Icons.AutoMirrored.Outlined.CallSplit
+    "auto" -> Icons.Outlined.AutoAwesome
+    "automations" -> Icons.Outlined.Schedule
+    "board" -> Icons.Outlined.Layers
+    "archived" -> Icons.Outlined.Archive
+    "export" -> Icons.Outlined.IosShare
+    "supervised", "ask" -> Icons.Outlined.Shield
     "edits" -> Icons.Outlined.VerifiedUser
     "full" -> Icons.Outlined.GppMaybe
     "terminal" -> Icons.Outlined.Terminal
@@ -212,6 +228,7 @@ fun OmniComposer(
     onOpenContextPicker: () -> Unit,
     onOpenModelSelector: () -> Unit,
     onSelectMode: (FfiSessionMode) -> Unit,
+    onToggleFastMode: () -> Unit = {},
     onRequestRefreshFiles: () -> Unit,
     onAddFileMention: (String) -> Unit,
     onRemoveFileMention: (String) -> Unit,
@@ -948,14 +965,54 @@ fun OmniComposer(
                         }
                     }
 
-                    // Right Action Cluster: Access Permissions Shield + Send / Queue / Stop
+                    // Right Action Cluster: Fast Mode Pill + Access Permissions Shield + Send / Queue / Stop
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        // Fast Mode Toggle Pill
+                        val fastPillShape = RoundedCornerShape(10.dp)
+                        Row(
+                            modifier = Modifier
+                                .height(30.dp)
+                                .clip(fastPillShape)
+                                .background(
+                                    if (draft.fastMode) colors.warning.copy(alpha = 0.16f) else Color.Transparent,
+                                    fastPillShape,
+                                )
+                                .border(
+                                    OrbitSpacing.hairline,
+                                    if (draft.fastMode) colors.warning.copy(alpha = 0.45f) else Color.Transparent,
+                                    fastPillShape,
+                                )
+                                .clickable {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onToggleFastMode()
+                                }
+                                .padding(horizontal = if (draft.fastMode) 7.dp else 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Bolt,
+                                contentDescription = if (draft.fastMode) "Fast mode on" else "Fast mode off",
+                                tint = if (draft.fastMode) colors.warning else colors.fgMuted,
+                                modifier = Modifier.size(OrbitSpacing.iconSm),
+                            )
+                            if (draft.fastMode) {
+                                Text(
+                                    text = "Fast",
+                                    style = typography.metaSemiBold,
+                                    color = colors.warning,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+
                         // Compact Access Permissions Shield Button + Unified Menu
                         Box {
                             val modeIcon = when (normalizedMode) {
+                                FfiSessionMode.Auto -> Icons.Outlined.AutoAwesome
                                 FfiSessionMode.AcceptEdits -> Icons.Outlined.VerifiedUser
                                 FfiSessionMode.FullAccess -> Icons.Outlined.GppMaybe
                                 else -> Icons.Outlined.Shield
@@ -973,7 +1030,7 @@ fun OmniComposer(
                                 Icon(
                                     imageVector = modeIcon,
                                     contentDescription = "Access Permissions: ${OrbitFormatters.sessionModeLabel(normalizedMode)}",
-                                    tint = colors.fgSecondary,
+                                    tint = if (normalizedMode == FfiSessionMode.Auto) colors.relay else colors.fgSecondary,
                                     modifier = Modifier.size(OrbitSpacing.iconSm),
                                 )
                             }
@@ -992,6 +1049,16 @@ fun OmniComposer(
                                     onClick = {
                                         modeMenuExpanded = false
                                         onSelectMode(FfiSessionMode.Default)
+                                    },
+                                )
+                                OrbitMenuOptionRow(
+                                    title = "Auto (Guardian)",
+                                    subtitle = "Auto-approve safe actions, prompt on risky ones",
+                                    icon = Icons.Outlined.AutoAwesome,
+                                    selected = normalizedMode == FfiSessionMode.Auto,
+                                    onClick = {
+                                        modeMenuExpanded = false
+                                        onSelectMode(FfiSessionMode.Auto)
                                     },
                                 )
                                 OrbitMenuOptionRow(

@@ -3,7 +3,10 @@
 //! - Android `minSdk 29` / `targetSdk 36` (`Kotlin 2` + `Jetpack Compose`)
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
 
 use orbit_client_core::app_core::{
     AgentCardView, AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest,
@@ -29,12 +32,13 @@ use orbit_client_core::composer::{
     SlashCommandView, SlashDirective,
 };
 use orbit_client_core::contract::{
-    AgentStageDeltaRequest, BridgeInfoView, ConversationSearchHit, CreateSessionRequest,
-    CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest,
-    FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView, GitReposInspectionView,
-    MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest,
-    ReadWorkspaceFileRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest, RenderDiagramView,
-    RewindAgentRequest, SendPromptRequest, SpawnWorkspacePeerRequest, UpdateHostConfigRequest,
+    AgentStageDeltaRequest, BridgeInfoView, CancelWorkflowRunRequest, ControlGoalRunRequest,
+    ConversationSearchHit, CreateSessionRequest, CreateWorkspaceEntryRequest,
+    DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, FleetSidebarRequest,
+    ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, MentionRankRequest,
+    ModelSelectionRequest, PreviewWorktreeHandoffRequest, ReadWorkspaceFileRequest,
+    RenameWorkspaceEntryRequest, RenderDiagramRequest, RenderDiagramView, RewindAgentRequest,
+    SendPromptRequest, SpawnWorkspacePeerRequest, StopMonitorWatchRequest, UpdateHostConfigRequest,
     UpsertArtifactRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
     WriteWorkspaceFileRequest,
 };
@@ -65,13 +69,16 @@ use orbit_client_core::{HostConnectionState, HostRouteMode};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSource, AcpAgentSpec, AcpProbeResult, AgentMessageKind,
     ArtifactDetail, ArtifactKind, ArtifactRevisionMeta, ArtifactSummary, AttentionState,
-    DirectoryEntry, DiscoveredProject, ForkTarget, HandoffFileChange, NestedGitRepo,
-    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
-    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    ProviderSubagentStatus, PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem,
-    QuotaWindow, ReasoningEffort, ScheduleKind, ScheduleNewAgentConfig, ScheduleRunRecord,
-    ScheduleRunStatus, ScheduleSpec, ScheduleStatus, ScheduleTarget, SessionMode, TerminalSummary,
-    ThinkingOptionSpec, TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot,
+    ConditionalTimerRecord, ConditionalTimerState, DirectoryEntry, DiscoveredProject, ForkTarget,
+    GoalControlAction, GoalCriterion, GoalRunRecord, GoalStatus, HandoffFileChange, MonitorKind,
+    MonitorStatus, MonitorWatchRecord, NestedGitRepo, PermissionCheckpointRef, PromptBadge,
+    ProviderKind, ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, ProviderSubagentStatus, PushDeviceRecord,
+    PushPlatform, PushPreferences, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
+    ScheduleNewAgentConfig, ScheduleRunRecord, ScheduleRunStatus, ScheduleSpec, ScheduleStatus,
+    ScheduleTarget, SessionMode, TerminalSummary, ThinkingOptionSpec, TimelinePayload,
+    TimerCondition, ToolCallDetail, ToolCallStatus, WorkflowKind, WorkflowRunRecord,
+    WorkflowRunStatus, WorkflowStepRecord, WorkflowStepStatus, WorkspaceBoardSnapshot,
     WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceFileConflict,
     WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceOrganizePhase, WorkspaceSummary,
     WorktreeHandoffDirection, WorktreeHandoffMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
@@ -1457,6 +1464,439 @@ impl From<ProviderQuotaSnapshot> for FfiProviderQuota {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiTimerCondition {
+    Never,
+    AnyMessage,
+    Sender { sender_id: String },
+    AllSubagentsSettled,
+    FileChanged { path: String },
+}
+
+impl From<TimerCondition> for FfiTimerCondition {
+    fn from(v: TimerCondition) -> Self {
+        match v {
+            TimerCondition::Never => Self::Never,
+            TimerCondition::AnyMessage => Self::AnyMessage,
+            TimerCondition::Sender { sender_id } => Self::Sender { sender_id },
+            TimerCondition::AllSubagentsSettled => Self::AllSubagentsSettled,
+            TimerCondition::FileChanged { path } => Self::FileChanged { path },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiConditionalTimerState {
+    Armed,
+    Fired,
+    CanceledEarly,
+    CanceledManual,
+}
+
+impl From<ConditionalTimerState> for FfiConditionalTimerState {
+    fn from(v: ConditionalTimerState) -> Self {
+        match v {
+            ConditionalTimerState::Armed => Self::Armed,
+            ConditionalTimerState::Fired => Self::Fired,
+            ConditionalTimerState::CanceledEarly => Self::CanceledEarly,
+            ConditionalTimerState::CanceledManual => Self::CanceledManual,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiConditionalTimerRecord {
+    pub timer_id: String,
+    pub agent_id: String,
+    pub workspace_id: String,
+    pub prompt: String,
+    pub duration_seconds: u64,
+    pub condition: FfiTimerCondition,
+    pub condition_label: String,
+    pub state: FfiConditionalTimerState,
+    pub created_at_ms: u64,
+    pub fire_at_ms: u64,
+    pub resolved_at_ms: Option<u64>,
+    pub resolved_reason: Option<String>,
+}
+
+impl From<ConditionalTimerRecord> for FfiConditionalTimerRecord {
+    fn from(v: ConditionalTimerRecord) -> Self {
+        let condition_label = v.condition.short_label();
+        Self {
+            timer_id: v.timer_id,
+            agent_id: v.agent_id,
+            workspace_id: v.workspace_id,
+            prompt: v.prompt,
+            duration_seconds: v.duration_seconds,
+            condition: v.condition.into(),
+            condition_label,
+            state: v.state.into(),
+            created_at_ms: v.created_at_ms,
+            fire_at_ms: v.fire_at_ms,
+            resolved_at_ms: v.resolved_at_ms,
+            resolved_reason: v.resolved_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiGoalStatus {
+    Running,
+    Verifying,
+    Paused,
+    Succeeded,
+    Failed,
+    Canceled,
+}
+
+impl From<GoalStatus> for FfiGoalStatus {
+    fn from(v: GoalStatus) -> Self {
+        match v {
+            GoalStatus::Running => Self::Running,
+            GoalStatus::Verifying => Self::Verifying,
+            GoalStatus::Paused => Self::Paused,
+            GoalStatus::Succeeded => Self::Succeeded,
+            GoalStatus::Failed => Self::Failed,
+            GoalStatus::Canceled => Self::Canceled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiGoalControlAction {
+    Pause,
+    Resume,
+    Cancel,
+    VerifyNow,
+}
+
+impl From<FfiGoalControlAction> for GoalControlAction {
+    fn from(v: FfiGoalControlAction) -> Self {
+        match v {
+            FfiGoalControlAction::Pause => Self::Pause,
+            FfiGoalControlAction::Resume => Self::Resume,
+            FfiGoalControlAction::Cancel => Self::Cancel,
+            FfiGoalControlAction::VerifyNow => Self::VerifyNow,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiGoalCriterion {
+    pub id: String,
+    pub label: String,
+    pub passed: bool,
+}
+
+impl From<GoalCriterion> for FfiGoalCriterion {
+    fn from(v: GoalCriterion) -> Self {
+        Self {
+            id: v.id,
+            label: v.label,
+            passed: v.passed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiGoalRunRecord {
+    pub goal_id: String,
+    pub agent_id: String,
+    pub workspace_id: String,
+    pub objective: String,
+    pub criteria: Vec<FfiGoalCriterion>,
+    pub verify_command: Option<String>,
+    pub max_iterations: u32,
+    pub current_iteration: u32,
+    pub max_duration_secs: u64,
+    pub status: FfiGoalStatus,
+    pub last_verify_exit_code: Option<i32>,
+    pub last_verify_output: Option<String>,
+    pub consecutive_identical_failures: u32,
+    pub started_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+}
+
+impl From<GoalRunRecord> for FfiGoalRunRecord {
+    fn from(v: GoalRunRecord) -> Self {
+        Self {
+            goal_id: v.goal_id,
+            agent_id: v.agent_id,
+            workspace_id: v.workspace_id,
+            objective: v.objective,
+            criteria: v.criteria.into_iter().map(Into::into).collect(),
+            verify_command: v.verify_command,
+            max_iterations: v.max_iterations,
+            current_iteration: v.current_iteration,
+            max_duration_secs: v.max_duration_secs,
+            status: v.status.into(),
+            last_verify_exit_code: v.last_verify_exit_code,
+            last_verify_output: v.last_verify_output,
+            consecutive_identical_failures: v.consecutive_identical_failures,
+            started_at_ms: v.started_at_ms,
+            updated_at_ms: v.updated_at_ms,
+            finished_at_ms: v.finished_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMonitorKind {
+    CommandStream {
+        command: String,
+        args: Vec<String>,
+        pattern: Option<String>,
+    },
+    LogFileTail {
+        path: String,
+        pattern: String,
+    },
+    HttpHealth {
+        url: String,
+        expect_status: u16,
+        interval_secs: u64,
+    },
+}
+
+impl From<MonitorKind> for FfiMonitorKind {
+    fn from(v: MonitorKind) -> Self {
+        match v {
+            MonitorKind::CommandStream {
+                command,
+                args,
+                pattern,
+            } => Self::CommandStream {
+                command,
+                args,
+                pattern,
+            },
+            MonitorKind::LogFileTail { path, pattern } => Self::LogFileTail { path, pattern },
+            MonitorKind::HttpHealth {
+                url,
+                expect_status,
+                interval_secs,
+            } => Self::HttpHealth {
+                url,
+                expect_status,
+                interval_secs,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMonitorStatus {
+    Active,
+    Paused,
+    Triggered,
+    Stopped,
+    Error,
+}
+
+impl From<MonitorStatus> for FfiMonitorStatus {
+    fn from(v: MonitorStatus) -> Self {
+        match v {
+            MonitorStatus::Active => Self::Active,
+            MonitorStatus::Paused => Self::Paused,
+            MonitorStatus::Triggered => Self::Triggered,
+            MonitorStatus::Stopped => Self::Stopped,
+            MonitorStatus::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiMonitorWatchRecord {
+    pub monitor_id: String,
+    pub agent_id: String,
+    pub name: String,
+    pub kind: FfiMonitorKind,
+    pub status: FfiMonitorStatus,
+    pub match_count: u64,
+    pub last_event_preview: Option<String>,
+    pub last_triggered_at_ms: Option<u64>,
+    pub expires_at_ms: Option<u64>,
+    pub created_at_ms: u64,
+}
+
+impl From<MonitorWatchRecord> for FfiMonitorWatchRecord {
+    fn from(v: MonitorWatchRecord) -> Self {
+        Self {
+            monitor_id: v.monitor_id,
+            agent_id: v.agent_id,
+            name: v.name,
+            kind: v.kind.into(),
+            status: v.status.into(),
+            match_count: v.match_count,
+            last_event_preview: v.last_event_preview,
+            last_triggered_at_ms: v.last_triggered_at_ms,
+            expires_at_ms: v.expires_at_ms,
+            created_at_ms: v.created_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorkflowKind {
+    BatchCsv,
+    Dag,
+    BestOfN,
+}
+
+impl From<WorkflowKind> for FfiWorkflowKind {
+    fn from(v: WorkflowKind) -> Self {
+        match v {
+            WorkflowKind::BatchCsv => Self::BatchCsv,
+            WorkflowKind::Dag => Self::Dag,
+            WorkflowKind::BestOfN => Self::BestOfN,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorkflowRunStatus {
+    Pending,
+    Running,
+    Succeeded,
+    PartialFailure,
+    Failed,
+    Canceled,
+}
+
+impl From<WorkflowRunStatus> for FfiWorkflowRunStatus {
+    fn from(v: WorkflowRunStatus) -> Self {
+        match v {
+            WorkflowRunStatus::Pending => Self::Pending,
+            WorkflowRunStatus::Running => Self::Running,
+            WorkflowRunStatus::Succeeded => Self::Succeeded,
+            WorkflowRunStatus::PartialFailure => Self::PartialFailure,
+            WorkflowRunStatus::Failed => Self::Failed,
+            WorkflowRunStatus::Canceled => Self::Canceled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorkflowStepStatus {
+    Pending,
+    Running,
+    Verifying,
+    Succeeded,
+    Failed,
+    Canceled,
+    Skipped,
+}
+
+impl From<WorkflowStepStatus> for FfiWorkflowStepStatus {
+    fn from(v: WorkflowStepStatus) -> Self {
+        match v {
+            WorkflowStepStatus::Pending => Self::Pending,
+            WorkflowStepStatus::Running => Self::Running,
+            WorkflowStepStatus::Verifying => Self::Verifying,
+            WorkflowStepStatus::Succeeded => Self::Succeeded,
+            WorkflowStepStatus::Failed => Self::Failed,
+            WorkflowStepStatus::Canceled => Self::Canceled,
+            WorkflowStepStatus::Skipped => Self::Skipped,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiWorkflowStepRecord {
+    pub run_id: String,
+    pub step_id: String,
+    pub name: String,
+    pub status: FfiWorkflowStepStatus,
+    pub depends_on: Vec<String>,
+    pub agent_id: Option<String>,
+    pub worktree_cwd: Option<String>,
+    pub provider: FfiProviderKind,
+    pub model: Option<String>,
+    pub output_preview: Option<String>,
+    pub diff_additions: u32,
+    pub diff_deletions: u32,
+    pub diff_files: u32,
+    pub verify_passed: Option<bool>,
+    pub verify_output: Option<String>,
+    pub error: Option<String>,
+    pub is_winner: bool,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+}
+
+impl From<WorkflowStepRecord> for FfiWorkflowStepRecord {
+    fn from(v: WorkflowStepRecord) -> Self {
+        Self {
+            run_id: v.run_id,
+            step_id: v.step_id,
+            name: v.name,
+            status: v.status.into(),
+            depends_on: v.depends_on,
+            agent_id: v.agent_id,
+            worktree_cwd: v.worktree_cwd,
+            provider: v.provider.into(),
+            model: v.model,
+            output_preview: v.output_preview,
+            diff_additions: v.diff_additions,
+            diff_deletions: v.diff_deletions,
+            diff_files: v.diff_files,
+            verify_passed: v.verify_passed,
+            verify_output: v.verify_output,
+            error: v.error,
+            is_winner: v.is_winner,
+            started_at_ms: v.started_at_ms,
+            finished_at_ms: v.finished_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiWorkflowRunRecord {
+    pub run_id: String,
+    pub name: String,
+    pub kind: FfiWorkflowKind,
+    pub workspace_cwd: String,
+    pub owner_agent_id: Option<String>,
+    pub status: FfiWorkflowRunStatus,
+    pub max_concurrency: u32,
+    pub verify_command: Option<String>,
+    pub winner_step_id: Option<String>,
+    pub steps: Vec<FfiWorkflowStepRecord>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+}
+
+impl From<WorkflowRunRecord> for FfiWorkflowRunRecord {
+    fn from(v: WorkflowRunRecord) -> Self {
+        Self {
+            run_id: v.run_id,
+            name: v.name,
+            kind: v.kind.into(),
+            workspace_cwd: v.workspace_cwd,
+            owner_agent_id: v.owner_agent_id,
+            status: v.status.into(),
+            max_concurrency: v.max_concurrency,
+            verify_command: v.verify_command,
+            winner_step_id: v.winner_step_id,
+            steps: v.steps.into_iter().map(Into::into).collect(),
+            created_at_ms: v.created_at_ms,
+            updated_at_ms: v.updated_at_ms,
+            finished_at_ms: v.finished_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPushRegistrationStatus {
+    pub platform: String,
+    pub token_registered: bool,
+    pub token_preview: Option<String>,
+    pub relay_sync_supported: bool,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiHostDetail {
     pub revision: u64,
@@ -1481,6 +1921,10 @@ pub struct FfiHostDetail {
     pub workspace_organize_status: HashMap<String, FfiWorkspaceOrganizeStatus>,
     pub acp_agents: Vec<FfiAcpAgentAvailability>,
     pub artifacts: Vec<FfiArtifactSummary>,
+    pub conditional_timers: Vec<FfiConditionalTimerRecord>,
+    pub goal_runs: Vec<FfiGoalRunRecord>,
+    pub monitor_watches: Vec<FfiMonitorWatchRecord>,
+    pub workflow_runs: Vec<FfiWorkflowRunRecord>,
 }
 
 impl From<HostDetailView> for FfiHostDetail {
@@ -1545,6 +1989,10 @@ impl From<HostDetailView> for FfiHostDetail {
                 .collect(),
             acp_agents: v.acp_agents.into_iter().map(Into::into).collect(),
             artifacts: v.artifacts.into_iter().map(Into::into).collect(),
+            conditional_timers: v.conditional_timers.into_iter().map(Into::into).collect(),
+            goal_runs: v.goal_runs.into_iter().map(Into::into).collect(),
+            monitor_watches: v.monitor_watches.into_iter().map(Into::into).collect(),
+            workflow_runs: v.workflow_runs.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -4620,9 +5068,49 @@ pub fn parse_markdown_preview(markdown: String, streaming: bool) -> Vec<FfiRichB
         .collect()
 }
 
+struct ThreadWaker(thread::Thread);
+
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Blocks the calling FFI thread on a future that spawns its real work onto `OrbitAppCore`'s
+/// internal Tokio runtime and only awaits a bounded `tokio::sync::oneshot::Receiver`.
+///
+/// Precondition: MUST ONLY be called with `OrbitAppCore::*_on_host` RPC wrappers whose top-level
+/// future performs no direct Tokio timer/IO reactor calls outside `self.runtime.spawn(...)`.
+fn block_on_oneshot_future<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+fn mask_push_token(token: &str) -> String {
+    let chars: Vec<char> = token.trim().chars().collect();
+    if chars.len() <= 12 {
+        return "••••".to_string();
+    }
+    let prefix: String = chars.iter().take(6).collect();
+    let suffix: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("{prefix}…{suffix}")
+}
+
 #[derive(uniffi::Object)]
 pub struct OrbitMobileCore {
     inner: Arc<OrbitAppCore>,
+    push_registration: Mutex<Option<(String, String)>>,
 }
 
 #[uniffi::export]
@@ -4632,7 +5120,10 @@ impl OrbitMobileCore {
         let inner = OrbitAppCore::open(&db_path, false).map_err(|e| FfiOrbitError::Core {
             detail: e.to_string(),
         })?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner,
+            push_registration: Mutex::new(None),
+        }))
     }
 
     #[uniffi::constructor]
@@ -4644,7 +5135,10 @@ impl OrbitMobileCore {
             OrbitAppCore::open(&db_path, auto_discover_local).map_err(|e| FfiOrbitError::Core {
                 detail: e.to_string(),
             })?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner,
+            push_registration: Mutex::new(None),
+        }))
     }
 
     #[uniffi::constructor]
@@ -4652,7 +5146,10 @@ impl OrbitMobileCore {
         let inner = OrbitAppCore::open_in_memory().map_err(|e| FfiOrbitError::Core {
             detail: e.to_string(),
         })?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner,
+            push_registration: Mutex::new(None),
+        }))
     }
 
     pub fn subscribe(&self, listener: Arc<dyn MobileCoreListener>) {
@@ -6072,6 +6569,207 @@ impl OrbitMobileCore {
             .map(Into::into)
             .map_err(|detail| FfiOrbitError::Core { detail })
     }
+
+    // --- Conditional Timers ---
+
+    pub fn list_conditional_timers(
+        &self,
+        host_id: String,
+        agent_id: Option<String>,
+        include_resolved: bool,
+    ) -> Result<Vec<FfiConditionalTimerRecord>, FfiOrbitError> {
+        block_on_oneshot_future(self.inner.list_conditional_timers_on_host(
+            &host_id,
+            agent_id,
+            include_resolved,
+        ))
+        .map(|list| list.into_iter().map(Into::into).collect())
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn cancel_conditional_timer(
+        &self,
+        host_id: String,
+        timer_id: String,
+    ) -> Result<FfiConditionalTimerRecord, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .cancel_conditional_timer_on_host(&host_id, &timer_id),
+        )
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn fire_conditional_timer_now(
+        &self,
+        host_id: String,
+        timer_id: String,
+    ) -> Result<FfiConditionalTimerRecord, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .fire_conditional_timer_now_on_host(&host_id, &timer_id),
+        )
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    // --- Goals & Monitors ---
+
+    pub fn list_goal_runs(
+        &self,
+        host_id: String,
+        agent_id: Option<String>,
+    ) -> Result<Vec<FfiGoalRunRecord>, FfiOrbitError> {
+        block_on_oneshot_future(self.inner.list_goal_runs_on_host(&host_id, agent_id))
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn control_goal_run(
+        &self,
+        host_id: String,
+        goal_id: String,
+        action: FfiGoalControlAction,
+    ) -> Result<FfiGoalRunRecord, FfiOrbitError> {
+        block_on_oneshot_future(self.inner.control_goal_run_on_host(ControlGoalRunRequest {
+            host_id,
+            goal_id,
+            action: action.into(),
+        }))
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn list_monitor_watches(
+        &self,
+        host_id: String,
+        agent_id: Option<String>,
+    ) -> Result<Vec<FfiMonitorWatchRecord>, FfiOrbitError> {
+        block_on_oneshot_future(self.inner.list_monitor_watches_on_host(&host_id, agent_id))
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn stop_monitor_watch(
+        &self,
+        host_id: String,
+        monitor_id: String,
+    ) -> Result<FfiMonitorWatchRecord, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .stop_monitor_watch_on_host(StopMonitorWatchRequest {
+                    host_id,
+                    monitor_id,
+                }),
+        )
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    // --- Workflows (Batch CSV, DAG, Best-of-N) ---
+
+    pub fn list_workflow_runs(
+        &self,
+        host_id: String,
+        include_completed: bool,
+    ) -> Result<Vec<FfiWorkflowRunRecord>, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .list_workflow_runs_on_host(&host_id, include_completed),
+        )
+        .map(|list| list.into_iter().map(Into::into).collect())
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn cancel_workflow_run(
+        &self,
+        host_id: String,
+        run_id: String,
+    ) -> Result<FfiWorkflowRunRecord, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .cancel_workflow_run_on_host(CancelWorkflowRunRequest { host_id, run_id }),
+        )
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    // --- Mobile Push Token Registration Bridge ---
+
+    pub fn register_push_token(
+        &self,
+        platform: String,
+        token: String,
+    ) -> Result<FfiPushRegistrationStatus, FfiOrbitError> {
+        let clean_platform = platform.trim().to_ascii_lowercase();
+        let clean_token = token.trim().to_string();
+        if clean_platform.is_empty() {
+            return Err(FfiOrbitError::Core {
+                detail: "push platform cannot be empty".to_string(),
+            });
+        }
+        if clean_token.is_empty() {
+            return Err(FfiOrbitError::Core {
+                detail: "push token cannot be empty".to_string(),
+            });
+        }
+        let preview = mask_push_token(&clean_token);
+        let mut guard = self
+            .push_registration
+            .lock()
+            .map_err(|_| FfiOrbitError::Core {
+                detail: "push registration lock poisoned".to_string(),
+            })?;
+        *guard = Some((clean_platform.clone(), clean_token));
+        Ok(FfiPushRegistrationStatus {
+            platform: clean_platform,
+            token_registered: true,
+            token_preview: Some(preview),
+            relay_sync_supported: false,
+        })
+    }
+
+    pub fn unregister_push_token(&self, platform: String) -> Result<(), FfiOrbitError> {
+        let clean_platform = platform.trim().to_ascii_lowercase();
+        let mut guard = self
+            .push_registration
+            .lock()
+            .map_err(|_| FfiOrbitError::Core {
+                detail: "push registration lock poisoned".to_string(),
+            })?;
+        if guard
+            .as_ref()
+            .is_some_and(|(existing, _)| clean_platform.is_empty() || existing == &clean_platform)
+        {
+            *guard = None;
+        }
+        Ok(())
+    }
+
+    pub fn push_registration_status(&self) -> FfiPushRegistrationStatus {
+        match self.push_registration.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some((platform, token)) => FfiPushRegistrationStatus {
+                    platform: platform.clone(),
+                    token_registered: true,
+                    token_preview: Some(mask_push_token(token)),
+                    relay_sync_supported: false,
+                },
+                None => FfiPushRegistrationStatus {
+                    platform: String::new(),
+                    token_registered: false,
+                    token_preview: None,
+                    relay_sync_supported: false,
+                },
+            },
+            Err(_) => FfiPushRegistrationStatus {
+                platform: String::new(),
+                token_registered: false,
+                token_preview: None,
+                relay_sync_supported: false,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -6521,5 +7219,135 @@ mod tests {
         core.on_app_background();
         core.on_app_foreground();
         core.on_network_changed();
+    }
+
+    #[test]
+    fn automation_records_and_push_bridge_roundtrip() {
+        let timer = ConditionalTimerRecord {
+            timer_id: "tmr_1".into(),
+            agent_id: "ag_1".into(),
+            workspace_id: "ws_1".into(),
+            prompt: "Check build status".into(),
+            duration_seconds: 120,
+            condition: TimerCondition::AllSubagentsSettled,
+            state: ConditionalTimerState::Armed,
+            created_at_ms: 1000,
+            fire_at_ms: 121_000,
+            resolved_at_ms: None,
+            resolved_reason: None,
+        };
+        let ffi_timer: FfiConditionalTimerRecord = timer.into();
+        assert_eq!(ffi_timer.state, FfiConditionalTimerState::Armed);
+        assert_eq!(ffi_timer.condition, FfiTimerCondition::AllSubagentsSettled);
+        assert_eq!(ffi_timer.condition_label, "until subagents settle");
+
+        let goal = GoalRunRecord {
+            goal_id: "goal_1".into(),
+            agent_id: "ag_1".into(),
+            workspace_id: "ws_1".into(),
+            objective: "Keep all tests green".into(),
+            criteria: vec![GoalCriterion {
+                id: "c1".into(),
+                label: "cargo test passes".into(),
+                passed: true,
+            }],
+            verify_command: Some("cargo test".into()),
+            max_iterations: 10,
+            current_iteration: 2,
+            max_duration_secs: 3600,
+            status: GoalStatus::Running,
+            last_verify_exit_code: Some(0),
+            last_verify_output: Some("ok".into()),
+            consecutive_identical_failures: 0,
+            started_at_ms: 1000,
+            updated_at_ms: 2000,
+            finished_at_ms: None,
+        };
+        let ffi_goal: FfiGoalRunRecord = goal.into();
+        assert_eq!(ffi_goal.status, FfiGoalStatus::Running);
+        assert_eq!(ffi_goal.criteria.len(), 1);
+        assert_eq!(
+            GoalControlAction::from(FfiGoalControlAction::Pause),
+            GoalControlAction::Pause
+        );
+
+        let monitor = MonitorWatchRecord {
+            monitor_id: "mon_1".into(),
+            agent_id: "ag_1".into(),
+            name: "Health Check".into(),
+            kind: MonitorKind::HttpHealth {
+                url: "https://example.com/health".into(),
+                expect_status: 200,
+                interval_secs: 30,
+            },
+            status: MonitorStatus::Active,
+            match_count: 3,
+            last_event_preview: Some("200 OK".into()),
+            last_triggered_at_ms: Some(1500),
+            expires_at_ms: None,
+            created_at_ms: 1000,
+        };
+        let ffi_monitor: FfiMonitorWatchRecord = monitor.into();
+        assert_eq!(ffi_monitor.status, FfiMonitorStatus::Active);
+
+        let workflow = WorkflowRunRecord {
+            run_id: "wf_1".into(),
+            name: "Nightly DAG".into(),
+            kind: WorkflowKind::Dag,
+            workspace_cwd: "/tmp/repo".into(),
+            owner_agent_id: Some("ag_1".into()),
+            status: WorkflowRunStatus::Running,
+            max_concurrency: 4,
+            verify_command: None,
+            winner_step_id: None,
+            steps: vec![WorkflowStepRecord {
+                run_id: "wf_1".into(),
+                step_id: "step_1".into(),
+                name: "Lint".into(),
+                status: WorkflowStepStatus::Succeeded,
+                depends_on: Vec::new(),
+                agent_id: Some("ag_2".into()),
+                worktree_cwd: None,
+                provider: ProviderKind::ClaudeCode,
+                model: None,
+                output_preview: Some("clean".into()),
+                diff_additions: 10,
+                diff_deletions: 2,
+                diff_files: 1,
+                verify_passed: Some(true),
+                verify_output: None,
+                error: None,
+                is_winner: false,
+                started_at_ms: Some(1000),
+                finished_at_ms: Some(1500),
+            }],
+            created_at_ms: 1000,
+            updated_at_ms: 1500,
+            finished_at_ms: None,
+        };
+        let ffi_wf: FfiWorkflowRunRecord = workflow.into();
+        assert_eq!(ffi_wf.kind, FfiWorkflowKind::Dag);
+        assert_eq!(ffi_wf.steps.len(), 1);
+
+        let core = OrbitMobileCore::open_in_memory().expect("open in-memory");
+        assert!(!core.push_registration_status().token_registered);
+        let registered = core
+            .register_push_token("android_fcm".into(), "fcm_token_1234567890abcdef".into())
+            .expect("register push token");
+        assert!(registered.token_registered);
+        assert_eq!(registered.platform, "android_fcm");
+        assert_eq!(registered.token_preview.as_deref(), Some("fcm_to…cdef"));
+
+        // Short ASCII and short multi-byte UTF-8 tokens must never leak plaintext.
+        assert_eq!(mask_push_token("short_tok"), "••••");
+        assert_eq!(mask_push_token("🔑令牌测试"), "••••");
+        assert_eq!(
+            mask_push_token("🔑令牌测试数据1234567890"),
+            "🔑令牌测试数…7890"
+        );
+
+        core.unregister_push_token("android_fcm".into())
+            .expect("unregister push token");
+        assert!(!core.push_registration_status().token_registered);
     }
 }

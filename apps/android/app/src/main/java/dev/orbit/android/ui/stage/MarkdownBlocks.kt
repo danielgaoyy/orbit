@@ -77,6 +77,7 @@ private sealed class MarkdownRenderSegment {
     data class BlockQuote(val block: FfiRichBlock.BlockQuote) : MarkdownRenderSegment()
     data class CodeBlock(val block: FfiRichBlock.CodeBlock) : MarkdownRenderSegment()
     data class Table(val block: FfiRichBlock.Table) : MarkdownRenderSegment()
+    data class MathBlock(val block: FfiRichBlock.MathBlock) : MarkdownRenderSegment()
     data object HorizontalRule : MarkdownRenderSegment()
 }
 
@@ -87,6 +88,7 @@ private fun isProseMergeable(block: FfiRichBlock): Boolean = when (block) {
     is FfiRichBlock.BlockQuote,
     is FfiRichBlock.CodeBlock,
     is FfiRichBlock.Table,
+    is FfiRichBlock.MathBlock,
     FfiRichBlock.HorizontalRule -> false
 }
 
@@ -111,6 +113,7 @@ private fun groupMarkdownBlocks(blocks: List<FfiRichBlock>): List<MarkdownRender
                 is FfiRichBlock.BlockQuote -> result += MarkdownRenderSegment.BlockQuote(block)
                 is FfiRichBlock.CodeBlock -> result += MarkdownRenderSegment.CodeBlock(block)
                 is FfiRichBlock.Table -> result += MarkdownRenderSegment.Table(block)
+                is FfiRichBlock.MathBlock -> result += MarkdownRenderSegment.MathBlock(block)
                 FfiRichBlock.HorizontalRule -> result += MarkdownRenderSegment.HorizontalRule
                 is FfiRichBlock.Heading,
                 is FfiRichBlock.Paragraph -> Unit
@@ -249,6 +252,25 @@ fun MarkdownBlocks(
                         MarkdownTableSurface(block = seg.block, textColor = textColor)
                     }
 
+                    is MarkdownRenderSegment.MathBlock -> {
+                        val mathShape = RoundedCornerShape(10.dp)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(mathShape)
+                                .background(colors.code, mathShape)
+                                .border(OrbitSpacing.hairline, colors.hairline, mathShape)
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+                        ) {
+                            Text(
+                                text = seg.block.tex,
+                                style = typography.code,
+                                color = textColor,
+                            )
+                        }
+                    }
+
                     MarkdownRenderSegment.HorizontalRule -> {
                         HorizontalDivider(
                             thickness = OrbitSpacing.hairline,
@@ -333,6 +355,7 @@ private fun buildCombinedProseAnnotatedString(
             is FfiRichBlock.BlockQuote,
             is FfiRichBlock.CodeBlock,
             is FfiRichBlock.Table,
+            is FfiRichBlock.MathBlock,
             FfiRichBlock.HorizontalRule -> Unit
         }
     }

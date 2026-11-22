@@ -621,6 +621,32 @@ fun OrbitProviderIcon(
                         )
                     }
                 }
+                else -> {
+                    val badgeColor = when (provider) {
+                        FfiProviderKind.GEMINI_CLI -> Color(0xFF4285F4)
+                        FfiProviderKind.CURSOR_AGENT -> Color(0xFF10B981)
+                        FfiProviderKind.COPILOT -> Color(0xFF6366F1)
+                        FfiProviderKind.OPEN_CODE -> Color(0xFF0EA5E9)
+                        FfiProviderKind.GOOSE -> Color(0xFFF59E0B)
+                        FfiProviderKind.PI -> Color(0xFFEC4899)
+                        FfiProviderKind.KIMI -> Color(0xFF14B8A6)
+                        FfiProviderKind.CLINE -> Color(0xFF8B5CF6)
+                        FfiProviderKind.MISTRAL_VIBE -> Color(0xFFF97316)
+                        FfiProviderKind.AUGMENT -> Color(0xFF3B82F6)
+                        FfiProviderKind.ACP -> Color(0xFF64748B)
+                        else -> Color(0xFF64748B)
+                    }
+                    drawCircle(
+                        color = badgeColor,
+                        radius = 10f,
+                        center = Offset(12f, 12f),
+                    )
+                    drawCircle(
+                        color = Color.White.copy(alpha = 0.88f),
+                        radius = 3.5f,
+                        center = Offset(12f, 12f),
+                    )
+                }
             }
         }
     }

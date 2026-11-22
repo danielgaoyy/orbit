@@ -977,18 +977,35 @@ fn is_safe_href(url: &str) -> bool {
 }
 
 fn render_markdown_to_safe_html(markdown: &str) -> String {
+    let preprocessed = crate::math::preprocess_markdown_math(markdown);
     let mut md_opts = MdOptions::empty();
     md_opts.insert(MdOptions::ENABLE_TABLES);
     md_opts.insert(MdOptions::ENABLE_STRIKETHROUGH);
     md_opts.insert(MdOptions::ENABLE_TASKLISTS);
+    md_opts.insert(MdOptions::ENABLE_MATH);
 
-    let parser = Parser::new_ext(markdown, md_opts);
-    let mut html = String::with_capacity(markdown.len() + 64);
+    let parser = Parser::new_ext(&preprocessed, md_opts);
+    let mut html = String::with_capacity(preprocessed.len() + 64);
     let mut in_code_block = false;
+    let mut active_math_fence: Option<(String, String)> = None;
     let mut in_table_head = false;
+    let mut in_paragraph = false;
+    let mut paragraph_tag_open = false;
+    let mut heading_depth: usize = 0;
+    let mut table_cell_depth: usize = 0;
+    let mut blockquote_depth: usize = 0;
+    let mut inline_format_depth: usize = 0;
     let mut active_link_opened: Vec<bool> = Vec::new();
     let mut image_depth: usize = 0;
     let mut image_alt = String::new();
+
+    let ensure_paragraph_open =
+        |html: &mut String, in_paragraph: bool, paragraph_tag_open: &mut bool| {
+            if in_paragraph && !*paragraph_tag_open {
+                html.push_str("<p>");
+                *paragraph_tag_open = true;
+            }
+        };
 
     for event in parser {
         if image_depth > 0 {
@@ -1005,6 +1022,7 @@ fn render_markdown_to_safe_html(markdown: &str) -> String {
                 MdEvent::End(TagEnd::Image) => {
                     image_depth -= 1;
                     if image_depth == 0 {
+                        ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
                         let trimmed = image_alt.trim();
                         let label = if trimmed.is_empty() { "image" } else { trimmed };
                         let _ = write!(
@@ -1022,8 +1040,12 @@ fn render_markdown_to_safe_html(markdown: &str) -> String {
 
         match event {
             MdEvent::Start(tag) => match tag {
-                Tag::Paragraph => html.push_str("<p>"),
+                Tag::Paragraph => {
+                    in_paragraph = true;
+                    paragraph_tag_open = false;
+                }
                 Tag::Heading { level, .. } => {
+                    heading_depth += 1;
                     let n = match level {
                         HeadingLevel::H1 => 1,
                         HeadingLevel::H2 => 2,
@@ -1034,7 +1056,10 @@ fn render_markdown_to_safe_html(markdown: &str) -> String {
                     };
                     let _ = write!(html, "<h{n}>");
                 }
-                Tag::BlockQuote(_) => html.push_str("<blockquote>"),
+                Tag::BlockQuote(_) => {
+                    blockquote_depth += 1;
+                    html.push_str("<blockquote>");
+                }
                 Tag::CodeBlock(kind) => {
                     in_code_block = true;
                     let lang = match kind {
@@ -1046,15 +1071,22 @@ fn render_markdown_to_safe_html(markdown: &str) -> String {
                             .to_string(),
                         CodeBlockKind::Indented => String::new(),
                     };
-                    html.push_str("<div class=\"code-wrap\">");
-                    if !lang.is_empty() {
-                        let _ = write!(
-                            html,
-                            "<div class=\"code-lang\">{}</div>",
-                            escape_html(&lang)
-                        );
+                    if matches!(
+                        lang.to_ascii_lowercase().as_str(),
+                        "math" | "latex" | "tex" | "katex"
+                    ) {
+                        active_math_fence = Some((lang, String::new()));
+                    } else {
+                        html.push_str("<div class=\"code-wrap\">");
+                        if !lang.is_empty() {
+                            let _ = write!(
+                                html,
+                                "<div class=\"code-lang\">{}</div>",
+                                escape_html(&lang)
+                            );
+                        }
+                        html.push_str("<pre><code>");
                     }
-                    html.push_str("<pre><code>");
                 }
                 Tag::List(Some(start)) => {
                     if start == 1 {
@@ -1072,18 +1104,33 @@ fn render_markdown_to_safe_html(markdown: &str) -> String {
                 }
                 Tag::TableRow => html.push_str("<tr>"),
                 Tag::TableCell => {
+                    table_cell_depth += 1;
                     if in_table_head {
                         html.push_str("<th>");
                     } else {
                         html.push_str("<td>");
                     }
                 }
-                Tag::Emphasis => html.push_str("<em>"),
-                Tag::Strong => html.push_str("<strong>"),
-                Tag::Strikethrough => html.push_str("<del>"),
+                Tag::Emphasis => {
+                    ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
+                    inline_format_depth += 1;
+                    html.push_str("<em>");
+                }
+                Tag::Strong => {
+                    ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
+                    inline_format_depth += 1;
+                    html.push_str("<strong>");
+                }
+                Tag::Strikethrough => {
+                    ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
+                    inline_format_depth += 1;
+                    html.push_str("<del>");
+                }
                 Tag::Link {
                     dest_url, title, ..
                 } => {
+                    ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
+                    inline_format_depth += 1;
                     let clean_url = dest_url.trim();
                     if is_safe_href(clean_url) {
                         let _ = write!(
@@ -1107,8 +1154,15 @@ fn render_markdown_to_safe_html(markdown: &str) -> String {
                 _ => {}
             },
             MdEvent::End(tag_end) => match tag_end {
-                TagEnd::Paragraph => html.push_str("</p>\n"),
+                TagEnd::Paragraph => {
+                    if paragraph_tag_open {
+                        html.push_str("</p>\n");
+                        paragraph_tag_open = false;
+                    }
+                    in_paragraph = false;
+                }
                 TagEnd::Heading(level) => {
+                    heading_depth = heading_depth.saturating_sub(1);
                     let n = match level {
                         HeadingLevel::H1 => 1,
                         HeadingLevel::H2 => 2,
@@ -1119,10 +1173,40 @@ fn render_markdown_to_safe_html(markdown: &str) -> String {
                     };
                     let _ = writeln!(html, "</h{n}>");
                 }
-                TagEnd::BlockQuote(_) => html.push_str("</blockquote>\n"),
+                TagEnd::BlockQuote(_) => {
+                    blockquote_depth = blockquote_depth.saturating_sub(1);
+                    html.push_str("</blockquote>\n");
+                }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
-                    html.push_str("</code></pre></div>\n");
+                    if let Some((lang, buf)) = active_math_fence.take() {
+                        let trimmed = buf.trim();
+                        if !trimmed.is_empty()
+                            && crate::math::is_math_code_fence_lang(&lang, trimmed)
+                        {
+                            let mml = crate::math::render_latex_to_mathml(
+                                trimmed,
+                                crate::math::MathDisplay::Block,
+                            );
+                            let _ = writeln!(html, "<div class=\"math-block\">{mml}</div>");
+                        } else {
+                            html.push_str("<div class=\"code-wrap\">");
+                            if !lang.is_empty() {
+                                let _ = write!(
+                                    html,
+                                    "<div class=\"code-lang\">{}</div>",
+                                    escape_html(&lang)
+                                );
+                            }
+                            let _ = writeln!(
+                                html,
+                                "<pre><code>{}</code></pre></div>",
+                                escape_html(buf.trim_end_matches('\n'))
+                            );
+                        }
+                    } else {
+                        html.push_str("</code></pre></div>\n");
+                    }
                 }
                 TagEnd::List(ordered) => {
                     if ordered {
@@ -1139,36 +1223,77 @@ fn render_markdown_to_safe_html(markdown: &str) -> String {
                 }
                 TagEnd::TableRow => html.push_str("</tr>\n"),
                 TagEnd::TableCell => {
+                    table_cell_depth = table_cell_depth.saturating_sub(1);
                     if in_table_head {
                         html.push_str("</th>");
                     } else {
                         html.push_str("</td>");
                     }
                 }
-                TagEnd::Emphasis => html.push_str("</em>"),
-                TagEnd::Strong => html.push_str("</strong>"),
-                TagEnd::Strikethrough => html.push_str("</del>"),
-                TagEnd::Link if active_link_opened.pop().unwrap_or(false) => {
-                    html.push_str("</a>");
+                TagEnd::Emphasis => {
+                    inline_format_depth = inline_format_depth.saturating_sub(1);
+                    html.push_str("</em>");
+                }
+                TagEnd::Strong => {
+                    inline_format_depth = inline_format_depth.saturating_sub(1);
+                    html.push_str("</strong>");
+                }
+                TagEnd::Strikethrough => {
+                    inline_format_depth = inline_format_depth.saturating_sub(1);
+                    html.push_str("</del>");
+                }
+                TagEnd::Link => {
+                    inline_format_depth = inline_format_depth.saturating_sub(1);
+                    if active_link_opened.pop().unwrap_or(false) {
+                        html.push_str("</a>");
+                    }
                 }
                 _ => {}
             },
             MdEvent::Text(text) => {
-                html.push_str(&escape_html(&text));
+                if let Some((_, ref mut buf)) = active_math_fence {
+                    buf.push_str(&text);
+                } else {
+                    if !in_code_block
+                        && !(in_paragraph && !paragraph_tag_open && text.trim().is_empty())
+                    {
+                        ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
+                    }
+                    if !in_paragraph || paragraph_tag_open || !text.trim().is_empty() {
+                        html.push_str(&escape_html(&text));
+                    }
+                }
             }
             MdEvent::Code(code) => {
+                ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
                 let _ = write!(html, "<code>{}</code>", escape_html(&code));
             }
             // Strict XSS defense: raw HTML embedded in user/assistant markdown is ALWAYS escaped.
             MdEvent::Html(raw) | MdEvent::InlineHtml(raw) => {
-                if in_code_block {
+                if let Some((_, ref mut buf)) = active_math_fence {
+                    buf.push_str(&raw);
+                } else if in_code_block {
                     html.push_str(&escape_html(&raw));
                 } else {
+                    ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
                     let _ = write!(html, "<code>{}</code>", escape_html(raw.trim()));
                 }
             }
-            MdEvent::SoftBreak => html.push('\n'),
-            MdEvent::HardBreak => html.push_str("<br>\n"),
+            MdEvent::SoftBreak => {
+                if let Some((_, ref mut buf)) = active_math_fence {
+                    buf.push('\n');
+                } else if !in_paragraph || paragraph_tag_open {
+                    html.push('\n');
+                }
+            }
+            MdEvent::HardBreak => {
+                if let Some((_, ref mut buf)) = active_math_fence {
+                    buf.push('\n');
+                } else {
+                    ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
+                    html.push_str("<br>\n");
+                }
+            }
             MdEvent::Rule => html.push_str("<hr>\n"),
             MdEvent::TaskListMarker(checked) => {
                 if checked {
@@ -1178,10 +1303,32 @@ fn render_markdown_to_safe_html(markdown: &str) -> String {
                 }
             }
             MdEvent::FootnoteReference(label) => {
+                ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
                 let _ = write!(html, "<sup>[{}]</sup>", escape_html(&label));
             }
-            MdEvent::InlineMath(math) | MdEvent::DisplayMath(math) => {
-                let _ = write!(html, "<code>{}</code>", escape_html(&math));
+            MdEvent::InlineMath(math) => {
+                ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
+                let mml =
+                    crate::math::render_latex_to_mathml(&math, crate::math::MathDisplay::Inline);
+                let _ = write!(html, "<span class=\"math-inline\">{mml}</span>");
+            }
+            MdEvent::DisplayMath(math) => {
+                let mml =
+                    crate::math::render_latex_to_mathml(&math, crate::math::MathDisplay::Block);
+                if heading_depth > 0
+                    || table_cell_depth > 0
+                    || blockquote_depth > 0
+                    || inline_format_depth > 0
+                {
+                    ensure_paragraph_open(&mut html, in_paragraph, &mut paragraph_tag_open);
+                    let _ = write!(html, "<span class=\"math-inline\">{mml}</span>");
+                } else {
+                    if paragraph_tag_open {
+                        html.push_str("</p>\n");
+                        paragraph_tag_open = false;
+                    }
+                    let _ = writeln!(html, "<div class=\"math-block\">{mml}</div>");
+                }
             }
         }
     }
@@ -1399,6 +1546,27 @@ code {
   padding: 0;
   border-radius: 0;
   font-size: inherit;
+}
+.math-inline math,
+.math-block math {
+  font-family: "STIX Two Math", "Cambria Math", "Apple Symbols", "Latin Modern Math", math;
+}
+.math-inline {
+  display: inline-block;
+  vertical-align: baseline;
+  margin: 0 0.08em;
+}
+.math-block {
+  margin: 14px 0;
+  padding: 12px 16px;
+  overflow-x: auto;
+  text-align: center;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-subtle);
+}
+.math-block math {
+  font-size: 1.08em;
 }
 .table-wrap {
   overflow-x: auto;
@@ -2543,5 +2711,72 @@ mod tests {
             &merged[3].payload,
             TimelinePayload::UserPrompt { text, .. } if text == "Brand new follow-up"
         ));
+    }
+
+    #[test]
+    fn html_export_renders_inline_and_display_math_as_safe_mathml() {
+        let meta = sample_meta();
+        let events = vec![TimelineEvent {
+            seq: 1,
+            epoch: 1,
+            agent_id: meta.agent_id.clone(),
+            turn_id: Some("t1".into()),
+            timestamp: fixed_ts(10),
+            payload: TimelinePayload::AssistantMessage {
+                item_id: "a_math".into(),
+                text: concat!(
+                    "Inline $x^2 + \\alpha$ and \\(\\frac{1}{2}\\).\n\n",
+                    "$$\\sum_{i=1}^n i = \\frac{n(n+1)}{2}$$\n\n",
+                    "```math\n\\text{<script>evil()</script>}\n```"
+                )
+                .into(),
+                streaming: false,
+            },
+        }];
+
+        let exported = export_timeline_transcript(
+            &meta,
+            &events,
+            &ExportOptions {
+                format: ExportFormat::Html,
+                include_thinking: false,
+                include_tool_calls: false,
+                include_timestamps: false,
+            },
+        );
+        assert!(
+            exported
+                .content
+                .contains("<math xmlns=\"http://www.w3.org/1998/Math/MathML\" display=\"inline\">")
+        );
+        assert!(
+            exported
+                .content
+                .contains("<math xmlns=\"http://www.w3.org/1998/Math/MathML\" display=\"block\">")
+        );
+        assert!(exported.content.contains("<span class=\"math-inline\">"));
+        assert!(exported.content.contains("<div class=\"math-block\">"));
+        assert!(exported.content.contains("<munderover>"));
+        assert!(
+            exported
+                .content
+                .contains("&lt;script&gt;evil()&lt;/script&gt;")
+        );
+        assert!(!exported.content.contains("<script"));
+        // Valid HTML5: `<div class="math-block">` must never be nested inside `<p>`, `<h2>`, `<td>`, or `<blockquote>`
+        assert!(
+            !exported.content.contains("<p><div class=\"math-block\">"),
+            "math-block must not nest inside <p>"
+        );
+
+        let mixed = render_markdown_to_safe_html(
+            "## Heading $$a^2$$\n\nBefore $$b^2$$ after\n\n> $$c^2$$\n\n| Col |\n| --- |\n| $$d^2$$ |",
+        );
+        assert!(!mixed.contains("<p><div class=\"math-block\">"));
+        assert!(!mixed.contains("<h2><div class=\"math-block\">"));
+        assert!(!mixed.contains("<td><div class=\"math-block\">"));
+        assert!(!mixed.contains("<blockquote><div class=\"math-block\">"));
+        assert!(mixed.contains("<p>Before </p>\n<div class=\"math-block\">"));
+        assert!(mixed.contains("<p> after</p>"));
     }
 }

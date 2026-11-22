@@ -3429,6 +3429,8 @@ function estimateRichBlockHeight(block: RichBlockView): number {
       return Math.max(34, Math.ceil(spanCharLen(block.spans) / 72) * 25 + 14);
     case "block_quote":
       return Math.max(44, Math.ceil(spanCharLen(block.spans) / 66) * 24 + 16);
+    case "math_block":
+      return Math.max(68, block.tex.split("\n").length * 28 + 40);
     case "horizontal_rule":
       return 28;
   }

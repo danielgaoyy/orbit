@@ -16,6 +16,7 @@ pub mod desktop_ops;
 pub mod diagram;
 pub mod export;
 pub mod logging;
+pub mod math;
 pub mod render;
 pub mod sidebar;
 pub mod stage;

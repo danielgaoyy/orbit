@@ -1723,6 +1723,7 @@ pub struct FfiInlineSpan {
     pub strikethrough: bool,
     pub inline_code: bool,
     pub link_url: Option<String>,
+    pub math_ml: Option<String>,
 }
 
 impl From<InlineSpanView> for FfiInlineSpan {
@@ -1734,6 +1735,7 @@ impl From<InlineSpanView> for FfiInlineSpan {
             strikethrough: v.strikethrough,
             inline_code: v.inline_code,
             link_url: v.link_url,
+            math_ml: v.math_ml,
         }
     }
 }
@@ -1846,6 +1848,10 @@ pub enum FfiRichBlock {
         rows: Vec<FfiTableRow>,
     },
     HorizontalRule,
+    MathBlock {
+        tex: String,
+        math_ml: String,
+    },
 }
 
 impl From<RichBlockView> for FfiRichBlock {
@@ -1890,6 +1896,7 @@ impl From<RichBlockView> for FfiRichBlock {
                 headers: headers.into_iter().map(Into::into).collect(),
                 rows: rows.into_iter().map(Into::into).collect(),
             },
+            RichBlockView::MathBlock { tex, math_ml } => Self::MathBlock { tex, math_ml },
             RichBlockView::HorizontalRule => Self::HorizontalRule,
         }
     }

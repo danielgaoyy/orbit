@@ -978,6 +978,7 @@ export interface InlineSpanView {
   strikethrough: boolean;
   inline_code: boolean;
   link_url: string | null;
+  math_ml?: string | null;
 }
 
 export interface HighlightedTokenView {
@@ -1025,6 +1026,7 @@ export type RichBlockView =
       headers: TableCellView[];
       rows: TableRowView[];
     }
+  | { kind: "math_block"; tex: string; math_ml: string }
   | { kind: "horizontal_rule" };
 
 export type DiffLineKind = "meta" | "hunk_header" | "context" | "added" | "removed";

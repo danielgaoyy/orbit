@@ -10,6 +10,7 @@ import {
 } from "react";
 import { Check, Copy } from "lucide-react";
 import { DiagramBlock } from "@/components/diagram-block";
+import { InlineMathSpan, MathBlockView } from "@/components/math-block";
 import { adaptTokenColor } from "@/lib/code-highlight";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -73,7 +74,8 @@ function spansAreEqual(a: InlineSpanView[], b: InlineSpanView[]): boolean {
       sa.italic !== sb.italic ||
       sa.inline_code !== sb.inline_code ||
       sa.strikethrough !== sb.strikethrough ||
-      sa.link_url !== sb.link_url
+      sa.link_url !== sb.link_url ||
+      (sa.math_ml ?? null) !== (sb.math_ml ?? null)
     ) {
       return false;
     }
@@ -142,6 +144,8 @@ function richBlockIsEqual(a: RichBlockView, b: RichBlockView): boolean {
         tableCellsAreEqual(a.headers, b.headers) &&
         tableRowsAreEqual(a.rows, b.rows)
       );
+    case "math_block":
+      return b.kind === "math_block" && a.tex === b.tex && a.math_ml === b.math_ml;
     case "horizontal_rule":
       return b.kind === "horizontal_rule";
   }
@@ -179,7 +183,9 @@ const InlineSpans = memo(
                 }}
                 className={`text-foreground decoration-foreground/30 hover:decoration-foreground cursor-pointer font-medium underline-offset-3 hover:underline ${className}`}
               >
-                {span.inline_code ? (
+                {span.math_ml ? (
+                  <InlineMathSpan tex={span.text} mathMl={span.math_ml} />
+                ) : span.inline_code ? (
                   <code className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[1.5px] font-mono text-[13px] [overflow-wrap:anywhere] dark:bg-white/[0.09]">
                     {span.text}
                   </code>
@@ -187,6 +193,17 @@ const InlineSpans = memo(
                   span.text
                 )}
               </a>
+            );
+          }
+
+          if (span.math_ml) {
+            return (
+              <InlineMathSpan
+                key={idx}
+                tex={span.text}
+                mathMl={span.math_ml}
+                className={className || undefined}
+              />
             );
           }
 
@@ -568,6 +585,8 @@ function renderGroupedNodeContent(
           settled={settled}
         />
       );
+    case "math_block":
+      return <MathBlockView tex={block.tex} mathMl={block.math_ml} settled={settled} />;
     case "horizontal_rule":
       return <hr className="border-border my-3.5 select-none" />;
     case "list_item":

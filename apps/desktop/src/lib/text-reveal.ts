@@ -59,6 +59,9 @@ export function countRichBlocksChars(blocks: RichBlockView[]): number {
       case "table":
         total += countTableBlockChars(b);
         break;
+      case "math_block":
+        total += Math.min(Math.max(b.tex.length, 1), 16);
+        break;
       case "horizontal_rule":
         total += 1;
         break;
@@ -73,6 +76,11 @@ function sliceSpans(spans: InlineSpanView[], budget: number): InlineSpanView[] {
   let rem = budget;
   for (const span of spans) {
     if (rem <= 0) break;
+    if (span.math_ml) {
+      out.push(span);
+      rem = Math.max(0, rem - span.text.length);
+      continue;
+    }
     if (span.text.length <= rem) {
       out.push(span);
       rem -= span.text.length;
@@ -172,6 +180,12 @@ export function sliceRichBlocks(blocks: RichBlockView[], budget: number): RichBl
           headers: nextHeaders,
           rows: nextRows,
         });
+        break;
+      }
+      case "math_block": {
+        const cost = Math.min(Math.max(block.tex.length, 1), 16);
+        out.push(block);
+        rem = Math.max(0, rem - cost);
         break;
       }
       case "horizontal_rule":

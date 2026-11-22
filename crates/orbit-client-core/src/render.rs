@@ -23,6 +23,8 @@ pub struct InlineSpanView {
     pub strikethrough: bool,
     pub inline_code: bool,
     pub link_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub math_ml: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +89,10 @@ pub enum RichBlockView {
         headers: Vec<TableCellView>,
         rows: Vec<TableRowView>,
     },
+    MathBlock {
+        tex: String,
+        math_ml: String,
+    },
     HorizontalRule,
 }
 
@@ -103,10 +109,14 @@ fn default_dark_theme() -> Option<&'static Theme> {
         .or_else(|| ts.themes.values().next())
 }
 
-/// Heal an unclosed fenced code block while assistant tokens are still streaming so the UI never flickers.
-/// Returns `(healed_markdown, had_unclosed_fence)`.
+/// Heal an unclosed fenced code block or trailing unclosed display math block (`$$` / `\[`)
+/// while assistant tokens are still streaming so the UI never flickers.
+/// Returns `(healed_markdown, had_unclosed_code_fence)`.
 fn heal_streaming_fences(markdown: &str) -> (String, bool) {
     let mut open_fence: Option<&str> = None;
+    let mut open_dollar_block = false;
+    let mut open_bracket_block = false;
+
     for line in markdown.lines() {
         let trimmed = line.trim_start();
         let fence_marker = if trimmed.starts_with("````") {
@@ -127,11 +137,41 @@ fn heal_streaming_fences(markdown: &str) -> (String, bool) {
                 }
                 _ => {}
             }
+            continue;
+        }
+
+        if open_fence.is_some() {
+            continue;
+        }
+
+        let clean = trimmed.trim();
+        if open_dollar_block {
+            if clean == "$$" || clean.ends_with("$$") {
+                open_dollar_block = false;
+            }
+        } else if open_bracket_block {
+            if clean.contains("\\]") {
+                open_bracket_block = false;
+            }
+        } else if clean == "$$" {
+            open_dollar_block = true;
+        } else if let Some(rest) = clean.strip_prefix("$$") {
+            if !rest.contains("$$") {
+                open_dollar_block = true;
+            }
+        } else if let Some(rest) = clean.strip_prefix("\\[")
+            && !rest.contains("\\]")
+        {
+            open_bracket_block = true;
         }
     }
 
     if let Some(unclosed) = open_fence {
         (format!("{markdown}\n{unclosed}"), true)
+    } else if open_dollar_block {
+        (format!("{markdown}\n$$"), false)
+    } else if open_bracket_block {
+        (format!("{markdown}\n\\]"), false)
     } else {
         (markdown.to_string(), false)
     }
@@ -524,6 +564,7 @@ fn push_inline_span(
         return;
     }
     if let Some(last) = spans.last_mut()
+        && last.math_ml.is_none()
         && last.bold == bold
         && last.italic == italic
         && last.strikethrough == strikethrough
@@ -540,7 +581,70 @@ fn push_inline_span(
         strikethrough,
         inline_code,
         link_url: link_url.clone(),
+        math_ml: None,
     });
+}
+
+fn push_inline_math_span(
+    spans: &mut Vec<InlineSpanView>,
+    tex: &str,
+    display: crate::math::MathDisplay,
+    bold: bool,
+    italic: bool,
+    strikethrough: bool,
+    link_url: &Option<String>,
+) {
+    let trimmed = tex.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let math_ml = crate::math::render_latex_to_mathml(trimmed, display);
+    spans.push(InlineSpanView {
+        text: trimmed.to_string(),
+        bold,
+        italic,
+        strikethrough,
+        inline_code: false,
+        link_url: link_url.clone(),
+        math_ml: Some(math_ml),
+    });
+}
+
+fn spans_have_visible_content(spans: &[InlineSpanView]) -> bool {
+    spans
+        .iter()
+        .any(|s| s.math_ml.is_some() || !s.text.trim().is_empty())
+}
+
+fn trim_edge_breaks(spans: &mut Vec<InlineSpanView>) {
+    while let Some(first) = spans.first_mut() {
+        if first.math_ml.is_some() || first.inline_code {
+            break;
+        }
+        let trimmed = first.text.trim_start_matches('\n');
+        if trimmed.len() != first.text.len() {
+            first.text = trimmed.to_string();
+        }
+        if first.text.is_empty() {
+            spans.remove(0);
+        } else {
+            break;
+        }
+    }
+    while let Some(last) = spans.last_mut() {
+        if last.math_ml.is_some() || last.inline_code {
+            break;
+        }
+        let trimmed = last.text.trim_end_matches('\n');
+        if trimmed.len() != last.text.len() {
+            last.text = trimmed.to_string();
+        }
+        if last.text.is_empty() {
+            spans.pop();
+        } else {
+            break;
+        }
+    }
 }
 
 fn flush_active_list_item_prefix(
@@ -578,11 +682,16 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
     } else {
         (markdown.to_string(), false)
     };
+    let preprocessed = crate::math::preprocess_markdown_math(&normalized);
 
     let mut options = Options::empty();
-    options
-        .insert(Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS);
-    let parser = Parser::new_ext(&normalized, options).into_offset_iter();
+    options.insert(
+        Options::ENABLE_TABLES
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_MATH,
+    );
+    let parser = Parser::new_ext(&preprocessed, options).into_offset_iter();
 
     let mut blocks = Vec::new();
     let mut cur_spans: Vec<InlineSpanView> = Vec::new();
@@ -607,7 +716,7 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
 
     let mut in_code_block: Option<String> = None;
     let mut code_buf = String::new();
-    let normalized_len = normalized.len();
+    let preprocessed_len = preprocessed.len();
 
     for (event, range) in parser {
         match event {
@@ -714,30 +823,43 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                     }
                 }
                 TagEnd::Paragraph => {
-                    if list_item_stack.is_empty()
-                        && !in_blockquote
-                        && !in_table_cell
-                        && !cur_spans.is_empty()
-                    {
-                        blocks.push(RichBlockView::Paragraph {
-                            spans: std::mem::take(&mut cur_spans),
-                        });
+                    if list_item_stack.is_empty() && !in_blockquote && !in_table_cell {
+                        trim_edge_breaks(&mut cur_spans);
+                        if spans_have_visible_content(&cur_spans) {
+                            blocks.push(RichBlockView::Paragraph {
+                                spans: std::mem::take(&mut cur_spans),
+                            });
+                        } else {
+                            cur_spans.clear();
+                        }
                     }
                 }
                 TagEnd::CodeBlock => {
                     let language = in_code_block.take().unwrap_or_default();
                     let raw_code = code_buf.trim_end_matches('\n').to_string();
-                    let is_streaming_tail = had_unclosed_fence && range.end >= normalized_len;
-                    let lines = if is_streaming_tail {
-                        plain_code_lines(&raw_code)
+                    let is_streaming_tail = had_unclosed_fence && range.end >= preprocessed_len;
+                    if !is_streaming_tail
+                        && crate::math::is_math_code_fence_lang(&language, &raw_code)
+                        && !raw_code.trim().is_empty()
+                    {
+                        let tex = raw_code.trim().to_string();
+                        let math_ml = crate::math::render_latex_to_mathml(
+                            &tex,
+                            crate::math::MathDisplay::Block,
+                        );
+                        blocks.push(RichBlockView::MathBlock { tex, math_ml });
                     } else {
-                        highlight_code_lines(&language, &raw_code)
-                    };
-                    blocks.push(RichBlockView::CodeBlock {
-                        language,
-                        raw_code,
-                        lines,
-                    });
+                        let lines = if is_streaming_tail {
+                            plain_code_lines(&raw_code)
+                        } else {
+                            highlight_code_lines(&language, &raw_code)
+                        };
+                        blocks.push(RichBlockView::CodeBlock {
+                            language,
+                            raw_code,
+                            lines,
+                        });
+                    }
                     code_buf.clear();
                 }
                 TagEnd::Item => {
@@ -909,6 +1031,64 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
             Event::TaskListMarker(checked) => {
                 if let Some((chk, _)) = list_item_stack.last_mut() {
                     *chk = Some(checked);
+                }
+            }
+            Event::InlineMath(tex) => {
+                if in_code_block.is_some() {
+                    code_buf.push_str(&tex);
+                } else {
+                    push_inline_math_span(
+                        &mut cur_spans,
+                        &tex,
+                        crate::math::MathDisplay::Inline,
+                        bold_depth > 0,
+                        italic_depth > 0,
+                        strike_depth > 0,
+                        &current_link,
+                    );
+                }
+            }
+            Event::DisplayMath(tex) => {
+                if in_code_block.is_some() {
+                    code_buf.push_str(&tex);
+                } else if in_table_cell || in_heading.is_some() || in_blockquote {
+                    push_inline_math_span(
+                        &mut cur_spans,
+                        &tex,
+                        crate::math::MathDisplay::Block,
+                        bold_depth > 0,
+                        italic_depth > 0,
+                        strike_depth > 0,
+                        &current_link,
+                    );
+                } else {
+                    if !list_item_stack.is_empty() {
+                        flush_active_list_item_prefix(
+                            &mut blocks,
+                            &mut cur_spans,
+                            &mut list_stack,
+                            &mut list_item_stack,
+                        );
+                    }
+                    trim_edge_breaks(&mut cur_spans);
+                    if spans_have_visible_content(&cur_spans) {
+                        blocks.push(RichBlockView::Paragraph {
+                            spans: std::mem::take(&mut cur_spans),
+                        });
+                    } else {
+                        cur_spans.clear();
+                    }
+                    let trimmed = tex.trim();
+                    if !trimmed.is_empty() {
+                        let math_ml = crate::math::render_latex_to_mathml(
+                            trimmed,
+                            crate::math::MathDisplay::Block,
+                        );
+                        blocks.push(RichBlockView::MathBlock {
+                            tex: trimmed.to_string(),
+                            math_ml,
+                        });
+                    }
                 }
             }
             Event::Rule => {
@@ -1860,5 +2040,88 @@ diff --git a/src/lib.rs b/src/lib.rs
             }
             other => panic!("expected CodeBlock, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_inline_and_display_math_and_fenced_math_blocks() {
+        let md = concat!(
+            "Euler identity $e^{i\\pi} + 1 = 0$ and \\(\\alpha + \\beta\\).\n\n",
+            "$$\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}$$\n\n",
+            "\\[\n\\begin{pmatrix} 1 & 0 \\\\ 0 & 1 \\end{pmatrix}\n\\]\n\n",
+            "```math\n\\sum_{k=1}^{n} k = \\frac{n(n+1)}{2}\n```\n\n",
+            "```latex\n\\mathbb{R}^3\n```\n\n",
+            "Price is \\$5 and `\\(not_math\\)`."
+        );
+        let blocks = parse_markdown_blocks(md, false);
+        assert_eq!(blocks.len(), 6, "blocks: {blocks:#?}");
+
+        match &blocks[0] {
+            RichBlockView::Paragraph { spans } => {
+                let math_spans: Vec<_> = spans.iter().filter(|s| s.math_ml.is_some()).collect();
+                assert_eq!(math_spans.len(), 2);
+                assert_eq!(math_spans[0].text, "e^{i\\pi} + 1 = 0");
+                assert!(
+                    math_spans[0]
+                        .math_ml
+                        .as_deref()
+                        .expect("inline mathml")
+                        .contains("display=\"inline\"")
+                );
+                assert_eq!(math_spans[1].text, "\\alpha + \\beta");
+                assert!(
+                    math_spans[1]
+                        .math_ml
+                        .as_deref()
+                        .expect("latex paren mathml")
+                        .contains("α")
+                );
+            }
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+
+        for (idx, block) in blocks.iter().enumerate().take(5).skip(1) {
+            match block {
+                RichBlockView::MathBlock { tex, math_ml } => {
+                    assert!(!tex.is_empty());
+                    assert!(
+                        math_ml.contains("display=\"block\""),
+                        "block {idx}: {math_ml}"
+                    );
+                }
+                other => panic!("expected MathBlock at {idx}, got {other:?}"),
+            }
+        }
+
+        match &blocks[5] {
+            RichBlockView::Paragraph { spans } => {
+                assert!(spans.iter().all(|s| s.math_ml.is_none()));
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| s.inline_code && s.text == "\\(not_math\\)")
+                );
+            }
+            other => panic!("expected trailing Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_heals_unclosed_display_math_without_italic_flicker() {
+        let streaming_dollar = "Derivation:\n\n$$\nx_1 + x_2 = \\sum_{i=1}^n a_i";
+        let blocks = parse_markdown_blocks(streaming_dollar, true);
+        assert_eq!(blocks.len(), 2, "blocks: {blocks:#?}");
+        assert!(matches!(blocks[0], RichBlockView::Paragraph { .. }));
+        match &blocks[1] {
+            RichBlockView::MathBlock { tex, math_ml } => {
+                assert!(tex.contains("x_1 + x_2"));
+                assert!(math_ml.contains("<msub><mi>x</mi><mn>1</mn></msub>"));
+            }
+            other => panic!("expected healed MathBlock, got {other:?}"),
+        }
+
+        let streaming_bracket = "Next:\n\n\\[\na_1 + b_2";
+        let blocks2 = parse_markdown_blocks(streaming_bracket, true);
+        assert_eq!(blocks2.len(), 2, "blocks2: {blocks2:#?}");
+        assert!(matches!(blocks2[1], RichBlockView::MathBlock { .. }));
     }
 }

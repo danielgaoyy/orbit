@@ -1169,6 +1169,83 @@ export interface HostDetailView {
   artifacts?: ArtifactSummary[];
   goal_runs?: GoalRunRecord[];
   monitor_watches?: MonitorWatchRecord[];
+  workflow_runs?: WorkflowRunRecord[];
+}
+
+export type WorkflowKind = "batch_csv" | "dag" | "best_of_n";
+
+export type WorkflowRunStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "partial_failure"
+  | "failed"
+  | "canceled";
+
+export type WorkflowStepStatus =
+  | "pending"
+  | "running"
+  | "verifying"
+  | "succeeded"
+  | "failed"
+  | "canceled"
+  | "skipped";
+
+export interface DagStepSpec {
+  step_id: string;
+  name: string;
+  depends_on: string[];
+  prompt_template: string;
+  provider?: ProviderKind | null;
+  model?: string | null;
+  isolated_worktree: boolean;
+  retry_count: number;
+  timeout_secs: number;
+}
+
+export interface BestOfNCandidateSpec {
+  label: string;
+  provider: ProviderKind;
+  model?: string | null;
+  effort?: string | null;
+}
+
+export interface WorkflowStepRecord {
+  run_id: string;
+  step_id: string;
+  name: string;
+  status: WorkflowStepStatus;
+  depends_on: string[];
+  agent_id?: string | null;
+  worktree_cwd?: string | null;
+  provider: ProviderKind;
+  model?: string | null;
+  output_preview?: string | null;
+  diff_additions: number;
+  diff_deletions: number;
+  diff_files: number;
+  verify_passed?: boolean | null;
+  verify_output?: string | null;
+  error?: string | null;
+  is_winner: boolean;
+  started_at_ms?: number | null;
+  finished_at_ms?: number | null;
+}
+
+export interface WorkflowRunRecord {
+  run_id: string;
+  name: string;
+  kind: WorkflowKind;
+  workspace_cwd: string;
+  owner_agent_id?: string | null;
+  status: WorkflowRunStatus;
+  max_concurrency: number;
+  verify_command?: string | null;
+  winner_step_id?: string | null;
+  steps: WorkflowStepRecord[];
+  created_at_ms: number;
+  updated_at_ms: number;
+  finished_at_ms?: number | null;
 }
 
 export type GoalStatus =
@@ -5099,6 +5176,104 @@ export const orbitIpc = {
     return invoke<BrowserSessionsSnapshotView>("update_browser_policy", {
       hostId,
       policy,
+    });
+  },
+
+  startBatchFanout: async (req: {
+    hostId: string;
+    name: string;
+    cwd: string;
+    csvContent: string;
+    promptTemplate: string;
+    provider: ProviderKind;
+    model?: string | null;
+    mode: SessionMode;
+    maxConcurrency?: number | null;
+    isolatedWorktree?: boolean;
+  }): Promise<WorkflowRunRecord> => {
+    return invoke<WorkflowRunRecord>("start_batch_fanout", {
+      hostId: req.hostId,
+      name: req.name,
+      cwd: req.cwd,
+      csvContent: req.csvContent,
+      promptTemplate: req.promptTemplate,
+      provider: req.provider,
+      model: req.model?.trim() ? req.model.trim() : null,
+      mode: req.mode,
+      maxConcurrency: req.maxConcurrency ?? null,
+      isolatedWorktree: req.isolatedWorktree ?? false,
+    });
+  },
+
+  startDagWorkflow: async (req: {
+    hostId: string;
+    name: string;
+    cwd: string;
+    steps: DagStepSpec[];
+    defaultProvider: ProviderKind;
+    defaultMode: SessionMode;
+    maxConcurrency?: number | null;
+  }): Promise<WorkflowRunRecord> => {
+    return invoke<WorkflowRunRecord>("start_dag_workflow", {
+      hostId: req.hostId,
+      name: req.name,
+      cwd: req.cwd,
+      steps: req.steps,
+      defaultProvider: req.defaultProvider,
+      defaultMode: req.defaultMode,
+      maxConcurrency: req.maxConcurrency ?? null,
+    });
+  },
+
+  startBestOfN: async (req: {
+    hostId: string;
+    name: string;
+    cwd: string;
+    prompt: string;
+    candidates: BestOfNCandidateSpec[];
+    mode: SessionMode;
+    verifyCommand?: string | null;
+  }): Promise<WorkflowRunRecord> => {
+    return invoke<WorkflowRunRecord>("start_best_of_n", {
+      hostId: req.hostId,
+      name: req.name,
+      cwd: req.cwd,
+      prompt: req.prompt,
+      candidates: req.candidates,
+      mode: req.mode,
+      verifyCommand: req.verifyCommand?.trim() ? req.verifyCommand.trim() : null,
+    });
+  },
+
+  listWorkflowRuns: async (
+    hostId: string,
+    includeCompleted = true,
+  ): Promise<WorkflowRunRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<WorkflowRunRecord[]>("list_workflow_runs", {
+      hostId,
+      includeCompleted,
+    });
+  },
+
+  cancelWorkflowRun: async (hostId: string, runId: string): Promise<WorkflowRunRecord> => {
+    return invoke<WorkflowRunRecord>("cancel_workflow_run", {
+      hostId,
+      runId,
+    });
+  },
+
+  selectBestOfNWinner: async (
+    hostId: string,
+    runId: string,
+    winnerStepId: string,
+    applyToWorkspace = true,
+  ): Promise<WorkflowRunRecord> => {
+    return invoke<WorkflowRunRecord>("select_best_of_n_winner", {
+      hostId,
+      runId,
+      winnerStepId,
+      applyToWorkspace,
     });
   },
 };

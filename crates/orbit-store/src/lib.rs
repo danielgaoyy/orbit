@@ -10,6 +10,7 @@ pub mod search;
 pub mod timers;
 pub mod triggers;
 pub mod usage;
+pub mod workflows;
 pub mod workspace_sync;
 pub use artifacts::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ID_LEN, MAX_ARTIFACT_REVISIONS, UpsertArtifactInput,
@@ -453,6 +454,7 @@ impl OrbitStore {
         guardian::migrate_guardian_schema(&conn)?;
         goals::migrate_goals_schema(&conn)?;
         triggers::migrate_event_triggers_schema(&conn)?;
+        workflows::migrate_workflows_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1960,6 +1962,33 @@ impl OrbitStore {
         limit: usize,
     ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
         self.fetch_timeline_since_budgeted(agent_id, since_seq, limit, usize::MAX)
+    }
+
+    /// Return the latest non-empty `AssistantMessage` text for `agent_id` by scanning from the
+    /// newest timeline sequence downward (works even when timelines exceed 500+ events).
+    pub fn latest_assistant_message(&self, agent_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT payload_json
+             FROM timeline_events
+             WHERE agent_id = ?1
+               AND (event_type = 'assistant_message' OR event_type IS NULL)
+             ORDER BY seq DESC
+             LIMIT 200",
+        )?;
+        let mut rows = stmt.query(params![agent_id])?;
+        while let Some(row) = rows.next()? {
+            let payload_json: String = row.get(0)?;
+            if let Ok(TimelinePayload::AssistantMessage { text, .. }) =
+                serde_json::from_str::<TimelinePayload>(&payload_json)
+            {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Ok(Some(trimmed.to_string()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Fetch timeline events strictly after `since_seq` bounded by both event count and an
@@ -5813,5 +5842,123 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("user_version");
         assert_eq!(ver, 6);
+    }
+
+    #[test]
+    fn latest_assistant_message_reads_newest_past_500_events() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_long".into(),
+                title: "Long".into(),
+                cwd: "/tmp/long".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_long".into(),
+                    workspace_id: "ws_long".into(),
+                    cwd: "/tmp/long".into(),
+                    title: "Long Turn".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: orbit_protocol::AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        // Append an early assistant message, then 550 tool calls, then the final assistant message.
+        store
+            .append_timeline_event(
+                "ag_long",
+                1,
+                None,
+                TimelinePayload::AssistantMessage {
+                    item_id: "m_early".into(),
+                    text: "Early message".into(),
+                    streaming: false,
+                },
+            )
+            .expect("early msg");
+        for i in 0..550 {
+            store
+                .append_timeline_event(
+                    "ag_long",
+                    1,
+                    None,
+                    TimelinePayload::ToolCall {
+                        call_id: format!("c_{i}"),
+                        status: ToolCallStatus::Completed,
+                        detail: ToolCallDetail::FileRead {
+                            path: format!("src/f{i}.rs"),
+                            start_line: Some(1),
+                            end_line: Some(10),
+                        },
+                        background_task: None,
+                    },
+                )
+                .expect("tool event");
+        }
+        store
+            .append_timeline_event(
+                "ag_long",
+                1,
+                None,
+                TimelinePayload::AssistantMessage {
+                    item_id: "m_final".into(),
+                    text: "Final summary past 500 events".into(),
+                    streaming: false,
+                },
+            )
+            .expect("final msg");
+
+        let latest = store
+            .latest_assistant_message("ag_long")
+            .expect("query latest assistant message");
+        assert_eq!(latest.as_deref(), Some("Final summary past 500 events"));
     }
 }

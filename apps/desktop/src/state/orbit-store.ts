@@ -69,6 +69,9 @@ import {
   type GoalRunRecord,
   type MonitorKind,
   type MonitorWatchRecord,
+  type BestOfNCandidateSpec,
+  type DagStepSpec,
+  type WorkflowRunRecord,
   type MatchedPathRulesView,
   type PathRulesSnapshotView,
   type UpsertPathRuleParams,
@@ -7971,6 +7974,7 @@ export const orbitActions = {
     await Promise.all([
       orbitIpc.listGoalRuns(hostId).catch(() => []),
       orbitIpc.listMonitorWatches(hostId).catch(() => []),
+      orbitIpc.listWorkflowRuns(hostId, true).catch(() => []),
     ]);
     await orbitActions.reloadHostDetail(hostId, true);
   },
@@ -8356,6 +8360,104 @@ export const orbitActions = {
       notifyToast(`Failed to update browser policy: ${String(err)}`);
       return null;
     }
+  },
+
+  async startBatchFanout(req: {
+    hostId: string;
+    name: string;
+    cwd: string;
+    csvContent: string;
+    promptTemplate: string;
+    provider: ProviderKind;
+    model?: string | null;
+    mode: SessionMode;
+    maxConcurrency?: number | null;
+    isolatedWorktree?: boolean;
+  }): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.startBatchFanout(req);
+      notifyToast(`Batch started: ${run.name}`);
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to start batch: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async startDagWorkflow(req: {
+    hostId: string;
+    name: string;
+    cwd: string;
+    steps: DagStepSpec[];
+    defaultProvider: ProviderKind;
+    defaultMode: SessionMode;
+    maxConcurrency?: number | null;
+  }): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.startDagWorkflow(req);
+      notifyToast(`DAG started: ${run.name}`);
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to start DAG: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async startBestOfN(req: {
+    hostId: string;
+    name: string;
+    cwd: string;
+    prompt: string;
+    candidates: BestOfNCandidateSpec[];
+    mode: SessionMode;
+    verifyCommand?: string | null;
+  }): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.startBestOfN(req);
+      notifyToast(`Arena started: ${run.name}`);
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to start Arena: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async cancelWorkflowRun(hostId: string, runId: string): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.cancelWorkflowRun(hostId, runId);
+      notifyToast(`Canceled workflow: ${run.name}`);
+      void orbitActions.reloadHostDetail(hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to cancel workflow: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async selectBestOfNWinner(
+    hostId: string,
+    runId: string,
+    winnerStepId: string,
+    applyToWorkspace = true,
+  ): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.selectBestOfNWinner(hostId, runId, winnerStepId, applyToWorkspace);
+      notifyToast(applyToWorkspace ? "Winner applied to workspace" : "Winner selected");
+      void orbitActions.reloadHostDetail(hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to apply winner: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async refreshWorkflowRuns(hostId: string): Promise<void> {
+    if (!hostId) return;
+    await orbitIpc.listWorkflowRuns(hostId, true).catch(() => []);
+    await orbitActions.reloadHostDetail(hostId, true);
   },
 
   async reloadWorkspaceFileFromConflict(hostId: string, cwd: string, path: string): Promise<void> {

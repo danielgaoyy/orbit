@@ -128,6 +128,7 @@ pub enum DaemonBroadcast {
     ConditionalTimerEvent(orbit_protocol::ConditionalTimerRecord),
     GoalRunEvent(orbit_protocol::GoalRunRecord),
     MonitorWatchEvent(orbit_protocol::MonitorWatchRecord),
+    WorkflowRunEvent(orbit_protocol::WorkflowRunRecord),
 }
 
 struct LiveAgentEntry {

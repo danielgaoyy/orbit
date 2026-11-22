@@ -57,6 +57,7 @@ import {
   ToggleSwitch,
   type SettingSelectOption,
 } from "@/components/settings/settings-primitives";
+import { WorkflowsPanel } from "@/components/automations/workflows-panel";
 import { type SlashDirective, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { EventTriggersSection } from "@/components/automations/event-triggers-section";
 import { cn } from "@/lib/utils";
@@ -334,6 +335,15 @@ export function AutomationsView() {
     () => hostDetail?.monitor_watches ?? [],
     [hostDetail?.monitor_watches],
   );
+  const workflowRuns = useMemo(
+    () => hostDetail?.workflow_runs ?? [],
+    [hostDetail?.workflow_runs],
+  );
+  const activeWorkflowCount = useMemo(
+    () => workflowRuns.filter((r) => r.status === "pending" || r.status === "running").length,
+    [workflowRuns],
+  );
+  const [sectionTab, setSectionTab] = useState<"automations" | "workflows">("automations");
   useEffect(() => {
     if (selectedHostId) {
       void orbitActions.refreshGoalsAndMonitors(selectedHostId);
@@ -561,11 +571,26 @@ export function AutomationsView() {
       if (selectedHostId && lp.host_id !== selectedHostId) continue;
       push(lp.path, lp.name, lp.branch ?? null);
     }
-    if (selectedCwd) {
-      push(selectedCwd, shortWorkspaceName(selectedCwd), null);
+    if (selectedCwd && selectedHostId) {
+      const cleanSel = normalizeProjectPath(selectedCwd);
+      const belongsToHost =
+        out.some((p) => p.path === cleanSel) ||
+        (hostDetail?.workspaces ?? []).some((w) => normalizeProjectPath(w.cwd) === cleanSel) ||
+        (hostDetail?.discovered_projects ?? []).some(
+          (d) => normalizeProjectPath(d.path) === cleanSel,
+        );
+      if (belongsToHost) {
+        push(cleanSel, shortWorkspaceName(cleanSel), null);
+      }
     }
     return out;
-  }, [sidebarView, selectedHostId, selectedCwd]);
+  }, [sidebarView, selectedHostId, selectedCwd, hostDetail]);
+
+  const hostScopedSelectedCwd = useMemo(() => {
+    if (!selectedCwd || !selectedHostId) return "";
+    const cleanSel = normalizeProjectPath(selectedCwd);
+    return hostProjects.some((p) => p.path === cleanSel) ? cleanSel : "";
+  }, [selectedCwd, selectedHostId, hostProjects]);
 
   const effectiveProjectPath = useMemo(() => {
     const chosen = normalizeProjectPath(targetProjectPath);
@@ -881,6 +906,70 @@ export function AutomationsView() {
         style={stagePushStyle}
         className="mx-auto w-full max-w-[var(--orbit-stage-max-w,768px)] space-y-6"
       >
+        {/* Top-level Automations / Workflows Section Switcher */}
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="bg-muted/70 inline-flex items-center gap-0.5 rounded-[9px] p-0.5">
+            {(
+              [
+                { id: "automations", label: "Automations", count: cronSchedules.length },
+                {
+                  id: "workflows",
+                  label: "Workflows",
+                  count: activeWorkflowCount > 0 ? activeWorkflowCount : workflowRuns.length,
+                  pulsing: activeWorkflowCount > 0,
+                },
+              ] as const
+            ).map((tab) => {
+              const selected = sectionTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setSectionTab(tab.id)}
+                  className={cn(
+                    "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] px-2.5 text-[12px] font-medium transition-colors",
+                    selected
+                      ? "bg-background text-foreground shadow-2xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {"pulsing" in tab && tab.pulsing && (
+                    <span className="size-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  )}
+                  <span>{tab.label}</span>
+                  {tab.count > 0 && (
+                    <span className="text-muted-foreground/75 tabular-nums text-[11px] font-normal">
+                      {tab.count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {showHostContext && (
+            <span className="text-muted-foreground inline-flex items-center gap-1.5 text-[12px]">
+              <span
+                className={cn(
+                  "size-1.5 shrink-0 rounded-full",
+                  activeHostOnline ? "bg-emerald-500" : "bg-zinc-400",
+                )}
+              />
+              <span className="max-w-36 truncate">{activeHostLabel}</span>
+            </span>
+          )}
+        </div>
+
+        {sectionTab === "workflows" ? (
+          <WorkflowsPanel
+            hostId={selectedHostId}
+            defaultProvider={draftProvider}
+            defaultCwd={hostScopedSelectedCwd || hostProjects[0]?.path || ""}
+            projectChoices={hostProjects}
+            runs={workflowRuns}
+          />
+        ) : (
+          <>
         {/* Compact Single-Row Toolbar (shown once schedules exist) */}
         {cronSchedules.length > 0 && (
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1579,6 +1668,8 @@ export function AutomationsView() {
               </div>
             )}
           </div>
+        )}
+          </>
         )}
       </div>
 

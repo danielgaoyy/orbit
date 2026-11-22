@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, ArtifactKind, BrowserActionRequest, ForkTarget,
-    McpToolPolicy, MonitorKind, ProviderKind, ReasoningEffort, ScheduleNewAgentConfig,
-    ScheduleStatus, ScheduleTarget, SessionMode, TimelinePayload, ToolCallDetail, WireMessage,
-    WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection, WorktreeHandoffMode,
+    ActiveTurnBehavior, AgentMessageKind, ArtifactKind, BestOfNCandidateSpec, BrowserActionRequest,
+    DagStepSpec, ForkTarget, McpToolPolicy, MonitorKind, ProviderKind, ReasoningEffort,
+    ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode, TimelinePayload,
+    ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection,
+    WorktreeHandoffMode,
 };
 use orbit_store::{ReceiptOutcome, UpsertArtifactInput};
 use serde_json::{Value, json};
@@ -27,6 +28,11 @@ use crate::manager::{
     CreateAgentSpec, CreateWorkspaceSpec, ExecuteWorktreeHandoffSpec, ForkAgentSpec,
 };
 use crate::messaging::{AgentPromptSource, QueuedAgentMessage};
+use crate::workflows::{
+    StartBatchFanoutSpec, StartBestOfNSpec, StartDagWorkflowSpec, authorize_workflow_cancel,
+    authorize_workflow_launch_from_caller, clamp_workflow_session_mode,
+    validate_mcp_verify_command,
+};
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
@@ -3046,6 +3052,417 @@ async fn execute_tool_inner(
             }))
         }
 
+        // ==================== BATCH CSV, DAG WORKFLOWS & BEST-OF-N ARENA ====================
+        "run_batch_fanout" => {
+            authorize_workflow_launch_from_caller(&rt.store, caller_agent_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let caller = caller_agent_id.and_then(|cid| rt.store.get_agent(cid).ok().flatten());
+            let name = opt_str(args, "name").unwrap_or_default();
+            let csv_content = str_arg(args, "csv_content")?;
+            let prompt_template = str_arg(args, "prompt_template")?;
+            let (provider, inline_model) = if let Some(p_raw) = opt_str(args, "provider") {
+                parse_provider_and_model(&p_raw)?
+            } else if let Some(ref c) = caller {
+                (c.provider, None)
+            } else {
+                (ProviderKind::ClaudeCode, None)
+            };
+            let model = opt_str(args, "model").or(inline_model);
+            let requested_mode = opt_str(args, "mode")
+                .map(|s| parse_session_mode(&s))
+                .unwrap_or_else(|| {
+                    caller
+                        .as_ref()
+                        .map(|c| c.mode.clone())
+                        .unwrap_or(SessionMode::AcceptEdits)
+                });
+            let mode = match caller.as_ref() {
+                Some(c) => clamp_workflow_session_mode(&c.mode, requested_mode),
+                None => requested_mode,
+            };
+            let max_concurrency = args
+                .get("max_concurrency")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(3)
+                .clamp(1, 8);
+            let isolated_worktree = args
+                .get("isolated_worktree")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            let run = if let Some(ref remote_host_id) = target_host {
+                let cwd = str_arg(args, "cwd")?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartBatchFanout {
+                            request_id: req_id,
+                            name,
+                            cwd,
+                            csv_content,
+                            prompt_template,
+                            provider,
+                            model,
+                            mode,
+                            max_concurrency,
+                            isolated_worktree,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunUpdated { run, .. } => run,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to run_batch_fanout"),
+                }
+            } else {
+                let cwd = opt_str(args, "cwd")
+                    .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
+                    .ok_or_else(|| anyhow::anyhow!("missing required parameter `cwd`"))?;
+                rt.workflows
+                    .start_batch_fanout(StartBatchFanoutSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: caller_agent_id.map(ToOwned::to_owned),
+                        csv_content,
+                        prompt_template,
+                        provider,
+                        model,
+                        mode,
+                        max_concurrency,
+                        isolated_worktree,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "run": run,
+            }))
+        }
+
+        "run_dag_workflow" => {
+            authorize_workflow_launch_from_caller(&rt.store, caller_agent_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let caller = caller_agent_id.and_then(|cid| rt.store.get_agent(cid).ok().flatten());
+            let name = opt_str(args, "name").unwrap_or_default();
+            let raw_steps = args
+                .get("steps")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `steps`"))?;
+            let steps: Vec<DagStepSpec> = serde_json::from_value(raw_steps)
+                .map_err(|e| anyhow::anyhow!("invalid `steps` array: {e}"))?;
+            let default_provider = if let Some(p_raw) = opt_str(args, "default_provider") {
+                parse_provider_and_model(&p_raw)?.0
+            } else if let Some(ref c) = caller {
+                c.provider
+            } else {
+                ProviderKind::ClaudeCode
+            };
+            let requested_mode = opt_str(args, "default_mode")
+                .map(|s| parse_session_mode(&s))
+                .unwrap_or_else(|| {
+                    caller
+                        .as_ref()
+                        .map(|c| c.mode.clone())
+                        .unwrap_or(SessionMode::AcceptEdits)
+                });
+            let default_mode = match caller.as_ref() {
+                Some(c) => clamp_workflow_session_mode(&c.mode, requested_mode),
+                None => requested_mode,
+            };
+            let max_concurrency = args
+                .get("max_concurrency")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(3)
+                .clamp(1, 8);
+
+            let run = if let Some(ref remote_host_id) = target_host {
+                let cwd = str_arg(args, "cwd")?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartDagWorkflow {
+                            request_id: req_id,
+                            name,
+                            cwd,
+                            steps,
+                            default_provider,
+                            default_mode,
+                            max_concurrency,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunUpdated { run, .. } => run,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to run_dag_workflow"),
+                }
+            } else {
+                let cwd = opt_str(args, "cwd")
+                    .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
+                    .ok_or_else(|| anyhow::anyhow!("missing required parameter `cwd`"))?;
+                rt.workflows
+                    .start_dag_workflow(StartDagWorkflowSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: caller_agent_id.map(ToOwned::to_owned),
+                        steps,
+                        default_provider,
+                        default_mode,
+                        max_concurrency,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "run": run,
+            }))
+        }
+
+        "run_best_of_n" => {
+            authorize_workflow_launch_from_caller(&rt.store, caller_agent_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let caller = caller_agent_id.and_then(|cid| rt.store.get_agent(cid).ok().flatten());
+            let name = opt_str(args, "name").unwrap_or_default();
+            let prompt = str_arg(args, "prompt")?;
+            let raw_candidates = args
+                .get("candidates")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `candidates`"))?;
+            let candidates: Vec<BestOfNCandidateSpec> = serde_json::from_value(raw_candidates)
+                .map_err(|e| anyhow::anyhow!("invalid `candidates` array: {e}"))?;
+            let requested_mode = opt_str(args, "mode")
+                .map(|s| parse_session_mode(&s))
+                .unwrap_or_else(|| {
+                    caller
+                        .as_ref()
+                        .map(|c| c.mode.clone())
+                        .unwrap_or(SessionMode::AcceptEdits)
+                });
+            let mode = match caller.as_ref() {
+                Some(c) => clamp_workflow_session_mode(&c.mode, requested_mode),
+                None => requested_mode,
+            };
+            let verify_command = opt_str(args, "verify_command");
+            validate_mcp_verify_command(
+                caller.as_ref().map(|c| &c.mode),
+                verify_command.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let run = if let Some(ref remote_host_id) = target_host {
+                let cwd = str_arg(args, "cwd")?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartBestOfN {
+                            request_id: req_id,
+                            name,
+                            cwd,
+                            prompt,
+                            candidates,
+                            mode,
+                            verify_command,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunUpdated { run, .. } => run,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to run_best_of_n"),
+                }
+            } else {
+                let cwd = opt_str(args, "cwd")
+                    .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
+                    .ok_or_else(|| anyhow::anyhow!("missing required parameter `cwd`"))?;
+                rt.workflows
+                    .start_best_of_n(StartBestOfNSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: caller_agent_id.map(ToOwned::to_owned),
+                        prompt,
+                        candidates,
+                        mode,
+                        verify_command,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "run": run,
+            }))
+        }
+
+        "get_workflow_status" => {
+            let run_id = opt_str(args, "run_id");
+            let include_completed = args
+                .get("include_completed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let runs = match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ListWorkflowRuns {
+                            request_id: req_id,
+                            include_completed: true,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunsSnapshot { runs, .. } => runs,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to get_workflow_status"),
+                };
+                if let Some(rid) = run_id {
+                    let run = runs.into_iter().find(|r| r.run_id == rid).ok_or_else(|| {
+                        anyhow::anyhow!("workflow run `{rid}` not found on host `{remote_host_id}`")
+                    })?;
+                    return Ok(json!({
+                        "host_id": remote_host_id,
+                        "run": run,
+                    }));
+                }
+                let filtered: Vec<_> = if include_completed {
+                    runs
+                } else {
+                    runs.into_iter().filter(|r| r.status.is_active()).collect()
+                };
+                return Ok(json!({
+                    "host_id": remote_host_id,
+                    "runs": filtered,
+                }));
+            }
+
+            if let Some(rid) = run_id {
+                let run = rt
+                    .workflows
+                    .get_run(&rid)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("workflow run `{rid}` not found"))?;
+                Ok(json!({
+                    "host_id": rt.host_info.host_id.clone(),
+                    "run": run,
+                }))
+            } else {
+                let runs = rt
+                    .workflows
+                    .list_runs(include_completed)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(json!({
+                    "host_id": rt.host_info.host_id.clone(),
+                    "runs": runs,
+                }))
+            }
+        }
+
+        "cancel_workflow" => {
+            let run_id = str_arg(args, "run_id")?;
+            let run = if let Some(ref remote_host_id) = target_host {
+                if caller_agent_id.is_some() {
+                    // Enforce caller ownership before forwarding cancel to remote host.
+                    let list_req = Uuid::new_v4();
+                    let remote_runs = match rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            list_req,
+                            WireMessage::ListWorkflowRuns {
+                                request_id: list_req,
+                                include_completed: true,
+                            },
+                            Duration::from_secs(20),
+                        )
+                        .await?
+                    {
+                        WireMessage::WorkflowRunsSnapshot { runs, .. } => runs,
+                        WireMessage::RpcError { message, .. } => {
+                            anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                        }
+                        _ => anyhow::bail!("unexpected remote reply to list_workflow_runs"),
+                    };
+                    let target_run = remote_runs
+                        .into_iter()
+                        .find(|r| r.run_id == run_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "workflow run `{run_id}` not found on host `{remote_host_id}`"
+                            )
+                        })?;
+                    authorize_workflow_cancel(caller_agent_id, &target_run)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CancelWorkflowRun {
+                            request_id: req_id,
+                            run_id,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunUpdated { run, .. } => run,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to cancel_workflow"),
+                }
+            } else {
+                let existing = rt
+                    .workflows
+                    .get_run(&run_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("workflow run `{run_id}` not found"))?;
+                authorize_workflow_cancel(caller_agent_id, &existing)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.workflows
+                    .cancel_run(&run_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "run": run,
+            }))
+        }
+
         other => anyhow::bail!("unknown Orbit tool `{other}`"),
     }
 }
@@ -4373,6 +4790,116 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["session_id"]
             }),
         },
+        // --- Batch CSV Fan-Out, Programmable DAG Workflows & Best-of-N Arena (5) ---
+        ToolDefinition {
+            name: "run_batch_fanout",
+            description: "Launch a bounded-concurrency Batch CSV Fan-Out workflow (up to 200 rows, RFC 4180 CSV with `{{col}}` interpolation).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Optional human-readable workflow run title." },
+                    "cwd": { "type": "string", "description": "Workspace directory (defaults to calling agent's cwd on local host)." },
+                    "csv_content": { "type": "string", "description": "RFC 4180 CSV text with header row and 1..=200 data rows." },
+                    "prompt_template": { "type": "string", "description": "Prompt template using `{{column}}` placeholders." },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, etc., or `provider/model`)." },
+                    "model": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"], "default": "accept_edits" },
+                    "max_concurrency": { "type": "integer", "default": 3, "description": "Parallel worker limit (1..=8)." },
+                    "isolated_worktree": { "type": "boolean", "default": false, "description": "Run each CSV row inside its own isolated Git worktree." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["csv_content", "prompt_template"]
+            }),
+        },
+        ToolDefinition {
+            name: "run_dag_workflow",
+            description: "Launch a topologically validated Programmable DAG Workflow (up to 64 nodes) with `{{step.<id>.output}}` interpolation and bounded concurrency.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "cwd": { "type": "string", "description": "Workspace directory (defaults to calling agent's cwd on local host)." },
+                    "steps": {
+                        "type": "array",
+                        "description": "1..=64 DAG step specifications.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step_id": { "type": "string" },
+                                "name": { "type": "string" },
+                                "depends_on": { "type": "array", "items": { "type": "string" } },
+                                "prompt_template": { "type": "string" },
+                                "provider": { "type": "string" },
+                                "model": { "type": "string" },
+                                "isolated_worktree": { "type": "boolean" },
+                                "retry_count": { "type": "integer" },
+                                "timeout_secs": { "type": "integer" }
+                            },
+                            "required": ["step_id", "name", "prompt_template"]
+                        }
+                    },
+                    "default_provider": { "type": "string" },
+                    "default_mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"], "default": "accept_edits" },
+                    "max_concurrency": { "type": "integer", "default": 3 },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["steps"]
+            }),
+        },
+        ToolDefinition {
+            name: "run_best_of_n",
+            description: "Launch a Best-of-N Parallel Arena (2..=5 candidates) where each model solves the same prompt in an isolated Git worktree with optional verification command.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "cwd": { "type": "string", "description": "Git workspace directory (defaults to calling agent's cwd on local host)." },
+                    "prompt": { "type": "string", "description": "Shared task prompt sent to every candidate." },
+                    "candidates": {
+                        "type": "array",
+                        "description": "2..=5 candidate specs (`label`, `provider`, optional `model` and `effort`).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string" },
+                                "provider": { "type": "string" },
+                                "model": { "type": "string" },
+                                "effort": { "type": "string" }
+                            },
+                            "required": ["label", "provider"]
+                        }
+                    },
+                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"], "default": "accept_edits" },
+                    "verify_command": { "type": "string", "description": "Optional scrubbed shell verification command run in each candidate worktree after completion." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["prompt", "candidates"]
+            }),
+        },
+        ToolDefinition {
+            name: "get_workflow_status",
+            description: "Inspect a specific workflow run by `run_id` or list recent Batch/DAG/Best-of-N workflow runs.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string", "description": "Optional workflow run ID to inspect." },
+                    "include_completed": { "type": "boolean", "default": true },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "cancel_workflow",
+            description: "Cancel an active Batch CSV, DAG, or Best-of-N workflow run and interrupt in-flight steps.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string", "description": "Workflow run ID to cancel." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["run_id"]
+            }),
+        },
     ]
 }
 
@@ -4383,7 +4910,16 @@ mod tests {
     #[test]
     fn timer_mcp_tools_expose_multi_host_id_schema() {
         let defs = all_tool_definitions();
-        for name in ["create_timer", "list_timers", "cancel_timer"] {
+        for name in [
+            "create_timer",
+            "list_timers",
+            "cancel_timer",
+            "run_batch_fanout",
+            "run_dag_workflow",
+            "run_best_of_n",
+            "get_workflow_status",
+            "cancel_workflow",
+        ] {
             let def = defs
                 .iter()
                 .find(|d| d.name == name)

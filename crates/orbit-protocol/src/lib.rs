@@ -17,6 +17,7 @@ pub mod skills;
 pub mod timers;
 pub mod triggers;
 pub mod usage;
+pub mod workflows;
 pub use acp::*;
 pub use artifacts::*;
 pub use browser::*;
@@ -34,6 +35,7 @@ pub use skills::*;
 pub use timers::*;
 pub use triggers::*;
 pub use usage::*;
+pub use workflows::*;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -57,6 +59,10 @@ fn wire_default_lsp_limit() -> u32 {
 
 fn wire_default_usage_days() -> u32 {
     7
+}
+
+fn wire_default_workflow_concurrency() -> u32 {
+    3
 }
 
 /// First-class supported coding agent CLIs in Orbit (native drivers + Universal ACP).
@@ -2525,6 +2531,70 @@ pub enum WireMessage {
         policy: BrowserPolicyConfig,
     },
 
+    // --- Batch CSV Fan-Out, Programmable DAG Workflows & Best-of-N Parallel Arena ---
+    StartBatchFanout {
+        request_id: Uuid,
+        name: String,
+        cwd: String,
+        csv_content: String,
+        prompt_template: String,
+        provider: ProviderKind,
+        #[serde(default)]
+        model: Option<String>,
+        mode: SessionMode,
+        #[serde(default = "wire_default_workflow_concurrency")]
+        max_concurrency: u32,
+        #[serde(default)]
+        isolated_worktree: bool,
+    },
+    StartDagWorkflow {
+        request_id: Uuid,
+        name: String,
+        cwd: String,
+        steps: Vec<DagStepSpec>,
+        default_provider: ProviderKind,
+        default_mode: SessionMode,
+        #[serde(default = "wire_default_workflow_concurrency")]
+        max_concurrency: u32,
+    },
+    StartBestOfN {
+        request_id: Uuid,
+        name: String,
+        cwd: String,
+        prompt: String,
+        candidates: Vec<BestOfNCandidateSpec>,
+        mode: SessionMode,
+        #[serde(default)]
+        verify_command: Option<String>,
+    },
+    ListWorkflowRuns {
+        request_id: Uuid,
+        #[serde(default)]
+        include_completed: bool,
+    },
+    CancelWorkflowRun {
+        request_id: Uuid,
+        run_id: String,
+    },
+    SelectBestOfNWinner {
+        request_id: Uuid,
+        run_id: String,
+        winner_step_id: String,
+        #[serde(default)]
+        apply_to_workspace: bool,
+    },
+    WorkflowRunUpdated {
+        request_id: Uuid,
+        run: WorkflowRunRecord,
+    },
+    WorkflowRunsSnapshot {
+        request_id: Uuid,
+        runs: Vec<WorkflowRunRecord>,
+    },
+    WorkflowRunEvent {
+        run: WorkflowRunRecord,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -4215,6 +4285,134 @@ mod tests {
             let encoded = msg.encode_zstd(3).expect("encode event trigger wire msg");
             let decoded =
                 WireMessage::decode_zstd(&encoded).expect("decode event trigger wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let run = WorkflowRunRecord {
+            run_id: "wf_abc".into(),
+            name: "Best-of-2".into(),
+            kind: WorkflowKind::BestOfN,
+            workspace_cwd: "/tmp/repo".into(),
+            owner_agent_id: Some("ag_owner".into()),
+            status: WorkflowRunStatus::Running,
+            max_concurrency: 2,
+            verify_command: Some("cargo test".into()),
+            winner_step_id: None,
+            steps: vec![WorkflowStepRecord {
+                run_id: "wf_abc".into(),
+                step_id: "cand_1".into(),
+                name: "Claude".into(),
+                status: WorkflowStepStatus::Succeeded,
+                depends_on: Vec::new(),
+                agent_id: Some("ag_1".into()),
+                worktree_cwd: Some("/tmp/wt-1".into()),
+                provider: ProviderKind::ClaudeCode,
+                model: Some("claude-opus-4-6".into()),
+                output_preview: Some("Done".into()),
+                diff_additions: 12,
+                diff_deletions: 4,
+                diff_files: 2,
+                verify_passed: Some(true),
+                verify_output: Some("ok".into()),
+                error: None,
+                is_winner: false,
+                started_at_ms: Some(1_760_000_001_000),
+                finished_at_ms: Some(1_760_000_010_000),
+            }],
+            created_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_010_000,
+            finished_at_ms: None,
+        };
+
+        let messages = vec![
+            WireMessage::StartBatchFanout {
+                request_id: req_id,
+                name: "Migrate endpoints".into(),
+                cwd: "/tmp/repo".into(),
+                csv_content: "file,owner\nsrc/a.rs,alice".into(),
+                prompt_template: "Migrate {{file}} for {{owner}}".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: None,
+                mode: SessionMode::AcceptEdits,
+                max_concurrency: 4,
+                isolated_worktree: true,
+            },
+            WireMessage::StartDagWorkflow {
+                request_id: req_id,
+                name: "Build & Verify".into(),
+                cwd: "/tmp/repo".into(),
+                steps: vec![DagStepSpec {
+                    step_id: "plan".into(),
+                    name: "Plan".into(),
+                    depends_on: Vec::new(),
+                    prompt_template: "Draft plan".into(),
+                    provider: Some(ProviderKind::ClaudeCode),
+                    model: None,
+                    isolated_worktree: false,
+                    retry_count: 1,
+                    timeout_secs: 600,
+                }],
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::AcceptEdits,
+                max_concurrency: 3,
+            },
+            WireMessage::StartBestOfN {
+                request_id: req_id,
+                name: "Arena".into(),
+                cwd: "/tmp/repo".into(),
+                prompt: "Implement feature".into(),
+                candidates: vec![
+                    BestOfNCandidateSpec {
+                        label: "Claude".into(),
+                        provider: ProviderKind::ClaudeCode,
+                        model: None,
+                        effort: Some("high".into()),
+                    },
+                    BestOfNCandidateSpec {
+                        label: "Codex".into(),
+                        provider: ProviderKind::Codex,
+                        model: None,
+                        effort: None,
+                    },
+                ],
+                mode: SessionMode::AcceptEdits,
+                verify_command: Some("cargo test".into()),
+            },
+            WireMessage::ListWorkflowRuns {
+                request_id: req_id,
+                include_completed: true,
+            },
+            WireMessage::CancelWorkflowRun {
+                request_id: req_id,
+                run_id: "wf_abc".into(),
+            },
+            WireMessage::SelectBestOfNWinner {
+                request_id: req_id,
+                run_id: "wf_abc".into(),
+                winner_step_id: "cand_1".into(),
+                apply_to_workspace: true,
+            },
+            WireMessage::WorkflowRunUpdated {
+                request_id: req_id,
+                run: run.clone(),
+            },
+            WireMessage::WorkflowRunsSnapshot {
+                request_id: req_id,
+                runs: vec![run.clone()],
+            },
+            WireMessage::WorkflowRunEvent { run },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode workflow wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode workflow wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

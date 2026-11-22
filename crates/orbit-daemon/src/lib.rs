@@ -35,6 +35,7 @@ pub mod timers;
 pub mod tools;
 pub mod triggers;
 pub mod usage;
+pub mod workflows;
 pub mod workspace_board;
 pub mod workspace_cluster;
 pub mod workspace_files;
@@ -105,6 +106,9 @@ use crate::scheduler::ScheduleEngine;
 use crate::symbols::WorkspaceSymbolIndex;
 use crate::timers::ConditionalTimerEngine;
 use crate::triggers::{EventTriggerEngine, UpsertTriggerRequest};
+use crate::workflows::{
+    StartBatchFanoutSpec, StartBestOfNSpec, StartDagWorkflowSpec, WorkflowEngine,
+};
 use crate::workspace_files::{
     canonicalize_workspace_root, create_workspace_entry, delete_workspace_entry,
     rename_workspace_entry, write_workspace_file,
@@ -234,6 +238,7 @@ pub struct DaemonRuntime {
     pub keep_awake: Arc<KeepAwakeManager>,
     pub goals: Arc<GoalMonitorEngine>,
     pub triggers: Arc<EventTriggerEngine>,
+    pub workflows: Arc<WorkflowEngine>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
     pub lsp: Arc<LspManager>,
     pub browser: Arc<BrowserManager>,
@@ -356,6 +361,7 @@ impl DaemonRuntime {
             listen_port.clone(),
             home_dir,
         );
+        let workflows = WorkflowEngine::new(store.clone(), &orchestrator, keep_awake.clone());
         let idle_cleanup = IdleRuntimeCleanup::new(
             store.clone(),
             orchestrator.clone(),
@@ -409,6 +415,7 @@ impl DaemonRuntime {
             keep_awake,
             goals,
             triggers,
+            workflows,
             symbol_index: Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
                 crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
             ))),
@@ -435,8 +442,9 @@ impl DaemonRuntime {
         // 3. Resume any persisted finish subscriptions & armed conditional timers across restarts
         self.finish_subs.start_recovery().await;
         self.conditional_timers.start_recovery().await;
-        // 3b. Recover active autonomous Goals & streaming Monitor watches
+        // 3b. Recover active autonomous Goals, streaming Monitor watches & interrupted Workflows
         self.goals.start_recovery().await;
+        self.workflows.start_recovery().await;
         // 3c. Start GitHub PR/Issue/CI polling fallback loop for enabled event triggers
         self.triggers.spawn_background_poller().await;
         // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup, LSP & Browser Idle Reaper loops
@@ -656,6 +664,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             runtime_shutdown.conditional_timers.shutdown().await;
             runtime_shutdown.goals.shutdown_all().await;
             runtime_shutdown.triggers.shutdown().await;
+            runtime_shutdown.workflows.shutdown_all().await;
             runtime_shutdown.lsp.shutdown_all().await;
             runtime_shutdown.browser.shutdown_all().await;
             runtime_shutdown.keep_awake.shutdown();
@@ -1193,6 +1202,9 @@ async fn run_client_session_loop(
                     DaemonBroadcast::GoalRunEvent(goal) => Some(WireMessage::GoalRunEvent { goal }),
                     DaemonBroadcast::MonitorWatchEvent(monitor) => {
                         Some(WireMessage::MonitorWatchEvent { monitor })
+                    }
+                    DaemonBroadcast::WorkflowRunEvent(run) => {
+                        Some(WireMessage::WorkflowRunEvent { run })
                     }
                 };
                 if let Some(msg) = maybe_msg
@@ -3775,6 +3787,170 @@ async fn handle_wire_rpc(
                         chrome_binary: snap.chrome_binary,
                     },
                     Err(e) => rpc_err(request_id, "update_browser_policy_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Batch CSV Fan-Out, Programmable DAG Workflows & Best-of-N Parallel Arena
+        WireMessage::StartBatchFanout {
+            request_id,
+            name,
+            cwd,
+            csv_content,
+            prompt_template,
+            provider,
+            model,
+            mode,
+            max_concurrency,
+            isolated_worktree,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows
+                    .start_batch_fanout(StartBatchFanoutSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: None,
+                        csv_content,
+                        prompt_template,
+                        provider,
+                        model,
+                        mode,
+                        max_concurrency,
+                        isolated_worktree,
+                    })
+                    .await
+                {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "start_batch_fanout_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::StartDagWorkflow {
+            request_id,
+            name,
+            cwd,
+            steps,
+            default_provider,
+            default_mode,
+            max_concurrency,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows
+                    .start_dag_workflow(StartDagWorkflowSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: None,
+                        steps,
+                        default_provider,
+                        default_mode,
+                        max_concurrency,
+                    })
+                    .await
+                {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "start_dag_workflow_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::StartBestOfN {
+            request_id,
+            name,
+            cwd,
+            prompt,
+            candidates,
+            mode,
+            verify_command,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows
+                    .start_best_of_n(StartBestOfNSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: None,
+                        prompt,
+                        candidates,
+                        mode,
+                        verify_command,
+                    })
+                    .await
+                {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "start_best_of_n_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ListWorkflowRuns {
+            request_id,
+            include_completed,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    workflows.list_runs(include_completed)
+                })
+                .await
+                {
+                    Ok(Ok(runs)) => WireMessage::WorkflowRunsSnapshot { request_id, runs },
+                    Ok(Err(e)) => rpc_err(request_id, "list_workflow_runs_failed", e),
+                    Err(e) => rpc_err(request_id, "list_workflow_runs_failed", e.to_string()),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::CancelWorkflowRun { request_id, run_id } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows.cancel_run(&run_id).await {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "cancel_workflow_run_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::SelectBestOfNWinner {
+            request_id,
+            run_id,
+            winner_step_id,
+            apply_to_workspace,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows
+                    .select_best_of_n_winner(&run_id, &winner_step_id, apply_to_workspace)
+                    .await
+                {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "select_best_of_n_winner_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });

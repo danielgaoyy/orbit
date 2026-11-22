@@ -619,3 +619,59 @@ pub struct BrowserActionResponseView {
     #[serde(default)]
     pub captcha_detected: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartBatchFanoutRequest {
+    pub host_id: String,
+    pub name: String,
+    pub cwd: String,
+    pub csv_content: String,
+    pub prompt_template: String,
+    pub provider: orbit_protocol::ProviderKind,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub mode: orbit_protocol::SessionMode,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    #[serde(default)]
+    pub isolated_worktree: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartDagWorkflowRequest {
+    pub host_id: String,
+    pub name: String,
+    pub cwd: String,
+    pub steps: Vec<orbit_protocol::DagStepSpec>,
+    pub default_provider: orbit_protocol::ProviderKind,
+    pub default_mode: orbit_protocol::SessionMode,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartBestOfNRequest {
+    pub host_id: String,
+    pub name: String,
+    pub cwd: String,
+    pub prompt: String,
+    pub candidates: Vec<orbit_protocol::BestOfNCandidateSpec>,
+    pub mode: orbit_protocol::SessionMode,
+    #[serde(default)]
+    pub verify_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelWorkflowRunRequest {
+    pub host_id: String,
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectBestOfNWinnerRequest {
+    pub host_id: String,
+    pub run_id: String,
+    pub winner_step_id: String,
+    #[serde(default)]
+    pub apply_to_workspace: bool,
+}

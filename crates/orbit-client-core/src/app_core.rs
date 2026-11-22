@@ -29,9 +29,9 @@ use orbit_protocol::{
     ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
     SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload,
     TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
-    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
-    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
-    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
+    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
+    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -49,15 +49,16 @@ use crate::cloud_sync::{
     unlock_remote_vault_with_passphrase,
 };
 pub use crate::contract::{
-    BrowserActionResponseView, BrowserSessionsSnapshotView, ControlGoalRunRequest,
-    ConversationSearchHit, CreateBrowserSessionRequest, CreateWorkspaceEntryRequest,
-    DeletePathRuleRequest, DeleteWorkspaceEntryRequest, EventTriggersSnapshotView,
-    ExecuteBrowserActionRequest, ExecuteWorktreeHandoffRequest, ForkAgentRequest,
-    ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
+    BrowserActionResponseView, BrowserSessionsSnapshotView, CancelWorkflowRunRequest,
+    ControlGoalRunRequest, ConversationSearchHit, CreateBrowserSessionRequest,
+    CreateWorkspaceEntryRequest, DeletePathRuleRequest, DeleteWorkspaceEntryRequest,
+    EventTriggersSnapshotView, ExecuteBrowserActionRequest, ExecuteWorktreeHandoffRequest,
+    ForkAgentRequest, ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
     InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
     MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
     PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    SaveInstructionFileRequest, StartGoalRunRequest, StartMonitorWatchRequest,
+    SaveInstructionFileRequest, SelectBestOfNWinnerRequest, StartBatchFanoutRequest,
+    StartBestOfNRequest, StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
     StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
     UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
     WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
@@ -361,6 +362,8 @@ pub struct HostDetailView {
     pub goal_runs: Vec<GoalRunRecord>,
     #[serde(default)]
     pub monitor_watches: Vec<MonitorWatchRecord>,
+    #[serde(default)]
+    pub workflow_runs: Vec<WorkflowRunRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -734,6 +737,10 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserSessionSummary, String>>>,
     pending_browser_actions:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserActionResponseView, String>>>,
+    pending_workflow_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorkflowRunRecord, String>>>,
+    pending_workflow_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<WorkflowRunRecord>, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -788,6 +795,7 @@ struct HostMemoryState {
     artifacts: Vec<ArtifactSummary>,
     goal_runs: Vec<GoalRunRecord>,
     monitor_watches: Vec<MonitorWatchRecord>,
+    workflow_runs: Vec<WorkflowRunRecord>,
 }
 
 impl HostMemoryState {
@@ -872,6 +880,8 @@ impl HostMemoryState {
             pending_browser_snapshots: HashMap::new(),
             pending_browser_sessions: HashMap::new(),
             pending_browser_actions: HashMap::new(),
+            pending_workflow_updates: HashMap::new(),
+            pending_workflow_lists: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -926,6 +936,7 @@ impl HostMemoryState {
             artifacts: Vec::new(),
             goal_runs: Vec::new(),
             monitor_watches: Vec::new(),
+            workflow_runs: Vec::new(),
         }
     }
 
@@ -1596,6 +1607,7 @@ impl OrbitAppCore {
             artifacts: state.artifacts.clone(),
             goal_runs: state.goal_runs.clone(),
             monitor_watches: state.monitor_watches.clone(),
+            workflow_runs: state.workflow_runs.clone(),
         })
     }
 
@@ -3764,6 +3776,12 @@ impl OrbitAppCore {
                     })
                     .await;
                 let _ = handle
+                    .send_wire(WireMessage::ListWorkflowRuns {
+                        request_id: Uuid::new_v4(),
+                        include_completed: true,
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::ListConnectedHosts {
                         request_id: Uuid::new_v4(),
                     })
@@ -5450,6 +5468,25 @@ impl OrbitAppCore {
                         }));
                     }
                 }
+                WireMessage::WorkflowRunsSnapshot { request_id, runs } => {
+                    if let Some(tx) = state.pending_workflow_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(runs.clone()));
+                    } else {
+                        state.workflow_runs = runs;
+                        notify_host = true;
+                    }
+                }
+                WireMessage::WorkflowRunUpdated { request_id, run } => {
+                    upsert_cached_workflow_run(&mut state.workflow_runs, run.clone());
+                    if let Some(tx) = state.pending_workflow_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(run));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::WorkflowRunEvent { run } => {
+                    upsert_cached_workflow_run(&mut state.workflow_runs, run);
+                    notify_host = true;
+                }
                 WireMessage::SideQuestionDelta {
                     request_id,
                     text_delta,
@@ -5738,6 +5775,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_browser_actions.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_workflow_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_workflow_lists.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -13486,6 +13531,241 @@ impl OrbitAppCore {
             .map_err(|_| "UpdateBrowserPolicy task cancelled".to_string())?
     }
 
+    async fn dispatch_workflow_update_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+        timeout_secs: u64,
+    ) -> Result<WorkflowRunRecord, String> {
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_workflow_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_workflow_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected during {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_workflow_updates.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for {op_label} reply"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn start_batch_fanout_on_host(
+        self: &Arc<Self>,
+        req: StartBatchFanoutRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::StartBatchFanout {
+                request_id,
+                name: req.name,
+                cwd: req.cwd,
+                csv_content: req.csv_content,
+                prompt_template: req.prompt_template,
+                provider: req.provider,
+                model: req.model,
+                mode: req.mode,
+                max_concurrency: req.max_concurrency.unwrap_or(3).clamp(1, 8),
+                isolated_worktree: req.isolated_worktree,
+            },
+            "StartBatchFanout",
+            30,
+        )
+        .await
+    }
+
+    pub async fn start_dag_workflow_on_host(
+        self: &Arc<Self>,
+        req: StartDagWorkflowRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::StartDagWorkflow {
+                request_id,
+                name: req.name,
+                cwd: req.cwd,
+                steps: req.steps,
+                default_provider: req.default_provider,
+                default_mode: req.default_mode,
+                max_concurrency: req.max_concurrency.unwrap_or(3).clamp(1, 8),
+            },
+            "StartDagWorkflow",
+            30,
+        )
+        .await
+    }
+
+    pub async fn start_best_of_n_on_host(
+        self: &Arc<Self>,
+        req: StartBestOfNRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::StartBestOfN {
+                request_id,
+                name: req.name,
+                cwd: req.cwd,
+                prompt: req.prompt,
+                candidates: req.candidates,
+                mode: req.mode,
+                verify_command: req.verify_command,
+            },
+            "StartBestOfN",
+            30,
+        )
+        .await
+    }
+
+    pub async fn list_workflow_runs_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        include_completed: bool,
+    ) -> Result<Vec<WorkflowRunRecord>, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_workflow_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing workflow runs".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListWorkflowRuns {
+                    request_id: req_id,
+                    include_completed,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_workflow_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListWorkflowRuns: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(runs))) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        if include_completed {
+                            h.workflow_runs = runs.clone();
+                        } else {
+                            for run in &runs {
+                                upsert_cached_workflow_run(&mut h.workflow_runs, run.clone());
+                            }
+                        }
+                    }
+                    core.emit(|revision| CoreNotification::HostChanged {
+                        revision,
+                        host_id: host_id.clone(),
+                    });
+                    Ok(runs)
+                }
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err("Host disconnected while listing workflow runs".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_workflow_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ListWorkflowRuns reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ListWorkflowRuns task cancelled".to_string())?
+    }
+
+    pub async fn cancel_workflow_run_on_host(
+        self: &Arc<Self>,
+        req: CancelWorkflowRunRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::CancelWorkflowRun {
+                request_id,
+                run_id: req.run_id,
+            },
+            "CancelWorkflowRun",
+            20,
+        )
+        .await
+    }
+
+    pub async fn select_best_of_n_winner_on_host(
+        self: &Arc<Self>,
+        req: SelectBestOfNWinnerRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::SelectBestOfNWinner {
+                request_id,
+                run_id: req.run_id,
+                winner_step_id: req.winner_step_id,
+                apply_to_workspace: req.apply_to_workspace,
+            },
+            "SelectBestOfNWinner",
+            45,
+        )
+        .await
+    }
+
     fn require_online_session(&self, host_id: &str) -> Result<HostSessionHandle, String> {
         let guard = self
             .hosts
@@ -15007,6 +15287,23 @@ fn upsert_cached_monitor(list: &mut Vec<MonitorWatchRecord>, monitor: MonitorWat
     });
 }
 
+fn upsert_cached_workflow_run(list: &mut Vec<WorkflowRunRecord>, run: WorkflowRunRecord) {
+    if let Some(slot) = list
+        .iter_mut()
+        .find(|existing| existing.run_id == run.run_id)
+    {
+        *slot = run;
+    } else {
+        list.insert(0, run);
+    }
+    list.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| b.run_id.cmp(&a.run_id))
+    });
+    list.truncate(100);
+}
+
 fn provider_subagent_logical_key(payload: &TimelinePayload) -> Option<(&'static str, String)> {
     match payload {
         TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
@@ -15186,6 +15483,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_browser_actions.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_workflow_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_workflow_lists.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {

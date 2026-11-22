@@ -2424,6 +2424,138 @@ async fn update_browser_policy(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_batch_fanout(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    name: String,
+    cwd: String,
+    csv_content: String,
+    prompt_template: String,
+    provider: orbit_protocol::ProviderKind,
+    model: Option<String>,
+    mode: orbit_protocol::SessionMode,
+    max_concurrency: Option<u32>,
+    isolated_worktree: Option<bool>,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .start_batch_fanout_on_host(orbit_client_core::contract::StartBatchFanoutRequest {
+            host_id,
+            name,
+            cwd,
+            csv_content,
+            prompt_template,
+            provider,
+            model,
+            mode,
+            max_concurrency,
+            isolated_worktree: isolated_worktree.unwrap_or(false),
+        })
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_dag_workflow(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    name: String,
+    cwd: String,
+    steps: Vec<orbit_protocol::DagStepSpec>,
+    default_provider: orbit_protocol::ProviderKind,
+    default_mode: orbit_protocol::SessionMode,
+    max_concurrency: Option<u32>,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .start_dag_workflow_on_host(orbit_client_core::contract::StartDagWorkflowRequest {
+            host_id,
+            name,
+            cwd,
+            steps,
+            default_provider,
+            default_mode,
+            max_concurrency,
+        })
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_best_of_n(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    name: String,
+    cwd: String,
+    prompt: String,
+    candidates: Vec<orbit_protocol::BestOfNCandidateSpec>,
+    mode: orbit_protocol::SessionMode,
+    verify_command: Option<String>,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .start_best_of_n_on_host(orbit_client_core::contract::StartBestOfNRequest {
+            host_id,
+            name,
+            cwd,
+            prompt,
+            candidates,
+            mode,
+            verify_command,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn list_workflow_runs(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    include_completed: Option<bool>,
+) -> Result<Vec<orbit_protocol::WorkflowRunRecord>, String> {
+    state
+        .core
+        .list_workflow_runs_on_host(&host_id, include_completed.unwrap_or(true))
+        .await
+}
+
+#[tauri::command]
+async fn cancel_workflow_run(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    run_id: String,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .cancel_workflow_run_on_host(orbit_client_core::contract::CancelWorkflowRunRequest {
+            host_id,
+            run_id,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn select_best_of_n_winner(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    run_id: String,
+    winner_step_id: String,
+    apply_to_workspace: Option<bool>,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .select_best_of_n_winner_on_host(
+            orbit_client_core::contract::SelectBestOfNWinnerRequest {
+                host_id,
+                run_id,
+                winner_step_id,
+                apply_to_workspace: apply_to_workspace.unwrap_or(true),
+            },
+        )
+        .await
+}
+
+#[tauri::command]
 async fn highlight_workspace_code(
     language: String,
     content: String,
@@ -3319,6 +3451,12 @@ pub fn run() {
             execute_browser_action,
             close_browser_session,
             update_browser_policy,
+            start_batch_fanout,
+            start_dag_workflow,
+            start_best_of_n,
+            list_workflow_runs,
+            cancel_workflow_run,
+            select_best_of_n_winner,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

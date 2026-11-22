@@ -585,7 +585,9 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::EventTriggerTestResponse { request_id, .. }
         | WireMessage::BrowserSessionsSnapshot { request_id, .. }
         | WireMessage::BrowserSessionUpdated { request_id, .. }
-        | WireMessage::BrowserActionResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::BrowserActionResponse { request_id, .. }
+        | WireMessage::WorkflowRunUpdated { request_id, .. }
+        | WireMessage::WorkflowRunsSnapshot { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }
@@ -1198,6 +1200,40 @@ mod tests {
                 screenshot_base64: None,
                 text_excerpt: None,
                 captcha_detected: false,
+            }),
+            Some(req_id)
+        );
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_workflow_responses() {
+        let req_id = Uuid::new_v4();
+        let run = orbit_protocol::WorkflowRunRecord {
+            run_id: "wf_1".into(),
+            name: "Batch".into(),
+            kind: orbit_protocol::WorkflowKind::BatchCsv,
+            workspace_cwd: "/tmp/repo".into(),
+            owner_agent_id: None,
+            status: orbit_protocol::WorkflowRunStatus::Running,
+            max_concurrency: 2,
+            verify_command: None,
+            winner_step_id: None,
+            steps: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            finished_at_ms: None,
+        };
+        assert_eq!(
+            extract_response_request_id(&WireMessage::WorkflowRunUpdated {
+                request_id: req_id,
+                run: run.clone(),
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::WorkflowRunsSnapshot {
+                request_id: req_id,
+                runs: vec![run],
             }),
             Some(req_id)
         );

@@ -1192,17 +1192,50 @@ pub async fn spawn_detached_shim(
         std_cmd.creation_flags(WIN_CREATE_NEW_PROCESS_GROUP | WIN_CREATE_NO_WINDOW);
     }
 
-    let _child = std_cmd.spawn()?;
+    let err_sidecar = socket_path.with_extension("err");
+    let _ = std::fs::remove_file(&err_sidecar);
+
+    let mut child = std_cmd.spawn()?;
 
     // Poll for shim listener readiness (Windows cold process + ConPTY startup can exceed 3s under AV scanning).
     let max_polls = if cfg!(windows) { 500 } else { 250 };
+    let mut last_connect_err: Option<String> = None;
     for _ in 0..max_polls {
-        if socket_path.exists()
-            && let Ok(client) = ShimClient::connect(socket_path).await
-        {
-            return Ok(client);
+        if socket_path.exists() {
+            match ShimClient::connect(socket_path).await {
+                Ok(client) => {
+                    let _ = std::fs::remove_file(&err_sidecar);
+                    return Ok(client);
+                }
+                Err(err) => {
+                    last_connect_err = Some(err.to_string());
+                }
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let detail = std::fs::read_to_string(&err_sidecar).unwrap_or_default();
+            let _ = std::fs::remove_file(&err_sidecar);
+            let detail = detail.trim();
+            return Err(ShimError::Pty(format!(
+                "shim process ({}) exited early ({status}) before {} became ready{}",
+                orbit_exe.display(),
+                socket_path.display(),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    if let Some(err) = last_connect_err {
+        return Err(ShimError::Pty(format!(
+            "shim socket {} existed (exe={}) but connect failed: {err}",
+            socket_path.display(),
+            orbit_exe.display()
+        )));
     }
 
     Err(ShimError::ReadyTimeout(socket_path.to_path_buf()))

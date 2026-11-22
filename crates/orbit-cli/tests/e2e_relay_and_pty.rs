@@ -24,6 +24,9 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
+    orbit_daemon::manager::set_orbit_exe_override(std::path::PathBuf::from(env!(
+        "CARGO_BIN_EXE_orbit"
+    )));
     let base_tmp = if std::path::Path::new("/tmp").is_dir() {
         std::path::PathBuf::from("/tmp")
     } else {

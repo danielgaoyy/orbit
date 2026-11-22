@@ -5906,7 +5906,20 @@ fn decode_terminal_key_token(token: &str) -> &'static [u8] {
     }
 }
 
+static ORBIT_EXE_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Override the resolved `orbit` executable path used when spawning detached `orbit shim`
+/// supervisors (primarily for integration tests via `env!("CARGO_BIN_EXE_orbit")`).
+pub fn set_orbit_exe_override(path: PathBuf) {
+    let _ = ORBIT_EXE_OVERRIDE.set(path);
+}
+
 fn resolve_orbit_exe() -> PathBuf {
+    if let Some(overridden) = ORBIT_EXE_OVERRIDE.get()
+        && overridden.is_file()
+    {
+        return overridden.clone();
+    }
     if let Ok(explicit) = std::env::var("ORBIT_BIN")
         && !explicit.trim().is_empty()
     {

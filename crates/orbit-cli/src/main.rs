@@ -1585,8 +1585,16 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Shim { socket, spec_json } => {
-            let spec: ShimSpawnSpec = serde_json::from_str(&spec_json)?;
-            run_shim(&socket, spec).await?;
+            let err_sidecar = socket.with_extension("err");
+            let parsed = serde_json::from_str::<ShimSpawnSpec>(&spec_json);
+            let res: anyhow::Result<()> = match parsed {
+                Ok(spec) => run_shim(&socket, spec).await.map_err(Into::into),
+                Err(e) => Err(e.into()),
+            };
+            if let Err(ref e) = res {
+                let _ = std::fs::write(&err_sidecar, format!("{e:#}"));
+            }
+            res?;
         }
     }
 

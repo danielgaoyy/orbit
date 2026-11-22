@@ -2464,4 +2464,81 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
     }
+
+    #[tokio::test]
+    async fn pty_shim_echoes_output_over_shim_ipc() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("orbit_pty_shim_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        let sock_path = tmp.join("pty_echo.sock");
+
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/C".to_string(),
+                    "echo ORBIT_SHIM_PTY_OK & ping -n 4 127.0.0.1 >NUL".to_string(),
+                ],
+            )
+        } else {
+            (
+                "/bin/sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    "echo ORBIT_SHIM_PTY_OK; sleep 3".to_string(),
+                ],
+            )
+        };
+        let spec = ShimSpawnSpec {
+            shim_id: "pty_echo_test".into(),
+            mode: ShimMode::Pty { cols: 80, rows: 24 },
+            program,
+            args,
+            cwd: tmp.clone(),
+            env: HashMap::new(),
+        };
+
+        let sock_bg = sock_path.clone();
+        let shim_task = tokio::spawn(async move { run_shim(&sock_bg, spec).await });
+
+        let mut client = None;
+        for _ in 0..250 {
+            if sock_path.exists()
+                && let Ok(c) = ShimClient::connect(&sock_path).await
+            {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("connect to in-process pty shim");
+
+        let mut collected = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), client.rx.recv()).await {
+                Ok(Some(ShimFrame::PtyOutput { data_b64 }))
+                | Ok(Some(ShimFrame::PtySnapshot { data_b64 })) => {
+                    if let Ok(bytes) = B64.decode(data_b64) {
+                        collected.push_str(&String::from_utf8_lossy(&bytes));
+                        if collected.contains("ORBIT_SHIM_PTY_OK") {
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(ShimFrame::Exited { .. })) | Ok(None) => break,
+                _ => {}
+            }
+        }
+        let _ = client.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), shim_task).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            collected.contains("ORBIT_SHIM_PTY_OK"),
+            "expected PTY shim output, got: {:?}",
+            collected
+        );
+    }
 }

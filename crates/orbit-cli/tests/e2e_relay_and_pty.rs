@@ -189,13 +189,16 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
     session
         .send_terminal(TerminalBinaryFrame::Input {
             slot,
-            data: pty_cmd,
+            data: pty_cmd.clone(),
         })
         .await
         .expect("send pty input");
 
     let mut collected = String::new();
-    let pty_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let pty_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(if cfg!(windows) { 25 } else { 10 });
+    let mut last_resend = tokio::time::Instant::now();
+    let mut dsr_answered = false;
     while tokio::time::Instant::now() < pty_deadline {
         if let Ok(Ok(ev)) =
             tokio::time::timeout(Duration::from_millis(250), term_events.recv()).await
@@ -204,29 +207,50 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
                 | TerminalBinaryFrame::Snapshot { data, .. },
             ) = ev
         {
-            collected.push_str(&String::from_utf8_lossy(&data));
+            let chunk = String::from_utf8_lossy(&data);
+            collected.push_str(&chunk);
+            if !dsr_answered && collected.contains("\x1b[6n") {
+                dsr_answered = true;
+                let _ = session
+                    .send_terminal(TerminalBinaryFrame::Input {
+                        slot,
+                        data: b"\x1b[1;1R".to_vec(),
+                    })
+                    .await;
+            }
             if collected.contains("ORBIT_E2EE_PTY_OK") {
                 break;
             }
         }
+        if cfg!(windows) && last_resend.elapsed() >= Duration::from_secs(2) {
+            last_resend = tokio::time::Instant::now();
+            let _ = session
+                .send_terminal(TerminalBinaryFrame::Input {
+                    slot,
+                    data: pty_cmd.clone(),
+                })
+                .await;
+        }
     }
-    assert!(
-        collected.contains("ORBIT_E2EE_PTY_OK"),
-        "expected PTY output over E2EE relay, got: {collected}"
-    );
 
     let kill_req = Uuid::new_v4();
-    let _ = session
+    let kill_res = session
         .request(
             WireMessage::KillTerminal {
                 request_id: kill_req,
                 terminal_id: term_id,
             },
-            Duration::from_secs(5),
+            Duration::from_secs(10),
             |w| matches!(w, WireMessage::Ack { request_id } if *request_id == kill_req),
         )
-        .await
-        .expect("kill terminal");
+        .await;
+    assert!(
+        collected.contains("ORBIT_E2EE_PTY_OK"),
+        "expected PTY output over E2EE relay (bytes={}), got: {:?}",
+        collected.len(),
+        collected
+    );
+    kill_res.expect("kill terminal");
 
     let _ = std::fs::remove_dir_all(&temp_home);
 }

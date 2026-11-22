@@ -2100,6 +2100,202 @@ async fn execute_tool_inner(
             }))
         }
 
+        "lsp_diagnostics" => {
+            let path = opt_str(args, "path");
+            let cwd = opt_str(args, "cwd")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller.as_ref().map(|c| c.cwd.clone())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing required parameter `cwd` (workspace root directory)")
+                })?;
+
+            let diagnostics = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::LspGetDiagnostics {
+                            request_id: req_id,
+                            cwd: cwd.clone(),
+                            path: path.clone(),
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::LspDiagnosticsResponse { diagnostics, .. } => diagnostics,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to lsp_diagnostics"),
+                }
+            } else {
+                let resolved_cwd = crate::expand_host_path(&cwd);
+                let authorized_cwd =
+                    crate::authorize_workspace_mutation_cwd(&rt.store, &resolved_cwd)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.lsp
+                    .get_diagnostics(&authorized_cwd, path.as_deref())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "cwd": cwd,
+                "path": path,
+                "count": diagnostics.len(),
+                "diagnostics": diagnostics,
+            }))
+        }
+
+        "lsp_symbols" => {
+            let query = opt_str(args, "query").unwrap_or_default();
+            let path = opt_str(args, "path");
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(50)
+                .clamp(1, 200);
+            let cwd = opt_str(args, "cwd")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller.as_ref().map(|c| c.cwd.clone())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing required parameter `cwd` (workspace root directory)")
+                })?;
+
+            let symbols = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::LspQuerySymbols {
+                            request_id: req_id,
+                            cwd: cwd.clone(),
+                            query: query.clone(),
+                            path: path.clone(),
+                            limit,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::LspSymbolsResponse { symbols, .. } => symbols,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to lsp_symbols"),
+                }
+            } else {
+                let resolved_cwd = crate::expand_host_path(&cwd);
+                let authorized_cwd =
+                    crate::authorize_workspace_mutation_cwd(&rt.store, &resolved_cwd)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.lsp
+                    .query_symbols(&authorized_cwd, &query, path.as_deref(), limit)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "cwd": cwd,
+                "query": query,
+                "path": path,
+                "count": symbols.len(),
+                "symbols": symbols,
+            }))
+        }
+
+        "lsp_goto_definition" => {
+            let path = str_arg(args, "path")?;
+            let line = args
+                .get("line")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|&v| v >= 1)
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid 1-based integer `line`"))?;
+            let col = args
+                .get("col")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|&v| v >= 1)
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid 1-based integer `col`"))?;
+            let cwd = opt_str(args, "cwd")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller.as_ref().map(|c| c.cwd.clone())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing required parameter `cwd` (workspace root directory)")
+                })?;
+
+            let locations = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::LspGotoDefinition {
+                            request_id: req_id,
+                            cwd: cwd.clone(),
+                            path: path.clone(),
+                            line,
+                            col,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::LspLocationsResponse { locations, .. } => locations,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to lsp_goto_definition"),
+                }
+            } else {
+                let resolved_cwd = crate::expand_host_path(&cwd);
+                let authorized_cwd =
+                    crate::authorize_workspace_mutation_cwd(&rt.store, &resolved_cwd)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.lsp
+                    .goto_definition(&authorized_cwd, &path, line, col)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "cwd": cwd,
+                "path": path,
+                "line": line,
+                "col": col,
+                "locations": locations,
+            }))
+        }
+
         other => anyhow::bail!("unknown Orbit tool `{other}`"),
     }
 }
@@ -2965,6 +3161,48 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "host_id": { "type": "string" }
                 },
                 "required": ["artifact_id"]
+            }),
+        },
+        // --- Pure-Rust LSP Language Server Intelligence (3) ---
+        ToolDefinition {
+            name: "lsp_diagnostics",
+            description: "Return compiler and language server diagnostics (errors, warnings, info, hints) for a file or workspace via Orbit's host-local LSP manager.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string", "description": "Workspace root directory (defaults to calling agent's cwd on local host)." },
+                    "path": { "type": "string", "description": "Optional workspace-relative file path to inspect." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "lsp_symbols",
+            description: "Search symbols across a workspace (`workspace/symbol`) or list symbols inside a single file (`textDocument/documentSymbol`) via LSP.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Symbol name substring filter (empty lists all document symbols when `path` is set)." },
+                    "path": { "type": "string", "description": "Optional workspace-relative file path for document-level symbols." },
+                    "limit": { "type": "integer", "default": 50, "description": "Maximum number of symbols to return (1-200)." },
+                    "cwd": { "type": "string", "description": "Workspace root directory (defaults to calling agent's cwd on local host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "lsp_goto_definition",
+            description: "Resolve Go-to-Definition target locations (with 1-based line/col and line preview) for a symbol at `(path, line, col)` via LSP.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace-relative path to the source file." },
+                    "line": { "type": "integer", "description": "1-based line number." },
+                    "col": { "type": "integer", "description": "1-based UTF-16 code-unit column number." },
+                    "cwd": { "type": "string", "description": "Workspace root directory (defaults to calling agent's cwd on local host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["path", "line", "col"]
             }),
         },
     ]

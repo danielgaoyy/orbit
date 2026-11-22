@@ -7,9 +7,8 @@ use std::collections::BTreeMap;
 
 use orbit_protocol::{
     AcpAgentAvailability, ArtifactKind, ForkTarget, InstructionFileEntry, McpTransportKind,
-    McpWriteScope, NestedGitRepo,
-    PromptBadge, ProviderKind, ReasoningEffort, SessionMode, WorkspaceSummary,
-    WorktreeHandoffDirection, WorktreeHandoffMode,
+    McpWriteScope, NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort, SessionMode,
+    WorkspaceSummary, WorktreeHandoffDirection, WorktreeHandoffMode,
 };
 use serde::{Deserialize, Serialize};
 

@@ -4,6 +4,7 @@ pub mod acp;
 pub mod artifacts;
 pub mod handoff;
 pub mod instructions;
+pub mod lsp;
 pub mod mcp_servers;
 pub mod media;
 pub mod orchestration;
@@ -13,6 +14,7 @@ pub use acp::*;
 pub use artifacts::*;
 pub use handoff::*;
 pub use instructions::*;
+pub use lsp::*;
 pub use mcp_servers::*;
 pub use media::*;
 pub use orchestration::*;
@@ -33,6 +35,10 @@ fn wire_default_true() -> bool {
 
 fn wire_default_symbol_limit() -> u32 {
     30
+}
+
+fn wire_default_lsp_limit() -> u32 {
+    50
 }
 
 /// First-class supported coding agent CLIs in Orbit (native drivers + Universal ACP).
@@ -2153,6 +2159,59 @@ pub enum WireMessage {
         injected_markdown: String,
         #[serde(default)]
         total_tokens: u32,
+    },
+
+    // Pure-Rust LSP Language Server Integration
+    ListLspServers {
+        request_id: Uuid,
+        cwd: String,
+    },
+    LspServersSnapshot {
+        request_id: Uuid,
+        cwd: String,
+        servers: Vec<LspServerStatus>,
+    },
+    LspQuerySymbols {
+        request_id: Uuid,
+        cwd: String,
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default = "wire_default_lsp_limit")]
+        limit: u32,
+    },
+    LspSymbolsResponse {
+        request_id: Uuid,
+        cwd: String,
+        symbols: Vec<LspSymbolInfo>,
+    },
+    LspGetDiagnostics {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    LspDiagnosticsResponse {
+        request_id: Uuid,
+        cwd: String,
+        diagnostics: Vec<LspDiagnostic>,
+    },
+    LspGotoDefinition {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+    },
+    LspLocationsResponse {
+        request_id: Uuid,
+        cwd: String,
+        locations: Vec<LspLocation>,
+    },
+    RestartLspServer {
+        request_id: Uuid,
+        cwd: String,
+        server_id: String,
     },
 
     RpcError {

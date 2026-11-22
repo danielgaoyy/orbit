@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, Copy, Loader2, RefreshCw, Save, X } from "lucide-react";
 import {
   type HighlightedLineView,
+  type LspDiagnostic,
   type WorkspaceFileConflict,
   orbitIpc,
 } from "@/lib/orbit-ipc";
@@ -83,6 +84,9 @@ export interface WorkspaceCodeEditorProps {
   onDismissError: () => void;
   onCopyMine: () => void;
   initialFocusLine?: number | null;
+  diagnostics?: readonly LspDiagnostic[];
+  jumpTarget?: { line: number; col?: number; nonce: number } | null;
+  onGotoDefinition?: (line: number, col: number) => void;
 }
 
 export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
@@ -102,6 +106,9 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
   onDismissError,
   onCopyMine,
   initialFocusLine,
+  diagnostics,
+  jumpTarget,
+  onGotoDefinition,
 }: WorkspaceCodeEditorProps) {
   const viewportContainerRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -220,6 +227,45 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Jump cleanly to any requested diagnostic or Go-to-Definition line inside Edit mode
+  useEffect(() => {
+    if (!jumpTarget || jumpTarget.line < 1) return;
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const splitRaw = value.split("\n");
+    const targetIdx = Math.min(jumpTarget.line - 1, Math.max(0, splitRaw.length - 1));
+    let offset = 0;
+    for (let i = 0; i < targetIdx && i < splitRaw.length; i += 1) {
+      offset += splitRaw[i].length + 1;
+    }
+    const targetCol = Math.max(1, jumpTarget.col ?? 1);
+    const colOffset = Math.min(targetCol - 1, splitRaw[targetIdx]?.length ?? 0);
+    const caret = offset + colOffset;
+    ta.focus();
+    ta.setSelectionRange(caret, caret);
+    const scrollY = Math.max(0, (targetIdx - 4) * LINE_HEIGHT_PX);
+    ta.scrollTop = scrollY;
+    setViewport((prev) => ({ ...prev, scrollTop: scrollY }));
+    syncScroll();
+    setCursor({ line: targetIdx + 1, col: colOffset + 1 });
+    // Triggered solely on explicit jumpTarget nonce updates
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpTarget?.nonce]);
+
+  const diagByLine = useMemo(() => {
+    const map = new Map<number, LspDiagnostic>();
+    if (!diagnostics || diagnostics.length === 0) return map;
+    const rank = (sev: LspDiagnostic["severity"]) =>
+      sev === "error" ? 0 : sev === "warning" ? 1 : sev === "info" ? 2 : 3;
+    for (const d of diagnostics) {
+      const existing = map.get(d.line);
+      if (!existing || rank(d.severity) < rank(existing.severity)) {
+        map.set(d.line, d);
+      }
+    }
+    return map;
+  }, [diagnostics]);
+
   // Adaptive debounced Rust `syntect` re-highlighting while typing
   useEffect(() => {
     const seq = ++highlightSeqRef.current;
@@ -273,6 +319,17 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (ime.shouldIgnoreKeyDown(e)) return;
+
+    // F12 Go-to-Definition via LSP
+    if (e.key === "F12" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      if (onGotoDefinition) {
+        e.preventDefault();
+        e.stopPropagation();
+        const pos = computeLineCol(e.currentTarget.value, e.currentTarget.selectionStart ?? 0);
+        onGotoDefinition(pos.line, pos.col);
+      }
+      return;
+    }
 
     // Cmd+S / Ctrl+S atomic save
     if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "s") {
@@ -460,17 +517,30 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
             {visibleSlice.map((_, relIdx) => {
               const ln = visibleStart + relIdx + 1;
               const isActive = ln === cursor.line;
+              const lineDiag = diagByLine.get(ln);
               return (
                 <div
                   key={ln}
                   className={cn(
-                    "tabular-nums h-[20px] text-right leading-[20px]",
+                    "tabular-nums flex h-[20px] items-center justify-end gap-1 leading-[20px]",
                     isActive
                       ? "text-foreground/85 font-medium"
                       : "text-zinc-400 dark:text-zinc-600",
                   )}
                 >
-                  {ln}
+                  {lineDiag && (
+                    <span
+                      className={cn(
+                        "size-[5px] shrink-0 rounded-full",
+                        lineDiag.severity === "error"
+                          ? "bg-rose-500"
+                          : lineDiag.severity === "warning"
+                            ? "bg-amber-500"
+                            : "bg-sky-500",
+                      )}
+                    />
+                  )}
+                  <span>{ln}</span>
                 </div>
               );
             })}
@@ -547,7 +617,15 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
             onScroll={syncScroll}
             onKeyDown={handleKeyDown}
             onKeyUp={(e) => refreshCursor(e.currentTarget)}
-            onClick={(e) => refreshCursor(e.currentTarget)}
+            onClick={(e) => {
+              refreshCursor(e.currentTarget);
+              if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && onGotoDefinition) {
+                const ta = e.currentTarget;
+                if (ta.selectionStart !== ta.selectionEnd) return;
+                const pos = computeLineCol(ta.value, ta.selectionStart ?? 0);
+                onGotoDefinition(pos.line, pos.col);
+              }
+            }}
             onSelect={(e) => refreshCursor(e.currentTarget)}
             className="caret-foreground selection:bg-primary/25 selectable-text absolute inset-0 h-full w-full resize-none overflow-auto bg-transparent px-3 py-2.5 font-mono text-[12px] leading-[20px] whitespace-pre text-transparent outline-none"
           />

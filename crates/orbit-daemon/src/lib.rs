@@ -17,6 +17,7 @@ pub mod git;
 pub mod idle_cleanup;
 pub mod instructions;
 pub mod keep_awake;
+pub mod lsp;
 pub mod manager;
 pub mod mcp;
 pub mod mcp_servers;
@@ -83,6 +84,7 @@ use crate::instructions::{
     discover_instruction_hierarchy, read_instruction_file, save_instruction_file,
 };
 use crate::keep_awake::KeepAwakeManager;
+use crate::lsp::LspManager;
 use crate::manager::{
     AgentOrchestrator, CreateAgentSpec, CreateWorkspaceSpec, DaemonBroadcast, PtyBroadcast,
 };
@@ -218,6 +220,7 @@ pub struct DaemonRuntime {
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
     pub keep_awake: Arc<KeepAwakeManager>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
+    pub lsp: Arc<LspManager>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
     pub mcp_config_lock: Arc<AsyncMutex<()>>,
@@ -307,6 +310,7 @@ impl DaemonRuntime {
             finish_subs.clone(),
             orch_config.clone(),
         );
+        let lsp = LspManager::new(home_dir.to_path_buf());
 
         let home_for_probe = home_dir.to_path_buf();
         let available_providers = tokio::task::spawn_blocking(move || {
@@ -348,7 +352,10 @@ impl DaemonRuntime {
             scheduler,
             idle_cleanup,
             keep_awake,
-            symbol_index: Arc::new(WorkspaceSymbolIndex::new()),
+            symbol_index: Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
+                crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
+            ))),
+            lsp,
             provider_catalogs,
             mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
             mcp_config_lock: Arc::new(AsyncMutex::new(())),
@@ -368,9 +375,10 @@ impl DaemonRuntime {
         self.connected_hosts.start_all().await;
         // 3. Resume any persisted finish subscriptions across restarts
         self.finish_subs.start_recovery().await;
-        // 4. Start Cron/Heartbeat scheduler & Idle Runtime Cleanup background loops
+        // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup & LSP Idle Reaper loops
         drop(self.scheduler.spawn_background());
         drop(self.idle_cleanup.spawn_background());
+        drop(self.lsp.spawn_idle_reaper());
 
         // 5. Warm login-shell environment snapshot & provider model catalogs in background (non-blocking)
         orbit_providers::set_snapshot_orbit_home(&self.home_dir);
@@ -574,6 +582,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             wait_daemon_shutdown_signal().await;
             runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
             runtime_shutdown.orchestrator.shutdown_worktree_pool().await;
+            runtime_shutdown.lsp.shutdown_all().await;
             runtime_shutdown.keep_awake.shutdown();
         })
         .await?;
@@ -1696,6 +1705,7 @@ async fn handle_wire_rpc(
             let zstd = *use_zstd;
             let store = runtime.store.clone();
             let symbol_index = runtime.symbol_index.clone();
+            let lsp = Arc::clone(&runtime.lsp);
             tokio::spawn(async move {
                 let resolved_cwd = expand_host_path(&cwd);
                 let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
@@ -1711,6 +1721,13 @@ async fn handle_wire_rpc(
                         Ok(outcome) => {
                             if outcome.conflict.is_none() {
                                 symbol_index.invalidate(&authorized_cwd);
+                                let lsp_cwd = authorized_cwd.clone();
+                                let lsp_path = path.clone();
+                                let lsp_content = content.clone();
+                                tokio::spawn(async move {
+                                    lsp.notify_file_saved(&lsp_cwd, &lsp_path, &lsp_content)
+                                        .await;
+                                });
                             }
                             WireMessage::WorkspaceFileWritten {
                                 request_id,
@@ -3152,6 +3169,147 @@ async fn handle_wire_rpc(
             None
         }
 
+        // Pure-Rust LSP Language Server Integration (offloaded async + strict workspace cwd authorization)
+        WireMessage::ListLspServers { request_id, cwd } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match lsp.list_servers(&authorized_cwd).await {
+                        Ok(servers) => WireMessage::LspServersSnapshot {
+                            request_id,
+                            cwd,
+                            servers,
+                        },
+                        Err(e) => rpc_err(request_id, "list_lsp_servers_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspQuerySymbols {
+            request_id,
+            cwd,
+            query,
+            path,
+            limit,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match lsp
+                        .query_symbols(&authorized_cwd, &query, path.as_deref(), limit)
+                        .await
+                    {
+                        Ok(symbols) => WireMessage::LspSymbolsResponse {
+                            request_id,
+                            cwd,
+                            symbols,
+                        },
+                        Err(e) => rpc_err(request_id, "lsp_query_symbols_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspGetDiagnostics {
+            request_id,
+            cwd,
+            path,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp.get_diagnostics(&authorized_cwd, path.as_deref()).await {
+                            Ok(diagnostics) => WireMessage::LspDiagnosticsResponse {
+                                request_id,
+                                cwd,
+                                diagnostics,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_diagnostics_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspGotoDefinition {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp.goto_definition(&authorized_cwd, &path, line, col).await {
+                            Ok(locations) => WireMessage::LspLocationsResponse {
+                                request_id,
+                                cwd,
+                                locations,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_goto_definition_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::RestartLspServer {
+            request_id,
+            cwd,
+            server_id,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp.restart_server(&authorized_cwd, &server_id).await {
+                            Ok(servers) => WireMessage::LspServersSnapshot {
+                                request_id,
+                                cwd,
+                                servers,
+                            },
+                            Err(e) => rpc_err(request_id, "restart_lsp_server_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
         // First-Class Artifacts & SEP-1865 MCP Apps (offloaded via spawn_blocking)
         WireMessage::ListArtifacts {
             request_id,
@@ -4542,7 +4700,7 @@ async fn authorize_path_rules_cwd(
 /// subdirectory of) a registered workspace, agent `cwd`, synced host project directory, or
 /// discovered project root on this host — preventing mutations in arbitrary host directories
 /// such as `~/.ssh`, `$HOME`, `/`, or `/etc`.
-async fn authorize_workspace_mutation_cwd(
+pub(crate) async fn authorize_workspace_mutation_cwd(
     store: &Arc<OrbitStore>,
     resolved_cwd: &Path,
 ) -> Result<PathBuf, String> {
@@ -4982,5 +5140,54 @@ mod self_upgrade_tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn lsp_mcp_tools_reject_unregistered_host_cwd() {
+        let home = std::env::temp_dir().join(format!("orbit-lsp-auth-home-{}", Uuid::new_v4()));
+        let rogue_dir =
+            std::env::temp_dir().join(format!("orbit-lsp-auth-rogue-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&rogue_dir).expect("create rogue");
+        std::fs::write(rogue_dir.join("main.rs"), "fn main() {}\n").expect("write rs");
+
+        let runtime = DaemonRuntime::bootstrap(&home)
+            .await
+            .expect("bootstrap daemon");
+
+        for (tool, args) in [
+            (
+                "lsp_diagnostics",
+                serde_json::json!({ "cwd": rogue_dir.to_string_lossy(), "path": "main.rs" }),
+            ),
+            (
+                "lsp_symbols",
+                serde_json::json!({ "cwd": rogue_dir.to_string_lossy(), "query": "main" }),
+            ),
+            (
+                "lsp_goto_definition",
+                serde_json::json!({
+                    "cwd": rogue_dir.to_string_lossy(),
+                    "path": "main.rs",
+                    "line": 1,
+                    "col": 4
+                }),
+            ),
+        ] {
+            let res = crate::tools::execute_tool(&runtime, None, tool, args).await;
+            assert!(
+                res.is_error,
+                "expected `{tool}` to reject unregistered cwd, got: {}",
+                res.text
+            );
+            assert!(
+                res.text.contains("not a registered or discovered project"),
+                "unexpected error text for `{tool}`: {}",
+                res.text
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&rogue_dir);
     }
 }

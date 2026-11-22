@@ -564,7 +564,11 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ExternalMcpServersSnapshot { request_id, .. }
         | WireMessage::ExternalMcpProbeResponse { request_id, .. }
         | WireMessage::PathRulesSnapshot { request_id, .. }
-        | WireMessage::MatchedPathRulesResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::MatchedPathRulesResponse { request_id, .. }
+        | WireMessage::LspServersSnapshot { request_id, .. }
+        | WireMessage::LspSymbolsResponse { request_id, .. }
+        | WireMessage::LspDiagnosticsResponse { request_id, .. }
+        | WireMessage::LspLocationsResponse { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

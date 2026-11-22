@@ -67,6 +67,9 @@ import {
   type ExtractedCodeBlock,
   type FleetOverviewView,
   type FleetSidebarView,
+  type LspDiagnostic,
+  type LspLocation,
+  type LspServerStatus,
   type GitHubDeviceFlowStartView,
   type GitReposInspectionView,
   type GitReviewView,
@@ -375,7 +378,15 @@ export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
 export type WorkspacePanelMode = "conversation" | "automations";
-export type HostSettingsTab = "agents" | "skills" | "acp" | "mcp" | "rules" | "usage" | "connection";
+export type HostSettingsTab =
+  | "agents"
+  | "skills"
+  | "acp"
+  | "mcp"
+  | "rules"
+  | "lsp"
+  | "usage"
+  | "connection";
 export type SettingsSection =
   | "general"
   | "instructions"
@@ -603,6 +614,23 @@ export interface OrbitUiState {
   cloudSyncError: string | null;
   cloudSyncDeviceFlow: GitHubDeviceFlowStartView | null;
   cloudSyncLastResult: CloudSyncResultView | null;
+
+  // Pure-Rust LSP Language Servers & File Diagnostics
+  lspServersByWorkspace: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      servers: LspServerStatus[];
+      error?: string | null;
+    }
+  >;
+  lspDiagnosticsByFile: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      diagnostics: LspDiagnostic[];
+    }
+  >;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -926,6 +954,8 @@ const defaultInitialState: OrbitUiState = {
   diffLayout: initialPrefs.diffLayout ?? "unified",
   selectedDiffPath: null,
   gitReviews: {},
+  lspServersByWorkspace: {},
+  lspDiagnosticsByFile: {},
 
   overviewDesktopOpenPref: initialPrefs.overviewDesktopOpenPref ?? true,
   overviewPopoverOpen: false,
@@ -6947,6 +6977,7 @@ export const orbitActions = {
 
       if (cwd && cwd !== "~") {
         void orbitActions.refreshGit(hostId, cwd, null, state.diffStaged);
+        void orbitActions.loadFileDiagnostics(hostId, cwd, path, true);
       }
       notifyToast(`Saved ${basenameFromPath(path) || path}`);
       return "saved";
@@ -6967,6 +6998,176 @@ export const orbitActions = {
         };
       });
       return "error";
+    }
+  },
+
+  async loadLspServers(hostId: string, cwd: string): Promise<LspServerStatus[]> {
+    if (!hostId || !cwd || cwd === "~") return [];
+    const scopeKey = `${hostId}::${cwd}`;
+    const seq = (lspServersSeqByKey.get(scopeKey) ?? 0) + 1;
+    lspServersSeqByKey.set(scopeKey, seq);
+    setState((s) => ({
+      ...s,
+      lspServersByWorkspace: upsertLruRecord(
+        s.lspServersByWorkspace,
+        scopeKey,
+        {
+          status: "loading",
+          servers: s.lspServersByWorkspace[scopeKey]?.servers ?? [],
+          error: null,
+        },
+        MAX_LSP_SERVERS_CACHE_ENTRIES,
+      ),
+    }));
+    try {
+      const servers = await orbitIpc.listLspServers(hostId, cwd);
+      if (lspServersSeqByKey.get(scopeKey) !== seq) return [];
+      setState((s) => ({
+        ...s,
+        lspServersByWorkspace: upsertLruRecord(
+          s.lspServersByWorkspace,
+          scopeKey,
+          { status: "ready", servers, error: null },
+          MAX_LSP_SERVERS_CACHE_ENTRIES,
+        ),
+      }));
+      return servers;
+    } catch (err) {
+      if (lspServersSeqByKey.get(scopeKey) !== seq) return [];
+      setState((s) => ({
+        ...s,
+        lspServersByWorkspace: upsertLruRecord(
+          s.lspServersByWorkspace,
+          scopeKey,
+          {
+            status: "error",
+            servers: s.lspServersByWorkspace[scopeKey]?.servers ?? [],
+            error: String(err),
+          },
+          MAX_LSP_SERVERS_CACHE_ENTRIES,
+        ),
+      }));
+      return [];
+    }
+  },
+
+  async restartLspServer(hostId: string, cwd: string, serverId: string): Promise<void> {
+    if (!hostId || !cwd || cwd === "~" || !serverId) return;
+    const scopeKey = `${hostId}::${cwd}`;
+    const seq = (lspServersSeqByKey.get(scopeKey) ?? 0) + 1;
+    lspServersSeqByKey.set(scopeKey, seq);
+    try {
+      const servers = await orbitIpc.restartLspServer(hostId, cwd, serverId);
+      if (lspServersSeqByKey.get(scopeKey) !== seq) return;
+      setState((s) => ({
+        ...s,
+        lspServersByWorkspace: upsertLruRecord(
+          s.lspServersByWorkspace,
+          scopeKey,
+          { status: "ready", servers, error: null },
+          MAX_LSP_SERVERS_CACHE_ENTRIES,
+        ),
+      }));
+      notifyToast(`Restarted ${serverId}`);
+    } catch (err) {
+      if (lspServersSeqByKey.get(scopeKey) !== seq) return;
+      notifyToast(`Restart failed: ${String(err)}`);
+    }
+  },
+
+  async loadFileDiagnostics(
+    hostId: string,
+    cwd: string,
+    path: string,
+    silent = false,
+  ): Promise<LspDiagnostic[]> {
+    if (!hostId || !cwd || cwd === "~" || !path) return [];
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const seq = (lspDiagSeqByKey.get(cKey) ?? 0) + 1;
+    lspDiagSeqByKey.set(cKey, seq);
+    if (!silent) {
+      setState((s) => ({
+        ...s,
+        lspDiagnosticsByFile: upsertLruRecord(
+          s.lspDiagnosticsByFile,
+          cKey,
+          {
+            status: "loading",
+            diagnostics: s.lspDiagnosticsByFile[cKey]?.diagnostics ?? [],
+          },
+          MAX_LSP_DIAGNOSTICS_CACHE_ENTRIES,
+        ),
+      }));
+    }
+    try {
+      const diagnostics = await orbitIpc.lspGetDiagnostics(hostId, cwd, path);
+      if (lspDiagSeqByKey.get(cKey) !== seq) return [];
+      setState((s) => ({
+        ...s,
+        lspDiagnosticsByFile: upsertLruRecord(
+          s.lspDiagnosticsByFile,
+          cKey,
+          { status: "ready", diagnostics },
+          MAX_LSP_DIAGNOSTICS_CACHE_ENTRIES,
+        ),
+      }));
+      return diagnostics;
+    } catch {
+      if (lspDiagSeqByKey.get(cKey) !== seq) return [];
+      setState((s) => ({
+        ...s,
+        lspDiagnosticsByFile: upsertLruRecord(
+          s.lspDiagnosticsByFile,
+          cKey,
+          {
+            status: "error",
+            diagnostics: s.lspDiagnosticsByFile[cKey]?.diagnostics ?? [],
+          },
+          MAX_LSP_DIAGNOSTICS_CACHE_ENTRIES,
+        ),
+      }));
+      return [];
+    }
+  },
+
+  async gotoLspDefinition(
+    hostId: string,
+    cwd: string,
+    path: string,
+    line: number,
+    col: number,
+  ): Promise<LspLocation | null> {
+    if (!hostId || !cwd || cwd === "~" || !path || line < 1 || col < 1) return null;
+    const seq = ++nextLspGotoSeq;
+    try {
+      const locations = await orbitIpc.lspGotoDefinition({
+        hostId,
+        cwd,
+        path,
+        line,
+        col,
+      });
+      if (seq !== nextLspGotoSeq || !state.sidePanelOpen || state.selectedHostId !== hostId) {
+        return null;
+      }
+      const first = locations[0] ?? null;
+      if (!first) {
+        notifyToast("No definition found");
+        return null;
+      }
+      orbitActions.openFileInSidePanel(first.path, {
+        hostId,
+        cwd,
+        focusLine: first.line,
+        focusEndLine: first.end_line > first.line ? first.end_line : null,
+      });
+      return first;
+    } catch {
+      if (seq !== nextLspGotoSeq || !state.sidePanelOpen || state.selectedHostId !== hostId) {
+        return null;
+      }
+      notifyToast("No definition found");
+      return null;
     }
   },
 
@@ -9147,6 +9348,27 @@ async function pushCloudPrefPatch(patch: Record<string, unknown>): Promise<void>
 }
 
 let nextFileFocusNonce = 1;
+const MAX_LSP_DIAGNOSTICS_CACHE_ENTRIES = 40;
+const MAX_LSP_SERVERS_CACHE_ENTRIES = 16;
+let nextLspGotoSeq = 0;
+const lspDiagSeqByKey = new Map<string, number>();
+const lspServersSeqByKey = new Map<string, number>();
+
+function upsertLruRecord<T>(
+  record: Record<string, T>,
+  key: string,
+  value: T,
+  maxEntries: number,
+): Record<string, T> {
+  const next: Record<string, T> = {};
+  const entries = Object.entries(record).filter(([k]) => k !== key);
+  const start = Math.max(0, entries.length - (maxEntries - 1));
+  for (let i = start; i < entries.length; i += 1) {
+    next[entries[i][0]] = entries[i][1];
+  }
+  next[key] = value;
+  return next;
+}
 
 registerOrbitLinkOpener({
   openFile(rawPath, opts) {

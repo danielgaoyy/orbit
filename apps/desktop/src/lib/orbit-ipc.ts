@@ -2002,6 +2002,53 @@ export interface MentionCandidateView {
   language?: string;
 }
 
+export type LspConfigSource = "builtin" | "project_json" | "user_config";
+export type LspServerState = "stopped" | "starting" | "ready" | "error" | "unavailable";
+export type LspDiagnosticSeverity = "error" | "warning" | "info" | "hint";
+
+export interface LspServerStatus {
+  id: string;
+  name: string;
+  state: LspServerState;
+  workspace_cwd: string;
+  binary_path?: string | null;
+  diagnostics_count: number;
+  error?: string | null;
+  language_ids: string[];
+  file_extensions: string[];
+  source: LspConfigSource;
+}
+
+export interface LspDiagnostic {
+  path: string;
+  line: number;
+  col: number;
+  end_line: number;
+  end_col: number;
+  severity: LspDiagnosticSeverity;
+  message: string;
+  source?: string | null;
+  code?: string | null;
+}
+
+export interface LspSymbolInfo {
+  name: string;
+  kind: string;
+  container_name?: string | null;
+  path: string;
+  line: number;
+  col: number;
+  end_line: number;
+}
+
+export interface LspLocation {
+  path: string;
+  line: number;
+  col: number;
+  end_line: number;
+  preview?: string | null;
+}
+
 export interface MentionRankRequest {
   host_id: string;
   cwd: string;
@@ -3789,6 +3836,71 @@ export const orbitIpc = {
       cwd: params.cwd,
       activePaths: params.activePaths,
       manualRuleNames: params.manualRuleNames,
+    });
+  },
+
+  listLspServers: async (hostId: string, cwd: string): Promise<LspServerStatus[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspServerStatus[]>("list_lsp_servers", { hostId, cwd });
+  },
+
+  lspQuerySymbols: async (params: {
+    hostId: string;
+    cwd: string;
+    query: string;
+    path?: string | null;
+    limit?: number;
+  }): Promise<LspSymbolInfo[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspSymbolInfo[]>("lsp_query_symbols", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      query: params.query,
+      path: params.path ?? null,
+      limit: params.limit ?? 50,
+    });
+  },
+
+  lspGetDiagnostics: async (
+    hostId: string,
+    cwd: string,
+    path?: string | null,
+  ): Promise<LspDiagnostic[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspDiagnostic[]>("lsp_get_diagnostics", {
+      hostId,
+      cwd,
+      path: path ?? null,
+    });
+  },
+
+  lspGotoDefinition: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+  }): Promise<LspLocation[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspLocation[]>("lsp_goto_definition", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+    });
+  },
+
+  restartLspServer: async (
+    hostId: string,
+    cwd: string,
+    serverId: string,
+  ): Promise<LspServerStatus[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspServerStatus[]>("restart_lsp_server", {
+      hostId,
+      cwd,
+      serverId,
     });
   },
   highlightWorkspaceCode: async (

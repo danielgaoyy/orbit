@@ -69,11 +69,12 @@ use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
-    ArtifactDetail, ArtifactSummary, ExternalMcpServerRecord, ManagedSkillRecord, McpProbeResult,
-    OrchestrationConfig, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
-    ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope,
-    WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
-    WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    ArtifactDetail, ArtifactSummary, ExternalMcpServerRecord, LspDiagnostic, LspLocation,
+    LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, OrchestrationConfig,
+    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort,
+    ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope, WorkspaceBoardSnapshot,
+    WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome,
+    WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -1978,6 +1979,71 @@ async fn match_path_rules(
 }
 
 #[tauri::command]
+async fn list_lsp_servers(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<Vec<LspServerStatus>, String> {
+    state.core.list_lsp_servers_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn lsp_query_symbols(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    query: String,
+    path: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<LspSymbolInfo>, String> {
+    state
+        .core
+        .lsp_query_symbols_on_host(&host_id, &cwd, &query, path, limit.unwrap_or(50))
+        .await
+}
+
+#[tauri::command]
+async fn lsp_get_diagnostics(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: Option<String>,
+) -> Result<Vec<LspDiagnostic>, String> {
+    state
+        .core
+        .lsp_get_diagnostics_on_host(&host_id, &cwd, path)
+        .await
+}
+
+#[tauri::command]
+async fn lsp_goto_definition(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+) -> Result<Vec<LspLocation>, String> {
+    state
+        .core
+        .lsp_goto_definition_on_host(&host_id, &cwd, &path, line, col)
+        .await
+}
+
+#[tauri::command]
+async fn restart_lsp_server(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    server_id: String,
+) -> Result<Vec<LspServerStatus>, String> {
+    state
+        .core
+        .restart_lsp_server_on_host(&host_id, &cwd, &server_id)
+        .await
+}
+
+#[tauri::command]
 async fn highlight_workspace_code(
     language: String,
     content: String,
@@ -2840,6 +2906,11 @@ pub fn run() {
             upsert_path_rule,
             delete_path_rule,
             match_path_rules,
+            list_lsp_servers,
+            lsp_query_symbols,
+            lsp_get_diagnostics,
+            lsp_goto_definition,
+            restart_lsp_server,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

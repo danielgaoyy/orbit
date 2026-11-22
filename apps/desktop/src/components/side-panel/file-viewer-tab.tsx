@@ -1,5 +1,7 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertCircle,
+  AlertTriangle,
   ArrowDown,
   Check,
   ChevronDown,
@@ -9,6 +11,7 @@ import {
   Eye,
   FileWarning,
   GitCompareArrows,
+  Info,
   Loader2,
   MessageSquarePlus,
   Pencil,
@@ -18,6 +21,7 @@ import {
   WrapText,
   X,
 } from "lucide-react";
+import type { LspDiagnostic } from "@/lib/orbit-ipc";
 import {
   MarkdownBlocksView,
   MarkdownLinkProvider,
@@ -64,6 +68,11 @@ export const FileViewerTab = memo(function FileViewerTab({
   const gitStatusFiles = useOrbitSelector((s) =>
     hostId && cwd ? (s.gitReviews[`${hostId}::${cwd}`]?.status?.files ?? null) : null,
   );
+  const lspDiagEntry = useOrbitSelector((s) => s.lspDiagnosticsByFile[cKey] ?? null);
+  const diagnostics = useMemo<readonly LspDiagnostic[]>(
+    () => lspDiagEntry?.diagnostics ?? [],
+    [lspDiagEntry],
+  );
 
   const isTaskLogPath = useMemo(
     () =>
@@ -87,6 +96,12 @@ export const FileViewerTab = memo(function FileViewerTab({
   const [findQuery, setFindQuery] = useState("");
   const [activeMatchIdx, setActiveMatchIdx] = useState(0);
   const [renderedLineCap, setRenderedLineCap] = useState(800);
+  const [diagDrawerOpen, setDiagDrawerOpen] = useState(false);
+  const [editorJumpTarget, setEditorJumpTarget] = useState<{
+    line: number;
+    col?: number;
+    nonce: number;
+  } | null>(null);
 
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const logViewportRef = useRef<HTMLDivElement | null>(null);
@@ -136,6 +151,74 @@ export const FileViewerTab = memo(function FileViewerTab({
   );
   const isEditMode = Boolean(isEditable && draft?.mode === "edit");
   const isDirty = Boolean(draft?.dirty);
+  const isLspEligible = Boolean(
+    data &&
+      data.content_kind === "text" &&
+      !data.truncated &&
+      !isLogFile &&
+      !isMarkdown &&
+      hostId &&
+      cwd &&
+      cwd !== "~" &&
+      relPath,
+  );
+
+  useEffect(() => {
+    if (!isLspEligible) return;
+    void orbitActions.loadFileDiagnostics(hostId, cwd, path, true);
+  }, [isLspEligible, hostId, cwd, path, data?.etag]);
+
+  const diagCounts = useMemo(() => {
+    let errors = 0;
+    let warnings = 0;
+    let others = 0;
+    for (const d of diagnostics) {
+      if (d.severity === "error") errors += 1;
+      else if (d.severity === "warning") warnings += 1;
+      else others += 1;
+    }
+    return { errors, warnings, others, total: diagnostics.length };
+  }, [diagnostics]);
+
+  const diagByLine = useMemo(() => {
+    const map = new Map<number, LspDiagnostic>();
+    if (diagnostics.length === 0) return map;
+    const rank = (sev: LspDiagnostic["severity"]) =>
+      sev === "error" ? 0 : sev === "warning" ? 1 : sev === "info" ? 2 : 3;
+    for (const d of diagnostics) {
+      const existing = map.get(d.line);
+      if (!existing || rank(d.severity) < rank(existing.severity)) {
+        map.set(d.line, d);
+      }
+    }
+    return map;
+  }, [diagnostics]);
+
+  const jumpToDiagnosticLine = useCallback(
+    (line: number, col = 1) => {
+      if (isEditMode) {
+        setEditorJumpTarget({ line, col, nonce: Date.now() });
+        return;
+      }
+      if (line > renderedLineCap) {
+        setRenderedLineCap(line + 200);
+      }
+      orbitActions.openFileInSidePanel(relPath, {
+        hostId,
+        cwd,
+        focusLine: line,
+      });
+    },
+    [isEditMode, renderedLineCap, relPath, hostId, cwd],
+  );
+
+  const handleGotoDefinition = useCallback(
+    (line: number, col: number) => {
+      if (!isLspEligible) return;
+      void orbitActions.gotoLspDefinition(hostId, cwd, path, line, col);
+    },
+    [isLspEligible, hostId, cwd, path],
+  );
 
   // Apply deferred Markdown mode switch once the unsaved-changes guard resolves out of Edit mode
   useEffect(() => {
@@ -177,6 +260,16 @@ export const FileViewerTab = memo(function FileViewerTab({
       setMarkdownMode("source");
     }
   }, [focusRange.startLine, tab.focusNonce, isMarkdown]);
+
+  // Sync tab.focusNonce into WorkspaceCodeEditor so same-file Go-to-Definition works in Edit mode
+  useEffect(() => {
+    if (!isEditMode || !tab.focusNonce || focusRange.startLine == null) return;
+    setEditorJumpTarget({
+      line: focusRange.startLine,
+      col: 1,
+      nonce: tab.focusNonce,
+    });
+  }, [isEditMode, tab.focusNonce, focusRange.startLine]);
 
   const hasGitDiff = useMemo(() => {
     if (!gitStatusFiles) return false;
@@ -383,6 +476,38 @@ export const FileViewerTab = memo(function FileViewerTab({
             <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10.5px]">
               Read-only
             </span>
+          )}
+          {diagCounts.total > 0 && (
+            <button
+              type="button"
+              title="Toggle LSP diagnostics"
+              onClick={() => setDiagDrawerOpen((v) => !v)}
+              className={cn(
+                "tabular-nums inline-flex h-[21px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md border px-1.5 text-[11px] font-medium transition-colors",
+                diagDrawerOpen
+                  ? "border-foreground/20 bg-accent text-foreground"
+                  : "border-border/80 bg-background/70 text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              {diagCounts.errors > 0 && (
+                <span className="inline-flex items-center gap-1 text-rose-600 dark:text-rose-400">
+                  <AlertCircle className="h-[11px] w-[11px]" />
+                  {diagCounts.errors}
+                </span>
+              )}
+              {diagCounts.warnings > 0 && (
+                <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400">
+                  <AlertTriangle className="h-[11px] w-[11px]" />
+                  {diagCounts.warnings}
+                </span>
+              )}
+              {diagCounts.errors === 0 && diagCounts.warnings === 0 && diagCounts.others > 0 && (
+                <span className="inline-flex items-center gap-1 text-sky-600 dark:text-sky-400">
+                  <Info className="h-[11px] w-[11px]" />
+                  {diagCounts.others}
+                </span>
+              )}
+            </button>
           )}
           {focusLabel && focusRange.startLine != null && !isEditMode && (
             <button
@@ -606,6 +731,44 @@ export const FileViewerTab = memo(function FileViewerTab({
         </div>
       </div>
 
+      {/* Collapsible LSP Diagnostics Drawer */}
+      {diagDrawerOpen && diagnostics.length > 0 && (
+        <div className="border-border bg-elevated/75 max-h-[168px] shrink-0 overflow-auto border-b">
+          <div className="divide-border/60 divide-y">
+            {diagnostics.slice(0, 50).map((d, idx) => (
+              <button
+                key={`${d.line}:${d.col}:${idx}`}
+                type="button"
+                onClick={() => jumpToDiagnosticLine(d.line, d.col)}
+                className="hover:bg-accent/70 flex w-full cursor-pointer items-start gap-2 px-3 py-1.5 text-left text-[11.5px] transition-colors"
+              >
+                <span
+                  className={cn(
+                    "mt-[5px] size-[6px] shrink-0 rounded-full",
+                    d.severity === "error"
+                      ? "bg-rose-500"
+                      : d.severity === "warning"
+                        ? "bg-amber-500"
+                        : "bg-sky-500",
+                  )}
+                />
+                <span className="text-foreground/90 min-w-0 flex-1 leading-snug">
+                  {d.message}
+                  {(d.source || d.code) && (
+                    <span className="text-muted-foreground/75 ml-1.5 font-mono text-[10.5px]">
+                      {[d.source, d.code].filter(Boolean).join(" ")}
+                    </span>
+                  )}
+                </span>
+                <span className="text-muted-foreground tabular-nums shrink-0 font-mono text-[10.5px]">
+                  {d.line}:{d.col}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Quiet Inline Unsaved-Changes Guard Strip */}
       {pendingUnsaved && (
         <div className="border-border bg-elevated/85 flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5 text-[12px]">
@@ -777,6 +940,9 @@ export const FileViewerTab = memo(function FileViewerTab({
           saveError={draft.saveError}
           conflict={draft.conflict}
           initialFocusLine={focusRange.startLine}
+          diagnostics={diagnostics}
+          jumpTarget={editorJumpTarget}
+          onGotoDefinition={isLspEligible ? handleGotoDefinition : undefined}
           onChange={(nextValue) =>
             orbitActions.updateFileEditorDraft(hostId, cwd, path, nextValue)
           }
@@ -957,6 +1123,8 @@ export const FileViewerTab = memo(function FileViewerTab({
                   line.line_number) ||
               isRangeFocused;
             const rawLineText = line.tokens.map((t) => t.text).join("");
+            const lineDiag = diagByLine.get(line.line_number);
+            let runningCol = 1;
 
             return (
               <div
@@ -977,8 +1145,23 @@ export const FileViewerTab = memo(function FileViewerTab({
                   !isFocused && isMatched && "bg-amber-500/[0.12]",
                 )}
               >
-                <span className="tabular-nums min-w-[2.75rem] shrink-0 pr-2 text-right text-[11px] text-zinc-400 select-none dark:text-zinc-600">
-                  {line.line_number}
+                <span
+                  title={lineDiag ? `${lineDiag.severity}: ${lineDiag.message}` : undefined}
+                  className="tabular-nums inline-flex min-w-[2.75rem] shrink-0 items-center justify-end gap-1 pr-2 text-right text-[11px] text-zinc-400 select-none dark:text-zinc-600"
+                >
+                  {lineDiag && (
+                    <span
+                      className={cn(
+                        "size-[5px] shrink-0 rounded-full",
+                        lineDiag.severity === "error"
+                          ? "bg-rose-500"
+                          : lineDiag.severity === "warning"
+                            ? "bg-amber-500"
+                            : "bg-sky-500",
+                      )}
+                    />
+                  )}
+                  <span>{line.line_number}</span>
                 </span>
                 <button
                   type="button"
@@ -993,18 +1176,73 @@ export const FileViewerTab = memo(function FileViewerTab({
                 <span className="pr-4 whitespace-pre">
                   {line.tokens.length === 0
                     ? " "
-                    : line.tokens.map((tok, idx) => (
-                        <span
-                          key={idx}
-                          style={{
-                            color: adaptTokenColor(tok.fg_hex, isDark),
-                            fontWeight: tok.bold ? 600 : undefined,
-                            fontStyle: tok.italic ? "italic" : undefined,
-                          }}
-                        >
-                          {tok.text}
-                        </span>
-                      ))}
+                    : line.tokens.map((tok, idx) => {
+                        const tokStartCol = runningCol;
+                        runningCol += tok.text.length;
+                        return (
+                          <span
+                            key={idx}
+                            onClick={(e) => {
+                              if (
+                                !isLspEligible ||
+                                !(e.metaKey || e.ctrlKey) ||
+                                e.shiftKey ||
+                                e.altKey
+                              ) {
+                                return;
+                              }
+                              if (!tok.text.trim()) return;
+                              e.preventDefault();
+                              e.stopPropagation();
+                              let offsetInTok = Math.floor(tok.text.length / 2);
+                              const doc = document as Document & {
+                                caretPositionFromPoint?: (
+                                  x: number,
+                                  y: number,
+                                ) => { offsetNode: Node; offset: number } | null;
+                                caretRangeFromPoint?: (x: number, y: number) => Range | null;
+                              };
+                              const caretPos = doc.caretPositionFromPoint?.(e.clientX, e.clientY);
+                              if (
+                                caretPos &&
+                                e.currentTarget.contains(caretPos.offsetNode) &&
+                                Number.isFinite(caretPos.offset)
+                              ) {
+                                offsetInTok = Math.max(
+                                  0,
+                                  Math.min(caretPos.offset, Math.max(0, tok.text.length - 1)),
+                                );
+                              } else {
+                                const caretRange = doc.caretRangeFromPoint?.(e.clientX, e.clientY);
+                                if (
+                                  caretRange &&
+                                  e.currentTarget.contains(caretRange.startContainer) &&
+                                  Number.isFinite(caretRange.startOffset)
+                                ) {
+                                  offsetInTok = Math.max(
+                                    0,
+                                    Math.min(
+                                      caretRange.startOffset,
+                                      Math.max(0, tok.text.length - 1),
+                                    ),
+                                  );
+                                }
+                              }
+                              handleGotoDefinition(
+                                line.line_number,
+                                Math.max(1, tokStartCol + offsetInTok),
+                              );
+                            }}
+                            style={{
+                              color: adaptTokenColor(tok.fg_hex, isDark),
+                              fontWeight: tok.bold ? 600 : undefined,
+                              fontStyle: tok.italic ? "italic" : undefined,
+                            }}
+                          >
+                            {tok.text}
+                          </span>
+                        );
+                      })}
                 </span>
               </div>
             );

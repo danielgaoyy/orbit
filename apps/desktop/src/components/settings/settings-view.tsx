@@ -7,6 +7,7 @@ import {
   Check,
   ChevronsUpDown,
   Cloud,
+  Code2,
   Cpu,
   FileCode2,
   Keyboard,
@@ -28,6 +29,7 @@ import { InstructionsSection } from "@/components/settings/instructions-section"
 import { HostAcpSection } from "@/components/settings/host-acp-section";
 import { HostAgentsSection } from "@/components/settings/host-agents-section";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
+import { HostLspSection } from "@/components/settings/host-lsp-section";
 import { HostMcpSection } from "@/components/settings/host-mcp-section";
 import { HostRulesSection } from "@/components/settings/host-rules-section";
 import { HostSkillsSection } from "@/components/settings/host-skills-section";
@@ -85,6 +87,7 @@ const HOST_TABS: {
   { id: "acp", label: "ACP Agents", icon: Plug },
   { id: "mcp", label: "MCP Servers", icon: Server },
   { id: "rules", label: "Rules", icon: BookOpen },
+  { id: "lsp", label: "Language Servers", icon: Code2 },
   { id: "usage", label: "Usage", icon: Activity },
   { id: "connection", label: "Connection", icon: Wifi },
 ];
@@ -103,6 +106,7 @@ function parseHostSection(
     tab !== "acp" &&
     tab !== "mcp" &&
     tab !== "rules" &&
+    tab !== "lsp" &&
     tab !== "usage" &&
     tab !== "connection"
   ) {
@@ -524,6 +528,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               )}
               {resolvedHost?.tab === "rules" && (
                 <HostRulesSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "lsp" && (
+                <HostLspSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
               )}
               {resolvedHost?.tab === "usage" && (
                 <HostUsageSection hostId={resolvedHost.hostId} />

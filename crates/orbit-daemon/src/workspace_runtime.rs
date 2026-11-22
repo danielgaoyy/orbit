@@ -15,7 +15,12 @@ use orbit_protocol::{
 use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
+
+use crate::fast_copy::{
+    CopyMethod, copy_dir_cow_within, copy_file_cow_within, resolve_symlink_target_safe,
+};
+use crate::worktree_pool::WorktreePool;
 
 /// Parsed project worktree/script manifest from `orbit.json` (with automatic `paseo.json` fallback).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -113,36 +118,82 @@ pub fn load_workspace_manifest_with_fallback(
     WorkspaceManifest::default()
 }
 
-/// Copy gitignored files declared in `<source_cwd>/.worktreeinclude` into the newly created worktree.
+/// Summary of a `.worktreeinclude` copy pass, including CoW vs standard copy counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeIncludeCopyReport {
+    pub copied: Vec<String>,
+    pub cow_cloned: usize,
+    pub standard_copied: usize,
+}
+
+/// Copy gitignored files and directories declared in `<source_cwd>/.worktreeinclude` into the
+/// newly created worktree using Copy-on-Write (`copy_file_cow` / `copy_dir_cow`) when supported.
 /// Guards against path traversal (`..`) and symlinks escaping `source_cwd`.
 pub fn copy_worktree_includes(source_cwd: &Path, worktree_cwd: &Path) -> Vec<String> {
+    copy_worktree_includes_with_report(source_cwd, worktree_cwd).copied
+}
+
+/// Like [`copy_worktree_includes`], returning detailed CoW vs standard copy metrics.
+pub fn copy_worktree_includes_with_report(
+    source_cwd: &Path,
+    worktree_cwd: &Path,
+) -> WorktreeIncludeCopyReport {
+    let mut report = WorktreeIncludeCopyReport::default();
     let include_file = source_cwd.join(".worktreeinclude");
     let Ok(raw) = std::fs::read_to_string(&include_file) else {
-        return Vec::new();
+        return report;
     };
     let Ok(canon_src) = std::fs::canonicalize(source_cwd) else {
-        return Vec::new();
+        return report;
     };
     let patterns: Vec<String> = raw
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| !pattern_has_parent_traversal(l))
         .map(ToOwned::to_owned)
         .collect();
     if patterns.is_empty() {
-        return Vec::new();
+        return report;
     }
 
-    let mut copied = Vec::new();
     walk_and_copy_matching(
         &canon_src,
         &canon_src,
         worktree_cwd,
         &patterns,
         0,
-        &mut copied,
+        &mut report,
     );
-    copied
+    report
+}
+
+fn pattern_has_parent_traversal(pattern: &str) -> bool {
+    Path::new(pattern)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+}
+
+fn is_heavy_ignored_dir(name: &str) -> bool {
+    matches!(name, "node_modules" | "target" | ".venv" | "venv")
+}
+
+fn patterns_may_target_inside(rel_dir: &str, dir_name: &str, patterns: &[String]) -> bool {
+    let rel_prefix = format!("{rel_dir}/");
+    let name_prefix = format!("{dir_name}/");
+    patterns.iter().any(|pat| {
+        let norm = pat.trim_start_matches('/').trim_end_matches('/');
+        norm.starts_with(&rel_prefix)
+            || norm.starts_with(&name_prefix)
+            || norm.contains(&format!("/{dir_name}/"))
+    })
+}
+
+fn record_copy_method(report: &mut WorktreeIncludeCopyReport, method: CopyMethod) {
+    match method {
+        CopyMethod::ApfsClone | CopyMethod::LinuxReflink => report.cow_cloned += 1,
+        CopyMethod::Standard => report.standard_copied += 1,
+    }
 }
 
 fn walk_and_copy_matching(
@@ -151,20 +202,23 @@ fn walk_and_copy_matching(
     dest_root: &Path,
     patterns: &[String],
     depth: usize,
-    copied: &mut Vec<String>,
+    report: &mut WorktreeIncludeCopyReport,
 ) {
-    if depth > 6 || copied.len() >= 256 {
+    if depth > 6 || report.copied.len() >= 256 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if report.copied.len() >= 256 {
+            return;
+        }
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name == ".git" || name == "node_modules" || name == "target" {
+        if name == ".git" {
             continue;
         }
         let Ok(rel) = path.strip_prefix(root) else {
@@ -174,53 +228,79 @@ fn walk_and_copy_matching(
         if rel.components().any(|c| matches!(c, Component::ParentDir)) {
             continue;
         }
+        let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        // Guard against any top-level or nested symlink escaping `root`
+        if sym_meta.file_type().is_symlink() && resolve_symlink_target_safe(&path, root).is_err() {
+            continue;
+        }
+
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if path.is_dir() {
             if matches_any_pattern(&rel_str, name, patterns) {
-                copy_dir_recursive_safe(root, &path, &dest_root.join(rel), copied);
-            } else {
-                walk_and_copy_matching(root, &path, dest_root, patterns, depth + 1, copied);
+                let target = dest_root.join(rel);
+                match copy_dir_cow_within(root, &path, &target) {
+                    Ok(method) => {
+                        record_copy_method(report, method);
+                        report.copied.push(rel_str);
+                    }
+                    Err(err) => {
+                        warn!(
+                            path = %rel_str,
+                            error = %err,
+                            "CoW directory copy rejected; falling back to filtered safe file copy"
+                        );
+                        copy_dir_filtered_cow(root, &path, &target, report);
+                    }
+                }
+            } else if !is_heavy_ignored_dir(name)
+                || patterns_may_target_inside(&rel_str, name, patterns)
+            {
+                walk_and_copy_matching(root, &path, dest_root, patterns, depth + 1, report);
             }
         } else if path.is_file() && matches_any_pattern(&rel_str, name, patterns) {
-            if let Ok(canon_file) = std::fs::canonicalize(&path)
-                && !canon_file.starts_with(root)
-            {
-                continue;
-            }
             let target = dest_root.join(rel);
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if std::fs::copy(&path, &target).is_ok() {
-                copied.push(rel_str);
+            if let Ok(method) = copy_file_cow_within(root, &path, &target) {
+                record_copy_method(report, method);
+                report.copied.push(rel_str);
             }
         }
     }
 }
 
-fn copy_dir_recursive_safe(root: &Path, src_dir: &Path, dst_dir: &Path, copied: &mut Vec<String>) {
+/// Safe per-entry fallback used only when a matched directory contains an escaping symlink that
+/// caused whole-directory CoW validation to reject the tree.
+fn copy_dir_filtered_cow(
+    root: &Path,
+    src_dir: &Path,
+    dst_dir: &Path,
+    report: &mut WorktreeIncludeCopyReport,
+) {
     let _ = std::fs::create_dir_all(dst_dir);
     let Ok(entries) = std::fs::read_dir(src_dir) else {
         return;
     };
     for entry in entries.flatten() {
-        if copied.len() >= 256 {
+        if report.copied.len() >= 256 {
             return;
         }
         let p = entry.path();
-        if let Ok(canon) = std::fs::canonicalize(&p)
-            && !canon.starts_with(root)
-        {
+        let Ok(sym_meta) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if sym_meta.file_type().is_symlink() && resolve_symlink_target_safe(&p, root).is_err() {
             continue;
         }
         let target = dst_dir.join(entry.file_name());
         if p.is_dir() {
-            copy_dir_recursive_safe(root, &p, &target, copied);
+            copy_dir_filtered_cow(root, &p, &target, report);
         } else if p.is_file()
-            && std::fs::copy(&p, &target).is_ok()
+            && let Ok(method) = copy_file_cow_within(root, &p, &target)
             && let Ok(rel) = p.strip_prefix(root)
         {
-            copied.push(rel.to_string_lossy().replace('\\', "/"));
+            record_copy_method(report, method);
+            report.copied.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
 }
@@ -269,6 +349,32 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+fn git_cmd_clean(cwd: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR");
+    cmd
+}
+
+async fn copy_worktree_includes_async(source_cwd: &Path, worktree_cwd: &Path) {
+    let src = source_cwd.to_path_buf();
+    let dst = worktree_cwd.to_path_buf();
+    if let Ok(report) =
+        tokio::task::spawn_blocking(move || copy_worktree_includes_with_report(&src, &dst)).await
+        && !report.copied.is_empty()
+    {
+        debug!(
+            entries = report.copied.len(),
+            cow_cloned = report.cow_cloned,
+            standard_copied = report.standard_copied,
+            "Copied .worktreeinclude entries into worktree"
+        );
+    }
+}
+
 /// Create a git worktree supporting all 3 modes: `branch_off`, `checkout_branch`, `checkout_pr`.
 pub async fn create_worktree_with_mode(
     orbit_home: &Path,
@@ -277,6 +383,29 @@ pub async fn create_worktree_with_mode(
     branch_name: Option<&str>,
     base_ref: Option<&str>,
     pr_number: Option<u32>,
+) -> anyhow::Result<(PathBuf, Option<String>)> {
+    create_worktree_with_mode_pooled(
+        orbit_home,
+        source_cwd,
+        mode,
+        branch_name,
+        base_ref,
+        pr_number,
+        None,
+    )
+    .await
+}
+
+/// Create a git worktree supporting all 3 modes, accelerating provisioning with an optional warm
+/// detached-HEAD [`WorktreePool`] and CoW `.worktreeinclude` copying.
+pub async fn create_worktree_with_mode_pooled(
+    orbit_home: &Path,
+    source_cwd: &Path,
+    mode: WorktreeCreateMode,
+    branch_name: Option<&str>,
+    base_ref: Option<&str>,
+    pr_number: Option<u32>,
+    pool: Option<&Arc<WorktreePool>>,
 ) -> anyhow::Result<(PathBuf, Option<String>)> {
     let repo_name = source_cwd
         .file_name()
@@ -288,9 +417,8 @@ pub async fn create_worktree_with_mode(
             // Best-effort remote fetch (bounded timeout) so `origin/main` is fresh
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(8),
-                Command::new("git")
+                git_cmd_clean(source_cwd)
                     .args(["fetch", "--quiet", "--prune"])
-                    .current_dir(source_cwd)
                     .output(),
             )
             .await;
@@ -305,24 +433,39 @@ pub async fn create_worktree_with_mode(
                     )
                 });
             let target_dir = allocate_worktree_dir(orbit_home, repo_name, &branch);
-            if let Some(parent) = target_dir.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+            let claimed = if let Some(p) = pool {
+                p.try_claim_branch_off(source_cwd, &target_dir, &branch, base_ref)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            if claimed.is_none() {
+                if let Some(parent) = target_dir.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let mut cmd = git_cmd_clean(source_cwd);
+                cmd.arg("worktree")
+                    .arg("add")
+                    .arg("-b")
+                    .arg(&branch)
+                    .arg(&target_dir);
+                if let Some(base) = base_ref.filter(|b| !b.trim().is_empty()) {
+                    cmd.arg(base);
+                }
+                let out = cmd.output().await?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    anyhow::bail!("git worktree add failed: {stderr}");
+                }
             }
-            let mut cmd = Command::new("git");
-            cmd.arg("worktree")
-                .arg("add")
-                .arg("-b")
-                .arg(&branch)
-                .arg(&target_dir);
-            if let Some(base) = base_ref.filter(|b| !b.trim().is_empty()) {
-                cmd.arg(base);
+
+            copy_worktree_includes_async(source_cwd, &target_dir).await;
+            if let Some(p) = pool {
+                p.schedule_replenish(source_cwd.to_path_buf());
             }
-            let out = cmd.current_dir(source_cwd).output().await?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!("git worktree add failed: {stderr}");
-            }
-            let _ = copy_worktree_includes(source_cwd, &target_dir);
             Ok((target_dir, Some(branch)))
         }
         WorktreeCreateMode::CheckoutBranch => {
@@ -330,31 +473,44 @@ pub async fn create_worktree_with_mode(
                 .filter(|b| !b.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("`branch` is required for checkout_branch mode"))?;
             let target_dir = allocate_worktree_dir(orbit_home, repo_name, branch);
-            if let Some(parent) = target_dir.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+            let claimed = if let Some(p) = pool {
+                p.try_claim_checkout_branch(source_cwd, &target_dir, branch)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            if claimed.is_none() {
+                if let Some(parent) = target_dir.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let out = git_cmd_clean(source_cwd)
+                    .arg("worktree")
+                    .arg("add")
+                    .arg(&target_dir)
+                    .arg(branch)
+                    .output()
+                    .await?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    anyhow::bail!("git worktree checkout branch failed: {stderr}");
+                }
             }
-            let out = Command::new("git")
-                .arg("worktree")
-                .arg("add")
-                .arg(&target_dir)
-                .arg(branch)
-                .current_dir(source_cwd)
-                .output()
-                .await?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!("git worktree checkout branch failed: {stderr}");
+
+            copy_worktree_includes_async(source_cwd, &target_dir).await;
+            if let Some(p) = pool {
+                p.schedule_replenish(source_cwd.to_path_buf());
             }
-            let _ = copy_worktree_includes(source_cwd, &target_dir);
             Ok((target_dir, Some(branch.to_string())))
         }
         WorktreeCreateMode::CheckoutPr => {
             let pr = pr_number
                 .ok_or_else(|| anyhow::anyhow!("`pr_number` is required for checkout_pr mode"))?;
             let local_branch = format!("orbit/pr-{pr}");
-            let fetch = Command::new("git")
+            let fetch = git_cmd_clean(source_cwd)
                 .args(["fetch", "origin", &format!("pull/{pr}/head:{local_branch}")])
-                .current_dir(source_cwd)
                 .output()
                 .await?;
             if !fetch.status.success() {
@@ -362,22 +518,36 @@ pub async fn create_worktree_with_mode(
                 anyhow::bail!("git fetch PR #{pr} failed: {stderr}");
             }
             let target_dir = allocate_worktree_dir(orbit_home, repo_name, &local_branch);
-            if let Some(parent) = target_dir.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+            let claimed = if let Some(p) = pool {
+                p.try_claim_checkout_branch(source_cwd, &target_dir, &local_branch)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            if claimed.is_none() {
+                if let Some(parent) = target_dir.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let out = git_cmd_clean(source_cwd)
+                    .arg("worktree")
+                    .arg("add")
+                    .arg(&target_dir)
+                    .arg(&local_branch)
+                    .output()
+                    .await?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    anyhow::bail!("git worktree add PR #{pr} failed: {stderr}");
+                }
             }
-            let out = Command::new("git")
-                .arg("worktree")
-                .arg("add")
-                .arg(&target_dir)
-                .arg(&local_branch)
-                .current_dir(source_cwd)
-                .output()
-                .await?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!("git worktree add PR #{pr} failed: {stderr}");
+
+            copy_worktree_includes_async(source_cwd, &target_dir).await;
+            if let Some(p) = pool {
+                p.schedule_replenish(source_cwd.to_path_buf());
             }
-            let _ = copy_worktree_includes(source_cwd, &target_dir);
             Ok((target_dir, Some(local_branch)))
         }
     }
@@ -533,14 +703,13 @@ pub async fn teardown_and_remove_worktree(
     }
 
     if let Some(src_repo) = source_cwd {
-        let out = Command::new("git")
+        let out = git_cmd_clean(src_repo)
             .args([
                 "worktree",
                 "remove",
                 "--force",
                 &worktree_cwd.to_string_lossy(),
             ])
-            .current_dir(src_repo)
             .output()
             .await;
         if out.is_ok_and(|o| o.status.success()) {
@@ -896,5 +1065,189 @@ mod tests {
             build_service_proxy_host("web", Some("feat/auth_v2"), "orbit"),
             "web--feat-auth-v2--orbit.localhost"
         );
+    }
+
+    #[test]
+    fn copies_worktreeinclude_cow_dirs_like_node_modules_and_venv_safely() {
+        let root = std::env::temp_dir().join(format!(
+            "orbit_wt_cow_inc_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let src = root.join("src");
+        let dst = root.join("dst");
+        let outside = root.join("outside.key");
+        std::fs::create_dir_all(src.join("node_modules/pkg/bin")).expect("mkdir node_modules");
+        std::fs::create_dir_all(src.join("node_modules/.bin")).expect("mkdir .bin");
+        std::fs::create_dir_all(src.join(".venv/lib")).expect("mkdir .venv");
+        std::fs::create_dir_all(src.join("mixed")).expect("mkdir mixed");
+        std::fs::create_dir_all(&dst).expect("mkdir dst");
+        std::fs::write(&outside, "SECRET_KEY").expect("write outside");
+        std::fs::write(
+            src.join(".worktreeinclude"),
+            ".env.local\nnode_modules\n.venv/\nmixed\n../outside.key\n",
+        )
+        .expect("write include");
+        std::fs::write(src.join(".env.local"), "PORT=8080").expect("write env");
+        std::fs::write(src.join("node_modules/pkg/index.js"), "exports.ok = true;")
+            .expect("write pkg");
+        std::fs::write(src.join("node_modules/pkg/bin/tool.js"), "console.log(1);")
+            .expect("write tool");
+        std::fs::write(src.join(".venv/lib/site.py"), "VERSION = 1\n").expect("write site.py");
+        std::fs::write(src.join("mixed/safe.txt"), "safe-data").expect("write safe");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../pkg/bin/tool.js", src.join("node_modules/.bin/tool"))
+                .expect("internal bin symlink");
+            std::os::unix::fs::symlink(&outside, src.join("mixed/escape.key"))
+                .expect("escape symlink");
+        }
+
+        let report = copy_worktree_includes_with_report(&src, &dst);
+        assert!(report.copied.iter().any(|p| p == ".env.local"));
+        assert!(report.copied.iter().any(|p| p == "node_modules"));
+        assert!(report.copied.iter().any(|p| p == ".venv"));
+        assert_eq!(
+            std::fs::read_to_string(dst.join(".env.local")).expect("read env"),
+            "PORT=8080"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("node_modules/pkg/index.js")).expect("read pkg"),
+            "exports.ok = true;"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join(".venv/lib/site.py")).expect("read venv"),
+            "VERSION = 1\n"
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                std::fs::symlink_metadata(dst.join("node_modules/.bin/tool"))
+                    .expect("bin symlink")
+                    .file_type()
+                    .is_symlink()
+            );
+            // Filtered fallback preserved safe file in `mixed` while blocking the escaping symlink
+            assert_eq!(
+                std::fs::read_to_string(dst.join("mixed/safe.txt")).expect("read mixed safe"),
+                "safe-data"
+            );
+            assert!(!dst.join("mixed/escape.key").exists());
+        }
+        assert!(!dst.join("outside.key").exists());
+
+        #[cfg(target_os = "macos")]
+        assert!(
+            report.cow_cloned >= 3,
+            "expected APFS CoW clones for .env.local, node_modules, .venv; got {:?}",
+            report
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn create_worktree_with_mode_pooled_uses_warm_pool_replenishes_and_copies_cow_includes() {
+        use crate::worktree_pool::WorktreePoolConfig;
+
+        let root = std::env::temp_dir().join(format!(
+            "orbit_wt_pooled_e2e_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let home = root.join("orbit_home");
+        let repo = root.join("sample-app");
+        std::fs::create_dir_all(repo.join("node_modules/dep")).expect("mkdir repo");
+
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "orbit@example.com"],
+            vec!["config", "user.name", "Orbit"],
+        ] {
+            let out = git_cmd_clean(&repo)
+                .args(&args)
+                .output()
+                .await
+                .expect("git init");
+            assert!(out.status.success());
+        }
+        std::fs::write(repo.join(".gitignore"), "node_modules/\n.env.local\n").expect("gitignore");
+        std::fs::write(repo.join(".worktreeinclude"), ".env.local\nnode_modules\n")
+            .expect("worktreeinclude");
+        std::fs::write(repo.join("README.md"), "hello\n").expect("readme");
+        std::fs::write(repo.join(".env.local"), "SECRET=dev").expect("env");
+        std::fs::write(repo.join("node_modules/dep/index.js"), "module.exports=1;").expect("dep");
+
+        for args in [
+            vec!["add", ".gitignore", ".worktreeinclude", "README.md"],
+            vec!["commit", "-m", "init"],
+            vec!["branch", "existing-feat"],
+        ] {
+            let out = git_cmd_clean(&repo)
+                .args(&args)
+                .output()
+                .await
+                .expect("git setup");
+            assert!(out.status.success());
+        }
+
+        let pool = WorktreePool::new(home.clone(), WorktreePoolConfig::with_max_standby(2));
+        assert_eq!(pool.prewarm_repo(&repo).await.expect("prewarm"), 2);
+
+        // 1. Warm-claimed BranchOff worktree
+        let (wt1, br1) = create_worktree_with_mode_pooled(
+            &home,
+            &repo,
+            WorktreeCreateMode::BranchOff,
+            Some("feat/warm-one"),
+            Some("main"),
+            None,
+            Some(&pool),
+        )
+        .await
+        .expect("create pooled branch_off");
+        assert_eq!(br1.as_deref(), Some("feat/warm-one"));
+        assert_eq!(
+            std::fs::read_to_string(wt1.join(".env.local")).expect("env copied"),
+            "SECRET=dev"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt1.join("node_modules/dep/index.js")).expect("nm copied"),
+            "module.exports=1;"
+        );
+
+        // 2. Warm-claimed CheckoutBranch worktree
+        let (wt2, br2) = create_worktree_with_mode_pooled(
+            &home,
+            &repo,
+            WorktreeCreateMode::CheckoutBranch,
+            Some("existing-feat"),
+            None,
+            None,
+            Some(&pool),
+        )
+        .await
+        .expect("create pooled checkout_branch");
+        assert_eq!(br2.as_deref(), Some("existing-feat"));
+        assert!(wt2.join("node_modules/dep/index.js").is_file());
+
+        // 3. Shutdown pool cleanup + verify fallback still creates a worktree cleanly
+        let _ = pool.shutdown_cleanup().await;
+        let (wt3, br3) = create_worktree_with_mode_pooled(
+            &home,
+            &repo,
+            WorktreeCreateMode::BranchOff,
+            Some("feat/cold-fallback"),
+            Some("main"),
+            None,
+            Some(&pool),
+        )
+        .await
+        .expect("cold fallback branch_off");
+        assert_eq!(br3.as_deref(), Some("feat/cold-fallback"));
+        assert_eq!(
+            std::fs::read_to_string(wt3.join(".env.local")).expect("env copied cold"),
+            "SECRET=dev"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

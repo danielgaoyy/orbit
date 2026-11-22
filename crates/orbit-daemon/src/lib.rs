@@ -10,6 +10,7 @@ pub mod attachments;
 pub mod connected_hosts;
 pub mod cron;
 pub mod discovery;
+pub mod fast_copy;
 pub mod finish_subscriptions;
 pub mod git;
 pub mod idle_cleanup;
@@ -24,6 +25,7 @@ pub mod workspace_board;
 pub mod workspace_cluster;
 pub mod workspace_organizer;
 pub mod workspace_runtime;
+pub mod worktree_pool;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -522,6 +524,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         .with_graceful_shutdown(async move {
             wait_daemon_shutdown_signal().await;
             runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
+            runtime_shutdown.orchestrator.shutdown_worktree_pool().await;
             runtime_shutdown.keep_awake.shutdown();
         })
         .await?;

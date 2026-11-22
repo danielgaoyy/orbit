@@ -30,6 +30,7 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::fast_copy::{DirShareMode, link_or_clone_dir};
 use crate::git::{
     capture_git_tree_snapshot, inspect_git_status, resolve_git_scope, restore_git_tree_snapshot,
     reverse_apply_file_edit_diffs,
@@ -43,9 +44,10 @@ use crate::workspace_board::{
 use crate::workspace_cluster::{allocate_unique_handle, evaluate_auto_cluster, sanitize_handle};
 use crate::workspace_runtime::{
     WorkspaceScriptRegistry, allocate_ephemeral_port, build_service_proxy_host,
-    create_worktree_with_mode, load_workspace_manifest_with_fallback, run_worktree_setup_hooks,
-    teardown_and_remove_worktree,
+    create_worktree_with_mode_pooled, load_workspace_manifest_with_fallback,
+    run_worktree_setup_hooks, teardown_and_remove_worktree,
 };
+use crate::worktree_pool::WorktreePool;
 
 #[derive(Debug, Clone)]
 pub struct RewindAgentOutcome {
@@ -162,6 +164,7 @@ pub struct AgentOrchestrator {
     store: Arc<OrbitStore>,
     pub scripts: Arc<WorkspaceScriptRegistry>,
     keep_awake: Arc<KeepAwakeManager>,
+    pub worktree_pool: Arc<WorktreePool>,
     live_agents: RwLock<HashMap<String, LiveAgentEntry>>,
     agent_generations: RwLock<HashMap<String, u64>>,
     pending_questions: RwLock<HashMap<String, Vec<String>>>,
@@ -194,6 +197,7 @@ impl AgentOrchestrator {
     ) -> Arc<Self> {
         let orbit_exe = resolve_orbit_exe();
         let (broadcast_tx, _) = broadcast::channel(2048);
+        let worktree_pool = WorktreePool::with_default_config(home_dir.clone());
         Arc::new(Self {
             home_dir,
             orbit_exe,
@@ -204,6 +208,7 @@ impl AgentOrchestrator {
             store,
             scripts,
             keep_awake,
+            worktree_pool,
             live_agents: RwLock::new(HashMap::new()),
             agent_generations: RwLock::new(HashMap::new()),
             pending_questions: RwLock::new(HashMap::new()),
@@ -292,6 +297,24 @@ impl AgentOrchestrator {
     pub async fn activate_runtime(self: &Arc<Self>) {
         self.reattach_surviving_terminals().await;
         self.reattach_or_recover_agents().await;
+        let pool = Arc::clone(&self.worktree_pool);
+        tokio::spawn(async move {
+            let pruned = pool.prune_stale_standbys().await;
+            if pruned > 0 {
+                info!(pruned, "Pruned stale worktree pool standbys on startup");
+            }
+        });
+    }
+
+    /// Clean up all warm worktree pool standbys on graceful daemon shutdown.
+    pub async fn shutdown_worktree_pool(&self) {
+        let removed = self.worktree_pool.shutdown_cleanup().await;
+        if removed > 0 {
+            info!(
+                removed,
+                "Cleaned up warm worktree pool standbys on shutdown"
+            );
+        }
     }
 
     /// Resolve a Unix Domain Socket path guaranteed to fit comfortably under Linux's 108-byte
@@ -488,13 +511,14 @@ impl AgentOrchestrator {
                     src_path.display()
                 );
             }
-            let (wt_path, br) = create_worktree_with_mode(
+            let (wt_path, br) = create_worktree_with_mode_pooled(
                 &self.home_dir,
                 &src_path,
                 spec.worktree_mode,
                 spec.worktree_branch.as_deref(),
                 spec.base_ref.as_deref(),
                 spec.pr_number,
+                Some(&self.worktree_pool),
             )
             .await?;
             (wt_path, true, br)
@@ -571,6 +595,30 @@ impl AgentOrchestrator {
             is_curated: spec.is_curated,
         };
         self.store.upsert_workspace(&ws)?;
+        // Share existing parent workspace scratch/artifacts directories in O(1) via reference link
+        if let Some(ref parent_ws_id) = ws.parent_workspace_id {
+            let parent_dir = board_file_path(&self.home_dir, parent_ws_id)
+                .parent()
+                .map(Path::to_path_buf);
+            let child_dir = board_file_path(&self.home_dir, &ws.workspace_id)
+                .parent()
+                .map(Path::to_path_buf);
+            if let (Some(p_dir), Some(c_dir)) = (parent_dir, child_dir) {
+                let _ = tokio::task::spawn_blocking(move || {
+                    for folder in ["scratch", "artifacts"] {
+                        let src_folder = p_dir.join(folder);
+                        if src_folder.is_dir() {
+                            let _ = link_or_clone_dir(
+                                &src_folder,
+                                &c_dir.join(folder),
+                                DirShareMode::ReferenceLink,
+                            );
+                        }
+                    }
+                })
+                .await;
+            }
+        }
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::WorkspaceUpdated(ws.clone()));
@@ -697,9 +745,37 @@ impl AgentOrchestrator {
             let wt_path = PathBuf::from(&ws.cwd);
             let br_opt = ws.git_branch.clone();
             teardown_and_remove_worktree(src_opt.as_deref(), &wt_path, br_opt.as_deref()).await;
+            if let Some(ref src) = src_opt {
+                self.reconcile_worktree_pool_after_archive(src).await;
+            }
         }
 
         Ok(())
+    }
+
+    async fn reconcile_worktree_pool_after_archive(&self, source_cwd: &Path) {
+        let src_str = source_cwd.to_string_lossy();
+        let has_active_ws = self
+            .store
+            .list_workspaces_filtered(false, true)
+            .unwrap_or_default()
+            .iter()
+            .any(|w| w.cwd == src_str || w.source_cwd.as_deref() == Some(src_str.as_ref()));
+        let has_active_wt_agent = self
+            .store
+            .list_agents_filtered(None, false, true, None)
+            .unwrap_or_default()
+            .iter()
+            .any(|a| {
+                a.labels
+                    .get("orbit.worktree_source_cwd")
+                    .is_some_and(|s| s == src_str.as_ref())
+            });
+        if !has_active_ws && !has_active_wt_agent {
+            let _ = self.worktree_pool.cleanup_repo_pool(source_cwd).await;
+        } else {
+            let _ = self.worktree_pool.prune_repo_pool(source_cwd).await;
+        }
     }
 
     pub async fn unarchive_workspace(
@@ -1005,13 +1081,14 @@ impl AgentOrchestrator {
                     .branch
                     .clone()
                     .unwrap_or_else(|| auto_worktree_branch(&human_seed));
-                let (wt_path, created_br) = create_worktree_with_mode(
+                let (wt_path, created_br) = create_worktree_with_mode_pooled(
                     &self.home_dir,
                     &src_for_wt,
                     spec.worktree_mode,
                     Some(&auto_branch),
                     spec.base_ref.as_deref(),
                     spec.pr_number,
+                    Some(&self.worktree_pool),
                 )
                 .await?;
                 let wt_str = wt_path.to_string_lossy().to_string();
@@ -2030,6 +2107,8 @@ impl AgentOrchestrator {
                             wt_branch.as_deref(),
                         )
                         .await;
+                        self.reconcile_worktree_pool_after_archive(Path::new(&src))
+                            .await;
                     }
                 }
             }

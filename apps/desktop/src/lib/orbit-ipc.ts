@@ -201,6 +201,18 @@ export interface FleetOverviewView {
   project_order?: string[];
 }
 
+export interface ConversationSearchHit {
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  seq: number;
+  role: string;
+  title: string;
+  project_name: string;
+  snippet: string;
+  updated_at_rfc3339: string;
+}
+
 export type ActiveTurnBehavior = "steer" | "queue" | "interrupt";
 export type AttentionState = "none" | "finished" | "error" | "permission" | "manual_unread";
 export type WorkspaceIsolation = "local" | "worktree";
@@ -2885,5 +2897,15 @@ export const orbitIpc = {
   cloudSyncUpdatePreferences: async (patch: Record<string, unknown>): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("cloud_sync_update_preferences", { patch }).catch(() => undefined);
+  },
+
+  searchMessages: async (query: string, limit = 20): Promise<ConversationSearchHit[]> => {
+    if (!isTauriRuntime()) return [];
+    const trimmed = query.trim();
+    if (!trimmed) return [];
+    return invoke<ConversationSearchHit[]>("search_messages", {
+      query: trimmed,
+      limit,
+    });
   },
 };

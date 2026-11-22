@@ -262,6 +262,11 @@ impl OhosCoreFacade {
         serde_json::to_string(&self.inner.bridge_info()).map_err(|e| e.to_string())
     }
 
+    pub fn search_messages_json(&self, query: &str, limit: Option<u32>) -> Result<String, String> {
+        serde_json::to_string(&self.inner.search_messages(query, limit.unwrap_or(20)))
+            .map_err(|e| e.to_string())
+    }
+
     pub fn fleet_sidebar_by_request_json(&self, req_json: &str) -> Result<String, String> {
         let req: FleetSidebarRequest = serde_json::from_str(req_json).map_err(|e| e.to_string())?;
         serde_json::to_string(&self.inner.fleet_sidebar_by_request(&req)).map_err(|e| e.to_string())
@@ -1229,6 +1234,13 @@ mod ohos_napi {
         #[napi]
         pub fn bridge_info_json(&self) -> Result<String> {
             self.facade.bridge_info_json().map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn search_messages_json(&self, query: String, limit: Option<u32>) -> Result<String> {
+            self.facade
+                .search_messages_json(&query, limit)
+                .map_err(Error::from_reason)
         }
 
         #[napi]

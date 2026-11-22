@@ -3051,10 +3051,55 @@ interface ScrollVelocityState {
   wasScrolling: boolean;
 }
 
+function findTurnIndexForSeq(
+  turns: StageTurnView[],
+  targetSeq: number,
+): { index: number; exact: boolean } {
+  if (turns.length === 0) return { index: -1, exact: false };
+  for (let i = 0; i < turns.length; i += 1) {
+    const t = turns[i];
+    if (
+      t.anchor_seq === targetSeq ||
+      t.user_prompt?.seq === targetSeq ||
+      t.agent_message?.seq === targetSeq ||
+      t.terminal_reply?.seq === targetSeq ||
+      t.last_assistant_reply?.seq === targetSeq ||
+      t.folded_steps.some((item) => item.seq === targetSeq) ||
+      t.notices.some((item) => item.seq === targetSeq) ||
+      t.compactions.some((item) => item.seq === targetSeq)
+    ) {
+      return { index: i, exact: true };
+    }
+    for (const seg of t.live_segments) {
+      if (seg.kind === "step_group" && seg.items.some((item) => item.seq === targetSeq)) {
+        return { index: i, exact: true };
+      }
+      if (
+        (seg.kind === "assistant_message" || seg.kind === "notice") &&
+        seg.item.seq === targetSeq
+      ) {
+        return { index: i, exact: true };
+      }
+    }
+  }
+  // Fallback: last chronological turn whose anchor_seq <= targetSeq
+  let best = 0;
+  for (let i = 0; i < turns.length; i += 1) {
+    if (turns[i].anchor_seq <= targetSeq) {
+      best = i;
+    } else {
+      break;
+    }
+  }
+  return { index: best, exact: false };
+}
+
 const VirtualizedTurnList = memo(function VirtualizedTurnList({
   selectedHostId,
   selectedAgentId,
   stageTurns,
+  highlightedTurnKey,
+  hasPendingJump,
   isLatestTurnActive,
   agentStatusLabel,
   hasLiveBackgroundTasks,
@@ -3077,6 +3122,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   selectedHostId: string;
   selectedAgentId: string;
   stageTurns: StageTurnView[];
+  highlightedTurnKey: string | null;
+  hasPendingJump: boolean;
   isLatestTurnActive: boolean;
   agentStatusLabel: string | null;
   hasLiveBackgroundTasks: boolean;
@@ -3342,8 +3389,11 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedAgentId]);
 
+  const hasPendingJumpRef = useRef(hasPendingJump);
+  hasPendingJumpRef.current = hasPendingJump;
+
   const initialBottomOffset = useMemo(() => {
-    if (stageTurns.length === 0) return 0;
+    if (hasPendingJump || stageTurns.length === 0) return 0;
     let total = 0;
     for (let i = 0; i < stageTurns.length; i += 1) {
       const turn = stageTurns[i];
@@ -3353,7 +3403,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     return Math.max(0, total - initialRect.height);
     // Compute initial bottom anchor only when mounting a fresh session list
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedAgentId, initialRect.height]);
+  }, [selectedAgentId, initialRect.height, hasPendingJump]);
 
   const observeOffsetWithBottomSeed = useCallback(
     (
@@ -3361,7 +3411,13 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
       cb: (offset: number, isScrolling: boolean) => void,
     ) => {
       const el = instance.scrollElement;
-      if (el && stickToBottomRef.current && initialBottomOffset > 0 && el.scrollTop === 0) {
+      if (
+        el &&
+        stickToBottomRef.current &&
+        !hasPendingJumpRef.current &&
+        initialBottomOffset > 0 &&
+        el.scrollTop === 0
+      ) {
         const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
         if (maxTop > 0) {
           el.scrollTop = maxTop;
@@ -3524,13 +3580,19 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
           thinkingTimingsRef.current,
         );
 
+        const isHighlighted = highlightedTurnKey === turn.key;
+
         return (
           <div
             key={vItem.key}
             data-index={vItem.index}
             data-orbit-turn-index={vItem.index}
             ref={measureTurnNode}
-            className="absolute top-0 left-0 w-full min-w-0"
+            className={cn(
+              "absolute top-0 left-0 w-full min-w-0 rounded-2xl transition-colors duration-700",
+              isHighlighted &&
+                "bg-foreground/[0.035] ring-1 ring-inset ring-foreground/[0.12] dark:bg-foreground/[0.055] dark:ring-foreground/[0.18]",
+            )}
           >
             <TurnStageSection
               turn={turn}
@@ -3563,7 +3625,16 @@ export function StreamStage() {
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const sessionScrollNonce = useOrbitSelector((s) => s.sessionScrollNonce);
+  const pendingJumpTarget = useOrbitSelector((s) => s.pendingJumpTarget);
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
+  const [highlightedTurnKey, setHighlightedTurnKey] = useState<string | null>(null);
+  const [jumpFallbackNonce, setJumpFallbackNonce] = useState<number | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
+  const jumpFallbackTimerRef = useRef<number | null>(null);
+  const jumpRafRef = useRef<{ raf1: number | null; raf2: number | null }>({
+    raf1: null,
+    raf2: null,
+  });
   const isNetworkOffline = useOrbitSelector((s) => s.isBrowserOffline);
   const {
     canDockOverview,
@@ -4197,6 +4268,16 @@ export function StreamStage() {
       ? `${selectedHostId}::${selectedAgentId}`
       : null;
 
+  const hasPendingJumpForActive = Boolean(
+    pendingJumpTarget &&
+      selectedHostId &&
+      selectedAgentId &&
+      pendingJumpTarget.hostId === selectedHostId &&
+      pendingJumpTarget.agentId === selectedAgentId,
+  );
+  const hasPendingJumpForActiveRef = useRef(hasPendingJumpForActive);
+  hasPendingJumpForActiveRef.current = hasPendingJumpForActive;
+
   // Always reset bottom-pinning cleanly before paint whenever switching into a session
   useLayoutEffect(() => {
     if (!activeSessionScope) {
@@ -4207,10 +4288,31 @@ export function StreamStage() {
       window.clearTimeout(programmaticScrollTimerRef.current);
       programmaticScrollTimerRef.current = null;
     }
+    if (jumpRafRef.current.raf1 !== null) {
+      window.cancelAnimationFrame(jumpRafRef.current.raf1);
+      jumpRafRef.current.raf1 = null;
+    }
+    if (jumpRafRef.current.raf2 !== null) {
+      window.cancelAnimationFrame(jumpRafRef.current.raf2);
+      jumpRafRef.current.raf2 = null;
+    }
+    if (jumpFallbackTimerRef.current !== null) {
+      window.clearTimeout(jumpFallbackTimerRef.current);
+      jumpFallbackTimerRef.current = null;
+    }
+    setJumpFallbackNonce(null);
     programmaticScrollRef.current = false;
     holdActiveRef.current = false;
-    stickToBottomRef.current = true;
-    sessionEntryLockUntilRef.current = performance.now() + 600;
+    const isTargetedJump = hasPendingJumpForActiveRef.current;
+    if (!isTargetedJump) {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = null;
+      }
+      setHighlightedTurnKey(null);
+    }
+    stickToBottomRef.current = !isTargetedJump;
+    sessionEntryLockUntilRef.current = isTargetedJump ? 0 : performance.now() + 600;
     lastObservedScrollTopRef.current = 0;
     prevTurnsCountRef.current = turnsCountRef.current;
     scrollUiStore.update({
@@ -4219,6 +4321,10 @@ export function StreamStage() {
       activePromptSeq: null,
     });
     setRewindTarget(null);
+
+    if (isTargetedJump) {
+      return;
+    }
 
     const anchorToBottom = () => {
       if (!stickToBottomRef.current || programmaticScrollRef.current) return;
@@ -4252,6 +4358,121 @@ export function StreamStage() {
     scheduleBottomSync,
     syncScrollMetrics,
   ]);
+
+  // Execute search-result jump-to-seq scroll + subtle pulse highlight once turns are hydrated
+  useEffect(() => {
+    if (!activeSessionScope || !pendingJumpTarget) return;
+    if (
+      pendingJumpTarget.hostId !== selectedHostId ||
+      pendingJumpTarget.agentId !== selectedAgentId
+    ) {
+      return;
+    }
+    if (stageTurns.length === 0) return;
+
+    const match = findTurnIndexForSeq(stageTurns, pendingJumpTarget.seq);
+    if (match.index < 0) return;
+    const jumpNonce = pendingJumpTarget.nonce;
+    const stageLatestSeq = stageView?.latest_seq ?? 0;
+
+    // If cached turns haven't caught up to the searched seq yet, wait for pullStageDelta
+    // hydration before consuming the jump target (with a 1500ms fallback if rewound/pruned).
+    if (!match.exact && stageLatestSeq < pendingJumpTarget.seq && jumpFallbackNonce !== jumpNonce) {
+      stickToBottomRef.current = false;
+      sessionEntryLockUntilRef.current = 0;
+      if (jumpFallbackTimerRef.current === null) {
+        jumpFallbackTimerRef.current = window.setTimeout(() => {
+          jumpFallbackTimerRef.current = null;
+          setJumpFallbackNonce(jumpNonce);
+        }, 1500);
+      }
+      return;
+    }
+
+    if (jumpFallbackTimerRef.current !== null) {
+      window.clearTimeout(jumpFallbackTimerRef.current);
+      jumpFallbackTimerRef.current = null;
+    }
+
+    const turnIdx = match.index;
+    const targetTurn = stageTurns[turnIdx];
+
+    stickToBottomRef.current = false;
+    sessionEntryLockUntilRef.current = 0;
+    programmaticScrollRef.current = true;
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+    }
+    programmaticScrollTimerRef.current = window.setTimeout(() => {
+      programmaticScrollRef.current = false;
+      programmaticScrollTimerRef.current = null;
+      syncScrollMetrics();
+    }, 250);
+
+    const performJump = () => {
+      virtualizerRef.current?.scrollToIndex(turnIdx, {
+        align: "center",
+        behavior: "auto",
+      });
+    };
+
+    if (jumpRafRef.current.raf1 !== null) {
+      window.cancelAnimationFrame(jumpRafRef.current.raf1);
+      jumpRafRef.current.raf1 = null;
+    }
+    if (jumpRafRef.current.raf2 !== null) {
+      window.cancelAnimationFrame(jumpRafRef.current.raf2);
+      jumpRafRef.current.raf2 = null;
+    }
+
+    performJump();
+    jumpRafRef.current.raf1 = window.requestAnimationFrame(() => {
+      jumpRafRef.current.raf1 = null;
+      performJump();
+      jumpRafRef.current.raf2 = window.requestAnimationFrame(() => {
+        jumpRafRef.current.raf2 = null;
+        performJump();
+        syncScrollMetrics();
+      });
+    });
+
+    setHighlightedTurnKey(targetTurn.key);
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedTurnKey((cur) => (cur === targetTurn.key ? null : cur));
+      highlightTimerRef.current = null;
+    }, 1800);
+
+    orbitActions.clearPendingJumpTarget(jumpNonce);
+  }, [
+    activeSessionScope,
+    selectedHostId,
+    selectedAgentId,
+    pendingJumpTarget,
+    stageTurns,
+    stageView?.latest_seq,
+    jumpFallbackNonce,
+    syncScrollMetrics,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+      if (jumpFallbackTimerRef.current !== null) {
+        window.clearTimeout(jumpFallbackTimerRef.current);
+      }
+      if (jumpRafRef.current.raf1 !== null) {
+        window.cancelAnimationFrame(jumpRafRef.current.raf1);
+      }
+      if (jumpRafRef.current.raf2 !== null) {
+        window.cancelAnimationFrame(jumpRafRef.current.raf2);
+      }
+    };
+  }, []);
 
   // Synchronously keep pinned to bottom before paint as timeline items arrive, turns append,
   // or sidebar layout motion starts/settles.
@@ -4417,6 +4638,8 @@ export function StreamStage() {
               selectedHostId={selectedHostId}
               selectedAgentId={selectedAgentId}
               stageTurns={stageTurns}
+              highlightedTurnKey={highlightedTurnKey}
+              hasPendingJump={hasPendingJumpForActive}
               isLatestTurnActive={isLatestTurnActive}
               agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
               hasLiveBackgroundTasks={stageInsights.background_tasks.length > 0}

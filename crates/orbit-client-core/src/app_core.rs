@@ -40,6 +40,7 @@ use crate::cloud_sync::{
     save_sync_meta_to_store, save_sync_prefs_to_store, stored_host_from_synced,
     unlock_remote_vault_with_passphrase,
 };
+pub use crate::contract::ConversationSearchHit;
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
 use crate::desktop_ops::{
@@ -1011,7 +1012,7 @@ impl OrbitAppCore {
             .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
             .unwrap_or_default();
 
-        Ok(Arc::new(Self {
+        let core = Arc::new(Self {
             runtime,
             store,
             hosts: Arc::new(RwLock::new(initial_hosts)),
@@ -1025,7 +1026,57 @@ impl OrbitAppCore {
             cloud_sync_in_flight: Arc::new(AtomicBool::new(false)),
             cloud_sync_last_auto_ms: Arc::new(AtomicU64::new(0)),
             cloud_sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
-        }))
+        });
+        if !core.store.is_replica_fts_backfill_done() {
+            let store_bg = Arc::clone(&core.store);
+            core.runtime.spawn(async move {
+                const BACKFILL_BATCH_SIZE: usize = 200;
+                const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+                let mut consecutive_errors: u32 = 0;
+                loop {
+                    let store_step = Arc::clone(&store_bg);
+                    let step = tokio::task::spawn_blocking(move || {
+                        store_step.backfill_replica_fts_batch(BACKFILL_BATCH_SIZE)
+                    })
+                    .await;
+                    match step {
+                        Ok(Ok(progress)) => {
+                            consecutive_errors = 0;
+                            if progress.done {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        Ok(Err(err)) => {
+                            consecutive_errors += 1;
+                            tracing::warn!(
+                                error = %err,
+                                attempt = consecutive_errors,
+                                "replica FTS5 backfill batch failed"
+                            );
+                            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                tracing::warn!(
+                                    "aborting replica FTS5 background backfill after repeated errors"
+                                );
+                                break;
+                            }
+                            let backoff_ms = 50u64
+                                .saturating_mul(1u64 << (consecutive_errors - 1).min(4))
+                                .min(1000);
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(
+                                error = %join_err,
+                                "replica FTS5 backfill worker task aborted"
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        Ok(core)
     }
 
     pub fn subscribe(&self, sub: Arc<dyn CoreEventSubscriber>) {
@@ -2007,8 +2058,121 @@ impl OrbitAppCore {
                 "side_question".into(),
                 "rewind".into(),
                 "native_diagrams".into(),
+                "fts5_search".into(),
             ],
         }
+    }
+
+    /// Cross-conversation full-text search across all locally replicated timeline messages,
+    /// backed by SQLite FTS5 + BM25 ranking and enriched with host/project/title metadata.
+    pub fn search_messages(
+        &self,
+        query: impl AsRef<str>,
+        limit: u32,
+    ) -> Vec<ConversationSearchHit> {
+        let q = query.as_ref().trim();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let max_hits = if limit == 0 {
+            20
+        } else {
+            (limit as usize).min(100)
+        };
+        let raw_hits = match self.store.search_replica_messages(q, max_hits) {
+            Ok(hits) => hits,
+            Err(err) => {
+                tracing::warn!(query = %q, error = %err, "FTS5 message search failed");
+                return Vec::new();
+            }
+        };
+        if raw_hits.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(hosts_guard) = self.hosts.read() else {
+            return Vec::new();
+        };
+        let projects_guard = self.projects.read().ok();
+        let mut results = Vec::with_capacity(raw_hits.len());
+
+        for hit in raw_hits {
+            let matched_pair = if !hit.host_id.is_empty() {
+                hosts_guard
+                    .get(&hit.host_id)
+                    .map(|mem| (hit.host_id.as_str(), mem))
+            } else {
+                hosts_guard
+                    .iter()
+                    .find(|(_, mem)| mem.agents.contains_key(&hit.agent_id))
+                    .map(|(hid, mem)| (hid.as_str(), mem))
+            };
+
+            let Some((hid, mem)) = matched_pair else {
+                continue;
+            };
+            if hid.is_empty() {
+                continue;
+            }
+            let Some(ag) = mem.agents.get(&hit.agent_id) else {
+                continue;
+            };
+
+            let resolved_host_id = hid.to_string();
+            let mut host_name = mem.profile.effective_display_name();
+            if host_name.is_empty() {
+                host_name = resolved_host_id.clone();
+            }
+            let title = if ag.title.trim().is_empty() {
+                "Conversation".to_string()
+            } else {
+                ag.title.clone()
+            };
+            let mut updated_at_rfc3339 = hit.timestamp_rfc3339.clone().unwrap_or_default();
+            if updated_at_rfc3339.is_empty() {
+                updated_at_rfc3339 = ag.last_activity_at.unwrap_or(ag.updated_at).to_rfc3339();
+            }
+            let effective_cwd = mem
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == ag.workspace_id)
+                .and_then(|w| {
+                    w.project_root
+                        .as_deref()
+                        .or(w.source_cwd.as_deref())
+                        .or(Some(w.cwd.as_str()))
+                })
+                .unwrap_or(ag.cwd.as_str());
+
+            let mut project_name = String::new();
+            if let Some(ref projects) = projects_guard
+                && let Some(proj) = projects.values().find(|p| {
+                    p.host_id == resolved_host_id
+                        && p.directories.iter().any(|dir| {
+                            cwd_paths_equivalent(effective_cwd, dir)
+                                || cwd_paths_equivalent(&ag.cwd, dir)
+                        })
+                })
+            {
+                project_name = proj.name.clone();
+            }
+            if project_name.is_empty() {
+                project_name = crate::sidebar::basename_of_project_path(effective_cwd);
+            }
+
+            results.push(ConversationSearchHit {
+                host_id: resolved_host_id,
+                host_name,
+                agent_id: hit.agent_id,
+                seq: hit.seq,
+                role: hit.role,
+                title,
+                project_name,
+                snippet: hit.snippet,
+                updated_at_rfc3339,
+            });
+        }
+        results
     }
 
     pub fn render_diagram(
@@ -4296,7 +4460,9 @@ impl OrbitAppCore {
             }
         }
         if let Some((ag, evs, files_restored, is_complete)) = rewound_to_persist {
-            let _ = self.store.replace_replica_timeline(&ag.agent_id, &evs);
+            let _ = self
+                .store
+                .replace_replica_timeline_for_host(host_id, &ag.agent_id, &evs);
             if is_complete {
                 let _ = self
                     .store
@@ -4337,7 +4503,9 @@ impl OrbitAppCore {
             }
         }
         for (stale_ag_id, should_resubscribe) in stale_replica_agents {
-            let _ = self.store.replace_replica_timeline(&stale_ag_id, &[]);
+            let _ = self
+                .store
+                .replace_replica_timeline_for_host(host_id, &stale_ag_id, &[]);
             if should_resubscribe {
                 self.dispatch_wire(
                     host_id,
@@ -12599,6 +12767,264 @@ mod tests {
                 .get_replica_contiguous_seq("ag_gap")
                 .expect("cursor reset"),
             0
+        );
+    }
+
+    #[test]
+    fn search_messages_cross_host_enrichment_cjk_punctuation_and_cleanup() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+
+        // Set up two hosts across a multi-host fleet
+        let mut mem_a = HostMemoryState::new(SavedHostProfile {
+            host_id: "host_devbox".into(),
+            hostname: "devbox.internal".into(),
+            custom_name: Some("Devbox".into()),
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk_a".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            state: HostConnectionState::OnlineDirect,
+        });
+        mem_a.initial_agents_hydrated = true;
+        mem_a.agents.insert(
+            "ag_db".into(),
+            AgentSummary {
+                agent_id: "ag_db".into(),
+                workspace_id: "ws_orbit".into(),
+                cwd: "/Users/dev/code/orbit".into(),
+                title: "SQLite FTS5 Search".into(),
+                provider: ProviderKind::Antigravity,
+                model: None,
+                effort: None,
+                mode: SessionMode::Default,
+                status: AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 2,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: Some(now),
+                read_seq: 2,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                queued_prompts: Vec::new(),
+            },
+        );
+        let mut mem_b = HostMemoryState::new(SavedHostProfile {
+            host_id: "host_mac".into(),
+            hostname: "mac-mini".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk_b".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            state: HostConnectionState::OnlineDirect,
+        });
+        mem_b.initial_agents_hydrated = true;
+        mem_b.agents.insert(
+            "ag_web".into(),
+            AgentSummary {
+                agent_id: "ag_web".into(),
+                workspace_id: "ws_web".into(),
+                cwd: "/srv/projects/orbit-web".into(),
+                title: "Cmd+K UI".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: None,
+                effort: None,
+                mode: SessionMode::Default,
+                status: AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 1,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: Some(now),
+                read_seq: 1,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                queued_prompts: Vec::new(),
+            },
+        );
+
+        {
+            let mut hosts = core.hosts.write().expect("hosts write");
+            hosts.insert("host_devbox".into(), mem_a);
+            hosts.insert("host_mac".into(), mem_b);
+        }
+        core.upsert_project(
+            Some("proj_orbit"),
+            "host_devbox",
+            "Orbit Core",
+            vec!["/Users/dev/code/orbit".into()],
+        )
+        .expect("upsert project");
+
+        // Index replica messages across both hosts
+        core.store
+            .upsert_replica_timeline_events_batch_for_host(
+                "host_devbox",
+                &[
+                    TimelineEvent {
+                        seq: 1,
+                        epoch: 0,
+                        agent_id: "ag_db".into(),
+                        turn_id: Some("t1".into()),
+                        timestamp: now,
+                        payload: TimelinePayload::UserPrompt {
+                            message_id: "m1".into(),
+                            text: "请实现全文检索以及 foo-bar 路由解析与 a/b 测试".into(),
+                            badges: Vec::new(),
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 2,
+                        epoch: 0,
+                        agent_id: "ag_db".into(),
+                        turn_id: Some("t1".into()),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "a1".into(),
+                            text: "Added nebula_fts_engine with BM25 scoring and \"unclosed quote safety.".into(),
+                            streaming: false,
+                        },
+                    },
+                ],
+            )
+            .expect("seed host_devbox");
+
+        core.store
+            .upsert_replica_timeline_event_for_host(
+                "host_mac",
+                &TimelineEvent {
+                    seq: 1,
+                    epoch: 0,
+                    agent_id: "ag_web".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "a2".into(),
+                        text: "Wired nebula_fts_engine into CommandPalette with 80ms debounce."
+                            .into(),
+                        streaming: false,
+                    },
+                },
+            )
+            .expect("seed host_mac");
+
+        // Cross-host query returns enriched hits from both hosts
+        let hits = core.search_messages("nebula_fts_engine", 10);
+        assert_eq!(hits.len(), 2);
+        let devbox_hit = hits
+            .iter()
+            .find(|h| h.host_id == "host_devbox")
+            .expect("devbox hit");
+        assert_eq!(devbox_hit.host_name, "Devbox");
+        assert_eq!(devbox_hit.agent_id, "ag_db");
+        assert_eq!(devbox_hit.title, "SQLite FTS5 Search");
+        assert_eq!(devbox_hit.project_name, "Orbit Core");
+        assert_eq!(devbox_hit.role, "assistant");
+        assert!(
+            devbox_hit
+                .snippet
+                .contains("<mark>nebula_fts_engine</mark>")
+        );
+        assert!(!devbox_hit.updated_at_rfc3339.is_empty());
+
+        let mac_hit = hits
+            .iter()
+            .find(|h| h.host_id == "host_mac")
+            .expect("mac hit");
+        assert_eq!(mac_hit.host_name, "mac-mini");
+        assert_eq!(mac_hit.project_name, "orbit-web");
+
+        // CJK + punctuation queries through OrbitAppCore
+        let cjk_hits = core.search_messages("全文检索", 10);
+        assert_eq!(cjk_hits.len(), 1);
+        assert_eq!(cjk_hits[0].agent_id, "ag_db");
+        assert!(cjk_hits[0].snippet.contains("<mark>全文检索</mark>"));
+
+        assert_eq!(core.search_messages("foo-bar", 10).len(), 1);
+        assert_eq!(core.search_messages("a/b", 10).len(), 1);
+        assert_eq!(core.search_messages("\"unclosed", 10).len(), 1);
+        assert!(core.search_messages("   ", 10).is_empty());
+
+        // Rewinding replica timeline removes rewound events from search results
+        core.store
+            .replace_replica_timeline_for_host("host_devbox", "ag_db", &[])
+            .expect("rewind empty");
+        assert!(core.search_messages("全文检索", 10).is_empty());
+        assert_eq!(core.search_messages("nebula_fts_engine", 10).len(), 1);
+
+        // Deleting agent removes remaining hit
+        core.delete_agent("host_mac", "ag_web");
+        assert!(core.search_messages("nebula_fts_engine", 10).is_empty());
+
+        // Orphaned / unknown-host FTS entries never resurface with empty host_id or placeholder title
+        core.store
+            .upsert_replica_timeline_event_for_host(
+                "host_removed",
+                &TimelineEvent {
+                    seq: 1,
+                    epoch: 0,
+                    agent_id: "ag_ghost".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: "g1".into(),
+                        text: "ghost_orphan_sentinel_token".into(),
+                        badges: Vec::new(),
+                    },
+                },
+            )
+            .expect("seed ghost host");
+        core.store
+            .upsert_replica_timeline_event_for_host(
+                "host_devbox",
+                &TimelineEvent {
+                    seq: 1,
+                    epoch: 0,
+                    agent_id: "ag_missing_from_mem".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: "g2".into(),
+                        text: "ghost_orphan_sentinel_token".into(),
+                        badges: Vec::new(),
+                    },
+                },
+            )
+            .expect("seed missing agent");
+        assert!(
+            core.search_messages("ghost_orphan_sentinel_token", 10)
+                .is_empty(),
+            "orphaned host/agent FTS rows must never surface in search_messages"
         );
     }
 }

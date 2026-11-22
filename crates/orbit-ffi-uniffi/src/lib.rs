@@ -28,10 +28,10 @@ use orbit_client_core::composer::{
     ComposerPasteInput, ComposerQuoteInput, MentionCandidateView, SlashCommandView, SlashDirective,
 };
 use orbit_client_core::contract::{
-    AgentStageDeltaRequest, BridgeInfoView, CreateSessionRequest, FleetSidebarRequest,
-    GitReposInspectionView, MentionRankRequest, ModelSelectionRequest, ReadWorkspaceFileRequest,
-    RenderDiagramRequest, RenderDiagramView, RewindAgentRequest, SendPromptRequest,
-    SpawnWorkspacePeerRequest, UpdateHostConfigRequest,
+    AgentStageDeltaRequest, BridgeInfoView, ConversationSearchHit, CreateSessionRequest,
+    FleetSidebarRequest, GitReposInspectionView, MentionRankRequest, ModelSelectionRequest,
+    ReadWorkspaceFileRequest, RenderDiagramRequest, RenderDiagramView, RewindAgentRequest,
+    SendPromptRequest, SpawnWorkspacePeerRequest, UpdateHostConfigRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, DiagramTheme, detect_diagram_kind as core_detect_diagram_kind,
@@ -72,6 +72,35 @@ uniffi::setup_scaffolding!();
 pub enum FfiOrbitError {
     #[error("{detail}")]
     Core { detail: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiConversationSearchHit {
+    pub host_id: String,
+    pub host_name: String,
+    pub agent_id: String,
+    pub seq: u64,
+    pub role: String,
+    pub title: String,
+    pub project_name: String,
+    pub snippet: String,
+    pub updated_at_rfc3339: String,
+}
+
+impl From<ConversationSearchHit> for FfiConversationSearchHit {
+    fn from(v: ConversationSearchHit) -> Self {
+        Self {
+            host_id: v.host_id,
+            host_name: v.host_name,
+            agent_id: v.agent_id,
+            seq: v.seq,
+            role: v.role,
+            title: v.title,
+            project_name: v.project_name,
+            snippet: v.snippet,
+            updated_at_rfc3339: v.updated_at_rfc3339,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -3793,6 +3822,14 @@ impl OrbitMobileCore {
 
     pub fn bridge_info(&self) -> FfiBridgeInfo {
         self.inner.bridge_info().into()
+    }
+
+    pub fn search_messages(&self, query: String, limit: u32) -> Vec<FfiConversationSearchHit> {
+        self.inner
+            .search_messages(query, limit)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     pub fn fleet_sidebar_request(&self, req: FfiFleetSidebarRequest) -> FfiFleetSidebar {

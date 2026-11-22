@@ -188,10 +188,14 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
 
         CREATE INDEX IF NOT EXISTS idx_psub_events
             ON provider_subagent_events(parent_agent_id, subagent_id, seq);
-
-        PRAGMA user_version = 3;
         ",
     )?;
+    let cur_ver: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if cur_ver < 3 {
+        conn.execute_batch("PRAGMA user_version = 3;")?;
+    }
     Ok(())
 }
 

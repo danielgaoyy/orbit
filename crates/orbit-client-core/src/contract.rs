@@ -158,6 +158,20 @@ pub struct GitReposInspectionView {
     pub nested_git_repos: Vec<NestedGitRepo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSearchHit {
+    pub host_id: String,
+    #[serde(default)]
+    pub host_name: String,
+    pub agent_id: String,
+    pub seq: u64,
+    pub role: String,
+    pub title: String,
+    pub project_name: String,
+    pub snippet: String,
+    pub updated_at_rfc3339: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnWorkspacePeerRequest {
     pub host_id: String,

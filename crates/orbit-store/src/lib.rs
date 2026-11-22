@@ -3,8 +3,10 @@
 //! Replaces Paseo's scattered JSON files with ACID event-sourced timelines and `< 1ms` cursor catch-up.
 
 pub mod orchestration;
+pub mod search;
 pub mod workspace_sync;
 pub use orchestration::*;
+pub use search::{FtsBackfillProgress, MessageSearchHit, build_fts5_match_query};
 pub use workspace_sync::AgentContextSnippet;
 
 use std::collections::{HashMap, HashSet};
@@ -125,7 +127,7 @@ impl OrbitStore {
         Self::init_connection(conn)
     }
 
-    fn init_connection(conn: Connection) -> Result<Self, StoreError> {
+    fn init_connection(mut conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -383,6 +385,7 @@ impl OrbitStore {
                 ON schedules(status, next_run_at);
             ",
         )?;
+        search::migrate_fts5_schema(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -930,6 +933,7 @@ impl OrbitStore {
     pub fn delete_agent(&self, agent_id: &str) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
+        search::delete_daemon_fts_for_agent(&tx, agent_id)?;
         tx.execute(
             "DELETE FROM agent_queued_prompts WHERE agent_id = ?1",
             params![agent_id],
@@ -962,6 +966,22 @@ impl OrbitStore {
 
         if let Some(ref key_val) = ckey {
             let boundary_seq = query_coalesce_boundary_seq(&tx, true, agent_id, &payload, None);
+            let superseded_seqs: Vec<i64> = {
+                if let Ok(mut sel_stmt) = tx.prepare_cached(
+                    "SELECT seq FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
+                ) {
+                    sel_stmt
+                        .query_map(params![agent_id, boundary_seq, key_val], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .ok()
+                        .map(|rows| rows.flatten().collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            };
+            search::delete_daemon_fts_by_seqs(&tx, &superseded_seqs)?;
             if let Ok(mut del_stmt) = tx.prepare_cached(
                 "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
             ) {
@@ -985,6 +1005,7 @@ impl OrbitStore {
             ])?;
         }
         let seq = tx.last_insert_rowid() as u64;
+        search::sync_daemon_fts_upsert(&tx, seq as i64, agent_id, &payload)?;
 
         if let TimelinePayload::StatusChanged { ref status } = payload {
             let status_json = serde_json::to_string(status)?;
@@ -1156,8 +1177,20 @@ impl OrbitStore {
 
     /// Upsert a server-sequenced timeline event into a client's local SQLite replica cache (`0ms` instant load).
     pub fn upsert_replica_timeline_event(&self, ev: &TimelineEvent) -> Result<(), StoreError> {
+        self.upsert_replica_timeline_event_for_host("", ev)
+    }
+
+    /// Host-aware variant of `upsert_replica_timeline_event` that tags the FTS5 index with `host_id`.
+    pub fn upsert_replica_timeline_event_for_host(
+        &self,
+        host_id: &str,
+        ev: &TimelineEvent,
+    ) -> Result<(), StoreError> {
+        let seq_i64 = i64::try_from(ev.seq)
+            .map_err(|_| StoreError::InvalidArgument("sequence number exceeds i64".into()))?;
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
+        let resolved_host = search::resolve_replica_host_id(&tx, host_id, &ev.agent_id);
         let payload_json = serde_json::to_string(&ev.payload)?;
         let ts_str = ev.timestamp.to_rfc3339();
         let event_type = payload_event_type(&ev.payload);
@@ -1166,12 +1199,28 @@ impl OrbitStore {
         if let Some(ref key_val) = ckey {
             let boundary_seq =
                 query_coalesce_boundary_seq(&tx, false, &ev.agent_id, &ev.payload, Some(ev.seq));
+            let superseded_rowids: Vec<i64> = {
+                if let Ok(mut sel_stmt) = tx.prepare_cached(
+                    "SELECT rowid FROM client_replica_events
+                     WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
+                ) {
+                    sel_stmt
+                        .query_map(params![ev.agent_id, boundary_seq, seq_i64, key_val], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .ok()
+                        .map(|rows| rows.flatten().collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            };
+            search::delete_replica_fts_by_rowids(&tx, &superseded_rowids)?;
             if let Ok(mut del_stmt) = tx.prepare_cached(
                 "DELETE FROM client_replica_events
                  WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
             ) {
-                let _ =
-                    del_stmt.execute(params![ev.agent_id, boundary_seq, ev.seq as i64, key_val]);
+                let _ = del_stmt.execute(params![ev.agent_id, boundary_seq, seq_i64, key_val]);
             }
         }
 
@@ -1186,7 +1235,7 @@ impl OrbitStore {
             )?;
             ins_stmt.execute(params![
                 ev.agent_id,
-                ev.seq as i64,
+                seq_i64,
                 ev.epoch,
                 ev.turn_id,
                 ts_str,
@@ -1195,6 +1244,20 @@ impl OrbitStore {
                 ckey.as_deref()
             ])?;
         }
+        let rowid: i64 = {
+            let mut rid_stmt = tx.prepare_cached(
+                "SELECT rowid FROM client_replica_events WHERE agent_id = ?1 AND seq = ?2",
+            )?;
+            rid_stmt.query_row(params![ev.agent_id, seq_i64], |r| r.get(0))?
+        };
+        search::sync_replica_fts_upsert(
+            &tx,
+            rowid,
+            &resolved_host,
+            &ev.agent_id,
+            ev.seq,
+            &ev.payload,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1204,12 +1267,33 @@ impl OrbitStore {
         &self,
         events: &[TimelineEvent],
     ) -> Result<(), StoreError> {
+        self.upsert_replica_timeline_events_batch_for_host("", events)
+    }
+
+    /// Host-aware batch-upsert of replica timeline events in a single SQLite transaction.
+    pub fn upsert_replica_timeline_events_batch_for_host(
+        &self,
+        host_id: &str,
+        events: &[TimelineEvent],
+    ) -> Result<(), StoreError> {
         if events.is_empty() {
             return Ok(());
         }
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
+        let mut host_cache: HashMap<String, String> = HashMap::new();
         for ev in events {
+            let seq_i64 = i64::try_from(ev.seq)
+                .map_err(|_| StoreError::InvalidArgument("sequence number exceeds i64".into()))?;
+            let resolved_host = if !host_id.is_empty() {
+                host_id.to_string()
+            } else if let Some(cached) = host_cache.get(&ev.agent_id) {
+                cached.clone()
+            } else {
+                let resolved = search::resolve_replica_host_id(&tx, "", &ev.agent_id);
+                host_cache.insert(ev.agent_id.clone(), resolved.clone());
+                resolved
+            };
             let payload_json = serde_json::to_string(&ev.payload)?;
             let ts_str = ev.timestamp.to_rfc3339();
             let event_type = payload_event_type(&ev.payload);
@@ -1222,16 +1306,28 @@ impl OrbitStore {
                     &ev.payload,
                     Some(ev.seq),
                 );
+                let superseded_rowids: Vec<i64> = {
+                    if let Ok(mut sel_stmt) = tx.prepare_cached(
+                        "SELECT rowid FROM client_replica_events
+                         WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
+                    ) {
+                        sel_stmt
+                            .query_map(params![ev.agent_id, boundary_seq, seq_i64, key_val], |r| {
+                                r.get::<_, i64>(0)
+                            })
+                            .ok()
+                            .map(|rows| rows.flatten().collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                search::delete_replica_fts_by_rowids(&tx, &superseded_rowids)?;
                 if let Ok(mut del_stmt) = tx.prepare_cached(
                     "DELETE FROM client_replica_events
                      WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
                 ) {
-                    let _ = del_stmt.execute(params![
-                        ev.agent_id,
-                        boundary_seq,
-                        ev.seq as i64,
-                        key_val
-                    ]);
+                    let _ = del_stmt.execute(params![ev.agent_id, boundary_seq, seq_i64, key_val]);
                 }
             }
             {
@@ -1245,7 +1341,7 @@ impl OrbitStore {
                 )?;
                 ins_stmt.execute(params![
                     ev.agent_id,
-                    ev.seq as i64,
+                    seq_i64,
                     ev.epoch,
                     ev.turn_id,
                     ts_str,
@@ -1254,6 +1350,20 @@ impl OrbitStore {
                     ckey.as_deref()
                 ])?;
             }
+            let rowid: i64 = {
+                let mut rid_stmt = tx.prepare_cached(
+                    "SELECT rowid FROM client_replica_events WHERE agent_id = ?1 AND seq = ?2",
+                )?;
+                rid_stmt.query_row(params![ev.agent_id, seq_i64], |r| r.get(0))?
+            };
+            search::sync_replica_fts_upsert(
+                &tx,
+                rowid,
+                &resolved_host,
+                &ev.agent_id,
+                ev.seq,
+                &ev.payload,
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -1341,8 +1451,20 @@ impl OrbitStore {
         agent_id: &str,
         events: &[TimelineEvent],
     ) -> Result<(), StoreError> {
+        self.replace_replica_timeline_for_host("", agent_id, events)
+    }
+
+    /// Host-aware variant of `replace_replica_timeline` that keeps `client_timeline_fts` in sync.
+    pub fn replace_replica_timeline_for_host(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        events: &[TimelineEvent],
+    ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
+        let resolved_host = search::resolve_replica_host_id(&tx, host_id, agent_id);
+        search::delete_replica_fts_for_agent(&tx, agent_id)?;
         tx.execute(
             "DELETE FROM client_replica_events WHERE agent_id = ?1",
             params![agent_id],
@@ -1356,10 +1478,30 @@ impl OrbitStore {
                 .map_err(|_| StoreError::InvalidArgument("sequence number exceeds i64".into()))?;
             let payload_json = serde_json::to_string(&ev.payload)?;
             let ts_str = ev.timestamp.to_rfc3339();
+            let event_type = payload_event_type(&ev.payload);
+            let ckey = coalesce_key(&ev.payload);
             tx.execute(
-                "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![agent_id, seq_i64, ev.epoch, ev.turn_id, ts_str, payload_json],
+                "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json, event_type, coalesce_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    agent_id,
+                    seq_i64,
+                    ev.epoch,
+                    ev.turn_id,
+                    ts_str,
+                    payload_json,
+                    event_type,
+                    ckey.as_deref()
+                ],
+            )?;
+            let rowid = tx.last_insert_rowid();
+            search::sync_replica_fts_upsert(
+                &tx,
+                rowid,
+                &resolved_host,
+                agent_id,
+                ev.seq,
+                &ev.payload,
             )?;
         }
         tx.commit()?;
@@ -1468,6 +1610,26 @@ impl OrbitStore {
     ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
+        let existing_ids: Vec<String> = {
+            let mut stmt =
+                tx.prepare_cached("SELECT agent_id FROM client_replica_agents WHERE host_id = ?1")?;
+            let rows = stmt.query_map(params![host_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let incoming_ids: HashSet<&str> = agents.iter().map(|a| a.agent_id.as_str()).collect();
+        for old_id in &existing_ids {
+            if !incoming_ids.contains(old_id.as_str()) {
+                search::delete_replica_fts_for_agent(&tx, old_id)?;
+                tx.execute(
+                    "DELETE FROM client_replica_events WHERE agent_id = ?1",
+                    params![old_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM client_replica_cursors WHERE agent_id = ?1",
+                    params![old_id],
+                )?;
+            }
+        }
         tx.execute(
             "DELETE FROM client_replica_agents WHERE host_id = ?1",
             params![host_id],
@@ -1501,11 +1663,22 @@ impl OrbitStore {
     }
 
     pub fn delete_replica_agent(&self, host_id: &str, agent_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.execute(
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        search::delete_replica_fts_for_agent(&tx, agent_id)?;
+        tx.execute(
+            "DELETE FROM client_replica_events WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        tx.execute(
+            "DELETE FROM client_replica_cursors WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        tx.execute(
             "DELETE FROM client_replica_agents WHERE host_id = ?1 AND agent_id = ?2",
             params![host_id, agent_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1707,6 +1880,7 @@ impl OrbitStore {
                 })
         });
 
+        search::delete_daemon_fts_from_seq(&tx, agent_id, to_before_i64)?;
         tx.execute(
             "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq >= ?2",
             params![agent_id, to_before_i64],
@@ -1918,44 +2092,50 @@ impl OrbitStore {
     }
 
     pub fn delete_client_host(&self, host_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.execute(
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        search::delete_replica_fts_and_events_for_host(&tx, host_id)?;
+        tx.execute(
             "DELETE FROM client_hosts WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_projects WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_replica_agents WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_thread_prefs WHERE host_id = ?1",
             params![host_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn clear_host_replica(&self, host_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.execute(
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        search::delete_replica_fts_and_events_for_host(&tx, host_id)?;
+        tx.execute(
             "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_replica_agents WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_thread_prefs WHERE host_id = ?1",
             params![host_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2238,6 +2418,7 @@ impl OrbitStore {
         if legacy_count <= 0 {
             return Ok(0);
         }
+        search::clear_daemon_fts(&conn)?;
         conn.execute("DELETE FROM turn_checkpoints", [])?;
         conn.execute("DELETE FROM timeline_events", [])?;
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");

@@ -849,7 +849,7 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
         WireMessage::TimelineCatchup {
             agent_id, events, ..
         } => {
-            if let Err(err) = store.upsert_replica_timeline_events_batch(events) {
+            if let Err(err) = store.upsert_replica_timeline_events_batch_for_host(host_id, events) {
                 tracing::warn!(
                     host_id = %host_id,
                     agent_id = %agent_id,
@@ -860,7 +860,7 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
             }
         }
         WireMessage::TimelineLive { event } => {
-            if let Err(err) = store.upsert_replica_timeline_event(event) {
+            if let Err(err) = store.upsert_replica_timeline_event_for_host(host_id, event) {
                 tracing::warn!(
                     host_id = %host_id,
                     agent_id = %event.agent_id,

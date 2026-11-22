@@ -38,8 +38,9 @@ use orbit_client_core::composer::{
     SlashCommandView,
 };
 use orbit_client_core::contract::{
-    BridgeInfoView, FleetSidebarRequest, GitReposInspectionView, MentionRankRequest,
-    ModelSelectionRequest, RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
+    BridgeInfoView, ConversationSearchHit, FleetSidebarRequest, GitReposInspectionView,
+    MentionRankRequest, ModelSelectionRequest, RenderDiagramRequest, RenderDiagramView,
+    SpawnWorkspacePeerRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
@@ -101,6 +102,19 @@ fn get_bridge_info(state: State<'_, DesktopAppState>) -> BridgeInfoView {
 #[tauri::command]
 fn get_fleet_overview(state: State<'_, DesktopAppState>) -> FleetOverviewView {
     state.core.fleet_overview()
+}
+
+#[tauri::command]
+async fn search_messages(
+    state: State<'_, DesktopAppState>,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<ConversationSearchHit>, String> {
+    let core = Arc::clone(&state.core);
+    let max_hits = limit.unwrap_or(20);
+    tauri::async_runtime::spawn_blocking(move || core.search_messages(&query, max_hits))
+        .await
+        .map_err(|e| format!("search messages task error: {e}"))
 }
 
 #[tauri::command]
@@ -2048,6 +2062,7 @@ pub fn run() {
             subscribe_core_events,
             get_bridge_info,
             get_fleet_overview,
+            search_messages,
             get_fleet_sidebar,
             get_host_detail,
             get_agent_stage,

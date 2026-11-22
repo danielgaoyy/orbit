@@ -325,6 +325,13 @@ export function sideQuestionScopeKey(s: Pick<OrbitUiState, "selectedHostId" | "s
   return `${s.selectedHostId ?? "none"}::${s.selectedAgentId}`;
 }
 
+export interface PendingJumpTarget {
+  hostId: string;
+  agentId: string;
+  seq: number;
+  nonce: number;
+}
+
 export interface OrbitUiState {
   fleet: FleetOverviewView;
   fleetHydrated: boolean;
@@ -335,6 +342,7 @@ export interface OrbitUiState {
   selectedWorkspaceCwd: string;
   isDraftNewSession: boolean;
   sessionScrollNonce: number;
+  pendingJumpTarget: PendingJumpTarget | null;
 
   // Draft new-session launch configuration
   draftProvider: ProviderKind;
@@ -674,6 +682,7 @@ const defaultInitialState: OrbitUiState = {
   selectedWorkspaceCwd: "",
   isDraftNewSession: false,
   sessionScrollNonce: 0,
+  pendingJumpTarget: null,
 
   draftProvider: initialPrefs.draftProvider ?? "codex",
   draftModels: {
@@ -2733,6 +2742,7 @@ export const orbitActions = {
         selectedAgentId: firstAgent?.agent_id ?? null,
         isDraftNewSession: stayInDraft || firstAgent === null,
         sessionScrollNonce: s.sessionScrollNonce + 1,
+        pendingJumpTarget: null,
         selectedWorkspaceCwd: nextCwd,
         selectedDiffPath: null,
         draftWorktreeRepoPath: null,
@@ -2756,7 +2766,7 @@ export const orbitActions = {
     }
   },
 
-  selectAgent(hostId: string, agentId: string): void {
+  selectAgent(hostId: string, agentId: string, jumpToSeq?: number | null): void {
     flushPendingSeenMarks();
     pendingDraftCreate = null;
     const detail = state.hostDetails[hostId];
@@ -2783,6 +2793,11 @@ export const orbitActions = {
             : (remainingSideTabs[remainingSideTabs.length - 1]?.id ?? null)
           : s.activeSidePanelTabId;
         const shouldCloseSidePanel = tabsChanged && remainingSideTabs.length === 0;
+        const nextNonce = s.sessionScrollNonce + 1;
+        const nextJumpTarget =
+          typeof jumpToSeq === "number" && jumpToSeq > 0
+            ? { hostId, agentId, seq: jumpToSeq, nonce: nextNonce }
+            : null;
         return {
           ...s,
           activeView: "workspace",
@@ -2790,7 +2805,8 @@ export const orbitActions = {
           selectedHostId: hostId,
           selectedAgentId: agentId,
           isDraftNewSession: false,
-          sessionScrollNonce: s.sessionScrollNonce + 1,
+          sessionScrollNonce: nextNonce,
+          pendingJumpTarget: nextJumpTarget,
           selectedWorkspaceCwd: nextCwd,
           selectedDiffPath: null,
           archivedThreads: nextArchived,
@@ -2827,6 +2843,14 @@ export const orbitActions = {
     }
   },
 
+  clearPendingJumpTarget(nonce: number): void {
+    setState((s) =>
+      s.pendingJumpTarget && s.pendingJumpTarget.nonce === nonce
+        ? { ...s, pendingJumpTarget: null }
+        : s,
+    );
+  },
+
   startNewThreadDraft(
     hostId?: string,
     cwd?: string,
@@ -2858,6 +2882,7 @@ export const orbitActions = {
       selectedHostId: targetHostId,
       selectedAgentId: null,
       isDraftNewSession: true,
+      pendingJumpTarget: null,
       selectedWorkspaceCwd: defaultCwd || "~",
       draftWorktreeRepoPath: null,
       draftWorkspaceId: workspaceId ?? null,

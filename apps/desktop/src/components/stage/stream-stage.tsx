@@ -88,6 +88,7 @@ import {
   AgentMessageCard,
   ParentSubagentBanner,
   SubagentApprovalBanner,
+  SubagentsTrack,
 } from "@/components/stage/subagents-track";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
 import { Button } from "@/components/ui/button";
@@ -4458,6 +4459,7 @@ export function StreamStage() {
         >
           <div style={stagePushStyle}>
             <SubagentApprovalBanner hostId={selectedHostId} agentId={selectedAgentId} />
+            <SubagentsTrack hostId={selectedHostId} agentId={selectedAgentId} />
             <StickyApprovalDock
               hostId={selectedHostId}
               agentId={selectedAgentId}

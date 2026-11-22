@@ -1537,6 +1537,10 @@ struct FleetDrawerView: View {
             Circle()
                 .fill(Color(hex: "#0EA5E9"))
                 .frame(width: 6, height: 6)
+        } else if agent.isBackgroundWaiting {
+            Image(systemName: "timer")
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(palette.fgMuted.opacity(0.8))
         } else if isWorktree {
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 11.5, weight: .medium))

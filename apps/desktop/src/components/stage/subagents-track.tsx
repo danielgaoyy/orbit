@@ -1,19 +1,30 @@
 import { memo, useMemo, useState } from "react";
 import {
   AlertTriangle,
+  Archive,
   ArrowLeft,
   ArrowUpRight,
   Check,
   ChevronRight,
+  ChevronUp,
   HeartPulse,
+  Layers,
   Server,
   Sparkles,
   Unlink,
   X,
 } from "lucide-react";
-import { type AgentCardView, type TimelineItemView, orbitIpc } from "@/lib/orbit-ipc";
+import {
+  type AgentCardView,
+  type ProviderSubagentDescriptor,
+  type TimelineItemView,
+  isAgentForegroundRunning,
+  orbitIpc,
+} from "@/lib/orbit-ipc";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/overlays";
+import { isSubagentArchived, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 /**
@@ -149,6 +160,279 @@ export const SubagentApprovalBanner = memo(function SubagentApprovalBanner({
           <ArrowUpRight className="size-[12.5px]" />
         </button>
       </div>
+    </div>
+  );
+});
+
+/**
+ * Compact docked Subagents pill above the composer (matching iOS `SubagentsTrackPill`)
+ * for quick visibility and 1-click Side Panel inspection of managed & native subagents.
+ */
+export const SubagentsTrack = memo(function SubagentsTrack({
+  hostId,
+  agentId,
+}: {
+  hostId: string | null;
+  agentId: string | null;
+}) {
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
+  const [open, setOpen] = useState(false);
+
+  const managedSubagents = useMemo(() => {
+    if (!hostId || !agentId) return [];
+    const out: { hostId: string; hostName: string | null; agent: AgentCardView }[] = [];
+    for (const [hid, detail] of Object.entries(hostDetails)) {
+      const hostName =
+        hid !== hostId
+          ? (fleetHosts.find((h) => h.host_id === hid)?.display_name ??
+            detail.host.display_name ??
+            hid)
+          : null;
+      for (const ag of detail.agents) {
+        if (ag.archived_at_rfc3339) continue;
+        const matchesParent =
+          ag.parent_agent_id === agentId &&
+          (!ag.parent_host_id || ag.parent_host_id === hostId);
+        if (matchesParent) {
+          out.push({ hostId: hid, hostName, agent: ag });
+        }
+      }
+    }
+    return out;
+  }, [hostId, agentId, hostDetails, fleetHosts]);
+
+  const providerSubagents: ProviderSubagentDescriptor[] = useMemo(() => {
+    if (!hostId || !agentId) return [];
+    return (hostDetails[hostId]?.provider_subagents?.[agentId] ?? []).filter(
+      (ps) =>
+        !isSubagentArchived(archivedSubagents, hostId, agentId, {
+          id: ps.subagent_id,
+          providerSubagentId: ps.subagent_id,
+        }),
+    );
+  }, [hostId, agentId, hostDetails, archivedSubagents]);
+
+  const totalCount = managedSubagents.length + providerSubagents.length;
+  if (!hostId || !agentId || totalCount === 0) return null;
+
+  const runningCount =
+    managedSubagents.filter((m) => isAgentForegroundRunning(m.agent)).length +
+    providerSubagents.filter((p) => p.status === "running").length;
+  const awaitingPermCount = managedSubagents.filter(
+    (m) => m.agent.is_awaiting_permission,
+  ).length;
+  const finishedManaged = managedSubagents.filter(
+    (m) => !isAgentForegroundRunning(m.agent) && !m.agent.is_awaiting_permission,
+  );
+  const finishedNative = providerSubagents.filter((p) => p.status !== "running");
+  const totalFinishedCount = finishedManaged.length + finishedNative.length;
+
+  return (
+    <div className="mx-auto mb-1.5 flex w-full max-w-[780px] justify-start px-4">
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className={cn(
+              "border-border/80 bg-elevated/90 hover:bg-accent/70 inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-full border px-2.5 text-[12px] shadow-xs backdrop-blur-sm transition-colors",
+              awaitingPermCount > 0 && "border-amber-500/40 bg-amber-500/[0.07]",
+            )}
+          >
+            {awaitingPermCount > 0 ? (
+              <span className="size-[6.5px] shrink-0 rounded-full bg-amber-500" />
+            ) : runningCount > 0 ? (
+              <OrbitSpinner size={12} className="text-foreground/75" />
+            ) : (
+              <Layers className="text-muted-foreground size-[12.5px] shrink-0" />
+            )}
+
+            <span className="text-foreground/90 font-medium">
+              Subagents · {totalCount}
+            </span>
+
+            {awaitingPermCount > 0 ? (
+              <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                {awaitingPermCount} waiting
+              </span>
+            ) : runningCount > 0 ? (
+              <span className="text-muted-foreground text-[11px]">
+                {runningCount} running
+              </span>
+            ) : null}
+
+            <ChevronUp
+              className={cn(
+                "text-muted-foreground/70 size-[12px] transition-transform",
+                open && "rotate-180",
+              )}
+            />
+          </button>
+        </PopoverTrigger>
+
+        <PopoverContent
+          align="start"
+          side="top"
+          sideOffset={6}
+          className="border-border bg-popover w-[340px] max-w-[calc(100vw-32px)] rounded-xl border p-1.5 shadow-lg"
+        >
+          <div className="flex items-center justify-between px-2 py-1">
+            <span className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
+              Subagents ({totalCount})
+            </span>
+            {totalFinishedCount > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  for (const m of finishedManaged) {
+                    orbitActions.archiveThread(m.hostId, m.agent.agent_id);
+                  }
+                  for (const p of finishedNative) {
+                    orbitActions.archiveSubagent(hostId, agentId, {
+                      id: p.subagent_id,
+                      providerSubagentId: p.subagent_id,
+                    });
+                  }
+                }}
+                className="text-muted-foreground hover:text-foreground cursor-pointer text-[11px] transition-colors"
+              >
+                Archive finished
+              </button>
+            )}
+          </div>
+
+          <div className="max-h-[260px] space-y-0.5 overflow-y-auto">
+            {managedSubagents.map(({ hostId: childHostId, hostName, agent }) => {
+              const isRunning = isAgentForegroundRunning(agent);
+              return (
+                <div
+                  key={`${childHostId}::${agent.agent_id}`}
+                  className="hover:bg-accent/60 flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-[12.5px] transition-colors"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpen(false);
+                      orbitActions.openSubagentTab({
+                        callId: agent.agent_id,
+                        role: agent.title || "Subagent",
+                        promptPreview: agent.task_summary ?? "",
+                        childAgentId: agent.agent_id,
+                        childHostId,
+                        parentAgentId: agentId,
+                      });
+                    }}
+                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+                  >
+                    {agent.is_awaiting_permission ? (
+                      <span className="size-[6.5px] shrink-0 rounded-full bg-amber-500" />
+                    ) : isRunning ? (
+                      <OrbitSpinner size={12} className="text-foreground/75 shrink-0" />
+                    ) : (
+                      <Check className="text-emerald-500 size-[12px] shrink-0" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <div className="text-foreground truncate font-medium">
+                        {agent.title || "Subagent"}
+                      </div>
+                      <div className="text-muted-foreground flex items-center gap-1.5 truncate text-[11px]">
+                        <span>{agent.status_label}</span>
+                        {hostName && <span>· {hostName}</span>}
+                      </div>
+                    </div>
+                  </button>
+
+                  <div className="flex shrink-0 items-center gap-0.5">
+                    <button
+                      type="button"
+                      title="Open thread"
+                      onClick={() => {
+                        setOpen(false);
+                        orbitActions.selectAgent(childHostId, agent.agent_id);
+                      }}
+                      className="text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer rounded p-1 transition-colors"
+                    >
+                      <ArrowUpRight className="size-[13px]" />
+                    </button>
+                    {!isRunning && !agent.is_awaiting_permission && (
+                      <button
+                        type="button"
+                        title="Archive subagent"
+                        onClick={() => orbitActions.archiveThread(childHostId, agent.agent_id)}
+                        className="text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer rounded p-1 transition-colors"
+                      >
+                        <Archive className="size-[12.5px]" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+
+            {providerSubagents.map((sub) => {
+              const isRunning = sub.status === "running";
+              const isFailed = sub.status === "failed";
+              return (
+                <div
+                  key={sub.subagent_id}
+                  className="hover:bg-accent/60 flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-[12.5px] transition-colors"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpen(false);
+                      orbitActions.openSubagentTab({
+                        callId: sub.subagent_id,
+                        role: sub.title || sub.subagent_id,
+                        promptPreview: sub.subtitle ?? "",
+                        childAgentId: null,
+                        providerSubagentId: sub.subagent_id,
+                        parentAgentId: agentId,
+                      });
+                    }}
+                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+                  >
+                    {isRunning ? (
+                      <OrbitSpinner size={12} className="text-foreground/75 shrink-0" />
+                    ) : isFailed ? (
+                      <AlertTriangle className="text-rose-500 size-[12px] shrink-0" />
+                    ) : (
+                      <Check className="text-emerald-500 size-[12px] shrink-0" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <div className="text-foreground truncate font-medium">
+                        {sub.title || sub.subagent_id}
+                      </div>
+                      {sub.subtitle && (
+                        <div className="text-muted-foreground truncate text-[11px]">
+                          {sub.subtitle}
+                        </div>
+                      )}
+                    </div>
+                  </button>
+
+                  {!isRunning && (
+                    <button
+                      type="button"
+                      title="Archive subagent"
+                      onClick={() =>
+                        orbitActions.archiveSubagent(hostId, agentId, {
+                          id: sub.subagent_id,
+                          providerSubagentId: sub.subagent_id,
+                        })
+                      }
+                      className="text-muted-foreground hover:text-foreground hover:bg-accent shrink-0 cursor-pointer rounded p-1 transition-colors"
+                    >
+                      <Archive className="size-[12.5px]" />
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </PopoverContent>
+      </Popover>
     </div>
   );
 });

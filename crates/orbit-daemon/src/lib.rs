@@ -8,6 +8,7 @@
 
 pub mod artifacts;
 pub mod attachments;
+pub mod browser;
 pub mod connected_hosts;
 pub mod cron;
 pub mod discovery;
@@ -79,6 +80,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::attachments::AttachmentStagingManager;
+use crate::browser::{BrowserManager, CreateBrowserSessionSpec};
 use crate::connected_hosts::ConnectedHostsManager;
 use crate::finish_subscriptions::FinishSubscriptionManager;
 use crate::git::{
@@ -234,6 +236,7 @@ pub struct DaemonRuntime {
     pub triggers: Arc<EventTriggerEngine>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
     pub lsp: Arc<LspManager>,
+    pub browser: Arc<BrowserManager>,
     pub hooks: Arc<HooksEngine>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
@@ -361,6 +364,7 @@ impl DaemonRuntime {
             orch_config.clone(),
         );
         let lsp = LspManager::new(home_dir.to_path_buf());
+        let browser = BrowserManager::new(home_dir.to_path_buf());
 
         let home_for_probe = home_dir.to_path_buf();
         let available_providers = tokio::task::spawn_blocking(move || {
@@ -409,6 +413,7 @@ impl DaemonRuntime {
                 crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
             ))),
             lsp,
+            browser,
             hooks,
             provider_catalogs,
             mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -434,10 +439,11 @@ impl DaemonRuntime {
         self.goals.start_recovery().await;
         // 3c. Start GitHub PR/Issue/CI polling fallback loop for enabled event triggers
         self.triggers.spawn_background_poller().await;
-        // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup & LSP Idle Reaper loops
+        // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup, LSP & Browser Idle Reaper loops
         drop(self.scheduler.spawn_background());
         drop(self.idle_cleanup.spawn_background());
         drop(self.lsp.spawn_idle_reaper());
+        drop(self.browser.spawn_idle_reaper());
 
         // 5. Warm login-shell environment snapshot & provider model catalogs in background (non-blocking)
         orbit_providers::set_snapshot_orbit_home(&self.home_dir);
@@ -651,6 +657,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             runtime_shutdown.goals.shutdown_all().await;
             runtime_shutdown.triggers.shutdown().await;
             runtime_shutdown.lsp.shutdown_all().await;
+            runtime_shutdown.browser.shutdown_all().await;
             runtime_shutdown.keep_awake.shutdown();
         })
         .await?;
@@ -3646,6 +3653,128 @@ async fn handle_wire_rpc(
                         monitor,
                     },
                     Err(e) => rpc_err(request_id, "stop_monitor_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Pure-Rust CDP Browser Automation & Guarded Computer Use
+        WireMessage::ListBrowserSessions {
+            request_id,
+            include_screenshots,
+        } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let snap = browser
+                    .list_snapshot_with_options(include_screenshots)
+                    .await;
+                let reply = WireMessage::BrowserSessionsSnapshot {
+                    request_id,
+                    sessions: snap.sessions,
+                    policy: snap.policy,
+                    chrome_binary: snap.chrome_binary,
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::CreateBrowserSession {
+            request_id,
+            agent_id,
+            initial_url,
+            headless,
+            viewport_width,
+            viewport_height,
+        } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match browser
+                    .create_session(CreateBrowserSessionSpec {
+                        agent_id,
+                        initial_url,
+                        headless,
+                        viewport_width,
+                        viewport_height,
+                    })
+                    .await
+                {
+                    Ok(session) => WireMessage::BrowserSessionUpdated {
+                        request_id,
+                        session,
+                    },
+                    Err(e) => rpc_err(request_id, "create_browser_session_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ExecuteBrowserAction {
+            request_id,
+            session_id,
+            action,
+        } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match browser.execute_action(&session_id, action).await {
+                    Ok(outcome) => WireMessage::BrowserActionResponse {
+                        request_id,
+                        session: outcome.session,
+                        elements: outcome.elements,
+                        screenshot_base64: outcome.screenshot_base64,
+                        text_excerpt: outcome.text_excerpt,
+                        captcha_detected: outcome.captcha_detected,
+                    },
+                    Err(e) => rpc_err(request_id, "execute_browser_action_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::CloseBrowserSession {
+            request_id,
+            session_id,
+        } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match browser.close_session(&session_id).await {
+                    Ok(snap) => WireMessage::BrowserSessionsSnapshot {
+                        request_id,
+                        sessions: snap.sessions,
+                        policy: snap.policy,
+                        chrome_binary: snap.chrome_binary,
+                    },
+                    Err(e) => rpc_err(request_id, "close_browser_session_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::UpdateBrowserPolicy { request_id, policy } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match browser.update_policy(policy).await {
+                    Ok(snap) => WireMessage::BrowserSessionsSnapshot {
+                        request_id,
+                        sessions: snap.sessions,
+                        policy: snap.policy,
+                        chrome_binary: snap.chrome_binary,
+                    },
+                    Err(e) => rpc_err(request_id, "update_browser_policy_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });

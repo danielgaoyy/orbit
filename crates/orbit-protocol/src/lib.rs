@@ -2,6 +2,7 @@
 
 pub mod acp;
 pub mod artifacts;
+pub mod browser;
 pub mod goals;
 pub mod guardian;
 pub mod handoff;
@@ -18,6 +19,7 @@ pub mod triggers;
 pub mod usage;
 pub use acp::*;
 pub use artifacts::*;
+pub use browser::*;
 pub use goals::*;
 pub use guardian::*;
 pub use handoff::*;
@@ -2465,6 +2467,62 @@ pub enum WireMessage {
     EventTriggerTestResponse {
         request_id: Uuid,
         delivery: EventTriggerDelivery,
+    },
+
+    // --- Pure-Rust CDP Browser Automation & Guarded Computer Use ---
+    ListBrowserSessions {
+        request_id: Uuid,
+        #[serde(default = "wire_default_true")]
+        include_screenshots: bool,
+    },
+    BrowserSessionsSnapshot {
+        request_id: Uuid,
+        sessions: Vec<BrowserSessionSummary>,
+        policy: BrowserPolicyConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chrome_binary: Option<String>,
+    },
+    CreateBrowserSession {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        headless: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewport_width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewport_height: Option<u32>,
+    },
+    BrowserSessionUpdated {
+        request_id: Uuid,
+        session: BrowserSessionSummary,
+    },
+    ExecuteBrowserAction {
+        request_id: Uuid,
+        session_id: String,
+        action: BrowserActionRequest,
+    },
+    BrowserActionResponse {
+        request_id: Uuid,
+        session: BrowserSessionSummary,
+        #[serde(default)]
+        elements: Vec<BrowserElementRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screenshot_base64: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_excerpt: Option<String>,
+        #[serde(default)]
+        captcha_detected: bool,
+    },
+    CloseBrowserSession {
+        request_id: Uuid,
+        session_id: String,
+    },
+    UpdateBrowserPolicy {
+        request_id: Uuid,
+        policy: BrowserPolicyConfig,
     },
 
     RpcError {

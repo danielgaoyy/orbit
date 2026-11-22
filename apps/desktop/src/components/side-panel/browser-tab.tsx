@@ -1,21 +1,30 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertCircle,
   AppWindow,
   ArrowLeft,
   ArrowRight,
+  Camera,
+  ChevronDown,
+  ChevronUp,
   ExternalLink,
   Globe,
+  History,
+  Layers,
   Maximize2,
   Monitor,
+  Play,
   RotateCw,
   Smartphone,
   Tablet,
+  X,
 } from "lucide-react";
 import { orbitIpc } from "@/lib/orbit-ipc";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 type ViewportPreset = "fluid" | "desktop" | "tablet" | "mobile";
+type BrowserPanelMode = "preview" | "cdp";
 
 const VIEWPORT_WIDTHS: Record<ViewportPreset, number | null> = {
   fluid: null,
@@ -78,6 +87,18 @@ function isLocalUrl(url: string): boolean {
   }
 }
 
+function formatAuditTime(ms: number): string {
+  try {
+    return new Date(ms).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
 export interface BrowserTabOverlayState {
   /** Reserved extension hook: locks pointer interaction on the preview canvas while active */
   readOnly: boolean;
@@ -95,6 +116,7 @@ export const BrowserTab = memo(function BrowserTab({
   overlayState?: BrowserTabOverlayState;
 }) {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const detectedUrls = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights.detected_local_urls ??
@@ -106,22 +128,44 @@ export const BrowserTab = memo(function BrowserTab({
       ? (s.fleet.hosts.find((h) => h.host_id === s.selectedHostId) ?? null)
       : null,
   );
+  const hostBrowser = useOrbitSelector((s) =>
+    s.selectedHostId ? (s.browserByHost[s.selectedHostId] ?? null) : null,
+  );
 
   const initialUrl = sanitizeHttpUrl(tab.url ?? "");
+  const [mode, setMode] = useState<BrowserPanelMode>("preview");
   const [navState, setNavState] = useState<{ entries: string[]; idx: number }>(() =>
     initialUrl ? { entries: [initialUrl], idx: 0 } : { entries: [], idx: -1 },
   );
-  const [addressInput, setAddressInput] = useState(initialUrl);
+  const [previewAddressInput, setPreviewAddressInput] = useState(initialUrl);
+  const [cdpAddressInput, setCdpAddressInput] = useState(initialUrl);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [viewportPreset, setViewportPreset] = useState<ViewportPreset>("fluid");
   const [isLoading, setIsLoading] = useState(false);
   const [dismissedFrameTip, setDismissedFrameTip] = useState(false);
   const [stageWidth, setStageWidth] = useState(0);
+  const [auditOpen, setAuditOpen] = useState(false);
+  const [consoleOpen, setConsoleOpen] = useState(false);
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const addressInputRef = useRef<HTMLInputElement | null>(null);
   const activeUrl = navState.idx >= 0 ? sanitizeHttpUrl(navState.entries[navState.idx] ?? "") : "";
+
+  const cdpSessions = hostBrowser?.sessions ?? [];
+  const activeCdpSession = useMemo(() => {
+    if (cdpSessions.length === 0) return null;
+    if (hostBrowser?.activeSessionId) {
+      return (
+        cdpSessions.find((s) => s.session_id === hostBrowser.activeSessionId) ?? cdpSessions[0]
+      );
+    }
+    return cdpSessions[0];
+  }, [cdpSessions, hostBrowser?.activeSessionId]);
+
+  const cdpBusy = Boolean(hostBrowser?.busy);
+  const hasCdpSessions = cdpSessions.length > 0;
+  const isCdpMode = mode === "cdp";
 
   useEffect(() => {
     const el = stageRef.current;
@@ -134,6 +178,22 @@ export const BrowserTab = memo(function BrowserTab({
     return () => ro.disconnect();
   }, []);
 
+  // Load host CDP sessions when visible or switching into CDP mode
+  useEffect(() => {
+    if (!visible || !selectedHostId) return;
+    if (isCdpMode || !hostBrowser) {
+      void orbitActions.loadBrowserSessions(selectedHostId);
+    }
+  }, [visible, selectedHostId, isCdpMode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Sync CDP address bar with live CDP session URL without disturbing Preview address input
+  useEffect(() => {
+    if (!activeCdpSession) return;
+    if (activeCdpSession.url && activeCdpSession.url !== "about:blank") {
+      setCdpAddressInput(activeCdpSession.url);
+    }
+  }, [activeCdpSession?.session_id, activeCdpSession?.url]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Clear loading spinner if a blocked/unreachable origin never triggers iframe `onLoad`
   useEffect(() => {
     if (!isLoading) return;
@@ -142,6 +202,7 @@ export const BrowserTab = memo(function BrowserTab({
   }, [isLoading, activeUrl, reloadNonce]);
 
   // Sync external navigation requests (e.g. clicking a localhost link from Overview/Stage)
+  // only into Preview address input so live CDP address input is never clobbered.
   useEffect(() => {
     const incoming = sanitizeHttpUrl(tab.url ?? "");
     if (!incoming || incoming === activeUrl) return;
@@ -151,14 +212,42 @@ export const BrowserTab = memo(function BrowserTab({
       const nextEntries = [...base, incoming];
       return { entries: nextEntries, idx: nextEntries.length - 1 };
     });
-    setAddressInput(incoming);
+    setPreviewAddressInput(incoming);
     setDismissedFrameTip(false);
     setIsLoading(true);
   }, [tab.url]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const runCdpNavigateAndCapture = async (url: string) => {
+    if (!selectedHostId) return;
+    if (!activeCdpSession) {
+      await orbitActions.createBrowserSession({
+        hostId: selectedHostId,
+        agentId: selectedAgentId ?? null,
+        initialUrl: url,
+      });
+      return;
+    }
+    const navRes = await orbitActions.executeBrowserAction(
+      selectedHostId,
+      activeCdpSession.session_id,
+      { kind: "navigate", url },
+    );
+    if (navRes) {
+      await orbitActions.executeBrowserAction(selectedHostId, activeCdpSession.session_id, {
+        kind: "screenshot",
+        full_page: false,
+      });
+    }
+  };
+
   const navigateTo = (rawUrl: string) => {
     const normalized = normalizeAddressInput(rawUrl);
     if (!normalized) return;
+    if (isCdpMode) {
+      setCdpAddressInput(normalized);
+      void runCdpNavigateAndCapture(normalized);
+      return;
+    }
     if (normalized === activeUrl) {
       setIsLoading(true);
       setReloadNonce((n) => n + 1);
@@ -169,21 +258,39 @@ export const BrowserTab = memo(function BrowserTab({
       const nextEntries = [...base, normalized];
       return { entries: nextEntries, idx: nextEntries.length - 1 };
     });
-    setAddressInput(normalized);
+    setPreviewAddressInput(normalized);
     setDismissedFrameTip(false);
     setIsLoading(true);
     orbitActions.updateBrowserTabUrl(tab.id, normalized);
   };
 
-  const canBack = navState.idx > 0;
-  const canForward = navState.idx >= 0 && navState.idx < navState.entries.length - 1;
+  const canBack = isCdpMode ? Boolean(activeCdpSession && !cdpBusy) : navState.idx > 0;
+  const canForward = !isCdpMode && navState.idx >= 0 && navState.idx < navState.entries.length - 1;
+  const canReload = isCdpMode ? Boolean(activeCdpSession && !cdpBusy) : Boolean(activeUrl);
 
   const goBack = () => {
+    if (isCdpMode) {
+      if (!selectedHostId || !activeCdpSession || cdpBusy) return;
+      void (async () => {
+        const res = await orbitActions.executeBrowserAction(
+          selectedHostId,
+          activeCdpSession.session_id,
+          { kind: "back" },
+        );
+        if (res) {
+          await orbitActions.executeBrowserAction(selectedHostId, activeCdpSession.session_id, {
+            kind: "screenshot",
+            full_page: false,
+          });
+        }
+      })();
+      return;
+    }
     if (!canBack) return;
     const nextIdx = navState.idx - 1;
     const nextUrl = navState.entries[nextIdx];
     setNavState((prev) => ({ ...prev, idx: nextIdx }));
-    setAddressInput(nextUrl);
+    setPreviewAddressInput(nextUrl);
     orbitActions.updateBrowserTabUrl(tab.id, nextUrl);
   };
 
@@ -192,33 +299,106 @@ export const BrowserTab = memo(function BrowserTab({
     const nextIdx = navState.idx + 1;
     const nextUrl = navState.entries[nextIdx];
     setNavState((prev) => ({ ...prev, idx: nextIdx }));
-    setAddressInput(nextUrl);
+    setPreviewAddressInput(nextUrl);
     orbitActions.updateBrowserTabUrl(tab.id, nextUrl);
   };
 
   const reload = () => {
+    if (isCdpMode) {
+      if (!selectedHostId || !activeCdpSession || cdpBusy) return;
+      void (async () => {
+        const res = await orbitActions.executeBrowserAction(
+          selectedHostId,
+          activeCdpSession.session_id,
+          { kind: "reload" },
+        );
+        if (res) {
+          await orbitActions.executeBrowserAction(selectedHostId, activeCdpSession.session_id, {
+            kind: "screenshot",
+            full_page: false,
+          });
+        }
+      })();
+      return;
+    }
     if (!activeUrl) return;
     setIsLoading(true);
     setReloadNonce((n) => n + 1);
   };
 
+  const captureCdpScreenshot = () => {
+    if (!selectedHostId || !activeCdpSession || cdpBusy) return;
+    void (async () => {
+      await orbitActions.executeBrowserAction(selectedHostId, activeCdpSession.session_id, {
+        kind: "snapshot",
+      });
+      await orbitActions.executeBrowserAction(selectedHostId, activeCdpSession.session_id, {
+        kind: "screenshot",
+        full_page: false,
+      });
+    })();
+  };
+
+  const handleScreenshotClick = (e: MouseEvent<HTMLImageElement>) => {
+    if (!selectedHostId || !activeCdpSession || cdpBusy || overlayState?.readOnly) return;
+    const img = e.currentTarget;
+    const rect = img.getBoundingClientRect();
+    const cw = img.clientWidth;
+    const ch = img.clientHeight;
+    const nw = img.naturalWidth || activeCdpSession.viewport_width;
+    const nh = img.naturalHeight || activeCdpSession.viewport_height;
+    if (rect.width <= 0 || rect.height <= 0 || cw <= 0 || ch <= 0 || nw <= 0 || nh <= 0) return;
+
+    // Account for `object-contain` letterboxing so clicks map accurately to viewport pixels.
+    const scale = Math.min(cw / nw, ch / nh);
+    const renderedW = nw * scale;
+    const renderedH = nh * scale;
+    const offsetX = (cw - renderedW) / 2;
+    const offsetY = (ch - renderedH) / 2;
+    const localX = e.clientX - rect.left - offsetX;
+    const localY = e.clientY - rect.top - offsetY;
+    if (localX < 0 || localY < 0 || localX > renderedW || localY > renderedH) {
+      return;
+    }
+
+    const x = Math.round((localX / renderedW) * activeCdpSession.viewport_width);
+    const y = Math.round((localY / renderedH) * activeCdpSession.viewport_height);
+    void (async () => {
+      const clickRes = await orbitActions.executeBrowserAction(
+        selectedHostId,
+        activeCdpSession.session_id,
+        { kind: "click", x, y },
+      );
+      if (clickRes) {
+        await orbitActions.executeBrowserAction(selectedHostId, activeCdpSession.session_id, {
+          kind: "screenshot",
+          full_page: false,
+        });
+      }
+    })();
+  };
+
   const openPopout = () => {
-    if (!activeUrl) return;
-    void orbitIpc.openBrowserPopoutWindow(activeUrl, activeUrl).catch((err) => {
+    const target = isCdpMode ? sanitizeHttpUrl(activeCdpSession?.url ?? "") : activeUrl;
+    if (!target) return;
+    void orbitIpc.openBrowserPopoutWindow(target, target).catch((err) => {
       orbitActions.showToast(String(err));
     });
   };
 
   const openExternal = () => {
-    if (!activeUrl) return;
-    void orbitIpc.openExternalBrowserUrl(activeUrl).catch((err) => {
+    const target = isCdpMode ? sanitizeHttpUrl(activeCdpSession?.url ?? "") : activeUrl;
+    if (!target) return;
+    void orbitIpc.openExternalBrowserUrl(target).catch((err) => {
       orbitActions.showToast(String(err));
     });
   };
 
   const presetWidth = VIEWPORT_WIDTHS[viewportPreset];
   const isReadOnlyOverlay = Boolean(overlayState?.readOnly);
-  const showExternalHint = Boolean(activeUrl && !isLocalUrl(activeUrl) && !dismissedFrameTip);
+  const showExternalHint = Boolean(
+    !isCdpMode && activeUrl && !isLocalUrl(activeUrl) && !dismissedFrameTip,
+  );
 
   const suggestedUrls = useMemo(() => {
     const merged = new Set<string>(detectedUrls);
@@ -239,6 +419,10 @@ export const BrowserTab = memo(function BrowserTab({
         (e) => e.includes("127.0.0.1") || e.includes("localhost"),
       ));
 
+  const effectiveExternalUrl = isCdpMode
+    ? sanitizeHttpUrl(activeCdpSession?.url ?? "")
+    : activeUrl;
+
   return (
     <div
       className={cn(
@@ -250,10 +434,9 @@ export const BrowserTab = memo(function BrowserTab({
           e.preventDefault();
           addressInputRef.current?.focus();
           addressInputRef.current?.select();
-        } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "r" && activeUrl) {
+        } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "r" && canReload) {
           e.preventDefault();
-          setIsLoading(true);
-          setReloadNonce((n) => n + 1);
+          reload();
         }
       }}
     >
@@ -269,30 +452,37 @@ export const BrowserTab = memo(function BrowserTab({
           >
             <ArrowLeft className="h-[13.5px] w-[13.5px]" />
           </button>
-          <button
-            type="button"
-            title="Forward"
-            disabled={!canForward}
-            onClick={goForward}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
-          >
-            <ArrowRight className="h-[13.5px] w-[13.5px]" />
-          </button>
+          {!isCdpMode && (
+            <button
+              type="button"
+              title="Forward"
+              disabled={!canForward}
+              onClick={goForward}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
+            >
+              <ArrowRight className="h-[13.5px] w-[13.5px]" />
+            </button>
+          )}
           <button
             type="button"
             title="Reload"
-            disabled={!activeUrl}
+            disabled={!canReload}
             onClick={reload}
             className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
           >
-            <RotateCw className={cn("h-[13px] w-[13px]", isLoading && "animate-spin")} />
+            <RotateCw
+              className={cn(
+                "h-[13px] w-[13px]",
+                (isCdpMode ? cdpBusy : isLoading) && "animate-spin",
+              )}
+            />
           </button>
         </div>
 
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            navigateTo(addressInput);
+            navigateTo(isCdpMode ? cdpAddressInput : previewAddressInput);
           }}
           className="border-border bg-canvas focus-within:border-foreground/20 flex h-[26px] min-w-0 flex-1 items-center gap-1.5 rounded-lg border px-2 transition-colors"
         >
@@ -300,49 +490,112 @@ export const BrowserTab = memo(function BrowserTab({
           <input
             ref={addressInputRef}
             type="text"
-            value={addressInput}
-            onChange={(e) => setAddressInput(e.target.value)}
-            placeholder="localhost:5173 or https://…"
+            value={isCdpMode ? cdpAddressInput : previewAddressInput}
+            onChange={(e) =>
+              isCdpMode
+                ? setCdpAddressInput(e.target.value)
+                : setPreviewAddressInput(e.target.value)
+            }
+            placeholder={isCdpMode ? "Navigate CDP session (http/https)…" : "localhost:5173 or https://…"}
             className="text-foreground placeholder:text-muted-foreground min-w-0 flex-1 bg-transparent font-mono text-[11.5px] outline-none"
           />
         </form>
 
-        {/* Responsive Viewport Presets */}
-        <div className="bg-muted hidden h-[26px] shrink-0 items-center rounded-lg p-0.5 sm:inline-flex">
-          {(
-            [
-              { id: "fluid", icon: Maximize2, label: "Fluid width" },
-              { id: "desktop", icon: Monitor, label: "Desktop (1280px)" },
-              { id: "tablet", icon: Tablet, label: "Tablet (768px)" },
-              { id: "mobile", icon: Smartphone, label: "Mobile (390px)" },
-            ] as const
-          ).map((preset) => {
-            const Icon = preset.icon;
-            return (
-              <button
-                key={preset.id}
-                type="button"
-                title={preset.label}
-                onClick={() => setViewportPreset(preset.id)}
-                className={cn(
-                  "inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md transition-colors",
-                  viewportPreset === preset.id
-                    ? "bg-background text-foreground shadow-2xs"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                <Icon className="h-[12px] w-[12px]" />
-              </button>
-            );
-          })}
+        {/* Preview vs Live CDP Mode Switch */}
+        <div className="bg-muted inline-flex h-[26px] shrink-0 items-center rounded-lg p-0.5 text-[11px]">
+          <button
+            type="button"
+            onClick={() => setMode("preview")}
+            className={cn(
+              "inline-flex h-[22px] cursor-pointer items-center rounded-md px-2 font-medium transition-colors",
+              !isCdpMode
+                ? "bg-background text-foreground shadow-2xs"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            Preview
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("cdp")}
+            className={cn(
+              "inline-flex h-[22px] cursor-pointer items-center gap-1.5 rounded-md px-2 font-medium transition-colors",
+              isCdpMode
+                ? "bg-background text-foreground shadow-2xs"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {hasCdpSessions && <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />}
+            <span>CDP</span>
+          </button>
         </div>
+
+        {/* Preview Viewport Presets or CDP Capture/Close Actions */}
+        {!isCdpMode ? (
+          <div className="bg-muted hidden h-[26px] shrink-0 items-center rounded-lg p-0.5 sm:inline-flex">
+            {(
+              [
+                { id: "fluid", icon: Maximize2, label: "Fluid width" },
+                { id: "desktop", icon: Monitor, label: "Desktop (1280px)" },
+                { id: "tablet", icon: Tablet, label: "Tablet (768px)" },
+                { id: "mobile", icon: Smartphone, label: "Mobile (390px)" },
+              ] as const
+            ).map((preset) => {
+              const Icon = preset.icon;
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  title={preset.label}
+                  onClick={() => setViewportPreset(preset.id)}
+                  className={cn(
+                    "inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md transition-colors",
+                    viewportPreset === preset.id
+                      ? "bg-background text-foreground shadow-2xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Icon className="h-[12px] w-[12px]" />
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="flex shrink-0 items-center gap-0.5">
+            <button
+              type="button"
+              title="Refresh snapshot & screenshot"
+              disabled={!activeCdpSession || cdpBusy}
+              onClick={captureCdpScreenshot}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
+            >
+              <Camera className="h-[13px] w-[13px]" />
+            </button>
+            <button
+              type="button"
+              title="Close CDP session"
+              disabled={!activeCdpSession || cdpBusy || !selectedHostId}
+              onClick={() => {
+                if (selectedHostId && activeCdpSession) {
+                  void orbitActions.closeBrowserSession(
+                    selectedHostId,
+                    activeCdpSession.session_id,
+                  );
+                }
+              }}
+              className="text-muted-foreground hover:text-destructive hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
+            >
+              <X className="h-[13.5px] w-[13.5px]" />
+            </button>
+          </div>
+        )}
 
         {/* Native Popout Window & External Browser */}
         <div className="flex shrink-0 items-center gap-0.5">
           <button
             type="button"
-            title="Open in native Orbit window (bypasses iframe restrictions)"
-            disabled={!activeUrl}
+            title="Open in native Orbit window"
+            disabled={!effectiveExternalUrl}
             onClick={openPopout}
             className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
           >
@@ -351,7 +604,7 @@ export const BrowserTab = memo(function BrowserTab({
           <button
             type="button"
             title="Open in system browser"
-            disabled={!activeUrl}
+            disabled={!effectiveExternalUrl}
             onClick={openExternal}
             className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
           >
@@ -360,11 +613,96 @@ export const BrowserTab = memo(function BrowserTab({
         </div>
       </div>
 
+      {/* Live CDP Status & Audit Strip */}
+      {isCdpMode && activeCdpSession && (
+        <div className="border-border bg-sidebar/60 flex shrink-0 items-center justify-between gap-2 border-b px-2.5 py-1 text-[11px]">
+          <div className="flex min-w-0 items-center gap-2">
+            {cdpSessions.length > 1 && selectedHostId ? (
+              <select
+                value={activeCdpSession.session_id}
+                onChange={(e) =>
+                  orbitActions.selectBrowserSession(selectedHostId, e.target.value)
+                }
+                className="border-border bg-canvas text-foreground h-[22px] rounded-md border px-1.5 font-mono text-[11px] outline-none"
+              >
+                {cdpSessions.map((s) => (
+                  <option key={s.session_id} value={s.session_id}>
+                    {s.session_id}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <span className="text-muted-foreground font-mono text-[10.5px]">
+                {activeCdpSession.session_id}
+              </span>
+            )}
+            <span className="text-muted-foreground truncate">
+              {activeCdpSession.title || activeCdpSession.url}
+            </span>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1.5">
+            <span className="border-border bg-canvas text-muted-foreground inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[10.5px] tabular-nums">
+              <Layers className="h-3 w-3 opacity-70" />
+              {activeCdpSession.element_count} refs
+            </span>
+            <button
+              type="button"
+              onClick={() => setConsoleOpen((v) => !v)}
+              className={cn(
+                "border-border inline-flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[10.5px] tabular-nums transition-colors",
+                activeCdpSession.console_errors.length > 0
+                  ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                  : "bg-canvas text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <AlertCircle className="h-3 w-3" />
+              {activeCdpSession.console_errors.length} err
+            </button>
+            <button
+              type="button"
+              onClick={() => setAuditOpen((v) => !v)}
+              className={cn(
+                "border-border inline-flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10.5px] transition-colors",
+                auditOpen
+                  ? "bg-accent text-foreground"
+                  : "bg-canvas text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <History className="h-3 w-3" />
+              <span>Audit</span>
+              {auditOpen ? (
+                <ChevronDown className="h-3 w-3" />
+              ) : (
+                <ChevronUp className="h-3 w-3" />
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Collapsible Console Errors Strip */}
+      {isCdpMode && activeCdpSession && consoleOpen && (
+        <div className="border-border bg-canvas/90 max-h-28 shrink-0 overflow-y-auto border-b px-3 py-1.5 font-mono text-[11px]">
+          {activeCdpSession.console_errors.length === 0 ? (
+            <div className="text-muted-foreground">No console errors captured.</div>
+          ) : (
+            <div className="space-y-1">
+              {activeCdpSession.console_errors.map((err, idx) => (
+                <div key={`${idx}-${err.slice(0, 24)}`} className="text-amber-600 dark:text-amber-400">
+                  {err}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Subtle Notice for External Websites That Restrict Embedded Frames */}
       {showExternalHint && (
         <div className="border-border bg-elevated/60 text-muted-foreground flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5 text-[11.5px]">
           <span className="truncate">
-            If this site blocks embedded preview, open it in a native window.
+            If this site blocks embedded preview, open it in a native window or Live CDP.
           </span>
           <div className="flex shrink-0 items-center gap-1.5">
             <button
@@ -385,9 +723,98 @@ export const BrowserTab = memo(function BrowserTab({
         </div>
       )}
 
-      {/* Layered Preview Stage (Base Frame + Extensible Read-Only Overlay Slot) */}
+      {/* Main Stage: Live CDP View OR Existing Embedded Web Preview */}
       <div ref={stageRef} className="bg-canvas relative flex min-h-0 flex-1 flex-col overflow-auto">
-        {!activeUrl ? (
+        {isCdpMode ? (
+          !activeCdpSession ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 py-10 text-center">
+              <div className="bg-muted text-muted-foreground inline-flex h-10 w-10 items-center justify-center rounded-xl">
+                <Monitor className="h-5 w-5 stroke-[1.6]" />
+              </div>
+              <div className="space-y-1">
+                <div className="text-foreground text-[13.5px] font-medium">
+                  Live CDP Browser Session
+                </div>
+                <div className="text-muted-foreground max-w-xs text-[12px] leading-relaxed">
+                  Launch an isolated Chromium session with URL, SSRF, and sensitive-input guards.
+                </div>
+              </div>
+
+              <div className="flex flex-col items-center gap-2">
+                <button
+                  type="button"
+                  disabled={!selectedHostId || cdpBusy}
+                  onClick={() => {
+                    if (!selectedHostId) return;
+                    const normalized = normalizeAddressInput(cdpAddressInput || activeUrl);
+                    void orbitActions.createBrowserSession({
+                      hostId: selectedHostId,
+                      agentId: selectedAgentId ?? null,
+                      initialUrl: normalized || null,
+                    });
+                  }}
+                  className="bg-foreground text-background hover:opacity-90 inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium transition-opacity disabled:cursor-default disabled:opacity-45"
+                >
+                  <Play className="h-3.5 w-3.5" />
+                  <span>{cdpBusy ? "Starting…" : "Start CDP Session"}</span>
+                </button>
+                <div className="text-muted-foreground font-mono text-[10.5px]">
+                  {hostBrowser?.chromeBinary
+                    ? `Binary: ${hostBrowser.chromeBinary.split(/[\\/]/).pop()}`
+                    : hostBrowser?.status === "ready"
+                      ? "No Chrome/Chromium binary detected on host"
+                      : ""}
+                </div>
+              </div>
+
+              {suggestedUrls.length > 0 && (
+                <div className="flex max-w-sm flex-wrap items-center justify-center gap-1.5">
+                  {suggestedUrls.map((url) => (
+                    <button
+                      key={url}
+                      type="button"
+                      disabled={!selectedHostId || cdpBusy}
+                      onClick={() => {
+                        setCdpAddressInput(url);
+                        void runCdpNavigateAndCapture(url);
+                      }}
+                      className="border-border hover:bg-accent text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 py-1 font-mono text-[11.5px] transition-colors disabled:opacity-45"
+                    >
+                      <span>{url.replace(/^https?:\/\//, "")}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="bg-muted/25 relative flex min-h-full flex-1 flex-col items-center justify-center p-3">
+              {activeCdpSession.last_screenshot_base64 ? (
+                <img
+                  src={`data:image/png;base64,${activeCdpSession.last_screenshot_base64}`}
+                  alt={activeCdpSession.title || activeCdpSession.url}
+                  onClick={handleScreenshotClick}
+                  className={cn(
+                    "border-border max-h-full max-w-full rounded-lg border bg-white object-contain shadow-sm",
+                    !cdpBusy && !isReadOnlyOverlay ? "cursor-crosshair" : "cursor-default",
+                  )}
+                />
+              ) : (
+                <div className="text-muted-foreground flex flex-col items-center gap-2 text-[12px]">
+                  <span>Session ready at {activeCdpSession.url}</span>
+                  <button
+                    type="button"
+                    disabled={cdpBusy}
+                    onClick={captureCdpScreenshot}
+                    className="border-border hover:bg-accent text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11.5px] transition-colors"
+                  >
+                    <Camera className="h-3.5 w-3.5" />
+                    <span>Capture Screenshot</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )
+        ) : !activeUrl ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 py-10 text-center">
             <div className="bg-muted text-muted-foreground inline-flex h-10 w-10 items-center justify-center rounded-xl">
               <Globe className="h-5 w-5 stroke-[1.6]" />
@@ -493,8 +920,53 @@ export const BrowserTab = memo(function BrowserTab({
         )}
       </div>
 
+      {/* Collapsible CDP Action Audit Drawer */}
+      {isCdpMode && activeCdpSession && auditOpen && (
+        <div className="border-border bg-sidebar max-h-44 shrink-0 overflow-y-auto border-t">
+          <div className="border-border text-muted-foreground flex items-center justify-between border-b px-3 py-1 text-[10.5px] font-medium">
+            <span>Action Audit Log ({activeCdpSession.recent_actions.length})</span>
+            <span className="font-mono">
+              {activeCdpSession.viewport_width}×{activeCdpSession.viewport_height}
+            </span>
+          </div>
+          {activeCdpSession.recent_actions.length === 0 ? (
+            <div className="text-muted-foreground px-3 py-2 text-[11px]">No actions yet.</div>
+          ) : (
+            <div className="divide-border/60 divide-y">
+              {[...activeCdpSession.recent_actions].reverse().map((entry) => (
+                <div
+                  key={entry.id}
+                  className="flex items-start gap-2 px-3 py-1.5 text-[11px]"
+                >
+                  <span
+                    className={cn(
+                      "mt-1 h-1.5 w-1.5 shrink-0 rounded-full",
+                      entry.ok ? "bg-emerald-500" : "bg-rose-500",
+                    )}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-foreground font-mono font-medium">{entry.action}</span>
+                      <span className="text-muted-foreground truncate font-mono text-[10.5px]">
+                        {entry.target}
+                      </span>
+                      <span className="text-muted-foreground ml-auto shrink-0 font-mono text-[10px] tabular-nums">
+                        {formatAuditTime(entry.timestamp_ms)}
+                      </span>
+                    </div>
+                    <div className="text-muted-foreground truncate text-[10.5px]">
+                      {entry.detail}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Host Context Footnote when Connected to Remote Host */}
-      {selectedHostId && activeUrl && isLocalUrl(activeUrl) && hostCard && isRemoteHost && (
+      {!isCdpMode && selectedHostId && activeUrl && isLocalUrl(activeUrl) && hostCard && isRemoteHost && (
         <div className="border-border bg-sidebar/80 text-muted-foreground flex items-center justify-between border-t px-3 py-1 text-[11px]">
           <span>
             Preview loads from your local machine; forward remote ports via SSH if serving on{" "}

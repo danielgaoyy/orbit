@@ -1240,6 +1240,78 @@ export interface MonitorWatchRecord {
   created_at_ms: number;
 }
 
+export interface BrowserPolicyConfig {
+  enabled: boolean;
+  headless: boolean;
+  allow_localhost: boolean;
+  allowed_domains: string[];
+  blocked_domains: string[];
+  block_password_inputs: boolean;
+  max_sessions: number;
+}
+
+export interface BrowserElementRef {
+  ref_id: string;
+  role: string;
+  name: string;
+  tag: string;
+  input_type?: string | null;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface BrowserActionAudit {
+  id: string;
+  action: string;
+  target: string;
+  ok: boolean;
+  detail: string;
+  timestamp_ms: number;
+}
+
+export interface BrowserSessionSummary {
+  session_id: string;
+  agent_id?: string | null;
+  url: string;
+  title: string;
+  viewport_width: number;
+  viewport_height: number;
+  headless: boolean;
+  element_count: number;
+  console_errors: string[];
+  recent_actions: BrowserActionAudit[];
+  last_screenshot_base64?: string | null;
+  updated_at_ms: number;
+}
+
+export type BrowserActionRequest =
+  | { kind: "navigate"; url: string }
+  | { kind: "snapshot" }
+  | { kind: "screenshot"; full_page?: boolean }
+  | { kind: "click"; ref_id?: string | null; x?: number | null; y?: number | null }
+  | { kind: "type"; ref_id?: string | null; text: string; submit?: boolean }
+  | { kind: "scroll"; delta_x: number; delta_y: number }
+  | { kind: "back" }
+  | { kind: "reload" };
+
+export interface BrowserSessionsSnapshotView {
+  host_id: string;
+  sessions: BrowserSessionSummary[];
+  policy: BrowserPolicyConfig;
+  chrome_binary?: string | null;
+}
+
+export interface BrowserActionResponseView {
+  host_id: string;
+  session: BrowserSessionSummary;
+  elements: BrowserElementRef[];
+  screenshot_base64?: string | null;
+  text_excerpt?: string | null;
+  captcha_detected?: boolean;
+}
+
 export interface InlineSpanView {
   text: string;
   bold: boolean;
@@ -4957,6 +5029,76 @@ export const orbitIpc = {
       triggerId,
       sampleEventType,
       samplePayload,
+    });
+  },
+
+  listBrowserSessions: async (hostId: string): Promise<BrowserSessionsSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return {
+        host_id: hostId,
+        sessions: [],
+        policy: {
+          enabled: true,
+          headless: true,
+          allow_localhost: true,
+          allowed_domains: [],
+          blocked_domains: [],
+          block_password_inputs: true,
+          max_sessions: 4,
+        },
+        chrome_binary: null,
+      };
+    }
+    return invoke<BrowserSessionsSnapshotView>("list_browser_sessions", { hostId });
+  },
+
+  createBrowserSession: async (req: {
+    hostId: string;
+    agentId?: string | null;
+    initialUrl?: string | null;
+    headless?: boolean | null;
+    viewportWidth?: number | null;
+    viewportHeight?: number | null;
+  }): Promise<BrowserSessionSummary> => {
+    return invoke<BrowserSessionSummary>("create_browser_session", {
+      hostId: req.hostId,
+      agentId: req.agentId ?? null,
+      initialUrl: req.initialUrl ?? null,
+      headless: req.headless ?? null,
+      viewportWidth: req.viewportWidth ?? null,
+      viewportHeight: req.viewportHeight ?? null,
+    });
+  },
+
+  executeBrowserAction: async (req: {
+    hostId: string;
+    sessionId: string;
+    action: BrowserActionRequest;
+  }): Promise<BrowserActionResponseView> => {
+    return invoke<BrowserActionResponseView>("execute_browser_action", {
+      hostId: req.hostId,
+      sessionId: req.sessionId,
+      action: req.action,
+    });
+  },
+
+  closeBrowserSession: async (
+    hostId: string,
+    sessionId: string,
+  ): Promise<BrowserSessionsSnapshotView> => {
+    return invoke<BrowserSessionsSnapshotView>("close_browser_session", {
+      hostId,
+      sessionId,
+    });
+  },
+
+  updateBrowserPolicy: async (
+    hostId: string,
+    policy: BrowserPolicyConfig,
+  ): Promise<BrowserSessionsSnapshotView> => {
+    return invoke<BrowserSessionsSnapshotView>("update_browser_policy", {
+      hostId,
+      policy,
     });
   },
 };

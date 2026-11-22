@@ -574,3 +574,48 @@ pub struct UpsertEventTriggerRequest {
     pub keep_existing_token: bool,
     pub enabled: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserSessionsSnapshotView {
+    pub host_id: String,
+    pub sessions: Vec<orbit_protocol::BrowserSessionSummary>,
+    pub policy: orbit_protocol::BrowserPolicyConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_binary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateBrowserSessionRequest {
+    pub host_id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub initial_url: Option<String>,
+    #[serde(default)]
+    pub headless: Option<bool>,
+    #[serde(default)]
+    pub viewport_width: Option<u32>,
+    #[serde(default)]
+    pub viewport_height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteBrowserActionRequest {
+    pub host_id: String,
+    pub session_id: String,
+    pub action: orbit_protocol::BrowserActionRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserActionResponseView {
+    pub host_id: String,
+    pub session: orbit_protocol::BrowserSessionSummary,
+    #[serde(default)]
+    pub elements: Vec<orbit_protocol::BrowserElementRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_excerpt: Option<String>,
+    #[serde(default)]
+    pub captcha_detected: bool,
+}

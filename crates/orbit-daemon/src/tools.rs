@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, ArtifactKind, ForkTarget, McpToolPolicy, MonitorKind,
-    ProviderKind, ReasoningEffort, ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget,
-    SessionMode, TimelinePayload, ToolCallDetail, WireMessage, WorkspaceIsolation,
-    WorktreeCreateMode, WorktreeHandoffDirection, WorktreeHandoffMode,
+    ActiveTurnBehavior, AgentMessageKind, ArtifactKind, BrowserActionRequest, ForkTarget,
+    McpToolPolicy, MonitorKind, ProviderKind, ReasoningEffort, ScheduleNewAgentConfig,
+    ScheduleStatus, ScheduleTarget, SessionMode, TimelinePayload, ToolCallDetail, WireMessage,
+    WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection, WorktreeHandoffMode,
 };
 use orbit_store::{ReceiptOutcome, UpsertArtifactInput};
 use serde_json::{Value, json};
@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::DaemonRuntime;
+use crate::browser::CreateBrowserSessionSpec;
 use crate::goals::{GoalCriterionPatch, StartGoalSpec, StartMonitorSpec, authorize_agent_control};
 use crate::manager::{
     CreateAgentSpec, CreateWorkspaceSpec, ExecuteWorktreeHandoffSpec, ForkAgentSpec,
@@ -2756,7 +2757,427 @@ async fn execute_tool_inner(
             }))
         }
 
+        // ==================== PURE-RUST CDP BROWSER AUTOMATION ====================
+        "browser_open" => {
+            let url = opt_str(args, "url");
+            let existing_session_id = opt_str(args, "session_id");
+            if let Some(session_id) = existing_session_id {
+                let target_url = url.ok_or_else(|| {
+                    anyhow::anyhow!("`url` is required when navigating an existing `session_id`")
+                })?;
+                authorize_browser_session_access(
+                    rt,
+                    target_host.as_deref(),
+                    caller_agent_id,
+                    &session_id,
+                )
+                .await?;
+                let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                    execute_browser_action_tool(
+                        rt,
+                        target_host.as_deref(),
+                        &session_id,
+                        BrowserActionRequest::Navigate { url: target_url },
+                    )
+                    .await?;
+                session.last_screenshot_base64 = None;
+                return Ok(json!({
+                    "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                    "session": session,
+                    "elements": elements,
+                    "text_excerpt": text_excerpt,
+                    "captcha_detected": captcha_detected,
+                }));
+            }
+
+            let headless = args.get("headless").and_then(Value::as_bool);
+            let viewport_width = args
+                .get("viewport_width")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok());
+            let viewport_height = args
+                .get("viewport_height")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok());
+            let owner_agent_id = caller_agent_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
+            let mut session = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CreateBrowserSession {
+                            request_id: req_id,
+                            agent_id: owner_agent_id,
+                            initial_url: url,
+                            headless,
+                            viewport_width,
+                            viewport_height,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::BrowserSessionUpdated { session, .. } => session,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to browser_open"),
+                }
+            } else {
+                rt.browser
+                    .create_session(CreateBrowserSessionSpec {
+                        agent_id: owner_agent_id,
+                        initial_url: url,
+                        headless,
+                        viewport_width,
+                        viewport_height,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+            session.last_screenshot_base64 = None;
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+            }))
+        }
+
+        "browser_snapshot" => {
+            let session_id = str_arg(args, "session_id")?;
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Snapshot,
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_screenshot" => {
+            let session_id = str_arg(args, "session_id")?;
+            let full_page = args
+                .get("full_page")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Screenshot { full_page },
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "screenshot_base64": screenshot_base64,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_click" => {
+            let session_id = str_arg(args, "session_id")?;
+            let ref_id = opt_str(args, "ref_id");
+            let x = args.get("x").and_then(Value::as_f64);
+            let y = args.get("y").and_then(Value::as_f64);
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Click { ref_id, x, y },
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_type" => {
+            let session_id = str_arg(args, "session_id")?;
+            let ref_id = opt_str(args, "ref_id");
+            let text = str_arg(args, "text")?;
+            let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Type {
+                        ref_id,
+                        text,
+                        submit,
+                    },
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_scroll" => {
+            let session_id = str_arg(args, "session_id")?;
+            let delta_x = args.get("delta_x").and_then(Value::as_f64).unwrap_or(0.0);
+            let delta_y = args.get("delta_y").and_then(Value::as_f64).unwrap_or(400.0);
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Scroll { delta_x, delta_y },
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_close" => {
+            let session_id = str_arg(args, "session_id")?;
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let remaining = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CloseBrowserSession {
+                            request_id: req_id,
+                            session_id: session_id.clone(),
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::BrowserSessionsSnapshot { sessions, .. } => sessions.len(),
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to browser_close"),
+                }
+            } else {
+                rt.browser
+                    .close_session(&session_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .sessions
+                    .len()
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "closed_session_id": session_id,
+                "active_sessions": remaining,
+            }))
+        }
+
         other => anyhow::bail!("unknown Orbit tool `{other}`"),
+    }
+}
+
+async fn authorize_browser_session_access(
+    rt: &DaemonRuntime,
+    remote_host_id: Option<&str>,
+    caller_agent_id: Option<&str>,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let Some(caller_id) = caller_agent_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if let Some(remote_id) = remote_host_id {
+        let req_id = Uuid::new_v4();
+        let owner = match rt
+            .connected_hosts
+            .send_rpc(
+                remote_id,
+                req_id,
+                WireMessage::ListBrowserSessions {
+                    request_id: req_id,
+                    include_screenshots: false,
+                },
+                Duration::from_secs(15),
+            )
+            .await?
+        {
+            WireMessage::BrowserSessionsSnapshot { sessions, .. } => {
+                sessions
+                    .into_iter()
+                    .find(|s| s.session_id == session_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "browser session `{session_id}` not found on host `{remote_id}`"
+                        )
+                    })?
+                    .agent_id
+            }
+            WireMessage::RpcError { message, .. } => {
+                anyhow::bail!("remote host `{remote_id}` error: {message}")
+            }
+            _ => anyhow::bail!("unexpected remote reply while verifying browser session ownership"),
+        };
+        let Some(owner_id) = owner else {
+            anyhow::bail!(
+                "caller agent `{caller_id}` is not authorized to access unowned browser session `{session_id}`"
+            );
+        };
+        if owner_id != caller_id {
+            authorize_remote_agent_control(rt, remote_id, Some(caller_id), &owner_id).await?;
+        }
+        return Ok(());
+    }
+
+    let owner = rt
+        .browser
+        .get_session_owner(session_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let Some(owner_id) = owner else {
+        anyhow::bail!(
+            "caller agent `{caller_id}` is not authorized to access unowned browser session `{session_id}`"
+        );
+    };
+    authorize_agent_control(&rt.store, Some(caller_id), &owner_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+type BrowserToolActionResult = (
+    orbit_protocol::BrowserSessionSummary,
+    Vec<orbit_protocol::BrowserElementRef>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
+async fn execute_browser_action_tool(
+    rt: &DaemonRuntime,
+    remote_host_id: Option<&str>,
+    session_id: &str,
+    action: BrowserActionRequest,
+) -> anyhow::Result<BrowserToolActionResult> {
+    if let Some(remote_id) = remote_host_id {
+        let req_id = Uuid::new_v4();
+        match rt
+            .connected_hosts
+            .send_rpc(
+                remote_id,
+                req_id,
+                WireMessage::ExecuteBrowserAction {
+                    request_id: req_id,
+                    session_id: session_id.to_string(),
+                    action,
+                },
+                Duration::from_secs(30),
+            )
+            .await?
+        {
+            WireMessage::BrowserActionResponse {
+                session,
+                elements,
+                screenshot_base64,
+                text_excerpt,
+                captcha_detected,
+                ..
+            } => Ok((
+                session,
+                elements,
+                screenshot_base64,
+                text_excerpt,
+                captcha_detected,
+            )),
+            WireMessage::RpcError { message, .. } => {
+                anyhow::bail!("remote host `{remote_id}` error: {message}")
+            }
+            _ => anyhow::bail!("unexpected remote reply to browser action"),
+        }
+    } else {
+        let outcome = rt
+            .browser
+            .execute_action(session_id, action)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok((
+            outcome.session,
+            outcome.elements,
+            outcome.screenshot_base64,
+            outcome.text_excerpt,
+            outcome.captcha_detected,
+        ))
     }
 }
 
@@ -3855,6 +4276,103 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["monitor_id"]
             }),
         },
+        // --- Pure-Rust CDP Browser Automation & Guarded Computer Use (7) ---
+        ToolDefinition {
+            name: "browser_open",
+            description: "Start a new isolated pure-Rust CDP browser session (or navigate an existing `session_id`) with strict URL/SSRF/domain guards.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Optional http:// or https:// URL to open." },
+                    "session_id": { "type": "string", "description": "Optional existing browser session ID to navigate instead of launching a new session." },
+                    "headless": { "type": "boolean", "description": "Override host headless mode default." },
+                    "viewport_width": { "type": "integer", "description": "Viewport width in CSS pixels (320-3840)." },
+                    "viewport_height": { "type": "integer", "description": "Viewport height in CSS pixels (240-2160)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "browser_snapshot",
+            description: "Capture compact numbered interactive DOM element refs (`e1`..`e80`), visible text excerpt, console errors, and CAPTCHA detection status for a live CDP session.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_screenshot",
+            description: "Capture a PNG screenshot (base64, capped at 8 MiB) of a live CDP browser session.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "full_page": { "type": "boolean", "default": false, "description": "Capture beyond viewport height." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_click",
+            description: "Click an interactive element by snapshot `ref_id` (e.g. `e1`) or explicit viewport `(x, y)` coordinates.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "ref_id": { "type": "string", "description": "Element reference ID from `browser_snapshot` (e.g. `e1`)." },
+                    "x": { "type": "number", "description": "Optional X coordinate when `ref_id` is omitted." },
+                    "y": { "type": "number", "description": "Optional Y coordinate when `ref_id` is omitted." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_type",
+            description: "Type text into a non-sensitive input field (refuses password and credit-card fields by default under host policy).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "ref_id": { "type": "string", "description": "Optional element ref ID to focus before typing." },
+                    "text": { "type": "string", "description": "Text to insert." },
+                    "submit": { "type": "boolean", "default": false, "description": "Press Enter after inserting text." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id", "text"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_scroll",
+            description: "Scroll the active viewport by `(delta_x, delta_y)` pixels.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "delta_x": { "type": "number", "default": 0, "description": "Horizontal scroll delta in pixels." },
+                    "delta_y": { "type": "number", "default": 400, "description": "Vertical scroll delta in pixels." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_close",
+            description: "Close a live CDP browser session, terminate its isolated process group, and clean up its temporary profile directory.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID to close." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
     ]
 }
 
@@ -3875,5 +4393,98 @@ mod tests {
                 "MCP tool `{name}` must expose `host_id` for multi-host routing"
             );
         }
+    }
+
+    #[test]
+    fn browser_mcp_tools_expose_multi_host_id_schema() {
+        let defs = all_tool_definitions();
+        for name in [
+            "browser_open",
+            "browser_snapshot",
+            "browser_screenshot",
+            "browser_click",
+            "browser_type",
+            "browser_scroll",
+            "browser_close",
+        ] {
+            let def = defs
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("missing MCP tool definition `{name}`"));
+            assert!(
+                def.input_schema["properties"].get("host_id").is_some(),
+                "MCP tool `{name}` must expose `host_id` for multi-host routing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_cannot_access_unowned_human_browser_session() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message as TungMsg;
+
+        let tmp_home =
+            std::env::temp_dir().join(format!("orbit-tools-browser-auth-{}", Uuid::new_v4()));
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+
+        // Minimal loopback mock CDP endpoint
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let ws_url = format!("ws://127.0.0.1:{port}/devtools/page/auth_test");
+        let server_task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sink, mut rx) = ws.split();
+            while let Some(Ok(TungMsg::Text(txt))) = rx.next().await {
+                let Ok(val) = serde_json::from_str::<Value>(&txt) else {
+                    continue;
+                };
+                let id = val.get("id").and_then(Value::as_u64).unwrap_or(0);
+                let reply = json!({ "id": id, "result": {} });
+                if sink
+                    .send(TungMsg::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Create an unowned (human desktop) browser session (`agent_id: None`).
+        let sess = rt
+            .browser
+            .create_session_from_cdp_ws_url(&ws_url, CreateBrowserSessionSpec::default())
+            .await
+            .expect("create unowned session");
+
+        // An agent caller MUST be denied access to an unowned session (P0 #4).
+        let err =
+            authorize_browser_session_access(&rt, None, Some("ag_intruder"), &sess.session_id)
+                .await
+                .expect_err("agent must not access unowned browser session");
+        assert!(
+            err.to_string()
+                .contains("not authorized to access unowned browser session"),
+            "unexpected error: {err}"
+        );
+
+        // Human operator (`caller_agent_id: None`) is permitted.
+        authorize_browser_session_access(&rt, None, None, &sess.session_id)
+            .await
+            .expect("operator must be allowed");
+
+        rt.browser.shutdown_all().await;
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&tmp_home);
     }
 }

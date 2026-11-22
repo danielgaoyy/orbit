@@ -53,6 +53,12 @@ import {
 } from "@/lib/workspace-layout";
 import {
   type AgentStageView,
+  type BrowserActionRequest,
+  type BrowserActionResponseView,
+  type BrowserElementRef,
+  type BrowserPolicyConfig,
+  type BrowserSessionSummary,
+  type BrowserSessionsSnapshotView,
   type ClientThreadPrefSeed,
   type CloudSyncResultView,
   type CloudSyncStatusView,
@@ -661,6 +667,20 @@ export interface OrbitUiState {
       error?: string | null;
     }
   >;
+  browserByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      sessions: BrowserSessionSummary[];
+      policy: BrowserPolicyConfig | null;
+      chromeBinary: string | null;
+      activeSessionId: string | null;
+      elementsBySession: Record<string, BrowserElementRef[]>;
+      textExcerptBySession: Record<string, string | null>;
+      busy: boolean;
+      error?: string | null;
+    }
+  >;
   guardianByHost: Record<
     string,
     {
@@ -1008,6 +1028,7 @@ const defaultInitialState: OrbitUiState = {
   lspServersByWorkspace: {},
   lspDiagnosticsByFile: {},
   lifecycleHooksByScope: {},
+  browserByHost: {},
   guardianByHost: {},
   eventTriggersByHost: {},
 
@@ -7954,6 +7975,389 @@ export const orbitActions = {
     await orbitActions.reloadHostDetail(hostId, true);
   },
 
+  async loadBrowserSessions(hostId: string): Promise<BrowserSessionsSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (browserReqSeqByHost.get(hostId) ?? 0) + 1;
+    browserReqSeqByHost.set(hostId, seq);
+    setState((s) => {
+      const prev = s.browserByHost[hostId];
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [hostId]: {
+            status: prev?.status === "ready" ? "ready" : "loading",
+            sessions: prev?.sessions ?? [],
+            policy: prev?.policy ?? null,
+            chromeBinary: prev?.chromeBinary ?? null,
+            activeSessionId: prev?.activeSessionId ?? null,
+            elementsBySession: prev?.elementsBySession ?? {},
+            textExcerptBySession: prev?.textExcerptBySession ?? {},
+            busy: prev?.busy ?? false,
+            error: null,
+          },
+        },
+      };
+    });
+    try {
+      const snap = await orbitIpc.listBrowserSessions(hostId);
+      if (browserReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        const nextActive =
+          prev?.activeSessionId && snap.sessions.some((x) => x.session_id === prev.activeSessionId)
+            ? prev.activeSessionId
+            : (snap.sessions[0]?.session_id ?? null);
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "ready",
+              sessions: snap.sessions,
+              policy: snap.policy,
+              chromeBinary: snap.chrome_binary ?? null,
+              activeSessionId: nextActive,
+              elementsBySession: prev?.elementsBySession ?? {},
+              textExcerptBySession: prev?.textExcerptBySession ?? {},
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      return snap;
+    } catch (err) {
+      if (browserReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "error",
+              sessions: prev?.sessions ?? [],
+              policy: prev?.policy ?? null,
+              chromeBinary: prev?.chromeBinary ?? null,
+              activeSessionId: prev?.activeSessionId ?? null,
+              elementsBySession: prev?.elementsBySession ?? {},
+              textExcerptBySession: prev?.textExcerptBySession ?? {},
+              busy: false,
+              error: String(err),
+            },
+          },
+        };
+      });
+      return null;
+    }
+  },
+
+  selectBrowserSession(hostId: string, sessionId: string | null) {
+    if (!hostId) return;
+    setState((s) => {
+      const prev = s.browserByHost[hostId];
+      if (!prev) return s;
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [hostId]: {
+            ...prev,
+            activeSessionId: sessionId,
+          },
+        },
+      };
+    });
+  },
+
+  async createBrowserSession(req: {
+    hostId: string;
+    agentId?: string | null;
+    initialUrl?: string | null;
+    headless?: boolean | null;
+    viewportWidth?: number | null;
+    viewportHeight?: number | null;
+  }): Promise<BrowserSessionSummary | null> {
+    if (!req.hostId) return null;
+    const seq = (browserReqSeqByHost.get(req.hostId) ?? 0) + 1;
+    browserReqSeqByHost.set(req.hostId, seq);
+    setState((s) => {
+      const prev = s.browserByHost[req.hostId];
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [req.hostId]: {
+            status: prev?.status ?? "loading",
+            sessions: prev?.sessions ?? [],
+            policy: prev?.policy ?? null,
+            chromeBinary: prev?.chromeBinary ?? null,
+            activeSessionId: prev?.activeSessionId ?? null,
+            elementsBySession: prev?.elementsBySession ?? {},
+            textExcerptBySession: prev?.textExcerptBySession ?? {},
+            busy: true,
+            error: null,
+          },
+        },
+      };
+    });
+    try {
+      const session = await orbitIpc.createBrowserSession(req);
+      setState((s) => {
+        const prev = s.browserByHost[req.hostId];
+        const nextSessions = [
+          session,
+          ...(prev?.sessions ?? []).filter((x) => x.session_id !== session.session_id),
+        ];
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [req.hostId]: {
+              status: "ready",
+              sessions: nextSessions,
+              policy: prev?.policy ?? null,
+              chromeBinary: prev?.chromeBinary ?? null,
+              activeSessionId: session.session_id,
+              elementsBySession: prev?.elementsBySession ?? {},
+              textExcerptBySession: prev?.textExcerptBySession ?? {},
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      // Immediately capture an initial viewport screenshot for visual feedback.
+      void orbitActions.executeBrowserAction(req.hostId, session.session_id, {
+        kind: "screenshot",
+        full_page: false,
+      });
+      return session;
+    } catch (err) {
+      const msg = String(err);
+      setState((s) => {
+        const prev = s.browserByHost[req.hostId];
+        if (!prev) return s;
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [req.hostId]: { ...prev, busy: false, error: msg },
+          },
+        };
+      });
+      notifyToast(`CDP session error: ${msg}`);
+      return null;
+    }
+  },
+
+  async executeBrowserAction(
+    hostId: string,
+    sessionId: string,
+    action: BrowserActionRequest,
+  ): Promise<BrowserActionResponseView | null> {
+    if (!hostId || !sessionId) return null;
+    setState((s) => {
+      const prev = s.browserByHost[hostId];
+      if (!prev) return s;
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [hostId]: { ...prev, busy: true, error: null },
+        },
+      };
+    });
+    try {
+      const res = await orbitIpc.executeBrowserAction({ hostId, sessionId, action });
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        if (!prev) return s;
+        const existingSession = prev.sessions.find((x) => x.session_id === res.session.session_id);
+        // Do not resurrect a session that was closed while this action was in flight.
+        if (!existingSession) {
+          return {
+            ...s,
+            browserByHost: {
+              ...s.browserByHost,
+              [hostId]: { ...prev, busy: false },
+            },
+          };
+        }
+        const mergedSession: BrowserSessionSummary = {
+          ...res.session,
+          last_screenshot_base64:
+            res.screenshot_base64 ??
+            res.session.last_screenshot_base64 ??
+            existingSession.last_screenshot_base64 ??
+            null,
+        };
+        const nextSessions = prev.sessions.map((x) =>
+          x.session_id === mergedSession.session_id ? mergedSession : x,
+        );
+        const nextActive =
+          prev.activeSessionId && nextSessions.some((x) => x.session_id === prev.activeSessionId)
+            ? prev.activeSessionId
+            : (nextSessions[0]?.session_id ?? null);
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "ready",
+              sessions: nextSessions,
+              policy: prev.policy,
+              chromeBinary: prev.chromeBinary,
+              activeSessionId: nextActive,
+              elementsBySession: {
+                ...prev.elementsBySession,
+                [mergedSession.session_id]: res.elements,
+              },
+              textExcerptBySession: {
+                ...prev.textExcerptBySession,
+                [mergedSession.session_id]:
+                  res.text_excerpt !== undefined
+                    ? res.text_excerpt
+                    : (prev.textExcerptBySession[mergedSession.session_id] ?? null),
+              },
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      return res;
+    } catch (err) {
+      const msg = String(err);
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        if (!prev) return s;
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: { ...prev, busy: false, error: msg },
+          },
+        };
+      });
+      notifyToast(msg);
+      return null;
+    }
+  },
+
+  async closeBrowserSession(
+    hostId: string,
+    sessionId: string,
+  ): Promise<BrowserSessionsSnapshotView | null> {
+    if (!hostId || !sessionId) return null;
+    const seq = (browserReqSeqByHost.get(hostId) ?? 0) + 1;
+    browserReqSeqByHost.set(hostId, seq);
+    setState((s) => {
+      const prev = s.browserByHost[hostId];
+      if (!prev) return s;
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [hostId]: { ...prev, busy: true, error: null },
+        },
+      };
+    });
+    try {
+      const snap = await orbitIpc.closeBrowserSession(hostId, sessionId);
+      if (browserReqSeqByHost.get(hostId) !== seq) return snap;
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        const nextElements = { ...(prev?.elementsBySession ?? {}) };
+        delete nextElements[sessionId];
+        const nextExcerpts = { ...(prev?.textExcerptBySession ?? {}) };
+        delete nextExcerpts[sessionId];
+        const nextActive =
+          prev?.activeSessionId &&
+          prev.activeSessionId !== sessionId &&
+          snap.sessions.some((x) => x.session_id === prev.activeSessionId)
+            ? prev.activeSessionId
+            : (snap.sessions[0]?.session_id ?? null);
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "ready",
+              sessions: snap.sessions,
+              policy: snap.policy,
+              chromeBinary: snap.chrome_binary ?? null,
+              activeSessionId: nextActive,
+              elementsBySession: nextElements,
+              textExcerptBySession: nextExcerpts,
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      notifyToast("CDP session closed");
+      return snap;
+    } catch (err) {
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        if (!prev) return s;
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: { ...prev, busy: false, error: String(err) },
+          },
+        };
+      });
+      notifyToast(`Failed to close CDP session: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async updateBrowserPolicy(
+    hostId: string,
+    policy: BrowserPolicyConfig,
+  ): Promise<BrowserSessionsSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (browserReqSeqByHost.get(hostId) ?? 0) + 1;
+    browserReqSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.updateBrowserPolicy(hostId, policy);
+      if (browserReqSeqByHost.get(hostId) !== seq) return snap;
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "ready",
+              sessions: snap.sessions,
+              policy: snap.policy,
+              chromeBinary: snap.chrome_binary ?? null,
+              activeSessionId:
+                prev?.activeSessionId &&
+                snap.sessions.some((x) => x.session_id === prev.activeSessionId)
+                  ? prev.activeSessionId
+                  : (snap.sessions[0]?.session_id ?? null),
+              elementsBySession: prev?.elementsBySession ?? {},
+              textExcerptBySession: prev?.textExcerptBySession ?? {},
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      notifyToast("Browser policy updated");
+      return snap;
+    } catch (err) {
+      notifyToast(`Failed to update browser policy: ${String(err)}`);
+      return null;
+    }
+  },
+
   async reloadWorkspaceFileFromConflict(hostId: string, cwd: string, path: string): Promise<void> {
     const cKey = fileCacheKey(hostId, cwd, path);
     try {
@@ -10138,6 +10542,7 @@ const MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES = 16;
 let nextLspGotoSeq = 0;
 const lspDiagSeqByKey = new Map<string, number>();
 const lspServersSeqByKey = new Map<string, number>();
+const browserReqSeqByHost = new Map<string, number>();
 const lifecycleHooksSeqByKey = new Map<string, number>();
 const eventTriggersSeqByHost = new Map<string, number>();
 const guardianReqSeqByHost = new Map<string, number>();

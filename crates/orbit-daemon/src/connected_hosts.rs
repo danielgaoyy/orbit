@@ -582,7 +582,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::MonitorWatchUpdated { request_id, .. }
         | WireMessage::MonitorWatchesSnapshot { request_id, .. }
         | WireMessage::EventTriggersSnapshot { request_id, .. }
-        | WireMessage::EventTriggerTestResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::EventTriggerTestResponse { request_id, .. }
+        | WireMessage::BrowserSessionsSnapshot { request_id, .. }
+        | WireMessage::BrowserSessionUpdated { request_id, .. }
+        | WireMessage::BrowserActionResponse { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }
@@ -1149,6 +1152,52 @@ mod tests {
             extract_response_request_id(&WireMessage::ConditionalTimerUpdated {
                 request_id: req_id,
                 timer: rec,
+            }),
+            Some(req_id)
+        );
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_browser_responses() {
+        let req_id = Uuid::new_v4();
+        let sess = orbit_protocol::BrowserSessionSummary {
+            session_id: "br_1".into(),
+            agent_id: Some("ag_1".into()),
+            url: "http://localhost:3000".into(),
+            title: "App".into(),
+            viewport_width: 1280,
+            viewport_height: 800,
+            headless: true,
+            element_count: 1,
+            console_errors: Vec::new(),
+            recent_actions: Vec::new(),
+            last_screenshot_base64: None,
+            updated_at_ms: 1,
+        };
+        assert_eq!(
+            extract_response_request_id(&WireMessage::BrowserSessionsSnapshot {
+                request_id: req_id,
+                sessions: vec![sess.clone()],
+                policy: orbit_protocol::BrowserPolicyConfig::default(),
+                chrome_binary: None,
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::BrowserSessionUpdated {
+                request_id: req_id,
+                session: sess.clone(),
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::BrowserActionResponse {
+                request_id: req_id,
+                session: sess,
+                elements: Vec::new(),
+                screenshot_base64: None,
+                text_excerpt: None,
+                captcha_detected: false,
             }),
             Some(req_id)
         );

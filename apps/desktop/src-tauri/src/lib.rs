@@ -2352,6 +2352,78 @@ async fn stop_monitor_watch(
 }
 
 #[tauri::command]
+async fn list_browser_sessions(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<orbit_client_core::contract::BrowserSessionsSnapshotView, String> {
+    state.core.list_browser_sessions_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn create_browser_session(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: Option<String>,
+    initial_url: Option<String>,
+    headless: Option<bool>,
+    viewport_width: Option<u32>,
+    viewport_height: Option<u32>,
+) -> Result<orbit_protocol::BrowserSessionSummary, String> {
+    state
+        .core
+        .create_browser_session_on_host(orbit_client_core::contract::CreateBrowserSessionRequest {
+            host_id,
+            agent_id,
+            initial_url,
+            headless,
+            viewport_width,
+            viewport_height,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn execute_browser_action(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    session_id: String,
+    action: orbit_protocol::BrowserActionRequest,
+) -> Result<orbit_client_core::contract::BrowserActionResponseView, String> {
+    state
+        .core
+        .execute_browser_action_on_host(orbit_client_core::contract::ExecuteBrowserActionRequest {
+            host_id,
+            session_id,
+            action,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn close_browser_session(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    session_id: String,
+) -> Result<orbit_client_core::contract::BrowserSessionsSnapshotView, String> {
+    state
+        .core
+        .close_browser_session_on_host(&host_id, &session_id)
+        .await
+}
+
+#[tauri::command]
+async fn update_browser_policy(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    policy: orbit_protocol::BrowserPolicyConfig,
+) -> Result<orbit_client_core::contract::BrowserSessionsSnapshotView, String> {
+    state
+        .core
+        .update_browser_policy_on_host(&host_id, policy)
+        .await
+}
+
+#[tauri::command]
 async fn highlight_workspace_code(
     language: String,
     content: String,
@@ -3242,6 +3314,11 @@ pub fn run() {
             upsert_event_trigger,
             delete_event_trigger,
             test_event_trigger,
+            list_browser_sessions,
+            create_browser_session,
+            execute_browser_action,
+            close_browser_session,
+            update_browser_policy,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

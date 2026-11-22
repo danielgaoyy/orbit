@@ -16,22 +16,22 @@ use orbit_crypto::PairingOffer;
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
-    BackgroundTaskInfo, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
-    ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, EventTriggerDelivery,
-    ExternalMcpServerRecord, GitStatusSnapshot, GoalRunRecord, GuardianAssessment,
-    GuardianAuditEntry, GuardianPolicyConfig, HookExecutionRecord, HookScope, HostProjectEntry,
-    HostSyncState, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus,
-    LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord,
-    OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary,
-    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog,
-    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem,
-    QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
-    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
-    TimelineEvent, TimelinePayload, TimerCondition, ToolCallDetail, ToolCallStatus,
-    UsageInsightsSnapshot, WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
-    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
-    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome,
-    WorktreeHandoffPreview,
+    BackgroundTaskInfo, BrowserPolicyConfig, BrowserSessionSummary, ConditionalTimerRecord,
+    ConditionalTimerState, ConnectedHostSummary, ContextOccupancyBreakdown, DirectoryEntry,
+    DiscoveredProject, EventTriggerDelivery, ExternalMcpServerRecord, GitStatusSnapshot,
+    GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
+    HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, KeepAwakeStatus,
+    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord, OrchestrationConfig,
+    OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef,
+    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, QueuedPromptView,
+    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
+    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload,
+    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
+    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
+    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
+    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -49,16 +49,18 @@ use crate::cloud_sync::{
     unlock_remote_vault_with_passphrase,
 };
 pub use crate::contract::{
-    ControlGoalRunRequest, ConversationSearchHit, CreateWorkspaceEntryRequest,
+    BrowserActionResponseView, BrowserSessionsSnapshotView, ControlGoalRunRequest,
+    ConversationSearchHit, CreateBrowserSessionRequest, CreateWorkspaceEntryRequest,
     DeletePathRuleRequest, DeleteWorkspaceEntryRequest, EventTriggersSnapshotView,
-    ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
-    InstructionFileContentView, InstructionFileSavedView, InstructionFilesSnapshotView,
-    LifecycleHooksSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
-    MatchedPathRulesView, PathRulesSnapshotView, PreviewWorktreeHandoffRequest,
-    ReadInstructionFileRequest, RenameWorkspaceEntryRequest, SaveInstructionFileRequest,
-    StartGoalRunRequest, StartMonitorWatchRequest, StopMonitorWatchRequest, UpsertArtifactRequest,
-    UpsertEventTriggerRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    ExecuteBrowserActionRequest, ExecuteWorktreeHandoffRequest, ForkAgentRequest,
+    ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
+    InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
+    MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
+    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
+    SaveInstructionFileRequest, StartGoalRunRequest, StartMonitorWatchRequest,
+    StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
+    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
+    WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
@@ -726,6 +728,12 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<EventTriggersSnapshotView, String>>>,
     pending_event_trigger_tests:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<EventTriggerDelivery, String>>>,
+    pending_browser_snapshots:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserSessionsSnapshotView, String>>>,
+    pending_browser_sessions:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserSessionSummary, String>>>,
+    pending_browser_actions:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserActionResponseView, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -861,6 +869,9 @@ impl HostMemoryState {
             pending_monitor_lists: HashMap::new(),
             pending_event_triggers: HashMap::new(),
             pending_event_trigger_tests: HashMap::new(),
+            pending_browser_snapshots: HashMap::new(),
+            pending_browser_sessions: HashMap::new(),
+            pending_browser_actions: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -5397,6 +5408,48 @@ impl OrbitAppCore {
                     upsert_cached_monitor(&mut state.monitor_watches, monitor);
                     notify_host = true;
                 }
+                WireMessage::BrowserSessionsSnapshot {
+                    request_id,
+                    sessions,
+                    policy,
+                    chrome_binary,
+                } => {
+                    if let Some(tx) = state.pending_browser_snapshots.remove(&request_id) {
+                        let _ = tx.send(Ok(BrowserSessionsSnapshotView {
+                            host_id: host_id.to_string(),
+                            sessions,
+                            policy,
+                            chrome_binary,
+                        }));
+                    }
+                }
+                WireMessage::BrowserSessionUpdated {
+                    request_id,
+                    session,
+                } => {
+                    if let Some(tx) = state.pending_browser_sessions.remove(&request_id) {
+                        let _ = tx.send(Ok(session));
+                    }
+                }
+                WireMessage::BrowserActionResponse {
+                    request_id,
+                    session,
+                    elements,
+                    screenshot_base64,
+                    text_excerpt,
+                    captcha_detected,
+                } => {
+                    if let Some(tx) = state.pending_browser_actions.remove(&request_id) {
+                        let _ = tx.send(Ok(BrowserActionResponseView {
+                            host_id: host_id.to_string(),
+                            session,
+                            elements,
+                            screenshot_base64,
+                            text_excerpt,
+                            captcha_detected,
+                        }));
+                    }
+                }
                 WireMessage::SideQuestionDelta {
                     request_id,
                     text_delta,
@@ -5673,6 +5726,18 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_monitor_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_browser_snapshots.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_browser_sessions.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_browser_actions.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -13107,6 +13172,320 @@ impl OrbitAppCore {
             .map_err(|_| "StopMonitorWatch task cancelled".to_string())?
     }
 
+    pub async fn list_browser_sessions_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<BrowserSessionsSnapshotView, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => {
+                        Some("Host disconnected before listing browser sessions".to_string())
+                    }
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListBrowserSessions {
+                    request_id: req_id,
+                    include_screenshots: true,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListBrowserSessions: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while listing browser sessions".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_snapshots.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ListBrowserSessions reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ListBrowserSessions task cancelled".to_string())?
+    }
+
+    pub async fn create_browser_session_on_host(
+        self: &Arc<Self>,
+        req: CreateBrowserSessionRequest,
+    ) -> Result<BrowserSessionSummary, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_sessions.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => {
+                        Some("Host disconnected before creating browser session".to_string())
+                    }
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::CreateBrowserSession {
+                    request_id: req_id,
+                    agent_id: req.agent_id,
+                    initial_url: req.initial_url,
+                    headless: req.headless,
+                    viewport_width: req.viewport_width,
+                    viewport_height: req.viewport_height,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_sessions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send CreateBrowserSession: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while creating browser session".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_sessions.remove(&req_id);
+                    }
+                    Err("Timed out waiting for CreateBrowserSession reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "CreateBrowserSession task cancelled".to_string())?
+    }
+
+    pub async fn execute_browser_action_on_host(
+        self: &Arc<Self>,
+        req: ExecuteBrowserActionRequest,
+    ) -> Result<BrowserActionResponseView, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_actions.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => {
+                        Some("Host disconnected before executing browser action".to_string())
+                    }
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ExecuteBrowserAction {
+                    request_id: req_id,
+                    session_id: req.session_id,
+                    action: req.action,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_actions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ExecuteBrowserAction: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while executing browser action".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_actions.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ExecuteBrowserAction reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ExecuteBrowserAction task cancelled".to_string())?
+    }
+
+    pub async fn close_browser_session_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        session_id: &str,
+    ) -> Result<BrowserSessionsSnapshotView, String> {
+        let host_id = host_id.to_string();
+        let session_id = session_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before closing browser session".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::CloseBrowserSession {
+                    request_id: req_id,
+                    session_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send CloseBrowserSession: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while closing browser session".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_snapshots.remove(&req_id);
+                    }
+                    Err("Timed out waiting for CloseBrowserSession reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "CloseBrowserSession task cancelled".to_string())?
+    }
+
+    pub async fn update_browser_policy_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        policy: BrowserPolicyConfig,
+    ) -> Result<BrowserSessionsSnapshotView, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before updating browser policy".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::UpdateBrowserPolicy {
+                    request_id: req_id,
+                    policy,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send UpdateBrowserPolicy: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while updating browser policy".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_snapshots.remove(&req_id);
+                    }
+                    Err("Timed out waiting for UpdateBrowserPolicy reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "UpdateBrowserPolicy task cancelled".to_string())?
+    }
+
     fn require_online_session(&self, host_id: &str) -> Result<HostSessionHandle, String> {
         let guard = self
             .hosts
@@ -14798,6 +15177,15 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_monitor_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_browser_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_browser_sessions.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_browser_actions.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {

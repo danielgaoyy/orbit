@@ -127,6 +127,7 @@ pub enum ShimError {
 pub struct ShimClient {
     tx: mpsc::Sender<ShimFrame>,
     pub rx: mpsc::Receiver<ShimFrame>,
+    attach_ack_seq: Option<u64>,
 }
 
 impl ShimClient {
@@ -156,6 +157,7 @@ impl ShimClient {
 
         let mut lines = BufReader::new(read_half).lines();
         let mut preloaded: Vec<ShimFrame> = Vec::new();
+        let mut attach_ack_seq: Option<u64> = None;
         let handshake_deadline = tokio::time::Instant::now() + Duration::from_millis(180);
         let mut quiet_window = Duration::from_millis(50);
         let mut legacy_drained: usize = 0;
@@ -173,9 +175,10 @@ impl ShimClient {
                         continue;
                     };
                     match frame {
-                        ShimFrame::AttachAck { .. } => {
+                        ShimFrame::AttachAck { latest_seq } => {
                             // Modern cursor-aware shim confirmed our cursor; every subsequent
                             // frame is strictly unseen (`seq > after_seq`).
+                            attach_ack_seq = Some(latest_seq);
                             break;
                         }
                         ShimFrame::StdoutLine { seq: None, .. }
@@ -237,6 +240,7 @@ impl ShimClient {
         Ok(Self {
             tx: in_tx,
             rx: out_rx,
+            attach_ack_seq,
         })
     }
 
@@ -279,7 +283,13 @@ impl ShimClient {
         Self {
             tx: in_tx,
             rx: out_rx,
+            attach_ack_seq: None,
         }
+    }
+
+    /// Returns the shim's latest frame sequence reported in `AttachAck` upon cursor-aware attach.
+    pub fn attach_ack_seq(&self) -> Option<u64> {
+        self.attach_ack_seq
     }
 
     pub async fn send(&self, frame: ShimFrame) -> Result<(), ShimError> {

@@ -39,6 +39,9 @@ pub async fn spawn_claude_session(
     };
 
     let (shim, is_reattached) = if let Some(existing) = reattached {
+        if let Some(ack_seq) = existing.attach_ack_seq() {
+            cfg.shim_seq_tracker.fetch_max(ack_seq, Ordering::Relaxed);
+        }
         (existing, true)
     } else {
         let perm_mode = claude_mode_flag(&cfg.mode);

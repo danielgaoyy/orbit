@@ -41,6 +41,9 @@ pub async fn spawn_codex_session(
     };
 
     let (shim, is_reattached) = if let Some(existing) = reattached {
+        if let Some(ack_seq) = existing.attach_ack_seq() {
+            cfg.shim_seq_tracker.fetch_max(ack_seq, Ordering::Relaxed);
+        }
         (existing, true)
     } else {
         let startup_guard = codex_startup_mutex().lock().await;

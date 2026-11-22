@@ -38,6 +38,9 @@ pub async fn spawn_antigravity_session(
     };
 
     let (shim, is_reattached) = if let Some(existing) = reattached {
+        if let Some(ack_seq) = existing.attach_ack_seq() {
+            cfg.shim_seq_tracker.fetch_max(ack_seq, Ordering::Relaxed);
+        }
         (existing, true)
     } else {
         let skip_perms = matches!(cfg.mode, SessionMode::FullAccess);
@@ -253,11 +256,12 @@ async fn open_agy_session(
             Err(e) => return Err(e),
         };
 
-    // Drain replay notifications on `session/load` until 50ms of quiet
+    // Drain replay notifications on `session/load` until 250ms of quiet (up to 8s ceiling)
+    // so large monorepo trajectories never leak historical `session/update` frames into the next prompt turn.
     if is_resume {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(50), shim.rx.recv()).await {
+            match tokio::time::timeout(Duration::from_millis(250), shim.rx.recv()).await {
                 Ok(Some(frame)) => {
                     if let Some(seq) = frame.seq() {
                         cfg.shim_seq_tracker.fetch_max(seq, Ordering::Relaxed);

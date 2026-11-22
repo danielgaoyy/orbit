@@ -582,7 +582,7 @@ fn map_pi_tool_detail(
                     .or_else(|| r.get("diff"))
                     .and_then(Value::as_str)
             })
-            .map(ToOwned::to_owned)
+            .map(|d| crate::compact_unified_diff(d, crate::MAX_UNIFIED_DIFF_BYTES))
             .or_else(|| {
                 let old_t = args
                     .and_then(|a| a.get("oldText").or_else(|| a.get("old_string")))

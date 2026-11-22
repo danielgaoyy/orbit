@@ -647,6 +647,7 @@ struct HostMemoryState {
     provider_subagent_timelines: HashMap<(String, String), Vec<ProviderSubagentEvent>>,
     provider_subagent_access_order: VecDeque<(String, String)>,
     active_provider_subagent: Option<(String, String)>,
+    subscribed_provider_subagents: HashSet<(String, String)>,
     acp_agents: Vec<AcpAgentAvailability>,
     artifacts: Vec<ArtifactSummary>,
 }
@@ -745,6 +746,7 @@ impl HostMemoryState {
             provider_subagent_timelines: HashMap::new(),
             provider_subagent_access_order: VecDeque::new(),
             active_provider_subagent: None,
+            subscribed_provider_subagents: HashSet::new(),
             acp_agents: Vec::new(),
             artifacts: Vec::new(),
         }
@@ -846,6 +848,7 @@ impl HostMemoryState {
             }
             self.provider_subagent_access_order.remove(idx);
             self.provider_subagent_timelines.remove(&candidate);
+            self.subscribed_provider_subagents.remove(&candidate);
         }
 
         // Fallback: evict any untracked finished keys (e.g. inserted directly without LRU touch).
@@ -873,6 +876,7 @@ impl HostMemoryState {
                     break;
                 }
                 self.provider_subagent_timelines.remove(&k);
+                self.subscribed_provider_subagents.remove(&k);
                 to_remove -= 1;
             }
         }
@@ -3415,7 +3419,7 @@ impl OrbitAppCore {
             Ok(handle) => {
                 let mut rx = handle.subscribe();
                 let welcome_host = handle.welcome_host.clone();
-                let (queued_outbox, resub_timelines, conn_gen) = {
+                let (queued_outbox, resub_timelines, resub_provider_subagents, conn_gen) = {
                     let Ok(mut guard) = self.hosts.write() else {
                         return;
                     };
@@ -3444,7 +3448,8 @@ impl OrbitAppCore {
                             (aid.clone(), self.safe_catchup_since_seq(aid, max_seq))
                         })
                         .collect();
-                    (outbox, resubs, conn_gen)
+                    let resub_subagents = collect_provider_subagent_resubscriptions(h);
+                    (outbox, resubs, resub_subagents, conn_gen)
                 };
                 if let Some(host_info) = welcome_host {
                     self.handle_inbound_wire(host_id, WireMessage::Welcome { host: host_info });
@@ -3570,6 +3575,16 @@ impl OrbitAppCore {
                         .send_wire(WireMessage::SubscribeTimeline {
                             request_id: Uuid::new_v4(),
                             agent_id,
+                            since_seq,
+                        })
+                        .await;
+                }
+                for (parent_agent_id, subagent_id, since_seq) in resub_provider_subagents {
+                    let _ = handle
+                        .send_wire(WireMessage::SubscribeProviderSubagent {
+                            request_id: Uuid::new_v4(),
+                            parent_agent_id,
+                            subagent_id,
                             since_seq,
                         })
                         .await;
@@ -3782,6 +3797,7 @@ impl OrbitAppCore {
         let mut notify_git_cwd: Option<String> = None;
         let mut auto_subscribe_agent: Option<String> = None;
         let mut continue_catchup: Option<(String, u64)> = None;
+        let mut continue_subagent_catchup: Option<(String, String, u64)> = None;
         let mut catchup_completed_cursor: Option<(String, u64)> = None;
         let mut live_event_cursor: Option<(String, u64)> = None;
         let mut host_to_persist: Option<StoredHostProfile> = None;
@@ -4126,6 +4142,27 @@ impl OrbitAppCore {
                     state.agents.remove(&agent_id);
                     state.timelines.remove(&agent_id);
                     state.provider_subagents.remove(&agent_id);
+                    state
+                        .provider_subagent_timelines
+                        .retain(|(pid, _), _| pid != &agent_id);
+                    state
+                        .provider_subagent_access_order
+                        .retain(|(pid, _)| pid != &agent_id);
+                    if state
+                        .active_provider_subagent
+                        .as_ref()
+                        .is_some_and(|(pid, _)| pid == &agent_id)
+                    {
+                        state.active_provider_subagent = None;
+                    }
+                    state
+                        .subscribed_provider_subagents
+                        .retain(|(pid, _)| pid != &agent_id);
+                    state.stage_cache.remove(&agent_id);
+                    state.stage_access_order.retain(|id| id != &agent_id);
+                    state.stage_dirty.remove(&agent_id);
+                    state.caught_up_agents.remove(&agent_id);
+                    state.rewound_agents.remove(&agent_id);
                     if let Some(pid) = parent_id {
                         state.mark_stage_meta_dirty(&pid);
                         push_notify_timeline(pid);
@@ -4363,6 +4400,7 @@ impl OrbitAppCore {
                     parent_agent_id,
                     subagent_id,
                     events,
+                    has_more,
                     ..
                 } => {
                     let key = (parent_agent_id, subagent_id);
@@ -4370,14 +4408,62 @@ impl OrbitAppCore {
                         .provider_subagent_timelines
                         .entry(key.clone())
                         .or_default();
+                    let prev_max_seq = list.iter().map(|e| e.seq).max().unwrap_or(0);
+                    let batch_max_seq = events.iter().map(|e| e.seq).max();
+                    let mut seq_to_idx: HashMap<u64, usize> = list
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, e)| (e.seq, idx))
+                        .collect();
+                    let mut logical_to_idx: HashMap<(&'static str, String), usize> = list
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, e)| {
+                            provider_subagent_logical_key(&e.payload).map(|k| (k, idx))
+                        })
+                        .collect();
+                    let mut advanced = false;
+                    let mut inserted_any = false;
                     for ev in events {
-                        if let Some(slot) = list.iter_mut().find(|e| e.seq == ev.seq) {
-                            *slot = ev;
+                        if ev.seq > prev_max_seq {
+                            advanced = true;
+                        }
+                        let lkey = provider_subagent_logical_key(&ev.payload);
+                        if let Some(&idx) = seq_to_idx.get(&ev.seq) {
+                            list[idx] = ev;
+                            if let Some(k) = lkey {
+                                logical_to_idx.insert(k, idx);
+                            }
+                        } else if let Some(ref k) = lkey
+                            && let Some(&idx) = logical_to_idx.get(k)
+                        {
+                            if ev.seq >= list[idx].seq {
+                                seq_to_idx.remove(&list[idx].seq);
+                                seq_to_idx.insert(ev.seq, idx);
+                                if ev.seq > list[idx].seq {
+                                    inserted_any = true;
+                                }
+                                list[idx] = ev;
+                            }
                         } else {
+                            let idx = list.len();
+                            seq_to_idx.insert(ev.seq, idx);
+                            if let Some(k) = lkey {
+                                logical_to_idx.insert(k, idx);
+                            }
                             list.push(ev);
+                            inserted_any = true;
                         }
                     }
                     list.sort_by_key(|e| e.seq);
+                    if has_more
+                        && let Some(next_since) = batch_max_seq
+                        && next_since > 0
+                        && (advanced || inserted_any)
+                    {
+                        continue_subagent_catchup =
+                            Some((key.0.clone(), key.1.clone(), next_since));
+                    }
                     state.touch_provider_subagent_lru(&key);
                     state.enforce_provider_subagent_timeline_bounds(Some(&key));
                     notify_host = true;
@@ -4388,8 +4474,18 @@ impl OrbitAppCore {
                         .provider_subagent_timelines
                         .entry(key.clone())
                         .or_default();
+                    let lkey = provider_subagent_logical_key(&event.payload);
                     if let Some(slot) = list.iter_mut().find(|e| e.seq == event.seq) {
                         *slot = event;
+                    } else if let Some(ref k) = lkey
+                        && let Some(slot) = list
+                            .iter_mut()
+                            .find(|e| provider_subagent_logical_key(&e.payload).as_ref() == Some(k))
+                    {
+                        if event.seq >= slot.seq {
+                            *slot = event;
+                            list.sort_by_key(|e| e.seq);
+                        }
                     } else {
                         list.push(event);
                     }
@@ -5130,6 +5226,17 @@ impl OrbitAppCore {
                 WireMessage::SubscribeTimeline {
                     request_id: Uuid::new_v4(),
                     agent_id: catchup_agent_id,
+                    since_seq,
+                },
+            );
+        }
+        if let Some((parent_agent_id, subagent_id, since_seq)) = continue_subagent_catchup {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::SubscribeProviderSubagent {
+                    request_id: Uuid::new_v4(),
+                    parent_agent_id,
+                    subagent_id,
                     since_seq,
                 },
             );
@@ -8065,6 +8172,7 @@ impl OrbitAppCore {
             .and_then(|mut g| {
                 let host_state = g.get_mut(host_id)?;
                 host_state.active_provider_subagent = Some(key.clone());
+                host_state.subscribed_provider_subagents.insert(key.clone());
                 if host_state.provider_subagent_timelines.contains_key(&key) {
                     host_state.touch_provider_subagent_lru(&key);
                 }
@@ -10912,6 +11020,44 @@ fn upsert_cached_artifact(list: &mut Vec<ArtifactSummary>, artifact: ArtifactSum
             .cmp(&a.updated_at)
             .then_with(|| a.artifact_id.cmp(&b.artifact_id))
     });
+}
+
+fn provider_subagent_logical_key(payload: &TimelinePayload) -> Option<(&'static str, String)> {
+    match payload {
+        TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
+            Some(("thinking", item_id.clone()))
+        }
+        TimelinePayload::AssistantMessage { item_id, .. } if !item_id.is_empty() => {
+            Some(("msg", item_id.clone()))
+        }
+        TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
+            Some(("tool", call_id.clone()))
+        }
+        TimelinePayload::UserPrompt { message_id, .. } if !message_id.is_empty() => {
+            Some(("user", message_id.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn collect_provider_subagent_resubscriptions(h: &HostMemoryState) -> Vec<(String, String, u64)> {
+    let mut keys: Vec<(String, String)> = h.subscribed_provider_subagents.iter().cloned().collect();
+    if let Some(ref active) = h.active_provider_subagent
+        && !keys.contains(active)
+    {
+        keys.push(active.clone());
+    }
+    keys.sort();
+    keys.into_iter()
+        .map(|(parent_id, sub_id)| {
+            let since_seq = h
+                .provider_subagent_timelines
+                .get(&(parent_id.clone(), sub_id.clone()))
+                .and_then(|list| list.iter().map(|e| e.seq).max())
+                .unwrap_or(0);
+            (parent_id, sub_id, since_seq)
+        })
+        .collect()
 }
 
 fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
@@ -16096,5 +16242,309 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&registered_dir);
         let _ = std::fs::remove_dir_all(&unregistered_dir);
+    }
+
+    #[test]
+    fn provider_subagent_catchup_paginates_resubscribes_and_cleans_on_agent_deleted() {
+        let core = OrbitAppCore::open_in_memory().expect("core");
+        let now = Utc::now();
+        let host_id = "h_sub_page";
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: host_id.into(),
+                hostname: "local".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag_p1".into(),
+                AgentSummary {
+                    agent_id: "ag_p1".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/tmp".into(),
+                    title: "Parent".into(),
+                    provider: ProviderKind::Antigravity,
+                    acp_agent_id: None,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    latest_seq: 1,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    parent_host_id: None,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    queued_prompts: Vec::new(),
+                },
+            );
+            mem.caught_up_agents.insert("ag_p1".into());
+            mem.rewound_agents.insert("ag_p1".into());
+            hosts.insert(host_id.into(), mem);
+        }
+
+        // 1. Open provider subagent timeline -> tracks subscription and queues SubscribeProviderSubagent
+        core.open_provider_subagent_timeline(host_id, "ag_p1", "sub_a");
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            assert!(
+                h.subscribed_provider_subagents
+                    .contains(&("ag_p1".to_string(), "sub_a".to_string()))
+            );
+            // Clear initial outbox so we can observe follow-up pagination messages cleanly
+            h.pending_outbox.clear();
+        }
+
+        // 2. Catchup page 1 with `has_more = true` must enqueue follow-up `since_seq = 2`
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineCatchup {
+                request_id: Uuid::new_v4(),
+                parent_agent_id: "ag_p1".into(),
+                subagent_id: "sub_a".into(),
+                events: vec![
+                    ProviderSubagentEvent {
+                        seq: 1,
+                        parent_agent_id: "ag_p1".into(),
+                        subagent_id: "sub_a".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m1".into(),
+                            text: "page1-a".into(),
+                            streaming: false,
+                        },
+                    },
+                    ProviderSubagentEvent {
+                        seq: 2,
+                        parent_agent_id: "ag_p1".into(),
+                        subagent_id: "sub_a".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m2".into(),
+                            text: "page1-b".into(),
+                            streaming: false,
+                        },
+                    },
+                ],
+                has_more: true,
+            },
+        );
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            assert!(
+                h.pending_outbox.iter().any(|m| matches!(
+                    m,
+                    WireMessage::SubscribeProviderSubagent {
+                        parent_agent_id,
+                        subagent_id,
+                        since_seq: 2,
+                        ..
+                    } if parent_agent_id == "ag_p1" && subagent_id == "sub_a"
+                )),
+                "has_more=true must trigger follow-up SubscribeProviderSubagent with since_seq=2"
+            );
+            h.pending_outbox.clear();
+
+            // 3. Reconnect helper must resubscribe active provider subagent at latest seq = 2
+            let resubs = collect_provider_subagent_resubscriptions(h);
+            assert_eq!(resubs, vec![("ag_p1".into(), "sub_a".into(), 2)]);
+        }
+
+        // 4. Empty catchup with `has_more = true` must NOT infinite-loop
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineCatchup {
+                request_id: Uuid::new_v4(),
+                parent_agent_id: "ag_p1".into(),
+                subagent_id: "sub_a".into(),
+                events: Vec::new(),
+                has_more: true,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts");
+            let h = hosts.get(host_id).expect("host");
+            assert!(
+                h.pending_outbox.is_empty(),
+                "empty catchup must not loop even if has_more=true"
+            );
+        }
+
+        // 5. Logical item replacement on live/catchup (mutated seq replaces older superseded seq)
+        //    and page-boundary live event ahead of catchup still triggers follow-up pagination!
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineLive {
+                event: ProviderSubagentEvent {
+                    seq: 10,
+                    parent_agent_id: "ag_p1".into(),
+                    subagent_id: "sub_a".into(),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantThinking {
+                        item_id: "wake_th_1".into(),
+                        text: "v1".into(),
+                    },
+                },
+            },
+        );
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineLive {
+                event: ProviderSubagentEvent {
+                    seq: 12,
+                    parent_agent_id: "ag_p1".into(),
+                    subagent_id: "sub_a".into(),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantThinking {
+                        item_id: "wake_th_1".into(),
+                        text: "v2-expanded".into(),
+                    },
+                },
+            },
+        );
+        {
+            let timeline = core.provider_subagent_timeline(host_id, "ag_p1", "sub_a");
+            let th_events: Vec<_> = timeline
+                .iter()
+                .filter(|e| matches!(&e.payload, TimelinePayload::AssistantThinking { item_id, .. } if item_id == "wake_th_1"))
+                .collect();
+            assert_eq!(
+                th_events.len(),
+                1,
+                "superseded seq 10 must be replaced in memory by seq 12"
+            );
+            assert_eq!(th_events[0].seq, 12);
+        }
+
+        // Now catchup delivers older page [seq 3, seq 4] with has_more=true while live seq 12 is already cached!
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            hosts.get_mut(host_id).expect("host").pending_outbox.clear();
+        }
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineCatchup {
+                request_id: Uuid::new_v4(),
+                parent_agent_id: "ag_p1".into(),
+                subagent_id: "sub_a".into(),
+                events: vec![
+                    ProviderSubagentEvent {
+                        seq: 3,
+                        parent_agent_id: "ag_p1".into(),
+                        subagent_id: "sub_a".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m3".into(),
+                            text: "page2-a".into(),
+                            streaming: false,
+                        },
+                    },
+                    ProviderSubagentEvent {
+                        seq: 4,
+                        parent_agent_id: "ag_p1".into(),
+                        subagent_id: "sub_a".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m4".into(),
+                            text: "page2-b".into(),
+                            streaming: false,
+                        },
+                    },
+                ],
+                has_more: true,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts");
+            let h = hosts.get(host_id).expect("host");
+            assert!(
+                h.pending_outbox.iter().any(|m| matches!(
+                    m,
+                    WireMessage::SubscribeProviderSubagent {
+                        parent_agent_id,
+                        subagent_id,
+                        since_seq: 4,
+                        ..
+                    } if parent_agent_id == "ag_p1" && subagent_id == "sub_a"
+                )),
+                "catchup inserting new seqs below live seq 12 must still paginate with since_seq=4"
+            );
+        }
+
+        // 6. Evicting finished timelines removes them from `subscribed_provider_subagents` (prevents reconnect thrash)
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            let mut descs = Vec::new();
+            for i in 0..10 {
+                let sid = format!("sub_evict_{i}");
+                descs.push(ProviderSubagentDescriptor {
+                    subagent_id: sid.clone(),
+                    parent_agent_id: "ag_p1".into(),
+                    parent_subagent_id: None,
+                    title: sid.clone(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Completed,
+                    created_at: now,
+                    updated_at: now,
+                });
+                let k = ("ag_p1".to_string(), sid);
+                h.subscribed_provider_subagents.insert(k.clone());
+                h.provider_subagent_timelines.insert(k.clone(), Vec::new());
+                h.touch_provider_subagent_lru(&k);
+            }
+            h.provider_subagents.insert("ag_p1".into(), descs);
+            h.enforce_provider_subagent_timeline_bounds(None);
+            assert!(
+                !h.subscribed_provider_subagents
+                    .contains(&("ag_p1".to_string(), "sub_evict_0".to_string())),
+                "evicted finished subagent must also be removed from subscribed_provider_subagents"
+            );
+        }
+
+        // 7. AgentDeleted must prune subagent timelines, active subagent, subscriptions, caches, and sets
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::AgentDeleted {
+                agent_id: "ag_p1".into(),
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts");
+            let h = hosts.get(host_id).expect("host");
+            assert!(h.provider_subagent_timelines.is_empty());
+            assert!(h.provider_subagent_access_order.is_empty());
+            assert!(h.active_provider_subagent.is_none());
+            assert!(h.subscribed_provider_subagents.is_empty());
+            assert!(!h.stage_cache.contains_key("ag_p1"));
+            assert!(!h.caught_up_agents.contains("ag_p1"));
+            assert!(!h.rewound_agents.contains("ag_p1"));
+        }
     }
 }

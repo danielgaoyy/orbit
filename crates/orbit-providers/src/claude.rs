@@ -388,6 +388,186 @@ struct PendingClaudePerm {
     question_texts: Vec<String>,
 }
 
+fn hydrate_reattached_claude_bg_tasks(
+    persisted: &[crate::PersistedBackgroundTask],
+    tool_cache: &mut HashMap<String, ToolCallDetail>,
+    bg_bash_tasks: &mut HashMap<String, (String, ToolCallDetail, BackgroundTaskInfo)>,
+    bg_tool_use_to_task: &mut HashMap<String, String>,
+    bg_tool_uses: &mut HashMap<String, BackgroundTaskInfo>,
+) {
+    for item in persisted {
+        let task_id = item
+            .info
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| item.call_id.clone());
+        tool_cache.insert(item.call_id.clone(), item.detail.clone());
+        bg_tool_use_to_task.insert(item.call_id.clone(), task_id.clone());
+        bg_tool_uses.insert(item.call_id.clone(), item.info.clone());
+        bg_bash_tasks.insert(
+            task_id,
+            (item.call_id.clone(), item.detail.clone(), item.info.clone()),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_claude_task_notification(
+    parent_agent_id: &str,
+    is_reattached: bool,
+    val: &Value,
+    bg_bash_tasks: &mut HashMap<String, (String, ToolCallDetail, BackgroundTaskInfo)>,
+    bg_tool_use_to_task: &mut HashMap<String, String>,
+    bg_tool_uses: &mut HashMap<String, BackgroundTaskInfo>,
+    tool_cache: &mut HashMap<String, ToolCallDetail>,
+    declared_tasks: &mut HashMap<String, ProviderSubagentDescriptor>,
+    tool_use_to_task: &HashMap<String, String>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let raw_task_id = val
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned);
+    let raw_tool_use_id = val
+        .get("tool_use_id")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned);
+    let bg_tid = raw_task_id
+        .clone()
+        .filter(|id| bg_bash_tasks.contains_key(id))
+        .or_else(|| {
+            raw_tool_use_id
+                .as_deref()
+                .and_then(|id| bg_tool_use_to_task.get(id).cloned())
+        });
+    if let Some(tid) = bg_tid
+        && let Some((call_id, mut detail, mut bg_info)) = bg_bash_tasks.remove(&tid)
+    {
+        bg_tool_use_to_task.remove(&call_id);
+        bg_tool_uses.remove(&call_id);
+        tool_cache.remove(&call_id);
+        if bg_info.log_path.is_none() {
+            bg_info.log_path = val
+                .get("output_file")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+        }
+        let st = val
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("completed");
+        let is_failed = matches!(
+            st,
+            "failed" | "error" | "stopped" | "canceled" | "cancelled"
+        );
+        if let Some(summary) = val
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && let ToolCallDetail::Shell {
+                ref mut output_preview,
+                ref mut exit_code,
+                ..
+            } = detail
+        {
+            *output_preview = Some(truncate_claude(summary, 800));
+            if exit_code.is_none() {
+                *exit_code = Some(if is_failed { 1 } else { 0 });
+            }
+        }
+        let _ = evt_tx
+            .send(DriverEvent::ToolCall {
+                call_id,
+                status: if is_failed {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                },
+                detail,
+                background_task: Some(bg_info),
+            })
+            .await;
+        return;
+    }
+    let lookup_id = raw_task_id.or_else(|| {
+        raw_tool_use_id
+            .as_deref()
+            .and_then(|id| tool_use_to_task.get(id).cloned())
+    });
+    if let Some(tid) = lookup_id {
+        let st = val
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("completed");
+        let terminal_status = match st {
+            "failed" | "error" => ProviderSubagentStatus::Failed,
+            "stopped" | "canceled" | "cancelled" => ProviderSubagentStatus::Canceled,
+            _ => ProviderSubagentStatus::Completed,
+        };
+        let now = Utc::now();
+        let desc = if let Some(existing) = declared_tasks.get_mut(&tid) {
+            existing.status = terminal_status;
+            existing.updated_at = now;
+            existing.clone()
+        } else {
+            let task_type = val.get("task_type").and_then(|v| v.as_str());
+            let skip_transcript = val
+                .get("skip_transcript")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Only synthesize an undeclared terminal subagent after a daemon hot-restart
+            // (`is_reattached == true`), and never for background bash or skipped transcripts.
+            if !is_reattached || task_type == Some("local_bash") || skip_transcript {
+                return;
+            }
+            let title = val
+                .get("description")
+                .or_else(|| val.get("title"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(tid.as_str())
+                .to_string();
+            let synthesized = ProviderSubagentDescriptor {
+                subagent_id: tid.clone(),
+                parent_agent_id: parent_agent_id.to_string(),
+                parent_subagent_id: None,
+                title,
+                subtitle: val
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
+                status: terminal_status,
+                created_at: now,
+                updated_at: now,
+            };
+            declared_tasks.insert(tid.clone(), synthesized.clone());
+            synthesized
+        };
+        let _ = evt_tx.send(DriverEvent::ProviderSubagentUpsert(desc)).await;
+        if let Some(summary) = val.get("summary").and_then(|v| v.as_str())
+            && !summary.trim().is_empty()
+        {
+            let _ = evt_tx
+                .send(DriverEvent::ProviderSubagentTimeline {
+                    subagent_id: tid,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: format!("task_notif_{}", Uuid::new_v4().simple()),
+                        text: summary.to_string(),
+                        streaming: false,
+                    },
+                })
+                .await;
+        }
+    }
+}
+
 fn build_claude_user_frame(
     session_id: &str,
     content_blocks: Vec<Value>,
@@ -469,6 +649,15 @@ async fn run_claude_actor(
         HashMap::new();
     let mut bg_tool_use_to_task: HashMap<String, String> = HashMap::new();
     let mut bg_tool_uses: HashMap<String, BackgroundTaskInfo> = HashMap::new();
+    if is_reattached {
+        hydrate_reattached_claude_bg_tasks(
+            &cfg.persisted_running_bg_tasks,
+            &mut tool_cache,
+            &mut bg_bash_tasks,
+            &mut bg_tool_use_to_task,
+            &mut bg_tool_uses,
+        );
+    }
     let mut confirmed_fast_mode: bool = cfg.fast_mode;
     let mut active_fast_mode: bool = cfg.fast_mode;
     let mut pending_fast_mode_reqs: HashMap<String, bool> = HashMap::new();
@@ -970,108 +1159,19 @@ async fn run_claude_actor(
                                         }
                                     }
                                     "task_notification" => {
-                                        let raw_task_id = val
-                                            .get("task_id")
-                                            .and_then(|v| v.as_str())
-                                            .map(ToOwned::to_owned);
-                                        let raw_tool_use_id = val
-                                            .get("tool_use_id")
-                                            .and_then(|v| v.as_str())
-                                            .map(ToOwned::to_owned);
-                                        let bg_tid = raw_task_id
-                                            .clone()
-                                            .filter(|id| bg_bash_tasks.contains_key(id))
-                                            .or_else(|| {
-                                                raw_tool_use_id
-                                                    .as_deref()
-                                                    .and_then(|id| bg_tool_use_to_task.get(id).cloned())
-                                            });
-                                        if let Some(tid) = bg_tid
-                                            && let Some((call_id, mut detail, mut bg_info)) =
-                                                bg_bash_tasks.remove(&tid)
-                                        {
-                                            bg_tool_use_to_task.remove(&call_id);
-                                            bg_tool_uses.remove(&call_id);
-                                            tool_cache.remove(&call_id);
-                                            if bg_info.log_path.is_none() {
-                                                bg_info.log_path = val
-                                                    .get("output_file")
-                                                    .and_then(|v| v.as_str())
-                                                    .map(str::trim)
-                                                    .filter(|s| !s.is_empty())
-                                                    .map(ToOwned::to_owned);
-                                            }
-                                            let st = val
-                                                .get("status")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("completed");
-                                            let is_failed = matches!(
-                                                st,
-                                                "failed" | "error" | "stopped" | "canceled" | "cancelled"
-                                            );
-                                            if let Some(summary) = val
-                                                .get("summary")
-                                                .and_then(|v| v.as_str())
-                                                .map(str::trim)
-                                                .filter(|s| !s.is_empty())
-                                                && let ToolCallDetail::Shell {
-                                                    ref mut output_preview,
-                                                    ref mut exit_code,
-                                                    ..
-                                                } = detail
-                                            {
-                                                *output_preview = Some(truncate_claude(summary, 800));
-                                                if exit_code.is_none() {
-                                                    *exit_code = Some(if is_failed { 1 } else { 0 });
-                                                }
-                                            }
-                                            let _ = evt_tx
-                                                .send(DriverEvent::ToolCall {
-                                                    call_id,
-                                                    status: if is_failed {
-                                                        ToolCallStatus::Failed
-                                                    } else {
-                                                        ToolCallStatus::Completed
-                                                    },
-                                                    detail,
-                                                    background_task: Some(bg_info),
-                                                })
-                                                .await;
-                                            continue;
-                                        }
-                                        let lookup_id = raw_task_id.or_else(|| {
-                                            raw_tool_use_id
-                                                .as_deref()
-                                                .and_then(|id| tool_use_to_task.get(id).cloned())
-                                        });
-                                        if let Some(tid) = lookup_id
-                                            && let Some(desc) = declared_tasks.get_mut(&tid)
-                                        {
-                                            let st = val.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
-                                            desc.status = match st {
-                                                "failed" | "error" => ProviderSubagentStatus::Failed,
-                                                "stopped" | "canceled" | "cancelled" => ProviderSubagentStatus::Canceled,
-                                                _ => ProviderSubagentStatus::Completed,
-                                            };
-                                            desc.updated_at = Utc::now();
-                                            let _ = evt_tx
-                                                .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
-                                                .await;
-                                            if let Some(summary) = val.get("summary").and_then(|v| v.as_str())
-                                                && !summary.trim().is_empty()
-                                            {
-                                                let _ = evt_tx
-                                                    .send(DriverEvent::ProviderSubagentTimeline {
-                                                        subagent_id: tid,
-                                                        payload: TimelinePayload::AssistantMessage {
-                                                            item_id: format!("task_notif_{}", Uuid::new_v4().simple()),
-                                                            text: summary.to_string(),
-                                                            streaming: false,
-                                                        },
-                                                    })
-                                                    .await;
-                                            }
-                                        }
+                                        handle_claude_task_notification(
+                                            &cfg.agent_id,
+                                            is_reattached,
+                                            &val,
+                                            &mut bg_bash_tasks,
+                                            &mut bg_tool_use_to_task,
+                                            &mut bg_tool_uses,
+                                            &mut tool_cache,
+                                            &mut declared_tasks,
+                                            &tool_use_to_task,
+                                            &evt_tx,
+                                        )
+                                        .await;
                                     }
                                     _ => {}
                                 }
@@ -2672,5 +2772,180 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn claude_post_restart_hydrates_bg_bash_and_settles_undeclared_subagent() {
+        let mut tool_cache = HashMap::new();
+        let mut bg_bash_tasks = HashMap::new();
+        let mut bg_tool_use_to_task = HashMap::new();
+        let mut bg_tool_uses = HashMap::new();
+        let mut declared_tasks = HashMap::new();
+        let tool_use_to_task = HashMap::new();
+        let (evt_tx, mut evt_rx) = mpsc::channel(16);
+
+        // 1. Hydrate a persisted running background bash task after daemon hot-restart
+        let persisted = vec![crate::PersistedBackgroundTask {
+            call_id: "toolu_bg_1".into(),
+            detail: ToolCallDetail::Shell {
+                command: "cargo test --workspace".into(),
+                cwd: None,
+                exit_code: None,
+                output_preview: None,
+            },
+            info: BackgroundTaskInfo {
+                task_id: Some("bash_task_42".into()),
+                label: Some("Run workspace tests".into()),
+                log_path: Some("/tmp/bash_42.log".into()),
+            },
+        }];
+        hydrate_reattached_claude_bg_tasks(
+            &persisted,
+            &mut tool_cache,
+            &mut bg_bash_tasks,
+            &mut bg_tool_use_to_task,
+            &mut bg_tool_uses,
+        );
+
+        let bg_notif = json!({
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "bash_task_42",
+            "status": "completed",
+            "summary": "All 500 tests passed"
+        });
+        handle_claude_task_notification(
+            "ag_claude_parent",
+            true,
+            &bg_notif,
+            &mut bg_bash_tasks,
+            &mut bg_tool_use_to_task,
+            &mut bg_tool_uses,
+            &mut tool_cache,
+            &mut declared_tasks,
+            &tool_use_to_task,
+            &evt_tx,
+        )
+        .await;
+
+        let ev1 = evt_rx.try_recv().expect("bg tool call settlement");
+        match ev1 {
+            DriverEvent::ToolCall {
+                call_id,
+                status,
+                detail:
+                    ToolCallDetail::Shell {
+                        exit_code,
+                        output_preview,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(call_id, "toolu_bg_1");
+                assert_eq!(status, ToolCallStatus::Completed);
+                assert_eq!(exit_code, Some(0));
+                assert!(
+                    output_preview
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("All 500 tests passed")
+                );
+            }
+            other => panic!("expected settled Shell ToolCall, got {other:?}"),
+        }
+
+        // 2. Fresh session (`is_reattached = false`) MUST NOT synthesize undeclared subagents,
+        // and `local_bash` / `skip_transcript` MUST NOT synthesize fake subagents even on reattach.
+        for (reattached, payload) in [
+            (
+                false,
+                json!({
+                    "type": "system",
+                    "subtype": "task_notification",
+                    "task_id": "sub_fresh_ignored",
+                    "status": "completed"
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "type": "system",
+                    "subtype": "task_notification",
+                    "task_id": "bash_untracked",
+                    "task_type": "local_bash",
+                    "status": "completed"
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "type": "system",
+                    "subtype": "task_notification",
+                    "task_id": "internal_hook_task",
+                    "skip_transcript": true,
+                    "status": "completed"
+                }),
+            ),
+        ] {
+            handle_claude_task_notification(
+                "ag_claude_parent",
+                reattached,
+                &payload,
+                &mut bg_bash_tasks,
+                &mut bg_tool_use_to_task,
+                &mut bg_tool_uses,
+                &mut tool_cache,
+                &mut declared_tasks,
+                &tool_use_to_task,
+                &evt_tx,
+            )
+            .await;
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "must not synthesize fake subagent for {payload}"
+            );
+        }
+
+        // 3. Post-restart (`is_reattached = true`) `task_notification` for an undeclared pre-restart subagent MUST emit terminal upsert
+        let sub_notif = json!({
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "sub_pre_restart_99",
+            "description": "Code Reviewer Subagent",
+            "status": "completed",
+            "summary": "Review complete with 0 issues."
+        });
+        handle_claude_task_notification(
+            "ag_claude_parent",
+            true,
+            &sub_notif,
+            &mut bg_bash_tasks,
+            &mut bg_tool_use_to_task,
+            &mut bg_tool_uses,
+            &mut tool_cache,
+            &mut declared_tasks,
+            &tool_use_to_task,
+            &evt_tx,
+        )
+        .await;
+
+        let ev2 = evt_rx.try_recv().expect("subagent upsert");
+        match ev2 {
+            DriverEvent::ProviderSubagentUpsert(desc) => {
+                assert_eq!(desc.subagent_id, "sub_pre_restart_99");
+                assert_eq!(desc.parent_agent_id, "ag_claude_parent");
+                assert_eq!(desc.title, "Code Reviewer Subagent");
+                assert_eq!(desc.status, ProviderSubagentStatus::Completed);
+            }
+            other => panic!("expected ProviderSubagentUpsert, got {other:?}"),
+        }
+        let ev3 = evt_rx.try_recv().expect("subagent summary message");
+        assert!(matches!(
+            ev3,
+            DriverEvent::ProviderSubagentTimeline {
+                subagent_id,
+                payload: TimelinePayload::AssistantMessage { text, .. }
+            } if subagent_id == "sub_pre_restart_99" && text.contains("Review complete")
+        ));
     }
 }

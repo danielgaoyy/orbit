@@ -526,6 +526,9 @@ async fn run_agy_actor(
         {
             Ok(rx) => rx,
             Err(_) => {
+                if !is_reattached {
+                    let _ = shim.kill().await;
+                }
                 let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                 return;
             }
@@ -548,6 +551,9 @@ async fn run_agy_actor(
                         recoverable: false,
                     }))
                     .await;
+                if !is_reattached {
+                    let _ = shim.kill().await;
+                }
                 return;
             }
         };
@@ -622,6 +628,9 @@ async fn run_agy_actor(
                                     recoverable: false,
                                 }))
                                 .await;
+                            if !is_reattached {
+                                let _ = shim.kill().await;
+                            }
                             return;
                         }
                     }
@@ -701,6 +710,9 @@ async fn run_agy_actor(
                                     recoverable: false,
                                 }))
                                 .await;
+                            if !is_reattached {
+                                let _ = shim.kill().await;
+                            }
                             return;
                         }
                     }
@@ -712,6 +724,9 @@ async fn run_agy_actor(
                             recoverable: false,
                         }))
                         .await;
+                    if !is_reattached {
+                        let _ = shim.kill().await;
+                    }
                     return;
                 }
             }
@@ -825,6 +840,10 @@ async fn run_agy_actor(
                 .await;
             }
             BgTaskDelta::SubagentMessaged { .. } => {}
+            BgTaskDelta::SubagentsCanceled { ids } => {
+                cancel_agy_subagent_monitors(ids.as_deref(), &mut subagent_monitors, &evt_tx).await;
+            }
+            BgTaskDelta::Compacted => {}
         }
     }
     let now_utc = Utc::now();
@@ -1011,6 +1030,7 @@ async fn run_agy_actor(
                         user_interrupted = true;
                         pending_self_heal = None;
                         bg_tracker.clear();
+                        cancel_agy_subagent_monitors(None, &mut subagent_monitors, &evt_tx).await;
                         if autonomous_turn_id.take().is_some() {
                             transcript_monitor.sync_silent();
                             for (cid, detail, bg_info) in
@@ -1784,6 +1804,14 @@ async fn run_agy_actor(
                                 )
                                 .await;
                             }
+                            WakeupStep::SubagentsCanceled { ids } => {
+                                cancel_agy_subagent_monitors(
+                                    ids.as_deref(),
+                                    &mut subagent_monitors,
+                                    &evt_tx,
+                                )
+                                .await;
+                            }
                             WakeupStep::UserMessage { .. } => {}
                             WakeupStep::Notice { level, message } => {
                                 if level != "info" {
@@ -2154,6 +2182,17 @@ async fn apply_foreground_bg_deltas(
             }
             BgTaskDelta::SubagentMessaged { subagent_id } => {
                 resume_agy_subagent_monitor(&subagent_id, subagent_monitors, evt_tx).await;
+            }
+            BgTaskDelta::SubagentsCanceled { ids } => {
+                cancel_agy_subagent_monitors(ids.as_deref(), subagent_monitors, evt_tx).await;
+            }
+            BgTaskDelta::Compacted => {
+                let _ = evt_tx
+                    .send(DriverEvent::Notice {
+                        level: "info".into(),
+                        message: "Context compacted automatically".into(),
+                    })
+                    .await;
             }
         }
     }
@@ -2562,6 +2601,28 @@ async fn handle_acp_session_update(
                 })
             {
                 resume_agy_subagent_monitor(&recipient_id, subagent_monitors, evt_tx).await;
+            } else if effective_status == ToolCallStatus::Completed {
+                let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let is_manage = is_manage_subagents_tool_name(title)
+                    || matches!(
+                        &detail,
+                        ToolCallDetail::Generic { tool_name, .. }
+                            if is_manage_subagents_tool_name(tool_name)
+                    );
+                if is_manage {
+                    let raw_out_text = extract_acp_raw_output_text(update.get("rawOutput"));
+                    if let Some(target_ids) = extract_manage_subagents_cancel(
+                        update.get("rawInput"),
+                        raw_out_text.as_deref(),
+                    ) {
+                        cancel_agy_subagent_monitors(
+                            target_ids.as_deref(),
+                            subagent_monitors,
+                            evt_tx,
+                        )
+                        .await;
+                    }
+                }
             }
             tool_cache.insert(call_id.clone(), detail.clone());
             let _ = evt_tx
@@ -2608,6 +2669,107 @@ fn is_send_message_tool_name(name: &str) -> bool {
     leaf.eq_ignore_ascii_case("send_message") || leaf.eq_ignore_ascii_case("sendmessage")
 }
 
+fn is_manage_subagents_tool_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    let without_run = trimmed
+        .strip_prefix("Run ")
+        .or_else(|| trimmed.strip_prefix("run "))
+        .unwrap_or(trimmed);
+    let first_tok = without_run.split_whitespace().next().unwrap_or("");
+    let leaf = first_tok
+        .rsplit([':', '/', '.'])
+        .next()
+        .unwrap_or(first_tok)
+        .rsplit("__")
+        .next()
+        .unwrap_or(first_tok);
+    leaf.eq_ignore_ascii_case("manage_subagents") || leaf.eq_ignore_ascii_case("managesubagents")
+}
+
+fn extract_uuids_from_text(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    if bytes.len() < 36 {
+        return out;
+    }
+    let is_hex = |b: u8| b.is_ascii_hexdigit();
+    let mut i = 0;
+    while i + 36 <= bytes.len() {
+        let slice = &bytes[i..i + 36];
+        let matches_shape = slice[8] == b'-'
+            && slice[13] == b'-'
+            && slice[18] == b'-'
+            && slice[23] == b'-'
+            && slice[0..8].iter().all(|&b| is_hex(b))
+            && slice[9..13].iter().all(|&b| is_hex(b))
+            && slice[14..18].iter().all(|&b| is_hex(b))
+            && slice[19..23].iter().all(|&b| is_hex(b))
+            && slice[24..36].iter().all(|&b| is_hex(b));
+        if matches_shape {
+            let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let right_ok = i + 36 == bytes.len() || !bytes[i + 36].is_ascii_alphanumeric();
+            if left_ok
+                && right_ok
+                && let Ok(s) = std::str::from_utf8(slice)
+            {
+                let id = s.to_string();
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+                i += 36;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn extract_manage_subagents_cancel(
+    args: Option<&Value>,
+    text_fallback: Option<&str>,
+) -> Option<Option<Vec<String>>> {
+    let action = transcript_arg_str(args, &["Action", "action"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if action == "kill_all" {
+        return Some(None);
+    }
+    if action != "kill" {
+        return None;
+    }
+    let mut ids: Vec<String> = args
+        .and_then(|a| {
+            a.get("ConversationIds")
+                .or_else(|| a.get("conversation_ids"))
+                .and_then(|v| v.as_array())
+        })
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty()
+        && let Some(single) = transcript_arg_str(args, &["ConversationId", "conversation_id"])
+    {
+        ids.push(single);
+    }
+    if ids.is_empty()
+        && let Some(txt) = text_fallback
+    {
+        ids = extract_uuids_from_text(txt);
+    }
+    if ids.is_empty() {
+        None
+    } else {
+        Some(Some(ids))
+    }
+}
+
 fn extract_send_message_recipient_from_detail(detail: &ToolCallDetail) -> Option<String> {
     let ToolCallDetail::Generic {
         tool_name,
@@ -2630,6 +2792,32 @@ fn extract_send_message_recipient_from_detail(detail: &ToolCallDetail) -> Option
             "agent_id",
         ],
     )
+}
+
+async fn cancel_agy_subagent_monitors(
+    target_ids: Option<&[String]>,
+    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let now = Utc::now();
+    for (sub_id, (desc, sub_mon)) in subagent_monitors.iter_mut() {
+        if desc.status != ProviderSubagentStatus::Running {
+            continue;
+        }
+        let matches = match target_ids {
+            None => true,
+            Some(ids) => ids.iter().any(|id| id.trim() == sub_id.as_str()),
+        };
+        if !matches {
+            continue;
+        }
+        desc.status = ProviderSubagentStatus::Canceled;
+        desc.updated_at = now;
+        sub_mon.in_wakeup = false;
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .await;
+    }
 }
 
 async fn resume_agy_subagent_monitor(
@@ -2757,7 +2945,8 @@ async fn poll_agy_subagent_monitor(
             WakeupStep::BackgroundTaskStarted { .. }
             | WakeupStep::BackgroundTaskCompleted { .. }
             | WakeupStep::SubagentSpawned { .. }
-            | WakeupStep::SubagentMessaged { .. } => {}
+            | WakeupStep::SubagentMessaged { .. }
+            | WakeupStep::SubagentsCanceled { .. } => {}
         }
     }
 }
@@ -2863,7 +3052,8 @@ async fn register_agy_subagent_monitor(
                 WakeupStep::BackgroundTaskStarted { .. }
                 | WakeupStep::BackgroundTaskCompleted { .. }
                 | WakeupStep::SubagentSpawned { .. }
-                | WakeupStep::SubagentMessaged { .. } => {}
+                | WakeupStep::SubagentMessaged { .. }
+                | WakeupStep::SubagentsCanceled { .. } => {}
             }
         }
         let _ = evt_tx
@@ -3613,6 +3803,9 @@ enum WakeupStep {
     SubagentMessaged {
         subagent_id: String,
     },
+    SubagentsCanceled {
+        ids: Option<Vec<String>>,
+    },
     Notice {
         level: String,
         message: String,
@@ -3666,6 +3859,10 @@ enum BgTaskDelta {
     SubagentMessaged {
         subagent_id: String,
     },
+    SubagentsCanceled {
+        ids: Option<Vec<String>>,
+    },
+    Compacted,
 }
 
 #[derive(Debug, Default)]
@@ -5272,6 +5469,10 @@ enum PendingTranscriptToolMeta {
         action: String,
         task_id: Option<String>,
     },
+    ManageSubagents {
+        action: String,
+        ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -5429,6 +5630,12 @@ impl AgyTranscriptMonitor {
             let Ok(raw) = std::fs::read_to_string(&path) else {
                 continue;
             };
+            if self.seen_undelivered_files.len() >= 2048 {
+                self.seen_undelivered_files.retain(|p| p.exists());
+                if self.seen_undelivered_files.len() >= 2048 {
+                    self.seen_undelivered_files.clear();
+                }
+            }
             self.seen_undelivered_files.insert(path);
 
             let lower = raw.to_ascii_lowercase();
@@ -5678,6 +5885,33 @@ impl AgyTranscriptMonitor {
                         let task_id = transcript_arg_str(args, &["TaskId", "task_id"]);
                         self.pending_silent_tools
                             .push_back(PendingTranscriptToolMeta::ManageTask { action, task_id });
+                    } else if is_manage_subagents_tool_name(tname) {
+                        let action = transcript_arg_str(args, &["Action", "action"])
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        let mut ids: Vec<String> = args
+                            .and_then(|a| {
+                                a.get("ConversationIds")
+                                    .or_else(|| a.get("conversation_ids"))
+                                    .and_then(|v| v.as_array())
+                            })
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(ToOwned::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if ids.is_empty()
+                            && let Some(single) =
+                                transcript_arg_str(args, &["ConversationId", "conversation_id"])
+                        {
+                            ids.push(single);
+                        }
+                        self.pending_silent_tools
+                            .push_back(PendingTranscriptToolMeta::ManageSubagents { action, ids });
                     } else if is_send_message_tool_name(tname) {
                         if let Some(recipient_id) = transcript_arg_str(
                             args,
@@ -5826,6 +6060,34 @@ impl AgyTranscriptMonitor {
                             }
                         }
                     }
+                    // 5) Paired `manage_subagents(Action: "kill" | "kill_all")` subagent cancellation
+                    if status == "DONE"
+                        && let PendingTranscriptToolMeta::ManageSubagents { action, ids } =
+                            &pending_meta
+                    {
+                        if action == "kill_all" {
+                            bg_deltas.push(BgTaskDelta::SubagentsCanceled { ids: None });
+                            if !silent {
+                                out.push(WakeupStep::SubagentsCanceled { ids: None });
+                            }
+                        } else if action == "kill" {
+                            let resolved_ids = if ids.is_empty() {
+                                extract_uuids_from_text(content)
+                            } else {
+                                ids.clone()
+                            };
+                            if !resolved_ids.is_empty() {
+                                bg_deltas.push(BgTaskDelta::SubagentsCanceled {
+                                    ids: Some(resolved_ids.clone()),
+                                });
+                                if !silent {
+                                    out.push(WakeupStep::SubagentsCanceled {
+                                        ids: Some(resolved_ids),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     for (task_id, canceled) in &completed_bg_tasks {
                         bg_deltas.push(BgTaskDelta::Completed {
                             task_id: task_id.clone(),
@@ -5893,6 +6155,10 @@ impl AgyTranscriptMonitor {
                             completed_bg_tasks.push((tid, true));
                         }
                     }
+                    bg_deltas.push(BgTaskDelta::SubagentsCanceled { ids: None });
+                    if !silent {
+                        out.push(WakeupStep::SubagentsCanceled { ids: None });
+                    }
                 }
                 for (task_id, canceled) in &completed_bg_tasks {
                     bg_deltas.push(BgTaskDelta::Completed {
@@ -5902,20 +6168,26 @@ impl AgyTranscriptMonitor {
                 }
             }
 
+            if step_type == "CHECKPOINT" {
+                bg_deltas.push(BgTaskDelta::Compacted);
+                if !silent {
+                    self.consecutive_errors = 0;
+                    self.last_error_at = None;
+                    self.last_error_message = None;
+                    self.last_in_progress_heartbeat = Some(Instant::now());
+                    out.push(WakeupStep::Notice {
+                        level: "info".into(),
+                        message: "Context compacted automatically".into(),
+                    });
+                }
+                continue;
+            }
+
             if silent {
                 continue;
             }
 
-            if step_type == "CHECKPOINT" {
-                self.consecutive_errors = 0;
-                self.last_error_at = None;
-                self.last_error_message = None;
-                self.last_in_progress_heartbeat = Some(Instant::now());
-                out.push(WakeupStep::Notice {
-                    level: "info".into(),
-                    message: "Context compacted automatically".into(),
-                });
-            } else if is_system_message_step(step_type, content) {
+            if is_system_message_step(step_type, content) {
                 for (task_id, canceled) in completed_bg_tasks {
                     out.push(WakeupStep::BackgroundTaskCompleted { task_id, canceled });
                 }
@@ -9770,5 +10042,248 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         assert!(monitors[sub_id].1.in_wakeup);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn manage_subagents_kill_and_kill_all_mark_running_subagents_canceled() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orbit_agy_cancel_sub_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let logs = tmp.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        let transcript = logs.join("transcript_full.jsonl");
+
+        // Parent invokes two subagents, then calls manage_subagents(kill) on sub_1, then kill_all on sub_2
+        let lines = [
+            json!({
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "tool_calls": [
+                    { "name": "invoke_subagent", "args": { "Role": "Worker 1", "Prompt": "Do A" } },
+                    { "name": "invoke_subagent", "args": { "Role": "Worker 2", "Prompt": "Do B" } }
+                ]
+            }),
+            json!({
+                "step_index": 1,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created the following subagent: {\"conversationId\": \"11111111-1111-1111-1111-111111111111\"}"
+            }),
+            json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created the following subagent: {\"conversationId\": \"22222222-2222-2222-2222-222222222222\"}"
+            }),
+            json!({
+                "step_index": 3,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "tool_calls": [
+                    {
+                        "name": "manage_subagents",
+                        "args": {
+                            "Action": "kill",
+                            "ConversationIds": ["11111111-1111-1111-1111-111111111111"]
+                        }
+                    }
+                ]
+            }),
+            json!({
+                "step_index": 4,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Killed subagent 11111111-1111-1111-1111-111111111111"
+            }),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        std::fs::write(&transcript, lines).expect("write transcript");
+
+        let mut monitor = AgyTranscriptMonitor::from_brain_dir_with_session(tmp.clone(), "sess_c");
+        let deltas1 = monitor.poll_foreground_bg_deltas();
+        assert!(deltas1.iter().any(|d| matches!(
+            d,
+            BgTaskDelta::SubagentsCanceled { ids: Some(ids) }
+                if ids.as_slice() == ["11111111-1111-1111-1111-111111111111"]
+        )));
+
+        let mut wakeup_tools = WakeupToolRegistry::default();
+        let mut bg_tracker = BackgroundTaskTracker::default();
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors = HashMap::new();
+        let (evt_tx, mut evt_rx) = mpsc::channel(32);
+
+        apply_foreground_bg_deltas(
+            "ag_parent",
+            deltas1,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &evt_tx,
+        )
+        .await;
+
+        assert_eq!(
+            subagent_monitors["11111111-1111-1111-1111-111111111111"]
+                .0
+                .status,
+            ProviderSubagentStatus::Canceled
+        );
+        assert_eq!(
+            subagent_monitors["22222222-2222-2222-2222-222222222222"]
+                .0
+                .status,
+            ProviderSubagentStatus::Running
+        );
+        while evt_rx.try_recv().is_ok() {}
+
+        // Now append `manage_subagents(Action: "kill_all")`
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("open append");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 5,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [
+                        { "name": "manage_subagents", "args": { "Action": "kill_all" } }
+                    ]
+                })
+            )
+            .expect("w5");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 6,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "Killed all subagents"
+                })
+            )
+            .expect("w6");
+        }
+
+        let deltas2 = monitor.poll_foreground_bg_deltas();
+        apply_foreground_bg_deltas(
+            "ag_parent",
+            deltas2,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &evt_tx,
+        )
+        .await;
+
+        assert_eq!(
+            subagent_monitors["22222222-2222-2222-2222-222222222222"]
+                .0
+                .status,
+            ProviderSubagentStatus::Canceled
+        );
+        let mut saw_canceled_2 = false;
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let DriverEvent::ProviderSubagentUpsert(d) = ev
+                && d.subagent_id == "22222222-2222-2222-2222-222222222222"
+                && d.status == ProviderSubagentStatus::Canceled
+            {
+                saw_canceled_2 = true;
+            }
+        }
+        assert!(saw_canceled_2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn foreground_checkpoint_emits_compaction_notice() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orbit_agy_fg_ckpt_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let logs = tmp.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        let transcript = logs.join("transcript_full.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 12,
+                    "type": "CHECKPOINT",
+                    "status": "DONE"
+                })
+            ),
+        )
+        .expect("write checkpoint");
+
+        let mut monitor = AgyTranscriptMonitor::from_brain_dir_with_session(tmp.clone(), "sess_cp");
+        let deltas = monitor.poll_foreground_bg_deltas();
+        assert!(deltas.iter().any(|d| matches!(d, BgTaskDelta::Compacted)));
+
+        let mut wakeup_tools = WakeupToolRegistry::default();
+        let mut bg_tracker = BackgroundTaskTracker::default();
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors = HashMap::new();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+
+        apply_foreground_bg_deltas(
+            "ag_parent",
+            deltas,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &evt_tx,
+        )
+        .await;
+
+        let notice = evt_rx.try_recv().expect("compaction notice emitted");
+        assert!(matches!(
+            notice,
+            DriverEvent::Notice { level, message }
+                if level == "info" && message == "Context compacted automatically"
+        ));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn manage_subagents_name_normalization_and_output_uuid_fallback_work() {
+        assert!(is_manage_subagents_tool_name("manage_subagents"));
+        assert!(is_manage_subagents_tool_name(
+            "default_api:manage_subagents"
+        ));
+        assert!(is_manage_subagents_tool_name("Run manage_subagents"));
+        assert!(is_manage_subagents_tool_name(
+            "mcp__orbit__manage_subagents"
+        ));
+        assert!(!is_manage_subagents_tool_name("invoke_subagent"));
+
+        let fallback = extract_manage_subagents_cancel(
+            Some(&json!({ "Action": "kill" })),
+            Some("Terminated subagent aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee cleanly."),
+        );
+        assert_eq!(
+            fallback,
+            Some(Some(vec!["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()]))
+        );
+        assert_eq!(
+            extract_manage_subagents_cancel(Some(&json!({ "Action": "kill_all" })), None),
+            Some(None)
+        );
     }
 }

@@ -183,11 +183,20 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
             parent_agent_id TEXT NOT NULL,
             subagent_id     TEXT NOT NULL,
             timestamp       TEXT NOT NULL,
-            payload_json    TEXT NOT NULL
+            payload_json    TEXT NOT NULL,
+            dedupe_key      TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_psub_events
             ON provider_subagent_events(parent_agent_id, subagent_id, seq);
+        ",
+    )?;
+    crate::ensure_table_column(conn, "provider_subagent_events", "dedupe_key", "TEXT")?;
+    conn.execute_batch(
+        "
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_psub_events_dedupe_uniq
+            ON provider_subagent_events(parent_agent_id, subagent_id, dedupe_key)
+            WHERE dedupe_key IS NOT NULL;
         ",
     )?;
     let cur_ver: i64 = conn
@@ -1232,7 +1241,12 @@ impl OrbitStore {
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(parent_agent_id, subagent_id) DO UPDATE SET
                 parent_subagent_id = COALESCE(excluded.parent_subagent_id, provider_subagents.parent_subagent_id),
-                title = excluded.title,
+                title = CASE
+                    WHEN excluded.title = excluded.subagent_id
+                         AND length(trim(provider_subagents.title)) > 0
+                    THEN provider_subagents.title
+                    ELSE excluded.title
+                END,
                 subtitle = COALESCE(excluded.subtitle, provider_subagents.subtitle),
                 status_json = excluded.status_json,
                 updated_at = excluded.updated_at",
@@ -1281,28 +1295,145 @@ impl OrbitStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn has_provider_subagent_events(
+        &self,
+        parent_agent_id: &str,
+        subagent_id: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.provider_subagent_event_count(parent_agent_id, subagent_id)? > 0)
+    }
+
+    pub fn provider_subagent_event_count(
+        &self,
+        parent_agent_id: &str,
+        subagent_id: &str,
+    ) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM provider_subagent_events
+             WHERE parent_agent_id = ?1 AND subagent_id = ?2",
+            params![parent_agent_id, subagent_id],
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
     pub fn append_provider_subagent_event(
         &self,
         parent_agent_id: &str,
         subagent_id: &str,
         payload: TimelinePayload,
     ) -> Result<ProviderSubagentEvent, StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        self.append_provider_subagent_event_upsert(parent_agent_id, subagent_id, payload)
+            .map(|(ev, _)| ev)
+    }
+
+    /// Idempotently append or coalesce a provider-subagent timeline event.
+    /// - Identical replays (`existing_json == payload_json`) return `(existing, false)` with zero write.
+    /// - Mutated updates (`existing_json != payload_json`, e.g. growing thinking or `Running -> Completed`
+    ///   tool call) atomically `DELETE` the superseded row and `INSERT` a fresh row inside an `IMMEDIATE`
+    ///   transaction so SQLite stays O(1) per logical item while `seq` strictly advances (`seq > since_seq`).
+    pub fn append_provider_subagent_event_upsert(
+        &self,
+        parent_agent_id: &str,
+        subagent_id: &str,
+        payload: TimelinePayload,
+    ) -> Result<(ProviderSubagentEvent, bool), StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = Utc::now();
+        let now_str = now.to_rfc3339();
         let payload_json = serde_json::to_string(&payload)?;
-        conn.execute(
-            "INSERT INTO provider_subagent_events (parent_agent_id, subagent_id, timestamp, payload_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![parent_agent_id, subagent_id, now.to_rfc3339(), payload_json],
+        let dedupe_key = provider_subagent_dedupe_key(&payload);
+
+        if let Some(ref dkey) = dedupe_key {
+            let existing: Option<(i64, String, String)> = tx
+                .query_row(
+                    "SELECT seq, payload_json, timestamp
+                     FROM provider_subagent_events
+                     WHERE parent_agent_id = ?1 AND subagent_id = ?2 AND dedupe_key = ?3
+                     LIMIT 1",
+                    params![parent_agent_id, subagent_id, dkey],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((existing_seq, existing_json, existing_ts)) = existing {
+                if existing_json == payload_json {
+                    tx.commit()?;
+                    return Ok((
+                        ProviderSubagentEvent {
+                            seq: existing_seq as u64,
+                            parent_agent_id: parent_agent_id.to_string(),
+                            subagent_id: subagent_id.to_string(),
+                            timestamp: parse_ts(&existing_ts),
+                            payload,
+                        },
+                        false,
+                    ));
+                }
+                tx.execute(
+                    "DELETE FROM provider_subagent_events WHERE seq = ?1",
+                    params![existing_seq],
+                )?;
+            } else {
+                // Self-heal legacy pre-dedupe_key rows when an identical payload is replayed on restart.
+                let legacy_match: Option<(i64, String)> = tx
+                    .query_row(
+                        "SELECT seq, timestamp
+                         FROM provider_subagent_events
+                         WHERE parent_agent_id = ?1
+                           AND subagent_id = ?2
+                           AND dedupe_key IS NULL
+                           AND payload_json = ?3
+                         ORDER BY seq DESC
+                         LIMIT 1",
+                        params![parent_agent_id, subagent_id, payload_json],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((legacy_seq, legacy_ts)) = legacy_match {
+                    let _ = tx.execute(
+                        "UPDATE provider_subagent_events SET dedupe_key = ?1 WHERE seq = ?2",
+                        params![dkey, legacy_seq],
+                    );
+                    tx.commit()?;
+                    return Ok((
+                        ProviderSubagentEvent {
+                            seq: legacy_seq as u64,
+                            parent_agent_id: parent_agent_id.to_string(),
+                            subagent_id: subagent_id.to_string(),
+                            timestamp: parse_ts(&legacy_ts),
+                            payload,
+                        },
+                        false,
+                    ));
+                }
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO provider_subagent_events (parent_agent_id, subagent_id, timestamp, payload_json, dedupe_key)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                parent_agent_id,
+                subagent_id,
+                now_str,
+                payload_json,
+                dedupe_key.as_deref()
+            ],
         )?;
-        let seq = conn.last_insert_rowid() as u64;
-        Ok(ProviderSubagentEvent {
-            seq,
-            parent_agent_id: parent_agent_id.to_string(),
-            subagent_id: subagent_id.to_string(),
-            timestamp: now,
-            payload,
-        })
+        let seq = tx.last_insert_rowid() as u64;
+        tx.commit()?;
+        Ok((
+            ProviderSubagentEvent {
+                seq,
+                parent_agent_id: parent_agent_id.to_string(),
+                subagent_id: subagent_id.to_string(),
+                timestamp: now,
+                payload,
+            },
+            true,
+        ))
     }
 
     pub fn fetch_provider_subagent_events_since(
@@ -1441,6 +1572,27 @@ fn map_connected_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCon
         created_at: parse_ts(&created_s),
         updated_at: parse_ts(&updated_s),
     })
+}
+
+fn provider_subagent_dedupe_key(payload: &TimelinePayload) -> Option<String> {
+    match payload {
+        TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
+            Some(format!("thinking:{item_id}"))
+        }
+        TimelinePayload::AssistantMessage { item_id, .. } if !item_id.is_empty() => {
+            Some(format!("msg:{item_id}"))
+        }
+        TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
+            Some(format!("tool:{call_id}"))
+        }
+        TimelinePayload::UserPrompt { message_id, .. } if !message_id.is_empty() => {
+            Some(format!("user:{message_id}"))
+        }
+        TimelinePayload::Notice { level, message } if !message.is_empty() => {
+            Some(format!("notice:{level}:{message}"))
+        }
+        _ => None,
+    }
 }
 
 fn schedule_run_status_str(status: ScheduleRunStatus) -> &'static str {

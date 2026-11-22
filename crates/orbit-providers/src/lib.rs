@@ -23,10 +23,293 @@ use orbit_protocol::{ModelOption, ProviderKind, ProviderModelCatalog, ProviderQu
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 
-const MAX_COMPACT_UNIFIED_DIFF_BYTES: usize = 64 * 1024;
+pub const MAX_UNIFIED_DIFF_BYTES: usize = 24 * 1024;
+const UNIFIED_DIFF_CONTEXT_RADIUS: usize = 3;
+
+/// Compact an existing unified diff down to ±3 context lines around changed (`+`/`-`) hunks and
+/// enforce a hard UTF-8-safe byte cap (`max_bytes`) with a clean truncation footer.
+pub fn compact_unified_diff(diff: &str, max_bytes: usize) -> String {
+    if diff.is_empty() {
+        return String::new();
+    }
+
+    let compacted = compact_unified_diff_context(diff, UNIFIED_DIFF_CONTEXT_RADIUS);
+    truncate_unified_diff_bytes(compacted, max_bytes)
+}
+
+fn compact_unified_diff_context(diff: &str, context_radius: usize) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let has_trailing_newline = diff.ends_with('\n');
+    let mut out: Vec<String> = Vec::with_capacity(lines.len().min(256));
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if line.starts_with("@@ ") {
+            let header = line;
+            let parsed_header = parse_hunk_header(header);
+            i += 1;
+            let body_start = i;
+            if let Some((_, old_total, _, new_total)) = parsed_header {
+                let mut old_rem = old_total;
+                let mut new_rem = new_total;
+                while i < lines.len() {
+                    let cur = lines[i];
+                    if old_rem == 0 && new_rem == 0 {
+                        if cur.starts_with('\\') {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    if cur.starts_with(' ') {
+                        old_rem = old_rem.saturating_sub(1);
+                        new_rem = new_rem.saturating_sub(1);
+                        i += 1;
+                    } else if cur.starts_with('-') {
+                        old_rem = old_rem.saturating_sub(1);
+                        i += 1;
+                    } else if cur.starts_with('+') {
+                        new_rem = new_rem.saturating_sub(1);
+                        i += 1;
+                    } else if cur.starts_with('\\') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                while i < lines.len()
+                    && !lines[i].starts_with("@@ ")
+                    && !lines[i].starts_with("diff --git ")
+                    && !is_file_header_pair(&lines, i)
+                {
+                    i += 1;
+                }
+            }
+            let body = &lines[body_start..i];
+            let parsed_start = parsed_header.map(|(os, _, ns, _)| (os, ns));
+            emit_compacted_hunk(
+                Some(header),
+                parsed_start,
+                body,
+                context_radius,
+                true,
+                &mut out,
+            );
+        } else if line.starts_with("diff --git ")
+            || line.starts_with("index ")
+            || is_file_header_pair(&lines, i)
+            || line.starts_with("+++ ")
+            || line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+            || line.starts_with("old mode ")
+            || line.starts_with("new mode ")
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ")
+            || line.starts_with("similarity index ")
+            || line.starts_with("Binary files ")
+        {
+            out.push(line.to_string());
+            i += 1;
+        } else if is_diff_body_line(line) {
+            let body_start = i;
+            while i < lines.len()
+                && !lines[i].starts_with("@@ ")
+                && !lines[i].starts_with("diff --git ")
+                && !is_file_header_pair(&lines, i)
+                && is_diff_body_line(lines[i])
+            {
+                i += 1;
+            }
+            let body = &lines[body_start..i];
+            emit_compacted_hunk(None, None, body, context_radius, false, &mut out);
+        } else {
+            out.push(line.to_string());
+            i += 1;
+        }
+    }
+
+    let mut joined = out.join("\n");
+    if has_trailing_newline && !joined.is_empty() {
+        joined.push('\n');
+    }
+    joined
+}
+
+fn is_file_header_pair(lines: &[&str], idx: usize) -> bool {
+    lines[idx].starts_with("--- ")
+        && lines
+            .get(idx + 1)
+            .is_some_and(|next| next.starts_with("+++ "))
+}
+
+fn is_diff_body_line(line: &str) -> bool {
+    line.starts_with(' ')
+        || line.starts_with('+')
+        || line.starts_with('-')
+        || line.starts_with('\\')
+}
+
+fn is_diff_change_line(line: &str, inside_hunk: bool) -> bool {
+    if inside_hunk {
+        line.starts_with('+') || line.starts_with('-')
+    } else {
+        (line.starts_with('+') && !line.starts_with("+++ "))
+            || (line.starts_with('-') && !line.starts_with("--- "))
+    }
+}
+
+fn parse_hunk_range_spec(spec: &str) -> Option<(usize, usize)> {
+    if let Some((start_s, count_s)) = spec.split_once(',') {
+        Some((
+            start_s.parse::<usize>().ok()?,
+            count_s.parse::<usize>().ok()?,
+        ))
+    } else {
+        Some((spec.parse::<usize>().ok()?, 1))
+    }
+}
+
+fn parse_hunk_header(header: &str) -> Option<(usize, usize, usize, usize)> {
+    let rest = header.strip_prefix("@@ ")?;
+    let end = rest.find(" @@")?;
+    let range_spec = &rest[..end];
+    let mut parts = range_spec.split_whitespace();
+    let old_part = parts.next()?.strip_prefix('-')?;
+    let new_part = parts.next()?.strip_prefix('+')?;
+    let (old_start, old_count) = parse_hunk_range_spec(old_part)?;
+    let (new_start, new_count) = parse_hunk_range_spec(new_part)?;
+    Some((old_start, old_count, new_start, new_count))
+}
+
+fn emit_compacted_hunk(
+    original_header: Option<&str>,
+    parsed_start: Option<(usize, usize)>,
+    body: &[&str],
+    context_radius: usize,
+    inside_hunk: bool,
+    out: &mut Vec<String>,
+) {
+    let change_indices: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| is_diff_change_line(line, inside_hunk).then_some(idx))
+        .collect();
+
+    if change_indices.is_empty() {
+        if let Some(h) = original_header {
+            out.push(h.to_string());
+        }
+        for line in body {
+            out.push((*line).to_string());
+        }
+        return;
+    }
+
+    // Build merged [start..=end] windows around each change line with `context_radius` lines of context.
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for idx in change_indices {
+        let start = idx.saturating_sub(context_radius);
+        let mut end = (idx + context_radius).min(body.len().saturating_sub(1));
+        // Keep trailing `\ No newline at end of file` marker attached to its preceding line.
+        if end + 1 < body.len() && body[end + 1].starts_with('\\') {
+            end += 1;
+        }
+        if let Some(last) = windows.last_mut()
+            && start <= last.1 + 1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            windows.push((start, end));
+        }
+    }
+
+    // Fast path: hunk is already compact (single window covering the entire body).
+    if windows.len() == 1 && windows[0].0 == 0 && windows[0].1 + 1 == body.len() {
+        if let Some(h) = original_header {
+            out.push(h.to_string());
+        }
+        for line in body {
+            out.push((*line).to_string());
+        }
+        return;
+    }
+
+    // Precompute old/new line offsets for accurate @@ headers when splitting a wide hunk.
+    let mut old_before: Vec<usize> = Vec::with_capacity(body.len() + 1);
+    let mut new_before: Vec<usize> = Vec::with_capacity(body.len() + 1);
+    let mut old_acc = 0usize;
+    let mut new_acc = 0usize;
+    for line in body {
+        old_before.push(old_acc);
+        new_before.push(new_acc);
+        if line.starts_with(' ') {
+            old_acc += 1;
+            new_acc += 1;
+        } else if line.starts_with('-') {
+            old_acc += 1;
+        } else if line.starts_with('+') {
+            new_acc += 1;
+        }
+    }
+    old_before.push(old_acc);
+    new_before.push(new_acc);
+
+    for (w_start, w_end) in windows {
+        let old_count = old_before[w_end + 1].saturating_sub(old_before[w_start]);
+        let new_count = new_before[w_end + 1].saturating_sub(new_before[w_start]);
+        if let Some((base_old, base_new)) = parsed_start {
+            let h_old = base_old.saturating_add(old_before[w_start]);
+            let h_new = base_new.saturating_add(new_before[w_start]);
+            out.push(format!("@@ -{h_old},{old_count} +{h_new},{new_count} @@"));
+        } else {
+            out.push("@@ ... @@".to_string());
+        }
+        for line in &body[w_start..=w_end] {
+            out.push((*line).to_string());
+        }
+    }
+}
+
+fn truncate_unified_diff_bytes(mut rendered: String, max_bytes: usize) -> String {
+    if rendered.len() <= max_bytes {
+        return rendered;
+    }
+    let footer = if max_bytes >= 1024 && max_bytes.is_multiple_of(1024) {
+        format!(
+            "\n… [diff truncated at {} KB — open Git Review for full diff]",
+            max_bytes / 1024
+        )
+    } else {
+        "\n… [diff truncated — open Git Review for full diff]".to_string()
+    };
+    if max_bytes <= footer.len() {
+        let mut cut = max_bytes;
+        while cut > 0 && !rendered.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        rendered.truncate(cut);
+        return rendered;
+    }
+    let mut cut = max_bytes - footer.len();
+    while cut > 0 && !rendered.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if let Some(nl) = rendered[..cut].rfind('\n')
+        && nl > 0
+    {
+        cut = nl;
+    }
+    rendered.truncate(cut);
+    rendered.push_str(&footer);
+    rendered
+}
 
 /// Build a standard compact unified diff (3 context lines per hunk) from `old_text` and `new_text`.
-/// Returns `None` when both texts are identical, and safely caps extreme payloads at 64 KiB on a
+/// Returns `None` when both texts are identical, and safely caps extreme payloads at 24 KiB on a
 /// UTF-8 line boundary so large file rewrites never bloat SQLite or WebSocket frames.
 pub(crate) fn build_compact_unified_diff(
     path: &str,
@@ -55,9 +338,9 @@ pub(crate) fn build_compact_unified_diff(
     };
 
     let diff = TextDiff::from_lines(old_text, new_text);
-    let mut rendered = diff
+    let rendered = diff
         .unified_diff()
-        .context_radius(3)
+        .context_radius(UNIFIED_DIFF_CONTEXT_RADIUS)
         .header(&old_header, &new_header)
         .to_string();
 
@@ -65,19 +348,7 @@ pub(crate) fn build_compact_unified_diff(
         return None;
     }
 
-    if rendered.len() > MAX_COMPACT_UNIFIED_DIFF_BYTES {
-        let mut cut = MAX_COMPACT_UNIFIED_DIFF_BYTES;
-        while cut > 0 && !rendered.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        if let Some(nl) = rendered[..cut].rfind('\n') {
-            cut = nl + 1;
-        }
-        rendered.truncate(cut);
-        rendered.push_str("\\ Diff truncated for storage efficiency\n");
-    }
-
-    Some(rendered)
+    Some(compact_unified_diff(&rendered, MAX_UNIFIED_DIFF_BYTES))
 }
 
 pub use acp_registry::{
@@ -767,5 +1038,98 @@ mod capability_tests {
             Some("default"),
             None
         ));
+    }
+
+    #[test]
+    fn compact_unified_diff_compacts_full_file_context_to_3_lines_and_caps_utf8_safely() {
+        // Build a synthetic full-file diff with 40 leading context lines, 1 edit, 40 middle
+        // context lines, 1 edit, and 40 trailing context lines.
+        let mut raw = String::from("--- a/demo.rs\n+++ b/demo.rs\n@@ -1,122 +1,122 @@\n");
+        for i in 1..=40 {
+            raw.push_str(&format!(" line_{i}\n"));
+        }
+        raw.push_str("-old_mid_1\n+new_mid_1\n");
+        for i in 42..=81 {
+            raw.push_str(&format!(" line_{i}\n"));
+        }
+        raw.push_str("-old_mid_2\n+new_mid_2\n");
+        for i in 83..=122 {
+            raw.push_str(&format!(" line_{i}\n"));
+        }
+
+        let compacted = compact_unified_diff(&raw, MAX_UNIFIED_DIFF_BYTES);
+        assert!(compacted.contains("-old_mid_1\n+new_mid_1"));
+        assert!(compacted.contains("-old_mid_2\n+new_mid_2"));
+        // Leading/middle/trailing far-away context lines must be dropped to ±3 lines
+        assert!(!compacted.contains(" line_1\n"));
+        assert!(!compacted.contains(" line_37\n"));
+        assert!(compacted.contains(" line_38\n"));
+        assert!(compacted.contains(" line_44\n"));
+        assert!(!compacted.contains(" line_45\n"));
+        assert!(!compacted.contains(" line_78\n"));
+        assert!(compacted.contains(" line_79\n"));
+        assert!(compacted.contains(" line_85\n"));
+        assert!(!compacted.contains(" line_86\n"));
+        assert!(
+            compacted.matches("@@ ").count() == 2,
+            "expected two compacted hunks, got:\n{compacted}"
+        );
+
+        // Giant UTF-8 diff (> 24 KiB with multibyte CJK characters) must cap cleanly <= 24 KiB
+        let mut giant = String::from("--- a/big.txt\n+++ b/big.txt\n@@ -1,1 +1,1000 @@\n");
+        for i in 0..1000 {
+            giant.push_str(&format!(
+                "+第{i:04}行：这是一段用于测试截断边界的中文内容 payload\n"
+            ));
+        }
+        assert!(giant.len() > MAX_UNIFIED_DIFF_BYTES);
+        let capped = compact_unified_diff(&giant, MAX_UNIFIED_DIFF_BYTES);
+        assert!(
+            capped.len() <= MAX_UNIFIED_DIFF_BYTES,
+            "capped len {} exceeded {}",
+            capped.len(),
+            MAX_UNIFIED_DIFF_BYTES
+        );
+        assert!(capped.ends_with("… [diff truncated at 24 KB — open Git Review for full diff]"));
+    }
+
+    #[test]
+    fn compact_unified_diff_preserves_deleted_sql_comments_yaml_separators_and_plus_plus_lines() {
+        let mut raw = String::from("--- a/query.sql\n+++ b/query.sql\n@@ -1,24 +1,24 @@\n");
+        for i in 1..=10 {
+            raw.push_str(&format!(" SELECT {i};\n"));
+        }
+        // Deleting `-- SQL comment` produces `--- SQL comment`, deleting `---` produces `----`,
+        // adding `++ x` produces `+++ x` — all MUST stay inside the hunk and be treated as changes!
+        raw.push_str("--- SQL comment deleted\n");
+        raw.push_str("----\n");
+        raw.push_str("+++ x\n");
+        raw.push_str("+++ y\n");
+        for i in 11..=22 {
+            raw.push_str(&format!(" SELECT {i};\n"));
+        }
+
+        let compacted = compact_unified_diff(&raw, MAX_UNIFIED_DIFF_BYTES);
+        assert!(compacted.contains("--- SQL comment deleted"));
+        assert!(compacted.contains("----\n"));
+        assert!(compacted.contains("+++ x\n"));
+        assert!(compacted.contains("+++ y\n"));
+        assert!(
+            !compacted.contains(" SELECT 1;\n"),
+            "far leading context must be compacted:\n{compacted}"
+        );
+        assert!(
+            compacted.contains(" SELECT 8;\n") && compacted.contains(" SELECT 13;\n"),
+            "±3 context lines around --/++ changes must be preserved:\n{compacted}"
+        );
+        assert!(
+            !compacted.contains(" SELECT 14;\n"),
+            "far trailing context must be compacted:\n{compacted}"
+        );
+        assert_eq!(
+            compacted.matches("@@ ").count(),
+            1,
+            "deleted -- and added ++ lines must NOT split the hunk:\n{compacted}"
+        );
     }
 }

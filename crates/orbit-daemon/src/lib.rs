@@ -771,7 +771,8 @@ async fn serve_e2ee_relay_tunnel(
                             }
                         }
                         Err(err) => {
-                            tracing::warn!(error = %err, bytes = plain.len(), "failed to decode E2EE zstd wire message");
+                            let summary = format_concise_wire_decode_error(&err);
+                            tracing::warn!(error = %summary, bytes = plain.len(), "failed to decode E2EE zstd wire message");
                         }
                     },
                     E2EE_FRAME_TERMINAL => {
@@ -863,7 +864,8 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
                                 }
                             }
                             Err(err) => {
-                                tracing::warn!(error = %err, bytes = bin.len(), "failed to decode direct zstd wire message");
+                                let summary = format_concise_wire_decode_error(&err);
+                                tracing::warn!(error = %summary, bytes = bin.len(), "failed to decode direct zstd wire message");
                             }
                         }
                     } else if let Ok(term) = TerminalBinaryFrame::decode(&bin)
@@ -882,6 +884,25 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
 }
 
 // --- Unified Transport-Neutral Session Controller (shared by Direct WS & Relay E2EE) ---
+
+fn format_concise_wire_decode_error(err: &impl std::fmt::Display) -> String {
+    const MAX_LEN: usize = 240;
+    let raw = err.to_string();
+    let condensed = if let Some(idx) = raw.find(", expected one of") {
+        format!("{}, expected known WireMessage variant", &raw[..idx])
+    } else {
+        raw
+    };
+    if condensed.len() <= MAX_LEN {
+        return condensed;
+    }
+    let ellipsis = "…";
+    let mut cut = MAX_LEN.saturating_sub(ellipsis.len());
+    while cut > 0 && !condensed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &condensed[..cut], ellipsis)
+}
 
 #[allow(clippy::large_enum_variant)]
 enum SessionFrame {
@@ -3928,5 +3949,30 @@ mod self_upgrade_tests {
         }
 
         server.abort();
+    }
+
+    #[test]
+    fn concise_wire_decode_error_strips_enum_variant_dump_and_caps_at_240_chars() {
+        let giant_variants: String = (0..100)
+            .map(|i| format!("`variant_name_{i:03}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let raw_err = format!(
+            "unknown variant `FutureClientFeature`, expected one of {giant_variants} at line 1 column 28"
+        );
+        assert!(raw_err.len() > 2000);
+        let summary = format_concise_wire_decode_error(&raw_err);
+        assert!(
+            summary.len() <= 240,
+            "summary must be <= 240 bytes, got {}",
+            summary.len()
+        );
+        assert!(summary.contains("FutureClientFeature"));
+        assert!(!summary.contains("variant_name_050"));
+
+        let long_generic = "解码错误: ".to_string() + &"a".repeat(500);
+        let truncated = format_concise_wire_decode_error(&long_generic);
+        assert!(truncated.len() <= 240);
+        assert!(truncated.ends_with('…'));
     }
 }

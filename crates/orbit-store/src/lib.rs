@@ -1068,6 +1068,21 @@ impl OrbitStore {
         turn_id: Option<&str>,
         payload: TimelinePayload,
     ) -> Result<TimelineEvent, StoreError> {
+        self.append_timeline_event_deduped(agent_id, epoch, turn_id, payload)
+            .map(|(ev, _)| ev)
+    }
+
+    /// Same as [`Self::append_timeline_event`], additionally returning `mutated == false` when an
+    /// identical `AssistantThinking` heartbeat matches the latest persisted row so callers can
+    /// avoid redundant SQLite writes and duplicate `TimelineLive` broadcasts. Any mutated payload
+    /// still executes `DELETE + INSERT` to strictly preserve monotonic `seq > since_seq`.
+    pub fn append_timeline_event_deduped(
+        &self,
+        agent_id: &str,
+        epoch: u32,
+        turn_id: Option<&str>,
+        payload: TimelinePayload,
+    ) -> Result<(TimelineEvent, bool), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
         let now = Utc::now();
@@ -1075,6 +1090,39 @@ impl OrbitStore {
         let payload_json = serde_json::to_string(&payload)?;
         let event_type = payload_event_type(&payload);
         let ckey = coalesce_key(&payload);
+
+        if matches!(payload, TimelinePayload::AssistantThinking { .. })
+            && let Some(ref key_val) = ckey
+        {
+            let latest_row: Option<(i64, Option<String>, String, String)> = tx
+                .query_row(
+                    "SELECT seq, coalesce_key, payload_json, timestamp
+                     FROM timeline_events
+                     WHERE agent_id = ?1
+                     ORDER BY seq DESC
+                     LIMIT 1",
+                    params![agent_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            if let Some((latest_seq, latest_ckey, latest_json, latest_ts)) = latest_row
+                && latest_ckey.as_deref() == Some(key_val.as_str())
+                && latest_json == payload_json
+            {
+                tx.commit()?;
+                return Ok((
+                    TimelineEvent {
+                        seq: latest_seq as u64,
+                        epoch,
+                        agent_id: agent_id.to_string(),
+                        turn_id: turn_id.map(ToOwned::to_owned),
+                        timestamp: parse_ts(&latest_ts),
+                        payload,
+                    },
+                    false,
+                ));
+            }
+        }
 
         if let Some(ref key_val) = ckey {
             let boundary_seq = query_coalesce_boundary_seq(&tx, true, agent_id, &payload, None);
@@ -1134,14 +1182,17 @@ impl OrbitStore {
 
         tx.commit()?;
 
-        Ok(TimelineEvent {
-            seq,
-            epoch,
-            agent_id: agent_id.to_string(),
-            turn_id: turn_id.map(ToOwned::to_owned),
-            timestamp: now,
-            payload,
-        })
+        Ok((
+            TimelineEvent {
+                seq,
+                epoch,
+                agent_id: agent_id.to_string(),
+                turn_id: turn_id.map(ToOwned::to_owned),
+                timestamp: now,
+                payload,
+            },
+            true,
+        ))
     }
 
     /// Returns all persisted background-task `ToolCall` entries for `agent_id` whose latest
@@ -5426,5 +5477,325 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("user_version");
         assert_eq!(ver_after, ver_before);
+    }
+
+    #[test]
+    fn provider_subagent_events_dedupe_historical_replay_and_coalesce_thinking_heartbeats() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_sub_dedupe".into(),
+                title: "Dedupe".into(),
+                cwd: "/tmp".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_parent_dedupe".into(),
+                    workspace_id: "ws_sub_dedupe".into(),
+                    cwd: "/tmp".into(),
+                    title: "Parent".into(),
+                    provider: ProviderKind::Antigravity,
+                    acp_agent_id: None,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    parent_host_id: None,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: orbit_protocol::AttentionState::None,
+                    last_activity_at: None,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    queued_prompts: Vec::new(),
+                },
+                None,
+            )
+            .expect("agent");
+
+        assert!(
+            !store
+                .has_provider_subagent_events("ag_parent_dedupe", "sub_1")
+                .expect("empty check")
+        );
+
+        // 1. Streaming thinking heartbeats for the same `wake_th_5` keep row count O(1) while
+        //    strictly advancing `seq > since_seq` on mutation so reconnecting clients never miss updates!
+        let (ev1, m1) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_5".into(),
+                    text: "Analyzing step 1...".into(),
+                },
+            )
+            .expect("hb1");
+        assert!(m1);
+        let (ev2, m2) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_5".into(),
+                    text: "Analyzing step 1... and step 2".into(),
+                },
+            )
+            .expect("hb2");
+        assert!(m2);
+        assert!(
+            ev2.seq > ev1.seq,
+            "mutated thinking heartbeat must advance seq past since_seq"
+        );
+        assert_eq!(
+            store
+                .provider_subagent_event_count("ag_parent_dedupe", "sub_1")
+                .expect("count after mutated thinking"),
+            1
+        );
+        // Client catching up with `since_seq = ev1.seq` MUST observe the mutated thinking event!
+        let (caught_up, _) = store
+            .fetch_provider_subagent_events_since("ag_parent_dedupe", "sub_1", ev1.seq, 50)
+            .expect("catchup after mutation");
+        assert_eq!(caught_up.len(), 1);
+        assert_eq!(caught_up[0].seq, ev2.seq);
+
+        let (ev3, m3) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_5".into(),
+                    text: "Analyzing step 1... and step 2".into(),
+                },
+            )
+            .expect("hb3 identical");
+        assert!(!m3, "identical heartbeat must be a zero-write no-op");
+        assert_eq!(ev3.seq, ev2.seq);
+
+        // 2. Tool call transition (Running -> Completed) keeps O(1) row while advancing seq
+        let (tool_run, m_tr) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                TimelinePayload::ToolCall {
+                    call_id: "wake_tool_5_0".into(),
+                    status: ToolCallStatus::Running,
+                    detail: ToolCallDetail::FileRead {
+                        path: "src/lib.rs".into(),
+                        start_line: None,
+                        end_line: None,
+                    },
+                    background_task: None,
+                },
+            )
+            .expect("tool run");
+        assert!(m_tr);
+        let msg_payload = TimelinePayload::AssistantMessage {
+            item_id: "wake_msg_5".into(),
+            text: "Done!".into(),
+            streaming: false,
+        };
+        let tool_payload = TimelinePayload::ToolCall {
+            call_id: "wake_tool_5_0".into(),
+            status: ToolCallStatus::Completed,
+            detail: ToolCallDetail::FileRead {
+                path: "src/lib.rs".into(),
+                start_line: None,
+                end_line: None,
+            },
+            background_task: None,
+        };
+        let (_, m_msg) = store
+            .append_provider_subagent_event_upsert("ag_parent_dedupe", "sub_1", msg_payload.clone())
+            .expect("msg");
+        let (tool_done, m_tool) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                tool_payload.clone(),
+            )
+            .expect("tool");
+        assert!(m_msg && m_tool);
+        assert!(tool_done.seq > tool_run.seq);
+        assert_eq!(
+            store
+                .provider_subagent_event_count("ag_parent_dedupe", "sub_1")
+                .expect("count"),
+            3
+        );
+
+        // Replay the entire historical sequence twice (simulating 2 daemon restarts)
+        for _ in 0..2 {
+            let (_, rm1) = store
+                .append_provider_subagent_event_upsert(
+                    "ag_parent_dedupe",
+                    "sub_1",
+                    TimelinePayload::AssistantThinking {
+                        item_id: "wake_th_5".into(),
+                        text: "Analyzing step 1... and step 2".into(),
+                    },
+                )
+                .expect("replay th");
+            let (_, rm2) = store
+                .append_provider_subagent_event_upsert(
+                    "ag_parent_dedupe",
+                    "sub_1",
+                    msg_payload.clone(),
+                )
+                .expect("replay msg");
+            let (_, rm3) = store
+                .append_provider_subagent_event_upsert(
+                    "ag_parent_dedupe",
+                    "sub_1",
+                    tool_payload.clone(),
+                )
+                .expect("replay tool");
+            assert!(
+                !rm1 && !rm2 && !rm3,
+                "historical replay must not mutate or duplicate"
+            );
+        }
+        assert_eq!(
+            store
+                .provider_subagent_event_count("ag_parent_dedupe", "sub_1")
+                .expect("count after replay"),
+            3
+        );
+        assert!(
+            store
+                .has_provider_subagent_events("ag_parent_dedupe", "sub_1")
+                .expect("has events")
+        );
+
+        // 3. Main timeline `AssistantThinking` heartbeats advance seq on mutation (1 row) and no-op on identical
+        let (t1, tm1) = store
+            .append_timeline_event_deduped(
+                "ag_parent_dedupe",
+                1,
+                None,
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_main_9".into(),
+                    text: "Thinking part A".into(),
+                },
+            )
+            .expect("main th1");
+        assert!(tm1);
+        let (t1_dup, tm1_dup) = store
+            .append_timeline_event_deduped(
+                "ag_parent_dedupe",
+                1,
+                None,
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_main_9".into(),
+                    text: "Thinking part A".into(),
+                },
+            )
+            .expect("main th1 dup");
+        assert!(!tm1_dup);
+        assert_eq!(t1_dup.seq, t1.seq);
+        let (t2, tm2) = store
+            .append_timeline_event_deduped(
+                "ag_parent_dedupe",
+                1,
+                None,
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_main_9".into(),
+                    text: "Thinking part A + B".into(),
+                },
+            )
+            .expect("main th2");
+        assert!(tm2);
+        assert!(
+            t2.seq > t1.seq,
+            "mutated main timeline thinking must advance seq past since_seq"
+        );
+        let (rows, _) = store
+            .fetch_timeline_since("ag_parent_dedupe", 0, 50)
+            .expect("fetch main");
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0].payload,
+            TimelinePayload::AssistantThinking { item_id, text }
+                if item_id == "wake_th_main_9" && text == "Thinking part A + B"
+        ));
+
+        // 4. `upsert_provider_subagent` preserves existing real title when post-restart fallback passes title == subagent_id
+        store
+            .upsert_provider_subagent(&orbit_protocol::ProviderSubagentDescriptor {
+                subagent_id: "sub_title_keep".into(),
+                parent_agent_id: "ag_parent_dedupe".into(),
+                parent_subagent_id: None,
+                title: "Database Migration Engineer".into(),
+                subtitle: None,
+                status: orbit_protocol::ProviderSubagentStatus::Running,
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("upsert real title");
+        store
+            .upsert_provider_subagent(&orbit_protocol::ProviderSubagentDescriptor {
+                subagent_id: "sub_title_keep".into(),
+                parent_agent_id: "ag_parent_dedupe".into(),
+                parent_subagent_id: None,
+                title: "sub_title_keep".into(),
+                subtitle: None,
+                status: orbit_protocol::ProviderSubagentStatus::Completed,
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("upsert synthetic id title");
+        let listed = store
+            .list_provider_subagents("ag_parent_dedupe")
+            .expect("list subagents");
+        let kept = listed
+            .iter()
+            .find(|s| s.subagent_id == "sub_title_keep")
+            .expect("found");
+        assert_eq!(kept.title, "Database Migration Engineer");
+        assert_eq!(
+            kept.status,
+            orbit_protocol::ProviderSubagentStatus::Completed
+        );
+
+        // Ensure PRAGMA user_version remains 6
+        let conn = store.conn.lock().expect("lock");
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(ver, 6);
     }
 }

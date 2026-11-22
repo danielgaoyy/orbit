@@ -411,8 +411,10 @@ impl AgentOrchestrator {
     }
 
     /// Increment generation to fence off stale startup/ingestion tasks, shut down any live driver,
-    /// and wait (bounded) for the old driver ingestion loop to drain before mutating files or store.
+    /// wait (bounded) for the old driver ingestion loop to drain, and guarantee zero surviving shims.
     async fn stop_and_wait_driver(&self, agent_id: &str) -> u64 {
+        let start_lock = self.agent_start_lock(agent_id).await;
+        let _start_guard = start_lock.lock().await;
         let next_gen = self.bump_generation(agent_id).await;
         let removed = self.live_agents.write().await.remove(agent_id);
         if let Some(entry) = removed {
@@ -425,6 +427,8 @@ impl AgentOrchestrator {
                 entry.ingest_abort.abort();
             }
         }
+        kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
+        kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
         self.clear_pending_requests(agent_id).await;
         self.keep_awake.mark_agent_idle(agent_id);
         next_gen
@@ -3003,8 +3007,6 @@ impl AgentOrchestrator {
         }
 
         let _ = self.stop_and_wait_driver(agent_id).await;
-        kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
-        kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
         self.store.switch_agent_provider(
             agent_id,
             provider,
@@ -3241,8 +3243,6 @@ impl AgentOrchestrator {
 
     pub async fn kill_agent(&self, agent_id: &str) -> anyhow::Result<()> {
         let _ = self.stop_and_wait_driver(agent_id).await;
-        kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
-        kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
         self.store
             .update_agent_status(agent_id, &AgentStatus::Closed)?;
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
@@ -3263,6 +3263,10 @@ impl AgentOrchestrator {
             }
         }
         self.store.delete_agent(agent_id)?;
+        self.driver_start_locks.write().await.remove(agent_id);
+        self.agent_generations.write().await.remove(agent_id);
+        self.roster_fingerprints.write().await.remove(agent_id);
+        self.suppress_auto_drain.write().await.remove(agent_id);
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::AgentDeleted(agent_id.to_string()));
@@ -3865,9 +3869,10 @@ impl AgentOrchestrator {
         let should_alert = {
             let mut guard = self.conflict_cooldowns.write().await;
             let now = std::time::Instant::now();
+            guard.retain(|_, prev| now.duration_since(*prev) < Duration::from_secs(60));
             match guard.get(&key) {
-                Some(prev) if now.duration_since(*prev) < Duration::from_secs(60) => false,
-                _ => {
+                Some(_) => false,
+                None => {
                     guard.insert(key, now);
                     true
                 }
@@ -4489,11 +4494,14 @@ impl AgentOrchestrator {
             }
             DriverEvent::ProviderSubagentTimeline {
                 subagent_id,
-                payload,
+                mut payload,
             } => {
-                if let Ok(saved) =
-                    self.store
-                        .append_provider_subagent_event(agent_id, &subagent_id, payload)
+                sanitize_timeline_payload(&mut payload);
+                if let Ok((saved, mutated)) = self.store.append_provider_subagent_event_upsert(
+                    agent_id,
+                    &subagent_id,
+                    payload,
+                ) && mutated
                 {
                     let _ = self
                         .broadcast_tx
@@ -4752,7 +4760,13 @@ impl AgentOrchestrator {
         };
 
         let is_status_change = matches!(payload, TimelinePayload::StatusChanged { .. });
-        if let Ok(saved_ev) = self.store.append_timeline_event(agent_id, 1, None, payload) {
+        let mut payload = payload;
+        sanitize_timeline_payload(&mut payload);
+        if let Ok((saved_ev, mutated)) = self
+            .store
+            .append_timeline_event_deduped(agent_id, 1, None, payload)
+            && mutated
+        {
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::TimelineLive(saved_ev));
@@ -5375,6 +5389,21 @@ impl StreamingEventBuffer {
                 }
             }
         }
+    }
+}
+
+fn sanitize_timeline_payload(payload: &mut TimelinePayload) {
+    if let TimelinePayload::ToolCall {
+        detail:
+            ToolCallDetail::FileEdit {
+                unified_diff: Some(diff),
+                ..
+            },
+        ..
+    } = payload
+    {
+        *diff =
+            orbit_providers::compact_unified_diff(diff, orbit_providers::MAX_UNIFIED_DIFF_BYTES);
     }
 }
 
@@ -6589,5 +6618,37 @@ mod fast_mode_orchestrator_tests {
         orch.shutdown_worktree_pool().await;
         let _ = std::fs::remove_dir_all(&home_dir);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sanitize_timeline_payload_caps_oversized_file_edit_diff() {
+        let mut giant = String::from("--- a/huge.rs\n+++ b/huge.rs\n@@ -1,1 +1,1500 @@\n");
+        for i in 0..1500 {
+            giant.push_str(&format!(
+                "+let line_{i} = \"payload_padding_0123456789\";\n"
+            ));
+        }
+        assert!(giant.len() > orbit_providers::MAX_UNIFIED_DIFF_BYTES);
+        let mut payload = TimelinePayload::ToolCall {
+            call_id: "c_big".into(),
+            status: ToolCallStatus::Completed,
+            detail: ToolCallDetail::FileEdit {
+                path: "huge.rs".into(),
+                unified_diff: Some(giant),
+            },
+            background_task: None,
+        };
+        sanitize_timeline_payload(&mut payload);
+        match payload {
+            TimelinePayload::ToolCall {
+                detail: ToolCallDetail::FileEdit { unified_diff, .. },
+                ..
+            } => {
+                let d = unified_diff.expect("diff preserved");
+                assert!(d.len() <= orbit_providers::MAX_UNIFIED_DIFF_BYTES);
+                assert!(d.contains("diff truncated at 24 KB"));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 }

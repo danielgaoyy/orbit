@@ -185,22 +185,25 @@ pub async fn spawn_codex_session(
         })
         .to_string();
 
-        fresh
-            .write_stdin_line(init_req)
-            .await
-            .map_err(|e| format!("codex write initialize failed: {e}"))?;
+        if let Err(e) = fresh.write_stdin_line(init_req).await {
+            let _ = fresh.kill().await;
+            return Err(format!("codex write initialize failed: {e}"));
+        }
 
-        wait_codex_id_response(&mut fresh, 1, &cfg.shim_seq_tracker).await?;
+        if let Err(e) = wait_codex_id_response(&mut fresh, 1, &cfg.shim_seq_tracker).await {
+            let _ = fresh.kill().await;
+            return Err(e);
+        }
 
         let initialized_notif = json!({
             "method": "initialized",
             "params": {}
         })
         .to_string();
-        fresh
-            .write_stdin_line(initialized_notif)
-            .await
-            .map_err(|e| format!("codex write initialized failed: {e}"))?;
+        if let Err(e) = fresh.write_stdin_line(initialized_notif).await {
+            let _ = fresh.kill().await;
+            return Err(format!("codex write initialized failed: {e}"));
+        }
 
         drop(startup_guard);
         (fresh, false)
@@ -334,6 +337,9 @@ async fn run_codex_actor(
 
         let start_msg = build_open_msg(thread_req_id, initial_open);
         if shim.write_stdin_line(start_msg.to_string()).await.is_err() {
+            if !is_reattached {
+                let _ = shim.kill().await;
+            }
             return;
         }
 
@@ -385,6 +391,9 @@ async fn run_codex_actor(
                     .await
                     .is_err()
                 {
+                    if !is_reattached {
+                        let _ = shim.kill().await;
+                    }
                     return;
                 }
                 match wait_codex_id_response(&mut shim, fallback_id, &cfg.shim_seq_tracker).await {
@@ -425,6 +434,9 @@ async fn run_codex_actor(
                                 recoverable: false,
                             }))
                             .await;
+                        if !is_reattached {
+                            let _ = shim.kill().await;
+                        }
                         return;
                     }
                 }
@@ -436,6 +448,9 @@ async fn run_codex_actor(
                         recoverable: false,
                     }))
                     .await;
+                if !is_reattached {
+                    let _ = shim.kill().await;
+                }
                 return;
             }
             Ok(v) => v,
@@ -1033,7 +1048,10 @@ async fn handle_codex_notification(
                         unified_diff: if combined_diff.is_empty() {
                             None
                         } else {
-                            Some(combined_diff)
+                            Some(crate::compact_unified_diff(
+                                &combined_diff,
+                                crate::MAX_UNIFIED_DIFF_BYTES,
+                            ))
                         },
                     };
                     file_change_cache.insert(item_id.clone(), detail.clone());

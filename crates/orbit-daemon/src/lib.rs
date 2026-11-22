@@ -19,6 +19,7 @@ pub mod goals;
 pub mod guardian;
 pub mod hooks;
 pub mod idle_cleanup;
+pub mod im_channels;
 pub mod instructions;
 pub mod keep_awake;
 pub mod lsp;
@@ -91,6 +92,7 @@ use crate::git::{
 use crate::goals::{GoalMonitorEngine, StartGoalSpec, StartMonitorSpec};
 use crate::hooks::HooksEngine;
 use crate::idle_cleanup::IdleRuntimeCleanup;
+use crate::im_channels::{ImChannelBridge, UpsertImChannelSpec};
 use crate::instructions::{
     discover_instruction_hierarchy, read_instruction_file, save_instruction_file,
 };
@@ -243,6 +245,7 @@ pub struct DaemonRuntime {
     pub lsp: Arc<LspManager>,
     pub browser: Arc<BrowserManager>,
     pub hooks: Arc<HooksEngine>,
+    pub im_channels: Arc<ImChannelBridge>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
     pub mcp_config_lock: Arc<AsyncMutex<()>>,
@@ -371,6 +374,8 @@ impl DaemonRuntime {
         );
         let lsp = LspManager::new(home_dir.to_path_buf());
         let browser = BrowserManager::new(home_dir.to_path_buf());
+        let im_channels =
+            ImChannelBridge::new(store.clone(), orchestrator.clone(), listen_port.clone());
 
         let home_for_probe = home_dir.to_path_buf();
         let available_providers = tokio::task::spawn_blocking(move || {
@@ -422,6 +427,7 @@ impl DaemonRuntime {
             lsp,
             browser,
             hooks,
+            im_channels,
             provider_catalogs,
             mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
             mcp_config_lock: Arc::new(AsyncMutex::new(())),
@@ -447,6 +453,8 @@ impl DaemonRuntime {
         self.workflows.start_recovery().await;
         // 3c. Start GitHub PR/Issue/CI polling fallback loop for enabled event triggers
         self.triggers.spawn_background_poller().await;
+        // 3d. Start Bidirectional IM Channels bridge & NAT-friendly pollers
+        self.im_channels.start().await;
         // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup, LSP & Browser Idle Reaper loops
         drop(self.scheduler.spawn_background());
         drop(self.idle_cleanup.spawn_background());
@@ -544,6 +552,27 @@ fn resolve_user_home() -> PathBuf {
 }
 
 fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
+    let im_webhook_routes = Router::new()
+        .route(
+            "/im/lark/{channel_id}",
+            post(crate::im_channels::lark_webhook_handler),
+        )
+        .route(
+            "/im/slack/{channel_id}",
+            post(crate::im_channels::slack_webhook_handler),
+        )
+        .route(
+            "/im/telegram/{channel_id}",
+            post(crate::im_channels::telegram_webhook_handler),
+        )
+        .route(
+            "/im/discord/{channel_id}",
+            post(crate::im_channels::discord_webhook_handler),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::im_channels::MAX_WEBHOOK_BODY_BYTES,
+        ));
+
     Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/ws", get(ws_handler))
@@ -554,6 +583,7 @@ fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
                 crate::triggers::MAX_WEBHOOK_BODY_BYTES,
             )),
         )
+        .merge(im_webhook_routes)
         .fallback(service_reverse_proxy_fallback)
         .with_state(runtime)
 }
@@ -665,6 +695,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             runtime_shutdown.goals.shutdown_all().await;
             runtime_shutdown.triggers.shutdown().await;
             runtime_shutdown.workflows.shutdown_all().await;
+            runtime_shutdown.im_channels.shutdown_all().await;
             runtime_shutdown.lsp.shutdown_all().await;
             runtime_shutdown.browser.shutdown_all().await;
             runtime_shutdown.keep_awake.shutdown();
@@ -5223,6 +5254,119 @@ async fn handle_wire_rpc(
                     .await;
             });
             active_side_questions.push(handle.abort_handle());
+            None
+        }
+
+        // Bidirectional IM Channels (Lark / Feishu, Telegram, Slack, Discord + Remote Approvals)
+        WireMessage::ListImChannels { request_id } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let im = Arc::clone(&runtime.im_channels);
+            tokio::spawn(async move {
+                let reply = match im.list_snapshot().await {
+                    Ok(snap) => WireMessage::ImChannelsSnapshot {
+                        request_id,
+                        channels: snap.channels,
+                        bindings: snap.bindings,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "list_im_channels_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertImChannel {
+            request_id,
+            channel_id,
+            name,
+            platform,
+            enabled,
+            app_id,
+            primary_secret,
+            signing_secret,
+            keep_existing_secrets,
+            allowed_chat_ids,
+            allowed_user_ids,
+            default_workspace_cwd,
+            default_provider,
+            default_mode,
+            forward_approvals,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let im = Arc::clone(&runtime.im_channels);
+            tokio::spawn(async move {
+                let spec = UpsertImChannelSpec {
+                    channel_id,
+                    name,
+                    platform,
+                    enabled,
+                    app_id,
+                    primary_secret,
+                    signing_secret,
+                    keep_existing_secrets,
+                    allowed_chat_ids,
+                    allowed_user_ids,
+                    default_workspace_cwd,
+                    default_provider,
+                    default_mode,
+                    forward_approvals,
+                };
+                let reply = match im.upsert_channel(spec).await {
+                    Ok(snap) => WireMessage::ImChannelsSnapshot {
+                        request_id,
+                        channels: snap.channels,
+                        bindings: snap.bindings,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "upsert_im_channel_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteImChannel {
+            request_id,
+            channel_id,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let im = Arc::clone(&runtime.im_channels);
+            tokio::spawn(async move {
+                let reply = match im.delete_channel(&channel_id).await {
+                    Ok(snap) => WireMessage::ImChannelsSnapshot {
+                        request_id,
+                        channels: snap.channels,
+                        bindings: snap.bindings,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "delete_im_channel_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::TestImChannel {
+            request_id,
+            channel_id,
+            target_chat_id,
+            message,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let im = Arc::clone(&runtime.im_channels);
+            tokio::spawn(async move {
+                let (ok, detail) = im
+                    .test_channel(&channel_id, &target_chat_id, &message)
+                    .await;
+                let reply = WireMessage::ImChannelTestResponse {
+                    request_id,
+                    ok,
+                    detail,
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
             None
         }
         _ => None,

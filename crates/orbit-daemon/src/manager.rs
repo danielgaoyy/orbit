@@ -4297,6 +4297,17 @@ impl AgentOrchestrator {
             .any(|(aid, _)| aid == agent_id)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn insert_pending_permission_for_test(
+        &self,
+        summary: PendingPermissionSummary,
+    ) {
+        self.pending_permissions.write().await.insert(
+            (summary.agent_id.clone(), summary.request_id.clone()),
+            summary,
+        );
+    }
+
     /// Rewind an agent to strictly before `to_before_seq`:
     /// 1. Increments the agent's lifecycle generation, gracefully stops any live provider driver,
     ///    and awaits its shutdown/ingestion drain before touching workspace files or SQLite.

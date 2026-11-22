@@ -7,6 +7,7 @@ pub mod goals;
 pub mod guardian;
 pub mod handoff;
 pub mod hooks;
+pub mod im_channels;
 pub mod instructions;
 pub mod lsp;
 pub mod mcp_servers;
@@ -25,6 +26,7 @@ pub use goals::*;
 pub use guardian::*;
 pub use handoff::*;
 pub use hooks::*;
+pub use im_channels::*;
 pub use instructions::*;
 pub use lsp::*;
 pub use mcp_servers::*;
@@ -2595,6 +2597,57 @@ pub enum WireMessage {
         run: WorkflowRunRecord,
     },
 
+    // Bidirectional IM Channels (Lark / Feishu, Telegram, Slack, Discord + Remote Approvals)
+    ListImChannels {
+        request_id: Uuid,
+    },
+    ImChannelsSnapshot {
+        request_id: Uuid,
+        channels: Vec<ImChannelRecord>,
+        bindings: Vec<ImThreadBinding>,
+        base_webhook_url: String,
+    },
+    UpsertImChannel {
+        request_id: Uuid,
+        #[serde(default)]
+        channel_id: Option<String>,
+        name: String,
+        platform: ImPlatform,
+        enabled: bool,
+        #[serde(default)]
+        app_id: Option<String>,
+        #[serde(default)]
+        primary_secret: Option<String>,
+        #[serde(default)]
+        signing_secret: Option<String>,
+        #[serde(default = "wire_default_true")]
+        keep_existing_secrets: bool,
+        #[serde(default)]
+        allowed_chat_ids: Vec<String>,
+        #[serde(default)]
+        allowed_user_ids: Vec<String>,
+        default_workspace_cwd: String,
+        default_provider: ProviderKind,
+        default_mode: SessionMode,
+        #[serde(default = "wire_default_true")]
+        forward_approvals: bool,
+    },
+    DeleteImChannel {
+        request_id: Uuid,
+        channel_id: String,
+    },
+    TestImChannel {
+        request_id: Uuid,
+        channel_id: String,
+        target_chat_id: String,
+        message: String,
+    },
+    ImChannelTestResponse {
+        request_id: Uuid,
+        ok: bool,
+        detail: String,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -4413,6 +4466,92 @@ mod tests {
         for msg in messages {
             let encoded = msg.encode_zstd(3).expect("encode workflow wire msg");
             let decoded = WireMessage::decode_zstd(&encoded).expect("decode workflow wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn im_channels_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let ch = ImChannelRecord {
+            channel_id: "im_lark_01".into(),
+            name: "Feishu Eng".into(),
+            platform: ImPlatform::Lark,
+            enabled: true,
+            status: ImConnectionStatus::Connected,
+            status_message: Some("Listening".into()),
+            webhook_path: "/im/lark/im_lark_01".into(),
+            app_id: Some("cli_12345".into()),
+            has_primary_secret: true,
+            has_signing_secret: true,
+            masked_primary_secret: Some("••••9999".into()),
+            masked_signing_secret: Some("••••8888".into()),
+            allowed_chat_ids: vec!["oc_1".into()],
+            allowed_user_ids: vec!["ou_1".into()],
+            default_workspace_cwd: "/workspace/orbit".into(),
+            default_provider: ProviderKind::ClaudeCode,
+            default_mode: SessionMode::Default,
+            forward_approvals: true,
+            message_count: 5,
+            last_activity_at_ms: Some(1_760_000_005_000),
+            created_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_005_000,
+        };
+        let binding = ImThreadBinding {
+            channel_id: "im_lark_01".into(),
+            external_chat_id: "oc_1".into(),
+            external_thread_id: "om_root".into(),
+            agent_id: "ag_1".into(),
+            updated_at_ms: 1_760_000_005_000,
+        };
+        let messages = vec![
+            WireMessage::ListImChannels { request_id: req_id },
+            WireMessage::ImChannelsSnapshot {
+                request_id: req_id,
+                channels: vec![ch],
+                bindings: vec![binding],
+                base_webhook_url: "http://127.0.0.1:7788".into(),
+            },
+            WireMessage::UpsertImChannel {
+                request_id: req_id,
+                channel_id: Some("im_lark_01".into()),
+                name: "Feishu Eng".into(),
+                platform: ImPlatform::Lark,
+                enabled: true,
+                app_id: Some("cli_12345".into()),
+                primary_secret: None,
+                signing_secret: None,
+                keep_existing_secrets: true,
+                allowed_chat_ids: vec!["oc_1".into()],
+                allowed_user_ids: vec!["ou_1".into()],
+                default_workspace_cwd: "/workspace/orbit".into(),
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::Default,
+                forward_approvals: true,
+            },
+            WireMessage::DeleteImChannel {
+                request_id: req_id,
+                channel_id: "im_lark_01".into(),
+            },
+            WireMessage::TestImChannel {
+                request_id: req_id,
+                channel_id: "im_lark_01".into(),
+                target_chat_id: "oc_1".into(),
+                message: "Orbit test".into(),
+            },
+            WireMessage::ImChannelTestResponse {
+                request_id: req_id,
+                ok: true,
+                detail: "Delivered".into(),
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode im_channels wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode im_channels wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

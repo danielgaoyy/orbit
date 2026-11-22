@@ -587,7 +587,9 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::BrowserSessionUpdated { request_id, .. }
         | WireMessage::BrowserActionResponse { request_id, .. }
         | WireMessage::WorkflowRunUpdated { request_id, .. }
-        | WireMessage::WorkflowRunsSnapshot { request_id, .. } => Some(*request_id),
+        | WireMessage::WorkflowRunsSnapshot { request_id, .. }
+        | WireMessage::ImChannelsSnapshot { request_id, .. }
+        | WireMessage::ImChannelTestResponse { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

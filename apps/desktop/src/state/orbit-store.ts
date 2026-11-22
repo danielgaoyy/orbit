@@ -103,6 +103,11 @@ import {
   type GuardianAuditEntry,
   type GuardianConfigSnapshotView,
   type GuardianPolicyConfig,
+  type ImChannelRecord,
+  type ImChannelTestResultView,
+  type ImChannelsSnapshotView,
+  type ImThreadBinding,
+  type UpsertImChannelRequest,
   type ProviderKind,
   type ReasoningEffort,
   type ReleaseUpdateInfo,
@@ -407,6 +412,7 @@ export type WorkspacePanelMode = "conversation" | "automations";
 export type HostSettingsTab =
   | "agents"
   | "guardian"
+  | "im_channels"
   | "skills"
   | "acp"
   | "mcp"
@@ -702,6 +708,17 @@ export interface OrbitUiState {
       triggers: EventTriggerRecord[];
       recentDeliveries: EventTriggerDelivery[];
       baseWebhookUrl: string;
+      error?: string | null;
+    }
+  >;
+  imChannelsByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      channels: ImChannelRecord[];
+      bindings: ImThreadBinding[];
+      baseWebhookUrl: string;
+      saving?: boolean;
       error?: string | null;
     }
   >;
@@ -1034,6 +1051,7 @@ const defaultInitialState: OrbitUiState = {
   browserByHost: {},
   guardianByHost: {},
   eventTriggersByHost: {},
+  imChannelsByHost: {},
 
   overviewDesktopOpenPref: initialPrefs.overviewDesktopOpenPref ?? true,
   overviewPopoverOpen: false,
@@ -7210,6 +7228,168 @@ export const orbitActions = {
     }
   },
 
+  async loadImChannels(hostId: string): Promise<ImChannelsSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (imChannelsReqSeqByHost.get(hostId) ?? 0) + 1;
+    imChannelsReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      imChannelsByHost: {
+        ...s.imChannelsByHost,
+        [hostId]: {
+          status: "loading",
+          channels: s.imChannelsByHost[hostId]?.channels ?? [],
+          bindings: s.imChannelsByHost[hostId]?.bindings ?? [],
+          baseWebhookUrl: s.imChannelsByHost[hostId]?.baseWebhookUrl ?? "",
+          saving: s.imChannelsByHost[hostId]?.saving ?? false,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.listImChannels(hostId);
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: "ready",
+            channels: snap.channels,
+            bindings: snap.bindings,
+            baseWebhookUrl: snap.base_webhook_url,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: "error",
+            channels: s.imChannelsByHost[hostId]?.channels ?? [],
+            bindings: s.imChannelsByHost[hostId]?.bindings ?? [],
+            baseWebhookUrl: s.imChannelsByHost[hostId]?.baseWebhookUrl ?? "",
+            saving: false,
+            error: String(err),
+          },
+        },
+      }));
+      return null;
+    }
+  },
+
+  async upsertImChannel(
+    hostId: string,
+    request: UpsertImChannelRequest,
+  ): Promise<ImChannelsSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (imChannelsReqSeqByHost.get(hostId) ?? 0) + 1;
+    imChannelsReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      imChannelsByHost: {
+        ...s.imChannelsByHost,
+        [hostId]: {
+          status: s.imChannelsByHost[hostId]?.status ?? "ready",
+          channels: s.imChannelsByHost[hostId]?.channels ?? [],
+          bindings: s.imChannelsByHost[hostId]?.bindings ?? [],
+          baseWebhookUrl: s.imChannelsByHost[hostId]?.baseWebhookUrl ?? "",
+          saving: true,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.upsertImChannel(hostId, request);
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: "ready",
+            channels: snap.channels,
+            bindings: snap.bindings,
+            baseWebhookUrl: snap.base_webhook_url,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: s.imChannelsByHost[hostId]?.status ?? "ready",
+            channels: s.imChannelsByHost[hostId]?.channels ?? [],
+            bindings: s.imChannelsByHost[hostId]?.bindings ?? [],
+            baseWebhookUrl: s.imChannelsByHost[hostId]?.baseWebhookUrl ?? "",
+            saving: false,
+            error: String(err),
+          },
+        },
+      }));
+      notifyToast(`IM channel save failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async deleteImChannel(
+    hostId: string,
+    channelId: string,
+  ): Promise<ImChannelsSnapshotView | null> {
+    if (!hostId || !channelId) return null;
+    const seq = (imChannelsReqSeqByHost.get(hostId) ?? 0) + 1;
+    imChannelsReqSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.deleteImChannel(hostId, channelId);
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: "ready",
+            channels: snap.channels,
+            bindings: snap.bindings,
+            baseWebhookUrl: snap.base_webhook_url,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      notifyToast(`Delete IM channel failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async testImChannel(
+    hostId: string,
+    channelId: string,
+    targetChatId: string,
+    message: string,
+  ): Promise<ImChannelTestResultView> {
+    try {
+      const res = await orbitIpc.testImChannel(hostId, channelId, targetChatId, message);
+      void orbitActions.loadImChannels(hostId);
+      return res;
+    } catch (err) {
+      return { ok: false, detail: String(err) };
+    }
+  },
+
   async loadLspServers(hostId: string, cwd: string): Promise<LspServerStatus[]> {
     if (!hostId || !cwd || cwd === "~") return [];
     const scopeKey = `${hostId}::${cwd}`;
@@ -10648,6 +10828,7 @@ const browserReqSeqByHost = new Map<string, number>();
 const lifecycleHooksSeqByKey = new Map<string, number>();
 const eventTriggersSeqByHost = new Map<string, number>();
 const guardianReqSeqByHost = new Map<string, number>();
+const imChannelsReqSeqByHost = new Map<string, number>();
 
 function upsertLruRecord<T>(
   record: Record<string, T>,

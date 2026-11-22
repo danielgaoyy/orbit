@@ -266,6 +266,70 @@ export interface GuardianConfigSnapshotView {
   recent_audits: GuardianAuditEntry[];
 }
 
+export type ImPlatform = "lark" | "telegram" | "slack" | "discord";
+export type ImConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
+
+export interface ImChannelRecord {
+  channel_id: string;
+  name: string;
+  platform: ImPlatform;
+  enabled: boolean;
+  status: ImConnectionStatus;
+  status_message?: string | null;
+  webhook_path: string;
+  app_id?: string | null;
+  has_primary_secret: boolean;
+  has_signing_secret: boolean;
+  masked_primary_secret?: string | null;
+  masked_signing_secret?: string | null;
+  allowed_chat_ids: string[];
+  allowed_user_ids: string[];
+  default_workspace_cwd: string;
+  default_provider: ProviderKind;
+  default_mode: SessionMode;
+  forward_approvals: boolean;
+  message_count: number;
+  last_activity_at_ms?: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface ImThreadBinding {
+  channel_id: string;
+  external_chat_id: string;
+  external_thread_id: string;
+  agent_id: string;
+  updated_at_ms: number;
+}
+
+export interface ImChannelsSnapshotView {
+  channels: ImChannelRecord[];
+  bindings: ImThreadBinding[];
+  base_webhook_url: string;
+}
+
+export interface ImChannelTestResultView {
+  ok: boolean;
+  detail: string;
+}
+
+export interface UpsertImChannelRequest {
+  channel_id?: string | null;
+  name: string;
+  platform: ImPlatform;
+  enabled: boolean;
+  app_id?: string | null;
+  primary_secret?: string | null;
+  signing_secret?: string | null;
+  keep_existing_secrets: boolean;
+  allowed_chat_ids: string[];
+  allowed_user_ids: string[];
+  default_workspace_cwd: string;
+  default_provider: ProviderKind;
+  default_mode: SessionMode;
+  forward_approvals: boolean;
+}
+
 export type HostConnectionState =
   | "disconnected"
   | "connecting_direct"
@@ -4519,6 +4583,50 @@ export const orbitIpc = {
       return { config, recent_audits: [] };
     }
     return invoke<GuardianConfigSnapshotView>("update_guardian_config", { hostId, config });
+  },
+
+  listImChannels: async (hostId: string): Promise<ImChannelsSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { channels: [], bindings: [], base_webhook_url: "http://127.0.0.1:7788" };
+    }
+    return invoke<ImChannelsSnapshotView>("list_im_channels", { hostId });
+  },
+
+  upsertImChannel: async (
+    hostId: string,
+    request: UpsertImChannelRequest,
+  ): Promise<ImChannelsSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { channels: [], bindings: [], base_webhook_url: "http://127.0.0.1:7788" };
+    }
+    return invoke<ImChannelsSnapshotView>("upsert_im_channel", { hostId, request });
+  },
+
+  deleteImChannel: async (
+    hostId: string,
+    channelId: string,
+  ): Promise<ImChannelsSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { channels: [], bindings: [], base_webhook_url: "http://127.0.0.1:7788" };
+    }
+    return invoke<ImChannelsSnapshotView>("delete_im_channel", { hostId, channelId });
+  },
+
+  testImChannel: async (
+    hostId: string,
+    channelId: string,
+    targetChatId: string,
+    message: string,
+  ): Promise<ImChannelTestResultView> => {
+    if (!isTauriRuntime()) {
+      return { ok: false, detail: "Not running in Tauri runtime" };
+    }
+    return invoke<ImChannelTestResultView>("test_im_channel", {
+      hostId,
+      channelId,
+      targetChatId,
+      message,
+    });
   },
   highlightWorkspaceCode: async (
     language: string,

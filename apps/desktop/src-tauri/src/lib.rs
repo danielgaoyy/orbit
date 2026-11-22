@@ -27,8 +27,9 @@ use orbit_client_core::app_core::{
     AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest, ClientProjectView,
     ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest, FleetOverviewView,
     GitReviewView, GuardianConfigSnapshotView, HostCardView, HostDetailView,
-    ImportManagedSkillRequest, ManagedSkillContentView, OrbitAppCore, RewindAgentResultView,
-    SideQuestionStreamEvent, SubscribeOptions, UpsertManagedSkillRequest, WorkspaceFileView,
+    ImChannelTestResultView, ImChannelsSnapshotView, ImportManagedSkillRequest,
+    ManagedSkillContentView, OrbitAppCore, RewindAgentResultView, SideQuestionStreamEvent,
+    SubscribeOptions, UpsertImChannelRequest, UpsertManagedSkillRequest, WorkspaceFileView,
 };
 use orbit_client_core::catalog::ResolvedModelSelectionView;
 use orbit_client_core::cloud_sync::{
@@ -2249,6 +2250,49 @@ async fn update_guardian_config(
 }
 
 #[tauri::command]
+async fn list_im_channels(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<ImChannelsSnapshotView, String> {
+    state.core.list_im_channels_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn upsert_im_channel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    request: UpsertImChannelRequest,
+) -> Result<ImChannelsSnapshotView, String> {
+    state.core.upsert_im_channel_on_host(&host_id, request).await
+}
+
+#[tauri::command]
+async fn delete_im_channel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    channel_id: String,
+) -> Result<ImChannelsSnapshotView, String> {
+    state
+        .core
+        .delete_im_channel_on_host(&host_id, channel_id)
+        .await
+}
+
+#[tauri::command]
+async fn test_im_channel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    channel_id: String,
+    target_chat_id: String,
+    message: String,
+) -> Result<ImChannelTestResultView, String> {
+    state
+        .core
+        .test_im_channel_on_host(&host_id, channel_id, target_chat_id, message)
+        .await
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn start_goal_run(
     state: State<'_, DesktopAppState>,
@@ -3436,6 +3480,10 @@ pub fn run() {
             fire_conditional_timer_now,
             get_guardian_config,
             update_guardian_config,
+            list_im_channels,
+            upsert_im_channel,
+            delete_im_channel,
+            test_im_channel,
             start_goal_run,
             list_goal_runs,
             control_goal_run,

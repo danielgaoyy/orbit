@@ -11,6 +11,7 @@ import {
   Cpu,
   FileCode2,
   Keyboard,
+  MessageSquare,
   Palette,
   Plug,
   Plus,
@@ -33,6 +34,7 @@ import { HostAgentsSection } from "@/components/settings/host-agents-section";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
 import { HostGuardianSection } from "@/components/settings/host-guardian-section";
 import { HostHooksSection } from "@/components/settings/host-hooks-section";
+import { HostImChannelsSection } from "@/components/settings/host-im-channels-section";
 import { HostLspSection } from "@/components/settings/host-lsp-section";
 import { HostMcpSection } from "@/components/settings/host-mcp-section";
 import { HostRulesSection } from "@/components/settings/host-rules-section";
@@ -88,6 +90,7 @@ const HOST_TABS: {
 }[] = [
   { id: "agents", label: "Agents", icon: Cpu },
   { id: "guardian", label: "Guardian", icon: ShieldCheck },
+  { id: "im_channels", label: "IM Channels", icon: MessageSquare },
   { id: "skills", label: "Skills", icon: Sparkles },
   { id: "acp", label: "ACP Agents", icon: Plug },
   { id: "mcp", label: "MCP Servers", icon: Server },
@@ -109,6 +112,7 @@ function parseHostSection(
   if (
     tab !== "agents" &&
     tab !== "guardian" &&
+    tab !== "im_channels" &&
     tab !== "skills" &&
     tab !== "acp" &&
     tab !== "mcp" &&
@@ -527,6 +531,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               )}
               {resolvedHost?.tab === "guardian" && (
                 <HostGuardianSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "im_channels" && (
+                <HostImChannelsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
               )}
               {resolvedHost?.tab === "skills" && (
                 <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />

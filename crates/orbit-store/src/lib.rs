@@ -5,6 +5,7 @@
 pub mod artifacts;
 pub mod goals;
 pub mod guardian;
+pub mod im_channels;
 pub mod orchestration;
 pub mod search;
 pub mod timers;
@@ -16,6 +17,7 @@ pub use artifacts::{
     MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ID_LEN, MAX_ARTIFACT_REVISIONS, UpsertArtifactInput,
     validate_artifact_id,
 };
+pub use im_channels::StoredImChannel;
 pub use orchestration::*;
 pub use search::{FtsBackfillProgress, MessageSearchHit, build_fts5_match_query};
 pub use triggers::{
@@ -455,6 +457,7 @@ impl OrbitStore {
         goals::migrate_goals_schema(&conn)?;
         triggers::migrate_event_triggers_schema(&conn)?;
         workflows::migrate_workflows_schema(&conn)?;
+        im_channels::migrate_im_channels_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

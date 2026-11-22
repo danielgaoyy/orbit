@@ -38,10 +38,12 @@ use orbit_client_core::composer::{
     SlashCommandView,
 };
 use orbit_client_core::contract::{
-    AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, ExecuteWorktreeHandoffRequest,
-    FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView, GitReposInspectionView,
-    MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest, RenderDiagramRequest,
-    RenderDiagramView, SpawnWorkspacePeerRequest,
+    AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, CreateWorkspaceEntryRequest,
+    DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, FleetSidebarRequest,
+    ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, MentionRankRequest,
+    ModelSelectionRequest, PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest,
+    RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
@@ -52,7 +54,9 @@ use orbit_client_core::desktop_ops::{
 use orbit_client_core::export::{
     ExportOptions, ExportedTranscript, ExtractedCodeBlock, write_file_atomically,
 };
-use orbit_client_core::render::{RichBlockView, parse_markdown_blocks};
+use orbit_client_core::render::{
+    HighlightedLineView, RichBlockView, highlight_code_lines_capped, parse_markdown_blocks,
+};
 use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
@@ -1545,6 +1549,96 @@ async fn read_workspace_file(
 }
 
 #[tauri::command]
+async fn write_workspace_file(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    content: String,
+    expected_etag: Option<String>,
+    force: Option<bool>,
+) -> Result<WorkspaceFileWriteResultView, String> {
+    state
+        .core
+        .write_workspace_file_on_host(WriteWorkspaceFileRequest {
+            host_id,
+            cwd,
+            path,
+            content,
+            expected_etag,
+            force: force.unwrap_or(false),
+        })
+        .await
+}
+
+#[tauri::command]
+async fn create_workspace_entry(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    is_dir: bool,
+    initial_content: Option<String>,
+) -> Result<WorkspaceEntryMutationResultView, String> {
+    state
+        .core
+        .create_workspace_entry_on_host(CreateWorkspaceEntryRequest {
+            host_id,
+            cwd,
+            path,
+            is_dir,
+            initial_content,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn rename_workspace_entry(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    old_path: String,
+    new_path: String,
+) -> Result<WorkspaceEntryMutationResultView, String> {
+    state
+        .core
+        .rename_workspace_entry_on_host(RenameWorkspaceEntryRequest {
+            host_id,
+            cwd,
+            old_path,
+            new_path,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn delete_workspace_entry(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+) -> Result<WorkspaceEntryMutationResultView, String> {
+    state
+        .core
+        .delete_workspace_entry_on_host(DeleteWorkspaceEntryRequest { host_id, cwd, path })
+        .await
+}
+
+#[tauri::command]
+async fn highlight_workspace_code(
+    language: String,
+    content: String,
+    max_lines: Option<usize>,
+) -> Result<Vec<HighlightedLineView>, String> {
+    let cap = max_lines.unwrap_or(2500).clamp(1, 5000);
+    tauri::async_runtime::spawn_blocking(move || {
+        highlight_code_lines_capped(&language, &content, cap)
+    })
+    .await
+    .map_err(|e| format!("code highlight task error: {e}"))
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn ask_side_question(
     state: State<'_, DesktopAppState>,
@@ -2349,6 +2443,11 @@ pub fn run() {
             list_agent_code_blocks,
             get_workspace_files,
             read_workspace_file,
+            write_workspace_file,
+            create_workspace_entry,
+            rename_workspace_entry,
+            delete_workspace_entry,
+            highlight_workspace_code,
             ask_side_question,
             render_diagram,
             parse_markdown_preview,

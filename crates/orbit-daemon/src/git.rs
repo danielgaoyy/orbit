@@ -294,6 +294,11 @@ fn empty_non_git(cwd: String) -> GitStatusSnapshot {
     }
 }
 
+use crate::workspace_files::{
+    detect_line_ending, is_metadata_writable, is_path_inside_git, metadata_mtime_unix_ms,
+    sha256_hex,
+};
+
 const DEFAULT_MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 const HARD_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 const IMAGE_MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
@@ -306,6 +311,10 @@ pub struct WorkspaceFilePayload {
     pub content: String,
     pub size_bytes: u64,
     pub truncated: bool,
+    pub etag: Option<String>,
+    pub mtime_unix_ms: Option<i64>,
+    pub writable: bool,
+    pub line_ending: Option<String>,
 }
 
 fn image_mime_for_path(path: &Path) -> Option<&'static str> {
@@ -437,6 +446,39 @@ async fn resolve_contained_file_path(
     ))
 }
 
+async fn compute_workspace_file_writable(
+    cwd: &Path,
+    trimmed: &str,
+    canonical: &Path,
+    meta: &std::fs::Metadata,
+) -> bool {
+    // Mutations strictly require relative workspace paths; never mark absolute or `~/` reads writable.
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed == "~"
+        || trimmed.starts_with("~/")
+        || Path::new(trimmed).is_absolute()
+    {
+        return false;
+    }
+    if !is_metadata_writable(meta) {
+        return false;
+    }
+    let Ok(canonical_cwd) = tokio::fs::canonicalize(cwd).await else {
+        return false;
+    };
+    if !canonical.starts_with(&canonical_cwd) || is_path_inside_git(&canonical_cwd, canonical) {
+        return false;
+    }
+    let direct_candidate = canonical_cwd.join(Path::new(trimmed));
+    if let Ok(sym_meta) = tokio::fs::symlink_metadata(&direct_candidate).await
+        && sym_meta.file_type().is_symlink()
+    {
+        return false;
+    }
+    true
+}
+
 /// Read a single workspace file safely on the host (UTF-8 source/text, raster image base64, or binary marker).
 pub async fn read_workspace_file(
     cwd: &Path,
@@ -455,6 +497,8 @@ pub async fn read_workspace_file(
     }
 
     let size_bytes = meta.len();
+    let mtime_unix_ms = metadata_mtime_unix_ms(&meta);
+    let writable = compute_workspace_file_writable(cwd, trimmed, &canonical, &meta).await;
     let is_image = image_mime_for_path(&canonical).is_some();
     let cap = if is_image {
         max_bytes
@@ -476,6 +520,10 @@ pub async fn read_workspace_file(
                 content: String::new(),
                 size_bytes,
                 truncated: true,
+                etag: None,
+                mtime_unix_ms,
+                writable,
+                line_ending: None,
             });
         }
         let mut img_file = tokio::fs::File::open(&canonical)
@@ -495,8 +543,13 @@ pub async fn read_workspace_file(
                 content: String::new(),
                 size_bytes: bytes.len() as u64,
                 truncated: true,
+                etag: None,
+                mtime_unix_ms,
+                writable,
+                line_ending: None,
             });
         }
+        let etag = Some(sha256_hex(&bytes));
         return Ok(WorkspaceFilePayload {
             resolved_path,
             content_kind: "image".to_string(),
@@ -504,6 +557,10 @@ pub async fn read_workspace_file(
             content: B64.encode(&bytes),
             size_bytes: bytes.len() as u64,
             truncated: false,
+            etag,
+            mtime_unix_ms,
+            writable,
+            line_ending: None,
         });
     }
 
@@ -513,13 +570,17 @@ pub async fn read_workspace_file(
 
     let read_limit = (cap as usize).min(size_bytes as usize);
     let mut buf = Vec::with_capacity(read_limit);
-    let mut limited = (&mut file).take(cap);
+    let mut limited = (&mut file).take(cap.saturating_add(1));
     limited
         .read_to_end(&mut buf)
         .await
         .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
 
-    let truncated = size_bytes > cap;
+    let truncated = (buf.len() as u64) > cap || size_bytes > cap;
+    if (buf.len() as u64) > cap {
+        buf.truncate(cap as usize);
+    }
+    let etag = (!truncated).then(|| sha256_hex(&buf));
     let probe_len = buf.len().min(8192);
     if buf[..probe_len].contains(&0) {
         return Ok(WorkspaceFilePayload {
@@ -529,6 +590,10 @@ pub async fn read_workspace_file(
             content: String::new(),
             size_bytes,
             truncated,
+            etag,
+            mtime_unix_ms,
+            writable,
+            line_ending: None,
         });
     }
 
@@ -549,10 +614,15 @@ pub async fn read_workspace_file(
                     content: String::new(),
                     size_bytes,
                     truncated,
+                    etag,
+                    mtime_unix_ms,
+                    writable,
+                    line_ending: None,
                 });
             }
         }
     };
+    let line_ending = Some(detect_line_ending(&text));
 
     Ok(WorkspaceFilePayload {
         resolved_path,
@@ -561,6 +631,10 @@ pub async fn read_workspace_file(
         content: text,
         size_bytes,
         truncated,
+        etag,
+        mtime_unix_ms,
+        writable,
+        line_ending,
     })
 }
 

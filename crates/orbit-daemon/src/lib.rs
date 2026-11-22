@@ -23,6 +23,7 @@ pub mod skills;
 pub mod tools;
 pub mod workspace_board;
 pub mod workspace_cluster;
+pub mod workspace_files;
 pub mod workspace_organizer;
 pub mod workspace_runtime;
 pub mod worktree_handoff;
@@ -77,6 +78,10 @@ use crate::messaging::{
     AgentMessageDelivery, AgentPromptSource, DEFAULT_COALESCE_WINDOW, QueuedAgentMessage,
 };
 use crate::scheduler::ScheduleEngine;
+use crate::workspace_files::{
+    canonicalize_workspace_root, create_workspace_entry, delete_workspace_entry,
+    rename_workspace_entry, write_workspace_file,
+};
 use crate::workspace_runtime::WorkspaceScriptRegistry;
 
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
@@ -1573,8 +1578,147 @@ async fn handle_wire_rpc(
                         content: file_data.content,
                         size_bytes: file_data.size_bytes,
                         truncated: file_data.truncated,
+                        etag: file_data.etag,
+                        mtime_unix_ms: file_data.mtime_unix_ms,
+                        writable: file_data.writable,
+                        line_ending: file_data.line_ending,
                     },
                     Err(e) => rpc_err(request_id, "read_file_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::WriteWorkspaceFile {
+            request_id,
+            cwd,
+            path,
+            content,
+            expected_etag,
+            force,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match write_workspace_file(
+                        &authorized_cwd,
+                        &path,
+                        &content,
+                        expected_etag.as_deref(),
+                        force,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => WireMessage::WorkspaceFileWritten {
+                            request_id,
+                            cwd,
+                            path,
+                            etag: outcome.etag,
+                            size_bytes: outcome.size_bytes,
+                            mtime_unix_ms: outcome.mtime_unix_ms,
+                            conflict: outcome.conflict,
+                        },
+                        Err(e) => rpc_err(request_id, "write_file_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "write_file_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::CreateWorkspaceEntry {
+            request_id,
+            cwd,
+            path,
+            is_dir,
+            initial_content,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match create_workspace_entry(
+                        &authorized_cwd,
+                        &path,
+                        is_dir,
+                        initial_content.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(outcome) => WireMessage::WorkspaceEntryMutated {
+                            request_id,
+                            cwd,
+                            path: outcome.path,
+                            new_path: outcome.new_path,
+                            action: outcome.action,
+                        },
+                        Err(e) => rpc_err(request_id, "create_entry_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "create_entry_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::RenameWorkspaceEntry {
+            request_id,
+            cwd,
+            old_path,
+            new_path,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match rename_workspace_entry(&authorized_cwd, &old_path, &new_path).await {
+                            Ok(outcome) => WireMessage::WorkspaceEntryMutated {
+                                request_id,
+                                cwd,
+                                path: outcome.path,
+                                new_path: outcome.new_path,
+                                action: outcome.action,
+                            },
+                            Err(e) => rpc_err(request_id, "rename_entry_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "rename_entry_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteWorkspaceEntry {
+            request_id,
+            cwd,
+            path,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match delete_workspace_entry(&authorized_cwd, &path).await {
+                            Ok(outcome) => WireMessage::WorkspaceEntryMutated {
+                                request_id,
+                                cwd,
+                                path: outcome.path,
+                                new_path: outcome.new_path,
+                                action: outcome.action,
+                            },
+                            Err(e) => rpc_err(request_id, "delete_entry_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "delete_entry_denied", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
@@ -3436,9 +3580,110 @@ fn is_valid_release_semver(ver: &str) -> bool {
     true
 }
 
+/// Verify that a workspace mutation `cwd` is strictly contained within (equals or is a
+/// subdirectory of) a registered workspace, agent `cwd`, synced host project directory, or
+/// discovered project root on this host — preventing mutations in arbitrary host directories
+/// such as `~/.ssh`, `$HOME`, `/`, or `/etc`.
+async fn authorize_workspace_mutation_cwd(
+    store: &Arc<OrbitStore>,
+    resolved_cwd: &Path,
+) -> Result<PathBuf, String> {
+    let store_owned = Arc::clone(store);
+    let cwd_owned = resolved_cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        authorize_workspace_mutation_cwd_sync(&store_owned, &cwd_owned)
+    })
+    .await
+    .map_err(|_| "Workspace authorization task cancelled".to_string())?
+}
+
+fn authorize_workspace_mutation_cwd_sync(
+    store: &OrbitStore,
+    resolved_cwd: &Path,
+) -> Result<PathBuf, String> {
+    let canon_cwd = canonicalize_workspace_root(resolved_cwd)?;
+    let mut candidate_roots: Vec<String> = Vec::new();
+
+    if let Ok(workspaces) = store.list_workspaces() {
+        for ws in workspaces {
+            candidate_roots.push(ws.cwd);
+            if let Some(root) = ws.project_root {
+                candidate_roots.push(root);
+            }
+            if let Some(src) = ws.source_cwd {
+                candidate_roots.push(src);
+            }
+        }
+    }
+    if let Ok(agents) = store.list_agents(None) {
+        for ag in agents {
+            candidate_roots.push(ag.cwd);
+        }
+    }
+    if let Ok(sync_state) = store.get_host_sync_state() {
+        for proj in sync_state.projects {
+            candidate_roots.extend(proj.directories);
+        }
+    }
+    for dp in crate::discovery::discover_host_projects(store) {
+        candidate_roots.push(dp.path);
+    }
+
+    for raw_root in candidate_roots {
+        let trimmed = raw_root.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let expanded = expand_host_path(trimmed);
+        // `canonicalize_workspace_root` automatically filters out `/`, `$HOME`, `.git`, and missing dirs.
+        if let Ok(canon_root) = canonicalize_workspace_root(&expanded)
+            && (canon_cwd == canon_root || canon_cwd.starts_with(&canon_root))
+        {
+            return Ok(canon_cwd);
+        }
+    }
+
+    Err(format!(
+        "Workspace `{}` is not a registered or discovered project directory on this host",
+        canon_cwd.display()
+    ))
+}
+
 #[cfg(test)]
 mod self_upgrade_tests {
     use super::*;
+
+    #[test]
+    fn authorize_workspace_mutation_cwd_allows_registered_and_rejects_unregistered() {
+        let root = std::env::temp_dir().join(format!("orbit_auth_cwd_{}", Uuid::new_v4()));
+        let registered = root.join("proj_a");
+        let nested = registered.join("packages/web");
+        let unregistered = root.join("unregistered_secret");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+        std::fs::create_dir_all(registered.join(".git")).expect("mkdir .git");
+
+        let db_path = root.join("orbit.db");
+        let store = OrbitStore::open(&db_path).expect("open store");
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "proj_a".into(),
+                name: "Project A".into(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert project");
+
+        assert!(authorize_workspace_mutation_cwd_sync(&store, &registered).is_ok());
+        assert!(authorize_workspace_mutation_cwd_sync(&store, &nested).is_ok());
+        assert!(authorize_workspace_mutation_cwd_sync(&store, &unregistered).is_err());
+        assert!(authorize_workspace_mutation_cwd_sync(&store, &registered.join(".git")).is_err());
+        assert!(authorize_workspace_mutation_cwd_sync(&store, Path::new("/")).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn parse_relay_port_from_json_reads_listen_addr() {

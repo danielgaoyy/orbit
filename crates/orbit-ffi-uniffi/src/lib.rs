@@ -30,11 +30,12 @@ use orbit_client_core::composer::{
 };
 use orbit_client_core::contract::{
     AgentStageDeltaRequest, BridgeInfoView, ConversationSearchHit, CreateSessionRequest,
-    ExecuteWorktreeHandoffRequest, FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView,
-    GitReposInspectionView, MentionRankRequest, ModelSelectionRequest,
-    PreviewWorktreeHandoffRequest, ReadWorkspaceFileRequest, RenderDiagramRequest,
-    RenderDiagramView, RewindAgentRequest, SendPromptRequest, SpawnWorkspacePeerRequest,
-    UpdateHostConfigRequest,
+    CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest,
+    FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView, GitReposInspectionView,
+    MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest,
+    ReadWorkspaceFileRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest, RenderDiagramView,
+    RewindAgentRequest, SendPromptRequest, SpawnWorkspacePeerRequest, UpdateHostConfigRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, DiagramTheme, detect_diagram_kind as core_detect_diagram_kind,
@@ -69,9 +70,9 @@ use orbit_protocol::{
     ScheduleNewAgentConfig, ScheduleRunRecord, ScheduleRunStatus, ScheduleSpec, ScheduleStatus,
     ScheduleTarget, SessionMode, TerminalSummary, ThinkingOptionSpec, TimelinePayload,
     ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
-    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
-    WorkspaceOrganizePhase, WorkspaceSummary, WorktreeHandoffDirection, WorktreeHandoffMode,
-    WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceFileConflict, WorkspaceIsolation,
+    WorkspaceOrganizeEvent, WorkspaceOrganizePhase, WorkspaceSummary, WorktreeHandoffDirection,
+    WorktreeHandoffMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 
 uniffi::setup_scaffolding!();
@@ -3261,6 +3262,10 @@ pub struct FfiWorkspaceFile {
     pub content: String,
     pub size_bytes: u64,
     pub truncated: bool,
+    pub etag: Option<String>,
+    pub mtime_unix_ms: Option<i64>,
+    pub writable: bool,
+    pub line_ending: Option<String>,
     pub highlighted_lines: Vec<FfiHighlightedLine>,
     pub markdown_blocks: Vec<FfiRichBlock>,
 }
@@ -3278,8 +3283,77 @@ impl From<WorkspaceFileView> for FfiWorkspaceFile {
             content: v.content,
             size_bytes: v.size_bytes,
             truncated: v.truncated,
+            etag: v.etag,
+            mtime_unix_ms: v.mtime_unix_ms,
+            writable: v.writable,
+            line_ending: v.line_ending,
             highlighted_lines: v.highlighted_lines.into_iter().map(Into::into).collect(),
             markdown_blocks: v.markdown_blocks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceFileConflict {
+    pub current_etag: String,
+    pub current_content: Option<String>,
+    pub current_size_bytes: u64,
+    pub current_mtime_unix_ms: Option<i64>,
+}
+
+impl From<WorkspaceFileConflict> for FfiWorkspaceFileConflict {
+    fn from(v: WorkspaceFileConflict) -> Self {
+        Self {
+            current_etag: v.current_etag,
+            current_content: v.current_content,
+            current_size_bytes: v.current_size_bytes,
+            current_mtime_unix_ms: v.current_mtime_unix_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceFileWriteResult {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub etag: String,
+    pub size_bytes: u64,
+    pub mtime_unix_ms: Option<i64>,
+    pub conflict: Option<FfiWorkspaceFileConflict>,
+}
+
+impl From<WorkspaceFileWriteResultView> for FfiWorkspaceFileWriteResult {
+    fn from(v: WorkspaceFileWriteResultView) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+            etag: v.etag,
+            size_bytes: v.size_bytes,
+            mtime_unix_ms: v.mtime_unix_ms,
+            conflict: v.conflict.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceEntryMutationResult {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub new_path: Option<String>,
+    pub action: String,
+}
+
+impl From<WorkspaceEntryMutationResultView> for FfiWorkspaceEntryMutationResult {
+    fn from(v: WorkspaceEntryMutationResultView) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+            new_path: v.new_path,
+            action: v.action,
         }
     }
 }
@@ -4046,6 +4120,86 @@ pub struct FfiReadWorkspaceFileRequest {
 
 impl From<FfiReadWorkspaceFileRequest> for ReadWorkspaceFileRequest {
     fn from(v: FfiReadWorkspaceFileRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWriteWorkspaceFileRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub content: String,
+    pub expected_etag: Option<String>,
+    pub force: bool,
+}
+
+impl From<FfiWriteWorkspaceFileRequest> for WriteWorkspaceFileRequest {
+    fn from(v: FfiWriteWorkspaceFileRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+            content: v.content,
+            expected_etag: v.expected_etag,
+            force: v.force,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCreateWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub initial_content: Option<String>,
+}
+
+impl From<FfiCreateWorkspaceEntryRequest> for CreateWorkspaceEntryRequest {
+    fn from(v: FfiCreateWorkspaceEntryRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+            is_dir: v.is_dir,
+            initial_content: v.initial_content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiRenameWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub old_path: String,
+    pub new_path: String,
+}
+
+impl From<FfiRenameWorkspaceEntryRequest> for RenameWorkspaceEntryRequest {
+    fn from(v: FfiRenameWorkspaceEntryRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            old_path: v.old_path,
+            new_path: v.new_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDeleteWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+}
+
+impl From<FfiDeleteWorkspaceEntryRequest> for DeleteWorkspaceEntryRequest {
+    fn from(v: FfiDeleteWorkspaceEntryRequest) -> Self {
         Self {
             host_id: v.host_id,
             cwd: v.cwd,
@@ -5049,6 +5203,46 @@ impl OrbitMobileCore {
     ) -> Result<FfiWorkspaceFile, FfiOrbitError> {
         self.inner
             .read_workspace_file_blocking(&host_id, &cwd, &path)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn write_workspace_file(
+        &self,
+        req: FfiWriteWorkspaceFileRequest,
+    ) -> Result<FfiWorkspaceFileWriteResult, FfiOrbitError> {
+        self.inner
+            .write_workspace_file_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn create_workspace_entry(
+        &self,
+        req: FfiCreateWorkspaceEntryRequest,
+    ) -> Result<FfiWorkspaceEntryMutationResult, FfiOrbitError> {
+        self.inner
+            .create_workspace_entry_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn rename_workspace_entry(
+        &self,
+        req: FfiRenameWorkspaceEntryRequest,
+    ) -> Result<FfiWorkspaceEntryMutationResult, FfiOrbitError> {
+        self.inner
+            .rename_workspace_entry_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn delete_workspace_entry(
+        &self,
+        req: FfiDeleteWorkspaceEntryRequest,
+    ) -> Result<FfiWorkspaceEntryMutationResult, FfiOrbitError> {
+        self.inner
+            .delete_workspace_entry_blocking(req.into())
             .map(Into::into)
             .map_err(|detail| FfiOrbitError::Core { detail })
     }

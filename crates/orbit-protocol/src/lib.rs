@@ -785,6 +785,18 @@ pub enum TimelinePayload {
     },
 }
 
+/// Optimistic concurrency conflict returned when saving a workspace file whose on-disk
+/// SHA-256 `etag` changed since it was loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceFileConflict {
+    pub current_etag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_content: Option<String>,
+    pub current_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_mtime_unix_ms: Option<i64>,
+}
+
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -983,6 +995,66 @@ pub enum WireMessage {
         content: String,
         size_bytes: u64,
         truncated: bool,
+        /// SHA-256 hex digest of exact disk bytes for optimistic concurrency.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        etag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mtime_unix_ms: Option<i64>,
+        #[serde(default)]
+        writable: bool,
+        /// `"lf"` | `"crlf"` | `"mixed"`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line_ending: Option<String>,
+    },
+    WriteWorkspaceFile {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
+        #[serde(default)]
+        force: bool,
+    },
+    WorkspaceFileWritten {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        etag: String,
+        size_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mtime_unix_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conflict: Option<WorkspaceFileConflict>,
+    },
+    CreateWorkspaceEntry {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        #[serde(default)]
+        is_dir: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_content: Option<String>,
+    },
+    RenameWorkspaceEntry {
+        request_id: Uuid,
+        cwd: String,
+        old_path: String,
+        new_path: String,
+    },
+    DeleteWorkspaceEntry {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+    },
+    WorkspaceEntryMutated {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_path: Option<String>,
+        /// `"created_file"` | `"created_dir"` | `"renamed"` | `"deleted"`
+        action: String,
     },
 
     // Agents & Interactive Orchestration
@@ -2153,6 +2225,161 @@ mod tests {
                 assert_eq!(question, "Why did we use RwLock here?");
             }
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_file_mutations_and_legacy_content_compat_roundtrip() {
+        let req_id = Uuid::new_v4();
+
+        // 1. Legacy WorkspaceFileContentResponse JSON without new metadata fields must deserialize cleanly
+        let legacy_json = serde_json::json!({
+            "op": "workspace_file_content_response",
+            "request_id": req_id,
+            "cwd": "/workspace/orbit",
+            "path": "src/main.rs",
+            "resolved_path": "/workspace/orbit/src/main.rs",
+            "content_kind": "text",
+            "mime_type": "text/plain",
+            "content": "fn main() {}\n",
+            "size_bytes": 13,
+            "truncated": false
+        });
+        let decoded_legacy: WireMessage =
+            serde_json::from_value(legacy_json).expect("decode legacy file content");
+        match decoded_legacy {
+            WireMessage::WorkspaceFileContentResponse {
+                request_id,
+                etag,
+                mtime_unix_ms,
+                writable,
+                line_ending,
+                ..
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(etag, None);
+                assert_eq!(mtime_unix_ms, None);
+                assert!(!writable);
+                assert_eq!(line_ending, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // 2. Enriched WorkspaceFileContentResponse roundtrip
+        let enriched = WireMessage::WorkspaceFileContentResponse {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            path: "src/main.rs".into(),
+            resolved_path: "/workspace/orbit/src/main.rs".into(),
+            content_kind: "text".into(),
+            mime_type: Some("text/plain".into()),
+            content: "fn main() {}\n".into(),
+            size_bytes: 13,
+            truncated: false,
+            etag: Some("a".repeat(64)),
+            mtime_unix_ms: Some(1_730_000_000_000),
+            writable: true,
+            line_ending: Some("lf".into()),
+        };
+        let z = enriched.encode_zstd(3).expect("encode enriched");
+        match WireMessage::decode_zstd(&z).expect("decode enriched") {
+            WireMessage::WorkspaceFileContentResponse {
+                etag,
+                mtime_unix_ms,
+                writable,
+                line_ending,
+                ..
+            } => {
+                assert_eq!(etag.as_deref(), Some("a".repeat(64).as_str()));
+                assert_eq!(mtime_unix_ms, Some(1_730_000_000_000));
+                assert!(writable);
+                assert_eq!(line_ending.as_deref(), Some("lf"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // 3. WriteWorkspaceFile & WorkspaceFileWritten (with conflict)
+        let write_req = WireMessage::WriteWorkspaceFile {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            path: "src/lib.rs".into(),
+            content: "pub fn hi() {}\n".into(),
+            expected_etag: Some("deadbeef".into()),
+            force: false,
+        };
+        let z_write = write_req.encode_zstd(3).expect("encode write");
+        match WireMessage::decode_zstd(&z_write).expect("decode write") {
+            WireMessage::WriteWorkspaceFile {
+                request_id,
+                path,
+                expected_etag,
+                force,
+                ..
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(expected_etag.as_deref(), Some("deadbeef"));
+                assert!(!force);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let written_conflict = WireMessage::WorkspaceFileWritten {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            path: "src/lib.rs".into(),
+            etag: "newetag".into(),
+            size_bytes: 20,
+            mtime_unix_ms: Some(1_730_000_000_123),
+            conflict: Some(WorkspaceFileConflict {
+                current_etag: "newetag".into(),
+                current_content: Some("pub fn disk() {}\n".into()),
+                current_size_bytes: 17,
+                current_mtime_unix_ms: Some(1_730_000_000_123),
+            }),
+        };
+        let z_written = written_conflict.encode_zstd(3).expect("encode written");
+        match WireMessage::decode_zstd(&z_written).expect("decode written") {
+            WireMessage::WorkspaceFileWritten {
+                conflict: Some(c), ..
+            } => {
+                assert_eq!(c.current_etag, "newetag");
+                assert_eq!(c.current_content.as_deref(), Some("pub fn disk() {}\n"));
+                assert_eq!(c.current_size_bytes, 17);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // 4. Create / Rename / Delete / Mutated roundtrip
+        for msg in [
+            WireMessage::CreateWorkspaceEntry {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/new.rs".into(),
+                is_dir: false,
+                initial_content: Some("// hi\n".into()),
+            },
+            WireMessage::RenameWorkspaceEntry {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                old_path: "src/new.rs".into(),
+                new_path: "src/renamed.rs".into(),
+            },
+            WireMessage::DeleteWorkspaceEntry {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/renamed.rs".into(),
+            },
+            WireMessage::WorkspaceEntryMutated {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/new.rs".into(),
+                new_path: Some("src/renamed.rs".into()),
+                action: "renamed".into(),
+            },
+        ] {
+            let enc = msg.encode_zstd(3).expect("encode mutation msg");
+            let _ = WireMessage::decode_zstd(&enc).expect("decode mutation msg");
         }
     }
 

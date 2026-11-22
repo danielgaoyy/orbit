@@ -162,6 +162,67 @@ pub struct ReadWorkspaceFileRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteWorkspaceFileRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub expected_etag: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceFileWriteResultView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub etag: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<orbit_protocol::WorkspaceFileConflict>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    #[serde(default)]
+    pub is_dir: bool,
+    #[serde(default)]
+    pub initial_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub old_path: String,
+    pub new_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceEntryMutationResultView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_path: Option<String>,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSelectionRequest {
     #[serde(default)]
     pub host_id: Option<String>,

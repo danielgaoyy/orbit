@@ -63,6 +63,7 @@ import {
   type SlashDirective,
   type SpawnWorkspacePeerRequest,
   type SshHostItem,
+  type WorkspaceFileConflict,
   type WorktreeHandoffDirection,
   type WorktreeHandoffMode,
   type WorkspaceFileView,
@@ -239,6 +240,55 @@ export interface FileViewCacheEntry {
   error?: string;
 }
 
+export type WorkspaceLineEnding = "lf" | "crlf" | "mixed";
+
+export interface FileEditorDraftState {
+  hostId: string;
+  cwd: string;
+  path: string;
+  content: string;
+  baseEtag: string | null;
+  baseContent: string;
+  lineEnding: WorkspaceLineEnding;
+  dirty: boolean;
+  mode: "view" | "edit";
+  saving: boolean;
+  saveError: string | null;
+  conflict: WorkspaceFileConflict | null;
+}
+
+function normalizeLineEndingKind(raw?: string | null): WorkspaceLineEnding {
+  if (raw === "crlf" || raw === "mixed") return raw;
+  return "lf";
+}
+
+function normalizeEditorText(raw: string): string {
+  return raw.replace(/\r\n/g, "\n");
+}
+
+export interface PendingUnsavedFileAction {
+  fileKey: string;
+  label: string;
+  action:
+    | { kind: "focus_tab"; tabId: string }
+    | { kind: "close_tab"; tabId: string }
+    | {
+        kind: "open_file";
+        rawPath: string;
+        opts?: {
+          focusLine?: number | null;
+          focusEndLine?: number | null;
+          hostId?: string;
+          cwd?: string;
+          fallbackPath?: string;
+          initialMode?: "view" | "edit";
+        };
+      }
+    | { kind: "new_tab" }
+    | { kind: "switch_to_view"; hostId: string; cwd: string; path: string }
+    | { kind: "reload"; hostId: string; cwd: string; path: string };
+}
+
 export interface SideQuestionEntry {
   id: string;
   question: string;
@@ -382,6 +432,7 @@ export interface OrbitUiState {
   diffQuotes: Record<string, DiffQuoteSnippet[]>;
   queuedPrompts: Record<string, QueuedPromptItem[]>;
   workspaceFilesCache: Record<string, string[]>;
+  workspaceEmptyDirsCache: Record<string, string[]>;
   promptHistory: string[];
 
   // Incremental stage projections keyed by `hostId::agentId` + Rust sidebar tree + slash commands
@@ -396,6 +447,8 @@ export interface OrbitUiState {
   sidePanelTabs: SidePanelTab[];
   activeSidePanelTabId: string | null;
   fileViewCache: Record<string, FileViewCacheEntry>;
+  fileEditorDrafts: Record<string, FileEditorDraftState>;
+  pendingUnsavedFileAction: PendingUnsavedFileAction | null;
   sideQuestionsByScope: Record<string, SideQuestionEntry[]>;
   sideQuestionDrafts: Record<string, string>;
   sideQuestionFocusNonce: number;
@@ -605,9 +658,13 @@ function scheduleSavePrefs(): void {
   }, 180);
 }
 
-const beforeUnloadListener = () => {
+const beforeUnloadListener = (e: BeforeUnloadEvent) => {
   if (savePrefsPending) {
     writePrefsNow(state);
+  }
+  if (Object.values(state.fileEditorDrafts).some((d) => d.dirty)) {
+    e.preventDefault();
+    e.returnValue = "";
   }
 };
 
@@ -739,6 +796,7 @@ const defaultInitialState: OrbitUiState = {
   diffQuotes: initialDrafts.diffQuotes,
   queuedPrompts: {},
   workspaceFilesCache: {},
+  workspaceEmptyDirsCache: {},
   promptHistory: initialPrefs.promptHistory ?? [],
 
   stages: {},
@@ -752,6 +810,8 @@ const defaultInitialState: OrbitUiState = {
   sidePanelTabs: [],
   activeSidePanelTabId: null,
   fileViewCache: {},
+  fileEditorDrafts: {},
+  pendingUnsavedFileAction: null,
   sideQuestionsByScope: {},
   sideQuestionDrafts: initialDrafts.sideQuestionDrafts,
   sideQuestionFocusNonce: 0,
@@ -5258,7 +5318,28 @@ export const orbitActions = {
     }
   },
 
-  openSidePanelNewTab(): void {
+  openSidePanelNewTab(opts?: { skipUnsavedGuard?: boolean }): void {
+    if (!opts?.skipUnsavedGuard) {
+      const activeTab = state.sidePanelTabs.find((t) => t.id === state.activeSidePanelTabId);
+      if (state.sidePanelOpen && activeTab?.kind === "file" && activeTab.filePath) {
+        const activeKey = fileCacheKey(
+          activeTab.hostId ?? state.selectedHostId ?? "",
+          activeTab.cwd ?? state.selectedWorkspaceCwd ?? "~",
+          activeTab.filePath,
+        );
+        if (state.fileEditorDrafts[activeKey]?.dirty) {
+          setState((s) => ({
+            ...s,
+            pendingUnsavedFileAction: {
+              fileKey: activeKey,
+              label: "Open new tab",
+              action: { kind: "new_tab" },
+            },
+          }));
+          return;
+        }
+      }
+    }
     setState((s) => {
       const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
       return {
@@ -5266,6 +5347,7 @@ export const orbitActions = {
         sidePanelOpen: true,
         overviewPopoverOpen: false,
         activeSidePanelTabId: null,
+        pendingUnsavedFileAction: null,
         sidePanelLaunchpadFocusNonce: s.sidePanelLaunchpadFocusNonce + 1,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
@@ -5304,7 +5386,7 @@ export const orbitActions = {
     setState((s) => {
       const nextCache = { ...s.fileViewCache };
       for (const k of matchingKeys) {
-        if (k !== activeFileKey) {
+        if (k !== activeFileKey && !s.fileEditorDrafts[k]?.dirty) {
           delete nextCache[k];
         }
       }
@@ -5318,15 +5400,37 @@ export const orbitActions = {
       activeTab.cwd &&
       activeTab.filePath &&
       activeFileKey.startsWith(prefix) &&
-      state.fileViewCache[activeFileKey]?.status !== "error"
+      state.fileViewCache[activeFileKey]?.status !== "error" &&
+      !state.fileEditorDrafts[activeFileKey]?.dirty
     ) {
       void orbitActions.loadWorkspaceFile(activeTab.hostId, activeTab.cwd, activeTab.filePath, true);
     }
   },
 
-  focusSidePanelTab(tabId: string): void {
+  focusSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void {
     const target = state.sidePanelTabs.find((t) => t.id === tabId);
     if (!target) return;
+    if (!opts?.skipUnsavedGuard && state.activeSidePanelTabId !== tabId) {
+      const activeTab = state.sidePanelTabs.find((t) => t.id === state.activeSidePanelTabId);
+      if (state.sidePanelOpen && activeTab?.kind === "file" && activeTab.filePath) {
+        const activeKey = fileCacheKey(
+          activeTab.hostId ?? state.selectedHostId ?? "",
+          activeTab.cwd ?? state.selectedWorkspaceCwd ?? "~",
+          activeTab.filePath,
+        );
+        if (state.fileEditorDrafts[activeKey]?.dirty) {
+          setState((s) => ({
+            ...s,
+            pendingUnsavedFileAction: {
+              fileKey: activeKey,
+              label: `Switch to ${target.title}`,
+              action: { kind: "focus_tab", tabId },
+            },
+          }));
+          return;
+        }
+      }
+    }
     setState((s) => {
       const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
       return {
@@ -5334,6 +5438,7 @@ export const orbitActions = {
         sidePanelOpen: true,
         overviewPopoverOpen: false,
         activeSidePanelTabId: tabId,
+        pendingUnsavedFileAction: null,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
       };
@@ -5358,11 +5463,46 @@ export const orbitActions = {
     }
   },
 
-  closeSidePanelTab(tabId: string): void {
+  closeSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void {
+    const closingTab = state.sidePanelTabs.find((t) => t.id === tabId);
+    if (!opts?.skipUnsavedGuard && closingTab?.kind === "file" && closingTab.filePath) {
+      const closingKey = fileCacheKey(
+        closingTab.hostId ?? state.selectedHostId ?? "",
+        closingTab.cwd ?? state.selectedWorkspaceCwd ?? "~",
+        closingTab.filePath,
+      );
+      if (state.fileEditorDrafts[closingKey]?.dirty) {
+        setState((s) => ({
+          ...s,
+          sidePanelOpen: true,
+          activeSidePanelTabId: tabId,
+          pendingUnsavedFileAction: {
+            fileKey: closingKey,
+            label: `Close ${closingTab.title}`,
+            action: { kind: "close_tab", tabId },
+          },
+        }));
+        return;
+      }
+    }
+
     let closedPanel = false;
     setState((s) => {
       const idx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
       if (idx < 0) return s;
+      const targetTab = s.sidePanelTabs[idx];
+      let nextDrafts = s.fileEditorDrafts;
+      if (targetTab.kind === "file" && targetTab.filePath) {
+        const k = fileCacheKey(
+          targetTab.hostId ?? s.selectedHostId ?? "",
+          targetTab.cwd ?? s.selectedWorkspaceCwd ?? "~",
+          targetTab.filePath,
+        );
+        if (k in s.fileEditorDrafts) {
+          nextDrafts = { ...s.fileEditorDrafts };
+          delete nextDrafts[k];
+        }
+      }
       const remaining = s.sidePanelTabs.filter((t) => t.id !== tabId);
       const nextActive =
         s.activeSidePanelTabId === tabId
@@ -5382,6 +5522,8 @@ export const orbitActions = {
           : s.sidebarAutoYieldedForSidePanel,
         sidePanelTabs: remaining,
         activeSidePanelTabId: nextActive,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction: null,
         sidePanelLaunchpadFocusNonce: showingLaunchpad
           ? s.sidePanelLaunchpadFocusNonce + 1
           : s.sidePanelLaunchpadFocusNonce,
@@ -5482,6 +5624,8 @@ export const orbitActions = {
       hostId?: string;
       cwd?: string;
       fallbackPath?: string;
+      initialMode?: "view" | "edit";
+      skipUnsavedGuard?: boolean;
     },
   ): void {
     const hostId = opts?.hostId ?? state.selectedHostId;
@@ -5502,6 +5646,40 @@ export const orbitActions = {
 
     const tabId = `tab:file:${hostId}::${cwd}::${cleanPath}`;
     const title = basenameFromPath(cleanPath) || cleanPath;
+
+    if (!opts?.skipUnsavedGuard && state.activeSidePanelTabId !== tabId) {
+      const activeTab = state.sidePanelTabs.find((t) => t.id === state.activeSidePanelTabId);
+      if (state.sidePanelOpen && activeTab?.kind === "file" && activeTab.filePath) {
+        const activeKey = fileCacheKey(
+          activeTab.hostId ?? state.selectedHostId ?? "",
+          activeTab.cwd ?? state.selectedWorkspaceCwd ?? "~",
+          activeTab.filePath,
+        );
+        if (state.fileEditorDrafts[activeKey]?.dirty) {
+          setState((s) => ({
+            ...s,
+            quickOpenFilesOpen: false,
+            pendingUnsavedFileAction: {
+              fileKey: activeKey,
+              label: `Open ${title}`,
+              action: {
+                kind: "open_file",
+                rawPath,
+                opts: {
+                  focusLine: opts?.focusLine,
+                  focusEndLine: opts?.focusEndLine,
+                  hostId: opts?.hostId,
+                  cwd: opts?.cwd,
+                  fallbackPath: opts?.fallbackPath,
+                  initialMode: opts?.initialMode,
+                },
+              },
+            },
+          }));
+          return;
+        }
+      }
+    }
 
     setState((s) => {
       const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
@@ -5540,6 +5718,7 @@ export const orbitActions = {
         quickOpenFilesOpen: false,
         sidePanelTabs: nextTabs,
         activeSidePanelTabId: tabId,
+        pendingUnsavedFileAction: null,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
       };
@@ -5586,7 +5765,12 @@ export const orbitActions = {
     void (async () => {
       await orbitActions.loadWorkspaceFile(hostId, cwd, cleanPath, false);
       const primaryKey = `${hostId}::${cwd}::${cleanPath}`;
-      if (state.fileViewCache[primaryKey]?.status !== "error") return;
+      if (state.fileViewCache[primaryKey]?.status !== "error") {
+        if (opts?.initialMode === "edit") {
+          orbitActions.enterFileEditMode(hostId, cwd, cleanPath);
+        }
+        return;
+      }
 
       const trySuffixResolve = async (candidate: string): Promise<string | null> => {
         if (!cwd || cwd === "~" || candidate.startsWith("/") || candidate.startsWith("~/")) {
@@ -5659,18 +5843,51 @@ export const orbitActions = {
     try {
       const data = await orbitIpc.readWorkspaceFile(hostId, cwd, path);
       setState((s) => {
-        // Maintain a bounded 20-entry LRU file cache so large files never grow memory unboundedly
+        // Maintain a bounded 20-entry LRU file cache, never evicting files with active editor drafts
         const nextCache: Record<string, FileViewCacheEntry> = {};
-        const entries = Object.entries(s.fileViewCache).filter(([k]) => k !== cKey);
-        const startIdx = Math.max(0, entries.length - 19);
-        for (let i = startIdx; i < entries.length; i += 1) {
-          const [k, v] = entries[i];
+        const pinnedEntries: Array<[string, FileViewCacheEntry]> = [];
+        const evictableEntries: Array<[string, FileViewCacheEntry]> = [];
+        for (const [k, v] of Object.entries(s.fileViewCache)) {
+          if (k === cKey) continue;
+          if (k in s.fileEditorDrafts) {
+            pinnedEntries.push([k, v]);
+          } else {
+            evictableEntries.push([k, v]);
+          }
+        }
+        for (const [k, v] of pinnedEntries) {
+          nextCache[k] = v;
+        }
+        const startIdx = Math.max(0, evictableEntries.length - 19);
+        for (let i = startIdx; i < evictableEntries.length; i += 1) {
+          const [k, v] = evictableEntries[i];
           nextCache[k] = v;
         }
         nextCache[cKey] = { status: "ready", data };
+
+        // If this file is currently open in Edit mode with no unsaved changes, keep its draft synced with disk
+        let nextDrafts = s.fileEditorDrafts;
+        const existingDraft = s.fileEditorDrafts[cKey];
+        if (existingDraft && !existingDraft.dirty && data.content_kind === "text") {
+          const normalized = normalizeEditorText(data.content);
+          nextDrafts = {
+            ...s.fileEditorDrafts,
+            [cKey]: {
+              ...existingDraft,
+              content: normalized,
+              baseContent: normalized,
+              baseEtag: data.etag ?? null,
+              lineEnding: normalizeLineEndingKind(data.line_ending),
+              conflict: null,
+              saveError: null,
+            },
+          };
+        }
+
         return {
           ...s,
           fileViewCache: nextCache,
+          fileEditorDrafts: nextDrafts,
         };
       });
     } catch (err) {
@@ -5681,6 +5898,643 @@ export const orbitActions = {
           [cKey]: { status: "error", error: String(err) },
         },
       }));
+    }
+  },
+
+  enterFileEditMode(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const data = state.fileViewCache[cKey]?.data;
+    if (!data || data.content_kind !== "text" || data.truncated || data.writable === false) {
+      return;
+    }
+    const normalized = normalizeEditorText(data.content);
+    const lineEnding = normalizeLineEndingKind(data.line_ending);
+    setState((s) => {
+      const existing = s.fileEditorDrafts[cKey];
+      if (existing) {
+        return {
+          ...s,
+          fileEditorDrafts: {
+            ...s.fileEditorDrafts,
+            [cKey]: { ...existing, mode: "edit" },
+          },
+        };
+      }
+      return {
+        ...s,
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: {
+            hostId,
+            cwd,
+            path,
+            content: normalized,
+            baseEtag: data.etag ?? null,
+            baseContent: normalized,
+            lineEnding,
+            dirty: false,
+            mode: "edit",
+            saving: false,
+            saveError: null,
+            conflict: null,
+          },
+        },
+      };
+    });
+  },
+
+  requestFileViewMode(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const draft = state.fileEditorDrafts[cKey];
+    if (!draft) return;
+    if (draft.dirty) {
+      setState((s) => ({
+        ...s,
+        pendingUnsavedFileAction: {
+          fileKey: cKey,
+          label: "Switch to View mode",
+          action: { kind: "switch_to_view", hostId, cwd, path },
+        },
+      }));
+      return;
+    }
+    setState((s) => {
+      const nextDrafts = { ...s.fileEditorDrafts };
+      delete nextDrafts[cKey];
+      return {
+        ...s,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction:
+          s.pendingUnsavedFileAction?.fileKey === cKey ? null : s.pendingUnsavedFileAction,
+      };
+    });
+  },
+
+  requestFileReload(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    if (state.fileEditorDrafts[cKey]?.dirty) {
+      setState((s) => ({
+        ...s,
+        pendingUnsavedFileAction: {
+          fileKey: cKey,
+          label: "Reload from disk",
+          action: { kind: "reload", hostId, cwd, path },
+        },
+      }));
+      return;
+    }
+    void orbitActions.loadWorkspaceFile(hostId, cwd, path, true);
+  },
+
+  updateFileEditorDraft(hostId: string, cwd: string, path: string, nextContent: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const normalizedNext = normalizeEditorText(nextContent);
+    setState((s) => {
+      const existing = s.fileEditorDrafts[cKey];
+      const diskData = s.fileViewCache[cKey]?.data;
+      const baseContent = existing?.baseContent ?? normalizeEditorText(diskData?.content ?? "");
+      const baseEtag = existing?.baseEtag ?? diskData?.etag ?? null;
+      const lineEnding = existing?.lineEnding ?? normalizeLineEndingKind(diskData?.line_ending);
+      return {
+        ...s,
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: {
+            hostId,
+            cwd,
+            path,
+            content: normalizedNext,
+            baseEtag,
+            baseContent,
+            lineEnding,
+            dirty: normalizedNext !== baseContent,
+            mode: "edit",
+            saving: existing?.saving ?? false,
+            saveError: null,
+            conflict: existing?.conflict ?? null,
+          },
+        },
+      };
+    });
+  },
+
+  clearFileEditorError(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    setState((s) => {
+      const existing = s.fileEditorDrafts[cKey];
+      if (!existing || !existing.saveError) return s;
+      return {
+        ...s,
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: { ...existing, saveError: null },
+        },
+      };
+    });
+  },
+
+  discardFileEditorDraft(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    setState((s) => {
+      const nextDrafts = { ...s.fileEditorDrafts };
+      delete nextDrafts[cKey];
+      return {
+        ...s,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction:
+          s.pendingUnsavedFileAction?.fileKey === cKey ? null : s.pendingUnsavedFileAction,
+      };
+    });
+  },
+
+  async saveWorkspaceFile(
+    hostId: string,
+    cwd: string,
+    path: string,
+    force = false,
+  ): Promise<"saved" | "conflict" | "error"> {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const draft = state.fileEditorDrafts[cKey];
+    if (!draft || draft.saving) return "saved";
+
+    const savedNormalizedContent = draft.content;
+    const savedLineEnding = draft.lineEnding;
+    const wireContent =
+      savedLineEnding === "crlf"
+        ? savedNormalizedContent.replace(/\n/g, "\r\n")
+        : savedNormalizedContent;
+
+    setState((s) => {
+      const cur = s.fileEditorDrafts[cKey];
+      if (!cur) return s;
+      return {
+        ...s,
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: { ...cur, saving: true, saveError: null },
+        },
+      };
+    });
+
+    try {
+      const res = await orbitIpc.writeWorkspaceFile({
+        hostId,
+        cwd,
+        path,
+        content: wireContent,
+        expectedEtag: draft.baseEtag,
+        force,
+      });
+
+      if (res.conflict) {
+        setState((s) => {
+          const cur = s.fileEditorDrafts[cKey];
+          if (!cur) return s;
+          return {
+            ...s,
+            fileEditorDrafts: {
+              ...s.fileEditorDrafts,
+              [cKey]: {
+                ...cur,
+                saving: false,
+                saveError: null,
+                conflict: res.conflict ?? null,
+              },
+            },
+          };
+        });
+        return "conflict";
+      }
+
+      const cachedData = state.fileViewCache[cKey]?.data;
+      const language = cachedData?.language ?? "text";
+      const [highlightedLines, markdownBlocks] = await Promise.all([
+        orbitIpc
+          .highlightWorkspaceCode(
+            language,
+            savedNormalizedContent,
+            Math.max(2500, savedNormalizedContent.split("\n").length + 50),
+          )
+          .catch(() => cachedData?.highlighted_lines ?? []),
+        language === "markdown"
+          ? orbitIpc
+              .parseMarkdownPreview(savedNormalizedContent, false)
+              .catch(() => cachedData?.markdown_blocks ?? [])
+          : Promise.resolve(cachedData?.markdown_blocks ?? []),
+      ]);
+
+      setState((s) => {
+        const curDraft = s.fileEditorDrafts[cKey];
+        const stillEdited = curDraft && curDraft.content !== savedNormalizedContent;
+        const curCache = s.fileViewCache[cKey]?.data;
+        const nextCache = curCache
+          ? {
+              ...s.fileViewCache,
+              [cKey]: {
+                status: "ready" as const,
+                data: {
+                  ...curCache,
+                  content: wireContent,
+                  size_bytes: res.size_bytes,
+                  etag: res.etag,
+                  mtime_unix_ms: res.mtime_unix_ms ?? curCache.mtime_unix_ms ?? null,
+                  line_ending: savedLineEnding,
+                  highlighted_lines: highlightedLines,
+                  markdown_blocks: markdownBlocks,
+                },
+              },
+            }
+          : s.fileViewCache;
+
+        const nextDrafts = curDraft
+          ? {
+              ...s.fileEditorDrafts,
+              [cKey]: {
+                ...curDraft,
+                baseEtag: res.etag,
+                baseContent: savedNormalizedContent,
+                lineEnding: savedLineEnding,
+                dirty: Boolean(stillEdited),
+                saving: false,
+                saveError: null,
+                conflict: null,
+              },
+            }
+          : s.fileEditorDrafts;
+
+        return {
+          ...s,
+          fileViewCache: nextCache,
+          fileEditorDrafts: nextDrafts,
+        };
+      });
+
+      if (cwd && cwd !== "~") {
+        void orbitActions.refreshGit(hostId, cwd, state.selectedDiffPath, state.diffStaged);
+      }
+      notifyToast(`Saved ${basenameFromPath(path) || path}`);
+      return "saved";
+    } catch (err) {
+      setState((s) => {
+        const cur = s.fileEditorDrafts[cKey];
+        if (!cur) return s;
+        return {
+          ...s,
+          fileEditorDrafts: {
+            ...s.fileEditorDrafts,
+            [cKey]: {
+              ...cur,
+              saving: false,
+              saveError: String(err),
+            },
+          },
+        };
+      });
+      return "error";
+    }
+  },
+
+  async reloadWorkspaceFileFromConflict(hostId: string, cwd: string, path: string): Promise<void> {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    try {
+      const refreshed = await orbitIpc.readWorkspaceFile(hostId, cwd, path);
+      const normalized = normalizeEditorText(refreshed.content);
+      const lineEnding = normalizeLineEndingKind(refreshed.line_ending);
+      setState((s) => ({
+        ...s,
+        fileViewCache: {
+          ...s.fileViewCache,
+          [cKey]: { status: "ready", data: refreshed },
+        },
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: {
+            hostId,
+            cwd,
+            path,
+            content: normalized,
+            baseEtag: refreshed.etag ?? null,
+            baseContent: normalized,
+            lineEnding,
+            dirty: false,
+            mode: "edit",
+            saving: false,
+            saveError: null,
+            conflict: null,
+          },
+        },
+      }));
+      notifyToast(`Reloaded ${basenameFromPath(path) || path}`);
+    } catch (err) {
+      // Preserve existing cache & editor buffer so the user retains access to `Copy mine`
+      setState((s) => {
+        const cur = s.fileEditorDrafts[cKey];
+        if (!cur) return s;
+        return {
+          ...s,
+          fileEditorDrafts: {
+            ...s.fileEditorDrafts,
+            [cKey]: {
+              ...cur,
+              saving: false,
+              saveError: `Reload failed: ${String(err)}`,
+            },
+          },
+        };
+      });
+    }
+  },
+
+  async resolveUnsavedFileAction(choice: "save" | "discard" | "cancel"): Promise<void> {
+    const pending = state.pendingUnsavedFileAction;
+    if (!pending) return;
+
+    if (choice === "cancel") {
+      setState((s) => ({ ...s, pendingUnsavedFileAction: null }));
+      return;
+    }
+
+    const draft = state.fileEditorDrafts[pending.fileKey];
+    if (choice === "save" && draft) {
+      const outcome = await orbitActions.saveWorkspaceFile(
+        draft.hostId,
+        draft.cwd,
+        draft.path,
+        false,
+      );
+      if (outcome !== "saved") {
+        // Keep user on current file so conflict banner or save error is visible
+        setState((s) => ({ ...s, pendingUnsavedFileAction: null }));
+        return;
+      }
+    }
+
+    if (choice === "discard" && draft) {
+      orbitActions.discardFileEditorDraft(draft.hostId, draft.cwd, draft.path);
+    } else {
+      setState((s) => ({ ...s, pendingUnsavedFileAction: null }));
+    }
+
+    const act = pending.action;
+    switch (act.kind) {
+      case "focus_tab":
+        orbitActions.focusSidePanelTab(act.tabId, { skipUnsavedGuard: true });
+        break;
+      case "close_tab":
+        orbitActions.closeSidePanelTab(act.tabId, { skipUnsavedGuard: true });
+        break;
+      case "open_file":
+        orbitActions.openFileInSidePanel(act.rawPath, {
+          ...act.opts,
+          skipUnsavedGuard: true,
+        });
+        break;
+      case "new_tab":
+        orbitActions.openSidePanelNewTab({ skipUnsavedGuard: true });
+        break;
+      case "switch_to_view":
+        orbitActions.discardFileEditorDraft(act.hostId, act.cwd, act.path);
+        break;
+      case "reload":
+        orbitActions.discardFileEditorDraft(act.hostId, act.cwd, act.path);
+        void orbitActions.loadWorkspaceFile(act.hostId, act.cwd, act.path, true);
+        break;
+    }
+  },
+
+  async createWorkspaceEntry(
+    hostId: string,
+    cwd: string,
+    path: string,
+    isDir: boolean,
+    initialContent?: string,
+  ): Promise<string> {
+    const res = await orbitIpc.createWorkspaceEntry({
+      hostId,
+      cwd,
+      path,
+      isDir,
+      initialContent: initialContent ?? (isDir ? null : ""),
+    });
+    const wsKey = `${hostId}::${cwd}`;
+    const normalized = res.path;
+    if (isDir) {
+      setState((s) => {
+        const cur = s.workspaceEmptyDirsCache[wsKey] ?? [];
+        if (cur.includes(normalized)) return s;
+        return {
+          ...s,
+          workspaceEmptyDirsCache: {
+            ...s.workspaceEmptyDirsCache,
+            [wsKey]: [...cur, normalized],
+          },
+        };
+      });
+    }
+    await orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+    if (!isDir) {
+      orbitActions.openFileInSidePanel(normalized, { hostId, cwd, initialMode: "edit" });
+    }
+    if (cwd && cwd !== "~") {
+      void orbitActions.refreshGit(hostId, cwd, state.selectedDiffPath, state.diffStaged);
+    }
+    return normalized;
+  },
+
+  async renameWorkspaceEntry(
+    hostId: string,
+    cwd: string,
+    oldPath: string,
+    newPath: string,
+  ): Promise<string> {
+    const res = await orbitIpc.renameWorkspaceEntry({ hostId, cwd, oldPath, newPath });
+    const oldNorm = res.path;
+    const newNorm = res.new_path ?? newPath;
+    const wsKey = `${hostId}::${cwd}`;
+    const remapPath = (p: string): string | null => {
+      if (p === oldNorm) return newNorm;
+      if (p.startsWith(`${oldNorm}/`)) return `${newNorm}${p.slice(oldNorm.length)}`;
+      return null;
+    };
+
+    const pathsNeedingHighlightReload: string[] = [];
+    const extOf = (p: string): string => {
+      const base = basenameFromPath(p);
+      const dot = base.lastIndexOf(".");
+      return dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
+    };
+
+    setState((s) => {
+      const prevEmptyDirs = s.workspaceEmptyDirsCache[wsKey] ?? [];
+      const nextEmptyDirs = prevEmptyDirs.map((d) => remapPath(d) ?? d);
+
+      const nextTabs = s.sidePanelTabs.map((t) => {
+        if (t.kind !== "file" || !t.filePath) return t;
+        const tHost = t.hostId ?? s.selectedHostId;
+        const tCwd = t.cwd ?? s.selectedWorkspaceCwd;
+        if (tHost !== hostId || tCwd !== cwd) return t;
+        const mapped = remapPath(t.filePath);
+        if (!mapped) return t;
+        const oldKey = `${hostId}::${cwd}::${t.filePath}`;
+        if (extOf(t.filePath) !== extOf(mapped) && !s.fileEditorDrafts[oldKey]?.dirty) {
+          pathsNeedingHighlightReload.push(mapped);
+        }
+        return {
+          ...t,
+          id: `tab:file:${hostId}::${cwd}::${mapped}`,
+          title: basenameFromPath(mapped) || mapped,
+          filePath: mapped,
+        };
+      });
+
+      let nextActiveTabId = s.activeSidePanelTabId;
+      for (let i = 0; i < s.sidePanelTabs.length; i += 1) {
+        if (s.sidePanelTabs[i].id === s.activeSidePanelTabId) {
+          nextActiveTabId = nextTabs[i]?.id ?? s.activeSidePanelTabId;
+          break;
+        }
+      }
+
+      const prefix = `${hostId}::${cwd}::`;
+      const nextCache: Record<string, FileViewCacheEntry> = {};
+      for (const [k, v] of Object.entries(s.fileViewCache)) {
+        if (k.startsWith(prefix)) {
+          const rel = k.slice(prefix.length);
+          const mapped = remapPath(rel);
+          if (mapped) {
+            nextCache[`${prefix}${mapped}`] = v.data
+              ? { ...v, data: { ...v.data, path: mapped } }
+              : v;
+            continue;
+          }
+        }
+        nextCache[k] = v;
+      }
+
+      const nextDrafts: Record<string, FileEditorDraftState> = {};
+      for (const [k, v] of Object.entries(s.fileEditorDrafts)) {
+        if (k.startsWith(prefix)) {
+          const rel = k.slice(prefix.length);
+          const mapped = remapPath(rel);
+          if (mapped) {
+            nextDrafts[`${prefix}${mapped}`] = { ...v, path: mapped };
+            continue;
+          }
+        }
+        nextDrafts[k] = v;
+      }
+
+      // Clear/remap any pending unsaved guard referencing the renamed file or tab
+      let nextPending = s.pendingUnsavedFileAction;
+      if (nextPending && nextPending.fileKey.startsWith(prefix)) {
+        const mappedKeyRel = remapPath(nextPending.fileKey.slice(prefix.length));
+        if (mappedKeyRel) {
+          nextPending = null;
+        }
+      }
+
+      return {
+        ...s,
+        workspaceEmptyDirsCache: {
+          ...s.workspaceEmptyDirsCache,
+          [wsKey]: nextEmptyDirs,
+        },
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: nextActiveTabId,
+        fileViewCache: nextCache,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction: nextPending,
+      };
+    });
+
+    for (const reloadPath of pathsNeedingHighlightReload) {
+      void orbitActions.loadWorkspaceFile(hostId, cwd, reloadPath, true);
+    }
+
+    await orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+    if (cwd && cwd !== "~") {
+      void orbitActions.refreshGit(hostId, cwd, state.selectedDiffPath, state.diffStaged);
+    }
+    return newNorm;
+  },
+
+  async deleteWorkspaceEntry(
+    hostId: string,
+    cwd: string,
+    path: string,
+    opts?: { allowDirty?: boolean },
+  ): Promise<void> {
+    const cleanTarget = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    const prefix = `${hostId}::${cwd}::`;
+    if (!opts?.allowDirty) {
+      const hasDirtyMatch = Object.entries(state.fileEditorDrafts).some(([k, d]) => {
+        if (!d.dirty || !k.startsWith(prefix)) return false;
+        const rel = k.slice(prefix.length);
+        return rel === cleanTarget || rel.startsWith(`${cleanTarget}/`);
+      });
+      if (hasDirtyMatch) {
+        throw new Error("Cannot delete entry while it has unsaved edits in the editor");
+      }
+    }
+
+    const res = await orbitIpc.deleteWorkspaceEntry({ hostId, cwd, path });
+    const delNorm = res.path;
+    const wsKey = `${hostId}::${cwd}`;
+    const matchesDeleted = (p: string): boolean => p === delNorm || p.startsWith(`${delNorm}/`);
+
+    setState((s) => {
+      const prevEmptyDirs = s.workspaceEmptyDirsCache[wsKey] ?? [];
+      const nextEmptyDirs = prevEmptyDirs.filter((d) => !matchesDeleted(d));
+
+      const remainingTabs = s.sidePanelTabs.filter((t) => {
+        if (t.kind !== "file" || !t.filePath) return true;
+        const tHost = t.hostId ?? s.selectedHostId;
+        const tCwd = t.cwd ?? s.selectedWorkspaceCwd;
+        if (tHost !== hostId || tCwd !== cwd) return true;
+        return !matchesDeleted(t.filePath);
+      });
+
+      const activeRemoved = !remainingTabs.some((t) => t.id === s.activeSidePanelTabId);
+      const nextActive = activeRemoved
+        ? (remainingTabs[remainingTabs.length - 1]?.id ?? null)
+        : s.activeSidePanelTabId;
+
+      const nextCache: Record<string, FileViewCacheEntry> = {};
+      for (const [k, v] of Object.entries(s.fileViewCache)) {
+        if (k.startsWith(prefix) && matchesDeleted(k.slice(prefix.length))) continue;
+        nextCache[k] = v;
+      }
+
+      const nextDrafts: Record<string, FileEditorDraftState> = {};
+      for (const [k, v] of Object.entries(s.fileEditorDrafts)) {
+        if (k.startsWith(prefix) && matchesDeleted(k.slice(prefix.length))) continue;
+        nextDrafts[k] = v;
+      }
+
+      const nextPending =
+        s.pendingUnsavedFileAction &&
+        s.pendingUnsavedFileAction.fileKey.startsWith(prefix) &&
+        matchesDeleted(s.pendingUnsavedFileAction.fileKey.slice(prefix.length))
+          ? null
+          : s.pendingUnsavedFileAction;
+
+      return {
+        ...s,
+        workspaceEmptyDirsCache: {
+          ...s.workspaceEmptyDirsCache,
+          [wsKey]: nextEmptyDirs,
+        },
+        sidePanelTabs: remainingTabs,
+        activeSidePanelTabId: nextActive,
+        fileViewCache: nextCache,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction: nextPending,
+      };
+    });
+
+    await orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+    if (cwd && cwd !== "~") {
+      void orbitActions.refreshGit(hostId, cwd, state.selectedDiffPath, state.diffStaged);
     }
   },
 

@@ -523,6 +523,9 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::GitStatusResponse { request_id, .. }
         | WireMessage::GitDiffResponse { request_id, .. }
         | WireMessage::WorkspaceFilesResponse { request_id, .. }
+        | WireMessage::WorkspaceFileContentResponse { request_id, .. }
+        | WireMessage::WorkspaceFileWritten { request_id, .. }
+        | WireMessage::WorkspaceEntryMutated { request_id, .. }
         | WireMessage::AgentsSnapshot { request_id, .. }
         | WireMessage::AgentCreated { request_id, .. }
         | WireMessage::AgentForked { request_id, .. }
@@ -1006,5 +1009,44 @@ mod tests {
             workspace: None,
         };
         assert_eq!(extract_response_request_id(&msg), Some(req_id));
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_workspace_file_responses() {
+        let req_id = Uuid::new_v4();
+        let read_resp = WireMessage::WorkspaceFileContentResponse {
+            request_id: req_id,
+            cwd: "/tmp/repo".into(),
+            path: "a.rs".into(),
+            resolved_path: "/tmp/repo/a.rs".into(),
+            content_kind: "text".into(),
+            mime_type: Some("text/plain".into()),
+            content: "fn main() {}\n".into(),
+            size_bytes: 13,
+            truncated: false,
+            etag: Some("abc".into()),
+            mtime_unix_ms: Some(1),
+            writable: true,
+            line_ending: Some("lf".into()),
+        };
+        let write_resp = WireMessage::WorkspaceFileWritten {
+            request_id: req_id,
+            cwd: "/tmp/repo".into(),
+            path: "a.rs".into(),
+            etag: "def".into(),
+            size_bytes: 14,
+            mtime_unix_ms: Some(2),
+            conflict: None,
+        };
+        let mutate_resp = WireMessage::WorkspaceEntryMutated {
+            request_id: req_id,
+            cwd: "/tmp/repo".into(),
+            path: "a.rs".into(),
+            new_path: Some("b.rs".into()),
+            action: "renamed".into(),
+        };
+        assert_eq!(extract_response_request_id(&read_resp), Some(req_id));
+        assert_eq!(extract_response_request_id(&write_resp), Some(req_id));
+        assert_eq!(extract_response_request_id(&mutate_resp), Some(req_id));
     }
 }

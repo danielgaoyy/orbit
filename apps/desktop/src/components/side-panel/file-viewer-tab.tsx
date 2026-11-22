@@ -11,7 +11,9 @@ import {
   GitCompareArrows,
   Loader2,
   MessageSquarePlus,
+  Pencil,
   RefreshCw,
+  Save,
   Search,
   WrapText,
   X,
@@ -20,8 +22,10 @@ import {
   MarkdownBlocksView,
   MarkdownLinkProvider,
 } from "@/components/markdown-blocks";
+import { WorkspaceCodeEditor } from "@/components/side-panel/workspace-code-editor";
 import { formatLineRangeLabel, normalizeLineRange } from "@/lib/file-links";
 import { useImeCompositionGuard } from "@/lib/ime";
+import { modSymbol } from "@/lib/keybindings";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { formatFileSizeCompact } from "@/lib/session-insights";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
@@ -51,6 +55,10 @@ export const FileViewerTab = memo(function FileViewerTab({
   const cKey = fileCacheKey(hostId, cwd, path);
 
   const cacheEntry = useOrbitSelector((s) => s.fileViewCache[cKey] ?? null);
+  const draft = useOrbitSelector((s) => s.fileEditorDrafts[cKey] ?? null);
+  const pendingUnsaved = useOrbitSelector((s) =>
+    s.pendingUnsavedFileAction?.fileKey === cKey ? s.pendingUnsavedFileAction : null,
+  );
   const gitStatusFiles = useOrbitSelector((s) =>
     hostId && cwd ? (s.gitReviews[`${hostId}::${cwd}`]?.status?.files ?? null) : null,
   );
@@ -67,6 +75,9 @@ export const FileViewerTab = memo(function FileViewerTab({
   );
 
   const [markdownMode, setMarkdownMode] = useState<"preview" | "source">("preview");
+  const [pendingMarkdownTarget, setPendingMarkdownTarget] = useState<"preview" | "source" | null>(
+    null,
+  );
   const [logWrapLines, setLogWrapLines] = useState(true);
   const [logFollow, setLogFollow] = useState(isTaskLogPath);
   const [copied, setCopied] = useState(false);
@@ -79,6 +90,7 @@ export const FileViewerTab = memo(function FileViewerTab({
   const logViewportRef = useRef<HTMLDivElement | null>(null);
   const lineRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const ime = useImeCompositionGuard();
+  const mod = modSymbol();
 
   useEffect(() => {
     setRenderedLineCap(800);
@@ -112,7 +124,29 @@ export const FileViewerTab = memo(function FileViewerTab({
     const base = normalized.slice(normalized.lastIndexOf("/") + 1);
     return base || relPath;
   }, [isTaskLogPath, path, relPath]);
+
   const isMarkdown = data?.language === "markdown" && (data?.markdown_blocks?.length ?? 0) > 0;
+  const isEditable = Boolean(
+    data && data.content_kind === "text" && !data.truncated && !isLogFile && data.writable !== false,
+  );
+  const isReadOnlyText = Boolean(
+    data && data.content_kind === "text" && !isLogFile && (data.writable === false || data.truncated),
+  );
+  const isEditMode = Boolean(isEditable && draft?.mode === "edit");
+  const isDirty = Boolean(draft?.dirty);
+
+  // Apply deferred Markdown mode switch once the unsaved-changes guard resolves out of Edit mode
+  useEffect(() => {
+    if (!pendingMarkdownTarget) return;
+    if (!isEditMode) {
+      setMarkdownMode(pendingMarkdownTarget);
+      setPendingMarkdownTarget(null);
+    } else if (!pendingUnsaved) {
+      // Guard was cancelled while still in Edit mode
+      setPendingMarkdownTarget(null);
+    }
+  }, [pendingMarkdownTarget, isEditMode, pendingUnsaved]);
+
   const logLines = useMemo(() => {
     if (!isLogFile || !data || data.content_kind !== "text") return [];
     return parseAnsiLogLines(data.content);
@@ -192,7 +226,7 @@ export const FileViewerTab = memo(function FileViewerTab({
 
   // Scroll to requested line or active find match once DOM nodes finish layout
   useEffect(() => {
-    if (!activeTargetLine) return;
+    if (!activeTargetLine || isEditMode) return;
     const rafId = window.requestAnimationFrame(() => {
       const node = lineRefs.current.get(activeTargetLine);
       if (node) {
@@ -206,14 +240,16 @@ export const FileViewerTab = memo(function FileViewerTab({
     data?.resolved_path,
     markdownMode,
     renderedLineCap,
+    isEditMode,
   ]);
 
   const handleCopyContent = async () => {
-    if (!data?.content) return;
+    const sourceText = isEditMode && draft ? draft.content : data?.content;
+    if (sourceText == null) return;
     try {
       const textToCopy = isLogFile
         ? logLines.map((l) => l.plain).join("\n")
-        : data.content;
+        : sourceText;
       await navigator.clipboard.writeText(textToCopy);
       setCopied(true);
       setTimeout(() => setCopied(false), 1400);
@@ -233,6 +269,7 @@ export const FileViewerTab = memo(function FileViewerTab({
       const snap = orbitActions.getSnapshot();
       if (
         !snap.sidePanelOpen ||
+        snap.activeSidePanelTabId !== tab.id ||
         snap.terminalFocused ||
         snap.commandPaletteOpen ||
         snap.quickOpenFilesOpen
@@ -240,10 +277,36 @@ export const FileViewerTab = memo(function FileViewerTab({
         return;
       }
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") {
+        if (isEditMode) return;
         e.preventDefault();
         setFindOpen(true);
         if (isMarkdown) setMarkdownMode("source");
         requestAnimationFrame(() => findInputRef.current?.focus());
+      } else if (
+        (e.metaKey || e.ctrlKey) &&
+        !e.shiftKey &&
+        !e.altKey &&
+        e.key.toLowerCase() === "e" &&
+        isEditable
+      ) {
+        e.preventDefault();
+        if (isEditMode) {
+          orbitActions.requestFileViewMode(hostId, cwd, path);
+        } else {
+          setFindOpen(false);
+          orbitActions.enterFileEditMode(hostId, cwd, path);
+        }
+      } else if (
+        (e.metaKey || e.ctrlKey) &&
+        !e.shiftKey &&
+        !e.altKey &&
+        e.key.toLowerCase() === "s" &&
+        isEditMode
+      ) {
+        e.preventDefault();
+        if (!orbitActions.getSnapshot().fileEditorDrafts[cKey]?.saving) {
+          void orbitActions.saveWorkspaceFile(hostId, cwd, path, false);
+        }
       } else if (e.key === "Escape" && findOpen) {
         e.preventDefault();
         setFindOpen(false);
@@ -252,7 +315,7 @@ export const FileViewerTab = memo(function FileViewerTab({
     };
     window.addEventListener("keydown", onWindowKeyDown);
     return () => window.removeEventListener("keydown", onWindowKeyDown);
-  }, [findOpen, isMarkdown]);
+  }, [findOpen, isMarkdown, isEditable, isEditMode, cKey, hostId, cwd, path, tab.id]);
 
   const stepMatch = (delta: number) => {
     if (matchLineNumbers.length === 0) return;
@@ -264,7 +327,7 @@ export const FileViewerTab = memo(function FileViewerTab({
       tabIndex={-1}
       className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden outline-none"
       onKeyDown={(e) => {
-        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f" && !isEditMode) {
           e.preventDefault();
           openFind();
         } else if (e.key === "Escape" && findOpen) {
@@ -291,6 +354,13 @@ export const FileViewerTab = memo(function FileViewerTab({
           >
             {displayHeaderPath}
           </span>
+          {isDirty && (
+            <span
+              title="Unsaved changes"
+              aria-label="Unsaved changes"
+              className="size-[6px] shrink-0 rounded-full bg-amber-500/90"
+            />
+          )}
           {data && (
             <span className="text-muted-foreground/75 tabular-nums shrink-0 text-[11px]">
               {isLogFile
@@ -298,7 +368,12 @@ export const FileViewerTab = memo(function FileViewerTab({
                 : formatFileSizeCompact(data.size_bytes)}
             </span>
           )}
-          {focusLabel && focusRange.startLine != null && (
+          {isReadOnlyText && (
+            <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10.5px]">
+              Read-only
+            </span>
+          )}
+          {focusLabel && focusRange.startLine != null && !isEditMode && (
             <button
               type="button"
               title="Jump to focused line range"
@@ -321,14 +396,25 @@ export const FileViewerTab = memo(function FileViewerTab({
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
-          {isMarkdown && (
+          {isMarkdown ? (
             <div className="bg-muted inline-flex h-[24px] items-center rounded-md p-0.5 text-[11px]">
               <button
                 type="button"
-                onClick={() => setMarkdownMode("preview")}
+                onClick={() => {
+                  if (isEditMode) {
+                    if (isDirty) {
+                      setPendingMarkdownTarget("preview");
+                    } else {
+                      setMarkdownMode("preview");
+                    }
+                    orbitActions.requestFileViewMode(hostId, cwd, path);
+                  } else {
+                    setMarkdownMode("preview");
+                  }
+                }}
                 className={cn(
                   "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
-                  markdownMode === "preview"
+                  !isEditMode && markdownMode === "preview"
                     ? "bg-background text-foreground shadow-2xs"
                     : "text-muted-foreground hover:text-foreground",
                 )}
@@ -338,18 +424,104 @@ export const FileViewerTab = memo(function FileViewerTab({
               </button>
               <button
                 type="button"
-                onClick={() => setMarkdownMode("source")}
+                onClick={() => {
+                  if (isEditMode) {
+                    if (isDirty) {
+                      setPendingMarkdownTarget("source");
+                    } else {
+                      setMarkdownMode("source");
+                    }
+                    orbitActions.requestFileViewMode(hostId, cwd, path);
+                  } else {
+                    setMarkdownMode("source");
+                  }
+                }}
                 className={cn(
                   "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
-                  markdownMode === "source"
+                  !isEditMode && markdownMode === "source"
                     ? "bg-background text-foreground shadow-2xs"
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
                 <Code2 className="h-[11.5px] w-[11.5px]" />
-                Source
+                View
               </button>
+              {isEditable && (
+                <button
+                  type="button"
+                  title={`Edit file (${mod}E)`}
+                  onClick={() => {
+                    setFindOpen(false);
+                    setPendingMarkdownTarget(null);
+                    orbitActions.enterFileEditMode(hostId, cwd, path);
+                  }}
+                  className={cn(
+                    "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
+                    isEditMode
+                      ? "bg-background text-foreground shadow-2xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Pencil className="h-[11px] w-[11px]" />
+                  Edit
+                </button>
+              )}
             </div>
+          ) : (
+            isEditable && (
+              <div className="bg-muted inline-flex h-[24px] items-center rounded-md p-0.5 text-[11px]">
+                <button
+                  type="button"
+                  onClick={() => orbitActions.requestFileViewMode(hostId, cwd, path)}
+                  className={cn(
+                    "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
+                    !isEditMode
+                      ? "bg-background text-foreground shadow-2xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  View
+                </button>
+                <button
+                  type="button"
+                  title={`Edit file (${mod}E)`}
+                  onClick={() => {
+                    setFindOpen(false);
+                    orbitActions.enterFileEditMode(hostId, cwd, path);
+                  }}
+                  className={cn(
+                    "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
+                    isEditMode
+                      ? "bg-background text-foreground shadow-2xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  Edit
+                </button>
+              </div>
+            )
+          )}
+
+          {isEditMode && (
+            <button
+              type="button"
+              title={`Save file (${mod}S)`}
+              disabled={draft?.saving || !isDirty}
+              onClick={() => void orbitActions.saveWorkspaceFile(hostId, cwd, path, false)}
+              className={cn(
+                "inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors disabled:cursor-default disabled:opacity-45",
+                isDirty
+                  ? "bg-foreground text-background hover:opacity-90"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              {draft?.saving ? (
+                <Loader2 className="h-[12px] w-[12px] animate-spin" />
+              ) : (
+                <Save className="h-[12px] w-[12px]" />
+              )}
+              Save
+            </button>
           )}
 
           {hasGitDiff && (
@@ -380,19 +552,21 @@ export const FileViewerTab = memo(function FileViewerTab({
 
           {data?.content_kind === "text" && (
             <>
-              <button
-                type="button"
-                title="Find in file (⌘F)"
-                onClick={openFind}
-                className={cn(
-                  "inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors",
-                  findOpen
-                    ? "bg-accent text-foreground"
-                    : "text-muted-foreground hover:bg-accent hover:text-foreground",
-                )}
-              >
-                <Search className="h-[13px] w-[13px]" />
-              </button>
+              {!isEditMode && (
+                <button
+                  type="button"
+                  title={`Find in file (${mod}F)`}
+                  onClick={openFind}
+                  className={cn(
+                    "inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors",
+                    findOpen
+                      ? "bg-accent text-foreground"
+                      : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                  )}
+                >
+                  <Search className="h-[13px] w-[13px]" />
+                </button>
+              )}
               <button
                 type="button"
                 title="Copy file contents"
@@ -411,7 +585,7 @@ export const FileViewerTab = memo(function FileViewerTab({
           <button
             type="button"
             title="Reload file"
-            onClick={() => void orbitActions.loadWorkspaceFile(hostId, cwd, path, true)}
+            onClick={() => orbitActions.requestFileReload(hostId, cwd, path)}
             className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors"
           >
             <RefreshCw
@@ -421,8 +595,46 @@ export const FileViewerTab = memo(function FileViewerTab({
         </div>
       </div>
 
+      {/* Quiet Inline Unsaved-Changes Guard Strip */}
+      {pendingUnsaved && (
+        <div className="border-border bg-elevated/85 flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5 text-[12px]">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="size-[6px] shrink-0 rounded-full bg-amber-500" />
+            <span className="text-foreground font-medium">Unsaved changes</span>
+            <span className="text-muted-foreground truncate text-[11.5px]">
+              · {pendingUnsaved.label}
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              disabled={draft?.saving}
+              onClick={() => void orbitActions.resolveUnsavedFileAction("save")}
+              className="bg-foreground text-background inline-flex h-[23px] cursor-pointer items-center rounded-md px-2 text-[11.5px] font-medium transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              disabled={draft?.saving}
+              onClick={() => void orbitActions.resolveUnsavedFileAction("discard")}
+              className="inline-flex h-[23px] cursor-pointer items-center rounded-md border border-rose-500/30 bg-rose-500/10 px-2 text-[11.5px] font-medium text-rose-700 transition-colors hover:bg-rose-500/20 disabled:opacity-50 dark:text-rose-300"
+            >
+              Discard
+            </button>
+            <button
+              type="button"
+              onClick={() => void orbitActions.resolveUnsavedFileAction("cancel")}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[23px] cursor-pointer items-center rounded-md px-2 text-[11.5px] transition-colors"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Collapsible Find-in-File Strip */}
-      {findOpen && (
+      {findOpen && !isEditMode && (
         <div className="border-border bg-elevated/70 flex h-[34px] shrink-0 items-center gap-1.5 border-b px-3">
           <Search className="text-muted-foreground h-[13px] w-[13px] shrink-0" />
           <input
@@ -517,6 +729,34 @@ export const FileViewerTab = memo(function FileViewerTab({
             {relPath} ({formatFileSizeCompact(data.size_bytes)}) cannot be displayed as text.
           </div>
         </div>
+      ) : isEditMode && draft ? (
+        <WorkspaceCodeEditor
+          value={draft.content}
+          language={data.language}
+          lineEnding={draft.lineEnding}
+          initialHighlightedLines={data.highlighted_lines}
+          initialContent={data.content.replace(/\r\n/g, "\n")}
+          isDark={isDark}
+          dirty={draft.dirty}
+          saving={draft.saving}
+          saveError={draft.saveError}
+          conflict={draft.conflict}
+          initialFocusLine={focusRange.startLine}
+          onChange={(nextValue) =>
+            orbitActions.updateFileEditorDraft(hostId, cwd, path, nextValue)
+          }
+          onSave={(force) => {
+            void orbitActions.saveWorkspaceFile(hostId, cwd, path, Boolean(force));
+          }}
+          onReloadFromConflict={() => {
+            void orbitActions.reloadWorkspaceFileFromConflict(hostId, cwd, path);
+          }}
+          onDismissError={() => orbitActions.clearFileEditorError(hostId, cwd, path)}
+          onCopyMine={() => {
+            void navigator.clipboard.writeText(draft.content);
+            orbitActions.showToast("Copied editor buffer to clipboard");
+          }}
+        />
       ) : isMarkdown && markdownMode === "preview" ? (
         <ScrollArea className="min-h-0 flex-1" viewportClassName="px-5 py-4">
           <MarkdownLinkProvider hostId={hostId} cwd={cwd} baseFilePath={relPath}>
@@ -689,6 +929,12 @@ export const FileViewerTab = memo(function FileViewerTab({
                 ref={(el) => {
                   if (el) lineRefs.current.set(line.line_number, el);
                   else lineRefs.current.delete(line.line_number);
+                }}
+                onDoubleClick={() => {
+                  if (isEditable) {
+                    setFindOpen(false);
+                    orbitActions.enterFileEditMode(hostId, cwd, path);
+                  }
                 }}
                 className={cn(
                   "group/fln flex min-w-fit items-start px-2 transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.035]",

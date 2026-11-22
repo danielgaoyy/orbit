@@ -43,8 +43,10 @@ use crate::cloud_sync::{
     unlock_remote_vault_with_passphrase,
 };
 pub use crate::contract::{
-    ConversationSearchHit, ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
-    PreviewWorktreeHandoffRequest,
+    ConversationSearchHit, CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest,
+    ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
+    PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest, WorkspaceEntryMutationResultView,
+    WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
@@ -448,6 +450,14 @@ pub struct WorkspaceFileView {
     pub content: String,
     pub size_bytes: u64,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub writable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_ending: Option<String>,
     pub highlighted_lines: Vec<HighlightedLineView>,
     pub markdown_blocks: Vec<RichBlockView>,
 }
@@ -488,6 +498,10 @@ struct RawFileReadResponse {
     content: String,
     size_bytes: u64,
     truncated: bool,
+    etag: Option<String>,
+    mtime_unix_ms: Option<i64>,
+    writable: bool,
+    line_ending: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -548,6 +562,12 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AttachmentStageAck, String>>>,
     pending_file_reads:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RawFileReadResponse, String>>>,
+    pending_file_writes:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorkspaceFileWriteResultView, String>>>,
+    pending_file_mutations: HashMap<
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<WorkspaceEntryMutationResultView, String>>,
+    >,
     pending_side_questions:
         HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>>,
     pending_rewinds:
@@ -644,6 +664,8 @@ impl HostMemoryState {
             pending_queue_reorders: HashMap::new(),
             pending_attachment_acks: HashMap::new(),
             pending_file_reads: HashMap::new(),
+            pending_file_writes: HashMap::new(),
+            pending_file_mutations: HashMap::new(),
             pending_side_questions: HashMap::new(),
             pending_rewinds: HashMap::new(),
             pending_forks: HashMap::new(),
@@ -4428,6 +4450,10 @@ impl OrbitAppCore {
                     content,
                     size_bytes,
                     truncated,
+                    etag,
+                    mtime_unix_ms,
+                    writable,
+                    line_ending,
                     ..
                 } => {
                     if let Some(tx) = state.pending_file_reads.remove(&request_id) {
@@ -4438,6 +4464,48 @@ impl OrbitAppCore {
                             content,
                             size_bytes,
                             truncated,
+                            etag,
+                            mtime_unix_ms,
+                            writable,
+                            line_ending,
+                        }));
+                    }
+                }
+                WireMessage::WorkspaceFileWritten {
+                    request_id,
+                    cwd,
+                    path,
+                    etag,
+                    size_bytes,
+                    mtime_unix_ms,
+                    conflict,
+                } => {
+                    if let Some(tx) = state.pending_file_writes.remove(&request_id) {
+                        let _ = tx.send(Ok(WorkspaceFileWriteResultView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            path,
+                            etag,
+                            size_bytes,
+                            mtime_unix_ms,
+                            conflict,
+                        }));
+                    }
+                }
+                WireMessage::WorkspaceEntryMutated {
+                    request_id,
+                    cwd,
+                    path,
+                    new_path,
+                    action,
+                } => {
+                    if let Some(tx) = state.pending_file_mutations.remove(&request_id) {
+                        let _ = tx.send(Ok(WorkspaceEntryMutationResultView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            path,
+                            new_path,
+                            action,
                         }));
                     }
                 }
@@ -4540,6 +4608,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_file_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_file_writes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_file_mutations.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -8629,6 +8705,10 @@ impl OrbitAppCore {
                             content: raw.content,
                             size_bytes: raw.size_bytes,
                             truncated: raw.truncated,
+                            etag: raw.etag,
+                            mtime_unix_ms: raw.mtime_unix_ms,
+                            writable: raw.writable,
+                            line_ending: raw.line_ending,
                         },
                     ))
                 })
@@ -8707,6 +8787,10 @@ impl OrbitAppCore {
                                 content: local.content,
                                 size_bytes: local.size_bytes,
                                 truncated: local.truncated,
+                                etag: local.etag,
+                                mtime_unix_ms: local.mtime_unix_ms,
+                                writable: local.writable,
+                                line_ending: local.line_ending,
                             }),
                             _ => Err(rpc_err),
                         }
@@ -8736,6 +8820,10 @@ impl OrbitAppCore {
                                 content: local.content,
                                 size_bytes: local.size_bytes,
                                 truncated: local.truncated,
+                                etag: local.etag,
+                                mtime_unix_ms: local.mtime_unix_ms,
+                                writable: local.writable,
+                                line_ending: local.line_ending,
                             }),
                             Ok(Err(e)) => Err(e),
                             Err(_) => Err("local file read task cancelled".to_string()),
@@ -8763,6 +8851,238 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| "file read task cancelled".to_string())?
+    }
+
+    /// Atomically write UTF-8 content to a workspace file on any connected host with optimistic concurrency.
+    pub async fn write_workspace_file_on_host(
+        self: &Arc<Self>,
+        req: WriteWorkspaceFileRequest,
+    ) -> Result<WorkspaceFileWriteResultView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to save files".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_file_writes.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before saving file".to_string()),
+                        None => Some(format!("host `{}` removed", req.host_id)),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let send_res = session
+                .send_wire(WireMessage::WriteWorkspaceFile {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                    path: req.path,
+                    content: req.content,
+                    expected_etag: req.expected_etag,
+                    force: req.force,
+                })
+                .await;
+
+            if let Err(e) = send_res {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_file_writes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send file write: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while saving file".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_file_writes.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to save file (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "file write task cancelled".to_string())?
+    }
+
+    async fn dispatch_workspace_entry_mutation_on_host(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_file_mutations.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_file_mutations.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_file_mutations.remove(&req_id);
+                    }
+                    Err(format!(
+                        "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                    ))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn create_workspace_entry_on_host(
+        self: &Arc<Self>,
+        req: CreateWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        let host_id = req.host_id;
+        let cwd = req.cwd;
+        let path = req.path;
+        let is_dir = req.is_dir;
+        let initial_content = req.initial_content;
+        self.dispatch_workspace_entry_mutation_on_host(
+            host_id,
+            move |request_id| WireMessage::CreateWorkspaceEntry {
+                request_id,
+                cwd,
+                path,
+                is_dir,
+                initial_content,
+            },
+            "create workspace entry",
+        )
+        .await
+    }
+
+    pub async fn rename_workspace_entry_on_host(
+        self: &Arc<Self>,
+        req: RenameWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        let host_id = req.host_id;
+        let cwd = req.cwd;
+        let old_path = req.old_path;
+        let new_path = req.new_path;
+        self.dispatch_workspace_entry_mutation_on_host(
+            host_id,
+            move |request_id| WireMessage::RenameWorkspaceEntry {
+                request_id,
+                cwd,
+                old_path,
+                new_path,
+            },
+            "rename workspace entry",
+        )
+        .await
+    }
+
+    pub async fn delete_workspace_entry_on_host(
+        self: &Arc<Self>,
+        req: DeleteWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        let host_id = req.host_id;
+        let cwd = req.cwd;
+        let path = req.path;
+        self.dispatch_workspace_entry_mutation_on_host(
+            host_id,
+            move |request_id| WireMessage::DeleteWorkspaceEntry {
+                request_id,
+                cwd,
+                path,
+            },
+            "delete workspace entry",
+        )
+        .await
     }
 
     /// Execute an ephemeral side question (`/btw`) on the target host and stream chunks via `event_tx`.
@@ -8907,6 +9227,38 @@ impl OrbitAppCore {
     ) -> Result<WorkspaceFileView, String> {
         self.runtime
             .block_on(self.read_workspace_file_on_host(host_id, cwd, path))
+    }
+
+    pub fn write_workspace_file_blocking(
+        self: &Arc<Self>,
+        req: WriteWorkspaceFileRequest,
+    ) -> Result<WorkspaceFileWriteResultView, String> {
+        self.runtime
+            .block_on(self.write_workspace_file_on_host(req))
+    }
+
+    pub fn create_workspace_entry_blocking(
+        self: &Arc<Self>,
+        req: CreateWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        self.runtime
+            .block_on(self.create_workspace_entry_on_host(req))
+    }
+
+    pub fn rename_workspace_entry_blocking(
+        self: &Arc<Self>,
+        req: RenameWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        self.runtime
+            .block_on(self.rename_workspace_entry_on_host(req))
+    }
+
+    pub fn delete_workspace_entry_blocking(
+        self: &Arc<Self>,
+        req: DeleteWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        self.runtime
+            .block_on(self.delete_workspace_entry_on_host(req))
     }
 
     pub fn ask_side_question_with_callback<F>(
@@ -9641,6 +9993,10 @@ fn build_workspace_file_view(
         content: raw.content,
         size_bytes: raw.size_bytes,
         truncated: raw.truncated,
+        etag: raw.etag,
+        mtime_unix_ms: raw.mtime_unix_ms,
+        writable: raw.writable,
+        line_ending: raw.line_ending,
         highlighted_lines,
         markdown_blocks,
     }
@@ -9766,6 +10122,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_file_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_file_writes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_file_mutations.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_rewinds.drain() {

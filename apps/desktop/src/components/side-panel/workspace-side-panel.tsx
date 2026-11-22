@@ -28,6 +28,7 @@ import { SimpleTooltip } from "@/components/ui/overlays";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type SidePanelTab,
+  fileCacheKey,
   orbitActions,
   sideQuestionScopeKey,
   useOrbitSelector,
@@ -97,7 +98,9 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   } = useWorkspaceMotion();
 
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
+  const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const tabs = useOrbitSelector((s) => s.sidePanelTabs);
+  const fileEditorDrafts = useOrbitSelector((s) => s.fileEditorDrafts);
   const panelElRef = useRef<HTMLElement | null>(null);
   const activeTabId = useOrbitSelector((s) => s.activeSidePanelTabId);
   const hasStreamingSideQuestion = useOrbitSelector((s) => {
@@ -233,6 +236,18 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
           >
             {tabs.map((tab) => {
               const isActive = tab.id === activeTab?.id;
+              const isDirtyFile =
+                tab.kind === "file" &&
+                Boolean(tab.filePath) &&
+                Boolean(
+                  fileEditorDrafts[
+                    fileCacheKey(
+                      tab.hostId ?? selectedHostId,
+                      tab.cwd ?? selectedWorkspaceCwd ?? "~",
+                      tab.filePath ?? "",
+                    )
+                  ]?.dirty,
+                );
               const showPulseDot =
                 (tab.kind === "side_question" && hasStreamingSideQuestion) ||
                 (tab.kind === "terminal" && activeTerminalCount > 0 && !isActive);
@@ -259,6 +274,12 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                 >
                   <SidePanelTabIcon tab={tab} />
                   <span className="truncate">{tab.title}</span>
+                  {isDirtyFile && (
+                    <span
+                      title="Unsaved changes"
+                      className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
+                    />
+                  )}
                   {showPulseDot && (
                     <span
                       className={cn(

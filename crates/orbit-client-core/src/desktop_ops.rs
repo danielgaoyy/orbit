@@ -1741,6 +1741,57 @@ pub struct LocalFileReadPayload {
     pub content: String,
     pub size_bytes: u64,
     pub truncated: bool,
+    pub etag: Option<String>,
+    pub mtime_unix_ms: Option<i64>,
+    pub writable: bool,
+    pub line_ending: Option<String>,
+}
+
+fn local_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn local_metadata_mtime_unix_ms(meta: &fs::Metadata) -> Option<i64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => i64::try_from(d.as_millis()).ok(),
+            Err(e) => i64::try_from(e.duration().as_millis()).ok().map(|v| -v),
+        })
+}
+
+fn local_detect_line_ending(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut crlf = 0usize;
+    let mut lf = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+            crlf += 1;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'\n' {
+            lf += 1;
+        }
+        i += 1;
+    }
+    if crlf > 0 && lf > 0 {
+        "mixed".to_string()
+    } else if crlf > 0 {
+        "crlf".to_string()
+    } else {
+        "lf".to_string()
+    }
 }
 
 fn local_image_mime_for_path(path: &Path) -> Option<&'static str> {
@@ -1863,6 +1914,10 @@ pub fn read_local_workspace_file(
     }
 
     let size_bytes = meta.len();
+    let mtime_unix_ms = local_metadata_mtime_unix_ms(&meta);
+    // Local fallback serves read-only previews when no capable daemon session is connected;
+    // never advertise `writable: true` if saving via daemon RPC would fail.
+    let writable = false;
     let is_image = local_image_mime_for_path(&canonical).is_some();
     let cap = if is_image {
         max_bytes
@@ -1884,6 +1939,10 @@ pub fn read_local_workspace_file(
                 content: String::new(),
                 size_bytes,
                 truncated: true,
+                etag: None,
+                mtime_unix_ms,
+                writable,
+                line_ending: None,
             });
         }
         let img_file = fs::File::open(&canonical)
@@ -1901,8 +1960,13 @@ pub fn read_local_workspace_file(
                 content: String::new(),
                 size_bytes: bytes.len() as u64,
                 truncated: true,
+                etag: None,
+                mtime_unix_ms,
+                writable,
+                line_ending: None,
             });
         }
+        let etag = Some(local_sha256_hex(&bytes));
         return Ok(LocalFileReadPayload {
             resolved_path,
             content_kind: "image".into(),
@@ -1910,17 +1974,25 @@ pub fn read_local_workspace_file(
             content: B64.encode(&bytes),
             size_bytes: bytes.len() as u64,
             truncated: false,
+            etag,
+            mtime_unix_ms,
+            writable,
+            line_ending: None,
         });
     }
 
     let file =
         fs::File::open(&canonical).map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
     let mut buf = Vec::with_capacity((cap as usize).min(size_bytes as usize));
-    file.take(cap)
+    file.take(cap.saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
 
-    let truncated = size_bytes > cap;
+    let truncated = (buf.len() as u64) > cap || size_bytes > cap;
+    if (buf.len() as u64) > cap {
+        buf.truncate(cap as usize);
+    }
+    let etag = (!truncated).then(|| local_sha256_hex(&buf));
     let probe_len = buf.len().min(8192);
     if buf[..probe_len].contains(&0) {
         return Ok(LocalFileReadPayload {
@@ -1930,6 +2002,10 @@ pub fn read_local_workspace_file(
             content: String::new(),
             size_bytes,
             truncated,
+            etag,
+            mtime_unix_ms,
+            writable,
+            line_ending: None,
         });
     }
 
@@ -1949,10 +2025,15 @@ pub fn read_local_workspace_file(
                     content: String::new(),
                     size_bytes,
                     truncated,
+                    etag,
+                    mtime_unix_ms,
+                    writable,
+                    line_ending: None,
                 });
             }
         }
     };
+    let line_ending = Some(local_detect_line_ending(&text));
 
     Ok(LocalFileReadPayload {
         resolved_path,
@@ -1961,6 +2042,10 @@ pub fn read_local_workspace_file(
         content: text,
         size_bytes,
         truncated,
+        etag,
+        mtime_unix_ms,
+        writable,
+        line_ending,
     })
 }
 

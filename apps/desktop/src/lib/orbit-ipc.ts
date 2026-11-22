@@ -1220,8 +1220,37 @@ export interface WorkspaceFileView {
   content: string;
   size_bytes: number;
   truncated: boolean;
+  etag?: string | null;
+  mtime_unix_ms?: number | null;
+  writable?: boolean;
+  line_ending?: "lf" | "crlf" | "mixed" | string | null;
   highlighted_lines: HighlightedLineView[];
   markdown_blocks: RichBlockView[];
+}
+
+export interface WorkspaceFileConflict {
+  current_etag: string;
+  current_content?: string | null;
+  current_size_bytes: number;
+  current_mtime_unix_ms?: number | null;
+}
+
+export interface WorkspaceFileWriteResult {
+  host_id: string;
+  cwd: string;
+  path: string;
+  etag: string;
+  size_bytes: number;
+  mtime_unix_ms?: number | null;
+  conflict?: WorkspaceFileConflict | null;
+}
+
+export interface WorkspaceEntryMutationResult {
+  host_id: string;
+  cwd: string;
+  path: string;
+  new_path?: string | null;
+  action: "created_file" | "created_dir" | "renamed" | "deleted" | string;
 }
 
 export type DiagramKind = "mermaid" | "svg" | "graphviz";
@@ -3015,6 +3044,10 @@ export const orbitIpc = {
         content: "// Desktop runtime required to read host files.",
         size_bytes: 0,
         truncated: false,
+        etag: null,
+        mtime_unix_ms: null,
+        writable: false,
+        line_ending: "lf",
         highlighted_lines: [
           {
             line_number: 1,
@@ -3032,6 +3065,96 @@ export const orbitIpc = {
       };
     }
     return invoke<WorkspaceFileView>("read_workspace_file", { hostId, cwd, path });
+  },
+
+  writeWorkspaceFile: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    content: string;
+    expectedEtag?: string | null;
+    force?: boolean;
+  }): Promise<WorkspaceFileWriteResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to save host files.");
+    }
+    return invoke<WorkspaceFileWriteResult>("write_workspace_file", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      content: params.content,
+      expectedEtag: params.expectedEtag ?? null,
+      force: params.force ?? false,
+    });
+  },
+
+  createWorkspaceEntry: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    isDir: boolean;
+    initialContent?: string | null;
+  }): Promise<WorkspaceEntryMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to create workspace entries.");
+    }
+    return invoke<WorkspaceEntryMutationResult>("create_workspace_entry", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      isDir: params.isDir,
+      initialContent: params.initialContent ?? null,
+    });
+  },
+
+  renameWorkspaceEntry: async (params: {
+    hostId: string;
+    cwd: string;
+    oldPath: string;
+    newPath: string;
+  }): Promise<WorkspaceEntryMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to rename workspace entries.");
+    }
+    return invoke<WorkspaceEntryMutationResult>("rename_workspace_entry", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      oldPath: params.oldPath,
+      newPath: params.newPath,
+    });
+  },
+
+  deleteWorkspaceEntry: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+  }): Promise<WorkspaceEntryMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to delete workspace entries.");
+    }
+    return invoke<WorkspaceEntryMutationResult>("delete_workspace_entry", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+    });
+  },
+
+  highlightWorkspaceCode: async (
+    language: string,
+    content: string,
+    maxLines = 2500,
+  ): Promise<HighlightedLineView[]> => {
+    if (!isTauriRuntime()) {
+      return content.split(/\r?\n/).map((line, i) => ({
+        line_number: i + 1,
+        tokens: [{ text: line, fg_hex: "#E2E8F0", bold: false, italic: false }],
+      }));
+    }
+    return invoke<HighlightedLineView[]>("highlight_workspace_code", {
+      language,
+      content,
+      maxLines,
+    });
   },
 
   askSideQuestion: async (

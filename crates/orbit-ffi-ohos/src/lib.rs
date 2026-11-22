@@ -19,10 +19,11 @@ use orbit_client_core::catalog::{
 };
 use orbit_client_core::composer::{ClientPlatform, ComposePromptRequest};
 use orbit_client_core::contract::{
-    AgentStageDeltaRequest, CreateSessionRequest, ExecuteWorktreeHandoffRequest,
-    FleetSidebarRequest, ForkAgentRequest, MentionRankRequest, ModelSelectionRequest,
-    PreviewWorktreeHandoffRequest, RenderDiagramRequest, SendPromptRequest,
-    UpdateHostConfigRequest,
+    AgentStageDeltaRequest, CreateSessionRequest, CreateWorkspaceEntryRequest,
+    DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, FleetSidebarRequest,
+    ForkAgentRequest, MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest,
+    RenameWorkspaceEntryRequest, RenderDiagramRequest, SendPromptRequest, UpdateHostConfigRequest,
+    WriteWorkspaceFileRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, detect_diagram_kind as core_detect_diagram_kind,
@@ -927,6 +928,34 @@ impl OhosCoreFacade {
         serde_json::to_string(&file).map_err(|e| e.to_string())
     }
 
+    pub fn write_workspace_file_json(&self, req_json: &str) -> Result<String, String> {
+        let req: WriteWorkspaceFileRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid WriteWorkspaceFileRequest: {e}"))?;
+        let res = self.inner.write_workspace_file_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn create_workspace_entry_json(&self, req_json: &str) -> Result<String, String> {
+        let req: CreateWorkspaceEntryRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid CreateWorkspaceEntryRequest: {e}"))?;
+        let res = self.inner.create_workspace_entry_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn rename_workspace_entry_json(&self, req_json: &str) -> Result<String, String> {
+        let req: RenameWorkspaceEntryRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid RenameWorkspaceEntryRequest: {e}"))?;
+        let res = self.inner.rename_workspace_entry_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_workspace_entry_json(&self, req_json: &str) -> Result<String, String> {
+        let req: DeleteWorkspaceEntryRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid DeleteWorkspaceEntryRequest: {e}"))?;
+        let res = self.inner.delete_workspace_entry_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
     pub fn build_side_question_context(
         &self,
         host_id: &str,
@@ -1332,6 +1361,86 @@ mod ohos_napi {
         fn compute(&mut self) -> Result<Self::Output> {
             self.facade
                 .read_workspace_file_json(&self.host_id, &self.cwd, &self.path)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct WriteWorkspaceFileTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for WriteWorkspaceFileTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .write_workspace_file_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct CreateWorkspaceEntryTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for CreateWorkspaceEntryTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .create_workspace_entry_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct RenameWorkspaceEntryTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for RenameWorkspaceEntryTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .rename_workspace_entry_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct DeleteWorkspaceEntryTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for DeleteWorkspaceEntryTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .delete_workspace_entry_json(&self.req_json)
                 .map_err(Error::from_reason)
         }
 
@@ -2136,6 +2245,50 @@ mod ohos_napi {
                 host_id,
                 cwd,
                 path,
+            })
+        }
+
+        #[napi]
+        pub fn write_workspace_file_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<WriteWorkspaceFileTask> {
+            AsyncTask::new(WriteWorkspaceFileTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn create_workspace_entry_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<CreateWorkspaceEntryTask> {
+            AsyncTask::new(CreateWorkspaceEntryTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn rename_workspace_entry_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<RenameWorkspaceEntryTask> {
+            AsyncTask::new(RenameWorkspaceEntryTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn delete_workspace_entry_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<DeleteWorkspaceEntryTask> {
+            AsyncTask::new(DeleteWorkspaceEntryTask {
+                facade: self.facade.clone(),
+                req_json,
             })
         }
 

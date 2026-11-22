@@ -560,7 +560,9 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ArtifactContent { request_id, .. }
         | WireMessage::InstructionFilesSnapshot { request_id, .. }
         | WireMessage::InstructionFileContentResponse { request_id, .. }
-        | WireMessage::InstructionFileSavedResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::InstructionFileSavedResponse { request_id, .. }
+        | WireMessage::ExternalMcpServersSnapshot { request_id, .. }
+        | WireMessage::ExternalMcpProbeResponse { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }
@@ -1066,5 +1068,30 @@ mod tests {
         assert_eq!(extract_response_request_id(&read_resp), Some(req_id));
         assert_eq!(extract_response_request_id(&write_resp), Some(req_id));
         assert_eq!(extract_response_request_id(&mutate_resp), Some(req_id));
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_external_mcp_responses() {
+        let req_id = Uuid::new_v4();
+        let snap = WireMessage::ExternalMcpServersSnapshot {
+            request_id: req_id,
+            servers: Vec::new(),
+        };
+        let probe = WireMessage::ExternalMcpProbeResponse {
+            request_id: req_id,
+            server_id: "orbit_user:github".into(),
+            result: orbit_protocol::McpProbeResult {
+                ok: true,
+                server_name: Some("github".into()),
+                server_version: Some("1.0.0".into()),
+                protocol_version: Some("2025-03-26".into()),
+                tools: Vec::new(),
+                latency_ms: 12,
+                error: None,
+                probed_at_ms: 1_760_000_000_000,
+            },
+        };
+        assert_eq!(extract_response_request_id(&snap), Some(req_id));
+        assert_eq!(extract_response_request_id(&probe), Some(req_id));
     }
 }

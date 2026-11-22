@@ -4,6 +4,7 @@ pub mod acp;
 pub mod artifacts;
 pub mod handoff;
 pub mod instructions;
+pub mod mcp_servers;
 pub mod media;
 pub mod orchestration;
 pub mod skills;
@@ -11,11 +12,12 @@ pub use acp::*;
 pub use artifacts::*;
 pub use handoff::*;
 pub use instructions::*;
+pub use mcp_servers::*;
 pub use media::*;
 pub use orchestration::*;
 pub use skills::*;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -2046,6 +2048,57 @@ pub enum WireMessage {
         approx_tokens: u32,
     },
 
+    // External MCP Server Manager (stdio + Streamable HTTP/SSE + live probe)
+    ListExternalMcpServers {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ExternalMcpServersSnapshot {
+        request_id: Uuid,
+        servers: Vec<ExternalMcpServerRecord>,
+    },
+    UpsertExternalMcpServer {
+        request_id: Uuid,
+        scope: McpWriteScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        name: String,
+        transport: McpTransportKind,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        #[serde(default)]
+        keep_existing_secrets: bool,
+        #[serde(default = "wire_default_true")]
+        enabled: bool,
+    },
+    ToggleExternalMcpServer {
+        request_id: Uuid,
+        server_id: String,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    DeleteExternalMcpServer {
+        request_id: Uuid,
+        server_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ProbeExternalMcpServer {
+        request_id: Uuid,
+        server_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ExternalMcpProbeResponse {
+        request_id: Uuid,
+        server_id: String,
+        result: McpProbeResult,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -3217,6 +3270,95 @@ mod tests {
         for msg in messages {
             let encoded = msg.encode_zstd(3).expect("encode handoff wire msg");
             let decoded = WireMessage::decode_zstd(&encoded).expect("decode handoff wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn external_mcp_servers_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let probe = McpProbeResult {
+            ok: true,
+            server_name: Some("github-mcp".into()),
+            server_version: Some("1.0.0".into()),
+            protocol_version: Some("2025-03-26".into()),
+            tools: vec![McpToolSummary {
+                name: "create_issue".into(),
+                description: "Create a GitHub issue".into(),
+            }],
+            latency_ms: 42,
+            error: None,
+            probed_at_ms: 1_760_000_000_000,
+        };
+        let record = ExternalMcpServerRecord {
+            id: "orbit_user:github".into(),
+            name: "github".into(),
+            scope: McpServerScope::OrbitUser,
+            transport: McpTransportKind::StreamableHttp {
+                url: "https://mcp.example.com/mcp".into(),
+                header_keys: vec!["Authorization".into()],
+            },
+            env_keys: vec!["GITHUB_TOKEN".into()],
+            masked_env: BTreeMap::from([("GITHUB_TOKEN".into(), "••••1234".into())]),
+            masked_headers: BTreeMap::from([("Authorization".into(), "••••5678".into())]),
+            enabled: true,
+            editable: true,
+            source_path: "/home/user/.orbit/mcp-servers.json".into(),
+            last_probe: Some(probe.clone()),
+        };
+
+        let messages = vec![
+            WireMessage::ListExternalMcpServers {
+                request_id: req_id,
+                cwd: Some("/workspace/orbit".into()),
+            },
+            WireMessage::ExternalMcpServersSnapshot {
+                request_id: req_id,
+                servers: vec![record],
+            },
+            WireMessage::UpsertExternalMcpServer {
+                request_id: req_id,
+                scope: McpWriteScope::User,
+                cwd: None,
+                name: "github".into(),
+                transport: McpTransportKind::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                },
+                env: BTreeMap::from([("LOG_LEVEL".into(), "info".into())]),
+                headers: BTreeMap::new(),
+                keep_existing_secrets: true,
+                enabled: true,
+            },
+            WireMessage::ToggleExternalMcpServer {
+                request_id: req_id,
+                server_id: "orbit_user:github".into(),
+                enabled: false,
+                cwd: None,
+            },
+            WireMessage::DeleteExternalMcpServer {
+                request_id: req_id,
+                server_id: "orbit_user:github".into(),
+                cwd: None,
+            },
+            WireMessage::ProbeExternalMcpServer {
+                request_id: req_id,
+                server_id: "orbit_user:github".into(),
+                cwd: Some("/workspace/orbit".into()),
+            },
+            WireMessage::ExternalMcpProbeResponse {
+                request_id: req_id,
+                server_id: "orbit_user:github".into(),
+                result: probe,
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode external mcp wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode external mcp wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

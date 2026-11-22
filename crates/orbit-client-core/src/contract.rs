@@ -3,8 +3,11 @@
 //! - Mobile UniFFI (`crates/orbit-ffi-uniffi`)
 //! - HarmonyOS N-API (`crates/orbit-ffi-ohos`)
 
+use std::collections::BTreeMap;
+
 use orbit_protocol::{
-    AcpAgentAvailability, ArtifactKind, ForkTarget, InstructionFileEntry, NestedGitRepo,
+    AcpAgentAvailability, ArtifactKind, ForkTarget, InstructionFileEntry, McpTransportKind,
+    McpWriteScope, NestedGitRepo,
     PromptBadge, ProviderKind, ReasoningEffort, SessionMode, WorkspaceSummary,
     WorktreeHandoffDirection, WorktreeHandoffMode,
 };
@@ -424,4 +427,22 @@ pub struct InstructionFileSavedView {
     pub etag: String,
     pub size_bytes: u64,
     pub approx_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertExternalMcpServerRequest {
+    pub host_id: String,
+    pub scope: McpWriteScope,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub name: String,
+    pub transport: McpTransportKind,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub keep_existing_secrets: bool,
+    #[serde(default = "default_include_committed_true")]
+    pub enabled: bool,
 }

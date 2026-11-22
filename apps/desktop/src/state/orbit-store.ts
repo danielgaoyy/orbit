@@ -60,6 +60,7 @@ import {
   type CoreNotification,
   type ExternalEditorInfo,
   type ExternalEditorKind,
+  type ExternalMcpServerRecord,
   type ExtractedCodeBlock,
   type FleetOverviewView,
   type FleetSidebarView,
@@ -67,6 +68,7 @@ import {
   type GitReposInspectionView,
   type GitReviewView,
   type HostDetailView,
+  type McpProbeResult,
   type PromptBadge,
   PROVIDER_LIST,
   formatProviderLabel,
@@ -80,6 +82,7 @@ import {
   type SlashDirective,
   type SpawnWorkspacePeerRequest,
   type SshHostItem,
+  type UpsertExternalMcpServerRequest,
   type WorkspaceFileConflict,
   type WorktreeHandoffDirection,
   type WorktreeHandoffMode,
@@ -369,7 +372,7 @@ export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
 export type WorkspacePanelMode = "conversation" | "automations";
-export type HostSettingsTab = "agents" | "skills" | "acp" | "usage" | "connection";
+export type HostSettingsTab = "agents" | "skills" | "acp" | "mcp" | "usage" | "connection";
 export type SettingsSection =
   | "general"
   | "instructions"
@@ -578,6 +581,7 @@ export interface OrbitUiState {
   mediaPreviewTarget: MediaPreviewTarget | null;
   sshHosts: SshHostItem[];
   externalEditors: ExternalEditorInfo[];
+  externalMcpServersByHost: Record<string, ExternalMcpServerRecord[]>;
   toastNotice: string | null;
   lastArchivedUndo: UndoArchiveEntry | null;
   appVersion: string | null;
@@ -850,6 +854,8 @@ if (hmrData?.draftUpdatedAtByScope) {
   draftPersistence.restoreUpdatedAtByScope(hmrData.draftUpdatedAtByScope);
 }
 
+const externalMcpSnapshotSeqByHost: Record<string, number> = {};
+
 const defaultInitialState: OrbitUiState = {
   fleet: { revision: 0, total_pending_approvals: 0, hosts: [], projects: [] },
   fleetHydrated: false,
@@ -970,6 +976,7 @@ const defaultInitialState: OrbitUiState = {
   mediaPreviewTarget: null,
   sshHosts: [],
   externalEditors: [],
+  externalMcpServersByHost: {},
   toastNotice: null,
   lastArchivedUndo: null,
   appVersion: null,
@@ -8096,6 +8103,106 @@ export const orbitActions = {
 
   setSettingsSection(section: SettingsSection): void {
     setState((s) => ({ ...s, settingsSection: section }));
+  },
+
+  async refreshExternalMcpServers(
+    hostId: string,
+    cwd?: string | null,
+  ): Promise<ExternalMcpServerRecord[]> {
+    const seq = (externalMcpSnapshotSeqByHost[hostId] ?? 0) + 1;
+    externalMcpSnapshotSeqByHost[hostId] = seq;
+    const servers = await orbitIpc.listExternalMcpServers(hostId, cwd);
+    if (externalMcpSnapshotSeqByHost[hostId] === seq) {
+      setState((s) => ({
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [hostId]: servers,
+        },
+      }));
+    }
+    return servers;
+  },
+
+  async upsertExternalMcpServer(
+    request: UpsertExternalMcpServerRequest,
+  ): Promise<ExternalMcpServerRecord[]> {
+    const seq = (externalMcpSnapshotSeqByHost[request.host_id] ?? 0) + 1;
+    externalMcpSnapshotSeqByHost[request.host_id] = seq;
+    const servers = await orbitIpc.upsertExternalMcpServer(request);
+    if (externalMcpSnapshotSeqByHost[request.host_id] === seq) {
+      setState((s) => ({
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [request.host_id]: servers,
+        },
+      }));
+    }
+    return servers;
+  },
+
+  async toggleExternalMcpServer(
+    hostId: string,
+    serverId: string,
+    enabled: boolean,
+    cwd?: string | null,
+  ): Promise<ExternalMcpServerRecord[]> {
+    const seq = (externalMcpSnapshotSeqByHost[hostId] ?? 0) + 1;
+    externalMcpSnapshotSeqByHost[hostId] = seq;
+    const servers = await orbitIpc.toggleExternalMcpServer(hostId, serverId, enabled, cwd);
+    if (externalMcpSnapshotSeqByHost[hostId] === seq) {
+      setState((s) => ({
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [hostId]: servers,
+        },
+      }));
+    }
+    return servers;
+  },
+
+  async deleteExternalMcpServer(
+    hostId: string,
+    serverId: string,
+    cwd?: string | null,
+  ): Promise<ExternalMcpServerRecord[]> {
+    const seq = (externalMcpSnapshotSeqByHost[hostId] ?? 0) + 1;
+    externalMcpSnapshotSeqByHost[hostId] = seq;
+    const servers = await orbitIpc.deleteExternalMcpServer(hostId, serverId, cwd);
+    if (externalMcpSnapshotSeqByHost[hostId] === seq) {
+      setState((s) => ({
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [hostId]: servers,
+        },
+      }));
+    }
+    return servers;
+  },
+
+  async probeExternalMcpServer(
+    hostId: string,
+    serverId: string,
+    cwd?: string | null,
+  ): Promise<McpProbeResult> {
+    const result = await orbitIpc.probeExternalMcpServer(hostId, serverId, cwd);
+    setState((s) => {
+      const existing = s.externalMcpServersByHost[hostId];
+      if (!existing) return s;
+      return {
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [hostId]: existing.map((srv) =>
+            srv.id === serverId ? { ...srv, last_probe: result } : srv,
+          ),
+        },
+      };
+    });
+    return result;
   },
 
   setCommandPaletteOpen(open: boolean): void {

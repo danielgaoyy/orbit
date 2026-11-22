@@ -19,6 +19,7 @@ pub mod instructions;
 pub mod keep_awake;
 pub mod manager;
 pub mod mcp;
+pub mod mcp_servers;
 pub mod messaging;
 pub mod scheduler;
 pub mod skills;
@@ -217,6 +218,8 @@ pub struct DaemonRuntime {
     pub keep_awake: Arc<KeepAwakeManager>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
+    pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
+    pub mcp_config_lock: Arc<AsyncMutex<()>>,
     catalog_refresh_lock: AsyncMutex<()>,
     upgrade_lock: AsyncMutex<()>,
 }
@@ -346,6 +349,8 @@ impl DaemonRuntime {
             keep_awake,
             symbol_index: Arc::new(WorkspaceSymbolIndex::new()),
             provider_catalogs,
+            mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
+            mcp_config_lock: Arc::new(AsyncMutex::new(())),
             catalog_refresh_lock: AsyncMutex::new(()),
             upgrade_lock: AsyncMutex::new(()),
         }))
@@ -2887,6 +2892,265 @@ async fn handle_wire_rpc(
             }
         }
 
+        // External MCP Server Manager (stdio + Streamable HTTP/SSE + live probe)
+        WireMessage::ListExternalMcpServers { request_id, cwd } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let cache = cache_lock.read().await.clone();
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::mcp_servers::list_external_mcp_servers(
+                        &home,
+                        authorized_cwd.as_deref(),
+                        &cache,
+                    )
+                })
+                .await
+                {
+                    Ok(servers) => WireMessage::ExternalMcpServersSnapshot {
+                        request_id,
+                        servers,
+                    },
+                    Err(e) => rpc_err(request_id, "list_external_mcp_servers_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertExternalMcpServer {
+            request_id,
+            scope,
+            cwd,
+            name,
+            transport,
+            env,
+            headers,
+            keep_existing_secrets,
+            enabled,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let config_lock = Arc::clone(&runtime.mcp_config_lock);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let server_id_to_clear = match scope {
+                orbit_protocol::McpWriteScope::User => format!("orbit_user:{}", name.trim()),
+                orbit_protocol::McpWriteScope::Project => {
+                    format!("project_dot_mcp:{}", name.trim())
+                }
+            };
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let _config_guard = config_lock.lock().await;
+                let cache_key = crate::mcp_servers::probe_cache_key(
+                    &server_id_to_clear,
+                    authorized_cwd.as_deref(),
+                );
+                let mut cache_snapshot = cache_lock.read().await.clone();
+                cache_snapshot.remove(&cache_key);
+                let input = crate::mcp_servers::UpsertExternalMcpInput {
+                    scope,
+                    cwd: authorized_cwd,
+                    name,
+                    transport,
+                    env,
+                    headers,
+                    keep_existing_secrets,
+                    enabled,
+                };
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::mcp_servers::upsert_external_mcp_server(&home, input, &cache_snapshot)
+                })
+                .await
+                {
+                    Ok(Ok(servers)) => {
+                        cache_lock.write().await.remove(&cache_key);
+                        WireMessage::ExternalMcpServersSnapshot {
+                            request_id,
+                            servers,
+                        }
+                    }
+                    Ok(Err(e)) => rpc_err(request_id, "upsert_external_mcp_server_failed", e),
+                    Err(e) => rpc_err(request_id, "upsert_external_mcp_server_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ToggleExternalMcpServer {
+            request_id,
+            server_id,
+            enabled,
+            cwd,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let config_lock = Arc::clone(&runtime.mcp_config_lock);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let _config_guard = config_lock.lock().await;
+                let cache = cache_lock.read().await.clone();
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::mcp_servers::toggle_external_mcp_server(
+                        &home,
+                        &server_id,
+                        enabled,
+                        authorized_cwd.as_deref(),
+                        &cache,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(servers)) => WireMessage::ExternalMcpServersSnapshot {
+                        request_id,
+                        servers,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "toggle_external_mcp_server_failed", e),
+                    Err(e) => rpc_err(request_id, "toggle_external_mcp_server_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteExternalMcpServer {
+            request_id,
+            server_id,
+            cwd,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let config_lock = Arc::clone(&runtime.mcp_config_lock);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let _config_guard = config_lock.lock().await;
+                let cache_key =
+                    crate::mcp_servers::probe_cache_key(&server_id, authorized_cwd.as_deref());
+                let mut cache_snapshot = cache_lock.read().await.clone();
+                cache_snapshot.remove(&cache_key);
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::mcp_servers::delete_external_mcp_server(
+                        &home,
+                        &server_id,
+                        authorized_cwd.as_deref(),
+                        &cache_snapshot,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(servers)) => {
+                        cache_lock.write().await.remove(&cache_key);
+                        WireMessage::ExternalMcpServersSnapshot {
+                            request_id,
+                            servers,
+                        }
+                    }
+                    Ok(Err(e)) => rpc_err(request_id, "delete_external_mcp_server_failed", e),
+                    Err(e) => rpc_err(request_id, "delete_external_mcp_server_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ProbeExternalMcpServer {
+            request_id,
+            server_id,
+            cwd,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let result = crate::mcp_servers::probe_external_mcp_server(
+                    &home,
+                    &server_id,
+                    authorized_cwd.as_deref(),
+                )
+                .await;
+                let cache_key =
+                    crate::mcp_servers::probe_cache_key(&server_id, authorized_cwd.as_deref());
+                {
+                    let mut guard = cache_lock.write().await;
+                    crate::mcp_servers::insert_probe_cache(&mut guard, cache_key, result.clone());
+                }
+                let reply = WireMessage::ExternalMcpProbeResponse {
+                    request_id,
+                    server_id,
+                    result,
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
         // First-Class Artifacts & SEP-1865 MCP Apps (offloaded via spawn_blocking)
         WireMessage::ListArtifacts {
             request_id,
@@ -4116,6 +4380,26 @@ async fn authorize_workspace_mutation_cwd(
     .map_err(|_| "Workspace authorization task cancelled".to_string())?
 }
 
+/// Authorize an optional External MCP workspace `cwd` against registered/discovered host
+/// workspaces, rejecting raw `..` segments or arbitrary directories outside registered projects.
+async fn authorize_optional_mcp_cwd(
+    store: &Arc<OrbitStore>,
+    cwd: Option<String>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let expanded = expand_host_path(raw);
+    if expanded
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("Workspace path must not contain `..` traversal segments".to_string());
+    }
+    let authorized = authorize_workspace_mutation_cwd(store, &expanded).await?;
+    Ok(Some(authorized))
+}
+
 fn authorize_workspace_mutation_cwd_sync(
     store: &OrbitStore,
     resolved_cwd: &Path,
@@ -4246,6 +4530,58 @@ mod self_upgrade_tests {
             .expect("search authorized dir");
         assert_eq!(res.symbols.len(), 1);
         assert_eq!(res.symbols[0].name, "authorized_symbol");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn authorize_optional_mcp_cwd_allows_none_and_registered_and_rejects_unregistered() {
+        let root = std::env::temp_dir().join(format!("orbit_mcp_auth_cwd_{}", Uuid::new_v4()));
+        let registered = root.join("proj_mcp");
+        let unregistered = root.join("outside_mcp");
+        std::fs::create_dir_all(&registered).expect("mkdir registered");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "proj_mcp".into(),
+                name: "MCP Project".into(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert project");
+
+        assert!(
+            authorize_optional_mcp_cwd(&store, None)
+                .await
+                .expect("none")
+                .is_none()
+        );
+        assert!(
+            authorize_optional_mcp_cwd(&store, Some("   ".into()))
+                .await
+                .expect("blank")
+                .is_none()
+        );
+        assert!(
+            authorize_optional_mcp_cwd(&store, Some(registered.to_string_lossy().to_string()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            authorize_optional_mcp_cwd(&store, Some(unregistered.to_string_lossy().to_string()))
+                .await
+                .is_err()
+        );
+        let traversal = format!("{}/../proj_mcp", registered.display());
+        assert!(
+            authorize_optional_mcp_cwd(&store, Some(traversal))
+                .await
+                .is_err()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

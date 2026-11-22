@@ -46,8 +46,9 @@ use orbit_client_core::contract::{
     MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest,
     ReadInstructionFileRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest,
     RenderDiagramView, SaveInstructionFileRequest, SearchWorkspaceSymbolsRequest,
-    SpawnWorkspacePeerRequest, UpsertArtifactRequest, WorkspaceEntryMutationResultView,
-    WorkspaceFileWriteResultView, WorkspaceSymbolsView, WriteWorkspaceFileRequest,
+    SpawnWorkspacePeerRequest, UpsertArtifactRequest, UpsertExternalMcpServerRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WorkspaceSymbolsView,
+    WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
@@ -66,10 +67,11 @@ use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
-    ArtifactDetail, ArtifactSummary, ManagedSkillRecord, OrchestrationConfig, PromptBadge,
-    ProviderKind, ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
-    ScheduleTarget, SessionMode, SkillWriteScope, WorkspaceBoardSnapshot, WorkspaceEventRecord,
-    WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    ArtifactDetail, ArtifactSummary, ExternalMcpServerRecord, ManagedSkillRecord, McpProbeResult,
+    OrchestrationConfig, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
+    ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope,
+    WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -1193,6 +1195,66 @@ async fn refresh_acp_registry(
     state
         .core
         .refresh_acp_registry_async(&host_id, registry_url)
+        .await
+}
+
+#[tauri::command]
+async fn list_external_mcp_servers(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+) -> Result<Vec<ExternalMcpServerRecord>, String> {
+    state
+        .core
+        .list_external_mcp_servers_async(&host_id, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn upsert_external_mcp_server(
+    state: State<'_, DesktopAppState>,
+    request: UpsertExternalMcpServerRequest,
+) -> Result<Vec<ExternalMcpServerRecord>, String> {
+    state.core.upsert_external_mcp_server_async(request).await
+}
+
+#[tauri::command]
+async fn toggle_external_mcp_server(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    server_id: String,
+    enabled: bool,
+    cwd: Option<String>,
+) -> Result<Vec<ExternalMcpServerRecord>, String> {
+    state
+        .core
+        .toggle_external_mcp_server_async(&host_id, &server_id, enabled, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn delete_external_mcp_server(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    server_id: String,
+    cwd: Option<String>,
+) -> Result<Vec<ExternalMcpServerRecord>, String> {
+    state
+        .core
+        .delete_external_mcp_server_async(&host_id, &server_id, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn probe_external_mcp_server(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    server_id: String,
+    cwd: Option<String>,
+) -> Result<McpProbeResult, String> {
+    state
+        .core
+        .probe_external_mcp_server_async(&host_id, &server_id, cwd)
         .await
 }
 
@@ -2637,6 +2699,11 @@ pub fn run() {
             delete_custom_acp_agent,
             test_acp_agent,
             refresh_acp_registry,
+            list_external_mcp_servers,
+            upsert_external_mcp_server,
+            toggle_external_mcp_server,
+            delete_external_mcp_server,
+            probe_external_mcp_server,
             create_schedule,
             update_schedule,
             pause_schedule,

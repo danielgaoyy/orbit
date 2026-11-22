@@ -12,6 +12,7 @@ import {
   Palette,
   Plug,
   Plus,
+  Server,
   Settings2,
   Sparkles,
   Wifi,
@@ -26,6 +27,7 @@ import { InstructionsSection } from "@/components/settings/instructions-section"
 import { HostAcpSection } from "@/components/settings/host-acp-section";
 import { HostAgentsSection } from "@/components/settings/host-agents-section";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
+import { HostMcpSection } from "@/components/settings/host-mcp-section";
 import { HostSkillsSection } from "@/components/settings/host-skills-section";
 import { HostUsageSection } from "@/components/settings/host-usage-section";
 import { NotificationsSection } from "@/components/settings/notifications-section";
@@ -79,6 +81,7 @@ const HOST_TABS: {
   { id: "agents", label: "Agents", icon: Cpu },
   { id: "skills", label: "Skills", icon: Sparkles },
   { id: "acp", label: "ACP Agents", icon: Plug },
+  { id: "mcp", label: "MCP Servers", icon: Server },
   { id: "usage", label: "Usage", icon: Activity },
   { id: "connection", label: "Connection", icon: Wifi },
 ];
@@ -95,6 +98,7 @@ function parseHostSection(
     tab !== "agents" &&
     tab !== "skills" &&
     tab !== "acp" &&
+    tab !== "mcp" &&
     tab !== "usage" &&
     tab !== "connection"
   ) {
@@ -510,6 +514,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               )}
               {resolvedHost?.tab === "acp" && (
                 <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "mcp" && (
+                <HostMcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
               )}
               {resolvedHost?.tab === "usage" && (
                 <HostUsageSection hostId={resolvedHost.hostId} />

@@ -104,6 +104,69 @@ export interface AcpProbeResult {
   error?: string | null;
 }
 
+export type McpTransportKind =
+  | {
+      kind: "stdio";
+      command: string;
+      args: string[];
+    }
+  | {
+      kind: "streamable_http";
+      url: string;
+      header_keys: string[];
+    };
+
+export type McpServerScope =
+  | "orbit_user"
+  | "project_dot_mcp"
+  | "claude_user"
+  | "codex_user"
+  | "antigravity_user";
+
+export type McpWriteScope = "user" | "project";
+
+export interface McpToolSummary {
+  name: string;
+  description: string;
+}
+
+export interface McpProbeResult {
+  ok: boolean;
+  server_name?: string | null;
+  server_version?: string | null;
+  protocol_version?: string | null;
+  tools: McpToolSummary[];
+  latency_ms: number;
+  error?: string | null;
+  probed_at_ms: number;
+}
+
+export interface ExternalMcpServerRecord {
+  id: string;
+  name: string;
+  scope: McpServerScope;
+  transport: McpTransportKind;
+  env_keys: string[];
+  masked_env: Record<string, string>;
+  masked_headers?: Record<string, string>;
+  enabled: boolean;
+  editable: boolean;
+  source_path: string;
+  last_probe?: McpProbeResult | null;
+}
+
+export interface UpsertExternalMcpServerRequest {
+  host_id: string;
+  scope: McpWriteScope;
+  cwd?: string | null;
+  name: string;
+  transport: McpTransportKind;
+  env: Record<string, string>;
+  headers: Record<string, string>;
+  keep_existing_secrets: boolean;
+  enabled: boolean;
+}
+
 export type ArtifactKind = "markdown" | "html" | "code" | "svg" | "mermaid" | "mcp_app";
 
 export interface ArtifactSummary {
@@ -2914,6 +2977,79 @@ export const orbitIpc = {
     return invoke<AcpRegistryRefreshView>("refresh_acp_registry", {
       hostId,
       registryUrl: registryUrl ?? null,
+    });
+  },
+
+  listExternalMcpServers: async (
+    hostId: string,
+    cwd?: string | null,
+  ): Promise<ExternalMcpServerRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ExternalMcpServerRecord[]>("list_external_mcp_servers", {
+      hostId,
+      cwd: cwd ?? null,
+    });
+  },
+
+  upsertExternalMcpServer: async (
+    request: UpsertExternalMcpServerRequest,
+  ): Promise<ExternalMcpServerRecord[]> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<ExternalMcpServerRecord[]>("upsert_external_mcp_server", { request });
+  },
+
+  toggleExternalMcpServer: async (
+    hostId: string,
+    serverId: string,
+    enabled: boolean,
+    cwd?: string | null,
+  ): Promise<ExternalMcpServerRecord[]> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<ExternalMcpServerRecord[]>("toggle_external_mcp_server", {
+      hostId,
+      serverId,
+      enabled,
+      cwd: cwd ?? null,
+    });
+  },
+
+  deleteExternalMcpServer: async (
+    hostId: string,
+    serverId: string,
+    cwd?: string | null,
+  ): Promise<ExternalMcpServerRecord[]> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<ExternalMcpServerRecord[]>("delete_external_mcp_server", {
+      hostId,
+      serverId,
+      cwd: cwd ?? null,
+    });
+  },
+
+  probeExternalMcpServer: async (
+    hostId: string,
+    serverId: string,
+    cwd?: string | null,
+  ): Promise<McpProbeResult> => {
+    if (!isTauriRuntime()) {
+      return {
+        ok: false,
+        tools: [],
+        latency_ms: 0,
+        error: "Desktop runtime unavailable",
+        probed_at_ms: Date.now(),
+      };
+    }
+    return invoke<McpProbeResult>("probe_external_mcp_server", {
+      hostId,
+      serverId,
+      cwd: cwd ?? null,
     });
   },
 

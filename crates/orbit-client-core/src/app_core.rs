@@ -16,17 +16,17 @@ use orbit_crypto::PairingOffer;
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
-    BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot,
-    HostProjectEntry, HostSyncState, KeepAwakeStatus, ManagedSkillRecord, ModelOption,
-    OrchestrationConfig, OrchestrationSkillInfo, PendingPermissionSummary, PermissionCheckpointRef,
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, QueuedPromptView,
-    ReasoningEffort, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope,
-    TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
-    ToolCallStatus, WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
-    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
-    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome,
-    WorktreeHandoffPreview,
+    BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject,
+    ExternalMcpServerRecord, GitStatusSnapshot, HostProjectEntry, HostSyncState, KeepAwakeStatus,
+    ManagedSkillRecord, McpProbeResult, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
+    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord, ScheduleSpec,
+    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
+    TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage,
+    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
+    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
+    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -49,7 +49,8 @@ pub use crate::contract::{
     InstructionFileContentView, InstructionFileSavedView, InstructionFilesSnapshotView,
     ListInstructionFilesRequest, PreviewWorktreeHandoffRequest, ReadInstructionFileRequest,
     RenameWorkspaceEntryRequest, SaveInstructionFileRequest, UpsertArtifactRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    UpsertExternalMcpServerRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
@@ -646,6 +647,9 @@ struct HostMemoryState {
         Uuid,
         tokio::sync::oneshot::Sender<Result<crate::contract::AcpRegistryRefreshView, String>>,
     >,
+    pending_mcp_snapshots:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<ExternalMcpServerRecord>, String>>>,
+    pending_mcp_probes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<McpProbeResult, String>>>,
     pending_artifact_lists: HashMap<Uuid, PendingArtifactListEntry>,
     unsolicited_unfiltered_artifact_reqs: HashSet<Uuid>,
     pending_artifact_reads:
@@ -757,6 +761,8 @@ impl HostMemoryState {
             pending_git_repo_inspections: HashMap::new(),
             pending_acp_probes: HashMap::new(),
             pending_acp_snapshots: HashMap::new(),
+            pending_mcp_snapshots: HashMap::new(),
+            pending_mcp_probes: HashMap::new(),
             pending_artifact_lists: HashMap::new(),
             unsolicited_unfiltered_artifact_reqs: HashSet::new(),
             pending_artifact_reads: HashMap::new(),
@@ -4305,6 +4311,23 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(result));
                     }
                 }
+                WireMessage::ExternalMcpServersSnapshot {
+                    request_id,
+                    servers,
+                } => {
+                    if let Some(tx) = state.pending_mcp_snapshots.remove(&request_id) {
+                        let _ = tx.send(Ok(servers));
+                    }
+                }
+                WireMessage::ExternalMcpProbeResponse {
+                    request_id,
+                    server_id: _,
+                    result,
+                } => {
+                    if let Some(tx) = state.pending_mcp_probes.remove(&request_id) {
+                        let _ = tx.send(Ok(result));
+                    }
+                }
                 WireMessage::ArtifactsSnapshot {
                     request_id,
                     artifacts,
@@ -5165,6 +5188,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_acp_snapshots.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_mcp_snapshots.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_mcp_probes.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -8108,6 +8139,239 @@ impl OrbitAppCore {
     ) -> Result<AcpProbeResult, String> {
         self.runtime
             .block_on(self.test_acp_agent_async(host_id, agent_id, cwd))
+    }
+
+    // --- External MCP Server Manager (stdio + Streamable HTTP/SSE + live probe) ---
+
+    async fn send_external_mcp_snapshot_rpc(
+        self: &Arc<Self>,
+        host_id: &str,
+        make_msg: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        timeout_secs: u64,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_mcp_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(make_msg(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_mcp_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send MCP server RPC: {e}")));
+                return;
+            }
+            let outcome =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
+                    Ok(Ok(Ok(servers))) => Ok(servers),
+                    Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                    Ok(Err(_)) => Err("Host disconnected while updating MCP servers".to_string()),
+                    Err(_) => {
+                        if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&owned_host)
+                        {
+                            h.pending_mcp_snapshots.remove(&req_id);
+                        }
+                        Err("Timed out waiting for daemon MCP servers response".to_string())
+                    }
+                };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "External MCP server task cancelled".to_string())?
+    }
+
+    pub async fn list_external_mcp_servers_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        self.send_external_mcp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::ListExternalMcpServers { request_id, cwd },
+            10,
+        )
+        .await
+    }
+
+    pub async fn upsert_external_mcp_server_async(
+        self: &Arc<Self>,
+        req: UpsertExternalMcpServerRequest,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        let host_id = req.host_id.clone();
+        self.send_external_mcp_snapshot_rpc(
+            &host_id,
+            move |request_id| WireMessage::UpsertExternalMcpServer {
+                request_id,
+                scope: req.scope,
+                cwd: req.cwd,
+                name: req.name,
+                transport: req.transport,
+                env: req.env,
+                headers: req.headers,
+                keep_existing_secrets: req.keep_existing_secrets,
+                enabled: req.enabled,
+            },
+            10,
+        )
+        .await
+    }
+
+    pub async fn toggle_external_mcp_server_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        server_id: &str,
+        enabled: bool,
+        cwd: Option<String>,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        let owned_id = server_id.to_string();
+        self.send_external_mcp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::ToggleExternalMcpServer {
+                request_id,
+                server_id: owned_id,
+                enabled,
+                cwd,
+            },
+            10,
+        )
+        .await
+    }
+
+    pub async fn delete_external_mcp_server_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        server_id: &str,
+        cwd: Option<String>,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        let owned_id = server_id.to_string();
+        self.send_external_mcp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::DeleteExternalMcpServer {
+                request_id,
+                server_id: owned_id,
+                cwd,
+            },
+            10,
+        )
+        .await
+    }
+
+    pub async fn probe_external_mcp_server_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        server_id: &str,
+        cwd: Option<String>,
+    ) -> Result<McpProbeResult, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_id = server_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_mcp_probes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ProbeExternalMcpServer {
+                    request_id: req_id,
+                    server_id: owned_id,
+                    cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_mcp_probes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ProbeExternalMcpServer: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(12), ack_rx).await {
+                Ok(Ok(Ok(res))) => Ok(res),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while probing MCP server".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_mcp_probes.remove(&req_id);
+                    }
+                    Err("Timed out waiting for MCP server probe".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "MCP probe task cancelled".to_string())?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11968,6 +12232,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_acp_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_mcp_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_mcp_probes.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, (_, tx)) in h.pending_artifact_lists.drain() {

@@ -115,6 +115,7 @@ pub async fn spawn_claude_session(
                 env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), s.into());
             }
         }
+        crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
 
         let spec = ShimSpawnSpec {
             shim_id: format!("claude_{}", cfg.agent_id),
@@ -1770,15 +1771,15 @@ pub async fn probe_claude_models(executable: Option<&Path>) -> ProviderModelCata
         return fallback_claude_models();
     };
     let ver = tokio::time::timeout(Duration::from_secs(2), async {
-        let child = tokio::process::Command::new(exe)
-            .arg("--version")
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.arg("--version")
             .env("NO_COLOR", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .ok()?;
+            .kill_on_drop(true);
+        crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
+        let child = cmd.spawn().ok()?;
         let out = child.wait_with_output().await.ok()?;
         parse_semver_prefix(&String::from_utf8_lossy(&out.stdout))
     })

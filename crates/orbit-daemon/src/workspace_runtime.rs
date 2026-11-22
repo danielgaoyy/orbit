@@ -608,13 +608,13 @@ where
             output_tail: None,
             error: None,
         });
-        let output = Command::new("/bin/sh")
-            .arg("-lc")
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-lc")
             .arg(cmd_str)
             .current_dir(worktree_cwd)
-            .envs(&env_map)
-            .output()
-            .await;
+            .envs(&env_map);
+        orbit_providers::apply_cached_shell_env(&mut cmd);
+        let output = cmd.output().await;
         match output {
             Ok(out) if out.status.success() => {
                 let tail = tail_output(&out.stdout, &out.stderr, 600);
@@ -687,16 +687,13 @@ pub async fn teardown_and_remove_worktree(
     let src = source_cwd.unwrap_or(worktree_cwd);
     let env_map = build_worktree_hook_env(src, worktree_cwd, branch_name);
     for cmd_str in cmds {
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            Command::new("/bin/sh")
-                .arg("-lc")
-                .arg(&cmd_str)
-                .current_dir(worktree_cwd)
-                .envs(&env_map)
-                .output(),
-        )
-        .await;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-lc")
+            .arg(&cmd_str)
+            .current_dir(worktree_cwd)
+            .envs(&env_map);
+        orbit_providers::apply_cached_shell_env(&mut cmd);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await;
         if let Err(_) | Ok(Err(_)) = res {
             warn!(cmd = %cmd_str, "worktree teardown hook failed or timed out");
         }

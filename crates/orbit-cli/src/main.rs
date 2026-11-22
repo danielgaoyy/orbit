@@ -24,7 +24,10 @@ use orbit_protocol::{
     ActiveTurnBehavior, AgentStatus, ProviderKind, SessionMode, TimelinePayload, ToolCallDetail,
     WireMessage, WorktreeCreateMode,
 };
-use orbit_providers::{discover_installed_providers, probe_all_provider_quotas};
+use orbit_providers::{
+    discover_installed_providers, probe_all_provider_quotas, resolve_login_shell_env,
+    set_snapshot_orbit_home, shell_snapshot_stats,
+};
 use orbit_relay::{RelayConfig, RelayPersistedConfig, run_relay};
 use orbit_relay_transport::{is_ssh_relay_url, redact_relay_url};
 use orbit_shim::{ShimSpawnSpec, run_shim};
@@ -503,6 +506,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Doctor => {
+            set_snapshot_orbit_home(&home_dir);
+            let _ = resolve_login_shell_env().await;
+            let snap_stats = shell_snapshot_stats();
+
             let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
             let persisted = DaemonPersistedConfig::load(&home_dir);
             let fallback_port = persisted
@@ -537,6 +544,21 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 None => println!(
                     "Relay Route  : (not configured — LAN/Tailscale only; run `orbit use-relay <HOST:PORT>`)"
                 ),
+            }
+            if snap_stats.warm {
+                println!(
+                    "Shell Cache  : {} ({} vars, age {}s, hits {}, misses {})",
+                    snap_stats.shell,
+                    snap_stats.var_count,
+                    snap_stats.age_secs.unwrap_or(0),
+                    snap_stats.hits,
+                    snap_stats.misses
+                );
+            } else {
+                println!(
+                    "Shell Cache  : {} (cold, errors {}, hits {}, misses {})",
+                    snap_stats.shell, snap_stats.probe_errors, snap_stats.hits, snap_stats.misses
+                );
             }
 
             println!("\nDiscovered Coding Agent CLIs:");

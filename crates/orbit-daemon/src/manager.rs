@@ -3719,7 +3719,9 @@ impl AgentOrchestrator {
         };
         let resolved_cwd_str = resolved_cwd.to_string_lossy().to_string();
 
+        let mut env = env;
         let (program, args) = if let Some(cmd_line) = initial_command {
+            orbit_providers::merge_cached_shell_env_into_map(&mut env);
             ("/bin/sh".to_string(), vec!["-lc".to_string(), cmd_line])
         } else {
             (shell.clone(), Vec::new())

@@ -334,9 +334,20 @@ impl DaemonRuntime {
         drop(self.scheduler.spawn_background());
         drop(self.idle_cleanup.spawn_background());
 
-        // 5. Warm provider model catalogs in background
+        // 5. Warm login-shell environment snapshot & provider model catalogs in background (non-blocking)
+        orbit_providers::set_snapshot_orbit_home(&self.home_dir);
         let rt_warm = Arc::clone(self);
         tokio::spawn(async move {
+            let env_map = orbit_providers::resolve_login_shell_env().await;
+            let stats = orbit_providers::shell_snapshot_stats();
+            tracing::debug!(
+                shell = %stats.shell,
+                var_count = env_map.len(),
+                hits = stats.hits,
+                misses = stats.misses,
+                disk_hits = stats.disk_hits,
+                "Login shell environment snapshot warmed"
+            );
             let _ = rt_warm.get_or_probe_provider_catalogs(false).await;
         });
 

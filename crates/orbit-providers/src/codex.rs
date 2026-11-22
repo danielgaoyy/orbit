@@ -47,6 +47,7 @@ pub async fn spawn_codex_session(
 
         let mut env = cfg.extra_env.clone();
         env.insert("NO_COLOR".into(), "1".into());
+        crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
 
         let spec = ShimSpawnSpec {
             shim_id: format!("codex_{}", cfg.agent_id),
@@ -1716,15 +1717,15 @@ pub async fn probe_codex_models(executable: Option<&Path>) -> ProviderModelCatal
 
     let rpc_res = tokio::time::timeout(Duration::from_secs(6), async {
         let _startup_guard = codex_startup_mutex().lock().await;
-        let mut child = Command::new(exe)
-            .arg("app-server")
+        let mut cmd = Command::new(exe);
+        cmd.arg("app-server")
             .env("NO_COLOR", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .kill_on_drop(true);
+        crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
 
         let Some(mut stdin) = child.stdin.take() else {
             return Err("codex stdin unavailable".to_string());

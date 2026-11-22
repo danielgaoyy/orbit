@@ -235,6 +235,7 @@ async fn run_claude_side_question(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -337,6 +338,7 @@ async fn run_codex_side_question(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -467,6 +469,7 @@ async fn run_agy_side_question(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
 
     let mut child = cmd
         .spawn()

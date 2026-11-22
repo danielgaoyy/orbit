@@ -5,6 +5,7 @@ pub mod attachments;
 pub mod claude;
 pub mod codex;
 pub mod driver;
+pub mod shell_snapshot;
 pub mod side_question;
 
 use std::collections::HashMap;
@@ -76,6 +77,12 @@ pub(crate) fn build_compact_unified_diff(
 pub use driver::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, ProviderSessionHandle,
     SessionLaunchConfig,
+};
+pub use shell_snapshot::{
+    ShellSnapshotCache, ShellSnapshotStats, apply_cached_shell_env, apply_cached_std_shell_env,
+    invalidate_shell_snapshot, merge_cached_shell_env_into_map, resolve_login_shell_env,
+    resolve_login_shell_env_cached, set_snapshot_orbit_home, shell_snapshot_stats,
+    warm_login_shell_env_in_background,
 };
 pub use side_question::{SideQuestionSpec, run_ephemeral_text_prompt, run_side_question};
 
@@ -177,6 +184,12 @@ pub fn find_executable(binary_name: &str) -> Option<PathBuf> {
     let mut search_dirs: Vec<PathBuf> = env::var_os("PATH")
         .map(|paths| env::split_paths(&paths).collect())
         .unwrap_or_default();
+
+    for dir in shell_snapshot::cached_login_shell_path_dirs() {
+        if !search_dirs.contains(&dir) {
+            search_dirs.push(dir);
+        }
+    }
 
     if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
         search_dirs.push(home.join(".local/bin"));

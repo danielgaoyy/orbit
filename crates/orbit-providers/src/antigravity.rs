@@ -67,6 +67,7 @@ pub async fn spawn_antigravity_session(
                 env.insert("AGY_EFFORT".into(), s.into());
             }
         }
+        crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
 
         let spec = ShimSpawnSpec {
             shim_id: format!("agy_{}", cfg.agent_id),
@@ -5661,14 +5662,19 @@ struct AgyUsageBucket {
 }
 
 pub async fn probe_antigravity_quota(executable: &Path) -> ProviderQuotaSnapshot {
-    let usage_fut = Command::new(executable)
+    let mut usage_cmd = Command::new(executable);
+    usage_cmd
         .args(["-p", "/usage", "--output-format", "json"])
-        .env("NO_COLOR", "1")
-        .output();
-    let credits_fut = Command::new(executable)
+        .env("NO_COLOR", "1");
+    crate::shell_snapshot::apply_cached_shell_env(&mut usage_cmd);
+    let usage_fut = usage_cmd.output();
+
+    let mut credits_cmd = Command::new(executable);
+    credits_cmd
         .args(["-p", "/credits", "--output-format", "json"])
-        .env("NO_COLOR", "1")
-        .output();
+        .env("NO_COLOR", "1");
+    crate::shell_snapshot::apply_cached_shell_env(&mut credits_cmd);
+    let credits_fut = credits_cmd.output();
 
     let (u_res, c_res) = tokio::time::timeout(Duration::from_secs(18), async {
         tokio::join!(usage_fut, credits_fut)
@@ -5949,15 +5955,15 @@ pub async fn probe_antigravity_models(executable: Option<&Path>) -> ProviderMode
         .unwrap_or_else(|| PathBuf::from("."));
 
     let rpc_res = tokio::time::timeout(Duration::from_secs(6), async {
-        let mut child = Command::new(exe)
-            .args(["acp", "--stdio"])
+        let mut cmd = Command::new(exe);
+        cmd.args(["acp", "--stdio"])
             .env("NO_COLOR", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .kill_on_drop(true);
+        crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
 
         let Some(mut stdin) = child.stdin.take() else {
             return Err("agy stdin unavailable".to_string());

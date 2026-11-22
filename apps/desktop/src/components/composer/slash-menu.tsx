@@ -19,6 +19,7 @@ import {
   Sparkles,
   SquarePen,
   SquareTerminal,
+  Target,
   Terminal,
   Users,
   Zap,
@@ -41,6 +42,8 @@ function resolveSlashCommandIcon(cmd: SlashCommandView): LucideIcon {
       return MessageCircleQuestion;
     case "plan":
       return ListTodo;
+    case "goal":
+      return Target;
     case "review":
       return FileSearch;
     case "diff":

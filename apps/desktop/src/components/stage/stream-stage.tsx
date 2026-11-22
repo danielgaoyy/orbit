@@ -94,6 +94,7 @@ import {
 } from "@/lib/prompt-image-cache";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { StickyApprovalDock } from "@/components/stage/stage-approval-dock";
+import { GoalBanner } from "@/components/stage/goal-banner";
 import { ChatOutlineRail } from "@/components/stage/stage-outline-rail";
 import {
   AgentMessageCard,
@@ -5394,6 +5395,7 @@ export function StreamStage() {
           }}
         >
           <div style={stagePushStyle}>
+            <GoalBanner hostId={selectedHostId} agentId={selectedAgentId} />
             <SubagentApprovalBanner hostId={selectedHostId} agentId={selectedAgentId} />
             <StickyApprovalDock
               hostId={selectedHostId}

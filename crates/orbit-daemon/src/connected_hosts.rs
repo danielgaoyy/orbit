@@ -576,7 +576,11 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ConditionalTimerCreated { request_id, .. }
         | WireMessage::ConditionalTimersSnapshot { request_id, .. }
         | WireMessage::ConditionalTimerUpdated { request_id, .. }
-        | WireMessage::GuardianConfigSnapshot { request_id, .. } => Some(*request_id),
+        | WireMessage::GuardianConfigSnapshot { request_id, .. }
+        | WireMessage::GoalRunUpdated { request_id, .. }
+        | WireMessage::GoalRunsSnapshot { request_id, .. }
+        | WireMessage::MonitorWatchUpdated { request_id, .. }
+        | WireMessage::MonitorWatchesSnapshot { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

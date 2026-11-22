@@ -18,19 +18,19 @@ use orbit_protocol::{
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
     BackgroundTaskInfo, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
     ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, ExternalMcpServerRecord,
-    GitStatusSnapshot, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
+    GitStatusSnapshot, GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
     HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, KeepAwakeStatus,
     LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
-    ManagedSkillRecord, McpProbeResult, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
-    PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord,
-    ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame,
-    TerminalSummary, TimelineEvent, TimelinePayload, TimerCondition, ToolCallDetail,
-    ToolCallStatus, UsageInsightsSnapshot, WireMessage, WorkspaceBoardSnapshot,
-    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
-    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
-    WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord, OrchestrationConfig,
+    OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef,
+    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, QueuedPromptView,
+    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
+    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload,
+    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
+    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
+    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
+    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -48,13 +48,14 @@ use crate::cloud_sync::{
     unlock_remote_vault_with_passphrase,
 };
 pub use crate::contract::{
-    ConversationSearchHit, CreateWorkspaceEntryRequest, DeletePathRuleRequest,
-    DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, ForkAgentRequest,
-    ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
+    ControlGoalRunRequest, ConversationSearchHit, CreateWorkspaceEntryRequest,
+    DeletePathRuleRequest, DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest,
+    ForkAgentRequest, ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
     InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
     MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
     PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    SaveInstructionFileRequest, UpsertArtifactRequest, UpsertExternalMcpServerRequest,
+    SaveInstructionFileRequest, StartGoalRunRequest, StartMonitorWatchRequest,
+    StopMonitorWatchRequest, UpsertArtifactRequest, UpsertExternalMcpServerRequest,
     UpsertPathRuleRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
     WriteWorkspaceFileRequest,
 };
@@ -353,6 +354,10 @@ pub struct HostDetailView {
     pub acp_agents: Vec<AcpAgentAvailability>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactSummary>,
+    #[serde(default)]
+    pub goal_runs: Vec<GoalRunRecord>,
+    #[serde(default)]
+    pub monitor_watches: Vec<MonitorWatchRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -708,6 +713,14 @@ struct HostMemoryState {
     background_timer_list_reqs: HashSet<Uuid>,
     pending_guardian_configs:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GuardianConfigSnapshotView, String>>>,
+    pending_goal_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GoalRunRecord, String>>>,
+    pending_goal_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<GoalRunRecord>, String>>>,
+    pending_monitor_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<MonitorWatchRecord, String>>>,
+    pending_monitor_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<MonitorWatchRecord>, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -760,6 +773,8 @@ struct HostMemoryState {
     subscribed_provider_subagents: HashSet<(String, String)>,
     acp_agents: Vec<AcpAgentAvailability>,
     artifacts: Vec<ArtifactSummary>,
+    goal_runs: Vec<GoalRunRecord>,
+    monitor_watches: Vec<MonitorWatchRecord>,
 }
 
 impl HostMemoryState {
@@ -835,6 +850,10 @@ impl HostMemoryState {
             pending_timer_updates: HashMap::new(),
             background_timer_list_reqs: HashSet::new(),
             pending_guardian_configs: HashMap::new(),
+            pending_goal_updates: HashMap::new(),
+            pending_goal_lists: HashMap::new(),
+            pending_monitor_updates: HashMap::new(),
+            pending_monitor_lists: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -887,6 +906,8 @@ impl HostMemoryState {
             subscribed_provider_subagents: HashSet::new(),
             acp_agents: Vec::new(),
             artifacts: Vec::new(),
+            goal_runs: Vec::new(),
+            monitor_watches: Vec::new(),
         }
     }
 
@@ -1555,6 +1576,8 @@ impl OrbitAppCore {
             host_sync_state: state.host_sync_state.clone(),
             acp_agents: state.acp_agents.clone(),
             artifacts: state.artifacts.clone(),
+            goal_runs: state.goal_runs.clone(),
+            monitor_watches: state.monitor_watches.clone(),
         })
     }
 
@@ -3711,6 +3734,18 @@ impl OrbitAppCore {
                     })
                     .await;
                 let _ = handle
+                    .send_wire(WireMessage::ListGoalRuns {
+                        request_id: Uuid::new_v4(),
+                        agent_id: None,
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListMonitorWatches {
+                        request_id: Uuid::new_v4(),
+                        agent_id: None,
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::ListConnectedHosts {
                         request_id: Uuid::new_v4(),
                     })
@@ -5289,6 +5324,50 @@ impl OrbitAppCore {
                         }));
                     }
                 }
+                WireMessage::GoalRunsSnapshot { request_id, goals } => {
+                    if let Some(tx) = state.pending_goal_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(goals.clone()));
+                    } else {
+                        state.goal_runs = goals;
+                        notify_host = true;
+                    }
+                }
+                WireMessage::GoalRunUpdated { request_id, goal } => {
+                    upsert_cached_goal(&mut state.goal_runs, goal.clone());
+                    if let Some(tx) = state.pending_goal_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(goal));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::GoalRunEvent { goal } => {
+                    upsert_cached_goal(&mut state.goal_runs, goal);
+                    notify_host = true;
+                }
+                WireMessage::MonitorWatchesSnapshot {
+                    request_id,
+                    monitors,
+                } => {
+                    if let Some(tx) = state.pending_monitor_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(monitors.clone()));
+                    } else {
+                        state.monitor_watches = monitors;
+                        notify_host = true;
+                    }
+                }
+                WireMessage::MonitorWatchUpdated {
+                    request_id,
+                    monitor,
+                } => {
+                    upsert_cached_monitor(&mut state.monitor_watches, monitor.clone());
+                    if let Some(tx) = state.pending_monitor_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(monitor));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::MonitorWatchEvent { monitor } => {
+                    upsert_cached_monitor(&mut state.monitor_watches, monitor);
+                    notify_host = true;
+                }
                 WireMessage::SideQuestionDelta {
                     request_id,
                     text_delta,
@@ -5541,6 +5620,22 @@ impl OrbitAppCore {
                         // Ignore unsupported/transient background timer list errors on older daemons.
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_guardian_configs.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_goal_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_goal_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_monitor_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_monitor_lists.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -12337,6 +12432,431 @@ impl OrbitAppCore {
             .map_err(|_| "context occupancy task cancelled".to_string())?
     }
 
+    pub async fn start_goal_run_on_host(
+        self: &Arc<Self>,
+        req: StartGoalRunRequest,
+    ) -> Result<GoalRunRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_goal_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before starting goal run".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::StartGoalRun {
+                    request_id: req_id,
+                    agent_id: req.agent_id,
+                    objective: req.objective,
+                    criteria: req.criteria,
+                    verify_command: req.verify_command,
+                    max_iterations: req.max_iterations,
+                    max_duration_secs: req.max_duration_secs,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_goal_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send StartGoalRun: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while starting goal run".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_goal_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for StartGoalRun reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "StartGoalRun task cancelled".to_string())?
+    }
+
+    pub async fn list_goal_runs_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: Option<String>,
+    ) -> Result<Vec<GoalRunRecord>, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let is_unfiltered = agent_id.is_none();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_goal_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing goal runs".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListGoalRuns {
+                    request_id: req_id,
+                    agent_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_goal_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListGoalRuns: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(goals))) => {
+                    if is_unfiltered {
+                        let updated = if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&host_id)
+                        {
+                            h.goal_runs = goals.clone();
+                            true
+                        } else {
+                            false
+                        };
+                        if updated {
+                            core.emit(|revision| CoreNotification::HostChanged {
+                                revision,
+                                host_id: host_id.clone(),
+                            });
+                        }
+                    }
+                    Ok(goals)
+                }
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err("Host disconnected while listing goal runs".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_goal_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ListGoalRuns reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ListGoalRuns task cancelled".to_string())?
+    }
+
+    pub async fn control_goal_run_on_host(
+        self: &Arc<Self>,
+        req: ControlGoalRunRequest,
+    ) -> Result<GoalRunRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_goal_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before controlling goal run".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ControlGoalRun {
+                    request_id: req_id,
+                    goal_id: req.goal_id,
+                    action: req.action,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_goal_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ControlGoalRun: {e}")));
+                return;
+            }
+            // VerifyNow can run up to verify timeout; allow generous wait
+            let out = match tokio::time::timeout(Duration::from_secs(130), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while controlling goal run".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_goal_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ControlGoalRun reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ControlGoalRun task cancelled".to_string())?
+    }
+
+    pub async fn start_monitor_watch_on_host(
+        self: &Arc<Self>,
+        req: StartMonitorWatchRequest,
+    ) -> Result<MonitorWatchRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_monitor_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before starting monitor".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::StartMonitorWatch {
+                    request_id: req_id,
+                    agent_id: req.agent_id,
+                    name: req.name,
+                    kind: req.kind,
+                    expires_in_secs: req.expires_in_secs,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_monitor_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send StartMonitorWatch: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while starting monitor".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_monitor_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for StartMonitorWatch reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "StartMonitorWatch task cancelled".to_string())?
+    }
+
+    pub async fn list_monitor_watches_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: Option<String>,
+    ) -> Result<Vec<MonitorWatchRecord>, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let is_unfiltered = agent_id.is_none();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_monitor_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing monitors".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListMonitorWatches {
+                    request_id: req_id,
+                    agent_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_monitor_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListMonitorWatches: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(monitors))) => {
+                    if is_unfiltered {
+                        let updated = if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&host_id)
+                        {
+                            h.monitor_watches = monitors.clone();
+                            true
+                        } else {
+                            false
+                        };
+                        if updated {
+                            core.emit(|revision| CoreNotification::HostChanged {
+                                revision,
+                                host_id: host_id.clone(),
+                            });
+                        }
+                    }
+                    Ok(monitors)
+                }
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err("Host disconnected while listing monitors".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_monitor_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ListMonitorWatches reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ListMonitorWatches task cancelled".to_string())?
+    }
+
+    pub async fn stop_monitor_watch_on_host(
+        self: &Arc<Self>,
+        req: StopMonitorWatchRequest,
+    ) -> Result<MonitorWatchRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_monitor_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before stopping monitor".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::StopMonitorWatch {
+                    request_id: req_id,
+                    monitor_id: req.monitor_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_monitor_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send StopMonitorWatch: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while stopping monitor".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_monitor_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for StopMonitorWatch reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "StopMonitorWatch task cancelled".to_string())?
+    }
+
+    fn require_online_session(&self, host_id: &str) -> Result<HostSessionHandle, String> {
+        let guard = self
+            .hosts
+            .read()
+            .map_err(|_| "host state lock poisoned".to_string())?;
+        let h = guard
+            .get(host_id)
+            .ok_or_else(|| format!("host `{host_id}` not found"))?;
+        h.session
+            .clone()
+            .ok_or_else(|| format!("host `{host_id}` is currently offline"))
+    }
+
     async fn dispatch_workspace_entry_mutation_on_host(
         self: &Arc<Self>,
         host_id: String,
@@ -13813,6 +14333,38 @@ fn upsert_cached_artifact(list: &mut Vec<ArtifactSummary>, artifact: ArtifactSum
     });
 }
 
+fn upsert_cached_goal(list: &mut Vec<GoalRunRecord>, goal: GoalRunRecord) {
+    if let Some(slot) = list
+        .iter_mut()
+        .find(|existing| existing.goal_id == goal.goal_id)
+    {
+        *slot = goal;
+    } else {
+        list.insert(0, goal);
+    }
+    list.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| b.goal_id.cmp(&a.goal_id))
+    });
+}
+
+fn upsert_cached_monitor(list: &mut Vec<MonitorWatchRecord>, monitor: MonitorWatchRecord) {
+    if let Some(slot) = list
+        .iter_mut()
+        .find(|existing| existing.monitor_id == monitor.monitor_id)
+    {
+        *slot = monitor;
+    } else {
+        list.insert(0, monitor);
+    }
+    list.sort_by(|a, b| {
+        b.created_at_ms
+            .cmp(&a.created_at_ms)
+            .then_with(|| b.monitor_id.cmp(&a.monitor_id))
+    });
+}
+
 fn provider_subagent_logical_key(payload: &TimelinePayload) -> Option<(&'static str, String)> {
     match payload {
         TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
@@ -13965,6 +14517,18 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     }
     h.background_timer_list_reqs.clear();
     for (_, tx) in h.pending_guardian_configs.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_goal_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_goal_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_monitor_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_monitor_lists.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {

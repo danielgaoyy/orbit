@@ -3,6 +3,7 @@
 //! Replaces Paseo's scattered JSON files with ACID event-sourced timelines and `< 1ms` cursor catch-up.
 
 pub mod artifacts;
+pub mod goals;
 pub mod guardian;
 pub mod orchestration;
 pub mod search;
@@ -445,6 +446,7 @@ impl OrbitStore {
         usage::migrate_usage_schema(&conn)?;
         timers::migrate_conditional_timers_schema(&conn)?;
         guardian::migrate_guardian_schema(&conn)?;
+        goals::migrate_goals_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

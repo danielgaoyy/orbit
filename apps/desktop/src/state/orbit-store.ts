@@ -59,6 +59,10 @@ import {
   type ComposerContextInput,
   type ContextOccupancyBreakdown,
   type CoreNotification,
+  type GoalControlAction,
+  type GoalRunRecord,
+  type MonitorKind,
+  type MonitorWatchRecord,
   type MatchedPathRulesView,
   type PathRulesSnapshotView,
   type UpsertPathRuleParams,
@@ -4139,6 +4143,26 @@ export const orbitActions = {
     const rawDraft = (state.composerDrafts[submitTarget.scopeKey] ?? "").trim();
     const storedDirective = state.slashDirectives[submitTarget.scopeKey] ?? null;
 
+    // Inline `/goal <objective>` command starts an unattended autonomous Goal run directly
+    if (!storedDirective && /^\/goal(?:\s+|$)/i.test(rawDraft)) {
+      const objective = rawDraft.replace(/^\/goal\s*/i, "").trim();
+      if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
+        notifyToast("Start an active session first to run /goal");
+        return;
+      }
+      if (!objective) {
+        notifyToast("Provide a goal objective after /goal");
+        return;
+      }
+      orbitActions.setComposerDraft("");
+      await orbitActions.startGoalRun({
+        hostId: submitTarget.hostId,
+        agentId: submitTarget.agentId,
+        objective,
+      });
+      return;
+    }
+
     const initialContexts = state.contextItems[submitTarget.scopeKey] ?? [];
     const registeredInline = state.inlineMentions[submitTarget.scopeKey] ?? [];
     const pastes = state.pastedAttachments[submitTarget.scopeKey] ?? [];
@@ -7655,6 +7679,91 @@ export const orbitActions = {
       notifyToast("No definition found");
       return null;
     }
+  },
+
+  async startGoalRun(req: {
+    hostId: string;
+    agentId: string;
+    objective: string;
+    criteria?: string[];
+    verifyCommand?: string | null;
+    maxIterations?: number | null;
+    maxDurationSecs?: number | null;
+  }): Promise<GoalRunRecord | null> {
+    try {
+      const goal = await orbitIpc.startGoalRun(req);
+      notifyToast("Goal loop started");
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return goal;
+    } catch (err) {
+      notifyToast(`Failed to start goal: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async controlGoalRun(
+    hostId: string,
+    goalId: string,
+    action: GoalControlAction,
+  ): Promise<GoalRunRecord | null> {
+    try {
+      const goal = await orbitIpc.controlGoalRun(hostId, goalId, action);
+      const label =
+        action === "pause"
+          ? "Goal paused"
+          : action === "resume"
+            ? "Goal resumed"
+            : action === "cancel"
+              ? "Goal stopped"
+              : goal.status === "succeeded"
+                ? "Goal verification passed"
+                : "Verification completed";
+      notifyToast(label);
+      void orbitActions.reloadHostDetail(hostId, true);
+      return goal;
+    } catch (err) {
+      notifyToast(`Goal action failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async startMonitorWatch(req: {
+    hostId: string;
+    agentId: string;
+    name: string;
+    kind: MonitorKind;
+    expiresInSecs?: number | null;
+  }): Promise<MonitorWatchRecord | null> {
+    try {
+      const monitor = await orbitIpc.startMonitorWatch(req);
+      notifyToast(`Monitor started: ${monitor.name}`);
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return monitor;
+    } catch (err) {
+      notifyToast(`Failed to start monitor: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async stopMonitorWatch(hostId: string, monitorId: string): Promise<MonitorWatchRecord | null> {
+    try {
+      const monitor = await orbitIpc.stopMonitorWatch(hostId, monitorId);
+      notifyToast(`Stopped monitor: ${monitor.name}`);
+      void orbitActions.reloadHostDetail(hostId, true);
+      return monitor;
+    } catch (err) {
+      notifyToast(`Failed to stop monitor: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async refreshGoalsAndMonitors(hostId: string): Promise<void> {
+    if (!hostId) return;
+    await Promise.all([
+      orbitIpc.listGoalRuns(hostId).catch(() => []),
+      orbitIpc.listMonitorWatches(hostId).catch(() => []),
+    ]);
+    await orbitActions.reloadHostDetail(hostId, true);
   },
 
   async reloadWorkspaceFileFromConflict(hostId: string, cwd: string, path: string): Promise<void> {

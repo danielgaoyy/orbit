@@ -21,6 +21,7 @@ import {
   Send,
   Sparkles,
   SquareSlash,
+  Target,
   Users,
   X,
 } from "lucide-react";
@@ -299,6 +300,39 @@ export const OmniComposer = memo(function OmniComposer({
 
   const [cursorOffset, setCursorOffset] = useState<number>(0);
   const [directiveIndentPx, setDirectiveIndentPx] = useState<number>(0);
+  const goalIme = useImeCompositionGuard();
+  const [goalPopoverOpen, setGoalPopoverOpen] = useState(false);
+  const [goalObjective, setGoalObjective] = useState("");
+  const [goalVerifyCommand, setGoalVerifyCommand] = useState("");
+  const [goalMaxIterations, setGoalMaxIterations] = useState("10");
+  const [goalSubmitting, setGoalSubmitting] = useState(false);
+
+  // Close the inline Goal popover whenever the user switches host or active agent
+  useEffect(() => {
+    setGoalPopoverOpen(false);
+  }, [selectedHostId, selectedAgentId]);
+
+  const submitGoalPopover = useCallback(() => {
+    if (!selectedHostId || !selectedAgentId || !goalObjective.trim() || goalSubmitting) return;
+    setGoalSubmitting(true);
+    const parsedIter = Number.parseInt(goalMaxIterations, 10);
+    const clampedIter = Number.isFinite(parsedIter) ? Math.max(1, Math.min(50, parsedIter)) : 10;
+    void orbitActions
+      .startGoalRun({
+        hostId: selectedHostId,
+        agentId: selectedAgentId,
+        objective: goalObjective.trim(),
+        verifyCommand: goalVerifyCommand.trim() || null,
+        maxIterations: clampedIter,
+      })
+      .then((created) => {
+        if (created) {
+          setGoalPopoverOpen(false);
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        }
+      })
+      .finally(() => setGoalSubmitting(false));
+  }, [selectedHostId, selectedAgentId, goalObjective, goalVerifyCommand, goalMaxIterations, goalSubmitting]);
   const [queueDrag, setQueueDrag] = useState<{
     fromIndex: number;
     overIndex: number;
@@ -694,6 +728,17 @@ export const OmniComposer = memo(function OmniComposer({
       case "plan":
         orbitActions.setSlashDirective("plan");
         break;
+      case "goal":
+        if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
+          setGoalObjective(stripped);
+          setGoalVerifyCommand("");
+          setGoalMaxIterations("10");
+          setGoalPopoverOpen(true);
+          orbitActions.setComposerDraft("");
+          return;
+        }
+        orbitActions.showToast("Start an active session first to run /goal");
+        return;
       case "auto":
         handleSelectMode("auto");
         break;
@@ -1395,6 +1440,99 @@ export const OmniComposer = memo(function OmniComposer({
               onHoverIndex={setMenuHighlightIdx}
               onSelect={executeSlashCommand}
             />
+          )}
+
+          {goalPopoverOpen && selectedHostId && selectedAgentId && (
+            <div
+              onKeyDown={(e) => {
+                if (goalIme.shouldIgnoreKeyDown(e)) return;
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setGoalPopoverOpen(false);
+                  requestAnimationFrame(() => textareaRef.current?.focus());
+                }
+              }}
+              className="bg-popover text-popover-foreground floating-surface orbit-inline-menu-up absolute right-0 bottom-full left-0 z-40 mb-2 rounded-[14px] border border-black/[0.09] p-3 dark:border-white/[0.10]"
+            >
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-[12px] font-medium">
+                  <Target className="text-muted-foreground size-3.5 stroke-[1.75]" />
+                  <span>Autonomous Goal</span>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Close goal config"
+                  onClick={() => {
+                    setGoalPopoverOpen(false);
+                    requestAnimationFrame(() => textareaRef.current?.focus());
+                  }}
+                  className="text-muted-foreground hover:text-foreground inline-flex size-5 cursor-pointer items-center justify-center rounded-md transition-colors"
+                >
+                  <X className="size-3.5" />
+                </button>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <input
+                  autoFocus
+                  value={goalObjective}
+                  onChange={(e) => setGoalObjective(e.target.value)}
+                  {...goalIme.compositionProps}
+                  onKeyDown={(e) => {
+                    if (goalIme.shouldIgnoreKeyDown(e)) return;
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      submitGoalPopover();
+                    }
+                  }}
+                  placeholder="Objective (e.g. Make all unit tests pass)"
+                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/30 h-8 w-full rounded-lg border px-2.5 text-[12.5px] outline-none"
+                />
+                <div className="flex items-center gap-2">
+                  <input
+                    value={goalVerifyCommand}
+                    onChange={(e) => setGoalVerifyCommand(e.target.value)}
+                    {...goalIme.compositionProps}
+                    onKeyDown={(e) => {
+                      if (goalIme.shouldIgnoreKeyDown(e)) return;
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        submitGoalPopover();
+                      }
+                    }}
+                    placeholder="Verify command (optional, e.g. cargo test)"
+                    className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/30 h-7 min-w-0 flex-1 rounded-lg border px-2.5 font-mono text-[11.5px] outline-none"
+                  />
+                  <label className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[11.5px]">
+                    <span>Max iter</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={50}
+                      value={goalMaxIterations}
+                      onChange={(e) => setGoalMaxIterations(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (goalIme.shouldIgnoreKeyDown(e)) return;
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          submitGoalPopover();
+                        }
+                      }}
+                      className="border-border bg-canvas text-foreground focus:border-foreground/30 h-7 w-14 rounded-lg border px-2 text-center font-mono text-[11.5px] outline-none"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    disabled={!goalObjective.trim() || goalSubmitting}
+                    onClick={submitGoalPopover}
+                    className="bg-foreground text-background hover:opacity-90 h-7 shrink-0 cursor-pointer rounded-lg px-3 text-[12px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    Start
+                  </button>
+                </div>
+              </div>
+            </div>
           )}
 
           {mentionTrigger && combinedMentions.length > 0 && (

@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, ArtifactKind, ForkTarget, McpToolPolicy, ProviderKind,
-    ReasoningEffort, ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode,
-    TimelinePayload, ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode,
-    WorktreeHandoffDirection, WorktreeHandoffMode,
+    ActiveTurnBehavior, AgentMessageKind, ArtifactKind, ForkTarget, McpToolPolicy, MonitorKind,
+    ProviderKind, ReasoningEffort, ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget,
+    SessionMode, TimelinePayload, ToolCallDetail, WireMessage, WorkspaceIsolation,
+    WorktreeCreateMode, WorktreeHandoffDirection, WorktreeHandoffMode,
 };
 use orbit_store::{ReceiptOutcome, UpsertArtifactInput};
 use serde_json::{Value, json};
@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::DaemonRuntime;
+use crate::goals::{GoalCriterionPatch, StartGoalSpec, StartMonitorSpec, authorize_agent_control};
 use crate::manager::{
     CreateAgentSpec, CreateWorkspaceSpec, ExecuteWorktreeHandoffSpec, ForkAgentSpec,
 };
@@ -2415,8 +2416,396 @@ async fn execute_tool_inner(
             }))
         }
 
+        // ==================== AUTONOMOUS GOAL MODE & MONITORS ====================
+        "start_goal" => {
+            let objective = str_arg(args, "objective")?;
+            let agent_id = opt_str(args, "agent_id")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller_agent_id.map(ToOwned::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `agent_id`"))?;
+            let criteria: Vec<String> = args
+                .get("criteria")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::trim))
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let verify_command = opt_str(args, "verify_command");
+            let max_iterations = args
+                .get("max_iterations")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok());
+            let max_duration_secs = args.get("max_duration_secs").and_then(Value::as_u64);
+
+            let goal = if let Some(ref remote_host_id) = target_host {
+                authorize_remote_agent_control(rt, remote_host_id, caller_agent_id, &agent_id)
+                    .await?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartGoalRun {
+                            request_id: req_id,
+                            agent_id,
+                            objective,
+                            criteria,
+                            verify_command,
+                            max_iterations,
+                            max_duration_secs,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::GoalRunUpdated { goal, .. } => goal,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to start_goal"),
+                }
+            } else {
+                authorize_agent_control(&rt.store, caller_agent_id, &agent_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let is_self_call = caller_agent_id == Some(agent_id.as_str());
+                rt.goals
+                    .start_goal(StartGoalSpec {
+                        agent_id,
+                        objective,
+                        criteria,
+                        verify_command,
+                        max_iterations,
+                        max_duration_secs,
+                        // Don't interrupt the calling agent's own active turn
+                        dispatch_initial_prompt: !is_self_call,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "goal": goal,
+            }))
+        }
+
+        "update_goal_progress" => {
+            if target_host.is_some() {
+                anyhow::bail!("`update_goal_progress` operates on the local host goal run");
+            }
+            let goal_id = opt_str(args, "goal_id");
+            let agent_id =
+                opt_str(args, "agent_id").or_else(|| caller_agent_id.map(ToOwned::to_owned));
+            let note = opt_str(args, "note");
+            let mut patches = Vec::new();
+            if let Some(arr) = args.get("criteria").and_then(Value::as_array) {
+                for item in arr {
+                    let key = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("label").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .trim();
+                    let passed = item.get("passed").and_then(Value::as_bool).unwrap_or(true);
+                    if !key.is_empty() {
+                        patches.push(GoalCriterionPatch {
+                            id_or_label: key.to_string(),
+                            passed,
+                        });
+                    }
+                }
+            }
+            if let Some(single_id) =
+                opt_str(args, "criterion_id").or_else(|| opt_str(args, "criterion"))
+            {
+                let passed = args.get("passed").and_then(Value::as_bool).unwrap_or(true);
+                patches.push(GoalCriterionPatch {
+                    id_or_label: single_id,
+                    passed,
+                });
+            }
+            let goal = rt
+                .goals
+                .update_goal_progress(
+                    caller_agent_id,
+                    goal_id.as_deref(),
+                    agent_id.as_deref(),
+                    patches,
+                    note,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(json!({ "goal": goal }))
+        }
+
+        "complete_goal" => {
+            if target_host.is_some() {
+                anyhow::bail!("`complete_goal` operates on the local host goal run");
+            }
+            let goal_id = opt_str(args, "goal_id");
+            let agent_id =
+                opt_str(args, "agent_id").or_else(|| caller_agent_id.map(ToOwned::to_owned));
+            let summary = opt_str(args, "summary");
+            let failed = args.get("failed").and_then(Value::as_bool).unwrap_or(false);
+            let goal = rt
+                .goals
+                .complete_goal(
+                    caller_agent_id,
+                    goal_id.as_deref(),
+                    agent_id.as_deref(),
+                    summary,
+                    failed,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(json!({ "goal": goal }))
+        }
+
+        "start_monitor" => {
+            let agent_id = opt_str(args, "agent_id")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller_agent_id.map(ToOwned::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `agent_id`"))?;
+            let name = opt_str(args, "name").unwrap_or_default();
+            let expires_in_secs = args.get("expires_in_secs").and_then(Value::as_u64);
+            let kind_str = str_arg(args, "kind")?.to_ascii_lowercase();
+            let kind = match kind_str.as_str() {
+                "command_stream" | "command" => {
+                    let command = str_arg(args, "command")?;
+                    let cmd_args: Vec<String> = args
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let pattern = opt_str(args, "pattern");
+                    MonitorKind::CommandStream {
+                        command,
+                        args: cmd_args,
+                        pattern,
+                    }
+                }
+                "log_file_tail" | "log_tail" | "file" => {
+                    let path = str_arg(args, "path")?;
+                    let pattern = str_arg(args, "pattern")?;
+                    MonitorKind::LogFileTail { path, pattern }
+                }
+                "http_health" | "http" => {
+                    let url = str_arg(args, "url")?;
+                    let expect_status = args
+                        .get("expect_status")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u16::try_from(v).ok())
+                        .unwrap_or(200);
+                    let interval_secs = args
+                        .get("interval_secs")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(30);
+                    MonitorKind::HttpHealth {
+                        url,
+                        expect_status,
+                        interval_secs,
+                    }
+                }
+                other => {
+                    anyhow::bail!(
+                        "unsupported monitor kind `{other}`; expected `command_stream`, `log_file_tail`, or `http_health`"
+                    )
+                }
+            };
+
+            let monitor = if let Some(ref remote_host_id) = target_host {
+                authorize_remote_agent_control(rt, remote_host_id, caller_agent_id, &agent_id)
+                    .await?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartMonitorWatch {
+                            request_id: req_id,
+                            agent_id,
+                            name,
+                            kind,
+                            expires_in_secs,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::MonitorWatchUpdated { monitor, .. } => monitor,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to start_monitor"),
+                }
+            } else {
+                authorize_agent_control(&rt.store, caller_agent_id, &agent_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.goals
+                    .start_monitor(StartMonitorSpec {
+                        agent_id,
+                        name,
+                        kind,
+                        expires_in_secs,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "monitor": monitor,
+            }))
+        }
+
+        "stop_monitor" => {
+            let monitor_id = str_arg(args, "monitor_id")?;
+            let monitor = if let Some(ref remote_host_id) = target_host {
+                if caller_agent_id.is_some() {
+                    let list_req = Uuid::new_v4();
+                    let owner_agent_id = match rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            list_req,
+                            WireMessage::ListMonitorWatches {
+                                request_id: list_req,
+                                agent_id: None,
+                            },
+                            Duration::from_secs(15),
+                        )
+                        .await?
+                    {
+                        WireMessage::MonitorWatchesSnapshot { monitors, .. } => monitors
+                            .into_iter()
+                            .find(|m| m.monitor_id == monitor_id)
+                            .map(|m| m.agent_id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "monitor `{monitor_id}` not found on host `{remote_host_id}`"
+                                )
+                            })?,
+                        WireMessage::RpcError { message, .. } => {
+                            anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                        }
+                        _ => anyhow::bail!("unexpected remote reply to list_monitor_watches"),
+                    };
+                    authorize_remote_agent_control(
+                        rt,
+                        remote_host_id,
+                        caller_agent_id,
+                        &owner_agent_id,
+                    )
+                    .await?;
+                }
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StopMonitorWatch {
+                            request_id: req_id,
+                            monitor_id,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::MonitorWatchUpdated { monitor, .. } => monitor,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to stop_monitor"),
+                }
+            } else {
+                let existing = rt
+                    .store
+                    .get_monitor_watch(&monitor_id)?
+                    .ok_or_else(|| anyhow::anyhow!("monitor `{monitor_id}` not found"))?;
+                authorize_agent_control(&rt.store, caller_agent_id, &existing.agent_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.goals
+                    .stop_monitor(&monitor_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "monitor": monitor,
+            }))
+        }
+
         other => anyhow::bail!("unknown Orbit tool `{other}`"),
     }
+}
+
+async fn authorize_remote_agent_control(
+    rt: &DaemonRuntime,
+    remote_host_id: &str,
+    caller_agent_id: Option<&str>,
+    target_agent_id: &str,
+) -> anyhow::Result<()> {
+    let Some(caller_id) = caller_agent_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let req_id = Uuid::new_v4();
+    let resp = rt
+        .connected_hosts
+        .send_rpc(
+            remote_host_id,
+            req_id,
+            WireMessage::ListAgents {
+                request_id: req_id,
+                workspace_id: None,
+                include_archived: true,
+                include_background: true,
+                parent_agent_id: None,
+            },
+            Duration::from_secs(15),
+        )
+        .await?;
+    let agents = match resp {
+        WireMessage::AgentsSnapshot { agents, .. } => agents,
+        WireMessage::RpcError { message, .. } => {
+            anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+        }
+        _ => anyhow::bail!("unexpected remote reply while verifying agent ownership"),
+    };
+    let target = agents
+        .into_iter()
+        .find(|a| a.agent_id == target_agent_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("target agent `{target_agent_id}` not found on host `{remote_host_id}`")
+        })?;
+    if target.parent_agent_id.as_deref() == Some(caller_id)
+        && target.parent_host_id.as_deref() == Some(rt.host_info.host_id.as_str())
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "caller agent `{caller_id}` is not authorized to control remote agent `{target_agent_id}` on host `{remote_host_id}`"
+    )
 }
 
 async fn resolve_target_host_id(
@@ -3365,6 +3754,105 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
                 },
                 "required": ["path", "line", "col"]
+            }),
+        },
+        // --- Autonomous Goal Mode & Streaming Monitor Engine (5) ---
+        ToolDefinition {
+            name: "start_goal",
+            description: "Start an unattended autonomous `/goal` verification loop on an agent until acceptance criteria or `verify_command` exits 0 (with automatic circuit-breaker & Keep-Awake).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "objective": { "type": "string", "description": "Clear goal objective to accomplish autonomously." },
+                    "criteria": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of acceptance criteria."
+                    },
+                    "verify_command": { "type": "string", "description": "Optional shell command run in the agent's workspace after each turn (exit 0 = goal succeeded)." },
+                    "max_iterations": { "type": "integer", "default": 10, "description": "Maximum verification retry iterations (1-50)." },
+                    "max_duration_secs": { "type": "integer", "default": 3600, "description": "Maximum wall-clock duration in seconds (60-86400)." },
+                    "agent_id": { "type": "string", "description": "Target agent ID (defaults to calling agent on local host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["objective"]
+            }),
+        },
+        ToolDefinition {
+            name: "update_goal_progress",
+            description: "Update pass/fail status on one or more criteria of an active Goal run.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "goal_id": { "type": "string", "description": "Optional Goal ID (defaults to calling agent's active goal)." },
+                    "agent_id": { "type": "string", "description": "Optional agent ID." },
+                    "criterion_id": { "type": "string", "description": "Single criterion ID or label to update." },
+                    "passed": { "type": "boolean", "default": true },
+                    "criteria": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "label": { "type": "string" },
+                                "passed": { "type": "boolean" }
+                            }
+                        },
+                        "description": "Batch of criterion progress updates."
+                    },
+                    "note": { "type": "string", "description": "Optional concise status note." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "complete_goal",
+            description: "Mark an active Goal run as completed (or trigger its configured `verify_command` before marking succeeded).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "goal_id": { "type": "string", "description": "Optional Goal ID (defaults to calling agent's active goal)." },
+                    "agent_id": { "type": "string", "description": "Optional agent ID." },
+                    "summary": { "type": "string", "description": "Concise completion or failure summary." },
+                    "failed": { "type": "boolean", "default": false, "description": "Set true to terminate the goal as failed." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "start_monitor",
+            description: "Start a streaming background Monitor watch (`command_stream`, `log_file_tail`, or `http_health`) that wakes the owning agent on matching events or HTTP transitions.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["command_stream", "log_file_tail", "http_health"],
+                        "description": "Monitor source kind."
+                    },
+                    "name": { "type": "string", "description": "Human-readable monitor label." },
+                    "command": { "type": "string", "description": "Non-shell executable for `command_stream`." },
+                    "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for `command_stream`." },
+                    "path": { "type": "string", "description": "Workspace-relative file path for `log_file_tail`." },
+                    "pattern": { "type": "string", "description": "Linear-time regex/substring match pattern." },
+                    "url": { "type": "string", "description": "Public HTTP/HTTPS URL for `http_health`." },
+                    "expect_status": { "type": "integer", "default": 200, "description": "Expected HTTP status code." },
+                    "interval_secs": { "type": "integer", "default": 30, "description": "HTTP poll interval in seconds (5-3600)." },
+                    "expires_in_secs": { "type": "integer", "description": "Optional auto-expiry TTL in seconds." },
+                    "agent_id": { "type": "string", "description": "Owning agent ID (defaults to calling agent on local host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["kind"]
+            }),
+        },
+        ToolDefinition {
+            name: "stop_monitor",
+            description: "Stop a running background Monitor watch and terminate any associated process group.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "monitor_id": { "type": "string", "description": "Monitor ID to stop." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["monitor_id"]
             }),
         },
     ]

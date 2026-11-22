@@ -2,6 +2,7 @@
 
 pub mod acp;
 pub mod artifacts;
+pub mod goals;
 pub mod guardian;
 pub mod handoff;
 pub mod hooks;
@@ -16,6 +17,7 @@ pub mod timers;
 pub mod usage;
 pub use acp::*;
 pub use artifacts::*;
+pub use goals::*;
 pub use guardian::*;
 pub use handoff::*;
 pub use hooks::*;
@@ -2349,6 +2351,70 @@ pub enum WireMessage {
         recent_audits: Vec<GuardianAuditEntry>,
     },
 
+    // --- Unattended Autonomous Goal Mode & Streaming Monitor Engine ---
+    StartGoalRun {
+        request_id: Uuid,
+        agent_id: String,
+        objective: String,
+        #[serde(default)]
+        criteria: Vec<String>,
+        #[serde(default)]
+        verify_command: Option<String>,
+        #[serde(default)]
+        max_iterations: Option<u32>,
+        #[serde(default)]
+        max_duration_secs: Option<u64>,
+    },
+    ListGoalRuns {
+        request_id: Uuid,
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    ControlGoalRun {
+        request_id: Uuid,
+        goal_id: String,
+        action: GoalControlAction,
+    },
+    GoalRunUpdated {
+        request_id: Uuid,
+        goal: GoalRunRecord,
+    },
+    GoalRunsSnapshot {
+        request_id: Uuid,
+        goals: Vec<GoalRunRecord>,
+    },
+    GoalRunEvent {
+        goal: GoalRunRecord,
+    },
+    StartMonitorWatch {
+        request_id: Uuid,
+        agent_id: String,
+        name: String,
+        kind: MonitorKind,
+        #[serde(default)]
+        expires_in_secs: Option<u64>,
+    },
+    ListMonitorWatches {
+        request_id: Uuid,
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    StopMonitorWatch {
+        request_id: Uuid,
+        monitor_id: String,
+    },
+    MonitorWatchUpdated {
+        request_id: Uuid,
+        monitor: MonitorWatchRecord,
+    },
+    MonitorWatchesSnapshot {
+        request_id: Uuid,
+        monitors: Vec<MonitorWatchRecord>,
+    },
+    MonitorWatchEvent {
+        monitor: MonitorWatchRecord,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -3831,6 +3897,115 @@ mod tests {
         for msg in messages {
             let encoded = msg.encode_zstd(3).expect("encode guardian wire msg");
             let decoded = WireMessage::decode_zstd(&encoded).expect("decode guardian wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn goal_and_monitor_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let goal = GoalRunRecord {
+            goal_id: "goal_abc".into(),
+            agent_id: "ag_1".into(),
+            workspace_id: "ws_1".into(),
+            objective: "Make tests green".into(),
+            criteria: vec![GoalCriterion {
+                id: "c1".into(),
+                label: "cargo test exits 0".into(),
+                passed: false,
+            }],
+            verify_command: Some("cargo test".into()),
+            max_iterations: 10,
+            current_iteration: 1,
+            max_duration_secs: 3600,
+            status: GoalStatus::Running,
+            last_verify_exit_code: Some(1),
+            last_verify_output: Some("1 failed".into()),
+            consecutive_identical_failures: 1,
+            started_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_005_000,
+            finished_at_ms: None,
+        };
+        let monitor = MonitorWatchRecord {
+            monitor_id: "mon_xyz".into(),
+            agent_id: "ag_1".into(),
+            name: "Health".into(),
+            kind: MonitorKind::HttpHealth {
+                url: "https://example.com/health".into(),
+                expect_status: 200,
+                interval_secs: 30,
+            },
+            status: MonitorStatus::Active,
+            match_count: 0,
+            last_event_preview: None,
+            last_triggered_at_ms: None,
+            expires_at_ms: Some(1_760_003_600_000),
+            created_at_ms: 1_760_000_000_000,
+        };
+
+        let messages = vec![
+            WireMessage::StartGoalRun {
+                request_id: req_id,
+                agent_id: "ag_1".into(),
+                objective: "Make tests green".into(),
+                criteria: vec!["cargo test exits 0".into()],
+                verify_command: Some("cargo test".into()),
+                max_iterations: Some(10),
+                max_duration_secs: Some(3600),
+            },
+            WireMessage::ListGoalRuns {
+                request_id: req_id,
+                agent_id: Some("ag_1".into()),
+            },
+            WireMessage::ControlGoalRun {
+                request_id: req_id,
+                goal_id: "goal_abc".into(),
+                action: GoalControlAction::VerifyNow,
+            },
+            WireMessage::GoalRunUpdated {
+                request_id: req_id,
+                goal: goal.clone(),
+            },
+            WireMessage::GoalRunsSnapshot {
+                request_id: req_id,
+                goals: vec![goal.clone()],
+            },
+            WireMessage::GoalRunEvent { goal },
+            WireMessage::StartMonitorWatch {
+                request_id: req_id,
+                agent_id: "ag_1".into(),
+                name: "Health".into(),
+                kind: MonitorKind::LogFileTail {
+                    path: "logs/app.log".into(),
+                    pattern: "ERROR".into(),
+                },
+                expires_in_secs: Some(3600),
+            },
+            WireMessage::ListMonitorWatches {
+                request_id: req_id,
+                agent_id: None,
+            },
+            WireMessage::StopMonitorWatch {
+                request_id: req_id,
+                monitor_id: "mon_xyz".into(),
+            },
+            WireMessage::MonitorWatchUpdated {
+                request_id: req_id,
+                monitor: monitor.clone(),
+            },
+            WireMessage::MonitorWatchesSnapshot {
+                request_id: req_id,
+                monitors: vec![monitor.clone()],
+            },
+            WireMessage::MonitorWatchEvent { monitor },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode goal/monitor wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode goal/monitor wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

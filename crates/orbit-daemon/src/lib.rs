@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod fast_copy;
 pub mod finish_subscriptions;
 pub mod git;
+pub mod goals;
 pub mod guardian;
 pub mod hooks;
 pub mod idle_cleanup;
@@ -83,6 +84,7 @@ use crate::git::{
     compute_git_diff, inspect_git_status, list_workspace_files,
     read_workspace_file_with_attachments_dir,
 };
+use crate::goals::{GoalMonitorEngine, StartGoalSpec, StartMonitorSpec};
 use crate::hooks::HooksEngine;
 use crate::idle_cleanup::IdleRuntimeCleanup;
 use crate::instructions::{
@@ -226,6 +228,7 @@ pub struct DaemonRuntime {
     pub conditional_timers: Arc<ConditionalTimerEngine>,
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
     pub keep_awake: Arc<KeepAwakeManager>,
+    pub goals: Arc<GoalMonitorEngine>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
     pub lsp: Arc<LspManager>,
     pub hooks: Arc<HooksEngine>,
@@ -334,6 +337,12 @@ impl DaemonRuntime {
                 })
             }))
             .await;
+        let goals = GoalMonitorEngine::new(
+            store.clone(),
+            &orchestrator,
+            delivery.clone(),
+            keep_awake.clone(),
+        );
         let idle_cleanup = IdleRuntimeCleanup::new(
             store.clone(),
             orchestrator.clone(),
@@ -384,6 +393,7 @@ impl DaemonRuntime {
             conditional_timers,
             idle_cleanup,
             keep_awake,
+            goals,
             symbol_index: Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
                 crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
             ))),
@@ -409,6 +419,8 @@ impl DaemonRuntime {
         // 3. Resume any persisted finish subscriptions & armed conditional timers across restarts
         self.finish_subs.start_recovery().await;
         self.conditional_timers.start_recovery().await;
+        // 3b. Recover active autonomous Goals & streaming Monitor watches
+        self.goals.start_recovery().await;
         // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup & LSP Idle Reaper loops
         drop(self.scheduler.spawn_background());
         drop(self.idle_cleanup.spawn_background());
@@ -617,6 +629,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
             runtime_shutdown.orchestrator.shutdown_worktree_pool().await;
             runtime_shutdown.conditional_timers.shutdown().await;
+            runtime_shutdown.goals.shutdown_all().await;
             runtime_shutdown.lsp.shutdown_all().await;
             runtime_shutdown.keep_awake.shutdown();
         })
@@ -1149,6 +1162,10 @@ async fn run_client_session_loop(
                     }
                     DaemonBroadcast::ConditionalTimerEvent(timer) => {
                         Some(WireMessage::ConditionalTimerEvent { timer })
+                    }
+                    DaemonBroadcast::GoalRunEvent(goal) => Some(WireMessage::GoalRunEvent { goal }),
+                    DaemonBroadcast::MonitorWatchEvent(monitor) => {
+                        Some(WireMessage::MonitorWatchEvent { monitor })
                     }
                 };
                 if let Some(msg) = maybe_msg
@@ -3463,6 +3480,156 @@ async fn handle_wire_rpc(
                 }),
                 Err(e) => Some(rpc_err(request_id, "update_guardian_config_failed", e)),
             }
+        }
+
+        // Unattended Autonomous Goal Mode & Streaming Monitor Engine
+        WireMessage::StartGoalRun {
+            request_id,
+            agent_id,
+            objective,
+            criteria,
+            verify_command,
+            max_iterations,
+            max_duration_secs,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals
+                    .start_goal(StartGoalSpec {
+                        agent_id,
+                        objective,
+                        criteria,
+                        verify_command,
+                        max_iterations,
+                        max_duration_secs,
+                        dispatch_initial_prompt: true,
+                    })
+                    .await
+                {
+                    Ok(goal) => WireMessage::GoalRunUpdated { request_id, goal },
+                    Err(e) => rpc_err(request_id, "start_goal_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ListGoalRuns {
+            request_id,
+            agent_id,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    goals.list_goals(agent_id.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(goals)) => WireMessage::GoalRunsSnapshot { request_id, goals },
+                    Ok(Err(e)) => rpc_err(request_id, "list_goals_failed", e),
+                    Err(e) => rpc_err(request_id, "list_goals_failed", e.to_string()),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ControlGoalRun {
+            request_id,
+            goal_id,
+            action,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals.control_goal(&goal_id, action).await {
+                    Ok(goal) => WireMessage::GoalRunUpdated { request_id, goal },
+                    Err(e) => rpc_err(request_id, "control_goal_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::StartMonitorWatch {
+            request_id,
+            agent_id,
+            name,
+            kind,
+            expires_in_secs,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals
+                    .start_monitor(StartMonitorSpec {
+                        agent_id,
+                        name,
+                        kind,
+                        expires_in_secs,
+                    })
+                    .await
+                {
+                    Ok(monitor) => WireMessage::MonitorWatchUpdated {
+                        request_id,
+                        monitor,
+                    },
+                    Err(e) => rpc_err(request_id, "start_monitor_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ListMonitorWatches {
+            request_id,
+            agent_id,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    goals.list_monitors(agent_id.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(monitors)) => WireMessage::MonitorWatchesSnapshot {
+                        request_id,
+                        monitors,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "list_monitors_failed", e),
+                    Err(e) => rpc_err(request_id, "list_monitors_failed", e.to_string()),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::StopMonitorWatch {
+            request_id,
+            monitor_id,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals.stop_monitor(&monitor_id).await {
+                    Ok(monitor) => WireMessage::MonitorWatchUpdated {
+                        request_id,
+                        monitor,
+                    },
+                    Err(e) => rpc_err(request_id, "stop_monitor_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
         }
 
         // First-Class Artifacts & SEP-1865 MCP Apps (offloaded via spawn_blocking)

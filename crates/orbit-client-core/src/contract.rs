@@ -505,3 +505,41 @@ pub struct LifecycleHooksSnapshotView {
     pub recent_executions: Vec<orbit_protocol::HookExecutionRecord>,
     pub project_hooks_trusted: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartGoalRunRequest {
+    pub host_id: String,
+    pub agent_id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub criteria: Vec<String>,
+    #[serde(default)]
+    pub verify_command: Option<String>,
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlGoalRunRequest {
+    pub host_id: String,
+    pub goal_id: String,
+    pub action: orbit_protocol::GoalControlAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartMonitorWatchRequest {
+    pub host_id: String,
+    pub agent_id: String,
+    pub name: String,
+    pub kind: orbit_protocol::MonitorKind,
+    #[serde(default)]
+    pub expires_in_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopMonitorWatchRequest {
+    pub host_id: String,
+    pub monitor_id: String,
+}

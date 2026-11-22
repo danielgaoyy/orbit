@@ -2206,6 +2206,109 @@ async fn update_guardian_config(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_goal_run(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    objective: String,
+    criteria: Option<Vec<String>>,
+    verify_command: Option<String>,
+    max_iterations: Option<u32>,
+    max_duration_secs: Option<u64>,
+) -> Result<orbit_protocol::GoalRunRecord, String> {
+    state
+        .core
+        .start_goal_run_on_host(orbit_client_core::contract::StartGoalRunRequest {
+            host_id,
+            agent_id,
+            objective,
+            criteria: criteria.unwrap_or_default(),
+            verify_command,
+            max_iterations,
+            max_duration_secs,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn list_goal_runs(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: Option<String>,
+) -> Result<Vec<orbit_protocol::GoalRunRecord>, String> {
+    state
+        .core
+        .list_goal_runs_on_host(&host_id, agent_id)
+        .await
+}
+
+#[tauri::command]
+async fn control_goal_run(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    goal_id: String,
+    action: orbit_protocol::GoalControlAction,
+) -> Result<orbit_protocol::GoalRunRecord, String> {
+    state
+        .core
+        .control_goal_run_on_host(orbit_client_core::contract::ControlGoalRunRequest {
+            host_id,
+            goal_id,
+            action,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn start_monitor_watch(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    name: String,
+    kind: orbit_protocol::MonitorKind,
+    expires_in_secs: Option<u64>,
+) -> Result<orbit_protocol::MonitorWatchRecord, String> {
+    state
+        .core
+        .start_monitor_watch_on_host(orbit_client_core::contract::StartMonitorWatchRequest {
+            host_id,
+            agent_id,
+            name,
+            kind,
+            expires_in_secs,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn list_monitor_watches(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: Option<String>,
+) -> Result<Vec<orbit_protocol::MonitorWatchRecord>, String> {
+    state
+        .core
+        .list_monitor_watches_on_host(&host_id, agent_id)
+        .await
+}
+
+#[tauri::command]
+async fn stop_monitor_watch(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    monitor_id: String,
+) -> Result<orbit_protocol::MonitorWatchRecord, String> {
+    state
+        .core
+        .stop_monitor_watch_on_host(orbit_client_core::contract::StopMonitorWatchRequest {
+            host_id,
+            monitor_id,
+        })
+        .await
+}
+
+#[tauri::command]
 async fn highlight_workspace_code(
     language: String,
     content: String,
@@ -3086,6 +3189,12 @@ pub fn run() {
             fire_conditional_timer_now,
             get_guardian_config,
             update_guardian_config,
+            start_goal_run,
+            list_goal_runs,
+            control_goal_run,
+            start_monitor_watch,
+            list_monitor_watches,
+            stop_monitor_watch,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

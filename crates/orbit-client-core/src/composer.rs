@@ -129,6 +129,23 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
             desktop_only: false,
         },
         SlashCommandView {
+            id: "goal".into(),
+            command: "/goal".into(),
+            label: "Autonomous Goal Loop".into(),
+            description: "Run unattended verification iterations until criteria or command passes"
+                .into(),
+            shortcut_key: None,
+            icon_key: "goal".into(),
+            keywords: vec![
+                "goal".into(),
+                "autonomous".into(),
+                "unattended".into(),
+                "loop".into(),
+                "verify".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
             id: "review".into(),
             command: "/review".into(),
             label: "Code Review Working Tree".into(),

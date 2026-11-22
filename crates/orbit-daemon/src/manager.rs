@@ -126,6 +126,8 @@ pub enum DaemonBroadcast {
     ArtifactUpdated(orbit_protocol::ArtifactSummary),
     ArtifactDeleted(String),
     ConditionalTimerEvent(orbit_protocol::ConditionalTimerRecord),
+    GoalRunEvent(orbit_protocol::GoalRunRecord),
+    MonitorWatchEvent(orbit_protocol::MonitorWatchRecord),
 }
 
 struct LiveAgentEntry {

@@ -1167,6 +1167,77 @@ export interface HostDetailView {
   host_sync_state?: HostSyncState | null;
   acp_agents?: AcpAgentAvailability[];
   artifacts?: ArtifactSummary[];
+  goal_runs?: GoalRunRecord[];
+  monitor_watches?: MonitorWatchRecord[];
+}
+
+export type GoalStatus =
+  | "running"
+  | "verifying"
+  | "paused"
+  | "succeeded"
+  | "failed"
+  | "canceled";
+
+export type GoalControlAction = "pause" | "resume" | "cancel" | "verify_now";
+
+export interface GoalCriterion {
+  id: string;
+  label: string;
+  passed: boolean;
+}
+
+export interface GoalRunRecord {
+  goal_id: string;
+  agent_id: string;
+  workspace_id: string;
+  objective: string;
+  criteria: GoalCriterion[];
+  verify_command?: string | null;
+  max_iterations: number;
+  current_iteration: number;
+  max_duration_secs: number;
+  status: GoalStatus;
+  last_verify_exit_code?: number | null;
+  last_verify_output?: string | null;
+  consecutive_identical_failures: number;
+  started_at_ms: number;
+  updated_at_ms: number;
+  finished_at_ms?: number | null;
+}
+
+export type MonitorKind =
+  | {
+      kind: "command_stream";
+      command: string;
+      args: string[];
+      pattern?: string | null;
+    }
+  | {
+      kind: "log_file_tail";
+      path: string;
+      pattern: string;
+    }
+  | {
+      kind: "http_health";
+      url: string;
+      expect_status: number;
+      interval_secs: number;
+    };
+
+export type MonitorStatus = "active" | "paused" | "triggered" | "stopped" | "error";
+
+export interface MonitorWatchRecord {
+  monitor_id: string;
+  agent_id: string;
+  name: string;
+  kind: MonitorKind;
+  status: MonitorStatus;
+  match_count: number;
+  last_event_preview?: string | null;
+  last_triggered_at_ms?: number | null;
+  expires_at_ms?: number | null;
+  created_at_ms: number;
 }
 
 export interface InlineSpanView {
@@ -4684,6 +4755,80 @@ export const orbitIpc = {
       cwd,
       hookId,
       samplePayload,
+    });
+  },
+
+  startGoalRun: async (req: {
+    hostId: string;
+    agentId: string;
+    objective: string;
+    criteria?: string[];
+    verifyCommand?: string | null;
+    maxIterations?: number | null;
+    maxDurationSecs?: number | null;
+  }): Promise<GoalRunRecord> => {
+    return invoke<GoalRunRecord>("start_goal_run", {
+      hostId: req.hostId,
+      agentId: req.agentId,
+      objective: req.objective,
+      criteria: req.criteria ?? null,
+      verifyCommand: req.verifyCommand?.trim() ? req.verifyCommand.trim() : null,
+      maxIterations: req.maxIterations ?? null,
+      maxDurationSecs: req.maxDurationSecs ?? null,
+    });
+  },
+
+  listGoalRuns: async (hostId: string, agentId?: string | null): Promise<GoalRunRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<GoalRunRecord[]>("list_goal_runs", {
+      hostId,
+      agentId: agentId ?? null,
+    });
+  },
+
+  controlGoalRun: async (
+    hostId: string,
+    goalId: string,
+    action: GoalControlAction,
+  ): Promise<GoalRunRecord> => {
+    return invoke<GoalRunRecord>("control_goal_run", {
+      hostId,
+      goalId,
+      action,
+    });
+  },
+
+  startMonitorWatch: async (req: {
+    hostId: string;
+    agentId: string;
+    name: string;
+    kind: MonitorKind;
+    expiresInSecs?: number | null;
+  }): Promise<MonitorWatchRecord> => {
+    return invoke<MonitorWatchRecord>("start_monitor_watch", {
+      hostId: req.hostId,
+      agentId: req.agentId,
+      name: req.name,
+      kind: req.kind,
+      expiresInSecs: req.expiresInSecs ?? null,
+    });
+  },
+
+  listMonitorWatches: async (
+    hostId: string,
+    agentId?: string | null,
+  ): Promise<MonitorWatchRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<MonitorWatchRecord[]>("list_monitor_watches", {
+      hostId,
+      agentId: agentId ?? null,
+    });
+  },
+
+  stopMonitorWatch: async (hostId: string, monitorId: string): Promise<MonitorWatchRecord> => {
+    return invoke<MonitorWatchRecord>("stop_monitor_watch", {
+      hostId,
+      monitorId,
     });
   },
 };

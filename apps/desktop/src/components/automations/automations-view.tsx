@@ -1,6 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
+  Activity,
   ArrowUpRight,
+  CheckCircle2,
   ChevronRight,
   Clock,
   FileText,
@@ -15,6 +17,8 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  Square,
+  Target,
   Timer,
   Trash2,
   X,
@@ -27,6 +31,8 @@ import {
   formatTimerConditionLabel,
   formatTimerCountdown,
   type ConditionalTimerRecord,
+  type GoalRunRecord,
+  type MonitorWatchRecord,
   type ProviderKind,
   type ScheduleRunRecord,
   type ScheduleSpec,
@@ -319,6 +325,19 @@ export function AutomationsView() {
   const hostDetail = useOrbitSelector((s) =>
     s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
   );
+  const goalRuns: GoalRunRecord[] = useMemo(
+    () => hostDetail?.goal_runs ?? [],
+    [hostDetail?.goal_runs],
+  );
+  const monitorWatches: MonitorWatchRecord[] = useMemo(
+    () => hostDetail?.monitor_watches ?? [],
+    [hostDetail?.monitor_watches],
+  );
+  useEffect(() => {
+    if (selectedHostId) {
+      void orbitActions.refreshGoalsAndMonitors(selectedHostId);
+    }
+  }, [selectedHostId]);
   const gitReposCache = useOrbitSelector((s) => s.gitReposCache);
   const sidebarView = useOrbitSelector((s) => s.sidebarView);
   const draftProvider = useOrbitSelector((s) => s.draftProvider);
@@ -1301,6 +1320,253 @@ export function AutomationsView() {
                 );
               })}
             </div>
+          </div>
+        )}
+        {/* Autonomous Goals & Streaming Monitors */}
+        {(goalRuns.length > 0 || monitorWatches.length > 0) && (
+          <div className="space-y-4">
+            {goalRuns.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-muted-foreground/80 flex items-center gap-1.5 px-0.5 text-[11.5px] font-medium">
+                  <span>Autonomous Goals</span>
+                  <span className="text-muted-foreground/60 tabular-nums">{goalRuns.length}</span>
+                </div>
+                <div className="border-border/80 bg-elevated/35 divide-border/70 divide-y overflow-hidden rounded-xl border">
+                  {goalRuns.map((goal) => {
+                    const targetAgent = hostDetail?.agents.find(
+                      (a) => a.agent_id === goal.agent_id,
+                    );
+                    const isActive =
+                      goal.status === "running" ||
+                      goal.status === "verifying" ||
+                      goal.status === "paused";
+                    const isPaused = goal.status === "paused";
+                    const isVerifying = goal.status === "verifying";
+                    const dotClass =
+                      goal.status === "running"
+                        ? "bg-emerald-500 animate-pulse"
+                        : goal.status === "verifying"
+                          ? "bg-sky-500 animate-pulse"
+                          : goal.status === "paused"
+                            ? "bg-amber-500"
+                            : goal.status === "succeeded"
+                              ? "bg-emerald-500"
+                              : goal.status === "failed"
+                                ? "bg-rose-500"
+                                : "bg-muted-foreground/45";
+                    return (
+                      <div
+                        key={goal.goal_id}
+                        className="group flex items-center justify-between gap-3 px-4 py-2.5 transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.025]"
+                      >
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          <Target className="text-muted-foreground mt-0.5 size-3.5 shrink-0 stroke-[1.75]" />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span
+                                title={goal.status}
+                                className={cn("size-1.5 shrink-0 rounded-full", dotClass)}
+                              />
+                              <span className="text-foreground truncate text-[13px] font-medium">
+                                {goal.objective}
+                              </span>
+                              <span className="text-muted-foreground/80 tabular-nums shrink-0 font-mono text-[11px]">
+                                Iter {goal.current_iteration}/{goal.max_iterations}
+                              </span>
+                            </div>
+                            <div className="text-muted-foreground/75 flex items-center gap-2 truncate text-[11.5px]">
+                              <span className="capitalize">{goal.status}</span>
+                              {targetAgent && (
+                                <>
+                                  <span>·</span>
+                                  <span className="truncate">{targetAgent.title}</span>
+                                </>
+                              )}
+                              {goal.verify_command && (
+                                <>
+                                  <span>·</span>
+                                  <span className="truncate font-mono text-[11px]">
+                                    {goal.verify_command}
+                                  </span>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {selectedHostId && (
+                          <div className="flex shrink-0 items-center gap-0.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                orbitActions.selectAgent(selectedHostId, goal.agent_id)
+                              }
+                              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors"
+                            >
+                              <span>Open</span>
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                            {isActive && !isVerifying && (
+                              <SimpleTooltip label="Verify now">
+                                <button
+                                  type="button"
+                                  aria-label="Verify goal"
+                                  onClick={() =>
+                                    void orbitActions.controlGoalRun(
+                                      selectedHostId,
+                                      goal.goal_id,
+                                      "verify_now",
+                                    )
+                                  }
+                                  className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors"
+                                >
+                                  <CheckCircle2 className="size-3.5 stroke-[1.75]" />
+                                </button>
+                              </SimpleTooltip>
+                            )}
+                            {isActive && !isVerifying && (
+                              <SimpleTooltip label={isPaused ? "Resume" : "Pause"}>
+                                <button
+                                  type="button"
+                                  aria-label={isPaused ? "Resume goal" : "Pause goal"}
+                                  onClick={() =>
+                                    void orbitActions.controlGoalRun(
+                                      selectedHostId,
+                                      goal.goal_id,
+                                      isPaused ? "resume" : "pause",
+                                    )
+                                  }
+                                  className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors"
+                                >
+                                  {isPaused ? (
+                                    <Play className="size-3.5 stroke-[1.75]" />
+                                  ) : (
+                                    <Pause className="size-3.5 stroke-[1.75]" />
+                                  )}
+                                </button>
+                              </SimpleTooltip>
+                            )}
+                            {isActive && (
+                              <SimpleTooltip label="Stop">
+                                <button
+                                  type="button"
+                                  aria-label="Stop goal"
+                                  onClick={() =>
+                                    void orbitActions.controlGoalRun(
+                                      selectedHostId,
+                                      goal.goal_id,
+                                      "cancel",
+                                    )
+                                  }
+                                  className="text-muted-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500"
+                                >
+                                  <Square className="size-3.5 stroke-[1.75]" />
+                                </button>
+                              </SimpleTooltip>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {monitorWatches.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-muted-foreground/80 flex items-center gap-1.5 px-0.5 text-[11.5px] font-medium">
+                  <span>Streaming Monitors</span>
+                  <span className="text-muted-foreground/60 tabular-nums">
+                    {monitorWatches.length}
+                  </span>
+                </div>
+                <div className="border-border/80 bg-elevated/35 divide-border/70 divide-y overflow-hidden rounded-xl border">
+                  {monitorWatches.map((mon) => {
+                    const isRunning = mon.status === "active" || mon.status === "triggered";
+                    const dotClass =
+                      mon.status === "active"
+                        ? "bg-emerald-500 animate-pulse"
+                        : mon.status === "triggered"
+                          ? "bg-amber-500 animate-pulse"
+                          : mon.status === "error"
+                            ? "bg-rose-500"
+                            : "bg-muted-foreground/45";
+                    const kindDetail =
+                      mon.kind.kind === "command_stream"
+                        ? `cmd: ${mon.kind.command}`
+                        : mon.kind.kind === "log_file_tail"
+                          ? `tail: ${mon.kind.path}`
+                          : `http: ${mon.kind.url}`;
+                    return (
+                      <div
+                        key={mon.monitor_id}
+                        className="group flex items-center justify-between gap-3 px-4 py-2.5 transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.025]"
+                      >
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          <Activity className="text-muted-foreground mt-0.5 size-3.5 shrink-0 stroke-[1.75]" />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span
+                                title={mon.status}
+                                className={cn("size-1.5 shrink-0 rounded-full", dotClass)}
+                              />
+                              <span className="text-foreground truncate text-[13px] font-medium">
+                                {mon.name}
+                              </span>
+                              <span className="text-muted-foreground/75 tabular-nums shrink-0 font-mono text-[11px]">
+                                {mon.match_count} {mon.match_count === 1 ? "match" : "matches"}
+                              </span>
+                            </div>
+                            <div className="text-muted-foreground/75 flex items-center gap-2 truncate text-[11.5px]">
+                              <span className="truncate font-mono text-[11px]">{kindDetail}</span>
+                              {mon.last_event_preview && (
+                                <>
+                                  <span>·</span>
+                                  <span className="truncate">{mon.last_event_preview}</span>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {selectedHostId && (
+                          <div className="flex shrink-0 items-center gap-0.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                orbitActions.selectAgent(selectedHostId, mon.agent_id)
+                              }
+                              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors"
+                            >
+                              <span>Open</span>
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                            {isRunning && (
+                              <SimpleTooltip label="Stop monitor">
+                                <button
+                                  type="button"
+                                  aria-label="Stop monitor"
+                                  onClick={() =>
+                                    void orbitActions.stopMonitorWatch(
+                                      selectedHostId,
+                                      mon.monitor_id,
+                                    )
+                                  }
+                                  className="text-muted-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500"
+                                >
+                                  <Square className="size-3.5 stroke-[1.75]" />
+                                </button>
+                              </SimpleTooltip>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

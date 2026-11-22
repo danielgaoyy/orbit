@@ -279,12 +279,16 @@ export const OmniComposer = memo(function OmniComposer({
       let active = false;
       let overIndex = fromIndex;
 
-      const cleanup = () => {
+      const detachListeners = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
         window.removeEventListener("pointercancel", onCancel);
         window.removeEventListener("keydown", onKeyDown);
         queueDragCleanupRef.current = null;
+      };
+
+      const cleanup = () => {
+        detachListeners();
         setQueueDrag(null);
       };
 
@@ -308,9 +312,12 @@ export const OmniComposer = memo(function OmniComposer({
       const onUp = () => {
         const shouldCommit = active && overIndex !== fromIndex;
         const targetIndex = overIndex;
-        cleanup();
         if (shouldCommit) {
+          detachListeners();
           orbitActions.reorderQueuedPrompts(fromIndex, targetIndex);
+          setQueueDrag(null);
+        } else {
+          cleanup();
         }
       };
 
@@ -1088,7 +1095,7 @@ export const OmniComposer = memo(function OmniComposer({
                   </div>
                   <div
                     className={cn(
-                      "flex shrink-0 items-center gap-0.5",
+                      "flex shrink-0 items-center gap-0.5 transition-opacity duration-150",
                       queueDrag && "pointer-events-none opacity-45",
                     )}
                   >

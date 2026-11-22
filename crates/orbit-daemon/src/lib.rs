@@ -2108,23 +2108,27 @@ async fn handle_wire_rpc(
             request_id,
             agent_id,
             since_seq,
-        } => {
-            subscribed_agents.insert(agent_id.clone());
-            match runtime.store.fetch_timeline_since_budgeted(
-                &agent_id,
-                since_seq,
-                2000,
-                orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES,
-            ) {
-                Ok((events, has_more)) => Some(WireMessage::TimelineCatchup {
+        } => match runtime.store.fetch_timeline_since_budgeted(
+            &agent_id,
+            since_seq,
+            2000,
+            orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES,
+        ) {
+            Ok((events, has_more)) => {
+                // Only enable live broadcast streaming after the final catchup page is fetched so
+                // TimelineLive frames cannot race ahead of paginated catchup history.
+                if !has_more {
+                    subscribed_agents.insert(agent_id.clone());
+                }
+                Some(WireMessage::TimelineCatchup {
                     request_id,
                     agent_id,
                     events,
                     has_more,
-                }),
-                Err(e) => Some(rpc_err(request_id, "timeline_error", e)),
+                })
             }
-        }
+            Err(e) => Some(rpc_err(request_id, "timeline_error", e)),
+        },
 
         // Terminals
         WireMessage::ListTerminals { request_id } => {

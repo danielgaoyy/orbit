@@ -629,7 +629,7 @@ html.orbit-linux .animate-spin {
   animation-timing-function: steps(12, end);
 }
 
-/* System Accessibility Guard (`prefers-reduced-motion`) */
+  /* System Accessibility Guard (`prefers-reduced-motion`) */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -638,5 +638,33 @@ html.orbit-linux .animate-spin {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+/*
+ * Base UI Menu/Popover triggers inject visually-hidden `<span data-base-ui-focus-guard>` siblings
+ * around the trigger while open. That makes the trigger no longer `:last-child`, causing Tailwind v4's
+ * `:where(.space-y-* > :not(:last-child))` and `divide-*` utilities to suddenly add margin/border
+ * and jump layout height on click. Reset those zero-specificity rules when followed by a trailing guard.
+ */
+@layer utilities {
+  :where([class*="space-y-"] > :has(+ [data-base-ui-focus-guard]:last-child)) {
+    margin-block-start: 0;
+    margin-block-end: 0;
+  }
+
+  :where([class*="space-x-"] > :has(+ [data-base-ui-focus-guard]:last-child)) {
+    margin-inline-start: 0;
+    margin-inline-end: 0;
+  }
+
+  :where([class*="divide-y"] > :has(+ [data-base-ui-focus-guard]:last-child)) {
+    border-top-width: 0;
+    border-bottom-width: 0;
+  }
+
+  :where([class*="divide-x"] > :has(+ [data-base-ui-focus-guard]:last-child)) {
+    border-inline-start-width: 0;
+    border-inline-end-width: 0;
   }
 }

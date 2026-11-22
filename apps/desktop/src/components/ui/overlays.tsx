@@ -2,6 +2,7 @@ import * as React from "react";
 import { Menu as BaseMenu } from "@base-ui/react/menu";
 import { Popover as BasePopover } from "@base-ui/react/popover";
 import { Tooltip as BaseTooltip } from "@base-ui/react/tooltip";
+import { ChevronRight } from "lucide-react";
 import { Kbd, KbdGroup, ShortcutKbd } from "@/components/ui/kbd";
 import { cn } from "@/lib/utils";
 
@@ -255,6 +256,75 @@ export function DropdownMenuShortcut({
       className={cn("text-muted-foreground ml-auto text-[11.5px] tracking-widest", className)}
       {...props}
     />
+  );
+}
+
+export const DropdownMenuSub = BaseMenu.SubmenuRoot;
+
+export interface DropdownMenuSubTriggerProps
+  extends React.ComponentProps<typeof BaseMenu.SubmenuTrigger> {}
+
+export function DropdownMenuSubTrigger({
+  className,
+  children,
+  ...props
+}: DropdownMenuSubTriggerProps) {
+  return (
+    <BaseMenu.SubmenuTrigger
+      data-slot="dropdown-menu-sub-trigger"
+      className={cn(
+        "focus:bg-accent focus:text-accent-foreground data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[popup-open]:bg-accent data-[popup-open]:text-accent-foreground relative flex cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-[13px] transition-colors duration-100 outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-45",
+        className,
+      )}
+      {...props}
+    >
+      {children}
+      <ChevronRight className="text-muted-foreground/75 ml-auto h-[13px] w-[13px] shrink-0 stroke-[1.75]" />
+    </BaseMenu.SubmenuTrigger>
+  );
+}
+
+export interface DropdownMenuSubContentProps
+  extends Omit<React.ComponentProps<typeof BaseMenu.Popup>, "finalFocus"> {
+  side?: React.ComponentProps<typeof BaseMenu.Positioner>["side"];
+  align?: React.ComponentProps<typeof BaseMenu.Positioner>["align"];
+  sideOffset?: number;
+  alignOffset?: number;
+  collisionPadding?: React.ComponentProps<typeof BaseMenu.Positioner>["collisionPadding"];
+  finalFocus?: React.ComponentProps<typeof BaseMenu.Popup>["finalFocus"];
+}
+
+export function DropdownMenuSubContent({
+  className,
+  side = "right",
+  align = "start",
+  sideOffset = 4,
+  alignOffset = -4,
+  collisionPadding = 8,
+  finalFocus,
+  ...props
+}: DropdownMenuSubContentProps) {
+  return (
+    <BaseMenu.Portal>
+      <BaseMenu.Positioner
+        side={side}
+        align={align}
+        sideOffset={sideOffset}
+        alignOffset={alignOffset}
+        collisionPadding={collisionPadding}
+        className="z-50 outline-none"
+      >
+        <BaseMenu.Popup
+          data-slot="dropdown-menu-sub-content"
+          finalFocus={finalFocus}
+          className={cn(
+            "bg-popover text-popover-foreground floating-surface orbit-floating-content w-max min-w-[168px] overflow-hidden rounded-[12px] border border-black/[0.09] p-1 outline-none dark:border-white/[0.10]",
+            className,
+          )}
+          {...props}
+        />
+      </BaseMenu.Positioner>
+    </BaseMenu.Portal>
   );
 }
 

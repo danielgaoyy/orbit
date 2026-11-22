@@ -395,9 +395,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
             </div>
 
             <ScrollArea
+              className="-mx-1.5"
               viewportRef={modelListRef}
               onViewportScroll={() => setHoveredModelKey(null)}
-              viewportClassName="max-h-[min(448px,calc(var(--available-height,540px)-42px))]"
+              viewportClassName="max-h-[min(448px,calc(var(--available-height,540px)-42px))] px-1.5"
             >
               {canSwitchAgentEngine && profiles.length > 0 && (
                 <div className="border-border mb-1.5 space-y-0.5 border-b pb-1.5">

@@ -347,6 +347,22 @@ impl OrbitStore {
                 ",
             )?;
         }
+        let post_v4_ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if post_v4_ver < 5 {
+            // One-time schema v5 migration: reset only `client_replica_cursors` while preserving
+            // all cached `client_replica_events` so previously gapped threads self-heal via a
+            // single silent `since_seq = 0` catchup pass without losing 0ms instant open.
+            conn.execute_batch(
+                "
+                BEGIN IMMEDIATE;
+                DELETE FROM client_replica_cursors;
+                PRAGMA user_version = 5;
+                COMMIT;
+                ",
+            )?;
+        }
         conn.execute_batch(
             "
             CREATE INDEX IF NOT EXISTS idx_timeline_agent_type_seq
@@ -1159,6 +1175,57 @@ impl OrbitStore {
             params![agent_id, seq_i64],
         )?;
         Ok(())
+    }
+
+    pub fn clear_replica_contiguous_seq(&self, agent_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM client_replica_cursors WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        Ok(())
+    }
+
+    /// Monotonically advance `contiguous_seq` for `agent_id`.
+    /// When `require_event_present` is true, verifies that `(agent_id, seq)` was actually persisted
+    /// into `client_replica_events`; if missing (e.g., an earlier replica write failed due to lock
+    /// contention), clears the cursor so the next open heals via a full backfill and returns `Ok(false)`.
+    pub fn advance_replica_contiguous_seq(
+        &self,
+        agent_id: &str,
+        seq: u64,
+        require_event_present: bool,
+    ) -> Result<bool, StoreError> {
+        if seq == 0 {
+            return Ok(false);
+        }
+        let seq_i64 = i64::try_from(seq)
+            .map_err(|_| StoreError::InvalidArgument("contiguous_seq exceeds i64".into()))?;
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        if require_event_present {
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM client_replica_events WHERE agent_id = ?1 AND seq = ?2 LIMIT 1",
+                    params![agent_id, seq_i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                let _ = conn.execute(
+                    "DELETE FROM client_replica_cursors WHERE agent_id = ?1",
+                    params![agent_id],
+                );
+                return Ok(false);
+            }
+        }
+        conn.execute(
+            "INSERT INTO client_replica_cursors (agent_id, contiguous_seq)
+             VALUES (?1, ?2)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                 contiguous_seq = MAX(client_replica_cursors.contiguous_seq, excluded.contiguous_seq)",
+            params![agent_id, seq_i64],
+        )?;
+        Ok(true)
     }
 
     /// Replace all cached replica events for an agent after an authoritative server-side rewind.
@@ -3041,13 +3108,27 @@ mod tests {
         store
             .upsert_replica_timeline_events_batch(&p1)
             .expect("batch");
-        store
-            .set_replica_contiguous_seq("ag_pg", p1[1].seq)
-            .expect("set");
+        assert!(
+            store
+                .advance_replica_contiguous_seq("ag_pg", p1[1].seq, true)
+                .expect("advance present")
+        );
         assert_eq!(
             store.get_replica_contiguous_seq("ag_pg").expect("get"),
             p1[1].seq
         );
+        // Refuses to advance when target seq was not actually persisted in client_replica_events
+        // and clears the cursor to 0 so the next open heals via full catchup.
+        assert!(
+            !store
+                .advance_replica_contiguous_seq("ag_pg", p3[0].seq, true)
+                .expect("advance missing")
+        );
+        assert_eq!(store.get_replica_contiguous_seq("ag_pg").expect("get"), 0);
+
+        store
+            .set_replica_contiguous_seq("ag_pg", p1[1].seq)
+            .expect("set");
         store.replace_replica_timeline("ag_pg", &[]).expect("wipe");
         assert_eq!(store.get_replica_contiguous_seq("ag_pg").expect("get"), 0);
     }

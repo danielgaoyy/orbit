@@ -846,11 +846,30 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
                 let _ = store.delete_replica_agent(host_id, agent_id);
             }
         }
-        WireMessage::TimelineCatchup { events, .. } => {
-            let _ = store.upsert_replica_timeline_events_batch(events);
+        WireMessage::TimelineCatchup {
+            agent_id, events, ..
+        } => {
+            if let Err(err) = store.upsert_replica_timeline_events_batch(events) {
+                tracing::warn!(
+                    host_id = %host_id,
+                    agent_id = %agent_id,
+                    error = %err,
+                    "failed to persist TimelineCatchup batch to replica; resetting contiguous cursor"
+                );
+                let _ = store.clear_replica_contiguous_seq(agent_id);
+            }
         }
         WireMessage::TimelineLive { event } => {
-            let _ = store.upsert_replica_timeline_event(event);
+            if let Err(err) = store.upsert_replica_timeline_event(event) {
+                tracing::warn!(
+                    host_id = %host_id,
+                    agent_id = %event.agent_id,
+                    seq = event.seq,
+                    error = %err,
+                    "failed to persist TimelineLive event to replica; resetting contiguous cursor"
+                );
+                let _ = store.clear_replica_contiguous_seq(&event.agent_id);
+            }
         }
         _ => {}
     }

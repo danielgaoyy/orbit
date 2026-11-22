@@ -14,7 +14,9 @@ import {
 import { basenameOfCwd } from "@/components/composer/composer-constants";
 import { useImeCompositionGuard } from "@/lib/ime";
 import {
+  filterAndRankProjects,
   isBareHomeDir,
+  isPathProjectQuery,
   matchesProjectDirectory,
   normalizeProjectPath,
 } from "@/lib/projects";
@@ -72,7 +74,9 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
 
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [projectQuery, setProjectQuery] = useState("");
+  const [highlightedIndex, setHighlightedIndex] = useState<number | null>(null);
   const projectSearchInputRef = useRef<HTMLInputElement | null>(null);
+  const projectRowRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const ime = useImeCompositionGuard();
 
   const heroProjects = useMemo<HeroProjectOption[]>(() => {
@@ -220,29 +224,27 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
     );
   }, [heroProjects]);
 
-  const filteredHeroProjects = useMemo(() => {
-    const q = projectQuery.trim().toLowerCase();
-    if (!q) return heroProjects;
-    return heroProjects.filter(
-      (p) =>
-        p.name.toLowerCase().includes(q) ||
-        p.path.toLowerCase().includes(q) ||
-        (p.branch?.toLowerCase().includes(q) ?? false),
-    );
-  }, [heroProjects, projectQuery]);
+  const hasProjectQuery = projectQuery.trim().length > 0;
+  const isPathQuery = isPathProjectQuery(projectQuery);
+
+  const filteredHeroProjects = useMemo(
+    () => filterAndRankProjects(heroProjects, projectQuery),
+    [heroProjects, projectQuery],
+  );
 
   const activeProjectsSection = useMemo(
-    () => filteredHeroProjects.filter((p) => p.isSidebarProject),
-    [filteredHeroProjects],
+    () => (hasProjectQuery ? [] : filteredHeroProjects.filter((p) => p.isSidebarProject)),
+    [filteredHeroProjects, hasProjectQuery],
   );
   const discoveredProjectsSection = useMemo(
-    () => filteredHeroProjects.filter((p) => !p.isSidebarProject),
-    [filteredHeroProjects],
+    () => (hasProjectQuery ? [] : filteredHeroProjects.filter((p) => !p.isSidebarProject)),
+    [filteredHeroProjects, hasProjectQuery],
   );
 
   useEffect(() => {
     if (!projectPickerOpen) {
       setProjectQuery("");
+      setHighlightedIndex(null);
       return;
     }
     if (heroProjects.length >= 6) {
@@ -252,6 +254,19 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
       return () => window.cancelAnimationFrame(raf);
     }
   }, [projectPickerOpen, heroProjects.length]);
+
+  useEffect(() => {
+    if (!projectPickerOpen) return;
+    if (hasProjectQuery) {
+      setHighlightedIndex(filteredHeroProjects.length > 0 ? 0 : null);
+    } else {
+      setHighlightedIndex(null);
+    }
+  }, [projectPickerOpen, hasProjectQuery, projectQuery, filteredHeroProjects.length]);
+
+  const scrollProjectRowIntoView = (index: number) => {
+    projectRowRefs.current[index]?.scrollIntoView({ block: "nearest" });
+  };
 
   const activeHeroProject = useMemo(() => {
     if (!selectedHostId) return null;
@@ -320,8 +335,8 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
   const effectiveUsingWorktree =
     draftUseWorktree && (isDirectGitRepo || Boolean(selectedNestedRepo));
 
-  const activeRepoBranch = useMemo(() => {
-    if (selectedNestedRepo?.git_branch) return selectedNestedRepo.git_branch;
+  const rootRepoBranch = useMemo(() => {
+    if (!isDirectGitRepo) return null;
     if (cachedInspection?.git_branch) return cachedInspection.git_branch;
     if (activeHeroProject?.branch) return activeHeroProject.branch;
     if (!hostDetail) return null;
@@ -332,7 +347,9 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
         ?.git_branch ??
       null
     );
-  }, [selectedNestedRepo, cachedInspection, activeHeroProject, hostDetail, selectedCwd]);
+  }, [isDirectGitRepo, cachedInspection, activeHeroProject, hostDetail, selectedCwd]);
+
+  const activeRepoBranch = selectedNestedRepo?.git_branch ?? rootRepoBranch;
 
   const activeProjectLabel = activeHeroProject?.name || basenameOfCwd(selectedCwd);
   const curatedWorkspacesForProject = useMemo(() => {
@@ -360,25 +377,33 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
     activeHostCard?.connection_state.startsWith("online"),
   );
 
-  const renderProjectRow = (proj: HeroProjectOption) => {
+  const renderProjectRow = (proj: HeroProjectOption, rowIndex: number) => {
     const active =
       proj.hostId === selectedHostId &&
       matchesProjectDirectory(proj.directories, selectedCwd);
-    const showParent = duplicateNames.has(proj.name.toLowerCase());
+    const showParent = duplicateNames.has(proj.name.toLowerCase()) || isPathQuery;
+    const isHighlighted = highlightedIndex === rowIndex;
     return (
       <button
         key={proj.id}
+        ref={(el) => {
+          projectRowRefs.current[rowIndex] = el;
+        }}
         type="button"
         title={proj.path}
+        onMouseEnter={() => setHighlightedIndex(rowIndex)}
         onClick={() => {
           orbitActions.selectProjectWorkspace(proj.hostId, proj.path);
           setProjectPickerOpen(false);
         }}
         className={cn(
           "flex w-full cursor-pointer items-center justify-between gap-2.5 rounded-[9px] px-2.5 py-1.5 text-left text-[13px] transition-colors outline-none",
-          active
-            ? "bg-foreground/[0.07] text-foreground font-medium dark:bg-white/[0.09]"
-            : "text-foreground/84 hover:bg-accent hover:text-foreground",
+          isHighlighted
+            ? "bg-accent text-foreground"
+            : active
+              ? "bg-foreground/[0.07] text-foreground dark:bg-white/[0.09]"
+              : "text-foreground/84 hover:bg-accent hover:text-foreground",
+          active && "font-medium",
         )}
       >
         <span className="flex min-w-0 flex-1 items-center gap-2">
@@ -465,10 +490,30 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                       if (e.key === "Escape") {
                         e.stopPropagation();
                         setProjectPickerOpen(false);
+                      } else if (e.key === "ArrowDown" && filteredHeroProjects.length > 0) {
+                        e.preventDefault();
+                        const next =
+                          highlightedIndex === null
+                            ? 0
+                            : (highlightedIndex + 1) % filteredHeroProjects.length;
+                        setHighlightedIndex(next);
+                        scrollProjectRowIntoView(next);
+                      } else if (e.key === "ArrowUp" && filteredHeroProjects.length > 0) {
+                        e.preventDefault();
+                        const next =
+                          highlightedIndex === null
+                            ? filteredHeroProjects.length - 1
+                            : (highlightedIndex - 1 + filteredHeroProjects.length) %
+                              filteredHeroProjects.length;
+                        setHighlightedIndex(next);
+                        scrollProjectRowIntoView(next);
                       } else if (e.key === "Enter" && filteredHeroProjects.length > 0) {
                         e.preventDefault();
-                        const first = filteredHeroProjects[0];
-                        orbitActions.selectProjectWorkspace(first.hostId, first.path);
+                        const target =
+                          highlightedIndex !== null && highlightedIndex < filteredHeroProjects.length
+                            ? filteredHeroProjects[highlightedIndex]
+                            : filteredHeroProjects[0];
+                        orbitActions.selectProjectWorkspace(target.hostId, target.path);
                         setProjectPickerOpen(false);
                       }
                     }}
@@ -484,20 +529,33 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                 No matching projects
               </div>
             ) : (
-              <ScrollArea viewportClassName="max-h-72">
-                <div className="space-y-0.5">
-                  {activeProjectsSection.map(renderProjectRow)}
+              <ScrollArea className="-mx-1.5" viewportClassName="max-h-72 px-1.5">
+                <div
+                  className="space-y-0.5"
+                  onMouseLeave={() => {
+                    if (!hasProjectQuery) setHighlightedIndex(null);
+                  }}
+                >
+                  {hasProjectQuery ? (
+                    filteredHeroProjects.map((proj, idx) => renderProjectRow(proj, idx))
+                  ) : (
+                    <>
+                      {activeProjectsSection.map((proj, idx) => renderProjectRow(proj, idx))}
 
-                  {activeProjectsSection.length > 0 && discoveredProjectsSection.length > 0 && (
-                    <div className="pt-1.5 pb-0.5">
-                      <div className="bg-border/70 mx-1 mb-1.5 h-px" />
-                      <div className="text-muted-foreground/75 px-2.5 pb-1 text-[11px] font-medium">
-                        Other folders
-                      </div>
-                    </div>
+                      {activeProjectsSection.length > 0 && discoveredProjectsSection.length > 0 && (
+                        <div className="pt-1.5 pb-0.5">
+                          <div className="bg-border/70 mx-1 mb-1.5 h-px" />
+                          <div className="text-muted-foreground/75 px-2.5 pb-1 text-[11px] font-medium">
+                            Other folders
+                          </div>
+                        </div>
+                      )}
+
+                      {discoveredProjectsSection.map((proj, idx) =>
+                        renderProjectRow(proj, activeProjectsSection.length + idx),
+                      )}
+                    </>
                   )}
-
-                  {discoveredProjectsSection.map(renderProjectRow)}
                 </div>
               </ScrollArea>
             )}
@@ -651,6 +709,15 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
           <DropdownMenuTrigger asChild>
             <button
               type="button"
+              title={
+                effectiveUsingWorktree
+                  ? activeRepoBranch
+                    ? `Worktree — new isolated branch from ${activeRepoBranch}`
+                    : "Worktree — isolated Git worktree for parallel tasks"
+                  : rootRepoBranch
+                    ? `Local — edit directly on ${rootRepoBranch}`
+                    : "Local — work directly in current project folder"
+              }
               className="text-foreground/72 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
             >
               {effectiveUsingWorktree ? (
@@ -665,11 +732,6 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                     : "Worktree"
                   : "Local"}
               </span>
-              {activeRepoBranch && (isDirectGitRepo || effectiveUsingWorktree) && (
-                <span className="text-foreground/45 max-w-28 truncate font-mono text-[12px]">
-                  · {activeRepoBranch}
-                </span>
-              )}
               <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
             </button>
           </DropdownMenuTrigger>
@@ -679,14 +741,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
             finalFocus={false}
             className="w-[320px] p-1.5"
           >
-            <DropdownMenuLabel className="flex items-center justify-between gap-2">
-              <span>Execution Environment</span>
-              {activeRepoBranch && isDirectGitRepo && (
-                <span className="text-muted-foreground max-w-28 truncate font-mono text-[11.5px] font-normal">
-                  {activeRepoBranch}
-                </span>
-              )}
-            </DropdownMenuLabel>
+            <DropdownMenuLabel>Execution Environment</DropdownMenuLabel>
 
             <DropdownMenuItem
               onSelect={() =>
@@ -709,9 +764,21 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                   <span className="text-foreground text-[13px] leading-tight font-medium">
                     Local
                   </span>
-                  <span className="text-muted-foreground text-[11.5px] leading-snug">
-                    Work directly in current project folder
-                  </span>
+                  {rootRepoBranch ? (
+                    <span
+                      title={rootRepoBranch}
+                      className="text-muted-foreground flex min-w-0 items-center gap-1 text-[11.5px] leading-snug"
+                    >
+                      <span className="shrink-0">Edit directly on</span>
+                      <span className="text-foreground/70 min-w-0 truncate font-mono text-[11px]">
+                        {rootRepoBranch}
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground text-[11.5px] leading-snug">
+                      Work directly in current project folder
+                    </span>
+                  )}
                 </div>
               </div>
               {!effectiveUsingWorktree && (
@@ -743,9 +810,21 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                     <span className="text-foreground text-[13px] leading-tight font-medium">
                       Worktree
                     </span>
-                    <span className="text-muted-foreground text-[11.5px] leading-snug">
-                      Isolated Git worktree for parallel tasks
-                    </span>
+                    {rootRepoBranch ? (
+                      <span
+                        title={`New isolated branch from ${rootRepoBranch}`}
+                        className="text-muted-foreground flex min-w-0 items-center gap-1 text-[11.5px] leading-snug"
+                      >
+                        <span className="shrink-0">New branch from</span>
+                        <span className="text-foreground/70 min-w-0 truncate font-mono text-[11px]">
+                          {rootRepoBranch}
+                        </span>
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground text-[11.5px] leading-snug">
+                        Isolated Git worktree for parallel tasks
+                      </span>
+                    )}
                   </div>
                 </div>
                 {effectiveUsingWorktree && !selectedNestedRepo && (
@@ -762,7 +841,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                     ? "Worktree · Nested Git Repos"
                     : "Worktree · Git Repos in Project"}
                 </DropdownMenuLabel>
-                <ScrollArea viewportClassName="max-h-48">
+                <ScrollArea className="-mx-1.5" viewportClassName="max-h-48 px-1.5">
                   <div className="space-y-0.5">
                     {nestedGitRepos.map((repo) => {
                       const active =
@@ -790,8 +869,14 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                               {repo.relative_path || repo.name}
                             </span>
                             {repo.git_branch && (
-                              <span className="text-muted-foreground truncate font-mono text-[11px]">
-                                {repo.git_branch}
+                              <span
+                                title={`New branch from ${repo.git_branch}`}
+                                className="text-muted-foreground flex min-w-0 items-center gap-1 text-[11px]"
+                              >
+                                <span className="shrink-0">New branch from</span>
+                                <span className="text-foreground/70 min-w-0 truncate font-mono">
+                                  {repo.git_branch}
+                                </span>
                               </span>
                             )}
                           </div>

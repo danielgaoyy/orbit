@@ -91,6 +91,7 @@ import {
 } from "@/components/stage/subagents-track";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
 import { Button } from "@/components/ui/button";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import {
   Dialog,
   DialogContent,
@@ -104,6 +105,65 @@ import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 const USER_PROMPT_PREVIEW_MAX_PX = 124;
+
+const StageHydratingFallback = memo(function StageHydratingFallback({
+  bootstrapError,
+}: {
+  bootstrapError: string | null;
+}) {
+  const [showIndicator, setShowIndicator] = useState(false);
+  const [showSlowRetry, setShowSlowRetry] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+
+  useEffect(() => {
+    const showTimer = window.setTimeout(() => setShowIndicator(true), 350);
+    const slowTimer = window.setTimeout(() => setShowSlowRetry(true), 5000);
+    return () => {
+      window.clearTimeout(showTimer);
+      window.clearTimeout(slowTimer);
+    };
+  }, []);
+
+  if (!bootstrapError && !showIndicator) {
+    return <div className="flex-1" />;
+  }
+
+  const needsRetry = Boolean(bootstrapError) || showSlowRetry;
+
+  return (
+    <div className="orbit-stage-enter text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2.5 px-6 text-[13px] select-none">
+      <div className="flex items-center gap-2">
+        {!bootstrapError && (
+          <OrbitSpinner size={13} className="text-muted-foreground/75 shrink-0" />
+        )}
+        <span className="text-muted-foreground/85">
+          {bootstrapError
+            ? "Unable to load workspace"
+            : showSlowRetry
+              ? "Taking longer than usual to connect…"
+              : "Connecting to workspace…"}
+        </span>
+      </div>
+      {needsRetry && (
+        <button
+          type="button"
+          disabled={retrying}
+          onClick={() => {
+            setRetrying(true);
+            setShowSlowRetry(false);
+            void orbitActions.retryBootstrap().finally(() => {
+              setRetrying(false);
+            });
+          }}
+          className="border-border/80 text-foreground/80 hover:bg-accent hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
+        >
+          <RotateCw className={cn("size-3", retrying && "animate-spin")} />
+          <span>{retrying ? "Retrying…" : "Retry"}</span>
+        </button>
+      )}
+    </div>
+  );
+});
 
 interface TurnTimingRecord {
   startedAtMs: number;
@@ -1775,7 +1835,9 @@ function HoverPillTooltip({
   }) => ReactElement;
 }) {
   const [anchorPos, setAnchorPos] = useState<{ x: number; y: number } | null>(null);
+  const [shiftX, setShiftX] = useState(0);
   const timerRef = useRef<number | null>(null);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
 
   const clearTimer = useCallback(() => {
     if (timerRef.current !== null) {
@@ -1786,6 +1848,23 @@ function HoverPillTooltip({
 
   useEffect(() => clearTimer, [clearTimer]);
 
+  useLayoutEffect(() => {
+    if (!anchorPos || !tooltipRef.current) {
+      setShiftX(0);
+      return;
+    }
+    const rect = tooltipRef.current.getBoundingClientRect();
+    const pad = 8;
+    const vw = window.innerWidth;
+    let delta = 0;
+    if (rect.right > vw - pad) {
+      delta = vw - pad - rect.right;
+    } else if (rect.left < pad) {
+      delta = pad - rect.left;
+    }
+    setShiftX(delta);
+  }, [anchorPos, label]);
+
   const scheduleShow = useCallback(
     (el: HTMLElement | null) => {
       clearTimer();
@@ -1794,6 +1873,7 @@ function HoverPillTooltip({
         timerRef.current = null;
         if (!el.isConnected) return;
         const rect = el.getBoundingClientRect();
+        setShiftX(0);
         setAnchorPos({ x: rect.left + rect.width / 2, y: rect.top - 6 });
       }, delay);
     },
@@ -1803,6 +1883,7 @@ function HoverPillTooltip({
   const hide = useCallback(() => {
     clearTimer();
     setAnchorPos(null);
+    setShiftX(0);
   }, [clearTimer]);
 
   return (
@@ -1817,16 +1898,17 @@ function HoverPillTooltip({
         label &&
         createPortal(
           <div
+            ref={tooltipRef}
             role="tooltip"
             style={{
-              left: `${anchorPos.x}px`,
+              left: `${anchorPos.x + shiftX}px`,
               top: `${anchorPos.y}px`,
             }}
-            className="pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-full"
+            className="pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-full whitespace-nowrap"
           >
             <div
               className={cn(
-                "bg-elevated text-foreground rounded-full border border-black/[0.08] px-2.5 py-0.5 text-[11.5px] leading-normal font-normal shadow-[0_4px_14px_rgba(0,0,0,0.08)] select-none dark:border-white/[0.11] dark:shadow-[0_4px_16px_rgba(0,0,0,0.36)]",
+                "bg-elevated text-foreground rounded-full border border-black/[0.08] px-2.5 py-0.5 text-[11.5px] leading-normal font-normal whitespace-nowrap shadow-[0_4px_14px_rgba(0,0,0,0.08)] select-none dark:border-white/[0.11] dark:shadow-[0_4px_16px_rgba(0,0,0,0.36)]",
                 tabularNums && "tabular-nums px-3 py-1 text-[12px]",
               )}
             >
@@ -3565,6 +3647,7 @@ export function StreamStage() {
   );
   const isAgentRunning = isAgentForegroundRunning(currentAgent);
   const fleetHydrated = useOrbitSelector((s) => s.fleetHydrated);
+  const bootstrapError = useOrbitSelector((s) => s.bootstrapError);
 
   const stageTurns = stageView?.turns ?? EMPTY_TURNS;
   const pendingPermissions = useMemo(
@@ -4209,7 +4292,7 @@ export function StreamStage() {
 
   if (!selectedHostId) {
     if (!fleetHydrated) {
-      return <div className="flex-1" />;
+      return <StageHydratingFallback bootstrapError={bootstrapError} />;
     }
     return (
       <div className="text-muted-foreground flex flex-1 items-center justify-center text-[13.5px]">

@@ -2,21 +2,24 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Archive,
+  ArrowDownAZ,
+  ArrowUpDown,
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  CircleDot,
   Clock,
   Folder,
   FolderOpen,
-  GripVertical,
   Layers,
+  List,
   ListFilter,
   MoreHorizontal,
   Plus,
   RefreshCw,
-  RotateCcw,
   Settings,
-  Trash2,
 } from "lucide-react";
 import { modSymbol } from "@/lib/keybindings";
 import {
@@ -32,6 +35,7 @@ import {
 } from "@/lib/orbit-ipc";
 import {
   basenameOfProjectPath,
+  isLocalHostCard,
   matchesProjectDirectory,
   normalizeProjectPath,
   projectPathScopeKey,
@@ -45,6 +49,8 @@ import {
   type ActiveWorkspaceMenuState,
   CreateWorkspaceDialog,
   type CreateWorkspaceDialogTarget,
+  DeleteConversationDialog,
+  type DeleteConversationTarget,
   DeleteProjectDialog,
   type MenuAnchorBox,
   SharedConversationMenu,
@@ -63,9 +69,6 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
   SimpleTooltip,
 } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -78,6 +81,28 @@ import {
 import { cn } from "@/lib/utils";
 
 const MAX_VISIBLE_CONVERSATIONS_PER_PROJECT = 6;
+
+function applyManualThreadOrder(
+  list: SidebarConversationView[],
+  manualIds: string[] | undefined,
+): SidebarConversationView[] {
+  if (!manualIds || manualIds.length === 0) return list;
+  const rank = new Map<string, number>();
+  manualIds.forEach((id, idx) => rank.set(id, idx));
+  const unordered: SidebarConversationView[] = [];
+  const ordered: SidebarConversationView[] = [];
+  for (const item of list) {
+    if (rank.has(item.agent.agent_id)) {
+      ordered.push(item);
+    } else {
+      unordered.push(item);
+    }
+  }
+  ordered.sort(
+    (a, b) => (rank.get(a.agent.agent_id) ?? 0) - (rank.get(b.agent.agent_id) ?? 0),
+  );
+  return [...unordered, ...ordered];
+}
 
 export const FleetSidebar = memo(function FleetSidebar() {
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
@@ -93,6 +118,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const collapsedWorkspaceIds = useOrbitSelector((s) => s.collapsedWorkspaceIds);
   const threadCustomTitles = useOrbitSelector((s) => s.threadCustomTitles);
   const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
+  const threadManualOrder = useOrbitSelector((s) => s.threadManualOrder);
   const sidebarProjectSort = useOrbitSelector((s) => s.sidebarProjectSort);
   const sidebarThreadFilter = useOrbitSelector((s) => s.sidebarThreadFilter);
   const hiddenProjectKeys = useOrbitSelector((s) => s.hiddenProjectKeys);
@@ -119,14 +145,33 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
   const [expandedMoreProjects, setExpandedMoreProjects] = useState<Record<string, boolean>>({});
   const [renamingThreadKey, setRenamingThreadKey] = useState<string | null>(null);
+  const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
+  const [projectRenameDraft, setProjectRenameDraft] = useState("");
+  const projectRenameCancelledRef = useRef(false);
   const [renamingWorkspaceId, setRenamingWorkspaceId] = useState<string | null>(null);
   const [workspaceRenameDraft, setWorkspaceRenameDraft] = useState("");
-  const [archivedOpen, setArchivedOpen] = useState(false);
   const [convMenu, setConvMenu] = useState<ActiveConversationMenuState | null>(null);
   const [projMenu, setProjMenu] = useState<ActiveProjectMenuState | null>(null);
   const [wsMenu, setWsMenu] = useState<ActiveWorkspaceMenuState | null>(null);
   const [createWsTarget, setCreateWsTarget] = useState<CreateWorkspaceDialogTarget | null>(null);
   const [dragOverDropId, setDragOverDropId] = useState<string | null>(null);
+  const [draggingThread, setDraggingThread] = useState<{
+    hostId: string;
+    projectId: string;
+    agentId: string;
+    title: string;
+    scopeKey: string;
+    workspaceId: string | null;
+    clientX: number;
+    clientY: number;
+  } | null>(null);
+  const [threadDropIndicator, setThreadDropIndicator] = useState<{
+    scopeKey: string;
+    targetAgentId: string;
+    position: "before" | "after";
+  } | null>(null);
+  const [deleteConversationTarget, setDeleteConversationTarget] =
+    useState<DeleteConversationTarget | null>(null);
   const [deleteProjectTarget, setDeleteProjectTarget] =
     useState<SidebarProjectGroupView | null>(null);
   const ime = useImeCompositionGuard();
@@ -136,14 +181,288 @@ export const FleetSidebar = memo(function FleetSidebar() {
     position: "before" | "after";
   } | null>(null);
   const projectRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const threadRowRefs = useRef<
+    Map<
+      string,
+      {
+        el: HTMLDivElement;
+        hostId: string;
+        projectId: string;
+        agentId: string;
+        scopeKey: string;
+        workspaceId: string | null;
+      }
+    >
+  >(new Map());
+  const workspaceHeaderRefs = useRef<
+    Map<string, { el: HTMLDivElement; hostId: string; projectId: string; workspaceId: string }>
+  >(new Map());
+  const inboxAreaRefs = useRef<
+    Map<string, { el: HTMLDivElement; hostId: string; projectId: string; scopeKey: string }>
+  >(new Map());
+  const scopeAgentIdsRef = useRef<Map<string, string[]>>(new Map());
   const suppressNextProjectClickRef = useRef(false);
+  const suppressNextThreadClickRef = useRef(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
+  const threadDragCleanupRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     return () => {
       dragCleanupRef.current?.();
+      threadDragCleanupRef.current?.();
     };
   }, []);
+
+  const shouldSuppressThreadClick = useCallback(() => suppressNextThreadClickRef.current, []);
+
+  const startThreadDrag = useCallback(
+    (
+      e: React.PointerEvent<HTMLDivElement>,
+      source: {
+        hostId: string;
+        projectId: string;
+        agentId: string;
+        title: string;
+        scopeKey: string;
+        workspaceId: string | null;
+      },
+    ) => {
+      if (e.button !== 0) return;
+      const targetEl = e.target as HTMLElement | null;
+      if (targetEl?.closest("[data-thread-action]") || targetEl?.tagName === "INPUT") return;
+
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let activeDrag = false;
+
+      type DropTarget =
+        | {
+            kind: "thread";
+            scopeKey: string;
+            workspaceId: string | null;
+            targetAgentId: string;
+            position: "before" | "after";
+          }
+        | { kind: "group"; workspaceId: string }
+        | { kind: "inbox"; projectId: string; scopeKey: string }
+        | null;
+
+      let currentTarget: DropTarget = null;
+
+      const onMove = (ev: PointerEvent) => {
+        if (!activeDrag) {
+          if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 4) return;
+          activeDrag = true;
+          suppressNextThreadClickRef.current = true;
+          document.body.style.cursor = "grabbing";
+        }
+
+        setDraggingThread({
+          ...source,
+          clientX: ev.clientX,
+          clientY: ev.clientY,
+        });
+
+        let best: DropTarget = null;
+
+        // 1. Check Curated Group headers in the same project (drop into group)
+        for (const wsEntry of workspaceHeaderRefs.current.values()) {
+          if (
+            wsEntry.hostId !== source.hostId ||
+            wsEntry.projectId !== source.projectId ||
+            wsEntry.workspaceId === source.workspaceId
+          ) {
+            continue;
+          }
+          const rect = wsEntry.el.getBoundingClientRect();
+          if (
+            ev.clientX >= rect.left - 8 &&
+            ev.clientX <= rect.right + 16 &&
+            ev.clientY >= rect.top - 2 &&
+            ev.clientY <= rect.bottom + 2
+          ) {
+            best = { kind: "group", workspaceId: wsEntry.workspaceId };
+            break;
+          }
+        }
+
+        // 2. Check Thread rows in the same project (reorder or cross-group insert at exact slot)
+        if (!best) {
+          const sameScopeEntries: {
+            entry: {
+              el: HTMLDivElement;
+              hostId: string;
+              projectId: string;
+              agentId: string;
+              scopeKey: string;
+              workspaceId: string | null;
+            };
+            rect: DOMRect;
+          }[] = [];
+
+          for (const entry of threadRowRefs.current.values()) {
+            if (entry.hostId !== source.hostId || entry.projectId !== source.projectId) {
+              continue;
+            }
+            const rect = entry.el.getBoundingClientRect();
+            if (rect.height === 0) continue;
+            if (entry.scopeKey === source.scopeKey) {
+              sameScopeEntries.push({ entry, rect });
+            }
+            if (ev.clientY >= rect.top - 4 && ev.clientY <= rect.bottom + 4) {
+              if (entry.agentId !== source.agentId) {
+                best = {
+                  kind: "thread",
+                  scopeKey: entry.scopeKey,
+                  workspaceId: entry.workspaceId,
+                  targetAgentId: entry.agentId,
+                  position: ev.clientY < rect.top + rect.height / 2 ? "before" : "after",
+                };
+              }
+              break;
+            }
+          }
+
+          // Edge snap: if dragging slightly above first or below last thread in the same scope
+          if (!best && sameScopeEntries.length > 1) {
+            sameScopeEntries.sort((a, b) => a.rect.top - b.rect.top);
+            const first = sameScopeEntries[0];
+            const last = sameScopeEntries[sameScopeEntries.length - 1];
+            if (
+              ev.clientY < first.rect.top &&
+              ev.clientY >= first.rect.top - 28 &&
+              first.entry.agentId !== source.agentId
+            ) {
+              best = {
+                kind: "thread",
+                scopeKey: first.entry.scopeKey,
+                workspaceId: first.entry.workspaceId,
+                targetAgentId: first.entry.agentId,
+                position: "before",
+              };
+            } else if (
+              ev.clientY > last.rect.bottom &&
+              ev.clientY <= last.rect.bottom + 28 &&
+              last.entry.agentId !== source.agentId
+            ) {
+              best = {
+                kind: "thread",
+                scopeKey: last.entry.scopeKey,
+                workspaceId: last.entry.workspaceId,
+                targetAgentId: last.entry.agentId,
+                position: "after",
+              };
+            }
+          }
+        }
+
+        // 3. Check Unclassified inbox area (ungroup when dragging out of a curated group)
+        if (!best && source.workspaceId !== null) {
+          for (const inboxEntry of inboxAreaRefs.current.values()) {
+            if (inboxEntry.hostId !== source.hostId || inboxEntry.projectId !== source.projectId) {
+              continue;
+            }
+            const rect = inboxEntry.el.getBoundingClientRect();
+            if (
+              ev.clientY >= rect.top - 4 &&
+              ev.clientY <= rect.bottom + 12 &&
+              ev.clientX <= rect.right + 24
+            ) {
+              best = {
+                kind: "inbox",
+                projectId: inboxEntry.projectId,
+                scopeKey: inboxEntry.scopeKey,
+              };
+              break;
+            }
+          }
+        }
+
+        currentTarget = best;
+
+        if (best?.kind === "thread") {
+          setDragOverDropId(null);
+          setThreadDropIndicator({
+            scopeKey: best.scopeKey,
+            targetAgentId: best.targetAgentId,
+            position: best.position,
+          });
+        } else if (best?.kind === "group") {
+          setThreadDropIndicator(null);
+          setDragOverDropId(`ws:${best.workspaceId}`);
+        } else if (best?.kind === "inbox") {
+          setThreadDropIndicator(null);
+          setDragOverDropId(`inbox:${best.projectId}`);
+        } else {
+          setThreadDropIndicator(null);
+          setDragOverDropId(null);
+        }
+      };
+
+      const finish = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        threadDragCleanupRef.current = null;
+        document.body.style.cursor = "";
+
+        if (activeDrag) {
+          setDraggingThread(null);
+          setThreadDropIndicator(null);
+          setDragOverDropId(null);
+
+          if (currentTarget?.kind === "thread") {
+            const fullIds = scopeAgentIdsRef.current.get(currentTarget.scopeKey) ?? [];
+            const orderedIds = fullIds.filter((id) => id !== source.agentId);
+            let toIdx = orderedIds.indexOf(currentTarget.targetAgentId);
+            if (toIdx >= 0) {
+              if (currentTarget.position === "after") toIdx += 1;
+              orderedIds.splice(toIdx, 0, source.agentId);
+            } else {
+              orderedIds.unshift(source.agentId);
+            }
+
+            if (source.workspaceId !== currentTarget.workspaceId) {
+              if (currentTarget.workspaceId) {
+                void orbitActions.moveAgentToWorkspace(
+                  source.hostId,
+                  source.agentId,
+                  currentTarget.workspaceId,
+                );
+              } else {
+                void orbitActions.moveAgentToWorkspace(source.hostId, source.agentId, null, {
+                  makeUnclassified: true,
+                });
+              }
+            }
+
+            orbitActions.reorderThreads(currentTarget.scopeKey, orderedIds);
+          } else if (currentTarget?.kind === "group") {
+            void orbitActions.moveAgentToWorkspace(
+              source.hostId,
+              source.agentId,
+              currentTarget.workspaceId,
+            );
+          } else if (currentTarget?.kind === "inbox") {
+            void orbitActions.moveAgentToWorkspace(source.hostId, source.agentId, null, {
+              makeUnclassified: true,
+            });
+          }
+
+          window.setTimeout(() => {
+            suppressNextThreadClickRef.current = false;
+          }, 80);
+        }
+      };
+
+      threadDragCleanupRef.current?.();
+      threadDragCleanupRef.current = finish;
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [],
+  );
 
   const nowMs = useSidebarRelativeClock(sidebarOpen);
   const isMac = isMacDesktop();
@@ -282,16 +601,6 @@ export const FleetSidebar = memo(function FleetSidebar() {
         matchesProjectDirectory(proj.directories, selectedWorkspaceCwd);
 
       const hasCuratedWorkspaces = (proj.workspaces ?? []).some((w) => w.is_curated !== false);
-      if (
-        proj.conversations.length === 0 &&
-        !hasCuratedWorkspaces &&
-        !proj.pinned_project_id &&
-        hiddenProjectKeys[projectPathScopeKey(proj.host_id, proj.primary_cwd)] &&
-        !isActiveTarget
-      ) {
-        continue;
-      }
-
       const detail = hostDetails[proj.host_id];
       const agentsById = new Map((detail?.agents ?? []).map((a) => [a.agent_id, a]));
 
@@ -307,6 +616,16 @@ export const FleetSidebar = memo(function FleetSidebar() {
         }
         return true;
       });
+
+      if (
+        proj.conversations.length === 0 &&
+        !hasCuratedWorkspaces &&
+        !proj.pinned_project_id &&
+        hiddenProjectKeys[projectPathScopeKey(proj.host_id, proj.primary_cwd)] &&
+        !isActiveTarget
+      ) {
+        continue;
+      }
 
       const allArchived =
         proj.conversations.length > 0 && visibleConversations.length === 0;
@@ -332,46 +651,49 @@ export const FleetSidebar = memo(function FleetSidebar() {
     selectedWorkspaceCwd,
   ]);
 
-  // 4. Restorable Archived Conversations (synced from Daemon `archived_at` + local drawer state)
-  const archivedEntries = useMemo(() => {
+  // 4. Archived conversation count (full management lives in Settings -> Archived)
+  const archivedCount = useMemo(() => {
     const seen = new Set<string>();
-    const entries: {
-      key: string;
-      hostId: string;
-      agent: AgentCardView;
-      projectName: string;
-      effectiveTitle: string;
-      archivedAtMs: number;
-    }[] = [];
-
     for (const [hostId, detail] of Object.entries(hostDetails)) {
       for (const ag of detail.agents) {
         if (ag.background) continue;
         const tKey = threadScopeKey(hostId, ag.agent_id);
-        const localMeta = archivedThreads[tKey];
-        if (!ag.archived_at_rfc3339 && !localMeta) continue;
-        if (seen.has(tKey)) continue;
+        if (!ag.archived_at_rfc3339 && !archivedThreads[tKey]) continue;
         seen.add(tKey);
-        const matchedProj = rawProjects.find(
-          (p) => p.host_id === hostId && matchesProjectDirectory(p.directories, ag.cwd),
-        );
-        const archivedAtMs = ag.archived_at_rfc3339
-          ? Date.parse(ag.archived_at_rfc3339) || Date.now()
-          : (localMeta?.archivedAtMs ?? Date.now());
-        entries.push({
-          key: tKey,
-          hostId,
-          agent: ag,
-          projectName: matchedProj?.name || basenameOfProjectPath(ag.cwd),
-          effectiveTitle: threadCustomTitles[tKey] || ag.title,
-          archivedAtMs,
-        });
       }
     }
+    return seen.size;
+  }, [archivedThreads, hostDetails]);
 
-    entries.sort((a, b) => b.archivedAtMs - a.archivedAtMs);
-    return entries;
-  }, [archivedThreads, hostDetails, rawProjects, threadCustomTitles]);
+  const fleetHealth = useMemo(() => {
+    let online = 0;
+    let connecting = 0;
+    let offline = 0;
+    for (const h of fleet.hosts) {
+      if (h.connection_state === "online_direct" || h.connection_state === "online_relay") {
+        online += 1;
+      } else if (
+        h.connection_state === "connecting_direct" ||
+        h.connection_state === "connecting_relay"
+      ) {
+        connecting += 1;
+      } else {
+        offline += 1;
+      }
+    }
+    return {
+      total: fleet.hosts.length,
+      online,
+      connecting,
+      offline,
+      showFooterPill: fleet.hosts.length > 1 || offline > 0 || connecting > 0,
+    };
+  }, [fleet.hosts]);
+
+  const anyProjectExpanded = useMemo(
+    () => displayProjects.some(({ project }) => !collapsedProjectIds[project.id]),
+    [displayProjects, collapsedProjectIds],
+  );
 
   const isAutomationsActive = workspacePanel === "automations";
   const hasFilterActive = sidebarThreadFilter === "active_unread";
@@ -536,50 +858,154 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   align="start"
                   sideOffset={6}
                   finalFocus={false}
-                  className="w-52 p-1.5"
+                  className="w-[200px] rounded-[12px] p-1"
                 >
-                  <DropdownMenuLabel>Sort Workspaces &amp; Threads</DropdownMenuLabel>
+                  <DropdownMenuLabel className="text-muted-foreground/70 px-2 pt-1 pb-0.5 text-[11px] font-medium">
+                    Sort by
+                  </DropdownMenuLabel>
                   <DropdownMenuItem
                     onSelect={() => orbitActions.setSidebarViewPrefs({ projectSort: "recent" })}
+                    className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
                   >
-                    <span>Recent activity</span>
-                    {sidebarProjectSort !== "alphabetical" && (
-                      <Check className="h-[13.5px] w-[13.5px] shrink-0" />
+                    <span className="flex min-w-0 items-center gap-2">
+                      <Clock
+                        className={cn(
+                          "h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]",
+                          sidebarProjectSort === "recent"
+                            ? "text-foreground/80"
+                            : "text-muted-foreground",
+                        )}
+                      />
+                      <span className="truncate">Recent</span>
+                    </span>
+                    {sidebarProjectSort === "recent" && (
+                      <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
                     )}
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={() =>
                       orbitActions.setSidebarViewPrefs({ projectSort: "alphabetical" })
                     }
+                    className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
                   >
-                    <span>Alphabetical</span>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <ArrowDownAZ
+                        className={cn(
+                          "h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]",
+                          sidebarProjectSort === "alphabetical"
+                            ? "text-foreground/80"
+                            : "text-muted-foreground",
+                        )}
+                      />
+                      <span className="truncate">Name</span>
+                    </span>
                     {sidebarProjectSort === "alphabetical" && (
-                      <Check className="h-[13.5px] w-[13.5px] shrink-0" />
+                      <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
                     )}
                   </DropdownMenuItem>
-                  <div className="text-muted-foreground/70 px-2.5 pt-0.5 pb-1 text-[10.5px] leading-snug">
-                    Projects stay in manual order (drag to reorder)
-                  </div>
+                  <DropdownMenuItem
+                    onSelect={() => orbitActions.setSidebarViewPrefs({ projectSort: "manual" })}
+                    className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
+                  >
+                    <span className="flex min-w-0 items-center gap-2">
+                      <ArrowUpDown
+                        className={cn(
+                          "h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]",
+                          sidebarProjectSort === "manual"
+                            ? "text-foreground/80"
+                            : "text-muted-foreground",
+                        )}
+                      />
+                      <span className="truncate">Custom</span>
+                    </span>
+                    {sidebarProjectSort === "manual" && (
+                      <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
+                    )}
+                  </DropdownMenuItem>
 
-                  <DropdownMenuSeparator />
+                  <DropdownMenuSeparator className="my-1" />
 
-                  <DropdownMenuLabel>Show Conversations</DropdownMenuLabel>
+                  <DropdownMenuLabel className="text-muted-foreground/70 px-2 pt-0.5 pb-0.5 text-[11px] font-medium">
+                    Show
+                  </DropdownMenuLabel>
                   <DropdownMenuItem
                     onSelect={() => orbitActions.setSidebarViewPrefs({ threadFilter: "all" })}
+                    className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
                   >
-                    <span>All conversations</span>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <List
+                        className={cn(
+                          "h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]",
+                          sidebarThreadFilter === "all"
+                            ? "text-foreground/80"
+                            : "text-muted-foreground",
+                        )}
+                      />
+                      <span className="truncate">All</span>
+                    </span>
                     {sidebarThreadFilter === "all" && (
-                      <Check className="h-[13.5px] w-[13.5px] shrink-0" />
+                      <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
                     )}
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={() =>
                       orbitActions.setSidebarViewPrefs({ threadFilter: "active_unread" })
                     }
+                    className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
                   >
-                    <span>Active & unread</span>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <CircleDot
+                        className={cn(
+                          "h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]",
+                          sidebarThreadFilter === "active_unread"
+                            ? "text-foreground/80"
+                            : "text-muted-foreground",
+                        )}
+                      />
+                      <span className="truncate">Active &amp; unread</span>
+                    </span>
                     {sidebarThreadFilter === "active_unread" && (
-                      <Check className="h-[13.5px] w-[13.5px] shrink-0" />
+                      <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
+                    )}
+                  </DropdownMenuItem>
+
+                  <DropdownMenuSeparator className="my-1" />
+
+                  {displayProjects.length > 1 && (
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        orbitActions.setAllProjectsCollapsed(
+                          displayProjects.map(({ project }) => project.id),
+                          anyProjectExpanded,
+                        );
+                      }}
+                      className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
+                    >
+                      <span className="flex min-w-0 items-center gap-2">
+                        {anyProjectExpanded ? (
+                          <ChevronsDownUp className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                        ) : (
+                          <ChevronsUpDown className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                        )}
+                        <span className="truncate">
+                          {anyProjectExpanded ? "Collapse all" : "Expand all"}
+                        </span>
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+
+                  <DropdownMenuItem
+                    onSelect={() => orbitActions.openSettings("archived")}
+                    className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
+                  >
+                    <span className="flex min-w-0 items-center gap-2">
+                      <Archive className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                      <span className="truncate">Archived</span>
+                    </span>
+                    {archivedCount > 0 && (
+                      <span className="text-muted-foreground/70 shrink-0 text-[11px] tabular-nums">
+                        {archivedCount}
+                      </span>
                     )}
                   </DropdownMenuItem>
                 </DropdownMenuContent>
@@ -588,6 +1014,21 @@ export const FleetSidebar = memo(function FleetSidebar() {
               <AddProjectButton hosts={fleet.hosts} />
             </div>
           </div>
+
+          {hasFilterActive && (
+            <div className="flex h-[24px] items-center justify-between gap-2 px-2 text-[11.5px]">
+              <span className="text-sky-600 dark:text-sky-400 truncate font-medium">
+                Showing active &amp; unread
+              </span>
+              <button
+                type="button"
+                onClick={() => orbitActions.setSidebarViewPrefs({ threadFilter: "all" })}
+                className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer transition-colors"
+              >
+                Reset
+              </button>
+            </div>
+          )}
 
           {!fleetHydrated && fleet.hosts.length === 0 ? null : fleet.hosts.length === 0 ? (
             <div className="text-muted-foreground mx-1 mt-1 space-y-2.5 rounded-xl border border-dashed p-4 text-center text-[13px]">
@@ -719,13 +1160,26 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
                 const visibleIdSet = new Set(visibleConversations.map((c) => c.agent.agent_id));
 
+                const normProjRoot = normalizeProjectPath(proj.primary_cwd);
+                const projThreadScopeKey = `proj:${proj.host_id}::${normProjRoot}`;
+                const useManualThreadOrder = sidebarProjectSort === "manual";
+
                 // 1. ALL Curated Mission Workspaces (including empty 0-agent & 1-agent curated workspaces!)
                 const curatedWorkspaces = (proj.workspaces ?? [])
                   .filter((ws) => ws.is_curated !== false)
-                  .map((ws) => ({
-                    ...ws,
-                    visiblePeers: ws.conversations.filter((c) => visibleIdSet.has(c.agent.agent_id)),
-                  }));
+                  .map((ws) => {
+                    const wsScopeKey = `ws:${proj.host_id}::${ws.workspace_id}`;
+                    const filteredPeers = ws.conversations.filter((c) =>
+                      visibleIdSet.has(c.agent.agent_id),
+                    );
+                    return {
+                      ...ws,
+                      threadScopeKey: wsScopeKey,
+                      visiblePeers: useManualThreadOrder
+                        ? applyManualThreadOrder(filteredPeers, threadManualOrder[wsScopeKey])
+                        : filteredPeers,
+                    };
+                  });
                 const curatedAgentIdSet = new Set<string>();
                 for (const ws of curatedWorkspaces) {
                   for (const c of ws.visiblePeers) {
@@ -734,12 +1188,15 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 }
 
                 // 2. Unclassified (`待归类`) conversations
-                const unclassifiedConversations =
+                const rawUnclassified =
                   proj.unclassified_conversations !== undefined
                     ? proj.unclassified_conversations.filter((c) =>
                         visibleIdSet.has(c.agent.agent_id),
                       )
                     : visibleConversations.filter((c) => !curatedAgentIdSet.has(c.agent.agent_id));
+                const unclassifiedConversations = useManualThreadOrder
+                  ? applyManualThreadOrder(rawUnclassified, threadManualOrder[projThreadScopeKey])
+                  : rawUnclassified;
 
                 const selectedUnclassifiedIdx = unclassifiedConversations.findIndex(
                   (c) =>
@@ -760,7 +1217,6 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   ? unclassifiedConversations
                   : unclassifiedConversations.slice(0, MAX_VISIBLE_CONVERSATIONS_PER_PROJECT);
 
-                const normProjRoot = normalizeProjectPath(proj.primary_cwd);
                 const organizeEvent =
                   hostDetails[proj.host_id]?.workspace_organize_status?.[normProjRoot] ??
                   hostDetails[proj.host_id]?.workspace_organize_status?.[proj.primary_cwd] ??
@@ -769,20 +1225,62 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 const hasProjectBody =
                   curatedWorkspaces.length > 0 || slicedUnclassified.length > 0;
 
-                const parseDraggedAgent = (
-                  e: React.DragEvent,
-                ): { hostId: string; agentId: string } | null => {
-                  const raw = e.dataTransfer.getData("application/x-orbit-agent");
-                  if (!raw) return null;
-                  try {
-                    const parsed = JSON.parse(raw) as { hostId?: string; agentId?: string };
-                    if (parsed.hostId === proj.host_id && parsed.agentId) {
-                      return { hostId: parsed.hostId, agentId: parsed.agentId };
-                    }
-                  } catch {
-                    // ignore invalid drop payload
-                  }
-                  return null;
+                // Keep latest full scope orders synced for pointer-drop handlers
+                scopeAgentIdsRef.current.set(
+                  projThreadScopeKey,
+                  unclassifiedConversations.map((c) => c.agent.agent_id),
+                );
+                for (const ws of curatedWorkspaces) {
+                  scopeAgentIdsRef.current.set(
+                    ws.threadScopeKey,
+                    ws.visiblePeers.map((c) => c.agent.agent_id),
+                  );
+                }
+
+                const makeThreadPointerProps = (
+                  scopeKey: string,
+                  workspaceId: string | null,
+                  agentId: string,
+                  title: string,
+                ) => {
+                  const refKey = `${proj.host_id}::${agentId}`;
+                  return {
+                    rowRef: (el: HTMLDivElement | null) => {
+                      if (el) {
+                        threadRowRefs.current.set(refKey, {
+                          el,
+                          hostId: proj.host_id,
+                          projectId: proj.id,
+                          agentId,
+                          scopeKey,
+                          workspaceId,
+                        });
+                      } else {
+                        const existing = threadRowRefs.current.get(refKey);
+                        if (existing && existing.scopeKey === scopeKey) {
+                          threadRowRefs.current.delete(refKey);
+                        }
+                      }
+                    },
+                    isDragging:
+                      draggingThread?.hostId === proj.host_id &&
+                      draggingThread?.agentId === agentId,
+                    dropIndicator:
+                      threadDropIndicator?.scopeKey === scopeKey &&
+                      threadDropIndicator.targetAgentId === agentId
+                        ? threadDropIndicator.position
+                        : null,
+                    shouldSuppressClick: shouldSuppressThreadClick,
+                    onThreadPointerDown: (e: React.PointerEvent<HTMLDivElement>) =>
+                      startThreadDrag(e, {
+                        hostId: proj.host_id,
+                        projectId: proj.id,
+                        agentId,
+                        title,
+                        scopeKey,
+                        workspaceId,
+                      }),
+                  };
                 };
 
                 return (
@@ -802,152 +1300,242 @@ export const FleetSidebar = memo(function FleetSidebar() {
                     )}
 
                     {/* Project Header Row (`30px`, pointer-draggable to reorder) */}
-                    <div
-                      onPointerDown={startProjectDrag}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        setProjMenu({
-                          project: proj,
-                          host,
-                          anchor: {
-                            left: e.clientX,
-                            top: e.clientY,
-                            width: 1,
-                            height: 1,
-                          },
-                        });
-                      }}
-                      className="group/proj text-foreground/85 hover:text-foreground flex h-[30px] items-center justify-between gap-1.5 rounded-[8px] px-2 transition-colors hover:bg-black/[0.035] dark:hover:bg-white/[0.045]"
-                    >
-                      <button
-                        type="button"
-                        title={`${proj.primary_cwd}${displayProjects.length > 1 ? " · Drag to reorder" : ""}`}
-                        onClick={() => {
-                          if (suppressNextProjectClickRef.current) return;
-                          orbitActions.toggleProjectCollapsed(proj.id);
-                        }}
-                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-                      >
-                        <span className="text-muted-foreground relative inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
-                          {collapsed ? (
-                            <Folder className="h-[15px] w-[15px] stroke-[1.75] transition-opacity group-hover/proj:opacity-0" />
-                          ) : (
-                            <FolderOpen className="h-[15px] w-[15px] stroke-[1.75] transition-opacity group-hover/proj:opacity-0" />
-                          )}
-                          {collapsed ? (
-                            <ChevronRight className="absolute h-[13.5px] w-[13.5px] opacity-0 transition-opacity group-hover/proj:opacity-90" />
-                          ) : (
-                            <ChevronDown className="absolute h-[13.5px] w-[13.5px] opacity-0 transition-opacity group-hover/proj:opacity-90" />
-                          )}
-                        </span>
+                    {(() => {
+                      const isRenamingThisProj = renamingProjectId === proj.id;
+                      const showRemoteHostTag = !singleHostMode && !isLocalHostCard(host);
+                      const isHostDisconnected =
+                        !singleHostMode && host.connection_state === "disconnected";
+                      const commitProjRename = () => {
+                        if (projectRenameCancelledRef.current) {
+                          projectRenameCancelledRef.current = false;
+                          setRenamingProjectId(null);
+                          return;
+                        }
+                        const clean = projectRenameDraft.trim();
+                        setRenamingProjectId(null);
+                        if (clean && clean !== proj.name) {
+                          void orbitActions.renameProject(proj, clean);
+                        }
+                      };
+                      const projTooltip = [
+                        !singleHostMode ? `${host.display_name} · ${proj.primary_cwd}` : proj.primary_cwd,
+                        displayProjects.length > 1 ? "Drag to reorder" : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ");
 
-                        <span className="truncate text-[13.5px] font-medium">{proj.name}</span>
-
-                        {!singleHostMode && (
-                          <span className="text-muted-foreground/75 ml-0.5 inline-flex shrink-0 items-center gap-1 text-[11.5px]">
-                            <HostStateDot state={host.connection_state} />
-                            <span className="max-w-18 truncate">{host.display_name}</span>
-                          </span>
-                        )}
-                      </button>
-
-                      {/* Right Slot: Collapsed Status Dot at Rest ↔ Project Actions on Hover */}
-                      <div className="flex shrink-0 items-center justify-end">
-                        {(hasCollapsedApproval || hasCollapsedRunning || hasCollapsedUnread) && (
-                          <span
-                            className={cn(
-                              "h-[22px] w-[22px] items-center justify-center",
-                              projMenuOpen ? "hidden" : "inline-flex group-hover/proj:hidden",
-                            )}
-                          >
-                            {hasCollapsedApproval ? (
-                              <span className="h-[6px] w-[6px] rounded-full bg-amber-500" />
-                            ) : hasCollapsedRunning ? (
-                              <OrbitSpinner size={13} className="text-foreground/65" />
-                            ) : (
-                              <span className="h-[6px] w-[6px] rounded-full bg-sky-500" />
-                            )}
-                          </span>
-                        )}
-
+                      return (
                         <div
-                          className={cn(
-                            "items-center gap-0.5",
-                            projMenuOpen ? "inline-flex" : "hidden group-hover/proj:inline-flex",
-                          )}
+                          onPointerDown={isRenamingThisProj ? undefined : startProjectDrag}
+                          onContextMenu={(e) => {
+                            if (isRenamingThisProj) return;
+                            e.preventDefault();
+                            setProjMenu({
+                              project: proj,
+                              host,
+                              anchor: {
+                                left: e.clientX,
+                                top: e.clientY,
+                                width: 1,
+                                height: 1,
+                              },
+                            });
+                          }}
+                          className="group/proj text-foreground/85 hover:text-foreground flex h-[30px] items-center justify-between gap-1.5 rounded-[8px] px-2 transition-colors hover:bg-black/[0.035] dark:hover:bg-white/[0.045]"
                         >
-                          {displayProjects.length > 1 && (
-                            <span
-                              title="Drag to reorder project"
-                              className="text-muted-foreground/60 inline-flex h-[22px] w-[18px] cursor-grab items-center justify-center active:cursor-grabbing"
+                          {isRenamingThisProj ? (
+                            <div className="flex min-w-0 flex-1 items-center gap-2">
+                              <span className="text-muted-foreground inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+                                {collapsed ? (
+                                  <Folder className="h-[15px] w-[15px] stroke-[1.75]" />
+                                ) : (
+                                  <FolderOpen className="h-[15px] w-[15px] stroke-[1.75]" />
+                                )}
+                              </span>
+                              <input
+                                autoFocus
+                                data-proj-action="true"
+                                value={projectRenameDraft}
+                                onFocus={(e) => e.currentTarget.select()}
+                                onChange={(e) => setProjectRenameDraft(e.target.value)}
+                                onBlur={commitProjRename}
+                                {...ime.compositionProps}
+                                onKeyDown={(e) => {
+                                  e.stopPropagation();
+                                  if (ime.shouldIgnoreKeyDown(e)) return;
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    commitProjRename();
+                                  } else if (e.key === "Escape") {
+                                    e.preventDefault();
+                                    projectRenameCancelledRef.current = true;
+                                    setRenamingProjectId(null);
+                                  }
+                                }}
+                                className="bg-background text-foreground ring-foreground/25 -mx-1 h-[22px] min-w-0 flex-1 rounded-[5px] px-1.5 text-[13.5px] font-medium ring-1 outline-none"
+                              />
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              title={projTooltip}
+                              onClick={() => {
+                                if (suppressNextProjectClickRef.current) return;
+                                orbitActions.toggleProjectCollapsed(proj.id);
+                              }}
+                              className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
                             >
-                              <GripVertical className="h-[12.5px] w-[12.5px]" />
-                            </span>
+                              <span className="text-muted-foreground relative inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+                                {collapsed ? (
+                                  <Folder className="h-[15px] w-[15px] stroke-[1.75] transition-opacity group-hover/proj:opacity-0" />
+                                ) : (
+                                  <FolderOpen className="h-[15px] w-[15px] stroke-[1.75] transition-opacity group-hover/proj:opacity-0" />
+                                )}
+                                {collapsed ? (
+                                  <ChevronRight className="absolute h-[13.5px] w-[13.5px] opacity-0 transition-opacity group-hover/proj:opacity-90" />
+                                ) : (
+                                  <ChevronDown className="absolute h-[13.5px] w-[13.5px] opacity-0 transition-opacity group-hover/proj:opacity-90" />
+                                )}
+                              </span>
+
+                              <span className="truncate text-[13.5px] font-medium">
+                                {proj.name}
+                              </span>
+
+                              {showRemoteHostTag && (
+                                <span className="text-muted-foreground/60 ml-0.5 inline-flex shrink-0 items-center gap-1 text-[11px]">
+                                  <HostStateDot state={host.connection_state} />
+                                  <span className="max-w-[72px] truncate">{host.display_name}</span>
+                                </span>
+                              )}
+                            </button>
                           )}
 
-                          {!singleHostMode &&
-                            host.connection_state === "disconnected" && (
+                          {/* Right Slot: Resting Status / Collapsed Count ↔ Compact 2-Action Hover (`⋯` + `+`) */}
+                          {!isRenamingThisProj && (
+                            <div className="flex shrink-0 items-center justify-end">
+                              {isHostDisconnected ? (
+                                <button
+                                  type="button"
+                                  data-proj-action="true"
+                                  title={`Offline · Reconnect ${host.display_name}`}
+                                  onClick={() => {
+                                    void orbitIpc.connectHost(host.host_id);
+                                    void orbitIpc.refreshHost(host.host_id);
+                                  }}
+                                  className={cn(
+                                    "text-muted-foreground/75 hover:text-foreground h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px]",
+                                    projMenuOpen ? "hidden" : "inline-flex group-hover/proj:hidden",
+                                  )}
+                                >
+                                  <RefreshCw className="h-[12.5px] w-[12.5px]" />
+                                </button>
+                              ) : hasCollapsedApproval || hasCollapsedRunning || hasCollapsedUnread ? (
+                                <span
+                                  className={cn(
+                                    "h-[22px] w-[22px] items-center justify-center",
+                                    projMenuOpen ? "hidden" : "inline-flex group-hover/proj:hidden",
+                                  )}
+                                >
+                                  {hasCollapsedApproval ? (
+                                    <span className="h-[6px] w-[6px] rounded-full bg-amber-500" />
+                                  ) : hasCollapsedRunning ? (
+                                    <OrbitSpinner size={13} className="text-foreground/65" />
+                                  ) : (
+                                    <span className="h-[6px] w-[6px] rounded-full bg-sky-500" />
+                                  )}
+                                </span>
+                              ) : collapsed && visibleConversations.length > 0 ? (
+                                <span
+                                  className={cn(
+                                    "text-muted-foreground/45 pr-1 text-[11px] tabular-nums",
+                                    projMenuOpen ? "hidden" : "inline-flex group-hover/proj:hidden",
+                                  )}
+                                >
+                                  {visibleConversations.length}
+                                </span>
+                              ) : null}
+
+                              <div
+                                className={cn(
+                                  "items-center gap-0.5",
+                                  projMenuOpen
+                                    ? "inline-flex"
+                                    : "hidden group-hover/proj:inline-flex",
+                                )}
+                              >
+                                <button
+                                  type="button"
+                                  data-proj-action="true"
+                                  aria-label={`Project options for ${proj.name}`}
+                                  onClick={(e) => {
+                                    const r = e.currentTarget.getBoundingClientRect();
+                                    setProjMenu({
+                                      project: proj,
+                                      host,
+                                      anchor: {
+                                        left: r.left,
+                                        top: r.top,
+                                        width: r.width,
+                                        height: r.height,
+                                      },
+                                    });
+                                  }}
+                                  className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
+                                >
+                                  <MoreHorizontal className="h-[13.5px] w-[13.5px]" />
+                                </button>
+
+                                <button
+                                  type="button"
+                                  data-proj-action="true"
+                                  title={`New conversation in ${proj.name}`}
+                                  onClick={() =>
+                                    orbitActions.startNewThreadDraft(
+                                      proj.host_id,
+                                      proj.primary_cwd,
+                                    )
+                                  }
+                                  className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
+                                >
+                                  <Plus className="h-[14px] w-[14px] stroke-[1.85]" />
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+
+                    {/* Optional Groups + Flat Project Threads (or quiet empty-project CTA) */}
+                    <div
+                      data-open={!collapsed ? "true" : "false"}
+                      className="orbit-collapse-grid"
+                    >
+                      <div className="orbit-collapse-inner">
+                        {!hasProjectBody ? (
+                          <div className="pt-0.5">
+                            {hasFilterActive ? (
+                              <div className="text-muted-foreground/55 flex h-[28px] items-center gap-2.5 px-2 text-[12px]">
+                                <span className="inline-flex h-[16px] w-[16px] shrink-0" />
+                                <span className="truncate">No active or unread threads</span>
+                              </div>
+                            ) : (
                               <button
                                 type="button"
-                                data-proj-action="true"
-                                title={`Reconnect ${host.display_name}`}
-                                onClick={() => {
-                                  void orbitIpc.connectHost(host.host_id);
-                                  void orbitIpc.refreshHost(host.host_id);
-                                }}
-                                className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
+                                onClick={() =>
+                                  orbitActions.startNewThreadDraft(proj.host_id, proj.primary_cwd)
+                                }
+                                className="text-muted-foreground/65 hover:text-foreground flex h-[28px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12.5px] transition-colors hover:bg-black/[0.035] dark:hover:bg-white/[0.045]"
                               >
-                                <RefreshCw className="h-[13px] w-[13px]" />
+                                <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+                                  <Plus className="h-[12.5px] w-[12.5px] stroke-[1.75] opacity-75" />
+                                </span>
+                                <span className="truncate">Start a conversation</span>
                               </button>
                             )}
-
-                          <button
-                            type="button"
-                            data-proj-action="true"
-                            aria-label={`Project options for ${proj.name}`}
-                            onClick={(e) => {
-                              const r = e.currentTarget.getBoundingClientRect();
-                              setProjMenu({
-                                project: proj,
-                                host,
-                                anchor: {
-                                  left: r.left,
-                                  top: r.top,
-                                  width: r.width,
-                                  height: r.height,
-                                },
-                              });
-                            }}
-                            className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
-                          >
-                            <MoreHorizontal className="h-[13.5px] w-[13.5px]" />
-                          </button>
-
-                          <button
-                            type="button"
-                            data-proj-action="true"
-                            title={`New conversation in ${proj.name}`}
-                            onClick={() =>
-                              orbitActions.startNewThreadDraft(
-                                proj.host_id,
-                                proj.primary_cwd,
-                              )
-                            }
-                            className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
-                          >
-                            <Plus className="h-[14px] w-[14px] stroke-[1.85]" />
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Optional Groups + Flat Project Threads */}
-                    {hasProjectBody && (
-                      <div
-                        data-open={!collapsed ? "true" : "false"}
-                        className="orbit-collapse-grid"
-                      >
-                        <div className="orbit-collapse-inner">
+                          </div>
+                        ) : (
                           <div className="space-y-0.5 pt-0.5">
                             {/* 1. Optional Groups (borderless, lightweight collapsible sections — zero chrome when none exist) */}
                             {curatedWorkspaces.map((ws) => {
@@ -974,32 +1562,6 @@ export const FleetSidebar = memo(function FleetSidebar() {
                               return (
                                 <div
                                   key={`ws-${ws.workspace_id}`}
-                                  onDragOver={(e) => {
-                                    if (e.dataTransfer.types.includes("application/x-orbit-agent")) {
-                                      e.preventDefault();
-                                      e.dataTransfer.dropEffect = "move";
-                                      setDragOverDropId(`ws:${ws.workspace_id}`);
-                                    }
-                                  }}
-                                  onDragLeave={(e) => {
-                                    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
-                                      setDragOverDropId((cur) =>
-                                        cur === `ws:${ws.workspace_id}` ? null : cur,
-                                      );
-                                    }
-                                  }}
-                                  onDrop={(e) => {
-                                    e.preventDefault();
-                                    setDragOverDropId(null);
-                                    const dragged = parseDraggedAgent(e);
-                                    if (dragged) {
-                                      void orbitActions.moveAgentToWorkspace(
-                                        dragged.hostId,
-                                        dragged.agentId,
-                                        ws.workspace_id,
-                                      );
-                                    }
-                                  }}
                                   className={cn(
                                     "space-y-0.5 rounded-[8px] transition-colors",
                                     isDropHover &&
@@ -1007,6 +1569,18 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                   )}
                                 >
                                   <div
+                                    ref={(el) => {
+                                      if (el) {
+                                        workspaceHeaderRefs.current.set(ws.workspace_id, {
+                                          el,
+                                          hostId: proj.host_id,
+                                          projectId: proj.id,
+                                          workspaceId: ws.workspace_id,
+                                        });
+                                      } else {
+                                        workspaceHeaderRefs.current.delete(ws.workspace_id);
+                                      }
+                                    }}
                                     onContextMenu={(e) => {
                                       e.preventDefault();
                                       setWsMenu({
@@ -1097,7 +1671,14 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                     )}
 
                                     {!isRenamingThisWs && (
-                                      <div className="hidden shrink-0 items-center gap-0.5 group-hover/ws:flex">
+                                      <div
+                                        className={cn(
+                                          "shrink-0 items-center gap-0.5",
+                                          wsMenu?.workspace.workspace_id === ws.workspace_id
+                                            ? "flex"
+                                            : "hidden group-hover/ws:flex",
+                                        )}
+                                      >
                                         <button
                                           type="button"
                                           aria-label={`Group options for ${ws.title}`}
@@ -1177,6 +1758,12 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                               nowMs={nowMs}
                                               menuOpen={convMenu?.threadKey === tKey}
                                               isRenaming={renamingThreadKey === tKey}
+                                              {...makeThreadPointerProps(
+                                                ws.threadScopeKey,
+                                                ws.workspace_id,
+                                                ag.agent_id,
+                                                effectiveTitle,
+                                              )}
                                               onOpenMenu={handleOpenConvMenu}
                                               onStartRename={handleStartRename}
                                               onFinishRename={handleFinishRename}
@@ -1199,31 +1786,16 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
                             {totalUnclassified > 0 && (
                               <div
-                                onDragOver={(e) => {
-                                  if (e.dataTransfer.types.includes("application/x-orbit-agent")) {
-                                    e.preventDefault();
-                                    e.dataTransfer.dropEffect = "move";
-                                    setDragOverDropId(`inbox:${proj.id}`);
-                                  }
-                                }}
-                                onDragLeave={(e) => {
-                                  if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
-                                    setDragOverDropId((cur) =>
-                                      cur === `inbox:${proj.id}` ? null : cur,
-                                    );
-                                  }
-                                }}
-                                onDrop={(e) => {
-                                  e.preventDefault();
-                                  setDragOverDropId(null);
-                                  const dragged = parseDraggedAgent(e);
-                                  if (dragged) {
-                                    void orbitActions.moveAgentToWorkspace(
-                                      dragged.hostId,
-                                      dragged.agentId,
-                                      null,
-                                      { makeUnclassified: true },
-                                    );
+                                ref={(el) => {
+                                  if (el) {
+                                    inboxAreaRefs.current.set(proj.id, {
+                                      el,
+                                      hostId: proj.host_id,
+                                      projectId: proj.id,
+                                      scopeKey: projThreadScopeKey,
+                                    });
+                                  } else {
+                                    inboxAreaRefs.current.delete(proj.id);
                                   }
                                 }}
                                 className={cn(
@@ -1260,6 +1832,12 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                       nowMs={nowMs}
                                       menuOpen={convMenu?.threadKey === tKey}
                                       isRenaming={renamingThreadKey === tKey}
+                                      {...makeThreadPointerProps(
+                                        projThreadScopeKey,
+                                        null,
+                                        ag.agent_id,
+                                        effectiveTitle,
+                                      )}
                                       onOpenMenu={handleOpenConvMenu}
                                       onStartRename={handleStartRename}
                                       onFinishRename={handleFinishRename}
@@ -1278,37 +1856,37 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                           [proj.id]: true,
                                         }))
                                       }
-                                      className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors"
-                                    >
-                                      <span className="inline-flex h-[16px] w-[16px] shrink-0" />
-                                      <span>Show {hiddenCount} more…</span>
-                                    </button>
-                                  )}
+                                  className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+                                >
+                                  <span className="inline-flex h-[16px] w-[16px] shrink-0" />
+                                  <span>Show {hiddenCount} more…</span>
+                                </button>
+                              )}
 
-                                {hiddenCount > 0 &&
-                                  Boolean(expandedMoreProjects[proj.id]) &&
-                                  selectedUnclassifiedIdx <
-                                    MAX_VISIBLE_CONVERSATIONS_PER_PROJECT && (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setExpandedMoreProjects((prev) => ({
-                                          ...prev,
-                                          [proj.id]: false,
-                                        }))
-                                      }
-                                      className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors"
-                                    >
-                                      <span className="inline-flex h-[16px] w-[16px] shrink-0" />
-                                      <span>Show less</span>
-                                    </button>
-                                  )}
-                              </div>
-                            )}
+                            {hiddenCount > 0 &&
+                              Boolean(expandedMoreProjects[proj.id]) &&
+                              selectedUnclassifiedIdx <
+                                MAX_VISIBLE_CONVERSATIONS_PER_PROJECT && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setExpandedMoreProjects((prev) => ({
+                                      ...prev,
+                                      [proj.id]: false,
+                                    }))
+                                  }
+                                  className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+                                >
+                                  <span className="inline-flex h-[16px] w-[16px] shrink-0" />
+                                  <span>Show less</span>
+                                </button>
+                              )}
                           </div>
-                        </div>
+                        )}
+                          </div>
+                        )}
                       </div>
-                    )}
+                    </div>
 
                     {showDropAfter && (
                       <div className="bg-primary pointer-events-none absolute right-1 -bottom-1 left-1 z-20 h-[2px] rounded-full" />
@@ -1322,113 +1900,80 @@ export const FleetSidebar = memo(function FleetSidebar() {
         </div>
       </ScrollArea>
 
-      {/* 4. Clean Borderless Footer: Settings + Conditional Archived Recovery */}
-      <div className="flex shrink-0 items-center justify-between gap-1 px-2 pt-1 pb-2.5">
+      {/* 4. Ultra-Clean Footer: Settings (`⌘,`) + Conditional Multi-Host Health Pill */}
+      <div className="flex shrink-0 items-center justify-between gap-1 border-t border-black/[0.05] px-2 py-2 dark:border-white/[0.06]">
         <button
           type="button"
           onClick={() => orbitActions.openSettings("general")}
-          className="text-foreground/78 hover:text-foreground flex h-[30px] min-w-0 flex-1 cursor-pointer items-center gap-2.5 rounded-[8px] px-2 text-[13.5px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.055]"
+          className="group/settings text-foreground/78 hover:text-foreground flex h-[30px] min-w-0 flex-1 cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-[13.5px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.055]"
         >
-          <span className="relative inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
-            {isFleetUpdating ? (
-              <OrbitSpinner size={14} className="text-sky-500" />
-            ) : (
-              <Settings className="h-[15.5px] w-[15.5px] stroke-[1.75] opacity-80" />
-            )}
-            {!isFleetUpdating && hasFleetUpdatesAvailable && (
-              <span
-                aria-label="Update available"
-                className="absolute -top-0.5 -right-0.5 h-[6px] w-[6px] rounded-full bg-sky-500"
-              />
-            )}
+          <span className="flex min-w-0 items-center gap-2.5">
+            <span className="relative inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+              {isFleetUpdating ? (
+                <OrbitSpinner size={14} className="text-sky-500" />
+              ) : (
+                <Settings className="h-[15.5px] w-[15.5px] stroke-[1.75] opacity-80" />
+              )}
+              {!isFleetUpdating && hasFleetUpdatesAvailable && (
+                <span
+                  aria-label="Update available"
+                  className="absolute -top-0.5 -right-0.5 h-[6px] w-[6px] rounded-full bg-sky-500"
+                />
+              )}
+            </span>
+            <span className="truncate">Settings</span>
           </span>
-          <span className="truncate">Settings</span>
-          {!isFleetUpdating && hasFleetUpdatesAvailable && (
-            <span className="ml-auto shrink-0 rounded-full bg-sky-500/12 px-1.5 py-0.5 text-[10px] font-medium text-sky-600 dark:text-sky-400">
+
+          {!isFleetUpdating && hasFleetUpdatesAvailable ? (
+            <span className="shrink-0 rounded-full bg-sky-500/12 px-1.5 py-0.5 text-[10px] font-medium text-sky-600 dark:text-sky-400">
               Update
+            </span>
+          ) : (
+            <span className="text-muted-foreground/55 shrink-0 text-[11.5px] opacity-0 transition-opacity group-hover/settings:opacity-100">
+              {mod},
             </span>
           )}
         </button>
 
-        {archivedEntries.length > 0 && (
-          <Popover open={archivedOpen} onOpenChange={setArchivedOpen}>
-            <SimpleTooltip label={`Archived (${archivedEntries.length})`}>
-              <PopoverTrigger asChild>
-                <button
-                  type="button"
-                  aria-label="Archived conversations"
-                  className="text-muted-foreground hover:text-foreground inline-flex h-[30px] w-[30px] shrink-0 cursor-pointer items-center justify-center rounded-[8px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.055]"
-                >
-                  <Archive className="h-[14.5px] w-[14.5px] stroke-[1.75]" />
-                </button>
-              </PopoverTrigger>
-            </SimpleTooltip>
-
-            <PopoverContent
-              side="top"
-              align="start"
-              sideOffset={8}
-              finalFocus={false}
-              className="w-72 space-y-1.5 p-2 select-none"
+        {fleetHealth.showFooterPill && (
+          <SimpleTooltip
+            label={
+              fleetHealth.total > 1
+                ? `${fleetHealth.online} of ${fleetHealth.total} hosts online · Manage hosts`
+                : fleetHealth.connecting > 0
+                  ? "Connecting to host… · Manage hosts"
+                  : "Host offline · Manage hosts"
+            }
+          >
+            <button
+              type="button"
+              aria-label="Manage hosts"
+              onClick={() => orbitActions.openSettings("hosts")}
+              className="text-muted-foreground hover:text-foreground inline-flex h-[28px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] px-2 text-[11.5px] tabular-nums transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.055]"
             >
-              <div className="text-muted-foreground flex items-center justify-between px-2 pt-0.5 text-[12px] font-medium">
-                <span>Archived Conversations</span>
-                <span className="tabular-nums">{archivedEntries.length}</span>
-              </div>
-
-              <ScrollArea viewportClassName="max-h-60">
-                <div className="space-y-0.5">
-                  {archivedEntries.map((item) => (
-                    <div
-                      key={item.key}
-                      onClick={() => {
-                        orbitActions.restoreArchivedThread(item.hostId, item.agent.agent_id);
-                        setArchivedOpen(false);
-                      }}
-                      className="group/arch hover:bg-accent flex h-[32px] cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-[13px] transition-colors"
-                    >
-                      <div className="flex min-w-0 flex-1 items-center gap-2">
-                        <span className="text-foreground truncate">{item.effectiveTitle}</span>
-                        <span className="text-muted-foreground/70 max-w-20 shrink-0 truncate text-[11.5px]">
-                          {item.projectName}
-                        </span>
-                      </div>
-
-                      <div
-                        className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/arch:opacity-100"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <button
-                          type="button"
-                          title="Restore conversation"
-                          onClick={() => {
-                            orbitActions.restoreArchivedThread(item.hostId, item.agent.agent_id);
-                          }}
-                          className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
-                        >
-                          <RotateCcw className="h-[13px] w-[13px] stroke-[1.75]" />
-                        </button>
-
-                        <button
-                          type="button"
-                          title="Delete permanently"
-                          onClick={() => {
-                            void orbitActions.deleteThreadPermanently(
-                              item.hostId,
-                              item.agent.agent_id,
-                            );
-                          }}
-                          className="inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] text-rose-600/80 hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-400/80 dark:hover:text-rose-400"
-                        >
-                          <Trash2 className="h-[13px] w-[13px] stroke-[1.75]" />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </ScrollArea>
-            </PopoverContent>
-          </Popover>
+              {fleetHealth.connecting > 0 ? (
+                <OrbitSpinner size={11} className="text-amber-500" />
+              ) : (
+                <span
+                  className={cn(
+                    "h-[6px] w-[6px] rounded-full",
+                    fleetHealth.online === fleetHealth.total
+                      ? "bg-emerald-500"
+                      : fleetHealth.online > 0
+                        ? "bg-amber-500"
+                        : "bg-zinc-400/80",
+                  )}
+                />
+              )}
+              <span>
+                {fleetHealth.total > 1
+                  ? `${fleetHealth.online}/${fleetHealth.total}`
+                  : fleetHealth.connecting > 0
+                    ? "Sync"
+                    : "Offline"}
+              </span>
+            </button>
+          </SimpleTooltip>
         )}
       </div>
 
@@ -1438,11 +1983,17 @@ export const FleetSidebar = memo(function FleetSidebar() {
         onClose={handleCloseConvMenu}
         onStartRename={handleStartRename}
         onRequestCreateWorkspace={setCreateWsTarget}
+        onRequestDelete={setDeleteConversationTarget}
       />
       <SharedProjectMenu
         target={projMenu}
         isMac={isMac}
         onClose={handleCloseProjMenu}
+        onStartRenameProject={(proj) => {
+          projectRenameCancelledRef.current = false;
+          setProjectRenameDraft(proj.name);
+          setRenamingProjectId(proj.id);
+        }}
         onRequestDelete={setDeleteProjectTarget}
         onRequestCreateWorkspace={setCreateWsTarget}
       />
@@ -1461,11 +2012,28 @@ export const FleetSidebar = memo(function FleetSidebar() {
         target={createWsTarget}
         onClose={() => setCreateWsTarget(null)}
       />
+      <DeleteConversationDialog
+        target={deleteConversationTarget}
+        onClose={() => setDeleteConversationTarget(null)}
+      />
       <DeleteProjectDialog
         project={deleteProjectTarget}
         archivedThreads={archivedThreads}
         onClose={() => setDeleteProjectTarget(null)}
       />
+
+      {/* Pointer-driven floating drag preview (100% compatible with macOS Tauri WKWebView) */}
+      {draggingThread && (
+        <div
+          style={{
+            left: `${draggingThread.clientX + 12}px`,
+            top: `${draggingThread.clientY - 14}px`,
+          }}
+          className="bg-elevated/95 text-foreground floating-surface pointer-events-none fixed z-50 max-w-[210px] truncate rounded-[8px] border border-black/[0.09] px-2.5 py-1 text-[12.5px] font-medium dark:border-white/[0.12]"
+        >
+          {draggingThread.title}
+        </div>
+      )}
     </aside>
   );
 });

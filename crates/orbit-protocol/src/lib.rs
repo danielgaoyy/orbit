@@ -3,12 +3,14 @@
 pub mod acp;
 pub mod artifacts;
 pub mod handoff;
+pub mod instructions;
 pub mod media;
 pub mod orchestration;
 pub mod skills;
 pub use acp::*;
 pub use artifacts::*;
 pub use handoff::*;
+pub use instructions::*;
 pub use media::*;
 pub use orchestration::*;
 pub use skills::*;
@@ -1964,6 +1966,51 @@ pub enum WireMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<Uuid>,
         artifact_id: String,
+    },
+
+    // Project Instruction Hierarchy Discovery & Atomic Editing
+    ListInstructionFiles {
+        request_id: Uuid,
+        cwd: String,
+    },
+    InstructionFilesSnapshot {
+        request_id: Uuid,
+        cwd: String,
+        files: Vec<InstructionFileEntry>,
+        #[serde(default)]
+        total_tokens: u32,
+        #[serde(default)]
+        merged_preview: String,
+    },
+    ReadInstructionFile {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+    },
+    InstructionFileContentResponse {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        etag: Option<String>,
+        exists: bool,
+    },
+    SaveInstructionFile {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
+    },
+    InstructionFileSavedResponse {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        etag: String,
+        size_bytes: u64,
+        approx_tokens: u32,
     },
 
     RpcError {

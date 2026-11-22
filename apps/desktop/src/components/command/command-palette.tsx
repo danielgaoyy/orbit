@@ -2,6 +2,7 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   Clock,
+  FileCode2,
   FolderOpen,
   FolderPlus,
   FolderTree,
@@ -302,6 +303,14 @@ function CommandPaletteDialog() {
         title: "Open Workspace Files Explorer",
         icon: <FolderTree className="size-3.5" />,
         run: () => orbitActions.openFilesExplorerTab(),
+      },
+      {
+        id: "act-project-instructions",
+        section: "Actions",
+        title: "Project Instructions",
+        subtitle: "Inspect & edit CLAUDE.md, AGENTS.md, local overrides, and @imports",
+        icon: <FileCode2 className="size-3.5" />,
+        run: () => orbitActions.openProjectInstructions(),
       },
       {
         id: "act-toggle-diff",

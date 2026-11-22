@@ -4,8 +4,9 @@
 //! - HarmonyOS N-API (`crates/orbit-ffi-ohos`)
 
 use orbit_protocol::{
-    AcpAgentAvailability, ArtifactKind, ForkTarget, NestedGitRepo, PromptBadge, ProviderKind,
-    ReasoningEffort, SessionMode, WorkspaceSummary, WorktreeHandoffDirection, WorktreeHandoffMode,
+    AcpAgentAvailability, ArtifactKind, ForkTarget, InstructionFileEntry, NestedGitRepo,
+    PromptBadge, ProviderKind, ReasoningEffort, SessionMode, WorkspaceSummary,
+    WorktreeHandoffDirection, WorktreeHandoffMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -347,4 +348,57 @@ pub struct UpsertArtifactRequest {
     pub content: String,
     #[serde(default)]
     pub summary_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListInstructionFilesRequest {
+    pub host_id: String,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionFilesSnapshotView {
+    pub host_id: String,
+    pub cwd: String,
+    pub files: Vec<InstructionFileEntry>,
+    pub total_tokens: u32,
+    pub merged_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadInstructionFileRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionFileContentView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveInstructionFileRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub expected_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionFileSavedView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub etag: String,
+    pub size_bytes: u64,
+    pub approx_tokens: u32,
 }

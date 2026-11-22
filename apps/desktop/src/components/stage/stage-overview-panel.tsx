@@ -7,6 +7,7 @@ import {
   CircleCheck,
   Clock,
   File,
+  FileCode2,
   FileDiff,
   FileText,
   MoreHorizontal,
@@ -344,7 +345,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
   const [showAllSubagents, setShowAllSubagents] = useState(false);
   const [showAllTasks, setShowAllTasks] = useState(false);
   const layer1Ref = useRef<HTMLDivElement | null>(null);
-  const [layer1HeightPx, setLayer1HeightPx] = useState(144);
+  const [layer1HeightPx, setLayer1HeightPx] = useState(176);
 
   useLayoutEffect(() => {
     const el = layer1Ref.current;
@@ -360,7 +361,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
     const ro = new ResizeObserver(syncHeight);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [showGroupNotesRow]);
+  }, [showGroupNotesRow, cwd]);
 
   useEffect(() => {
     setShowAllSubagents(false);
@@ -523,6 +524,13 @@ const StageOverviewBody = memo(function StageOverviewBody({
                   </span>
                 ) : undefined
               }
+            />
+          )}
+          {cwd && (
+            <OverviewActionRow
+              icon={FileCode2}
+              label="Instructions"
+              onClick={() => orbitActions.openProjectInstructions({ hostId, cwd })}
             />
           )}
         </div>

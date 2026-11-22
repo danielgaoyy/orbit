@@ -7,6 +7,7 @@ import {
   ChevronsUpDown,
   Cloud,
   Cpu,
+  FileCode2,
   Keyboard,
   Palette,
   Plug,
@@ -21,6 +22,7 @@ import { AppearanceSection } from "@/components/settings/appearance-section";
 import { ArchivedSection } from "@/components/settings/archived-section";
 import { CloudSyncSection } from "@/components/settings/cloud-sync-section";
 import { GeneralSection } from "@/components/settings/general-section";
+import { InstructionsSection } from "@/components/settings/instructions-section";
 import { HostAcpSection } from "@/components/settings/host-acp-section";
 import { HostAgentsSection } from "@/components/settings/host-agents-section";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
@@ -55,12 +57,13 @@ import { cn } from "@/lib/utils";
 const APP_SECTIONS: {
   id: Extract<
     SettingsSection,
-    "general" | "cloud_sync" | "appearance" | "shortcuts" | "notifications" | "archived"
+    "general" | "instructions" | "cloud_sync" | "appearance" | "shortcuts" | "notifications" | "archived"
   >;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   { id: "general", label: "General", icon: Settings2 },
+  { id: "instructions", label: "Instructions", icon: FileCode2 },
   { id: "cloud_sync", label: "Cloud Sync", icon: Cloud },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
@@ -482,33 +485,41 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
         </aside>
 
         {/* Right Scrollable Settings Content */}
-        <ScrollArea className="min-h-0 flex-1" viewportClassName="px-10 py-8">
-          <div key={section} className="orbit-stage-enter mx-auto w-full max-w-[640px] pb-8">
-            {section === "general" && <GeneralSection />}
-            {section === "cloud_sync" && <CloudSyncSection />}
-            {section === "appearance" && <AppearanceSection />}
-            {section === "shortcuts" && <ShortcutsSection />}
-            {section === "notifications" && <NotificationsSection />}
-            {section === "archived" && <ArchivedSection />}
-            {section === "add_host" && <AddHostSection />}
-            {parsedHost && !resolvedHost && <AddHostSection />}
-            {resolvedHost?.tab === "agents" && (
-              <HostAgentsSection hostId={resolvedHost.hostId} />
-            )}
-            {resolvedHost?.tab === "skills" && (
-              <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-            )}
-            {resolvedHost?.tab === "acp" && (
-              <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-            )}
-            {resolvedHost?.tab === "usage" && (
-              <HostUsageSection hostId={resolvedHost.hostId} />
-            )}
-            {resolvedHost?.tab === "connection" && (
-              <HostConnectionSection hostId={resolvedHost.hostId} />
-            )}
+        {section === "instructions" ? (
+          <div className="min-h-0 flex-1 overflow-hidden px-7 py-6">
+            <div key={section} className="orbit-stage-enter h-full w-full">
+              <InstructionsSection />
+            </div>
           </div>
-        </ScrollArea>
+        ) : (
+          <ScrollArea className="min-h-0 flex-1" viewportClassName="px-10 py-8">
+            <div key={section} className="orbit-stage-enter mx-auto w-full max-w-[640px] pb-8">
+              {section === "general" && <GeneralSection />}
+              {section === "cloud_sync" && <CloudSyncSection />}
+              {section === "appearance" && <AppearanceSection />}
+              {section === "shortcuts" && <ShortcutsSection />}
+              {section === "notifications" && <NotificationsSection />}
+              {section === "archived" && <ArchivedSection />}
+              {section === "add_host" && <AddHostSection />}
+              {parsedHost && !resolvedHost && <AddHostSection />}
+              {resolvedHost?.tab === "agents" && (
+                <HostAgentsSection hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "skills" && (
+                <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "acp" && (
+                <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "usage" && (
+                <HostUsageSection hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "connection" && (
+                <HostConnectionSection hostId={resolvedHost.hostId} />
+              )}
+            </div>
+          </ScrollArea>
+        )}
       </div>
     </div>
   );

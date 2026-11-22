@@ -41,10 +41,13 @@ use orbit_client_core::composer::{
 use orbit_client_core::contract::{
     AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, CreateWorkspaceEntryRequest,
     DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, FleetSidebarRequest,
-    ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, MentionRankRequest,
-    ModelSelectionRequest, PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest,
-    RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest, UpsertArtifactRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, InstructionFileContentView,
+    InstructionFileSavedView, InstructionFilesSnapshotView, ListInstructionFilesRequest,
+    MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest,
+    ReadInstructionFileRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest,
+    RenderDiagramView, SaveInstructionFileRequest, SpawnWorkspacePeerRequest,
+    UpsertArtifactRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
@@ -1773,6 +1776,52 @@ async fn delete_workspace_entry(
 }
 
 #[tauri::command]
+async fn list_instruction_files(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<InstructionFilesSnapshotView, String> {
+    state
+        .core
+        .list_instruction_files_on_host(ListInstructionFilesRequest { host_id, cwd })
+        .await
+}
+
+#[tauri::command]
+async fn read_instruction_file(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+) -> Result<InstructionFileContentView, String> {
+    state
+        .core
+        .read_instruction_file_on_host(ReadInstructionFileRequest { host_id, cwd, path })
+        .await
+}
+
+#[tauri::command]
+async fn save_instruction_file(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    content: String,
+    expected_etag: Option<String>,
+) -> Result<InstructionFileSavedView, String> {
+    state
+        .core
+        .save_instruction_file_on_host(SaveInstructionFileRequest {
+            host_id,
+            cwd,
+            path,
+            content,
+            expected_etag,
+        })
+        .await
+}
+
+#[tauri::command]
 async fn highlight_workspace_code(
     language: String,
     content: String,
@@ -2622,6 +2671,9 @@ pub fn run() {
             create_workspace_entry,
             rename_workspace_entry,
             delete_workspace_entry,
+            list_instruction_files,
+            read_instruction_file,
+            save_instruction_file,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

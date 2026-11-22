@@ -46,7 +46,9 @@ use crate::cloud_sync::{
 pub use crate::contract::{
     ConversationSearchHit, CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest,
     ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
-    PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest, UpsertArtifactRequest,
+    InstructionFileContentView, InstructionFileSavedView, InstructionFilesSnapshotView,
+    ListInstructionFilesRequest, PreviewWorktreeHandoffRequest, ReadInstructionFileRequest,
+    RenameWorkspaceEntryRequest, SaveInstructionFileRequest, UpsertArtifactRequest,
     WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
@@ -616,6 +618,12 @@ struct HostMemoryState {
         Uuid,
         tokio::sync::oneshot::Sender<Result<WorkspaceEntryMutationResultView, String>>,
     >,
+    pending_instruction_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<InstructionFilesSnapshotView, String>>>,
+    pending_instruction_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<InstructionFileContentView, String>>>,
+    pending_instruction_saves:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<InstructionFileSavedView, String>>>,
     pending_side_questions:
         HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>>,
     pending_rewinds:
@@ -731,6 +739,9 @@ impl HostMemoryState {
             pending_file_reads: HashMap::new(),
             pending_file_writes: HashMap::new(),
             pending_file_mutations: HashMap::new(),
+            pending_instruction_lists: HashMap::new(),
+            pending_instruction_reads: HashMap::new(),
+            pending_instruction_saves: HashMap::new(),
             pending_side_questions: HashMap::new(),
             pending_rewinds: HashMap::new(),
             pending_forks: HashMap::new(),
@@ -4925,6 +4936,61 @@ impl OrbitAppCore {
                         }));
                     }
                 }
+                WireMessage::InstructionFilesSnapshot {
+                    request_id,
+                    cwd,
+                    files,
+                    total_tokens,
+                    merged_preview,
+                } => {
+                    if let Some(tx) = state.pending_instruction_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(InstructionFilesSnapshotView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            files,
+                            total_tokens,
+                            merged_preview,
+                        }));
+                    }
+                }
+                WireMessage::InstructionFileContentResponse {
+                    request_id,
+                    cwd,
+                    path,
+                    content,
+                    etag,
+                    exists,
+                } => {
+                    if let Some(tx) = state.pending_instruction_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(InstructionFileContentView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            path,
+                            content,
+                            etag,
+                            exists,
+                        }));
+                    }
+                }
+                WireMessage::InstructionFileSavedResponse {
+                    request_id,
+                    cwd,
+                    path,
+                    etag,
+                    size_bytes,
+                    approx_tokens,
+                } => {
+                    if let Some(tx) = state.pending_instruction_saves.remove(&request_id) {
+                        let _ = tx.send(Ok(InstructionFileSavedView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            path,
+                            etag,
+                            size_bytes,
+                            approx_tokens,
+                        }));
+                    }
+                }
                 WireMessage::SideQuestionDelta {
                     request_id,
                     text_delta,
@@ -5032,6 +5098,18 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_file_mutations.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_instruction_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_instruction_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_instruction_saves.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -10525,6 +10603,284 @@ impl OrbitAppCore {
             .block_on(self.delete_workspace_entry_on_host(req))
     }
 
+    /// Discover the full project instruction hierarchy (`CLAUDE.md` / `AGENTS.md` / `AGENTS.override.md` / etc.)
+    /// for `cwd` on any connected host.
+    pub async fn list_instruction_files_on_host(
+        self: &Arc<Self>,
+        req: ListInstructionFilesRequest,
+    ) -> Result<InstructionFilesSnapshotView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to inspect project instructions".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_instruction_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing instructions".to_string()),
+                    None => Some(format!("host `{}` removed", req.host_id)),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::ListInstructionFiles {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_instruction_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to list instruction files: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while listing instructions".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_instruction_lists.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to list project instructions (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "list instructions task cancelled".to_string())?
+    }
+
+    /// Read an allowlisted instruction file on any connected host.
+    pub async fn read_instruction_file_on_host(
+        self: &Arc<Self>,
+        req: ReadInstructionFileRequest,
+    ) -> Result<InstructionFileContentView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to read instruction file".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_instruction_reads.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before reading instruction file".to_string()),
+                    None => Some(format!("host `{}` removed", req.host_id)),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::ReadInstructionFile {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                    path: req.path,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_instruction_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to read instruction file: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while reading instruction file".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_instruction_reads.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to read instruction file (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "read instruction file task cancelled".to_string())?
+    }
+
+    /// Atomically save an allowlisted instruction file on any connected host with optimistic etag concurrency.
+    pub async fn save_instruction_file_on_host(
+        self: &Arc<Self>,
+        req: SaveInstructionFileRequest,
+    ) -> Result<InstructionFileSavedView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to save instruction file".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_instruction_saves.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before saving instruction file".to_string()),
+                    None => Some(format!("host `{}` removed", req.host_id)),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::SaveInstructionFile {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                    path: req.path,
+                    content: req.content,
+                    expected_etag: req.expected_etag,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_instruction_saves.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to save instruction file: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while saving instruction file".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_instruction_saves.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to save instruction file (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "save instruction file task cancelled".to_string())?
+    }
+
+    pub fn list_instruction_files_blocking(
+        self: &Arc<Self>,
+        req: ListInstructionFilesRequest,
+    ) -> Result<InstructionFilesSnapshotView, String> {
+        self.runtime
+            .block_on(self.list_instruction_files_on_host(req))
+    }
+
+    pub fn read_instruction_file_blocking(
+        self: &Arc<Self>,
+        req: ReadInstructionFileRequest,
+    ) -> Result<InstructionFileContentView, String> {
+        self.runtime
+            .block_on(self.read_instruction_file_on_host(req))
+    }
+
+    pub fn save_instruction_file_blocking(
+        self: &Arc<Self>,
+        req: SaveInstructionFileRequest,
+    ) -> Result<InstructionFileSavedView, String> {
+        self.runtime
+            .block_on(self.save_instruction_file_on_host(req))
+    }
+
     pub fn ask_side_question_with_callback<F>(
         self: &Arc<Self>,
         req: AskSideQuestionRequest,
@@ -11446,6 +11802,15 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_file_mutations.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_instruction_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_instruction_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_instruction_saves.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_rewinds.drain() {

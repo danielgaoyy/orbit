@@ -1335,6 +1335,55 @@ export interface WorkspaceEntryMutationResult {
   action: "created_file" | "created_dir" | "renamed" | "deleted" | string;
 }
 
+export type InstructionScope =
+  | "global_user"
+  | "repo_root"
+  | "ancestor_dir"
+  | "workspace_dir"
+  | "local_override";
+
+export interface InstructionFileEntry {
+  id: string;
+  path: string;
+  relative_path: string;
+  filename: string;
+  scope: InstructionScope;
+  provider_hint?: string | null;
+  precedence_order: number;
+  exists: boolean;
+  size_bytes: number;
+  approx_tokens: number;
+  etag?: string | null;
+  preview: string;
+  imports: string[];
+}
+
+export interface InstructionFilesSnapshotView {
+  host_id: string;
+  cwd: string;
+  files: InstructionFileEntry[];
+  total_tokens: number;
+  merged_preview: string;
+}
+
+export interface InstructionFileContentView {
+  host_id: string;
+  cwd: string;
+  path: string;
+  content: string;
+  etag?: string | null;
+  exists: boolean;
+}
+
+export interface InstructionFileSavedView {
+  host_id: string;
+  cwd: string;
+  path: string;
+  etag: string;
+  size_bytes: number;
+  approx_tokens: number;
+}
+
 export type DiagramKind = "mermaid" | "svg" | "graphviz";
 export type DiagramTheme = "light" | "dark";
 
@@ -3363,6 +3412,66 @@ export const orbitIpc = {
       hostId: params.hostId,
       cwd: params.cwd,
       path: params.path,
+    });
+  },
+
+  listInstructionFiles: async (
+    hostId: string,
+    cwd: string,
+  ): Promise<InstructionFilesSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return {
+        host_id: hostId,
+        cwd,
+        files: [],
+        total_tokens: 0,
+        merged_preview: "",
+      };
+    }
+    return invoke<InstructionFilesSnapshotView>("list_instruction_files", {
+      hostId,
+      cwd,
+    });
+  },
+
+  readInstructionFile: async (
+    hostId: string,
+    cwd: string,
+    path: string,
+  ): Promise<InstructionFileContentView> => {
+    if (!isTauriRuntime()) {
+      return {
+        host_id: hostId,
+        cwd,
+        path,
+        content: "",
+        etag: null,
+        exists: false,
+      };
+    }
+    return invoke<InstructionFileContentView>("read_instruction_file", {
+      hostId,
+      cwd,
+      path,
+    });
+  },
+
+  saveInstructionFile: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    content: string;
+    expectedEtag?: string | null;
+  }): Promise<InstructionFileSavedView> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to save instruction files.");
+    }
+    return invoke<InstructionFileSavedView>("save_instruction_file", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      content: params.content,
+      expectedEtag: params.expectedEtag ?? null,
     });
   },
 

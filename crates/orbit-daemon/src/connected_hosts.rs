@@ -556,7 +556,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }
         | WireMessage::WorktreeHandoffExecuted { request_id, .. }
         | WireMessage::ArtifactsSnapshot { request_id, .. }
-        | WireMessage::ArtifactContent { request_id, .. } => Some(*request_id),
+        | WireMessage::ArtifactContent { request_id, .. }
+        | WireMessage::InstructionFilesSnapshot { request_id, .. }
+        | WireMessage::InstructionFileContentResponse { request_id, .. }
+        | WireMessage::InstructionFileSavedResponse { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

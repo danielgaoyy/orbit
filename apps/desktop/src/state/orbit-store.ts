@@ -346,6 +346,7 @@ export type WorkspacePanelMode = "conversation" | "automations";
 export type HostSettingsTab = "agents" | "skills" | "acp" | "usage" | "connection";
 export type SettingsSection =
   | "general"
+  | "instructions"
   | "cloud_sync"
   | "appearance"
   | "shortcuts"
@@ -432,12 +433,18 @@ export interface WorktreeHandoffDialogTarget {
   targetWorkspaceId?: string | null;
 }
 
+export interface InstructionsTarget {
+  hostId: string;
+  cwd: string;
+}
+
 export interface OrbitUiState {
   fleet: FleetOverviewView;
   fleetHydrated: boolean;
   bootstrapError: string | null;
   hostDetails: Record<string, HostDetailView>;
   selectedHostId: string | null;
+  instructionsTarget: InstructionsTarget | null;
   selectedAgentId: string | null;
   selectedWorkspaceCwd: string;
   isDraftNewSession: boolean;
@@ -823,6 +830,7 @@ const defaultInitialState: OrbitUiState = {
   bootstrapError: null,
   hostDetails: {},
   selectedHostId: null,
+  instructionsTarget: null,
   selectedAgentId: null,
   selectedWorkspaceCwd: "",
   isDraftNewSession: false,
@@ -7957,8 +7965,23 @@ export const orbitActions = {
     }));
   },
 
+  openProjectInstructions(target?: InstructionsTarget | null): void {
+    setState((s) => ({
+      ...s,
+      activeView: "settings",
+      settingsSection: "instructions",
+      instructionsTarget: target ?? null,
+      commandPaletteOpen: false,
+      overviewPopoverOpen: false,
+    }));
+  },
+
+  setInstructionsTarget(target: InstructionsTarget | null): void {
+    setState((s) => ({ ...s, instructionsTarget: target }));
+  },
+
   closeSettings(): void {
-    setState((s) => ({ ...s, activeView: "workspace" }));
+    setState((s) => ({ ...s, activeView: "workspace", instructionsTarget: null }));
   },
 
   toggleSettings(section?: SettingsSectionTarget): void {

@@ -15,6 +15,7 @@ pub mod fast_copy;
 pub mod finish_subscriptions;
 pub mod git;
 pub mod idle_cleanup;
+pub mod instructions;
 pub mod keep_awake;
 pub mod manager;
 pub mod mcp;
@@ -75,6 +76,9 @@ use crate::git::{
     read_workspace_file_with_attachments_dir,
 };
 use crate::idle_cleanup::IdleRuntimeCleanup;
+use crate::instructions::{
+    discover_instruction_hierarchy, read_instruction_file, save_instruction_file,
+};
 use crate::keep_awake::KeepAwakeManager;
 use crate::manager::{
     AgentOrchestrator, CreateAgentSpec, CreateWorkspaceSpec, DaemonBroadcast, PtyBroadcast,
@@ -2954,6 +2958,99 @@ async fn handle_wire_rpc(
                         Ok(Err(e)) => rpc_err(request_id, "delete_artifact_failed", e),
                         Err(e) => rpc_err(request_id, "delete_artifact_failed", e),
                     };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Project Instruction Hierarchy Discovery & Atomic Editing
+        WireMessage::ListInstructionFiles { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match discover_instruction_hierarchy(&authorized_cwd).await {
+                            Ok(res) => WireMessage::InstructionFilesSnapshot {
+                                request_id,
+                                cwd,
+                                files: res.files,
+                                total_tokens: res.total_tokens,
+                                merged_preview: res.merged_preview,
+                            },
+                            Err(e) => rpc_err(request_id, e.rpc_code(), e.to_string()),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "instruction_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ReadInstructionFile {
+            request_id,
+            cwd,
+            path,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match read_instruction_file(&authorized_cwd, &path).await
+                    {
+                        Ok(res) => WireMessage::InstructionFileContentResponse {
+                            request_id,
+                            cwd,
+                            path: res.path,
+                            content: res.content,
+                            etag: res.etag,
+                            exists: res.exists,
+                        },
+                        Err(e) => rpc_err(request_id, e.rpc_code(), e.to_string()),
+                    },
+                    Err(e) => rpc_err(request_id, "instruction_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::SaveInstructionFile {
+            request_id,
+            cwd,
+            path,
+            content,
+            expected_etag,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match save_instruction_file(
+                        &authorized_cwd,
+                        &path,
+                        &content,
+                        expected_etag.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(res) => WireMessage::InstructionFileSavedResponse {
+                            request_id,
+                            cwd,
+                            path: res.path,
+                            etag: res.etag,
+                            size_bytes: res.size_bytes,
+                            approx_tokens: res.approx_tokens,
+                        },
+                        Err(e) => rpc_err(request_id, e.rpc_code(), e.to_string()),
+                    },
+                    Err(e) => rpc_err(request_id, "instruction_cwd_denied", e),
+                };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
             None

@@ -548,6 +548,8 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ConnectedHostAdded { request_id, .. }
         | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
         | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
+        | WireMessage::ManagedSkillsSnapshot { request_id, .. }
+        | WireMessage::ManagedSkillContentResponse { request_id, .. }
         | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
         | WireMessage::ProviderSubagentsSnapshot { request_id, .. }
         | WireMessage::ProviderSubagentTimelineCatchup { request_id, .. }

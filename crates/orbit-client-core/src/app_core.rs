@@ -17,15 +17,16 @@ use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
     BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot,
-    HostProjectEntry, HostSyncState, KeepAwakeStatus, ModelOption, OrchestrationConfig,
-    OrchestrationSkillInfo, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge,
-    ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor,
-    ProviderSubagentEvent, QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord,
-    ScheduleSpec, ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
-    TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceBoardSnapshot,
-    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
-    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
-    WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    HostProjectEntry, HostSyncState, KeepAwakeStatus, ManagedSkillRecord, ModelOption,
+    OrchestrationConfig, OrchestrationSkillInfo, PendingPermissionSummary, PermissionCheckpointRef,
+    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, QueuedPromptView,
+    ReasoningEffort, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope,
+    TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
+    ToolCallStatus, WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
+    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
+    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome,
+    WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -258,6 +259,39 @@ pub struct CreateAgentRequest<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedSkillContentView {
+    pub skill_id: String,
+    pub content: String,
+    pub etag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertManagedSkillRequest {
+    pub host_id: String,
+    pub scope: SkillWriteScope,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub expected_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportManagedSkillRequest {
+    pub host_id: String,
+    pub scope: SkillWriteScope,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub source_markdown_or_path: String,
+    #[serde(default)]
+    pub slug_override: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostDetailView {
     pub revision: u64,
     pub host: HostCardView,
@@ -284,6 +318,8 @@ pub struct HostDetailView {
     pub orchestration_config: OrchestrationConfig,
     #[serde(default)]
     pub orchestration_skills: Vec<OrchestrationSkillInfo>,
+    #[serde(default)]
+    pub managed_skills: Vec<ManagedSkillRecord>,
     #[serde(default)]
     pub keep_awake_status: Option<KeepAwakeStatus>,
     #[serde(default)]
@@ -545,6 +581,11 @@ type PendingArtifactListEntry = (
     tokio::sync::oneshot::Sender<Result<Vec<ArtifactSummary>, String>>,
 );
 
+type PendingManagedSkillsListEntry = (
+    Option<String>,
+    tokio::sync::oneshot::Sender<Result<Vec<ManagedSkillRecord>, String>>,
+);
+
 struct HostMemoryState {
     profile: SavedHostProfile,
     is_local: bool,
@@ -600,6 +641,11 @@ struct HostMemoryState {
     pending_artifact_upserts:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ArtifactSummary, String>>>,
     pending_artifact_deletes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
+    pending_managed_skills_lists: HashMap<Uuid, PendingManagedSkillsListEntry>,
+    background_managed_skills_reqs: HashSet<Uuid>,
+    active_managed_skills_cwd: Option<String>,
+    pending_managed_skill_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ManagedSkillContentView, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -640,6 +686,7 @@ struct HostMemoryState {
     connected_hosts: Vec<ConnectedHostSummary>,
     orchestration_config: OrchestrationConfig,
     orchestration_skills: Vec<OrchestrationSkillInfo>,
+    managed_skills: Vec<ManagedSkillRecord>,
     keep_awake_status: Option<KeepAwakeStatus>,
     workspace_scripts: HashMap<String, Vec<WorkspaceScriptInfo>>,
     pending_permissions: Vec<PendingPermissionSummary>,
@@ -699,6 +746,10 @@ impl HostMemoryState {
             pending_artifact_reads: HashMap::new(),
             pending_artifact_upserts: HashMap::new(),
             pending_artifact_deletes: HashMap::new(),
+            pending_managed_skills_lists: HashMap::new(),
+            background_managed_skills_reqs: HashSet::new(),
+            active_managed_skills_cwd: None,
+            pending_managed_skill_reads: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -739,6 +790,7 @@ impl HostMemoryState {
             connected_hosts: Vec::new(),
             orchestration_config: OrchestrationConfig::default(),
             orchestration_skills: Vec::new(),
+            managed_skills: Vec::new(),
             keep_awake_status: None,
             workspace_scripts: HashMap::new(),
             pending_permissions: Vec::new(),
@@ -1404,6 +1456,7 @@ impl OrbitAppCore {
             connected_hosts: state.connected_hosts.clone(),
             orchestration_config: state.orchestration_config.clone(),
             orchestration_skills: state.orchestration_skills.clone(),
+            managed_skills: state.managed_skills.clone(),
             keep_awake_status: state.keep_awake_status.clone(),
             workspace_scripts: state.workspace_scripts.clone(),
             pending_permissions: state.pending_permissions.clone(),
@@ -3547,6 +3600,21 @@ impl OrbitAppCore {
                         request_id: Uuid::new_v4(),
                     })
                     .await;
+                let bg_skills_req_id = Uuid::new_v4();
+                if let Ok(mut hosts) = self.hosts.write()
+                    && let Some(h) = hosts.get_mut(host_id)
+                {
+                    if h.background_managed_skills_reqs.len() >= 64 {
+                        h.background_managed_skills_reqs.clear();
+                    }
+                    h.background_managed_skills_reqs.insert(bg_skills_req_id);
+                }
+                let _ = handle
+                    .send_wire(WireMessage::ListManagedSkills {
+                        request_id: bg_skills_req_id,
+                        cwd: None,
+                    })
+                    .await;
                 let _ = handle
                     .send_wire(WireMessage::ListPendingPermissions {
                         request_id: Uuid::new_v4(),
@@ -4362,6 +4430,40 @@ impl OrbitAppCore {
                     state.orchestration_skills = skills;
                     notify_host = true;
                 }
+                WireMessage::ManagedSkillsSnapshot { request_id, skills } => {
+                    if let Some((req_cwd, tx)) =
+                        state.pending_managed_skills_lists.remove(&request_id)
+                    {
+                        if req_cwd == state.active_managed_skills_cwd {
+                            state.managed_skills = skills.clone();
+                            notify_host = true;
+                        }
+                        let _ = tx.send(Ok(skills));
+                    } else if state.background_managed_skills_reqs.remove(&request_id) {
+                        // Never let an unsolicited `cwd: None` boot/refresh snapshot clobber an active project-scoped skills list.
+                        if state.active_managed_skills_cwd.is_none() {
+                            state.managed_skills = skills;
+                            notify_host = true;
+                        }
+                    } else if state.active_managed_skills_cwd.is_none() {
+                        state.managed_skills = skills;
+                        notify_host = true;
+                    }
+                }
+                WireMessage::ManagedSkillContentResponse {
+                    request_id,
+                    skill_id,
+                    content,
+                    etag,
+                } => {
+                    if let Some(tx) = state.pending_managed_skill_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(ManagedSkillContentView {
+                            skill_id,
+                            content,
+                            etag,
+                        }));
+                    }
+                }
                 WireMessage::ProviderSubagentsSnapshot {
                     parent_agent_id,
                     subagents,
@@ -4985,6 +5087,14 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
+                        && let Some((_, tx)) = state.pending_managed_skills_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_managed_skill_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_side_questions.remove(&req_id)
                     {
                         let _ = tx.send(SideQuestionStreamEvent::Done {
@@ -5598,6 +5708,22 @@ impl OrbitAppCore {
             host_id,
             WireMessage::ListOrchestrationSkills {
                 request_id: Uuid::new_v4(),
+            },
+        );
+        let bg_skills_req_id = Uuid::new_v4();
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if h.background_managed_skills_reqs.len() >= 64 {
+                h.background_managed_skills_reqs.clear();
+            }
+            h.background_managed_skills_reqs.insert(bg_skills_req_id);
+        }
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListManagedSkills {
+                request_id: bg_skills_req_id,
+                cwd: None,
             },
         );
         self.dispatch_wire(
@@ -8146,6 +8272,255 @@ impl OrbitAppCore {
                 skill_ids,
             },
         );
+    }
+
+    fn normalize_managed_skills_cwd(cwd: Option<&str>) -> Option<String> {
+        cwd.map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "~")
+            .map(ToString::to_string)
+    }
+
+    async fn request_managed_skills_snapshot(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+        build_wire: impl FnOnce(Uuid, Option<String>) -> WireMessage + Send + 'static,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let normalized_cwd = Self::normalize_managed_skills_cwd(cwd.as_deref());
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to manage skills".to_string());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.active_managed_skills_cwd = normalized_cwd.clone();
+                        h.pending_managed_skills_lists
+                            .insert(req_id, (normalized_cwd.clone(), ack_tx));
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id, normalized_cwd)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_managed_skills_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send skills RPC: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(skills))) => Ok(skills),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while updating skills".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_managed_skills_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for managed skills snapshot".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "managed skills request cancelled".to_string())?
+    }
+
+    pub async fn list_managed_skills_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        self.request_managed_skills_snapshot(host_id, cwd, move |request_id, cwd| {
+            WireMessage::ListManagedSkills { request_id, cwd }
+        })
+        .await
+    }
+
+    pub async fn read_managed_skill_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        skill_id: &str,
+        cwd: Option<String>,
+    ) -> Result<ManagedSkillContentView, String> {
+        let normalized_cwd = Self::normalize_managed_skills_cwd(cwd.as_deref());
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to read skill".to_string());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_skill_id = skill_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_managed_skill_reads.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ReadManagedSkill {
+                    request_id: req_id,
+                    skill_id: owned_skill_id,
+                    cwd: normalized_cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_managed_skill_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ReadManagedSkill: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(content))) => Ok(content),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while reading skill".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_managed_skill_reads.remove(&req_id);
+                    }
+                    Err("Timed out waiting for managed skill content".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "read_managed_skill task cancelled".to_string())?
+    }
+
+    pub async fn upsert_managed_skill_async(
+        self: &Arc<Self>,
+        req: UpsertManagedSkillRequest,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let host_id = req.host_id.clone();
+        let cwd = req.cwd.clone();
+        self.request_managed_skills_snapshot(&host_id, cwd, move |request_id, cwd| {
+            WireMessage::UpsertManagedSkill {
+                request_id,
+                scope: req.scope,
+                cwd,
+                slug: req.slug,
+                name: req.name,
+                description: req.description,
+                content: req.content,
+                enabled: req.enabled,
+                expected_etag: req.expected_etag,
+            }
+        })
+        .await
+    }
+
+    pub async fn toggle_managed_skill_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        skill_id: &str,
+        enabled: bool,
+        cwd: Option<String>,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let owned_skill_id = skill_id.to_string();
+        self.request_managed_skills_snapshot(host_id, cwd, move |request_id, cwd| {
+            WireMessage::ToggleManagedSkill {
+                request_id,
+                skill_id: owned_skill_id,
+                enabled,
+                cwd,
+            }
+        })
+        .await
+    }
+
+    pub async fn delete_managed_skill_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        skill_id: &str,
+        cwd: Option<String>,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let owned_skill_id = skill_id.to_string();
+        self.request_managed_skills_snapshot(host_id, cwd, move |request_id, cwd| {
+            WireMessage::DeleteManagedSkill {
+                request_id,
+                skill_id: owned_skill_id,
+                cwd,
+            }
+        })
+        .await
+    }
+
+    pub async fn import_managed_skill_async(
+        self: &Arc<Self>,
+        req: ImportManagedSkillRequest,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let host_id = req.host_id.clone();
+        let cwd = req.cwd.clone();
+        self.request_managed_skills_snapshot(&host_id, cwd, move |request_id, cwd| {
+            WireMessage::ImportManagedSkill {
+                request_id,
+                scope: req.scope,
+                cwd,
+                source_markdown_or_path: req.source_markdown_or_path,
+                slug_override: req.slug_override,
+            }
+        })
+        .await
     }
 
     pub fn list_provider_subagents(self: &Arc<Self>, host_id: &str, parent_agent_id: &str) {
@@ -11105,6 +11480,13 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_artifact_deletes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, (_, tx)) in h.pending_managed_skills_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.background_managed_skills_reqs.clear();
+    for (_, tx) in h.pending_managed_skill_reads.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {

@@ -462,6 +462,8 @@ fn matches_rpc_response(w: &WireMessage, req_id: Uuid) -> bool {
         | WireMessage::ConnectedHostAdded { request_id, .. }
         | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
         | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
+        | WireMessage::ManagedSkillsSnapshot { request_id, .. }
+        | WireMessage::ManagedSkillContentResponse { request_id, .. }
         | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
         | WireMessage::ProviderSubagentsSnapshot { request_id, .. }
         | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }

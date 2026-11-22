@@ -31,6 +31,9 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 
 function resolveSlashCommandIcon(cmd: SlashCommandView): LucideIcon {
+  if (cmd.icon_key === "skill") {
+    return Sparkles;
+  }
   switch (cmd.id || cmd.icon_key) {
     case "fork":
       return GitFork;
@@ -161,7 +164,13 @@ export function SlashCommandMenu({
                   </span>
                 </div>
               </div>
-              {shortcut && <ShortcutKbd keys={shortcut} className="shrink-0" />}
+              {shortcut ? (
+                <ShortcutKbd keys={shortcut} className="shrink-0" />
+              ) : cmd.icon_key === "skill" ? (
+                <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium">
+                  Skill
+                </span>
+              ) : null}
             </button>
           );
         })}

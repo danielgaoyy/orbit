@@ -45,6 +45,7 @@ import { modSymbol } from "@/lib/keybindings";
 import {
   type ClipboardImagePayload,
   type GitFileEntry,
+  type ManagedSkillRecord,
   type MentionCandidateView,
   type QueuedPromptView,
   type SessionMode,
@@ -83,6 +84,7 @@ const EMPTY_SERVER_QUEUED: readonly QueuedPromptView[] = [];
 const EMPTY_FILES: readonly string[] = [];
 const EMPTY_GIT_FILES: readonly GitFileEntry[] = [];
 const EMPTY_MENTIONS: MentionCandidateView[] = [];
+const EMPTY_MANAGED_SKILLS: readonly ManagedSkillRecord[] = [];
 
 const IMAGE_URI_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|svg|avif|ico)(?:[?#].*)?$/i;
 
@@ -133,7 +135,47 @@ export const OmniComposer = memo(function OmniComposer({
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const promptHistory = useOrbitSelector((s) => s.promptHistory);
   const slashCommands = useOrbitSelector((s) => s.slashCommands);
+  const managedSkills = useOrbitSelector((s) =>
+    s.selectedHostId
+      ? (s.hostDetails[s.selectedHostId]?.managed_skills ?? EMPTY_MANAGED_SKILLS)
+      : EMPTY_MANAGED_SKILLS,
+  );
   const ime = useImeCompositionGuard();
+
+  // Keep host/project managed skills hydrated for slash command discovery
+  useEffect(() => {
+    if (!selectedHostId) return;
+    const scopedCwd = selectedCwd && selectedCwd !== "~" ? selectedCwd : null;
+    void orbitIpc.listManagedSkills(selectedHostId, scopedCwd).catch(() => {});
+  }, [selectedHostId, selectedCwd]);
+
+  const effectiveSlashCommands = useMemo<SlashCommandView[]>(() => {
+    const disabledSlugs = new Set(
+      managedSkills.filter((s) => !s.enabled).map((s) => s.slug.toLowerCase()),
+    );
+    const visibleBuiltins =
+      disabledSlugs.size > 0
+        ? slashCommands.filter((c) => !disabledSlugs.has(c.id.toLowerCase()))
+        : slashCommands;
+    const existingCommands = new Set(visibleBuiltins.map((c) => c.command.toLowerCase()));
+    const skillEntries: SlashCommandView[] = [];
+    for (const skill of managedSkills) {
+      if (!skill.enabled) continue;
+      const cmd = `/${skill.slug}`;
+      if (existingCommands.has(cmd.toLowerCase())) continue;
+      skillEntries.push({
+        id: `skill:${skill.slug}`,
+        command: cmd,
+        label: skill.name,
+        description: skill.description || `Invoke ${skill.name} skill`,
+        shortcut_key: null,
+        icon_key: "skill",
+        keywords: ["skills", "skill", skill.slug, skill.name, ...skill.triggers],
+        desktop_only: false,
+      });
+    }
+    return skillEntries.length > 0 ? [...visibleBuiltins, ...skillEntries] : visibleBuiltins;
+  }, [slashCommands, managedSkills]);
 
   // Primitive/narrow selectors instead of subscribing to full `HostDetailView`
   const hasCurrentAgent = useOrbitSelector((s) =>
@@ -453,10 +495,10 @@ export const OmniComposer = memo(function OmniComposer({
     const query = match[1];
     const tokenKey = `slash:${slashIndex}:${query}`;
     if (dismissedToken === tokenKey) return null;
-    const items = filterSlashCommands(slashCommands, query);
+    const items = filterSlashCommands(effectiveSlashCommands, query);
     if (items.length === 0) return null;
     return { slashIndex, endIndex: safeOffset, query, tokenKey, items };
-  }, [draftText, cursorOffset, dismissedToken, slashCommands]);
+  }, [draftText, cursorOffset, dismissedToken, effectiveSlashCommands]);
 
   const mentionTrigger = useMemo(() => {
     if (slashTrigger || !draftText.includes("@")) return null;
@@ -621,6 +663,28 @@ export const OmniComposer = memo(function OmniComposer({
       case "settings":
         orbitActions.openSettings();
         return;
+      default:
+        if (cmd.id.startsWith("skill:")) {
+          const slug = cmd.id.slice("skill:".length);
+          const directive = `Use skill /${slug} (${cmd.label}): `;
+          const before = stripped.slice(0, joined.cursor);
+          const after = stripped.slice(joined.cursor);
+          const needsLeadingSpace = before.length > 0 && !/\s$/.test(before);
+          const inserted = `${needsLeadingSpace ? " " : ""}${directive}`;
+          const nextText = `${before}${inserted}${after.replace(/^[ \t]+/, "")}`;
+          const nextCursor = before.length + inserted.length;
+          orbitActions.setComposerDraft(nextText);
+          setCursorOffset(nextCursor);
+          requestAnimationFrame(() => {
+            const el = textareaRef.current;
+            if (el) {
+              el.focus();
+              el.setSelectionRange(nextCursor, nextCursor);
+            }
+          });
+          return;
+        }
+        break;
     }
 
     requestAnimationFrame(() => {

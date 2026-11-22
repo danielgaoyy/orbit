@@ -630,6 +630,40 @@ export interface OrchestrationSkillInfo {
   outdated: boolean;
 }
 
+export type SkillSource =
+  | "orbit_user"
+  | "orbit_project"
+  | "claude_user"
+  | "claude_project"
+  | "codex_user"
+  | "antigravity_user"
+  | "builtin";
+
+export type SkillWriteScope = "user" | "project";
+
+export interface ManagedSkillRecord {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  source: SkillSource;
+  path: string;
+  enabled: boolean;
+  editable: boolean;
+  triggers: string[];
+  allowed_tools: string[];
+  has_scripts: boolean;
+  has_references: boolean;
+  approx_tokens: number;
+  updated_at_ms: number;
+}
+
+export interface ManagedSkillContentView {
+  skill_id: string;
+  content: string;
+  etag: string;
+}
+
 export interface ScheduleNewAgentConfig {
   cwd: string;
   workspace_id?: string | null;
@@ -958,6 +992,7 @@ export interface HostDetailView {
   connected_hosts?: ConnectedHostSummary[];
   orchestration_config?: OrchestrationConfig;
   orchestration_skills?: OrchestrationSkillInfo[];
+  managed_skills?: ManagedSkillRecord[];
   keep_awake_status?: KeepAwakeStatus | null;
   workspace_scripts?: Record<string, WorkspaceScriptInfo[]>;
   pending_permissions?: PendingPermissionSummary[];
@@ -2921,6 +2956,106 @@ export const orbitIpc = {
   syncOrchestrationSkills: async (hostId: string, skillIds: string[]): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("sync_orchestration_skills", { hostId, skillIds });
+  },
+
+  listManagedSkills: async (
+    hostId: string,
+    cwd?: string | null,
+  ): Promise<ManagedSkillRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ManagedSkillRecord[]>("list_managed_skills", {
+      hostId,
+      cwd: cwd ?? null,
+    });
+  },
+
+  readManagedSkill: async (
+    hostId: string,
+    skillId: string,
+    cwd?: string | null,
+  ): Promise<ManagedSkillContentView> => {
+    if (!isTauriRuntime()) {
+      return { skill_id: skillId, content: "", etag: "" };
+    }
+    return invoke<ManagedSkillContentView>("read_managed_skill", {
+      hostId,
+      skillId,
+      cwd: cwd ?? null,
+    });
+  },
+
+  upsertManagedSkill: async (
+    hostId: string,
+    params: {
+      scope: SkillWriteScope;
+      cwd?: string | null;
+      slug: string;
+      name: string;
+      description: string;
+      content: string;
+      enabled: boolean;
+      expectedEtag?: string | null;
+    },
+  ): Promise<ManagedSkillRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ManagedSkillRecord[]>("upsert_managed_skill", {
+      hostId,
+      scope: params.scope,
+      cwd: params.cwd ?? null,
+      slug: params.slug,
+      name: params.name,
+      description: params.description,
+      content: params.content,
+      enabled: params.enabled,
+      expectedEtag: params.expectedEtag ?? null,
+    });
+  },
+
+  toggleManagedSkill: async (
+    hostId: string,
+    skillId: string,
+    enabled: boolean,
+    cwd?: string | null,
+  ): Promise<ManagedSkillRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ManagedSkillRecord[]>("toggle_managed_skill", {
+      hostId,
+      skillId,
+      enabled,
+      cwd: cwd ?? null,
+    });
+  },
+
+  deleteManagedSkill: async (
+    hostId: string,
+    skillId: string,
+    cwd?: string | null,
+  ): Promise<ManagedSkillRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ManagedSkillRecord[]>("delete_managed_skill", {
+      hostId,
+      skillId,
+      cwd: cwd ?? null,
+    });
+  },
+
+  importManagedSkill: async (
+    hostId: string,
+    params: {
+      scope: SkillWriteScope;
+      cwd?: string | null;
+      sourceMarkdownOrPath: string;
+      slugOverride?: string | null;
+    },
+  ): Promise<ManagedSkillRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ManagedSkillRecord[]>("import_managed_skill", {
+      hostId,
+      scope: params.scope,
+      cwd: params.cwd ?? null,
+      sourceMarkdownOrPath: params.sourceMarkdownOrPath,
+      slugOverride: params.slugOverride ?? null,
+    });
   },
 
   listProviderSubagents: async (hostId: string, parentAgentId: string): Promise<void> => {

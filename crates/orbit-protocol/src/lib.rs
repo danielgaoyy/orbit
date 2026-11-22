@@ -5,11 +5,13 @@ pub mod artifacts;
 pub mod handoff;
 pub mod media;
 pub mod orchestration;
+pub mod skills;
 pub use acp::*;
 pub use artifacts::*;
 pub use handoff::*;
 pub use media::*;
 pub use orchestration::*;
+pub use skills::*;
 
 use std::collections::HashMap;
 
@@ -1565,6 +1567,64 @@ pub enum WireMessage {
     SyncOrchestrationSkills {
         request_id: Uuid,
         skill_ids: Vec<String>,
+    },
+
+    // Skills Ecosystem & Managed Skills CRUD
+    ListManagedSkills {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ManagedSkillsSnapshot {
+        request_id: Uuid,
+        skills: Vec<ManagedSkillRecord>,
+    },
+    ReadManagedSkill {
+        request_id: Uuid,
+        skill_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ManagedSkillContentResponse {
+        request_id: Uuid,
+        skill_id: String,
+        content: String,
+        etag: String,
+    },
+    UpsertManagedSkill {
+        request_id: Uuid,
+        scope: SkillWriteScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        slug: String,
+        name: String,
+        description: String,
+        content: String,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
+    },
+    ToggleManagedSkill {
+        request_id: Uuid,
+        skill_id: String,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    DeleteManagedSkill {
+        request_id: Uuid,
+        skill_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ImportManagedSkill {
+        request_id: Uuid,
+        scope: SkillWriteScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        source_markdown_or_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slug_override: Option<String>,
     },
 
     // System Keep-Awake (OS Sleep Prevention)

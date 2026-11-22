@@ -26,8 +26,9 @@ use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
     AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest, ClientProjectView,
     ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest, FleetOverviewView,
-    GitReviewView, HostCardView, HostDetailView, OrbitAppCore, RewindAgentResultView,
-    SideQuestionStreamEvent, SubscribeOptions, WorkspaceFileView,
+    GitReviewView, HostCardView, HostDetailView, ImportManagedSkillRequest,
+    ManagedSkillContentView, OrbitAppCore, RewindAgentResultView, SideQuestionStreamEvent,
+    SubscribeOptions, UpsertManagedSkillRequest, WorkspaceFileView,
 };
 use orbit_client_core::catalog::ResolvedModelSelectionView;
 use orbit_client_core::cloud_sync::{
@@ -62,10 +63,10 @@ use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
-    ArtifactDetail, ArtifactSummary, OrchestrationConfig, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
-    ScheduleTarget, SessionMode, WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation,
-    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    ArtifactDetail, ArtifactSummary, ManagedSkillRecord, OrchestrationConfig, PromptBadge,
+    ProviderKind, ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
+    ScheduleTarget, SessionMode, SkillWriteScope, WorkspaceBoardSnapshot, WorkspaceEventRecord,
+    WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -1329,6 +1330,106 @@ fn sync_orchestration_skills(
 }
 
 #[tauri::command]
+async fn list_managed_skills(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state.core.list_managed_skills_async(&host_id, cwd).await
+}
+
+#[tauri::command]
+async fn read_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    skill_id: String,
+    cwd: Option<String>,
+) -> Result<ManagedSkillContentView, String> {
+    state
+        .core
+        .read_managed_skill_async(&host_id, &skill_id, cwd)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn upsert_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    scope: SkillWriteScope,
+    cwd: Option<String>,
+    slug: String,
+    name: String,
+    description: String,
+    content: String,
+    enabled: bool,
+    expected_etag: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state
+        .core
+        .upsert_managed_skill_async(UpsertManagedSkillRequest {
+            host_id,
+            scope,
+            cwd,
+            slug,
+            name,
+            description,
+            content,
+            enabled,
+            expected_etag,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn toggle_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    skill_id: String,
+    enabled: bool,
+    cwd: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state
+        .core
+        .toggle_managed_skill_async(&host_id, &skill_id, enabled, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn delete_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    skill_id: String,
+    cwd: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state
+        .core
+        .delete_managed_skill_async(&host_id, &skill_id, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn import_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    scope: SkillWriteScope,
+    cwd: Option<String>,
+    source_markdown_or_path: String,
+    slug_override: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state
+        .core
+        .import_managed_skill_async(ImportManagedSkillRequest {
+            host_id,
+            scope,
+            cwd,
+            source_markdown_or_path,
+            slug_override,
+        })
+        .await
+}
+
+#[tauri::command]
 fn list_provider_subagents(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -2482,6 +2583,12 @@ pub fn run() {
             sync_fleet_connected_hosts,
             update_orchestration_config,
             sync_orchestration_skills,
+            list_managed_skills,
+            read_managed_skill,
+            upsert_managed_skill,
+            toggle_managed_skill,
+            delete_managed_skill,
+            import_managed_skill,
             list_provider_subagents,
             open_provider_subagent_timeline,
             get_provider_subagent_timeline,

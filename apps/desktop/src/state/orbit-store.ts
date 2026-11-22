@@ -343,7 +343,7 @@ export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
 export type WorkspacePanelMode = "conversation" | "automations";
-export type HostSettingsTab = "agents" | "acp" | "usage" | "connection";
+export type HostSettingsTab = "agents" | "skills" | "acp" | "usage" | "connection";
 export type SettingsSection =
   | "general"
   | "cloud_sync"
@@ -353,7 +353,7 @@ export type SettingsSection =
   | "archived"
   | "add_host"
   | `host:${string}:${HostSettingsTab}`;
-export type SettingsSectionTarget = SettingsSection | "hosts" | "providers";
+export type SettingsSectionTarget = SettingsSection | "hosts" | "providers" | "skills";
 export type TerminalCursorStyle = "bar" | "block" | "underline";
 export type SidebarProjectSort = "recent" | "alphabetical" | "manual";
 export type SidebarThreadFilter = "all" | "active_unread";
@@ -1752,6 +1752,9 @@ function resolveSettingsSectionTarget(
   }
   if (section === "providers") {
     return targetHostId ? `host:${targetHostId}:agents` : "general";
+  }
+  if (section === "skills") {
+    return targetHostId ? `host:${targetHostId}:skills` : "general";
   }
   return section ?? s.settingsSection;
 }

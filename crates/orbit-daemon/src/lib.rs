@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod messaging;
 pub mod scheduler;
 pub mod skills;
+pub mod skills_manager;
 pub mod tools;
 pub mod workspace_board;
 pub mod workspace_cluster;
@@ -3168,6 +3169,178 @@ async fn handle_wire_rpc(
                 Err(e) => Some(rpc_err(request_id, "sync_skills_failed", e)),
             }
         }
+        WireMessage::ListManagedSkills { request_id, cwd } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::list_managed_skills(
+                    &orbit_home,
+                    &user_home,
+                    authorized_cwd.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(skills) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Err(e) => Some(rpc_err(request_id, "list_managed_skills_failed", e)),
+            }
+        }
+        WireMessage::ReadManagedSkill {
+            request_id,
+            skill_id,
+            cwd,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::read_managed_skill(
+                    &orbit_home,
+                    &user_home,
+                    &skill_id,
+                    authorized_cwd.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(outcome)) => Some(WireMessage::ManagedSkillContentResponse {
+                    request_id,
+                    skill_id: outcome.skill_id,
+                    content: outcome.content,
+                    etag: outcome.etag,
+                }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "read_managed_skill_failed", e)),
+            }
+        }
+        WireMessage::UpsertManagedSkill {
+            request_id,
+            scope,
+            cwd,
+            slug,
+            name,
+            description,
+            content,
+            enabled,
+            expected_etag,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            let params = crate::skills_manager::UpsertSkillParams {
+                scope,
+                cwd: authorized_cwd,
+                slug,
+                name,
+                description,
+                content,
+                enabled,
+                expected_etag,
+            };
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::upsert_managed_skill(&orbit_home, &user_home, params)
+            })
+            .await
+            {
+                Ok(Ok(skills)) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "upsert_managed_skill_failed", e)),
+            }
+        }
+        WireMessage::ToggleManagedSkill {
+            request_id,
+            skill_id,
+            enabled,
+            cwd,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::toggle_managed_skill(
+                    &orbit_home,
+                    &user_home,
+                    &skill_id,
+                    enabled,
+                    authorized_cwd.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(skills)) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "toggle_managed_skill_failed", e)),
+            }
+        }
+        WireMessage::DeleteManagedSkill {
+            request_id,
+            skill_id,
+            cwd,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::delete_managed_skill(
+                    &orbit_home,
+                    &user_home,
+                    &skill_id,
+                    authorized_cwd.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(skills)) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "delete_managed_skill_failed", e)),
+            }
+        }
+        WireMessage::ImportManagedSkill {
+            request_id,
+            scope,
+            cwd,
+            source_markdown_or_path,
+            slug_override,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::import_managed_skill(
+                    &orbit_home,
+                    &user_home,
+                    scope,
+                    authorized_cwd.as_deref(),
+                    &source_markdown_or_path,
+                    slug_override.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(skills)) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "import_managed_skill_failed", e)),
+            }
+        }
 
         // Provider-Native Subagent Observability
         WireMessage::ListProviderSubagents {
@@ -3758,6 +3931,22 @@ fn is_valid_release_semver(ver: &str) -> bool {
     true
 }
 
+async fn authorize_optional_skills_cwd(
+    store: &Arc<OrbitStore>,
+    cwd: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(raw) = cwd else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "~" {
+        return Ok(None);
+    }
+    let expanded = expand_host_path(trimmed);
+    let canonical = authorize_workspace_mutation_cwd(store, &expanded).await?;
+    Ok(Some(canonical.to_string_lossy().to_string()))
+}
+
 /// Verify that a workspace mutation `cwd` is strictly contained within (equals or is a
 /// subdirectory of) a registered workspace, agent `cwd`, synced host project directory, or
 /// discovered project root on this host — preventing mutations in arbitrary host directories
@@ -3974,5 +4163,75 @@ mod self_upgrade_tests {
         let truncated = format_concise_wire_decode_error(&long_generic);
         assert!(truncated.len() <= 240);
         assert!(truncated.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn authorize_optional_skills_cwd_enforces_workspace_boundary() {
+        let base =
+            std::env::temp_dir().join(format!("orbit_skills_cwd_auth_{}", Uuid::new_v4().simple()));
+        let registered = base.join("registered_repo");
+        let unregistered = base.join("unregistered_dir");
+        std::fs::create_dir_all(&registered).expect("mkdir registered");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+        let store = Arc::new(OrbitStore::open(base.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "ws-skills-test".to_string(),
+                name: "Skills Test".to_string(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("insert host project");
+
+        // None / empty / "~" map cleanly to None (user-only scope)
+        assert_eq!(
+            authorize_optional_skills_cwd(&store, None)
+                .await
+                .expect("none ok"),
+            None
+        );
+        assert_eq!(
+            authorize_optional_skills_cwd(&store, Some("  ".to_string()))
+                .await
+                .expect("empty ok"),
+            None
+        );
+        assert_eq!(
+            authorize_optional_skills_cwd(&store, Some("~".to_string()))
+                .await
+                .expect("tilde ok"),
+            None
+        );
+
+        // Registered workspace directory is authorized
+        let ok_cwd =
+            authorize_optional_skills_cwd(&store, Some(registered.to_string_lossy().to_string()))
+                .await
+                .expect("registered cwd authorized");
+        assert!(ok_cwd.is_some());
+
+        // Root `/`, `$HOME`, `~/.ssh`, and unregistered directories MUST be rejected
+        assert!(
+            authorize_optional_skills_cwd(&store, Some("/".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(
+            authorize_optional_skills_cwd(&store, Some("~/.ssh".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(
+            authorize_optional_skills_cwd(
+                &store,
+                Some(unregistered.to_string_lossy().to_string()),
+            )
+            .await
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

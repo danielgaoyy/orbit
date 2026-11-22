@@ -34,11 +34,14 @@ struct WorkspacePeerStripView: View {
 
     private var shouldRenderStrip: Bool {
         guard let agent = activeAgent, !store.isDraftNewSession else { return false }
-        return agent.parentAgentId != nil
-            || isCuratedWorkspace
-            || peers.count > 1
-            || agent.clusterSuggestion != nil
-            || !curatedWorkspacesInProject.isEmpty
+        if agent.parentAgentId != nil || agent.clusterSuggestion != nil {
+            return true
+        }
+        return OrbitSidebarLogic.shouldShowWorkspacePeerStrip(
+            isExplicitCluster: isCuratedWorkspace,
+            peerCount: peers.count,
+            groupTitle: activeWorkspace?.title
+        )
     }
 
     var body: some View {
@@ -135,7 +138,7 @@ struct WorkspacePeerStripView: View {
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(isCuratedWorkspace ? palette.accentViolet : palette.fgMuted)
 
-                        Text(isCuratedWorkspace ? (activeWorkspace?.title ?? "Workspace") : "待归类")
+                        Text(isCuratedWorkspace ? (activeWorkspace?.title ?? "Workspace") : "Unassigned")
                             .font(OrbitTypography.meta(.semibold))
                             .foregroundStyle(palette.fgPrimary)
                             .lineLimit(1)
@@ -334,7 +337,7 @@ struct WorkspacePeerStripView: View {
                 .foregroundStyle(palette.accentViolet)
 
             if suggestion.autoApplied {
-                Text("自动归类至「\(suggestion.targetWorkspaceTitle)」")
+                Text("Auto-grouped into \"\(suggestion.targetWorkspaceTitle)\"")
                     .font(OrbitTypography.meta(.medium))
                     .foregroundStyle(palette.fgPrimary)
                     .lineLimit(1)
@@ -353,7 +356,7 @@ struct WorkspacePeerStripView: View {
                     }
                     store.dismissClusterSuggestion(agent.agentId)
                 } label: {
-                    Text("撤销")
+                    Text("Undo")
                         .font(OrbitTypography.meta(.semibold))
                         .foregroundStyle(palette.accentViolet)
                         .padding(.horizontal, 8)
@@ -362,7 +365,7 @@ struct WorkspacePeerStripView: View {
                 }
                 .buttonStyle(.plain)
             } else {
-                Text("建议移入「\(suggestion.targetWorkspaceTitle)」")
+                Text("Suggested workspace: \"\(suggestion.targetWorkspaceTitle)\"")
                     .font(OrbitTypography.meta(.medium))
                     .foregroundStyle(palette.fgPrimary)
                     .lineLimit(1)
@@ -376,7 +379,7 @@ struct WorkspacePeerStripView: View {
                     )
                     store.dismissClusterSuggestion(agent.agentId)
                 } label: {
-                    Text("移入")
+                    Text("Move")
                         .font(OrbitTypography.meta(.semibold))
                         .foregroundStyle(palette.accentViolet)
                         .padding(.horizontal, 8)
@@ -411,13 +414,13 @@ struct WorkspacePeerStripView: View {
         return VStack(alignment: .leading, spacing: 6) {
             OrbitPopoverSectionHeader(
                 title: "Mission Workspace",
-                trailing: isCuratedWorkspace ? "Active" : "待归类"
+                trailing: isCuratedWorkspace ? "Active" : "Unassigned"
             )
             .padding(.horizontal, 10)
 
             VStack(alignment: .leading, spacing: 2) {
                 OrbitPopoverActionRow(
-                    title: "AI 归类此会话",
+                    title: "AI Organize Session",
                     systemImage: "sparkles"
                 ) {
                     isWorkspaceSwitcherPresented = false
@@ -429,7 +432,7 @@ struct WorkspacePeerStripView: View {
                 }
 
                 OrbitPopoverActionRow(
-                    title: "AI 更新标题与摘要",
+                    title: "AI Summarize Title & Summary",
                     systemImage: "text.badge.star"
                 ) {
                     isWorkspaceSwitcherPresented = false
@@ -515,7 +518,7 @@ struct WorkspacePeerStripView: View {
 
                 if isCuratedWorkspace {
                     OrbitPopoverActionRow(
-                        title: "移回待归类",
+                        title: "Move to Unassigned",
                         systemImage: "tray"
                     ) {
                         isWorkspaceSwitcherPresented = false

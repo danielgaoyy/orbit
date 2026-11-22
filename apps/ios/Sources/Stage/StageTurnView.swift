@@ -84,11 +84,12 @@ struct StageTurnView: View {
     }
 
     private var canFoldPreReplyWork: Bool {
-        store.coalesceExploration && turn.terminalReply != nil && !turn.foldedSteps.isEmpty
+        turn.liveSegments.isEmpty && store.coalesceExploration && turn.terminalReply != nil && !turn.foldedSteps.isEmpty
     }
 
     private var terminalReplyText: String? {
-        guard case let .assistantMessage(_, _, text, _, blocks, _) = turn.terminalReply else {
+        guard let replyItem = turn.terminalReply ?? turn.lastAssistantReply,
+              case let .assistantMessage(_, _, text, _, blocks, _) = replyItem else {
             return nil
         }
         let resolved = resolvedAssistantText(text: text, blocks: blocks)
@@ -113,7 +114,7 @@ struct StageTurnView: View {
                             blocks: blocks,
                             timestampMs: timestampMs,
                             onCopy: {
-                                store.copyAssistantReply(text)
+                                store.copyPromptText(text)
                             },
                             onRewind: !store.isActiveAgentRunning ? {
                                 rewindTargetSeq = promptSeq
@@ -184,6 +185,9 @@ struct StageTurnView: View {
                                 isTurnActive: isTurnActive,
                                 startedAtMs: turn.startedAtMs,
                                 completedAtMs: turn.completedAtMs,
+                                turnDurationMs: turn.turnDurationMs,
+                                workDurationMs: turn.workDurationMs,
+                                thoughtDurationMs: turn.thoughtDurationMs,
                                 replyText: !isTurnActive ? terminalReplyText : nil,
                                 onCopy: { reply in
                                     store.copyAssistantReply(reply)
@@ -243,13 +247,20 @@ struct StageTurnView: View {
 
     // MARK: - Assistant Markdown (Native Range Selection + Quote)
 
+    @State private var expandedSegmentKeys: Set<String> = []
+
     @ViewBuilder
-    private func assistantMarkdownBlock(text: String, blocks: [FfiRichBlock]) -> some View {
+    private func assistantMarkdownBlock(text: String, blocks: [FfiRichBlock], streaming: Bool = false) -> some View {
         RichMarkdownView(
             blocks: blocks,
             fallbackText: text,
+            isStreaming: streaming,
+            workspaceCwd: store.activeCwd,
             onQuoteSelection: { selected in
                 store.quoteAssistantReply(turnKey: turn.key, text: selected)
+            },
+            onOpenFileLink: { target in
+                store.openWorkspaceFiles(initialPath: target.path, line: target.line)
             }
         )
     }
@@ -295,7 +306,7 @@ struct StageTurnView: View {
         VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
             ForEach(Array(turn.liveSegments.enumerated()), id: \.element.segmentKey) { segIdx, segment in
                 switch segment {
-                case let .stepGroup(_, _, items, summary, _, _, _, _, hasFollowingContent, hasRunningStep):
+                case let .stepGroup(segKey, _, items, summary, _, _, _, _, hasFollowingContent, hasRunningStep):
                     let isTrailingSeg = segIdx == turn.liveSegments.count - 1
                     let isSegLiveActive = isTurnActive && isTrailingSeg && !hasFollowingContent
                     let segSettled = !isSegLiveActive && !hasRunningStep
@@ -304,17 +315,30 @@ struct StageTurnView: View {
 
                     LiveStepGroupView(
                         store: store,
+                        segmentKey: segKey,
                         items: items,
                         summary: summary,
                         fallbackLiveLabel: turn.workSummaryLiveLabel,
+                        fallbackLiveDetail: turn.workSummaryLiveDetail,
                         shouldFold: shouldFold,
                         isLiveActive: isSegLiveActive,
-                        showInlineDiffStat: isTurnActive
+                        showInlineDiffStat: isTurnActive,
+                        isManualExpanded: Binding(
+                            get: { expandedSegmentKeys.contains(segKey) },
+                            set: { next in
+                                if next {
+                                    expandedSegmentKeys.insert(segKey)
+                                } else {
+                                    expandedSegmentKeys.remove(segKey)
+                                }
+                            }
+                        )
                     )
+                    .id(segKey)
 
                 case let .assistantMessage(_, item):
-                    if case let .assistantMessage(_, _, text, _, blocks, _) = item {
-                        assistantMarkdownBlock(text: text, blocks: blocks)
+                    if case let .assistantMessage(_, _, text, isMsgStreaming, blocks, _) = item {
+                        assistantMarkdownBlock(text: text, blocks: blocks, streaming: isMsgStreaming)
                     }
 
                 case let .notice(_, item):
@@ -419,6 +443,9 @@ private struct TurnFooterView: View {
     let isTurnActive: Bool
     let startedAtMs: Int64?
     let completedAtMs: Int64?
+    var turnDurationMs: Int64? = nil
+    var workDurationMs: Int64? = nil
+    var thoughtDurationMs: Int64? = nil
     let replyText: String?
     let onCopy: (String) -> Void
     var onQuote: ((String) -> Void)? = nil
@@ -428,6 +455,19 @@ private struct TurnFooterView: View {
 
     private var hasSettledContent: Bool {
         replyText != nil || completedAtMs != nil
+    }
+
+    private var compactDurationBadge: String? {
+        if let total = turnDurationMs, total > 0 {
+            return OrbitFormatters.formatDurationCompact(UInt64(total))
+        }
+        let work = max(0, workDurationMs ?? 0)
+        let thought = max(0, thoughtDurationMs ?? 0)
+        let sum = work + thought
+        if sum > 0 {
+            return OrbitFormatters.formatDurationCompact(UInt64(sum))
+        }
+        return nil
     }
 
     var body: some View {
@@ -477,6 +517,12 @@ private struct TurnFooterView: View {
                     if let completedMs = completedAtMs {
                         RelativeTimestampText(timestampMs: completedMs)
                             .padding(.leading, replyText != nil ? 2 : 0)
+                    }
+
+                    if let dur = compactDurationBadge {
+                        Text("· \(dur)")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
                     }
                 }
 
@@ -1101,20 +1147,32 @@ private struct StepSummaryDisclosureButton: View {
 
 private struct LiveStepGroupView: View {
     @ObservedObject var store: OrbitIosStore
+    let segmentKey: String
     let items: [FfiTimelineItem]
     let summary: FfiWorkSummaryResult
     let fallbackLiveLabel: String
+    var fallbackLiveDetail: String? = nil
     let shouldFold: Bool
     let isLiveActive: Bool
     let showInlineDiffStat: Bool
+    @Binding var isManualExpanded: Bool
 
-    @State private var manualExpanded = false
+    @Environment(\.orbitPalette) private var palette
 
     private var headerText: String {
         if isLiveActive {
-            if !summary.liveLabel.isEmpty { return summary.liveLabel }
-            if !fallbackLiveLabel.isEmpty { return fallbackLiveLabel }
-            return "Working…"
+            let base: String
+            if !summary.liveLabel.isEmpty {
+                base = summary.liveLabel
+            } else if !fallbackLiveLabel.isEmpty {
+                base = fallbackLiveLabel
+            } else {
+                base = "Working…"
+            }
+            if let detail = summary.liveDetail ?? fallbackLiveDetail, !detail.isEmpty {
+                return "\(base) · \(detail)"
+            }
+            return base
         }
         return summary.label.isEmpty ? "Completed \(items.count) \(items.count == 1 ? "step" : "steps")" : summary.label
     }
@@ -1124,18 +1182,26 @@ private struct LiveStepGroupView: View {
     }
 
     private var isFoldOpen: Bool {
-        forceExpanded || manualExpanded
+        forceExpanded || isManualExpanded
     }
 
     var body: some View {
         if !shouldFold || forceExpanded {
-            StepRailListView(
-                store: store,
-                items: items,
-                expandFirstToolStep: store.expandFirstStepByDefault,
-                isLiveActive: isLiveActive,
-                autoExpandErrors: !isLiveActive && summary.counts.unrecoveredFailureCount > 0
-            )
+            VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
+                if isLiveActive, let detail = summary.liveDetail ?? fallbackLiveDetail, !detail.isEmpty {
+                    Text(detail)
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgMuted)
+                        .lineLimit(1)
+                }
+                StepRailListView(
+                    store: store,
+                    items: items,
+                    expandFirstToolStep: store.expandFirstStepByDefault,
+                    isLiveActive: isLiveActive,
+                    autoExpandErrors: !isLiveActive && summary.counts.unrecoveredFailureCount > 0
+                )
+            }
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 StepSummaryDisclosureButton(
@@ -1150,7 +1216,7 @@ private struct LiveStepGroupView: View {
                 ) {
                     store.hapticLight()
                     withAnimation(orbitDisclosureAnimation) {
-                        manualExpanded.toggle()
+                        isManualExpanded.toggle()
                     }
                 }
                 .zIndex(1)

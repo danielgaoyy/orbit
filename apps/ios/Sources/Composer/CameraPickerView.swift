@@ -55,34 +55,49 @@ enum OrbitAttachmentNormalizer {
         let originalSize = image.size
         guard originalSize.width > 0, originalSize.height > 0 else { return nil }
 
-        let maxSide = max(originalSize.width, originalSize.height)
+        let pixelWidth = originalSize.width * max(1.0, image.scale)
+        let pixelHeight = originalSize.height * max(1.0, image.scale)
+        let maxSide = max(pixelWidth, pixelHeight)
         let scale = maxSide > maxDimension ? (maxDimension / maxSide) : 1.0
         let targetSize = CGSize(
-            width: max(1, (originalSize.width * scale).rounded()),
-            height: max(1, (originalSize.height * scale).rounded())
+            width: max(1, (pixelWidth * scale).rounded()),
+            height: max(1, (pixelHeight * scale).rounded())
         )
+
+        let hasAlpha: Bool = {
+            guard let cgImage = image.cgImage else { return false }
+            switch cgImage.alphaInfo {
+            case .first, .last, .premultipliedFirst, .premultipliedLast, .alphaOnly:
+                return true
+            default:
+                return false
+            }
+        }()
 
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = 1.0
-        format.opaque = false
+        format.opaque = !hasAlpha
 
         let normalized = UIGraphicsImageRenderer(size: targetSize, format: format).image { _ in
             image.draw(in: CGRect(origin: .zero, size: targetSize))
         }
-        guard let uploadData = normalized.jpegData(compressionQuality: quality) else {
+        let uploadData: Data? = hasAlpha
+            ? (normalized.pngData() ?? normalized.jpegData(compressionQuality: quality))
+            : normalized.jpegData(compressionQuality: quality)
+        guard let uploadData else {
             return nil
         }
 
         let thumbMax: CGFloat = 160
         let thumbScale = maxSide > thumbMax ? (thumbMax / maxSide) : 1.0
         let thumbSize = CGSize(
-            width: max(1, (originalSize.width * thumbScale).rounded()),
-            height: max(1, (originalSize.height * thumbScale).rounded())
+            width: max(1, (pixelWidth * thumbScale).rounded()),
+            height: max(1, (pixelHeight * thumbScale).rounded())
         )
         let thumbImage = UIGraphicsImageRenderer(size: thumbSize, format: format).image { _ in
             normalized.draw(in: CGRect(origin: .zero, size: thumbSize))
         }
-        let previewData = thumbImage.jpegData(compressionQuality: 0.72) ?? uploadData
+        let previewData = (hasAlpha ? thumbImage.pngData() : thumbImage.jpegData(compressionQuality: 0.72)) ?? uploadData
 
         return (uploadData: uploadData, previewData: previewData)
     }

@@ -34,6 +34,7 @@ struct SessionOverviewPanel: View {
     @Environment(\.orbitPalette) private var palette
     @State private var expandedTaskIds: Set<String> = []
     @State private var expandedNativeSubagentIds: Set<String> = []
+    @State private var localInspectorTarget: OrbitSubagentInspectorTarget? = nil
 
     private var insights: FfiSessionInsights? {
         store.agentStage?.insights
@@ -80,6 +81,9 @@ struct SessionOverviewPanel: View {
             .padding(.vertical, OrbitSpacing.md)
         }
         .background((palette.isDark ? palette.canvas : palette.drawer).ignoresSafeArea())
+        .sheet(item: $localInspectorTarget) { target in
+            SubagentInspectorSheet(store: store, target: target)
+        }
     }
 
     // MARK: - 1. Session Summary + AI Sparkle
@@ -135,6 +139,14 @@ struct SessionOverviewPanel: View {
             }
 
             HStack(spacing: 6) {
+                if let hid = store.selectedHostId {
+                    let tone = store.overviewBadgeTone(forAgent: agent, hostId: hid)
+                    if tone != .none {
+                        Circle()
+                            .fill(overviewToneColor(tone))
+                            .frame(width: 7, height: 7)
+                    }
+                }
                 metaPill(agent.statusLabel)
                 if let branch = agent.worktreeBranch ?? store.activeGitBranch, !branch.isEmpty {
                     metaPill(branch, icon: "arrow.triangle.branch")
@@ -151,6 +163,15 @@ struct SessionOverviewPanel: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(palette.hairline, lineWidth: 0.5)
         )
+    }
+
+    private func overviewToneColor(_ tone: OrbitBadgeTone) -> Color {
+        switch tone {
+        case .critical: return palette.danger
+        case .accent: return palette.primary
+        case .muted: return palette.warning
+        case .none: return .clear
+        }
     }
 
     private func metaPill(_ text: String, icon: String? = nil) -> some View {
@@ -190,9 +211,7 @@ struct SessionOverviewPanel: View {
                     badge: diff.fileCount > 0 ? "\(diff.fileCount) files (+\(diff.additions) -\(diff.deletions))" : nil
                 ) {
                     onNavigateAction?()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                        store.openGitDiff()
-                    }
+                    store.openGitDiff()
                 }
 
                 OrbitHairline().padding(.leading, 44)
@@ -203,9 +222,7 @@ struct SessionOverviewPanel: View {
                     badge: fileCount > 0 ? "\(fileCount)" : nil
                 ) {
                     onNavigateAction?()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                        store.openWorkspaceFiles()
-                    }
+                    store.openWorkspaceFiles()
                 }
 
                 OrbitHairline().padding(.leading, 44)
@@ -216,9 +233,7 @@ struct SessionOverviewPanel: View {
                     badge: terminalCount > 0 ? "\(terminalCount) active" : nil
                 ) {
                     onNavigateAction?()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                        store.openTerminal()
-                    }
+                    store.openTerminal()
                 }
 
                 OrbitHairline().padding(.leading, 44)
@@ -229,9 +244,7 @@ struct SessionOverviewPanel: View {
                     badge: btwCount > 0 ? "\(btwCount)" : nil
                 ) {
                     onNavigateAction?()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                        store.openSideQuestion()
-                    }
+                    store.openSideQuestion()
                 }
 
                 if let ws = store.activeWorkspace, ws.isCurated || store.activeWorkspacePeers.count > 1 {
@@ -243,9 +256,7 @@ struct SessionOverviewPanel: View {
                         badge: ws.boardRevision > 0 ? "v\(ws.boardRevision)" : nil
                     ) {
                         onNavigateAction?()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                            store.openWorkspaceBoard(workspaceId: ws.workspaceId)
-                        }
+                        store.openWorkspaceBoard(workspaceId: ws.workspaceId)
                     }
                 }
             }
@@ -393,9 +404,7 @@ struct SessionOverviewPanel: View {
                 if let logPath = task.logPath, !logPath.isEmpty {
                     Button {
                         onNavigateAction?()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                            store.openWorkspaceFiles(initialPath: logPath)
-                        }
+                        store.openWorkspaceFiles(initialPath: logPath)
                     } label: {
                         Label("Open Log", systemImage: "doc.text")
                             .font(OrbitTypography.meta(.semibold))
@@ -470,6 +479,18 @@ struct SessionOverviewPanel: View {
                                 .foregroundStyle(palette.fgMuted)
                         }
                         Spacer(minLength: 4)
+                        if let hid = store.selectedHostId {
+                            Button("Inspect") {
+                                localInspectorTarget = OrbitSubagentInspectorTarget(
+                                    hostId: hid,
+                                    parentAgentId: child.parentAgentId ?? store.selectedAgentId ?? "",
+                                    childAgentId: child.agentId,
+                                    title: child.title.isEmpty ? "Subagent" : child.title
+                                )
+                            }
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.fgSecondary)
+                        }
                         Button("Open") {
                             onNavigateAction?()
                             store.selectAgent(child.agentId)
@@ -590,12 +611,11 @@ struct SessionOverviewPanel: View {
                     if idx > 0 { OrbitHairline().padding(.leading, 40) }
                     Button {
                         onNavigateAction?()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                            if tf.action == .edited || tf.action == .created {
-                                store.openGitDiff(focusFilePath: tf.path)
-                            } else {
-                                store.openWorkspaceFiles(initialPath: tf.displayPath)
-                            }
+                        if tf.action == .edited || tf.action == .created {
+                            store.openGitDiff(focusFilePath: tf.path)
+                        } else {
+                            let target = tf.path.isEmpty ? tf.displayPath : tf.path
+                            store.openWorkspaceFiles(initialPath: target)
                         }
                     } label: {
                         HStack(spacing: 10) {

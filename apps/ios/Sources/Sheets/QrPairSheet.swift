@@ -10,6 +10,7 @@ struct QrPairSheet: View {
     @State private var manualUri = ""
     @State private var detectedClipboardPairUri: String?
     @State private var cameraState: QrCameraState = .checking
+    @State private var scanGeneration: Int = 0
 
     enum QrCameraState: Equatable {
         case checking
@@ -45,7 +46,6 @@ struct QrPairSheet: View {
         .background(palette.canvas.ignoresSafeArea())
         .onAppear {
             store.refreshPasteboardAvailability()
-            detectedClipboardPairUri = store.detectValidPairUriInClipboard()
             evaluateCameraAvailability()
         }
     }
@@ -96,9 +96,7 @@ struct QrPairSheet: View {
 
             Button {
                 dismiss()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    store.activeSheet = .settings
-                }
+                store.presentSheetSafely(.settings)
             } label: {
                 Text("Open Cloud Sync in Settings")
                     .font(OrbitTypography.subhead(.semibold))
@@ -236,9 +234,11 @@ struct QrPairSheet: View {
 
                 case .ready:
                     ZStack {
-                        QrScannerRepresentable { scannedCode in
+                        QrScannerRepresentable(scanGeneration: scanGeneration) { scannedCode in
                             if store.pairHost(uri: scannedCode) {
                                 dismiss()
+                            } else {
+                                scanGeneration &+= 1
                             }
                         } onFailure: { reason in
                             cameraState = .unavailable(reason: reason)
@@ -297,13 +297,16 @@ struct QrPairSheet: View {
                 Button {
                     if let clip = store.readPairingUriFromClipboard() {
                         manualUri = clip
+                        detectedClipboardPairUri = clip
                         store.hapticLight()
+                    } else {
+                        store.showToast("No orbit://pair URI found in clipboard")
                     }
                 } label: {
                     HStack(spacing: OrbitSpacing.xs) {
                         Image(systemName: "doc.on.clipboard")
                             .font(OrbitTypography.iconMicro)
-                        Text("Paste")
+                        Text("Paste Pairing Code")
                             .font(OrbitTypography.meta(.semibold))
                     }
                     .foregroundStyle(palette.primary)
@@ -384,27 +387,46 @@ struct QrPairSheet: View {
 // MARK: - Native AVCaptureSession QR Scanner Representable
 
 private struct QrScannerRepresentable: UIViewControllerRepresentable {
+    let scanGeneration: Int
     let onCodeScanned: (String) -> Void
     let onFailure: (String) -> Void
 
     func makeUIViewController(context: Context) -> QrScannerViewController {
         let controller = QrScannerViewController()
+        controller.lastScanGeneration = scanGeneration
         controller.onCodeScanned = onCodeScanned
         controller.onFailure = onFailure
         return controller
     }
 
-    func updateUIViewController(_ uiViewController: QrScannerViewController, context: Context) {}
+    func updateUIViewController(_ uiViewController: QrScannerViewController, context: Context) {
+        uiViewController.onCodeScanned = onCodeScanned
+        uiViewController.onFailure = onFailure
+        uiViewController.resumeScanningIfNeeded(generation: scanGeneration)
+    }
 }
 
 private final class QrScannerViewController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
     var onCodeScanned: ((String) -> Void)?
     var onFailure: ((String) -> Void)?
+    var lastScanGeneration: Int = 0
 
     private let captureSession = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "dev.orbit.ios.qrscanner", qos: .userInitiated)
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private var hasDeliveredScan = false
+
+    func resumeScanningIfNeeded(generation: Int) {
+        guard generation != lastScanGeneration else { return }
+        lastScanGeneration = generation
+        hasDeliveredScan = false
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if !self.captureSession.isRunning {
+                self.captureSession.startRunning()
+            }
+        }
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()

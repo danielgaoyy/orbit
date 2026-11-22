@@ -1,5 +1,13 @@
 import SwiftUI
 
+private enum AutomationFilterKind: String, CaseIterable, Identifiable {
+    case all = "All"
+    case schedules = "Schedules"
+    case heartbeats = "Heartbeats"
+
+    var id: String { rawValue }
+}
+
 /// Desktop `AutomationsView` parity — Manage daemon Cron Schedules & Heartbeats,
 /// inspect Run History, trigger Run Now, Pause/Resume, and create new scheduled jobs.
 struct AutomationsSheet: View {
@@ -11,9 +19,21 @@ struct AutomationsSheet: View {
     @State private var expandedScheduleIds: Set<String> = []
     @State private var isCreatePresented = false
     @State private var confirmDeleteSchedule: FfiScheduleSpec? = nil
+    @State private var filterKind: AutomationFilterKind = .all
 
     private var schedules: [FfiScheduleSpec] {
         store.currentHostDetail?.schedules ?? []
+    }
+
+    private var filteredSchedules: [FfiScheduleSpec] {
+        switch filterKind {
+        case .all:
+            return schedules
+        case .schedules:
+            return schedules.filter { $0.kind == .schedule }
+        case .heartbeats:
+            return schedules.filter { $0.kind == .heartbeat }
+        }
     }
 
     var body: some View {
@@ -23,9 +43,24 @@ struct AutomationsSheet: View {
                     if schedules.isEmpty {
                         emptyStateView
                     } else {
-                        VStack(spacing: OrbitSpacing.sm) {
-                            ForEach(schedules) { sched in
-                                scheduleCard(sched)
+                        Picker("Filter", selection: $filterKind) {
+                            ForEach(AutomationFilterKind.allCases) { kind in
+                                Text(kind.rawValue).tag(kind)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        if filteredSchedules.isEmpty {
+                            Text("No \(filterKind.rawValue.lowercased()) configured on this host.")
+                                .font(OrbitTypography.subhead(.regular))
+                                .foregroundStyle(palette.fgMuted)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 32)
+                        } else {
+                            VStack(spacing: OrbitSpacing.sm) {
+                                ForEach(filteredSchedules) { sched in
+                                    scheduleCard(sched)
+                                }
                             }
                         }
                     }
@@ -156,21 +191,23 @@ struct AutomationsSheet: View {
             }
 
             HStack(spacing: OrbitSpacing.sm) {
-                Button {
-                    if isActive {
-                        store.pauseSchedule(sched.scheduleId)
-                    } else {
-                        store.resumeSchedule(sched.scheduleId)
+                if sched.status == .active || sched.status == .paused {
+                    Button {
+                        if isActive {
+                            store.pauseSchedule(sched.scheduleId)
+                        } else {
+                            store.resumeSchedule(sched.scheduleId)
+                        }
+                    } label: {
+                        Label(isActive ? "Pause" : "Resume", systemImage: isActive ? "pause.fill" : "play.fill")
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.fgPrimary)
+                            .padding(.horizontal, 10)
+                            .frame(height: 28)
+                            .background(palette.subtleFill, in: Capsule())
                     }
-                } label: {
-                    Label(isActive ? "Pause" : "Resume", systemImage: isActive ? "pause.fill" : "play.fill")
-                        .font(OrbitTypography.meta(.semibold))
-                        .foregroundStyle(palette.fgPrimary)
-                        .padding(.horizontal, 10)
-                        .frame(height: 28)
-                        .background(palette.subtleFill, in: Capsule())
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
 
                 Button {
                     store.runScheduleOnce(sched.scheduleId)
@@ -280,11 +317,45 @@ private struct CreateAutomationSheet: View {
     @State private var name = ""
     @State private var cronExpr = "daily 09:00"
     @State private var prompt = ""
+    @State private var cwd = ""
     @State private var provider: FfiProviderKind = .claudeCode
+    @State private var mode: FfiSessionMode = .acceptEdits
     @State private var useWorktree = true
     @State private var archiveOnFinish = true
 
     private let cronPresets = ["15m", "1h", "daily 09:00", "weekdays 09:00"]
+
+    private var availableProviders: [FfiProviderKind] {
+        let live = store.activeHost?.availableProviders ?? []
+        return live.isEmpty ? [.claudeCode, .codex, .antigravity] : live
+    }
+
+    private var candidateCwds: [String] {
+        var seen: Set<String> = []
+        var result: [String] = []
+        let projectDirs = store.projects
+            .filter { $0.hostId == store.selectedHostId }
+            .flatMap(\.directories)
+        let discovered = (store.currentHostDetail?.discoveredProjects ?? [])
+            .map(\.path)
+        for path in [store.activeCwd] + projectDirs + discovered {
+            let norm = OrbitPathLogic.normalizePath(path)
+            if !norm.isEmpty && norm != "~" && !seen.contains(norm) {
+                seen.insert(norm)
+                result.append(norm)
+            }
+        }
+        return Array(result.prefix(6))
+    }
+
+    private var resolvedCwd: String {
+        let trimmed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? store.activeCwd : trimmed
+    }
+
+    private var isResolvedCwdGitRepo: Bool {
+        store.isActiveFolderGitRepo(hostId: store.selectedHostId, cwd: resolvedCwd)
+    }
 
     var body: some View {
         NavigationStack {
@@ -341,10 +412,107 @@ private struct CreateAutomationSheet: View {
 
                         OrbitHairline().padding(.leading, OrbitSpacing.md)
 
-                        Toggle("Run in isolated Git Worktree", isOn: $useWorktree)
-                            .font(OrbitTypography.subhead(.regular))
-                            .tint(palette.direct)
-                            .padding(OrbitSpacing.md)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Working Directory")
+                                .font(OrbitTypography.meta(.medium))
+                                .foregroundStyle(palette.fgSecondary)
+                            TextField("~/project/path", text: $cwd)
+                                .font(OrbitTypography.code(.regular))
+                                .foregroundStyle(palette.fgPrimary)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            if !candidateCwds.isEmpty {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 6) {
+                                        ForEach(candidateCwds, id: \.self) { dir in
+                                            let isCurrent = OrbitFormatters.arePathsEquivalent(resolvedCwd, dir)
+                                            Button(OrbitFormatters.shortPath(dir)) {
+                                                cwd = dir
+                                                if !store.isActiveFolderGitRepo(hostId: store.selectedHostId, cwd: dir) {
+                                                    useWorktree = false
+                                                }
+                                                store.hapticLight()
+                                            }
+                                            .font(OrbitTypography.meta(isCurrent ? .semibold : .medium))
+                                            .foregroundStyle(isCurrent ? palette.onPrimary : palette.fgSecondary)
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(isCurrent ? palette.primary : palette.subtleFill, in: Capsule())
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .padding(OrbitSpacing.md)
+
+                        OrbitHairline().padding(.leading, OrbitSpacing.md)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Provider")
+                                .font(OrbitTypography.meta(.medium))
+                                .foregroundStyle(palette.fgSecondary)
+                            HStack(spacing: 6) {
+                                ForEach(availableProviders, id: \.self) { prov in
+                                    let selected = provider == prov
+                                    Button {
+                                        store.hapticLight()
+                                        provider = prov
+                                    } label: {
+                                        HStack(spacing: 5) {
+                                            OrbitProviderIcon(provider: prov, size: 13)
+                                            Text(OrbitFormatters.providerShortLabel(prov))
+                                                .font(OrbitTypography.meta(selected ? .semibold : .medium))
+                                                .lineLimit(1)
+                                        }
+                                        .foregroundStyle(selected ? palette.fgPrimary : palette.fgSecondary)
+                                        .frame(maxWidth: .infinity, minHeight: 34)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                                .fill(selected ? palette.activeRowFill : palette.subtleFill.opacity(0.6))
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                                .strokeBorder(selected ? palette.primary.opacity(0.35) : Color.clear, lineWidth: 0.75)
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        .padding(OrbitSpacing.md)
+
+                        OrbitHairline().padding(.leading, OrbitSpacing.md)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Access Permissions")
+                                .font(OrbitTypography.meta(.medium))
+                                .foregroundStyle(palette.fgSecondary)
+                            HStack(spacing: 6) {
+                                modeChip(.default, label: "Always Ask")
+                                modeChip(.acceptEdits, label: "Accept Edits")
+                                modeChip(.fullAccess, label: "Full Access")
+                            }
+                        }
+                        .padding(OrbitSpacing.md)
+
+                        OrbitHairline().padding(.leading, OrbitSpacing.md)
+
+                        Toggle(isOn: $useWorktree) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Run in isolated Git Worktree")
+                                    .font(OrbitTypography.subhead(.regular))
+                                    .foregroundStyle(isResolvedCwdGitRepo ? palette.fgPrimary : palette.fgMuted)
+                                if !isResolvedCwdGitRepo {
+                                    Text("Git repository required for isolated worktrees")
+                                        .font(OrbitTypography.meta(.regular))
+                                        .foregroundStyle(palette.fgMuted)
+                                }
+                            }
+                        }
+                        .tint(palette.direct)
+                        .disabled(!isResolvedCwdGitRepo)
+                        .padding(OrbitSpacing.md)
 
                         OrbitHairline().padding(.leading, OrbitSpacing.md)
 
@@ -382,14 +550,15 @@ private struct CreateAutomationSheet: View {
                         && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
                     Button {
+                        let allowWorktree = isResolvedCwdGitRepo && useWorktree
                         store.createSchedule(
                             name: name,
                             cronExpr: cronExpr,
                             prompt: prompt,
-                            cwd: store.activeCwd,
+                            cwd: resolvedCwd,
                             provider: provider,
-                            mode: .acceptEdits,
-                            worktree: useWorktree,
+                            mode: mode,
+                            worktree: allowWorktree,
                             archiveOnFinish: archiveOnFinish
                         )
                         dismiss()
@@ -419,9 +588,32 @@ private struct CreateAutomationSheet: View {
                 }
             }
             .onAppear {
+                cwd = store.activeCwd
                 provider = store.selectedProvider
+                mode = OrbitFormatters.normalizePermissionMode(store.selectedMode)
+                if !isResolvedCwdGitRepo {
+                    useWorktree = false
+                }
             }
         }
+    }
+
+    private func modeChip(_ target: FfiSessionMode, label: String) -> some View {
+        let selected = OrbitFormatters.normalizePermissionMode(mode) == target
+        return Button {
+            store.hapticLight()
+            mode = target
+        } label: {
+            Text(label)
+                .font(OrbitTypography.meta(selected ? .semibold : .medium))
+                .foregroundStyle(selected ? palette.fgPrimary : palette.fgSecondary)
+                .frame(maxWidth: .infinity, minHeight: 32)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(selected ? palette.activeRowFill : palette.subtleFill.opacity(0.6))
+                )
+        }
+        .buttonStyle(.plain)
     }
 
     private func templateChip(_ title: String, cron: String, prompt text: String) -> some View {

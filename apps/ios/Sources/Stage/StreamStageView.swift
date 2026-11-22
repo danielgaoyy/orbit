@@ -61,10 +61,12 @@ struct StreamStageView: View {
             }
 
             Group {
-                if store.hosts.isEmpty {
+                if store.hosts.isEmpty && !store.hasDemoStageOverlay && !store.isDemoChatMode {
                     unpairedZeroState
-                } else if turns.isEmpty {
+                } else if store.isDraftNewSession && turns.isEmpty {
                     newSessionZeroState
+                } else if turns.isEmpty {
+                    activeEmptyOrHydratingState
                 } else {
                     turnStreamScrollView
                 }
@@ -72,22 +74,54 @@ struct StreamStageView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .contentShape(Rectangle())
-        .simultaneousGesture(
-            TapGesture().onEnded {
-                dismissKeyboard()
-            }
-        )
         .background(palette.canvas.ignoresSafeArea())
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !store.hosts.isEmpty || store.hasDemoStageOverlay {
+            if !store.hosts.isEmpty || store.hasDemoStageOverlay || store.isDemoChatMode {
                 VStack(spacing: 0) {
+                    SubagentApprovalBanner(store: store)
                     SubagentsTrackPill(store: store)
                     StickyDecisionDock(store: store)
                     OmniComposerView(store: store)
                 }
             }
         }
+    }
+
+    private var activeEmptyOrHydratingState: some View {
+        VStack(spacing: OrbitSpacing.md) {
+            Spacer(minLength: 24)
+            if store.isStageHydrating {
+                OrbitSpinnerRingView(color: palette.primary, size: 22)
+                Text("Loading conversation…")
+                    .font(OrbitTypography.subhead(.medium))
+                    .foregroundStyle(palette.fgSecondary)
+            } else if let err = store.activeStageLoadError, !err.isEmpty {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(palette.warning)
+                Text(err)
+                    .font(OrbitTypography.meta(.regular))
+                    .foregroundStyle(palette.fgSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, OrbitSpacing.xl)
+                Button("Retry") {
+                    if let hid = store.selectedHostId, let aid = store.selectedAgentId {
+                        store.reloadAgentStage(hostId: hid, agentId: aid)
+                    }
+                }
+                .font(OrbitTypography.subhead(.semibold))
+                .foregroundStyle(palette.primary)
+            } else {
+                Image(systemName: "text.bubble")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(palette.fgMuted)
+                Text("Ready — send a message to continue")
+                    .font(OrbitTypography.subhead(.medium))
+                    .foregroundStyle(palette.fgSecondary)
+            }
+            Spacer(minLength: 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - Turn Stream ScrollView
@@ -196,11 +230,11 @@ struct StreamStageView: View {
                     }
                 }
                 .onChange(of: store.agentStage?.latestSeq) { _ in
-                    guard !showScrollToBottomPill && !store.keepStageScrolledToTop else { return }
+                    guard wasPinnedToBottom, !showScrollToBottomPill, !store.keepStageScrolledToTop else { return }
                     proxy.scrollTo(bottomAnchorId, anchor: .bottom)
                 }
                 .onChange(of: turns.count) { _ in
-                    guard !store.keepStageScrolledToTop else { return }
+                    guard wasPinnedToBottom, !showScrollToBottomPill, !store.keepStageScrolledToTop else { return }
                     withAnimation(.easeOut(duration: 0.22)) {
                         proxy.scrollTo(bottomAnchorId, anchor: .bottom)
                     }
@@ -436,7 +470,7 @@ struct StreamStageView: View {
            let ws = store.activeProjectCuratedWorkspaces.first(where: { $0.workspaceId == wsId }) {
             return ws.title
         }
-        return "待归类"
+        return "Unassigned"
     }
 
     private var newSessionZeroState: some View {
@@ -836,7 +870,7 @@ struct StreamStageView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 OrbitPopoverOptionRow(
-                    title: "待归类",
+                    title: "Unassigned",
                     subtitle: "Start standalone in project inbox",
                     systemImage: "tray",
                     isSelected: store.draftWorkspaceId == nil

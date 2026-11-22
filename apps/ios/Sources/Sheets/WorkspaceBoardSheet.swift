@@ -19,9 +19,7 @@ struct WorkspaceBoardSheet: View {
                 },
                 onOpenFile: { path in
                     dismiss()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-                        store.openWorkspaceFiles(initialPath: path)
-                    }
+                    store.openWorkspaceFiles(initialPath: path)
                 }
             )
             .navigationTitle("Mission Overview")
@@ -148,17 +146,7 @@ struct WorkspaceBoardPanel: View {
     }
 
     private func localizedSectionTitle(_ raw: String) -> String {
-        let lower = raw.lowercased()
-        if lower.contains("decision") || lower.contains("contract") {
-            return "决策与约定"
-        }
-        if lower.contains("task") || lower.contains("plan") {
-            return "任务分工"
-        }
-        if lower.contains("finding") || lower.contains("update") || lower.contains("progress") || lower.contains("note") {
-            return "进展与结论"
-        }
-        return raw
+        OrbitBoardLogic.englishSectionTitle(raw)
     }
 
     var body: some View {
@@ -568,11 +556,12 @@ struct WorkspaceBoardPanel: View {
                         OrbitHairline().padding(.leading, 28)
                     }
                     let rel = OrbitFormatters.shortFileLabel(path, rootCwd: rootCwd)
+                    let resolvedPath = OrbitPathLogic.resolveWorkspaceFilePath(path, rootCwd: rootCwd)
                     Button {
                         if let onOpenFile {
-                            onOpenFile(rel)
+                            onOpenFile(resolvedPath)
                         } else {
-                            store.openWorkspaceFiles(initialPath: rel)
+                            store.openWorkspaceFiles(initialPath: resolvedPath)
                         }
                     } label: {
                         HStack(spacing: 8) {

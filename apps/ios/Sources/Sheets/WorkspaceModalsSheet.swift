@@ -24,6 +24,14 @@ struct SpawnPeerSheet: View {
             ?? "Mission Workspace"
     }
 
+    private var workspaceCwd: String? {
+        store.currentHostDetail?.workspaces.first(where: { $0.workspaceId == workspaceId })?.cwd
+    }
+
+    private var isWorkspaceGitRepo: Bool {
+        store.isActiveFolderGitRepo(hostId: store.selectedHostId, cwd: workspaceCwd ?? store.activeCwd)
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView(.vertical, showsIndicators: true) {
@@ -132,13 +140,18 @@ struct SpawnPeerSheet: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Isolated Git Worktree")
                                     .font(OrbitTypography.subhead(.medium))
-                                    .foregroundStyle(palette.fgPrimary)
-                                Text("Run peer on its own branch to avoid file conflicts")
-                                    .font(OrbitTypography.meta(.regular))
-                                    .foregroundStyle(palette.fgMuted)
+                                    .foregroundStyle(isWorkspaceGitRepo ? palette.fgPrimary : palette.fgMuted)
+                                Text(
+                                    isWorkspaceGitRepo
+                                        ? "Run peer on its own branch to avoid file conflicts"
+                                        : "Git repository required for isolated worktrees"
+                                )
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgMuted)
                             }
                         }
                         .tint(palette.direct)
+                        .disabled(!isWorkspaceGitRepo)
                         .padding(OrbitSpacing.md)
 
                         OrbitHairline().padding(.leading, OrbitSpacing.md)
@@ -168,6 +181,10 @@ struct SpawnPeerSheet: View {
                     Button {
                         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !cleanPrompt.isEmpty else { return }
+                        let allowWorktree = OrbitComposerLogic.canCreateWorktreeSession(
+                            isWorktreeMode: useWorktree,
+                            isGitRepo: isWorkspaceGitRepo
+                        ) ? useWorktree : false
                         store.spawnWorkspacePeer(
                             workspaceId: workspaceId,
                             provider: provider,
@@ -176,7 +193,7 @@ struct SpawnPeerSheet: View {
                             mode: mode,
                             handle: handle,
                             initialPrompt: cleanPrompt,
-                            useWorktree: useWorktree
+                            useWorktree: allowWorktree
                         )
                         dismiss()
                     } label: {
@@ -209,6 +226,9 @@ struct SpawnPeerSheet: View {
             .onAppear {
                 provider = store.selectedProvider
                 mode = OrbitFormatters.normalizePermissionMode(store.selectedMode)
+                if !isWorkspaceGitRepo {
+                    useWorktree = false
+                }
             }
         }
     }
@@ -310,19 +330,24 @@ struct CreateWorkspaceSheet: View {
                         }
                         .padding(OrbitSpacing.md)
 
-                        if isGitRepo && moveAgentId == nil {
+                        if moveAgentId == nil {
                             OrbitHairline().padding(.leading, OrbitSpacing.md)
                             Toggle(isOn: $useWorktree) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Create Git Worktree")
                                         .font(OrbitTypography.subhead(.medium))
-                                        .foregroundStyle(palette.fgPrimary)
-                                    Text("Isolate workspace files on a dedicated branch")
-                                        .font(OrbitTypography.meta(.regular))
-                                        .foregroundStyle(palette.fgMuted)
+                                        .foregroundStyle(isGitRepo ? palette.fgPrimary : palette.fgMuted)
+                                    Text(
+                                        isGitRepo
+                                            ? "Isolate workspace files on a dedicated branch"
+                                            : "Git repository required to create a worktree"
+                                    )
+                                    .font(OrbitTypography.meta(.regular))
+                                    .foregroundStyle(palette.fgMuted)
                                 }
                             }
                             .tint(palette.direct)
+                            .disabled(!isGitRepo)
                             .padding(OrbitSpacing.md)
                         }
                     }
@@ -341,11 +366,17 @@ struct CreateWorkspaceSheet: View {
                     Button {
                         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !clean.isEmpty else { return }
+                        let allowWorktree = moveAgentId == nil
+                            && OrbitComposerLogic.canCreateWorktreeSession(
+                                isWorktreeMode: useWorktree,
+                                isGitRepo: isGitRepo
+                            )
+                            && useWorktree
                         store.createMissionWorkspace(
                             sourceCwd: projectRoot,
                             title: clean,
                             missionGoal: missionGoal,
-                            useWorktree: useWorktree,
+                            useWorktree: allowWorktree,
                             moveAgentId: moveAgentId
                         )
                         dismiss()

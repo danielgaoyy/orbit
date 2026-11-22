@@ -87,7 +87,7 @@ private struct GitDiffWorkspacePanel: View {
         if let files = review?.diffFiles, !files.isEmpty {
             return files
         }
-        if !store.gitStagedMode, let sessionDiffs = store.agentStage?.sessionTurnDiffs, !sessionDiffs.isEmpty {
+        if store.gitReviewScope != .staged, let sessionDiffs = store.agentStage?.sessionTurnDiffs, !sessionDiffs.isEmpty {
             return sessionDiffs
         }
         return []
@@ -237,13 +237,12 @@ private struct GitDiffWorkspacePanel: View {
                     .lineLimit(1)
             }
 
-            // Segmented Unstaged / Staged Toggle
+            // Segmented Unstaged / Staged / All Changes Toggle
             HStack(spacing: OrbitSpacing.xs) {
-                stagedSegmentButton(title: "Unstaged", isSelected: !store.gitStagedMode) {
-                    store.setGitStagedFilter(false)
-                }
-                stagedSegmentButton(title: "Staged", isSelected: store.gitStagedMode) {
-                    store.setGitStagedFilter(true)
+                ForEach(OrbitGitReviewScope.allCases) { scope in
+                    stagedSegmentButton(title: scope.label, isSelected: store.gitReviewScope == scope) {
+                        store.setGitReviewScope(scope)
+                    }
                 }
             }
             .padding(3)
@@ -434,18 +433,24 @@ private struct GitDiffWorkspacePanel: View {
                         await store.pullToRefreshGitDiff()
                     }
                     .onAppear {
-                        if let jump = store.jumpToDiffFilePath {
-                            expandedOverrides[jump] = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    proxy.scrollTo("diff-file-\(jump)", anchor: .top)
-                                }
-                                store.jumpToDiffFilePath = nil
-                            }
-                        }
+                        jumpToRequestedDiffFileIfNeeded(proxy: proxy)
+                    }
+                    .onChange(of: store.jumpToDiffFilePath) { _ in
+                        jumpToRequestedDiffFileIfNeeded(proxy: proxy)
                     }
                 }
             }
+        }
+    }
+
+    private func jumpToRequestedDiffFileIfNeeded(proxy: ScrollViewProxy) {
+        guard let jump = store.jumpToDiffFilePath else { return }
+        expandedOverrides[jump] = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                proxy.scrollTo("diff-file-\(jump)", anchor: .top)
+            }
+            store.jumpToDiffFilePath = nil
         }
     }
 
@@ -522,7 +527,7 @@ private struct DiffFileSectionCard: View {
 
     @Environment(\.orbitPalette) private var palette
     @State private var showAllLines = false
-    @State private var currentHunkCursor = 0
+    @State private var currentHunkCursor = -1
 
     private let initialLineCap = 120
 
@@ -594,7 +599,9 @@ private struct DiffFileSectionCard: View {
 
                 if hunkOffsets.count > 1 {
                     Button {
-                        let nextCursor = (currentHunkCursor + 1) % hunkOffsets.count
+                        let nextCursor = (currentHunkCursor < 0 || currentHunkCursor + 1 >= hunkOffsets.count)
+                            ? 0
+                            : (currentHunkCursor + 1)
                         currentHunkCursor = nextCursor
                         let targetOffset = hunkOffsets[nextCursor]
                         if targetOffset >= initialLineCap {

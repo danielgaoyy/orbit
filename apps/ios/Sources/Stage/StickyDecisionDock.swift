@@ -5,6 +5,7 @@ struct StickyDecisionDock: View {
 
     @Environment(\.orbitPalette) private var palette
     @State private var focusedIndex: Int = 0
+    @State private var submittingRequestIds: Set<String> = []
 
     private var pendingPermissions: [FfiTimelineItem] {
         let live = store.agentStage?.pendingPermissions ?? []
@@ -56,6 +57,12 @@ struct StickyDecisionDock: View {
                         allowedDecisions: allowedDecisions,
                         queuePosition: currentIdx + 1,
                         totalQueued: totalCount,
+                        isSubmitting: submittingRequestIds.contains(requestId),
+                        onResolve: { decision in
+                            guard !submittingRequestIds.contains(requestId) else { return }
+                            submittingRequestIds.insert(requestId)
+                            store.resolvePermission(requestId: requestId, decision: decision)
+                        },
                         onStepQueue: { delta in
                             stepQueue(by: delta, total: totalCount)
                         }
@@ -158,12 +165,32 @@ private struct PermissionApprovalCard: View {
     let allowedDecisions: [String]
     let queuePosition: Int
     let totalQueued: Int
+    let isSubmitting: Bool
+    let onResolve: (String) -> Void
     let onStepQueue: (Int) -> Void
 
     @Environment(\.orbitPalette) private var palette
+    @State private var showDetails: Bool = false
 
     private var decisions: [String] {
         allowedDecisions.isEmpty ? ["deny", "allow_always", "allow"] : allowedDecisions
+    }
+
+    private var inspectPayload: OrbitInspectableDecisionPayload {
+        switch detail {
+        case let .shell(command, _, _, _):
+            return OrbitDecisionLogic.inspectablePayload(rawArgsJson: nil, command: command, diff: nil, path: nil)
+        case let .fileEdit(path, unifiedDiff):
+            return OrbitDecisionLogic.inspectablePayload(rawArgsJson: nil, command: nil, diff: unifiedDiff, path: path)
+        case let .fileRead(path, _, _):
+            return OrbitDecisionLogic.inspectablePayload(rawArgsJson: nil, command: nil, diff: nil, path: path)
+        case let .generic(_, argumentsJson):
+            return OrbitDecisionLogic.inspectablePayload(rawArgsJson: argumentsJson, command: nil, diff: nil, path: nil)
+        case let .search(query, scope):
+            return OrbitDecisionLogic.inspectablePayload(rawArgsJson: nil, command: query, diff: nil, path: scope)
+        case let .subagent(_, _, promptPreview):
+            return OrbitDecisionLogic.inspectablePayload(rawArgsJson: nil, command: promptPreview, diff: nil, path: nil)
+        }
     }
 
     private var targetPreview: String {
@@ -191,6 +218,23 @@ private struct PermissionApprovalCard: View {
 
                 Spacer(minLength: OrbitSpacing.xs)
 
+                if inspectPayload.hasInspectableContent {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            showDetails.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text(showDetails ? "Hide Details" : "Inspect")
+                                .font(OrbitTypography.meta(.medium))
+                            Image(systemName: showDetails ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 9, weight: .semibold))
+                        }
+                        .foregroundStyle(palette.fgSecondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 if totalQueued > 1 {
                     DecisionQueueStepperPill(
                         position: queuePosition,
@@ -206,7 +250,7 @@ private struct PermissionApprovalCard: View {
                     Text(targetPreview)
                         .orbitCodeStyle()
                         .foregroundStyle(palette.fgPrimary)
-                        .lineLimit(3)
+                        .lineLimit(showDetails ? nil : 3)
                         .padding(.horizontal, OrbitSpacing.sm + 2)
                         .padding(.vertical, OrbitSpacing.sm)
                 }
@@ -219,11 +263,17 @@ private struct PermissionApprovalCard: View {
                 )
             }
 
+            if showDetails {
+                inspectDetailBox
+            }
+
             HStack(spacing: OrbitSpacing.sm) {
                 ForEach(decisions, id: \.self) { dec in
                     decisionButton(dec)
                 }
             }
+            .disabled(isSubmitting)
+            .opacity(isSubmitting ? 0.65 : 1.0)
         }
         .padding(OrbitSpacing.md)
         .orbitGlassSurface(
@@ -235,16 +285,48 @@ private struct PermissionApprovalCard: View {
         )
     }
 
+    @ViewBuilder
+    private var inspectDetailBox: some View {
+        ScrollView([.vertical, .horizontal], showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 6) {
+                if let path = inspectPayload.path {
+                    Text("Path: \(path)")
+                        .font(OrbitTypography.code(.medium))
+                        .foregroundStyle(palette.fgSecondary)
+                }
+                if let diff = inspectPayload.diff {
+                    Text(diff)
+                        .orbitCodeStyle()
+                        .foregroundStyle(palette.fgPrimary)
+                }
+                if let json = inspectPayload.formattedArgsJson {
+                    Text(json)
+                        .orbitCodeStyle()
+                        .foregroundStyle(palette.fgSecondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(OrbitSpacing.sm)
+        }
+        .frame(maxHeight: 160)
+        .background(palette.code)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(palette.hairline, lineWidth: 0.5)
+        )
+    }
+
     private func decisionButton(_ decision: String) -> some View {
-        let lower = decision.lowercased()
-        let isDeny = lower.contains("deny") || lower.contains("reject")
-        let isAlways = lower.contains("always") || lower.contains("session")
-        let isPrimaryAllow = !isDeny && !isAlways
+        let kind = OrbitDecisionLogic.classify(decision)
+        let isDeny = (kind == .decline || kind == .cancel)
+        let isAlways = (kind == .allowAlways || kind == .allowSession)
+        let isPrimaryAllow = (kind == .allowOnce)
 
         return Button {
-            store.resolvePermission(requestId: requestId, decision: decision)
+            onResolve(decision)
         } label: {
-            Text(OrbitFormatters.decisionLabel(decision))
+            Text(OrbitDecisionLogic.decisionLabel(decision))
                 .font(OrbitTypography.subhead(.semibold))
                 .foregroundStyle(
                     isDeny ? palette.danger :
@@ -262,8 +344,8 @@ private struct PermissionApprovalCard: View {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .strokeBorder(
                             isDeny ? palette.danger.opacity(0.3) :
-                            isPrimaryAllow ? Color.clear :
-                            palette.hairline,
+                            (isAlways || kind == .custom) ? palette.hairline :
+                            Color.clear,
                             lineWidth: 0.5
                         )
                 )

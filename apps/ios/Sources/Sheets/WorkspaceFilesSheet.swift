@@ -322,9 +322,12 @@ struct WorkspaceFilesPanel: View {
     @ViewBuilder
     private func fileViewerContent(path: String) -> some View {
         let file = store.cachedWorkspaceFile(path: path)
-        let isMarkdown = (file?.contentKind == "markdown")
-            || path.lowercased().hasSuffix(".md")
-            || path.lowercased().hasSuffix(".mdx")
+        let isImage = file?.contentKind == "image" || OrbitPathLogic.isPreviewableImagePath(path)
+        let isBinary = file?.contentKind == "binary"
+        let isMarkdown = !isImage && !isBinary && (
+            file?.language.lowercased() == "markdown"
+            || OrbitPathLogic.isMarkdownPath(path)
+        )
         let isDirty = dirtyPaths.contains(path)
 
         VStack(spacing: 0) {
@@ -435,12 +438,42 @@ struct WorkspaceFilesPanel: View {
                 .padding(OrbitSpacing.xl)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let file {
-                if isMarkdown && showMarkdownPreview {
+                if file.contentKind == "image",
+                   let decodedData = Data(base64Encoded: file.content, options: .ignoreUnknownCharacters),
+                   let uiImage = UIImage(data: decodedData) {
+                    ScrollView([.vertical, .horizontal], showsIndicators: true) {
+                        VStack(spacing: OrbitSpacing.md) {
+                            Image(uiImage: uiImage)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxWidth: .infinity)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            Text("\(OrbitFormatters.shortPath(file.path)) · \(ByteCountFormatter.string(fromByteCount: Int64(file.sizeBytes), countStyle: .file))")
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgMuted)
+                        }
+                        .padding(OrbitSpacing.lg)
+                    }
+                } else if file.contentKind == "binary" {
+                    VStack(spacing: OrbitSpacing.sm) {
+                        Image(systemName: "doc.zipper")
+                            .font(.system(size: 28, weight: .medium))
+                            .foregroundStyle(palette.fgMuted)
+                        Text("Binary file preview unavailable")
+                            .font(OrbitTypography.subhead(.semibold))
+                            .foregroundStyle(palette.fgPrimary)
+                        Text("\(OrbitFormatters.shortPath(file.path)) · \(ByteCountFormatter.string(fromByteCount: Int64(file.sizeBytes), countStyle: .file))")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(OrbitSpacing.xl)
+                } else if isMarkdown && showMarkdownPreview {
                     ScrollView(.vertical, showsIndicators: true) {
                         let blocks = file.markdownBlocks.isEmpty
                             ? parseMarkdownPreview(markdown: file.content, streaming: false)
                             : file.markdownBlocks
-                        RichMarkdownView(blocks: blocks, fallbackText: file.content)
+                        RichMarkdownView(blocks: blocks, fallbackText: file.content, workspaceCwd: store.activeCwd)
                             .padding(.horizontal, OrbitSpacing.lg)
                             .padding(.vertical, OrbitSpacing.md)
                     }
@@ -454,67 +487,96 @@ struct WorkspaceFilesPanel: View {
     private func highlightedCodeScrollView(file: FfiWorkspaceFile, path: String) -> some View {
         let query = inFileSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let lines = file.highlightedLines
+        let targetLine = store.activeWorkspaceFileLine
 
-        return ScrollView([.vertical, .horizontal], showsIndicators: true) {
-            LazyVStack(alignment: .leading, spacing: 1) {
-                if !lines.isEmpty {
-                    ForEach(lines, id: \.lineNumber) { line in
-                        let plainText = line.tokens.map(\.text).joined()
-                        let isMatch = !query.isEmpty && plainText.lowercased().contains(query)
+        return ScrollViewReader { proxy in
+            ScrollView([.vertical, .horizontal], showsIndicators: true) {
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    if !lines.isEmpty {
+                        ForEach(lines, id: \.lineNumber) { line in
+                            let plainText = line.tokens.map(\.text).joined()
+                            let isMatch = !query.isEmpty && plainText.lowercased().contains(query)
+                            let isTargetLine = targetLine.map { UInt32($0) == line.lineNumber } ?? false
 
-                        Button {
-                            store.quoteFileLine(path: path, lineNumber: line.lineNumber, content: plainText)
-                        } label: {
-                            HStack(alignment: .top, spacing: 10) {
-                                Text("\(line.lineNumber)")
-                                    .font(OrbitTypography.code(.regular))
-                                    .foregroundStyle(palette.fgMuted)
-                                    .frame(width: 38, alignment: .trailing)
+                            Button {
+                                store.quoteFileLine(path: path, lineNumber: line.lineNumber, content: plainText)
+                            } label: {
+                                HStack(alignment: .top, spacing: 10) {
+                                    Text("\(line.lineNumber)")
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(isTargetLine ? palette.primary : palette.fgMuted)
+                                        .frame(width: 38, alignment: .trailing)
 
-                                renderedHighlightedTokens(line.tokens)
-                                    .fixedSize(horizontal: true, vertical: false)
+                                    renderedHighlightedTokens(line.tokens)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                }
+                                .padding(.horizontal, OrbitSpacing.md)
+                                .padding(.vertical, 1.5)
+                                .background(
+                                    isTargetLine ? palette.primary.opacity(0.16) :
+                                    isMatch ? palette.warning.opacity(0.22) : Color.clear
+                                )
                             }
-                            .padding(.horizontal, OrbitSpacing.md)
-                            .padding(.vertical, 1.5)
-                            .background(isMatch ? palette.warning.opacity(0.22) : Color.clear)
+                            .buttonStyle(.plain)
+                            .id("file-line-\(line.lineNumber)")
                         }
-                        .buttonStyle(.plain)
+                    } else {
+                        let rawLines = file.content.components(separatedBy: .newlines)
+                        ForEach(Array(rawLines.enumerated()), id: \.offset) { idx, text in
+                            let lineNo = UInt32(idx + 1)
+                            let isMatch = !query.isEmpty && text.lowercased().contains(query)
+                            let isTargetLine = targetLine.map { UInt32($0) == lineNo } ?? false
+                            Button {
+                                store.quoteFileLine(path: path, lineNumber: lineNo, content: text)
+                            } label: {
+                                HStack(alignment: .top, spacing: 10) {
+                                    Text("\(lineNo)")
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(isTargetLine ? palette.primary : palette.fgMuted)
+                                        .frame(width: 38, alignment: .trailing)
+                                    Text(text.isEmpty ? " " : text)
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(palette.fgPrimary)
+                                }
+                                .padding(.horizontal, OrbitSpacing.md)
+                                .padding(.vertical, 1.5)
+                                .background(
+                                    isTargetLine ? palette.primary.opacity(0.16) :
+                                    isMatch ? palette.warning.opacity(0.22) : Color.clear
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .id("file-line-\(lineNo)")
+                        }
                     }
-                } else {
-                    let rawLines = file.content.components(separatedBy: .newlines)
-                    ForEach(Array(rawLines.enumerated()), id: \.offset) { idx, text in
-                        let lineNo = UInt32(idx + 1)
-                        let isMatch = !query.isEmpty && text.lowercased().contains(query)
-                        Button {
-                            store.quoteFileLine(path: path, lineNumber: lineNo, content: text)
-                        } label: {
-                            HStack(alignment: .top, spacing: 10) {
-                                Text("\(lineNo)")
-                                    .font(OrbitTypography.code(.regular))
-                                    .foregroundStyle(palette.fgMuted)
-                                    .frame(width: 38, alignment: .trailing)
-                                Text(text.isEmpty ? " " : text)
-                                    .font(OrbitTypography.code(.regular))
-                                    .foregroundStyle(palette.fgPrimary)
-                            }
-                            .padding(.horizontal, OrbitSpacing.md)
-                            .padding(.vertical, 1.5)
-                            .background(isMatch ? palette.warning.opacity(0.22) : Color.clear)
-                        }
-                        .buttonStyle(.plain)
+
+                    if file.truncated {
+                        Text("File truncated for preview (\(file.sizeBytes) bytes total)")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                            .padding(OrbitSpacing.md)
                     }
                 }
-
-                if file.truncated {
-                    Text("File truncated for preview (\(file.sizeBytes) bytes total)")
-                        .font(OrbitTypography.meta(.regular))
-                        .foregroundStyle(palette.fgMuted)
-                        .padding(OrbitSpacing.md)
+                .padding(.vertical, OrbitSpacing.sm)
+            }
+            .onAppear {
+                if let line = store.activeWorkspaceFileLine {
+                    DispatchQueue.main.async {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            proxy.scrollTo("file-line-\(line)", anchor: .center)
+                        }
+                    }
                 }
             }
-            .padding(.vertical, OrbitSpacing.sm)
+            .onChange(of: store.activeWorkspaceFileLine) { newLine in
+                if let line = newLine {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo("file-line-\(line)", anchor: .center)
+                    }
+                }
+            }
+            .background(palette.code)
         }
-        .background(palette.code)
     }
 
     private func renderedHighlightedTokens(_ tokens: [FfiHighlightedToken]) -> Text {

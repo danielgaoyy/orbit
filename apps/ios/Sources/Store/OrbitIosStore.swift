@@ -81,11 +81,13 @@ public enum OrbitPadInspectorTab: String, CaseIterable, Identifiable, Equatable 
 public enum OrbitRenameTarget: Identifiable, Equatable {
     case agent(hostId: String, agentId: String, currentTitle: String, currentHandle: String?)
     case workspace(hostId: String, workspaceId: String, currentTitle: String)
+    case project(projectId: String, currentName: String)
 
     public var id: String {
         switch self {
         case let .agent(hid, aid, _, _): return "agent:\(hid):\(aid)"
         case let .workspace(hid, wid, _): return "ws:\(hid):\(wid)"
+        case let .project(pid, _): return "proj:\(pid)"
         }
     }
 }
@@ -212,8 +214,8 @@ public extension OrbitSlashDirective {
         case "orbit-handoff": return "paperplane"
         case "orbit-committee": return "person.3"
         case "orbit-advisor": return "sparkles"
-        case "ask": return "shield"
-        case "edits": return "checkmark.shield"
+        case "ask", "supervised": return "shield"
+        case "edits", "auto": return "checkmark.shield"
         case "full": return "shield.slash"
         case "terminal": return "terminal"
         case "new": return "square.and.pencil"
@@ -487,6 +489,23 @@ public struct QueuedPromptItem: Identifiable, Equatable {
     }
 }
 
+public struct OrbitScopeComposerDraft: Equatable {
+    public var text: String
+    public var slashDirective: OrbitSlashDirective?
+    public var attachedContexts: [ComposerContextItem]
+    public var quotedDiffSnippets: [QuotedDiffSnippet]
+    public var registeredInlineMentions: [InlineMentionRegistration]
+}
+
+private struct OrbitFailedAttachmentPayload {
+    let hostId: String
+    let contextId: String
+    let filename: String
+    let mimeType: String?
+    let data: Data
+    let completedItem: @MainActor (FfiStagedAttachment) -> ComposerContextItem
+}
+
 // MARK: - Side Question Stream Bridge
 
 private final class WeakSideQuestionListenerBridge: SideQuestionListener, @unchecked Sendable {
@@ -536,6 +555,9 @@ public final class OrbitIosStore: ObservableObject {
     @Published public private(set) var totalPendingApprovals: UInt32 = 0
     @Published public var selectedHostId: String?
     @Published public private(set) var currentHostDetail: FfiHostDetail?
+    @Published public private(set) var hostDetailsByHostId: [String: FfiHostDetail] = [:]
+    @Published public private(set) var agentStageHostId: String? = nil
+    private var agentStageScopeKey: String? = nil
 
     // Active Session & Stage (`selectedAgentId == nil` means New Session draft)
     @Published public var selectedAgentId: String?
@@ -551,11 +573,13 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var draftWorktreeRepoPath: String? = nil
     @Published public private(set) var workspaceFilesList: [String] = []
     @Published public var activeWorkspaceFilePath: String? = nil
+    @Published public var activeWorkspaceFileLine: Int? = nil
     @Published public private(set) var workspaceFileCache: [String: FfiWorkspaceFile] = [:]
     @Published public private(set) var workspaceFileLoadingPath: String? = nil
     @Published public private(set) var workspaceFileError: String? = nil
     @Published public private(set) var gitReview: FfiGitReview?
     @Published public var gitStagedMode: Bool = false
+    @Published public var gitReviewScope: OrbitGitReviewScope = .workingTree
     @Published public var jumpToDiffFilePath: String?
     @Published public private(set) var terminalScreen: FfiTerminalScreen?
     @Published public private(set) var localDaemonUri: String?
@@ -576,6 +600,21 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var renameTarget: OrbitRenameTarget? = nil
     @Published public private(set) var subagentTimelinesCache: [String: [FfiProviderSubagentEvent]] = [:]
     @Published public private(set) var scheduleRunsCache: [String: [FfiScheduleRunRecord]] = [:]
+    @Published public var resolvedChildDecisionsByRequestId: [String: String] = [:]
+    @Published public var pendingArchiveUndo: OrbitPendingArchiveUndo? = nil
+    @Published public var composerUploadStates: [String: OrbitComposerUploadState] = [:]
+    @Published public var isGitRepoCache: [String: Bool] = [:]
+    @Published public var isStageHydrating: Bool = false
+    @Published public var activeStageLoadError: String? = nil
+    @Published public var subagentInspectorTarget: OrbitSubagentInspectorTarget? = nil
+    @Published public var pendingSheetDestination: OrbitSheetDestination? = nil
+    @Published public var isDemoChatMode: Bool = false
+    private var activeSideQuestionRequestIds: Set<String> = []
+    private var workspaceFileCacheOrder: [String] = []
+    private var isApplyingCloudPrefs: Bool = false
+    private var composerDraftsByScope: [String: OrbitScopeComposerDraft] = [:]
+    private var activeComposerScopeKey: String = ""
+    private var failedUploadPayloadsByContextId: [String: OrbitFailedAttachmentPayload] = [:]
 
     // Composer State & Live Queueing
     @Published public var composerText: String = ""
@@ -585,7 +624,7 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var selectedMode: FfiSessionMode = .acceptEdits
     @Published public var slashDirective: OrbitSlashDirective?
     private var hasUserCustomizedDraftModel: Bool = false
-    private var draftSelectionsByProvider: [FfiProviderKind: (modelId: String?, effort: FfiReasoningEffort?)] = [:]
+    private var draftSelectionsByHostProvider: [String: (modelId: String?, effort: FfiReasoningEffort?)] = [:]
     private var hasSyncedLiveCatalogDefault: Bool = false
     @Published public var attachedContexts: [ComposerContextItem] = []
     @Published public var registeredInlineMentions: [InlineMentionRegistration] = []
@@ -602,14 +641,24 @@ public final class OrbitIosStore: ObservableObject {
             refreshSidebar()
         }
     }
-    @Published public var drawerFilter: OrbitDrawerFilter = .all
+    @Published public var drawerFilter: OrbitDrawerFilter = .all {
+        didSet {
+            UserDefaults.standard.set(drawerFilter.rawValue, forKey: Self.drawerFilterDefaultsKey)
+            pushCloudSyncPreferencesPatch(["drawerFilter": drawerFilter.rawValue])
+            refreshSidebar()
+        }
+    }
     @Published public var sidebarProjectSort: OrbitSidebarProjectSort = .recent {
         didSet {
+            UserDefaults.standard.set(sidebarProjectSort.rawValue, forKey: Self.sidebarProjectSortDefaultsKey)
+            pushCloudSyncPreferencesPatch(["sidebarProjectSort": sidebarProjectSort.rawValue])
             refreshSidebar()
         }
     }
     @Published public var sidebarThreadFilter: OrbitSidebarThreadFilter = .all {
         didSet {
+            UserDefaults.standard.set(sidebarThreadFilter.rawValue, forKey: Self.sidebarThreadFilterDefaultsKey)
+            pushCloudSyncPreferencesPatch(["sidebarThreadFilter": sidebarThreadFilter.rawValue])
             refreshSidebar()
         }
     }
@@ -659,6 +708,9 @@ public final class OrbitIosStore: ObservableObject {
     private static let archivedSubagentsDefaultsKey = "orbit.ios.archivedSubagentKeys"
     private static let coalesceExplorationDefaultsKey = "orbit.ios.coalesceExploration"
     private static let defaultPermissionModeDefaultsKey = "orbit.ios.defaultPermissionMode"
+    private static let drawerFilterDefaultsKey = "orbit.ios.drawerFilter"
+    private static let sidebarProjectSortDefaultsKey = "orbit.ios.sidebarProjectSort"
+    private static let sidebarThreadFilterDefaultsKey = "orbit.ios.sidebarThreadFilter"
 
     public init() {
         self.draftUseWorktree = UserDefaults.standard.bool(forKey: Self.draftUseWorktreeDefaultsKey)
@@ -671,6 +723,18 @@ public final class OrbitIosStore: ObservableObject {
         if let savedPerm = UserDefaults.standard.string(forKey: Self.defaultPermissionModeDefaultsKey), !savedPerm.isEmpty {
             self.defaultPermissionModeRaw = savedPerm
             self.selectedMode = Self.sessionModeFromRaw(savedPerm)
+        }
+        if let savedDrawerFilter = UserDefaults.standard.string(forKey: Self.drawerFilterDefaultsKey),
+           let df = OrbitDrawerFilter(rawValue: savedDrawerFilter) {
+            self.drawerFilter = df
+        }
+        if let savedSort = UserDefaults.standard.string(forKey: Self.sidebarProjectSortDefaultsKey),
+           let s = OrbitSidebarProjectSort(rawValue: savedSort) {
+            self.sidebarProjectSort = s
+        }
+        if let savedThreadFilter = UserDefaults.standard.string(forKey: Self.sidebarThreadFilterDefaultsKey),
+           let tf = OrbitSidebarThreadFilter(rawValue: savedThreadFilter) {
+            self.sidebarThreadFilter = tf
         }
         let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         let dbPath = docDir?.appendingPathComponent("orbit_ios_v3.sqlite").path ?? ":memory:"
@@ -722,6 +786,7 @@ public final class OrbitIosStore: ObservableObject {
             self.localDaemonUri = instance.discoverLocalDaemonUri()
             self.cloudSyncStatus = instance.cloudSyncStatus()
             self.refreshPasteboardAvailability()
+            self.hydrateCloudSyncPreferences()
 
             reloadFleet()
             refreshSidebar()
@@ -746,10 +811,16 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public var activeAgent: FfiAgentCard? {
-        if let stageAgent = agentStage?.agent {
+        guard let aid = selectedAgentId else { return nil }
+        if let stageAgent = agentStage?.agent,
+           stageAgent.agentId == aid,
+           (agentStageHostId == nil || agentStageHostId == selectedHostId) {
             return stageAgent
         }
-        guard let aid = selectedAgentId else { return nil }
+        if let selectedHostId,
+           let matched = hostDetailsByHostId[selectedHostId]?.agents.first(where: { $0.agentId == aid }) {
+            return matched
+        }
         return currentHostDetail?.agents.first(where: { $0.agentId == aid })
     }
 
@@ -757,14 +828,96 @@ public final class OrbitIosStore: ObservableObject {
         selectedAgentId == nil
     }
 
+    /// True when the agent is executing a foreground turn OR still holds live background tasks.
     public var isActiveAgentRunning: Bool {
+        if isActiveAgentTurnBusy {
+            return true
+        }
+        return isActiveAgentBackgroundWaiting
+    }
+
+    /// True only while an active foreground turn is streaming or executing tools.
+    public var isActiveAgentTurnBusy: Bool {
         if let agent = activeAgent {
-            return agent.isRunning
+            let lastTurnActive = agentStage?.turns.last.map { $0.hasActiveItem && $0.terminalReply == nil } ?? false
+            return OrbitAgentLogic.isAgentForegroundRunning(
+                statusRaw: agent.statusLabel,
+                hasActiveTurn: agent.isRunning || lastTurnActive
+            )
         }
         if let lastTurn = agentStage?.turns.last, lastTurn.hasActiveItem && lastTurn.terminalReply == nil {
             return true
         }
         return false
+    }
+
+    /// True when no foreground turn is active, yet the agent still has running background tasks or subagents.
+    public var isActiveAgentBackgroundWaiting: Bool {
+        guard let agent = activeAgent else { return false }
+        let hasBgTasks = agent.hasBackgroundTasks || !(agentStage?.insights.backgroundTasks.isEmpty ?? true)
+        return OrbitAgentLogic.isAgentBackgroundWaiting(
+            statusRaw: agent.statusLabel,
+            hasActiveTurn: isActiveAgentTurnBusy,
+            hasBackgroundTasks: hasBgTasks
+        )
+    }
+
+    public func detail(forHostId hostId: String?) -> FfiHostDetail? {
+        guard let hostId, !hostId.isEmpty else { return currentHostDetail }
+        if let cached = hostDetailsByHostId[hostId] {
+            return cached
+        }
+        if currentHostDetail?.host.hostId == hostId {
+            return currentHostDetail
+        }
+        return nil
+    }
+
+    public func isActiveFolderGitRepo(hostId: String? = nil, cwd: String? = nil) -> Bool {
+        let hid = hostId ?? selectedHostId ?? ""
+        let targetCwd = OrbitPathLogic.normalizePath(cwd ?? activeCwd)
+        if let cached = isGitRepoCache["\(hid)::\(targetCwd)"] {
+            return cached
+        }
+        if let detail = detail(forHostId: hid),
+           let inspected = detail.gitReposByCwd.first(where: { OrbitFormatters.arePathsEquivalent($0.key, targetCwd) })?.value {
+            return inspected.isGitRepo || !inspected.nestedGitRepos.isEmpty
+        }
+        if let review = gitReview,
+           OrbitFormatters.arePathsEquivalent(review.cwd, targetCwd) {
+            return review.isGitRepo
+        }
+        if let repo = detail(forHostId: hid)?.discoveredProjects.first(where: {
+            OrbitFormatters.arePathsEquivalent($0.path, targetCwd)
+        }) {
+            return (repo.gitBranch?.isEmpty == false)
+        }
+        return false
+    }
+
+    public var isActiveCwdGitRepo: Bool {
+        isActiveFolderGitRepo(hostId: selectedHostId, cwd: activeCwd)
+    }
+
+    public func overviewBadgeTone(forAgent agent: FfiAgentCard, hostId: String) -> OrbitBadgeTone {
+        let subagentApproval = pendingSubagentApprovalCount(forParentHostId: hostId, parentAgentId: agent.agentId) > 0
+        let isError = agent.statusLabel.lowercased().contains("error") || agent.statusLabel.lowercased().contains("fail")
+        return OrbitAgentLogic.overviewBadgeTone(
+            hasPendingApproval: agent.isAwaitingPermission,
+            hasSubagentApproval: subagentApproval,
+            isError: isError,
+            hasUnread: isThreadUnread(hostId: hostId, agent: agent),
+            hasBackgroundTasks: agent.hasBackgroundTasks,
+            isRunning: agent.isRunning
+        )
+    }
+
+    public func pendingSubagentApprovalCount(forParentHostId hostId: String, parentAgentId: String) -> Int {
+        guard let detail = detail(forHostId: hostId) else { return 0 }
+        return detail.agents.filter { child in
+            let sameHost = (child.parentHostId ?? hostId) == hostId
+            return sameHost && child.parentAgentId == parentAgentId && child.isAwaitingPermission && child.archivedAtRfc3339 == nil
+        }.count
     }
 
     public var canShowInlineDiffInspector: Bool {
@@ -918,6 +1071,13 @@ public final class OrbitIosStore: ObservableObject {
         lastMarkedSeenSeqByAgent.removeValue(forKey: "\(hostId)::\(agentId)")
         core?.markAgentUnread(hostId: hostId, agentId: agentId)
         refreshSidebar()
+        hapticLight()
+    }
+
+    public func markAgentRead(hostId: String, agentId: String, latestSeq: UInt64 = UInt64.max / 2) {
+        let resolvedSeq = detail(forHostId: hostId)?.agents.first(where: { $0.agentId == agentId })?.latestSeq ?? latestSeq
+        lastMarkedSeenSeqByAgent.removeValue(forKey: "\(hostId)::\(agentId)")
+        markAgentSeen(hostId: hostId, agentId: agentId, seq: max(1, resolvedSeq), refreshSidebarAfter: true)
         hapticLight()
     }
 
@@ -1226,6 +1386,10 @@ public final class OrbitIosStore: ObservableObject {
             ]
         }
 
+        if args.contains("-orbitDemoChat") {
+            seedDemoChatShowcase()
+        }
+
         if let demoCompIdx = args.firstIndex(of: "-orbitDemoComposer"), demoCompIdx + 1 < args.count {
             hasDemoComposerLaunch = true
             composerText = args[demoCompIdx + 1]
@@ -1363,8 +1527,163 @@ public final class OrbitIosStore: ObservableObject {
 
     // MARK: - Fleet, Host & Session Selection
 
+    private func seedDemoChatShowcase() {
+        isDemoChatMode = true
+        let demoHostId = "demo-host"
+        let demoAgentId = "demo-agent-ios-parity"
+        let demoCwd = "~/Code/orbit"
+        let demoHost = FfiHostCard(
+            hostId: demoHostId,
+            displayName: "Devbox Studio",
+            hostname: "devbox.local",
+            customName: nil,
+            sshAlias: nil,
+            routeMode: .auto,
+            remoteDaemonPort: 7474,
+            customDirectEndpoint: nil,
+            viaSshTunnel: false,
+            lastPingMs: 14,
+            daemonVersion: appShortVersion,
+            daemonProtocolVersion: 1,
+            clientProtocolVersion: 1,
+            osArch: "aarch64-apple-darwin",
+            daemonPubkeyB64: "demoPubKeyOrbit082",
+            directEndpoints: ["ws://127.0.0.1:7474"],
+            relayUrl: nil,
+            connectionState: .onlineDirect,
+            lastError: nil,
+            availableProviders: [.claudeCode, .codex],
+            workspaceCount: 1,
+            agentCount: 1,
+            pendingApprovalCount: 0,
+            supportsServerQueue: true
+        )
+        let demoCard = FfiAgentCard(
+            agentId: demoAgentId,
+            workspaceId: "demo-ws-1",
+            cwd: demoCwd,
+            title: "Align iOS Chat & Sidebar with Desktop v0.8.2",
+            provider: .claudeCode,
+            providerLabel: "Claude Code",
+            model: "claude-sonnet-4-6",
+            effort: .high,
+            mode: .acceptEdits,
+            statusLabel: "Working",
+            isRunning: true,
+            hasBackgroundTasks: false,
+            isAwaitingPermission: false,
+            parentAgentId: nil,
+            parentHostId: nil,
+            archivedAtRfc3339: nil,
+            handle: "ios-parity",
+            clusterSuggestion: nil,
+            worktreeBranch: "feat/ios-parity",
+            taskSummary: "Verifying markdown rendering & queue reorder",
+            attentionLabel: nil,
+            latestSeq: 22,
+            updatedAtRfc3339: "2026-11-22T06:00:00Z",
+            isPinned: true,
+            seenSeq: 22,
+            isUnread: false,
+            queuedPrompts: [
+                FfiQueuedPrompt(queueId: "demo-q1", displayText: "Run XCTest suite & capture iOS screenshots", badges: [], createdAtRfc3339: "2026-11-22T06:01:00Z")
+            ]
+        )
+        let demoDetail = FfiHostDetail(
+            revision: 1,
+            host: demoHost,
+            discoveredProjects: [],
+            directoryListing: nil,
+            providerCatalogs: cachedFallbackCatalogs,
+            workspaces: [
+                FfiWorkspaceSummary(
+                    workspaceId: "demo-ws-1",
+                    title: "Orbit iOS Parity",
+                    cwd: demoCwd,
+                    gitBranch: "feat/ios-parity",
+                    isWorktree: true,
+                    missionGoal: "Ship v0.8.2 parity across stage, composer, sidebar, and sheets.",
+                    projectRoot: demoCwd,
+                    sourceCwd: demoCwd,
+                    boardRevision: 2,
+                    isCurated: true,
+                    updatedAtRfc3339: "2026-11-22T06:00:00Z"
+                )
+            ],
+            agents: [demoCard],
+            archivedAgents: [],
+            lastCreatedAgentId: nil,
+            replacedOptimisticAgents: [:],
+            quotas: [],
+            terminals: [],
+            activeTerminalId: nil,
+            activeTerminalSlot: 1,
+            schedules: [],
+            providerSubagents: [:],
+            gitReposByCwd: [:],
+            workspaceBoards: [:],
+            workspaceEvents: [:],
+            workspaceOrganizeStatus: [:]
+        )
+        hosts = [demoHost]
+        hostDetailsByHostId[demoHostId] = demoDetail
+        currentHostDetail = demoDetail
+        selectedHostId = demoHostId
+        selectedAgentId = demoAgentId
+        activeCwd = demoCwd
+        let counts1 = FfiTurnWorkCounts(
+            editedFileCount: 2, createdFileCount: 1, commandCount: 1, readFileCount: 3, searchCount: 1,
+            subagentCount: 1, mcpServerCount: 0, otherToolCount: 0, thoughtCount: 1, narrationCount: 1,
+            actionSteps: 4, totalSteps: 5, failedCount: 0, deniedCount: 0, unrecoveredFailureCount: 0,
+            additions: 48, deletions: 12
+        )
+        let summary1 = FfiWorkSummaryResult(counts: counts1, label: "5 steps · 2 edited", liveLabel: "Running", liveDetail: nil, labelIncludesFailure: false)
+        let replyMd = """
+        All **iOS v0.8.2** fixes are wired in [OrbitIosLogic.swift](Sources/Store/OrbitIosLogic.swift#L42):
+
+        | Layer | Status | Verification |
+        | --- | --- | --- |
+        | Stage & Markdown | Aligned | Unit tested |
+        | Sidebar & Modals | Aligned | Zero duplicate IDs |
+        """
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let startMs = nowMs - 18_000
+        let replyItem1 = FfiTimelineItem.assistantMessage(
+            seq: 10, itemId: "demo-msg-1", text: replyMd, streaming: false,
+            blocks: parseMarkdownPreview(markdown: replyMd, streaming: false), timestampMs: nowMs
+        )
+        let turn1 = FfiStageTurn(
+            key: "demo-turn-1", turnIndex: 0, anchorSeq: 1,
+            userPrompt: .userPrompt(seq: 1, messageId: "demo-u1", text: "Align iOS chat, markdown tables, and sidebar with Desktop v0.8.2", badges: [], blocks: [], timestampMs: startMs),
+            agentMessage: nil, isCompactionCommand: false, foldedSteps: [],
+            workCounts: counts1, workSummaryLabel: summary1.label, workSummaryLiveLabel: summary1.liveLabel,
+            workSummaryLiveDetail: nil, workSummaryIncludesFailure: false,
+            thoughtDurationMs: 2_400, workDurationMs: 6_800, turnDurationMs: 9_200,
+            terminalReply: replyItem1, lastAssistantReply: replyItem1, notices: [], compactions: [],
+            liveSegments: [
+                .stepGroup(key: "demo-sg-1", firstSeq: 2, items: [
+                    .assistantThinking(seq: 2, itemId: "demo-t1", text: "Auditing FFI bindings and iOS view lifecycles.", headline: "Auditing iOS vs Desktop parity", timestampMs: startMs + 2_000)
+                ], summary: summary1, thoughtDurationMs: 2_400, workDurationMs: 6_800, startedAtMs: startMs, latestActivityMs: nowMs, hasFollowingContent: true, hasRunningStep: false),
+                .assistantMessage(key: "demo-am-1", item: replyItem1)
+            ],
+            turnDiffs: [], hasError: false, hasUnrecoveredError: false, hasActiveItem: false,
+            startedAtMs: startMs, completedAtMs: nowMs
+        )
+        agentStage = FfiAgentStage(
+            revision: 1, hostId: demoHostId, agent: demoCard, turns: [turn1],
+            pendingPermissions: [], pendingQuestions: [], sessionTurnDiffs: [],
+            insights: FfiSessionInsights(touchedFiles: [], backgroundTasks: [], subagents: [], detectedLocalUrls: []),
+            latestSeq: 22
+        )
+        agentStageHostId = demoHostId
+        agentStageScopeKey = OrbitAgentLogic.stageScopeKey(hostId: demoHostId, agentId: demoAgentId)
+    }
+
     public func reloadFleet() {
         guard let snap = core?.fleetOverview() else { return }
+        if isDemoChatMode {
+            return
+        }
         hosts = snap.hosts
         projects = snap.projects
         projectOrder = snap.projectOrder
@@ -1373,24 +1692,92 @@ public final class OrbitIosStore: ObservableObject {
         if selectedHostId == nil, let firstHost = snap.hosts.first {
             selectHost(firstHost.hostId)
         } else if let hid = selectedHostId, !snap.hosts.contains(where: { $0.hostId == hid }) {
-            selectedHostId = snap.hosts.first?.hostId
-            if let nextId = selectedHostId {
+            if let nextId = snap.hosts.first?.hostId {
                 selectHost(nextId)
             } else {
+                selectedHostId = nil
                 currentHostDetail = nil
                 selectedAgentId = nil
                 agentStage = nil
+                agentStageHostId = nil
+                agentStageScopeKey = nil
+                activeCwd = "~"
+                draftWorkspaceId = nil
+                workspaceFilesList = []
             }
         }
         refreshSidebar()
     }
 
+    private func currentComposerScopeKey() -> String {
+        OrbitComposerLogic.scopedDraftKey(
+            hostId: selectedHostId,
+            agentId: selectedAgentId,
+            draftWorkspaceId: draftWorkspaceId,
+            draftCwd: activeCwd
+        )
+    }
+
+    private func saveCurrentComposerDraft() {
+        let key = activeComposerScopeKey.isEmpty ? currentComposerScopeKey() : activeComposerScopeKey
+        let hasContent = !composerText.isEmpty
+            || slashDirective != nil
+            || !attachedContexts.isEmpty
+            || !quotedDiffSnippets.isEmpty
+            || !registeredInlineMentions.isEmpty
+        if hasContent {
+            composerDraftsByScope[key] = OrbitScopeComposerDraft(
+                text: composerText,
+                slashDirective: slashDirective,
+                attachedContexts: attachedContexts,
+                quotedDiffSnippets: quotedDiffSnippets,
+                registeredInlineMentions: registeredInlineMentions
+            )
+        } else {
+            composerDraftsByScope.removeValue(forKey: key)
+        }
+    }
+
+    private func restoreComposerDraftForCurrentScope() {
+        let nextKey = currentComposerScopeKey()
+        activeComposerScopeKey = nextKey
+        if let saved = composerDraftsByScope[nextKey] {
+            composerText = saved.text
+            slashDirective = saved.slashDirective
+            attachedContexts = saved.attachedContexts
+            quotedDiffSnippets = saved.quotedDiffSnippets
+            registeredInlineMentions = saved.registeredInlineMentions
+        } else {
+            composerText = ""
+            slashDirective = nil
+            attachedContexts = []
+            quotedDiffSnippets = []
+            registeredInlineMentions = []
+        }
+    }
+
+    private func draftModelKey(hostId: String? = nil, for provider: FfiProviderKind) -> String {
+        "\(hostId ?? selectedHostId ?? "")::\(provider)"
+    }
+
     public func selectHost(_ hostId: String) {
         let changed = selectedHostId != hostId
-        selectedHostId = hostId
         if changed {
+            saveCurrentComposerDraft()
             selectedAgentId = nil
             agentStage = nil
+            agentStageHostId = nil
+            agentStageScopeKey = nil
+            activeStageLoadError = nil
+            isStageHydrating = false
+            activeCwd = "~"
+            activeExtraDirs = []
+            draftUseWorktree = false
+            draftWorkspaceId = nil
+            draftWorktreeRepoPath = nil
+            workspaceFilesList = []
+            activeWorkspaceFilePath = nil
+            activeWorkspaceFileLine = nil
             gitReview = nil
             terminalScreen = nil
             if !hasUserCustomizedDraftModel {
@@ -1398,6 +1785,11 @@ public final class OrbitIosStore: ObservableObject {
                 selectedModel = nil
                 selectedEffort = nil
             }
+        }
+        selectedHostId = hostId
+        if changed {
+            currentHostDetail = hostDetailsByHostId[hostId]
+            restoreComposerDraftForCurrentScope()
         }
         core?.connectHost(hostId: hostId)
         core?.refreshHost(hostId: hostId)
@@ -1408,8 +1800,11 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func reloadHostDetail(_ hostId: String) {
+        if isDemoChatMode && hostId == "demo-host" {
+            return
+        }
         guard let detail = core?.hostDetail(hostId: hostId) else { return }
-        currentHostDetail = detail
+        hostDetailsByHostId[hostId] = detail
 
         // Migrate queued prompts and running state across optimistic -> permanent agent IDs
         for (oldAid, newAid) in detail.replacedOptimisticAgents {
@@ -1425,8 +1820,22 @@ public final class OrbitIosStore: ObservableObject {
             }
         }
 
+        // Evaluate running -> settled transitions for background sessions with queued prompts
+        for agent in detail.agents where !(hostId == selectedHostId && agent.agentId == selectedAgentId) {
+            let busy = OrbitAgentLogic.isAgentForegroundRunning(statusRaw: agent.statusLabel, hasActiveTurn: agent.isRunning)
+                || agent.isAwaitingPermission
+            evaluateAgentQueueDrain(hostId: hostId, agentId: agent.agentId, isBusy: busy)
+        }
+
+        guard selectedHostId == hostId else {
+            refreshSidebar()
+            return
+        }
+
+        currentHostDetail = detail
+
         // Advance active thread's seen cursor if currently viewing it
-        if selectedHostId == hostId, let currentAid = selectedAgentId, !isDraftNewSession,
+        if let currentAid = selectedAgentId, !isDraftNewSession,
            let ag = detail.agents.first(where: { $0.agentId == currentAid }) {
             markAgentSeen(hostId: hostId, agentId: currentAid, seq: ag.latestSeq, refreshSidebarAfter: false)
         }
@@ -1479,19 +1888,13 @@ public final class OrbitIosStore: ObservableObject {
         if autoSelectLatestAgentOnLoad, selectedAgentId == nil,
            let firstAgent = detail.agents.first {
             autoSelectLatestAgentOnLoad = false
-            selectAgent(firstAgent.agentId)
+            selectAgent(hostId: hostId, agentId: firstAgent.agentId)
         }
 
         if (isPadDiffInspectorVisible || activeSheet == .gitDiff),
            (detail.host.connectionState == .onlineDirect || detail.host.connectionState == .onlineRelay),
            (gitReview == nil || !OrbitFormatters.arePathsEquivalent(gitReview?.cwd ?? "", activeCwd)) {
             refreshGitReview()
-        }
-
-        // Evaluate running -> settled transitions for background sessions with queued prompts
-        for agent in detail.agents where agent.agentId != selectedAgentId {
-            let busy = agent.isRunning || agent.isAwaitingPermission
-            evaluateAgentQueueDrain(hostId: hostId, agentId: agent.agentId, isBusy: busy)
         }
 
         refreshSidebar()
@@ -1519,37 +1922,85 @@ public final class OrbitIosStore: ObservableObject {
 
     public func selectAgent(_ agentId: String) {
         guard let hid = selectedHostId else { return }
+        selectAgent(hostId: hid, agentId: agentId)
+    }
+
+    public func selectAgent(hostId: String, agentId: String) {
+        let hostChanged = selectedHostId != hostId
+        let agentChanged = selectedAgentId != agentId || hostChanged
+        if agentChanged {
+            saveCurrentComposerDraft()
+        }
+        if hostChanged {
+            selectedHostId = hostId
+            currentHostDetail = hostDetailsByHostId[hostId]
+            gitReview = nil
+            terminalScreen = nil
+            core?.connectHost(hostId: hostId)
+            core?.refreshHost(hostId: hostId)
+            core?.refreshProviderModels(hostId: hostId, forceRefresh: false)
+            core?.refreshQuotas(hostId: hostId)
+            reloadHostDetail(hostId)
+        }
+        if agentChanged {
+            agentStage = nil
+            agentStageHostId = nil
+            agentStageScopeKey = nil
+            activeStageLoadError = nil
+            isStageHydrating = true
+            draftWorkspaceId = nil
+            draftUseWorktree = false
+            draftWorktreeRepoPath = nil
+            activeWorkspaceFilePath = nil
+            activeWorkspaceFileLine = nil
+        }
         selectedAgentId = agentId
         isDrawerOpen = false
-        core?.openAgentTimeline(hostId: hid, agentId: agentId)
-        core?.listProviderSubagents(hostId: hid, parentAgentId: agentId)
-        reloadAgentStage(hostId: hid, agentId: agentId)
+        core?.openAgentTimeline(hostId: hostId, agentId: agentId)
+        core?.listProviderSubagents(hostId: hostId, parentAgentId: agentId)
+        reloadAgentStage(hostId: hostId, agentId: agentId)
 
-        if let card = currentHostDetail?.agents.first(where: { $0.agentId == agentId }) ?? agentStage?.agent {
+        if let card = detail(forHostId: hostId)?.agents.first(where: { $0.agentId == agentId }) ?? activeAgent {
             selectedProvider = card.provider
             selectedModel = card.model
             selectedEffort = card.effort
             selectedMode = card.mode
             updateActiveWorkspaceCwd(card.cwd)
             if !card.workspaceId.isEmpty {
-                core?.fetchWorkspaceEvents(hostId: hid, workspaceId: card.workspaceId, limit: 40)
-                if let ws = currentHostDetail?.workspaces.first(where: { $0.workspaceId == card.workspaceId }),
+                core?.fetchWorkspaceEvents(hostId: hostId, workspaceId: card.workspaceId, limit: 40)
+                if let ws = detail(forHostId: hostId)?.workspaces.first(where: { $0.workspaceId == card.workspaceId }),
                    ws.isCurated || ws.boardRevision > 0 {
-                    core?.fetchWorkspaceBoard(hostId: hid, workspaceId: card.workspaceId)
+                    core?.fetchWorkspaceBoard(hostId: hostId, workspaceId: card.workspaceId)
                 }
             }
-            markAgentSeen(hostId: hid, agentId: agentId, seq: max(card.latestSeq, agentStage?.latestSeq ?? 0))
+            markAgentSeen(hostId: hostId, agentId: agentId, seq: max(card.latestSeq, agentStage?.latestSeq ?? 0))
+        }
+        if agentChanged {
+            restoreComposerDraftForCurrentScope()
         }
         refreshSidebar()
         hapticLight()
     }
 
     public func reloadAgentStage(hostId: String, agentId: String) {
-        let sameStage = agentStage?.hostId == hostId && (agentStage?.agent?.agentId ?? selectedAgentId) == agentId
-        let sinceRev: UInt64 = sameStage ? (agentStage?.revision ?? 0) : 0
-        guard let delta = core?.agentStageDelta(hostId: hostId, agentId: agentId, sinceRevision: sinceRev) else {
+        guard hostId == selectedHostId, agentId == selectedAgentId else { return }
+        if isDemoChatMode && hostId == "demo-host" {
             return
         }
+        let targetScope = OrbitAgentLogic.stageScopeKey(hostId: hostId, agentId: agentId)
+        let sameStage = targetScope != nil
+            && agentStageScopeKey == targetScope
+            && agentStage?.hostId == hostId
+            && agentStageHostId == hostId
+            && agentStage?.agent?.agentId == agentId
+        let sinceRev: UInt64 = sameStage ? (agentStage?.revision ?? 0) : 0
+        guard let delta = core?.agentStageDelta(hostId: hostId, agentId: agentId, sinceRevision: sinceRev) else {
+            if hostId == selectedHostId && agentId == selectedAgentId {
+                isStageHydrating = false
+            }
+            return
+        }
+        guard hostId == selectedHostId && agentId == selectedAgentId else { return }
 
         let stage: FfiAgentStage
         if !delta.reset,
@@ -1597,6 +2048,10 @@ public final class OrbitIosStore: ObservableObject {
         }
 
         agentStage = stage
+        agentStageHostId = hostId
+        agentStageScopeKey = targetScope
+        isStageHydrating = false
+        activeStageLoadError = nil
         if let card = stage.agent {
             if selectedProvider != card.provider { selectedProvider = card.provider }
             if let m = card.model, selectedModel != m { selectedModel = m }
@@ -1621,7 +2076,7 @@ public final class OrbitIosStore: ObservableObject {
             let awaitingDecision = !stage.pendingPermissions.isEmpty
                 || !stage.pendingQuestions.isEmpty
                 || (stage.agent?.isAwaitingPermission ?? false)
-            let isBusy = isActiveAgentRunning || awaitingDecision
+            let isBusy = isActiveAgentTurnBusy || awaitingDecision
             evaluateAgentQueueDrain(hostId: hostId, agentId: agentId, isBusy: isBusy)
         }
     }
@@ -1632,9 +2087,16 @@ public final class OrbitIosStore: ObservableObject {
         provider: FfiProviderKind? = nil,
         workspaceId: String? = nil
     ) {
+        saveCurrentComposerDraft()
         let wasViewingAgent = selectedAgentId != nil
         selectedAgentId = nil
         agentStage = nil
+        agentStageHostId = nil
+        agentStageScopeKey = nil
+        isStageHydrating = false
+        activeStageLoadError = nil
+        activeWorkspaceFilePath = nil
+        activeWorkspaceFileLine = nil
         isDrawerOpen = false
         activeExtraDirs = extraDirs
         draftWorkspaceId = workspaceId
@@ -1642,7 +2104,7 @@ public final class OrbitIosStore: ObservableObject {
         selectedMode = Self.sessionModeFromRaw(defaultPermissionModeRaw)
         if let provider = provider {
             selectedProvider = provider
-            if let saved = draftSelectionsByProvider[provider] {
+            if let saved = draftSelectionsByHostProvider[draftModelKey(for: provider)] {
                 applyModelSelection(provider: provider, modelId: saved.modelId, effort: saved.effort)
             } else {
                 hasSyncedLiveCatalogDefault = currentHostDetail?.providerCatalogs.contains {
@@ -1651,7 +2113,7 @@ public final class OrbitIosStore: ObservableObject {
                 syncDefaultModelAndEffort(for: provider)
             }
         } else if wasViewingAgent {
-            if let saved = draftSelectionsByProvider[selectedProvider] {
+            if let saved = draftSelectionsByHostProvider[draftModelKey(for: selectedProvider)] {
                 applyModelSelection(provider: selectedProvider, modelId: saved.modelId, effort: saved.effort)
             } else {
                 hasUserCustomizedDraftModel = false
@@ -1666,13 +2128,14 @@ public final class OrbitIosStore: ObservableObject {
         } else if let hid = selectedHostId, !activeCwd.isEmpty, activeCwd != "~" {
             core?.requestGitReposInspection(hostId: hid, path: activeCwd, extraDirs: activeExtraDirs)
         }
+        restoreComposerDraftForCurrentScope()
         refreshSidebar()
         hapticLight()
     }
 
     public func openTerminal(inCwd cwd: String? = nil) {
         guard let hid = selectedHostId else {
-            activeSheet = .qrPair
+            presentSheetSafely(.qrPair)
             return
         }
         isDrawerOpen = false
@@ -1687,7 +2150,7 @@ public final class OrbitIosStore: ObservableObject {
             }
         }
         hapticLight()
-        activeSheet = .pty
+        presentSheetSafely(.pty)
     }
 
     public func inspectGitDiff(inCwd cwd: String) {
@@ -1711,6 +2174,7 @@ public final class OrbitIosStore: ObservableObject {
     public func setDraftUseWorktree(_ useWorktree: Bool) {
         draftUseWorktree = useWorktree
         UserDefaults.standard.set(useWorktree, forKey: Self.draftUseWorktreeDefaultsKey)
+        pushCloudSyncPreferencesPatch(["draftUseWorktree": useWorktree])
         hapticLight()
     }
 
@@ -1739,16 +2203,161 @@ public final class OrbitIosStore: ObservableObject {
         }
     }
 
-    public func archiveSession(_ agentId: String) {
-        guard let hid = selectedHostId else { return }
+    public func archiveSession(_ agentId: String, hostId: String? = nil) {
+        guard let hid = hostId ?? selectedHostId else { return }
+        let title = detail(forHostId: hid)?.agents.first(where: { $0.agentId == agentId })?.title
+            ?? activeAgent?.title
+            ?? "Conversation"
         core?.archiveAgent(hostId: hid, agentId: agentId)
-        if selectedAgentId == agentId {
+        if selectedAgentId == agentId && hid == selectedHostId {
             selectedAgentId = nil
             agentStage = nil
+            agentStageHostId = nil
+            agentStageScopeKey = nil
         }
+        pendingArchiveUndo = OrbitPendingArchiveUndo(hostId: hid, agentId: agentId, title: title)
         reloadHostDetail(hid)
+        refreshSidebar()
         hapticLight()
         showToast("Session archived")
+    }
+
+    public func undoPendingArchive() {
+        guard let undo = pendingArchiveUndo else { return }
+        pendingArchiveUndo = nil
+        core?.unarchiveAgent(hostId: undo.hostId, agentId: undo.agentId)
+        reloadHostDetail(undo.hostId)
+        refreshSidebar()
+        hapticSuccess()
+        showToast("Restored \(undo.title)")
+    }
+
+    public func dismissArchiveUndo() {
+        pendingArchiveUndo = nil
+    }
+
+    public func addProjectDirectory(hostId: String? = nil, name: String? = nil, path: String) {
+        let cleanPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let hid = hostId ?? selectedHostId, !cleanPath.isEmpty else { return }
+        let cleanName: String = {
+            let trimmed = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+            let base = OrbitPathLogic.basename(cleanPath)
+            return base.isEmpty ? cleanPath : base
+        }()
+        do {
+            _ = try core?.upsertProject(
+                projectId: nil,
+                hostId: hid,
+                name: cleanName,
+                directories: [cleanPath]
+            )
+            reloadFleet()
+            hapticSuccess()
+            showToast("Added project \(cleanName)")
+        } catch {
+            lastError = error.localizedDescription
+            hapticWarning()
+        }
+    }
+
+    public func renameProject(projectId: String, newName: String) {
+        let clean = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty,
+              let proj = projects.first(where: { $0.projectId == projectId }) else { return }
+        do {
+            _ = try core?.upsertProject(
+                projectId: proj.projectId,
+                hostId: proj.hostId,
+                name: clean,
+                directories: proj.directories
+            )
+            reloadFleet()
+            hapticLight()
+            showToast("Renamed project to \(clean)")
+        } catch {
+            lastError = error.localizedDescription
+            hapticWarning()
+        }
+    }
+
+    public func deleteProject(_ projectId: String) {
+        unpinProject(projectId)
+        showToast("Removed project")
+    }
+
+    public func copyPromptText(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        UIPasteboard.general.string = trimmed
+        refreshPasteboardAvailability()
+        hapticLight()
+        showToast("Copied prompt")
+    }
+
+    public func copyThreadTranscript(hostId: String? = nil, agentId: String? = nil) {
+        guard let hid = hostId ?? selectedHostId,
+              let aid = agentId ?? selectedAgentId else { return }
+        let stage: FfiAgentStage? = (hid == agentStageHostId && aid == agentStage?.agent?.agentId)
+            ? agentStage
+            : core?.agentStage(hostId: hid, agentId: aid)
+        guard let stage else { return }
+        var sections: [String] = []
+        for turn in stage.turns {
+            if case let .userPrompt(_, _, text, _, _, _)? = turn.userPrompt {
+                let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty {
+                    sections.append("## User\n\(t)")
+                }
+            }
+            if case let .assistantMessage(_, _, text, _, _, _)? = (turn.terminalReply ?? turn.lastAssistantReply) {
+                let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty {
+                    sections.append("## Assistant\n\(t)")
+                }
+            }
+        }
+        let body = sections.joined(separator: "\n\n---\n\n")
+        guard !body.isEmpty else {
+            showToast("No transcript content yet")
+            return
+        }
+        UIPasteboard.general.string = body
+        refreshPasteboardAvailability()
+        hapticLight()
+        showToast("Copied thread transcript")
+    }
+
+    public var allArchivedAgentsAcrossHosts: [(host: FfiHostCard, agent: FfiAgentCard)] {
+        var collected: [(host: FfiHostCard, agent: FfiAgentCard)] = []
+        for host in hosts {
+            let detail = detail(forHostId: host.hostId) ?? core?.hostDetail(hostId: host.hostId)
+            for agent in detail?.archivedAgents ?? [] {
+                collected.append((host: host, agent: agent))
+            }
+        }
+        return collected.sorted { lhs, rhs in
+            let lTime = lhs.agent.archivedAtRfc3339 ?? lhs.agent.updatedAtRfc3339
+            let rTime = rhs.agent.archivedAtRfc3339 ?? rhs.agent.updatedAtRfc3339
+            return lTime > rTime
+        }
+    }
+
+    public func emptyArchive(hostId: String? = nil) {
+        let targets: [(hostId: String, agentId: String)] = allArchivedAgentsAcrossHosts.compactMap { item in
+            if let hostId, item.host.hostId != hostId { return nil }
+            return (item.host.hostId, item.agent.agentId)
+        }
+        guard !targets.isEmpty else { return }
+        for target in targets {
+            core?.deleteAgent(hostId: target.hostId, agentId: target.agentId)
+        }
+        for hid in Set(targets.map(\.hostId)) {
+            reloadHostDetail(hid)
+        }
+        refreshSidebar()
+        hapticMedium()
+        showToast("Emptied \(targets.count) archived conversation\(targets.count == 1 ? "" : "s")")
     }
 
     // MARK: - Projects & Remote Directory Browser
@@ -1843,18 +2452,18 @@ public final class OrbitIosStore: ObservableObject {
         relayUrl: String?
     ) {
         let targetHost = hosts.first(where: { $0.hostId == hostId })
-        let cleanName = customName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanDirect = customDirectEndpoint?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanRelay = relayUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextCustomName = customName.map { OrbitAgentLogic.hostConfigFieldValue(edited: $0, original: targetHost?.customName) } ?? nil
+        let nextDirectEndpoint = customDirectEndpoint.map { OrbitAgentLogic.hostConfigFieldValue(edited: $0, original: targetHost?.customDirectEndpoint) } ?? nil
+        let nextRelayUrl = relayUrl.map { OrbitAgentLogic.hostConfigFieldValue(edited: $0, original: targetHost?.relayUrl) } ?? nil
         do {
             _ = try core?.updateHostConfig(
                 hostId: hostId,
-                customName: (cleanName?.isEmpty == false) ? cleanName : nil,
+                customName: nextCustomName,
                 routeMode: routeMode,
                 sshAlias: targetHost?.sshAlias,
                 remoteDaemonPort: targetHost?.remoteDaemonPort,
-                customDirectEndpoint: (cleanDirect?.isEmpty == false) ? cleanDirect : nil,
-                relayUrl: (cleanRelay?.isEmpty == false) ? cleanRelay : nil,
+                customDirectEndpoint: nextDirectEndpoint,
+                relayUrl: nextRelayUrl,
                 reconnect: true
             )
             lastError = nil
@@ -1894,7 +2503,15 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Model, Provider & Mode Configuration
 
     public func switchDraftProvider(_ provider: FfiProviderKind) {
-        if isDraftNewSession, let saved = draftSelectionsByProvider[provider] {
+        guard OrbitAgentLogic.canSwitchProvider(
+            selectedAgentId: selectedAgentId,
+            activeAgentExists: activeAgent != nil,
+            supportsProviderSwitch: true
+        ) else {
+            showToast("Wait for thread to finish loading before switching provider")
+            return
+        }
+        if isDraftNewSession, let saved = draftSelectionsByHostProvider[draftModelKey(for: provider)] {
             applyModelSelection(
                 provider: provider,
                 modelId: saved.modelId,
@@ -1919,6 +2536,14 @@ public final class OrbitIosStore: ObservableObject {
         effort: FfiReasoningEffort?
     ) {
         let providerChanged = selectedProvider != provider
+        if providerChanged && !OrbitAgentLogic.canSwitchProvider(
+            selectedAgentId: selectedAgentId,
+            activeAgentExists: activeAgent != nil,
+            supportsProviderSwitch: true
+        ) {
+            showToast("Wait for thread to finish loading before switching provider")
+            return
+        }
         selectedProvider = provider
         if let resolved = resolvedModelSelection(
             provider: provider,
@@ -1944,7 +2569,7 @@ public final class OrbitIosStore: ObservableObject {
 
         if isDraftNewSession {
             hasUserCustomizedDraftModel = true
-            draftSelectionsByProvider[provider] = (selectedModel, selectedEffort)
+            draftSelectionsByHostProvider[draftModelKey(for: provider)] = (selectedModel, selectedEffort)
         }
 
         if let hid = selectedHostId, let aid = selectedAgentId {
@@ -1991,6 +2616,8 @@ public final class OrbitIosStore: ObservableObject {
 
     public func removeContextItem(_ item: ComposerContextItem) {
         attachedContexts.removeAll(where: { $0.id == item.id })
+        composerUploadStates.removeValue(forKey: item.id)
+        failedUploadPayloadsByContextId.removeValue(forKey: item.id)
         hapticLight()
     }
 
@@ -1999,7 +2626,7 @@ public final class OrbitIosStore: ObservableObject {
         hapticLight()
     }
 
-    private static let maxAttachmentBytes = 10 * 1024 * 1024
+    private static let maxAttachmentBytes = OrbitComposerLogic.maxAttachmentBytes
     private static let maxInlineTextFileBytes = 64 * 1024
 
     public func attachImage(filename: String, uploadData: Data, previewData: Data) {
@@ -2007,8 +2634,8 @@ public final class OrbitIosStore: ObservableObject {
             showToast("Selected image is empty")
             return
         }
-        guard uploadData.count <= Self.maxAttachmentBytes else {
-            showToast("Image exceeds 10 MB limit")
+        guard !OrbitComposerLogic.attachmentExceedsLimit(uploadData.count, maxBytes: Self.maxAttachmentBytes) else {
+            showToast("Image exceeds 25 MB limit")
             return
         }
 
@@ -2044,11 +2671,12 @@ public final class OrbitIosStore: ObservableObject {
         )
         hapticLight()
 
+        let mime = filename.lowercased().hasSuffix(".png") ? "image/png" : "image/jpeg"
         performRemoteStage(
             hostId: hid,
             contextId: "img:\(itemId)",
             filename: filename,
-            mimeType: "image/jpeg",
+            mimeType: mime,
             data: uploadData
         ) { staged in
             .stagedImage(
@@ -2067,8 +2695,8 @@ public final class OrbitIosStore: ObservableObject {
             showToast("\(filename) is empty")
             return
         }
-        guard data.count <= Self.maxAttachmentBytes else {
-            showToast("\(filename) exceeds 10 MB limit")
+        guard !OrbitComposerLogic.attachmentExceedsLimit(data.count, maxBytes: Self.maxAttachmentBytes) else {
+            showToast("\(filename) exceeds 25 MB limit")
             return
         }
 
@@ -2169,6 +2797,8 @@ public final class OrbitIosStore: ObservableObject {
         data: Data,
         buildCompletedItem: @escaping @MainActor (FfiStagedAttachment) -> ComposerContextItem
     ) {
+        composerUploadStates[contextId] = .uploading
+        failedUploadPayloadsByContextId.removeValue(forKey: contextId)
         let coreRef = self.core
         Task { @MainActor [weak self] in
             do {
@@ -2188,6 +2818,8 @@ public final class OrbitIosStore: ObservableObject {
                     )
                 }.value
                 guard let self else { return }
+                self.composerUploadStates[contextId] = .uploaded
+                self.failedUploadPayloadsByContextId.removeValue(forKey: contextId)
                 guard let idx = self.attachedContexts.firstIndex(where: { $0.id == contextId }) else {
                     return
                 }
@@ -2200,11 +2832,77 @@ public final class OrbitIosStore: ObservableObject {
                     errorDetail = error.localizedDescription
                 }
                 guard let self else { return }
-                self.attachedContexts.removeAll(where: { $0.id == contextId })
+                self.composerUploadStates[contextId] = .failed(errorDetail)
+                self.failedUploadPayloadsByContextId[contextId] = OrbitFailedAttachmentPayload(
+                    hostId: hostId,
+                    contextId: contextId,
+                    filename: filename,
+                    mimeType: mimeType,
+                    data: data,
+                    completedItem: buildCompletedItem
+                )
+                if let idx = self.attachedContexts.firstIndex(where: { $0.id == contextId }) {
+                    switch self.attachedContexts[idx] {
+                    case let .stagedImage(id, fname, remotePath, previewData, sizeBytes, _):
+                        self.attachedContexts[idx] = .stagedImage(
+                            id: id,
+                            filename: fname,
+                            remotePath: remotePath,
+                            previewData: previewData,
+                            sizeBytes: sizeBytes,
+                            isUploading: false
+                        )
+                    case let .stagedFile(id, fname, remotePath, sizeBytes, _):
+                        self.attachedContexts[idx] = .stagedFile(
+                            id: id,
+                            filename: fname,
+                            remotePath: remotePath,
+                            sizeBytes: sizeBytes,
+                            isUploading: false
+                        )
+                    default:
+                        break
+                    }
+                }
                 self.hapticWarning()
-                self.showToast("Upload failed: \(errorDetail)")
+                self.showToast("Upload failed (tap chip to retry): \(errorDetail)")
             }
         }
+    }
+
+    public func retryAttachmentUpload(contextId: String) {
+        guard let payload = failedUploadPayloadsByContextId[contextId] else { return }
+        if let idx = attachedContexts.firstIndex(where: { $0.id == contextId }) {
+            switch attachedContexts[idx] {
+            case let .stagedImage(id, fname, remotePath, previewData, sizeBytes, _):
+                attachedContexts[idx] = .stagedImage(
+                    id: id,
+                    filename: fname,
+                    remotePath: remotePath,
+                    previewData: previewData,
+                    sizeBytes: sizeBytes,
+                    isUploading: true
+                )
+            case let .stagedFile(id, fname, remotePath, sizeBytes, _):
+                attachedContexts[idx] = .stagedFile(
+                    id: id,
+                    filename: fname,
+                    remotePath: remotePath,
+                    sizeBytes: sizeBytes,
+                    isUploading: true
+                )
+            default:
+                break
+            }
+        }
+        performRemoteStage(
+            hostId: payload.hostId,
+            contextId: payload.contextId,
+            filename: payload.filename,
+            mimeType: payload.mimeType,
+            data: payload.data,
+            buildCompletedItem: payload.completedItem
+        )
     }
 
     public func registerInlineMention(token: String, item: ComposerContextItem) {
@@ -2226,7 +2924,7 @@ public final class OrbitIosStore: ObservableObject {
     ) -> [ComposerContextItem] {
         var merged = baseContexts
         for reg in registeredInlineMentions {
-            guard text.contains(reg.token) else { continue }
+            guard OrbitComposerLogic.containsWholeToken(text, token: reg.token) else { continue }
             if !merged.contains(where: { $0.id == reg.item.id }) {
                 merged.append(reg.item)
             }
@@ -2303,7 +3001,7 @@ public final class OrbitIosStore: ObservableObject {
             return
         }
 
-        if isActiveAgentRunning, selectedAgentId != nil {
+        if isActiveAgentTurnBusy, selectedAgentId != nil {
             enqueueComposerPrompt()
             return
         }
@@ -2408,6 +3106,71 @@ public final class OrbitIosStore: ObservableObject {
         removeQueuedPrompt(item, inKey: key)
         if useServerQueue, let core = core {
             core.removeQueuedPrompt(hostId: hid, agentId: aid, queueId: item.id)
+        }
+        hapticLight()
+    }
+
+    public func mergeQueuedPromptWithNext(_ item: QueuedPromptItem) {
+        let list = activeQueuedPrompts
+        guard let idx = list.firstIndex(where: { $0.id == item.id }),
+              idx + 1 < list.count,
+              let hid = selectedHostId,
+              let aid = selectedAgentId,
+              let key = activeAgentQueueKey else { return }
+        let nextItem = list[idx + 1]
+        let mergedText = OrbitComposerLogic.mergeQueuedPrompts(item.text, nextItem.text)
+        let mergedContexts = item.attachedContexts + nextItem.attachedContexts.filter { cand in
+            !item.attachedContexts.contains(where: { $0.id == cand.id })
+        }
+        let mergedQuotes = item.quotedDiffSnippets + nextItem.quotedDiffSnippets.filter { cand in
+            !item.quotedDiffSnippets.contains(where: { $0.id == cand.id })
+        }
+        let combined = QueuedPromptItem(
+            id: item.id,
+            text: mergedText,
+            slashDirective: item.slashDirective ?? nextItem.slashDirective,
+            attachedContexts: mergedContexts,
+            quotedDiffSnippets: mergedQuotes,
+            badges: item.badges + nextItem.badges
+        )
+        var updated = list
+        updated[idx] = combined
+        updated.remove(at: idx + 1)
+        queuedPromptsByAgent[key] = updated
+
+        if currentHostDetail?.host.supportsServerQueue == true, let core = core {
+            core.removeQueuedPrompt(hostId: hid, agentId: aid, queueId: nextItem.id)
+            if let composed = composePromptDraft(
+                hostId: hid,
+                rawInput: combined.text,
+                explicitDirective: combined.slashDirective,
+                contexts: combined.attachedContexts,
+                quotes: combined.quotedDiffSnippets
+            ) {
+                core.removeQueuedPrompt(hostId: hid, agentId: aid, queueId: item.id)
+                _ = core.enqueuePrompt(
+                    hostId: hid,
+                    agentId: aid,
+                    prompt: composed.wirePrompt,
+                    displayPrompt: composed.displayPrompt,
+                    badges: composed.badges,
+                    queueId: combined.id
+                )
+            }
+        }
+        hapticLight()
+        showToast("Merged queued prompts")
+    }
+
+    public func reorderQueuedPrompts(fromIndex: Int, toOffset: Int) {
+        guard let hid = selectedHostId, let aid = selectedAgentId, let key = activeAgentQueueKey else { return }
+        let current = activeQueuedPrompts
+        let reorderedIds = OrbitComposerLogic.reorderQueueIds(current.map(\.id), fromIndex: fromIndex, toOffset: toOffset)
+        var byId: [String: QueuedPromptItem] = [:]
+        for item in current { byId[item.id] = item }
+        queuedPromptsByAgent[key] = reorderedIds.compactMap { byId[$0] }
+        if currentHostDetail?.host.supportsServerQueue == true {
+            core?.reorderQueuedPrompts(hostId: hid, agentId: aid, queueIds: reorderedIds)
         }
         hapticLight()
     }
@@ -2610,7 +3373,15 @@ public final class OrbitIosStore: ObservableObject {
                 reloadAgentStage(hostId: hid, agentId: aid)
             }
         } else {
-            let effectiveCwd = (draftUseWorktree && (draftWorktreeRepoPath?.isEmpty == false))
+            let canWorktree = OrbitComposerLogic.canCreateWorktreeSession(
+                isWorktreeMode: draftUseWorktree,
+                isGitRepo: isActiveCwdGitRepo
+            )
+            if draftUseWorktree && !canWorktree {
+                showToast("Git repository required for Worktree mode — using local folder")
+                draftUseWorktree = false
+            }
+            let effectiveCwd = (canWorktree && draftUseWorktree && (draftWorktreeRepoPath?.isEmpty == false))
                 ? (draftWorktreeRepoPath ?? activeCwd)
                 : activeCwd
             let req = FfiCreateSessionRequest(
@@ -2624,7 +3395,7 @@ public final class OrbitIosStore: ObservableObject {
                 initialPrompt: composed.wirePrompt,
                 initialDisplayPrompt: composed.displayPrompt,
                 initialBadges: composed.badges,
-                worktreeBranch: draftUseWorktree ? "auto" : nil
+                worktreeBranch: (canWorktree && draftUseWorktree) ? "auto" : nil
             )
             let createdId = core?.createSessionInWorkspace(
                 req: req,
@@ -2754,7 +3525,7 @@ public final class OrbitIosStore: ObservableObject {
             }
         } else {
             isPadDiffInspectorVisible = false
-            activeSheet = .gitDiff
+            presentSheetSafely(.gitDiff)
         }
     }
 
@@ -2799,10 +3570,13 @@ public final class OrbitIosStore: ObservableObject {
         let shortPreview = firstLine.count > 28 ? String(firstLine.prefix(28)) + "…" : firstLine
         let chipLabel = "\"\(shortPreview)\""
         let excerpt = trimmed.count > 800 ? String(trimmed.prefix(800)) + "…" : trimmed
-        let item = ComposerContextItem.assistantQuote(id: turnKey, label: chipLabel, excerpt: excerpt)
-        if !attachedContexts.contains(item) {
-            attachedContexts.append(item)
-        }
+        let uniqueId = OrbitComposerLogic.nextUniqueQuoteId(
+            existingIds: attachedContexts.map(\.id),
+            baseTurnKey: turnKey
+        )
+        let item = ComposerContextItem.assistantQuote(id: uniqueId, label: chipLabel, excerpt: excerpt)
+        attachedContexts.append(item)
+        requestComposerFocus()
         hapticLight()
         showToast("Quoted into composer")
     }
@@ -2873,13 +3647,28 @@ public final class OrbitIosStore: ObservableObject {
     public func ensureTerminalReady(cols: UInt16, rows: UInt16) {
         guard let hid = selectedHostId else { return }
         lastTerminalDimensions = (cols, rows)
+        let targetCwd = activeCwd.trimmingCharacters(in: .whitespacesAndNewlines)
         if let detail = currentHostDetail, !detail.terminals.isEmpty {
-            if let activeTid = detail.activeTerminalId {
-                core?.attachTerminal(hostId: hid, terminalId: activeTid, slot: 1)
-            } else if let first = detail.terminals.first {
-                core?.attachTerminal(hostId: hid, terminalId: first.terminalId, slot: 1)
+            let matchedTid: String? = {
+                if !targetCwd.isEmpty && targetCwd != "~" {
+                    if let activeTid = detail.activeTerminalId,
+                       let activeTerm = detail.terminals.first(where: { $0.terminalId == activeTid }),
+                       OrbitFormatters.arePathsEquivalent(activeTerm.cwd, targetCwd) {
+                        return activeTid
+                    }
+                    return detail.terminals.first(where: {
+                        OrbitFormatters.arePathsEquivalent($0.cwd, targetCwd)
+                    })?.terminalId
+                } else {
+                    return detail.activeTerminalId ?? detail.terminals.first?.terminalId
+                }
+            }()
+            if let tid = matchedTid {
+                core?.attachTerminal(hostId: hid, terminalId: tid, slot: 1)
+                core?.resizeTerminal(hostId: hid, cols: cols, rows: rows)
+            } else {
+                core?.startTerminal(hostId: hid, cwd: activeCwd, cols: cols, rows: rows)
             }
-            core?.resizeTerminal(hostId: hid, cols: cols, rows: rows)
         } else {
             core?.startTerminal(hostId: hid, cwd: activeCwd, cols: cols, rows: rows)
         }
@@ -3107,6 +3896,7 @@ public final class OrbitIosStore: ObservableObject {
     public func setCoalesceExploration(_ enabled: Bool) {
         coalesceExploration = enabled
         UserDefaults.standard.set(enabled, forKey: Self.coalesceExplorationDefaultsKey)
+        pushCloudSyncPreferencesPatch(["coalesceExploration": enabled])
         hapticLight()
     }
 
@@ -3117,13 +3907,14 @@ public final class OrbitIosStore: ObservableObject {
         if isDraftNewSession {
             selectedMode = OrbitFormatters.normalizePermissionMode(mode)
         }
+        pushCloudSyncPreferencesPatch(["draftMode": raw])
         hapticLight()
     }
 
     // MARK: - Mission Workspaces, Peers, Board, Events & Auto-Organize
 
     public var activeWorkspace: FfiWorkspaceSummary? {
-        guard let detail = currentHostDetail else { return nil }
+        guard let detail = detail(forHostId: selectedHostId) else { return nil }
         if let agent = activeAgent, !agent.workspaceId.isEmpty {
             return detail.workspaces.first(where: { $0.workspaceId == agent.workspaceId })
         }
@@ -3134,11 +3925,27 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public var activeWorkspacePeers: [FfiAgentCard] {
-        guard let ws = activeWorkspace, let detail = currentHostDetail else { return [] }
+        guard let ws = activeWorkspace,
+              let hid = selectedHostId,
+              let detail = detail(forHostId: hid) else { return [] }
         return detail.agents.filter { ag in
-            ag.workspaceId == ws.workspaceId
+            let isSameHostChild = ag.parentAgentId != nil && (ag.parentHostId == nil || ag.parentHostId == hid)
+            return ag.workspaceId == ws.workspaceId
                 && ag.archivedAtRfc3339 == nil
-                && !(ag.parentAgentId != nil && ag.parentHostId == nil)
+                && !isSameHostChild
+        }
+    }
+
+    public var activePendingSubagentApprovals: [FfiAgentCard] {
+        guard let hid = selectedHostId,
+              let parentId = selectedAgentId,
+              let detail = detail(forHostId: hid) else { return [] }
+        return detail.agents.filter { child in
+            let sameHostParent = (child.parentHostId == nil || child.parentHostId == hid)
+            return sameHostParent
+                && child.parentAgentId == parentId
+                && child.isAwaitingPermission
+                && child.archivedAtRfc3339 == nil
         }
     }
 
@@ -3271,7 +4078,10 @@ public final class OrbitIosStore: ObservableObject {
         guard let hid = selectedHostId else { return }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty else { return }
+        let cleanGoal = missionGoal?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedGoal = (cleanGoal?.isEmpty == false) ? cleanGoal : nil
         if let moveId = moveAgentId {
+            let previousWorkspaceId = currentHostDetail?.agents.first(where: { $0.agentId == moveId })?.workspaceId
             core?.moveAgentToWorkspaceV2(
                 hostId: hid,
                 agentId: moveId,
@@ -3279,16 +4089,34 @@ public final class OrbitIosStore: ObservableObject {
                 newWorkspaceTitle: cleanTitle,
                 makeUnclassified: false
             )
+            if let goalToApply = normalizedGoal {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    for attempt in 0..<4 {
+                        self.reloadHostDetail(hid)
+                        if let createdWsId = self.currentHostDetail?.agents.first(where: {
+                            $0.agentId == moveId && $0.workspaceId != previousWorkspaceId
+                        })?.workspaceId ?? self.currentHostDetail?.workspaces.first(where: {
+                            $0.title == cleanTitle
+                        })?.workspaceId {
+                            self.core?.updateWorkspaceGoal(hostId: hid, workspaceId: createdWsId, goal: goalToApply)
+                            break
+                        }
+                        if attempt < 3 {
+                            try? await Task.sleep(nanoseconds: 180_000_000)
+                        }
+                    }
+                }
+            }
             hapticSuccess()
             showToast("Created \"\(cleanTitle)\"")
             return
         }
-        let cleanGoal = missionGoal?.trimmingCharacters(in: .whitespacesAndNewlines)
         core?.createMissionWorkspace(
             hostId: hid,
             sourceCwd: sourceCwd,
             title: cleanTitle,
-            missionGoal: (cleanGoal?.isEmpty == false) ? cleanGoal : nil,
+            missionGoal: normalizedGoal,
             useWorktree: useWorktree,
             worktreeBranch: nil,
             baseRef: nil
@@ -3358,7 +4186,7 @@ public final class OrbitIosStore: ObservableObject {
         )
         hapticLight()
         if makeUnclassified {
-            showToast("Moved to 待归类")
+            showToast("Moved to Unassigned")
         } else if let title = newWorkspaceTitle, !title.isEmpty {
             showToast("Moved to \"\(title)\"")
         } else {
@@ -3456,23 +4284,38 @@ public final class OrbitIosStore: ObservableObject {
         showToast("Spawned workspace peer")
     }
 
-    public func unarchiveAgent(_ agentId: String) {
-        guard let hid = selectedHostId else { return }
+    public func unarchiveAgent(_ agentId: String, hostId: String? = nil) {
+        guard let hid = hostId ?? selectedHostId else { return }
         core?.unarchiveAgent(hostId: hid, agentId: agentId)
+        if pendingArchiveUndo?.agentId == agentId && pendingArchiveUndo?.hostId == hid {
+            pendingArchiveUndo = nil
+        }
+        reloadHostDetail(hid)
+        refreshSidebar()
         hapticSuccess()
         showToast("Conversation restored")
     }
 
-    public func deleteAgentPermanently(_ agentId: String) {
-        guard let hid = selectedHostId else { return }
+    public func deleteAgentPermanently(_ agentId: String, hostId: String? = nil) {
+        guard let hid = hostId ?? selectedHostId else { return }
         core?.deleteAgent(hostId: hid, agentId: agentId)
+        if selectedAgentId == agentId && selectedHostId == hid {
+            selectedAgentId = nil
+            agentStage = nil
+            agentStageHostId = nil
+            agentStageScopeKey = nil
+        }
+        reloadHostDetail(hid)
+        refreshSidebar()
         hapticMedium()
         showToast("Conversation deleted")
     }
 
-    public func detachAgent(_ agentId: String) {
-        guard let hid = selectedHostId else { return }
+    public func detachAgent(_ agentId: String, hostId: String? = nil) {
+        guard let hid = hostId ?? selectedHostId else { return }
         core?.detachAgent(hostId: hid, agentId: agentId)
+        reloadHostDetail(hid)
+        refreshSidebar()
         hapticLight()
         showToast("Detached as standalone session")
     }
@@ -3484,12 +4327,14 @@ public final class OrbitIosStore: ObservableObject {
         decision: String
     ) {
         guard let hid = childHostId ?? selectedHostId else { return }
+        resolvedChildDecisionsByRequestId[requestId] = decision
         core?.resolvePermission(
             hostId: hid,
             agentId: childAgentId,
             permissionRequestId: requestId,
             decision: decision
         )
+        reloadHostDetail(hid)
         hapticMedium()
         showToast("Sent decision: \(OrbitFormatters.decisionLabel(decision))")
     }
@@ -3623,7 +4468,7 @@ public final class OrbitIosStore: ObservableObject {
                 isPadDiffInspectorVisible = true
             }
         } else {
-            activeSheet = .workspaceBoard(workspaceId: workspaceId)
+            presentSheetSafely(.workspaceBoard(workspaceId: workspaceId))
         }
     }
 
@@ -3638,15 +4483,17 @@ public final class OrbitIosStore: ObservableObject {
                 isPadDiffInspectorVisible = true
             }
         } else {
-            activeSheet = .sessionOverview
+            presentSheetSafely(.sessionOverview)
         }
     }
 
-    public func openWorkspaceFiles(initialPath: String? = nil) {
+    public func openWorkspaceFiles(initialPath: String? = nil, line: Int? = nil) {
         refreshWorkspaceFiles()
+        activeWorkspaceFileLine = line
         if let p = initialPath, !p.isEmpty {
-            activeWorkspaceFilePath = p
-            loadWorkspaceFile(path: p)
+            let resolved = OrbitPathLogic.resolveWorkspaceFilePath(p, rootCwd: activeCwd)
+            activeWorkspaceFilePath = resolved
+            loadWorkspaceFile(path: resolved)
         }
         hapticLight()
         if canShowInlineDiffInspector {
@@ -3655,7 +4502,26 @@ public final class OrbitIosStore: ObservableObject {
                 isPadDiffInspectorVisible = true
             }
         } else {
-            activeSheet = .workspaceFiles(initialPath: initialPath)
+            presentSheetSafely(.workspaceFiles(initialPath: activeWorkspaceFilePath))
+        }
+    }
+
+    public func setGitReviewScope(_ scope: OrbitGitReviewScope) {
+        gitReviewScope = scope
+        let nextStaged = (scope == .staged)
+        if gitStagedMode != nextStaged {
+            gitStagedMode = nextStaged
+        }
+        refreshGitReview()
+        hapticLight()
+    }
+
+    public func presentSheetSafely(_ destination: OrbitSheetDestination) {
+        if activeSheet == nil {
+            activeSheet = destination
+        } else if activeSheet != destination {
+            pendingSheetDestination = destination
+            activeSheet = nil
         }
     }
 
@@ -3667,7 +4533,7 @@ public final class OrbitIosStore: ObservableObject {
                 isPadDiffInspectorVisible = true
             }
         } else {
-            activeSheet = .sideQuestion
+            presentSheetSafely(.sideQuestion)
         }
         if let q = question?.trimmingCharacters(in: .whitespacesAndNewlines), !q.isEmpty {
             submitSideQuestion(q)
@@ -3693,6 +4559,15 @@ public final class OrbitIosStore: ObservableObject {
                     try coreRef.readWorkspaceFile(hostId: hid, cwd: cwd, path: path)
                 }.value
                 guard let self else { return }
+                if self.workspaceFileCache.count >= 30,
+                   !self.workspaceFileCacheOrder.isEmpty {
+                    let evicted = self.workspaceFileCacheOrder.removeFirst()
+                    if evicted != cacheKey {
+                        self.workspaceFileCache.removeValue(forKey: evicted)
+                    }
+                }
+                self.workspaceFileCacheOrder.removeAll(where: { $0 == cacheKey })
+                self.workspaceFileCacheOrder.append(cacheKey)
                 self.workspaceFileCache[cacheKey] = file
                 if self.workspaceFileLoadingPath == path {
                     self.workspaceFileLoadingPath = nil
@@ -3866,18 +4741,30 @@ public final class OrbitIosStore: ObservableObject {
         case let .delta(_, textDelta):
             items[idx].answer.append(textDelta)
         case let .done(_, fullText, error):
-            if !fullText.isEmpty {
+            let trimmedFull = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedFull.isEmpty {
                 items[idx].answer = fullText
             }
             items[idx].error = error
             items[idx].isStreaming = false
             activeSideQuestionListeners.removeValue(forKey: entryId)
+            if !items[idx].requestId.isEmpty {
+                activeSideQuestionRequestIds.remove(items[idx].requestId)
+            }
         }
         sideQuestionsByScope[scopeKey] = items
     }
 
     public func clearSideQuestions() {
-        sideQuestionsByScope.removeValue(forKey: activeSideQuestionScopeKey)
+        let key = activeSideQuestionScopeKey
+        if let existing = sideQuestionsByScope.removeValue(forKey: key) {
+            for entry in existing {
+                activeSideQuestionListeners.removeValue(forKey: entry.id)
+                if !entry.requestId.isEmpty {
+                    activeSideQuestionRequestIds.remove(entry.requestId)
+                }
+            }
+        }
         hapticLight()
     }
 
@@ -3896,7 +4783,7 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Fleet Daemon Version & One-Click Over-the-Wire Update
 
     public var appShortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.8.3"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.8.4"
     }
 
     public func isHostProtocolBehind(_ host: FfiHostCard) -> Bool {
@@ -3916,12 +4803,23 @@ public final class OrbitIosStore: ObservableObject {
         return OrbitFormatters.compareSemver(daemonSemver, appSemver) < 0
     }
 
+    public func isVersionMismatchDismissed(for host: FfiHostCard) -> Bool {
+        let key = OrbitAgentLogic.dismissedVersionKey(hostId: host.hostId, daemonVersion: host.daemonVersion)
+        return dismissedVersionMismatchHosts.contains(key)
+    }
+
     public var outdatedOnlineHosts: [FfiHostCard] {
         hosts.filter { isHostDaemonOutdated($0) || isHostProtocolBehind($0) }
     }
 
+    public var bannerOutdatedOnlineHosts: [FfiHostCard] {
+        outdatedOnlineHosts.filter { !isVersionMismatchDismissed(for: $0) }
+    }
+
     public func dismissVersionMismatch(for hostId: String) {
-        dismissedVersionMismatchHosts.insert(hostId)
+        let daemonVersion = hosts.first(where: { $0.hostId == hostId })?.daemonVersion
+        let key = OrbitAgentLogic.dismissedVersionKey(hostId: hostId, daemonVersion: daemonVersion)
+        dismissedVersionMismatchHosts.insert(key)
         hapticLight()
     }
 
@@ -3980,12 +4878,18 @@ public final class OrbitIosStore: ObservableObject {
         guard let idx = keys.firstIndex(of: sortOrderKey) else { return }
         let targetIdx = idx + offset
         guard targetIdx >= 0 && targetIdx < keys.count else { return }
-        var reordered = keys
-        let moved = reordered.remove(at: idx)
-        reordered.insert(moved, at: targetIdx)
+        let insertionOffset = offset > 0 ? targetIdx + 1 : targetIdx
+        let updatedOrder = OrbitAgentLogic.reorderProjectKeys(
+            existingOrder: projectOrder,
+            targetHostProjectKeys: keys,
+            movedFromIndex: idx,
+            movedToOffset: insertionOffset
+        )
         do {
-            if let updated = try core?.reorderProjects(orderedKeys: reordered) {
+            if let updated = try core?.reorderProjects(orderedKeys: updatedOrder) {
                 projectOrder = updated
+            } else {
+                projectOrder = updatedOrder
             }
             sidebarProjectSort = .manual
             refreshSidebar()
@@ -4074,10 +4978,9 @@ public final class OrbitIosStore: ObservableObject {
 
     public func stopBackgroundTask(_ task: FfiSessionBackgroundTask) {
         guard let hid = selectedHostId, let aid = selectedAgentId else { return }
-        let prompt = "Please stop the running background task \"\(task.title)\" (id: \(task.id))."
-        core?.sendPrompt(hostId: hid, agentId: aid, prompt: prompt)
-        hapticLight()
-        showToast("Requested stop for \(task.title)")
+        core?.interruptAgent(hostId: hid, agentId: aid)
+        hapticMedium()
+        showToast("Interrupting \(task.title)…")
     }
 
     // MARK: - Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist)
@@ -4214,6 +5117,7 @@ public final class OrbitIosStore: ObservableObject {
                 self.cloudSyncBusy = false
                 self.cloudSyncStatus = core.cloudSyncStatus()
                 self.cloudSyncError = nil
+                self.hydrateCloudSyncPreferences()
                 self.reloadFleet()
                 self.refreshSidebar()
                 self.hapticSuccess()
@@ -4239,6 +5143,7 @@ public final class OrbitIosStore: ObservableObject {
                 self.cloudSyncBusy = false
                 self.cloudSyncStatus = core.cloudSyncStatus()
                 self.cloudSyncError = nil
+                self.hydrateCloudSyncPreferences()
                 self.reloadFleet()
                 self.refreshSidebar()
                 self.hapticSuccess()
@@ -4249,6 +5154,52 @@ public final class OrbitIosStore: ObservableObject {
                 self.cloudSyncError = Self.describeCloudSyncError(error)
             }
         }
+    }
+
+    public func hydrateCloudSyncPreferences() {
+        guard let raw = core?.cloudSyncGetPreferencesJson(),
+              let data = raw.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        isApplyingCloudPrefs = true
+        defer { isApplyingCloudPrefs = false }
+
+        if let val = dict["coalesceExploration"] as? Bool {
+            coalesceExploration = val
+            UserDefaults.standard.set(val, forKey: Self.coalesceExplorationDefaultsKey)
+        }
+        if let val = dict["draftUseWorktree"] as? Bool {
+            draftUseWorktree = val
+            UserDefaults.standard.set(val, forKey: Self.draftUseWorktreeDefaultsKey)
+        }
+        if let val = dict["draftMode"] as? String, !val.isEmpty {
+            let mode = Self.sessionModeFromRaw(val)
+            let norm = Self.rawFromSessionMode(mode)
+            defaultPermissionModeRaw = norm
+            UserDefaults.standard.set(norm, forKey: Self.defaultPermissionModeDefaultsKey)
+            if isDraftNewSession {
+                selectedMode = OrbitFormatters.normalizePermissionMode(mode)
+            }
+        }
+        if let sortRaw = dict["sidebarProjectSort"] as? String,
+           let sortVal = OrbitSidebarProjectSort(rawValue: sortRaw) {
+            sidebarProjectSort = sortVal
+        }
+        if let filterRaw = dict["sidebarThreadFilter"] as? String,
+           let filterVal = OrbitSidebarThreadFilter(rawValue: filterRaw) {
+            sidebarThreadFilter = filterVal
+        }
+    }
+
+    public func pushCloudSyncPreferencesPatch(_ patch: [String: Any]) {
+        guard !isApplyingCloudPrefs,
+              let core,
+              let data = try? JSONSerialization.data(withJSONObject: patch, options: []),
+              let json = String(data: data, encoding: .utf8) else {
+            return
+        }
+        try? core.cloudSyncUpdatePreferencesJson(patchJson: json)
     }
 
     public func setCloudAutoSync(_ enabled: Bool) {

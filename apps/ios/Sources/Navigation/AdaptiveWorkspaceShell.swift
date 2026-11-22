@@ -45,7 +45,14 @@ struct AdaptiveWorkspaceShell: View {
                 activeSheetDetent = dest.defaultDetent
             }
         }
-        .sheet(item: $store.activeSheet) { destination in
+        .sheet(item: $store.activeSheet, onDismiss: {
+            if let next = store.pendingSheetDestination {
+                store.pendingSheetDestination = nil
+                DispatchQueue.main.async {
+                    store.activeSheet = next
+                }
+            }
+        }) { destination in
             sheetContent(for: destination)
                 .environment(\.orbitPalette, palette)
                 .preferredColorScheme(appearanceMode.preferredColorScheme)
@@ -55,7 +62,17 @@ struct AdaptiveWorkspaceShell: View {
                     activeSheetDetent = destination.defaultDetent
                 }
         }
+        .sheet(item: $store.subagentInspectorTarget) { target in
+            SubagentInspectorSheet(store: store, target: target)
+                .environment(\.orbitPalette, palette)
+                .preferredColorScheme(appearanceMode.preferredColorScheme)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
         .onChange(of: store.renameTarget) { target in
+            if target != nil && store.activeSheet != nil {
+                store.activeSheet = nil
+            }
             switch target {
             case let .agent(_, _, currentTitle, currentHandle):
                 renamePrimaryField = currentTitle
@@ -63,34 +80,27 @@ struct AdaptiveWorkspaceShell: View {
             case let .workspace(_, _, currentTitle):
                 renamePrimaryField = currentTitle
                 renameSecondaryField = ""
+            case let .project(_, currentName):
+                renamePrimaryField = currentName
+                renameSecondaryField = ""
             case nil:
                 break
             }
         }
-        .alert(
-            renameAlertTitle,
-            isPresented: Binding(
-                get: { store.renameTarget != nil },
-                set: { if !$0 { store.renameTarget = nil } }
-            )
-        ) {
-            TextField("Title", text: $renamePrimaryField)
-            if case .agent = store.renameTarget {
-                TextField("Peer @handle (optional)", text: $renameSecondaryField)
-            }
-            Button("Save") {
-                commitRename()
-            }
-            Button("Cancel", role: .cancel) {
-                store.renameTarget = nil
-            }
-        }
+        .modifier(OrbitRenameAlertModifier(
+            store: store,
+            title: renameAlertTitle,
+            primaryField: $renamePrimaryField,
+            secondaryField: $renameSecondaryField,
+            onCommit: { commitRename() }
+        ))
     }
 
     private var renameAlertTitle: String {
         switch store.renameTarget {
         case .agent: return "Rename Conversation"
         case .workspace: return "Rename Workspace"
+        case .project: return "Rename Project"
         case nil: return "Rename"
         }
     }
@@ -114,6 +124,10 @@ struct AdaptiveWorkspaceShell: View {
         case let .workspace(hid, wid, _):
             if !title.isEmpty {
                 store.renameWorkspace(hostId: hid, workspaceId: wid, title: title)
+            }
+        case let .project(pid, _):
+            if !title.isEmpty {
+                store.renameProject(projectId: pid, newName: title)
             }
         }
         store.renameTarget = nil
@@ -190,6 +204,7 @@ struct AdaptiveWorkspaceShell: View {
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(palette.canvas.ignoresSafeArea())
+            .simultaneousGesture(edgeOpenGesture, including: store.isDrawerOpen ? .none : .all)
             .overlay {
                 if progress > 0.001 {
                     Color.black
@@ -205,20 +220,11 @@ struct AdaptiveWorkspaceShell: View {
             }
             .offset(x: stageOffset)
 
-            // Interactive left-edge swipe strip when drawer is closed
-            if !store.isDrawerOpen {
-                Color.clear
-                    .frame(width: 24)
-                    .contentShape(Rectangle())
-                    .gesture(edgeOpenGesture)
-            }
-
-            // Full-Height Edge-to-Edge Push-Over Drawer
-            if progress > 0.001 {
-                compactDrawerPanel(drawerWidth: drawerWidth)
-                    .offset(x: drawerOffset)
-                    .gesture(drawerCloseGesture)
-            }
+            // Full-Height Edge-to-Edge Push-Over Drawer (kept mounted so search & scroll state persists)
+            compactDrawerPanel(drawerWidth: drawerWidth)
+                .offset(x: drawerOffset)
+                .opacity(progress > 0.001 ? 1 : 0)
+                .allowsHitTesting(store.isDrawerOpen || progress > 0.05)
         }
     }
 
@@ -237,13 +243,18 @@ struct AdaptiveWorkspaceShell: View {
     }
 
     private var edgeOpenGesture: some Gesture {
-        DragGesture(minimumDistance: 12, coordinateSpace: .global)
+        DragGesture(minimumDistance: 20, coordinateSpace: .global)
             .updating($drawerDragTranslation) { value, state, _ in
-                if value.translation.width > 0 {
+                let isLeftEdge = value.startLocation.x < 24
+                let isHorizontal = abs(value.translation.width) > abs(value.translation.height) * 1.6
+                if isLeftEdge && isHorizontal && value.translation.width > 0 {
                     state = value.translation.width
                 }
             }
             .onEnded { value in
+                let isLeftEdge = value.startLocation.x < 24
+                let isHorizontal = abs(value.translation.width) > abs(value.translation.height) * 1.6
+                guard isLeftEdge && isHorizontal else { return }
                 let shouldOpen = value.translation.width > 72 || value.predictedEndTranslation.width > 140
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
                     store.isDrawerOpen = shouldOpen
@@ -255,13 +266,16 @@ struct AdaptiveWorkspaceShell: View {
     }
 
     private var drawerCloseGesture: some Gesture {
-        DragGesture(minimumDistance: 10, coordinateSpace: .global)
+        DragGesture(minimumDistance: 16, coordinateSpace: .global)
             .updating($drawerDragTranslation) { value, state, _ in
-                if value.translation.width < 0 {
+                let isHorizontal = abs(value.translation.width) > abs(value.translation.height) * 1.6
+                if isHorizontal && value.translation.width < 0 {
                     state = value.translation.width
                 }
             }
             .onEnded { value in
+                let isHorizontal = abs(value.translation.width) > abs(value.translation.height) * 1.6
+                guard isHorizontal else { return }
                 let shouldClose = value.translation.width < -64 || value.predictedEndTranslation.width < -130
                 withAnimation(.spring(response: 0.26, dampingFraction: 0.88)) {
                     if shouldClose {
@@ -316,7 +330,39 @@ struct AdaptiveWorkspaceShell: View {
     @ViewBuilder
     private var toastAndErrorOverlay: some View {
         VStack(spacing: OrbitSpacing.sm) {
-            if let message = store.toastMessage {
+            if let undo = store.pendingArchiveUndo {
+                HStack(spacing: OrbitSpacing.sm) {
+                    Image(systemName: "archivebox")
+                        .font(OrbitTypography.iconSmall)
+                        .foregroundStyle(palette.fgSecondary)
+                    Text("Archived \"\(undo.title)\"")
+                        .font(OrbitTypography.subhead(.medium))
+                        .foregroundStyle(palette.fgPrimary)
+                        .lineLimit(1)
+                    Button("Undo") {
+                        store.undoPendingArchive()
+                    }
+                    .font(OrbitTypography.subhead(.semibold))
+                    .foregroundStyle(palette.primary)
+                    Button {
+                        store.dismissArchiveUndo()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(OrbitTypography.iconMicro)
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, OrbitSpacing.sm)
+                .orbitGlassSurface(
+                    in: Capsule(),
+                    fallbackFill: palette.elevated,
+                    fallbackBorder: palette.hairline,
+                    fallbackShadowOpacity: 0.14
+                )
+                .transition(.move(edge: .top).combined(with: .opacity))
+            } else if let message = store.toastMessage {
                 HStack(spacing: OrbitSpacing.sm) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(OrbitTypography.iconSmall)
@@ -753,16 +799,29 @@ private struct WorkspaceStagePane: View {
                     Label("Settings", systemImage: "gearshape")
                 }
             }
-        } else if store.activeAgent != nil {
+        } else if let agent = store.activeAgent {
+            let overviewColor: Color? = {
+                guard let hid = store.selectedHostId else { return nil }
+                switch store.overviewBadgeTone(forAgent: agent, hostId: hid) {
+                case .critical: return palette.warning
+                case .accent: return palette.direct
+                case .muted: return palette.fgMuted
+                case .none: return nil
+                }
+            }()
             ToolbarItemGroup(placement: .topBarTrailing) {
+                if store.activeWorkspace == nil && store.activeProjectCuratedWorkspaces.isEmpty == false {
+                    StandaloneGroupButton(store: store)
+                }
+
                 Button {
                     store.openSessionOverview()
                 } label: {
                     Image(systemName: "sidebar.right")
                         .overlay(alignment: .topTrailing) {
-                            if store.activeRunningBackgroundTaskCount > 0 {
+                            if let dotColor = overviewColor {
                                 Circle()
-                                    .fill(palette.direct)
+                                    .fill(dotColor)
                                     .frame(width: 6.5, height: 6.5)
                                     .offset(x: 2, y: -2)
                             }
@@ -915,7 +974,19 @@ struct WorkspaceTopBar: View {
                 .accessibilityLabel("Settings")
                 .padding(.trailing, -OrbitSpacing.sm)
             } else {
-                if store.activeAgent != nil {
+                if let agent = store.activeAgent {
+                    let overviewColor: Color? = {
+                        guard let hid = store.selectedHostId else { return nil }
+                        switch store.overviewBadgeTone(forAgent: agent, hostId: hid) {
+                        case .critical: return palette.warning
+                        case .accent: return palette.direct
+                        case .muted: return palette.fgMuted
+                        case .none: return nil
+                        }
+                    }()
+                    if store.activeWorkspace == nil && !store.activeProjectCuratedWorkspaces.isEmpty {
+                        StandaloneGroupButton(store: store)
+                    }
                     Button {
                         store.openSessionOverview()
                     } label: {
@@ -924,9 +995,9 @@ struct WorkspaceTopBar: View {
                                 .font(OrbitTypography.icon)
                                 .foregroundStyle(palette.fgPrimary)
                                 .padding(OrbitSpacing.xs)
-                            if store.activeRunningBackgroundTaskCount > 0 {
+                            if let dotColor = overviewColor {
                                 Circle()
-                                    .fill(palette.direct)
+                                    .fill(dotColor)
                                     .frame(width: 6, height: 6)
                                     .offset(x: 1, y: 1)
                             }
@@ -1066,5 +1137,75 @@ private struct PadMultiTabInspectorView: View {
             }
         }
         .background(palette.drawer)
+        .onChange(of: availableTabs.count) { _ in
+            if !availableTabs.contains(store.padInspectorTab) {
+                store.padInspectorTab = .overview
+            }
+        }
+    }
+}
+
+private struct StandaloneGroupButton: View {
+    @ObservedObject var store: OrbitIosStore
+    @Environment(\.orbitPalette) private var palette
+
+    var body: some View {
+        Menu {
+            ForEach(store.activeProjectCuratedWorkspaces, id: \.workspaceId) { ws in
+                Button {
+                    if let aid = store.selectedAgentId {
+                        store.moveAgentToWorkspace(agentId: aid, targetWorkspaceId: ws.workspaceId)
+                    }
+                } label: {
+                    Label(ws.title, systemImage: "square.stack.3d.up")
+                }
+            }
+            if let aid = store.selectedAgentId {
+                Divider()
+                Button {
+                    let proj = store.activeProjectGroup
+                    store.presentSheetSafely(.createWorkspace(
+                        projectRoot: store.activeProjectRoot,
+                        projectName: proj?.name ?? OrbitFormatters.shortPath(store.activeProjectRoot),
+                        isGitRepo: proj?.isGitRepo ?? store.isActiveCwdGitRepo,
+                        moveAgentId: aid
+                    ))
+                } label: {
+                    Label("New Mission Workspace…", systemImage: "plus.rectangle.on.folder")
+                }
+            }
+        } label: {
+            Image(systemName: "tray.and.arrow.up")
+                .font(OrbitTypography.icon)
+                .foregroundStyle(palette.fgSecondary)
+        }
+        .accessibilityLabel("Group Standalone Session")
+    }
+}
+
+private struct OrbitRenameAlertModifier: ViewModifier {
+    @ObservedObject var store: OrbitIosStore
+    let title: String
+    @Binding var primaryField: String
+    @Binding var secondaryField: String
+    let onCommit: () -> Void
+
+    func body(content: Content) -> some View {
+        content.alert(
+            title,
+            isPresented: Binding(
+                get: { store.renameTarget != nil },
+                set: { if !$0 { store.renameTarget = nil } }
+            )
+        ) {
+            TextField("Title", text: $primaryField)
+            if case .agent = store.renameTarget {
+                TextField("Peer @handle (optional)", text: $secondaryField)
+            }
+            Button("Save", action: onCommit)
+            Button("Cancel", role: .cancel) {
+                store.renameTarget = nil
+            }
+        }
     }
 }

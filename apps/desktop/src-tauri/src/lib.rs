@@ -69,11 +69,12 @@ use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
-    ArtifactDetail, ArtifactSummary, ContextOccupancyBreakdown, ExternalMcpServerRecord,
-    HookExecutionRecord, HookScope, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus,
-    LspSymbolInfo, ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge,
-    ProviderKind, ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
-    ScheduleTarget, SessionMode, SkillWriteScope, UsageInsightsSnapshot, WorkspaceBoardSnapshot,
+    ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
+    ExternalMcpServerRecord, HookExecutionRecord, HookScope, LifecycleHookRule, LspDiagnostic,
+    LspLocation, LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult,
+    OrchestrationConfig, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
+    ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope,
+    TimerCondition, UsageInsightsSnapshot, WorkspaceBoardSnapshot,
     WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome,
     WorktreeHandoffPreview,
 };
@@ -1980,6 +1981,58 @@ async fn match_path_rules(
 }
 
 #[tauri::command]
+async fn create_conditional_timer(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    duration_seconds: u64,
+    prompt: String,
+    condition: TimerCondition,
+) -> Result<ConditionalTimerRecord, String> {
+    state
+        .core
+        .create_conditional_timer_on_host(&host_id, &agent_id, duration_seconds, prompt, condition)
+        .await
+}
+
+#[tauri::command]
+async fn list_conditional_timers(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: Option<String>,
+    include_resolved: Option<bool>,
+) -> Result<Vec<ConditionalTimerRecord>, String> {
+    state
+        .core
+        .list_conditional_timers_on_host(&host_id, agent_id, include_resolved.unwrap_or(true))
+        .await
+}
+
+#[tauri::command]
+async fn cancel_conditional_timer(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    timer_id: String,
+) -> Result<ConditionalTimerRecord, String> {
+    state
+        .core
+        .cancel_conditional_timer_on_host(&host_id, &timer_id)
+        .await
+}
+
+#[tauri::command]
+async fn fire_conditional_timer_now(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    timer_id: String,
+) -> Result<ConditionalTimerRecord, String> {
+    state
+        .core
+        .fire_conditional_timer_now_on_host(&host_id, &timer_id)
+        .await
+}
+
+#[tauri::command]
 async fn list_lsp_servers(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -3006,6 +3059,10 @@ pub fn run() {
             delete_lifecycle_hook,
             set_project_hooks_trust,
             test_lifecycle_hook,
+            create_conditional_timer,
+            list_conditional_timers,
+            cancel_conditional_timer,
+            fire_conditional_timer_now,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

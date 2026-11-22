@@ -206,6 +206,14 @@ pub type DispatchCallback = Arc<
         + Sync,
 >;
 
+/// Immediate admission callback fired as soon as a message is enqueued (before the coalescing
+/// quiet window elapses), allowing conditional timers to cancel early without race windows.
+pub type MessageAdmittedCallback = Arc<
+    dyn Fn(String, AgentMessageKind, Option<String>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 struct PendingItem {
     msg: QueuedAgentMessage,
     ack_tx: oneshot::Sender<Result<(), String>>,
@@ -226,6 +234,7 @@ struct DeliveryInner {
 pub struct AgentMessageDelivery {
     coalesce_window: Duration,
     dispatcher: DispatchCallback,
+    on_admitted: tokio::sync::RwLock<Option<MessageAdmittedCallback>>,
     inner: Mutex<DeliveryInner>,
 }
 
@@ -234,12 +243,17 @@ impl AgentMessageDelivery {
         Arc::new(Self {
             coalesce_window,
             dispatcher,
+            on_admitted: tokio::sync::RwLock::new(None),
             inner: Mutex::new(DeliveryInner {
                 pending: HashMap::new(),
                 in_flight: HashMap::new(),
                 closed: false,
             }),
         })
+    }
+
+    pub async fn set_on_admitted(&self, hook: MessageAdmittedCallback) {
+        *self.on_admitted.write().await = Some(hook);
     }
 
     /// Admit an agent/system message into the recipient's quiet-window queue.
@@ -253,6 +267,8 @@ impl AgentMessageDelivery {
         }
         let msg_id = msg.message_id.clone();
         let recipient_id = msg.recipient_id.clone();
+        let msg_kind = msg.source.kind;
+        let source_agent_id = msg.source.source_agent_id.clone();
         let (ack_tx, ack_rx) = oneshot::channel();
 
         let mut guard = self.inner.lock().await;
@@ -273,13 +289,17 @@ impl AgentMessageDelivery {
 
         let this = Arc::clone(self);
         let delay = self.coalesce_window;
-        let recip = recipient_id;
+        let recip = recipient_id.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            this.flush_recipient(&recip).await;
+            this.flush_recipient_internal(&recip, false).await;
         });
         bucket.timer_abort = Some(handle.abort_handle());
         drop(guard);
+
+        if let Some(hook) = self.on_admitted.read().await.clone() {
+            hook(recipient_id, msg_kind, source_agent_id).await;
+        }
 
         Ok((msg_id, ack_rx))
     }
@@ -292,12 +312,18 @@ impl AgentMessageDelivery {
 
     /// Flush a single recipient's pending bucket immediately and dispatch ordered compatible batches.
     pub async fn flush_recipient(self: &Arc<Self>, recipient_id: &str) {
+        self.flush_recipient_internal(recipient_id, true).await;
+    }
+
+    async fn flush_recipient_internal(self: &Arc<Self>, recipient_id: &str, abort_timer: bool) {
         let items = {
             let mut guard = self.inner.lock().await;
             let Some(mut bucket) = guard.pending.remove(recipient_id) else {
                 return;
             };
-            if let Some(abort) = bucket.timer_abort.take() {
+            if let Some(abort) = bucket.timer_abort.take()
+                && abort_timer
+            {
                 abort.abort();
             }
             *guard.in_flight.entry(recipient_id.to_string()).or_insert(0) += 1;

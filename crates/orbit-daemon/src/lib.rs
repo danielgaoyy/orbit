@@ -28,6 +28,7 @@ pub mod scheduler;
 pub mod skills;
 pub mod skills_manager;
 pub mod symbols;
+pub mod timers;
 pub mod tools;
 pub mod usage;
 pub mod workspace_board;
@@ -96,6 +97,7 @@ use crate::messaging::{
 };
 use crate::scheduler::ScheduleEngine;
 use crate::symbols::WorkspaceSymbolIndex;
+use crate::timers::ConditionalTimerEngine;
 use crate::workspace_files::{
     canonicalize_workspace_root, create_workspace_entry, delete_workspace_entry,
     rename_workspace_entry, write_workspace_file,
@@ -220,6 +222,7 @@ pub struct DaemonRuntime {
     pub finish_subs: Arc<FinishSubscriptionManager>,
     pub connected_hosts: Arc<ConnectedHostsManager>,
     pub scheduler: Arc<ScheduleEngine>,
+    pub conditional_timers: Arc<ConditionalTimerEngine>,
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
     pub keep_awake: Arc<KeepAwakeManager>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
@@ -309,6 +312,27 @@ impl DaemonRuntime {
             connected_hosts.clone(),
         );
         let scheduler = ScheduleEngine::new(store.clone(), orchestrator.clone(), delivery.clone());
+        let conditional_timers =
+            ConditionalTimerEngine::new(store.clone(), orchestrator.clone(), delivery.clone());
+        orchestrator
+            .set_conditional_timers(conditional_timers.clone())
+            .await;
+        let timers_for_admission = conditional_timers.clone();
+        delivery
+            .set_on_admitted(Arc::new(move |recipient_id, kind, sender_id| {
+                let timers = Arc::clone(&timers_for_admission);
+                Box::pin(async move {
+                    if matches!(
+                        kind,
+                        AgentMessageKind::DirectMessage | AgentMessageKind::FinishNotification
+                    ) {
+                        timers
+                            .notify_agent_message(&recipient_id, sender_id.as_deref())
+                            .await;
+                    }
+                })
+            }))
+            .await;
         let idle_cleanup = IdleRuntimeCleanup::new(
             store.clone(),
             orchestrator.clone(),
@@ -356,6 +380,7 @@ impl DaemonRuntime {
             finish_subs,
             connected_hosts,
             scheduler,
+            conditional_timers,
             idle_cleanup,
             keep_awake,
             symbol_index: Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
@@ -380,8 +405,9 @@ impl DaemonRuntime {
         self.orchestrator.activate_runtime().await;
         // 2. Establish outbound Daemon-to-Daemon mesh connections
         self.connected_hosts.start_all().await;
-        // 3. Resume any persisted finish subscriptions across restarts
+        // 3. Resume any persisted finish subscriptions & armed conditional timers across restarts
         self.finish_subs.start_recovery().await;
+        self.conditional_timers.start_recovery().await;
         // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup & LSP Idle Reaper loops
         drop(self.scheduler.spawn_background());
         drop(self.idle_cleanup.spawn_background());
@@ -589,6 +615,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             wait_daemon_shutdown_signal().await;
             runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
             runtime_shutdown.orchestrator.shutdown_worktree_pool().await;
+            runtime_shutdown.conditional_timers.shutdown().await;
             runtime_shutdown.lsp.shutdown_all().await;
             runtime_shutdown.keep_awake.shutdown();
         })
@@ -1118,6 +1145,9 @@ async fn run_client_session_loop(
                             request_id: None,
                             artifact_id,
                         })
+                    }
+                    DaemonBroadcast::ConditionalTimerEvent(timer) => {
+                        Some(WireMessage::ConditionalTimerEvent { timer })
                     }
                 };
                 if let Some(msg) = maybe_msg
@@ -3330,6 +3360,84 @@ async fn handle_wire_rpc(
                         }
                     }
                     Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Early-Wakeup One-Shot Conditional Timers
+        WireMessage::CreateConditionalTimer {
+            request_id,
+            agent_id,
+            duration_seconds,
+            prompt,
+            condition,
+        } => {
+            let timers = Arc::clone(&runtime.conditional_timers);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match timers
+                    .create_timer(&agent_id, duration_seconds, prompt, condition)
+                    .await
+                {
+                    Ok(timer) => WireMessage::ConditionalTimerCreated { request_id, timer },
+                    Err(e) => rpc_err(request_id, "create_conditional_timer_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ListConditionalTimers {
+            request_id,
+            agent_id,
+            include_resolved,
+        } => {
+            let timers = Arc::clone(&runtime.conditional_timers);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    timers.list_timers(agent_id.as_deref(), include_resolved)
+                })
+                .await
+                {
+                    Ok(Ok(timers)) => WireMessage::ConditionalTimersSnapshot { request_id, timers },
+                    Ok(Err(e)) => rpc_err(request_id, "list_conditional_timers_failed", e),
+                    Err(e) => rpc_err(request_id, "list_conditional_timers_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::CancelConditionalTimer {
+            request_id,
+            timer_id,
+        } => {
+            let timers = Arc::clone(&runtime.conditional_timers);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match timers.cancel_timer(&timer_id).await {
+                    Ok(timer) => WireMessage::ConditionalTimerUpdated { request_id, timer },
+                    Err(e) => rpc_err(request_id, "cancel_conditional_timer_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::FireConditionalTimerNow {
+            request_id,
+            timer_id,
+        } => {
+            let timers = Arc::clone(&runtime.conditional_timers);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match timers.fire_timer_now(&timer_id).await {
+                    Ok(timer) => WireMessage::ConditionalTimerUpdated { request_id, timer },
+                    Err(e) => rpc_err(request_id, "fire_conditional_timer_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });

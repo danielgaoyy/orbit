@@ -125,6 +125,7 @@ pub enum DaemonBroadcast {
     AcpAgentsUpdated(Vec<orbit_protocol::AcpAgentAvailability>),
     ArtifactUpdated(orbit_protocol::ArtifactSummary),
     ArtifactDeleted(String),
+    ConditionalTimerEvent(orbit_protocol::ConditionalTimerRecord),
 }
 
 struct LiveAgentEntry {
@@ -241,6 +242,7 @@ pub struct AgentOrchestrator {
     /// Bounded concurrency limiter for background Turn-1 AI auto-naming & summary tasks
     /// so bursts of completing sessions never saturate local CPU or provider API rate limits.
     auto_name_semaphore: Arc<tokio::sync::Semaphore>,
+    conditional_timers: RwLock<Option<Arc<crate::timers::ConditionalTimerEngine>>>,
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
 }
 
@@ -308,8 +310,42 @@ impl AgentOrchestrator {
             last_call_prompt_occupancy: RwLock::new(HashMap::new()),
             organizing_locks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             auto_name_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            conditional_timers: RwLock::new(None),
             broadcast_tx,
         })
+    }
+
+    pub async fn set_conditional_timers(&self, timers: Arc<crate::timers::ConditionalTimerEngine>) {
+        *self.conditional_timers.write().await = Some(timers);
+    }
+
+    async fn conditional_timers(&self) -> Option<Arc<crate::timers::ConditionalTimerEngine>> {
+        self.conditional_timers.read().await.clone()
+    }
+
+    fn are_all_subagents_settled(&self, parent_agent_id: &str) -> bool {
+        let managed_busy = self
+            .store
+            .list_agents_filtered(None, false, true, Some(parent_agent_id))
+            .map(|children| {
+                children.into_iter().any(|child| {
+                    child.status.is_foreground_busy()
+                        || matches!(child.status, AgentStatus::AwaitingPermission { .. })
+                })
+            })
+            .unwrap_or(false);
+        if managed_busy {
+            return false;
+        }
+        let native_running = self
+            .store
+            .list_provider_subagents(parent_agent_id)
+            .map(|subs| {
+                subs.into_iter()
+                    .any(|s| s.status == orbit_protocol::ProviderSubagentStatus::Running)
+            })
+            .unwrap_or(false);
+        !native_running
     }
 
     pub fn keep_awake(&self) -> &Arc<KeepAwakeManager> {
@@ -2737,6 +2773,22 @@ impl AgentOrchestrator {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
 
         // Persist structured `TimelinePayload::AgentMessage` cards for each entry in the coalesced batch
+        if let Some(timers) = self.conditional_timers().await {
+            for entry in &batch.entries {
+                if matches!(
+                    entry.source.kind,
+                    orbit_protocol::AgentMessageKind::DirectMessage
+                        | orbit_protocol::AgentMessageKind::FinishNotification
+                ) {
+                    timers
+                        .notify_agent_message(
+                            &batch.recipient_id,
+                            entry.source.source_agent_id.as_deref(),
+                        )
+                        .await;
+                }
+            }
+        }
         for entry in &batch.entries {
             let ev = self.store.append_timeline_event(
                 &batch.recipient_id,
@@ -2786,6 +2838,9 @@ impl AgentOrchestrator {
             .live_agent_tx(agent_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("agent session not active"))?;
+        if let Some(timers) = self.conditional_timers().await {
+            timers.notify_agent_message(agent_id, Some("user")).await;
+        }
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let msg_id = message_id.unwrap_or_else(|| format!("u_{}", Uuid::new_v4().simple()));
         let visible_text = display_prompt.unwrap_or_else(|| prompt.clone());
@@ -3290,7 +3345,12 @@ impl AgentOrchestrator {
             // 1. Stop live runtime & clear pending permissions
             let _ = self.stop_and_wait_driver(agent_id).await;
 
-            // 2. Retire any heartbeats bound to this agent
+            // 2. Retire any heartbeats & armed conditional timers bound to this agent
+            if let Some(timers) = self.conditional_timers().await {
+                timers
+                    .cancel_all_for_agent(agent_id, "Agent archived")
+                    .await;
+            }
             if let Ok(removed_hbs) = self.store.delete_heartbeats_for_agent(agent_id) {
                 for hb_id in removed_hbs {
                     let _ = self
@@ -3323,6 +3383,12 @@ impl AgentOrchestrator {
                         )
                         .await;
                 });
+            }
+            if let Some(ref parent_id) = existing.as_ref().and_then(|a| a.parent_agent_id.clone())
+                && let Some(timers) = self.conditional_timers().await
+            {
+                let all_settled = self.are_all_subagents_settled(parent_id);
+                timers.notify_subagent_settled(parent_id, all_settled).await;
             }
             if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
                 let wt_src = updated.labels.get("orbit.worktree_source_cwd").cloned();
@@ -3385,6 +3451,10 @@ impl AgentOrchestrator {
     }
 
     pub async fn detach_agent(&self, agent_id: &str) -> anyhow::Result<AgentSummary> {
+        let prev_parent_id = self
+            .store
+            .get_agent(agent_id)?
+            .and_then(|a| a.parent_agent_id);
         self.store.detach_agent(agent_id)?;
         let updated = self
             .store
@@ -3393,6 +3463,12 @@ impl AgentOrchestrator {
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::AgentUpdated(updated.clone()));
+        if let Some(ref parent_id) = prev_parent_id
+            && let Some(timers) = self.conditional_timers().await
+        {
+            let all_settled = self.are_all_subagents_settled(parent_id);
+            timers.notify_subagent_settled(parent_id, all_settled).await;
+        }
         Ok(updated)
     }
 
@@ -3401,15 +3477,32 @@ impl AgentOrchestrator {
         self.store
             .update_agent_status(agent_id, &AgentStatus::Closed)?;
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+            let parent_id = updated.parent_agent_id.clone();
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::AgentUpdated(updated));
+            if let Some(ref pid) = parent_id
+                && let Some(timers) = self.conditional_timers().await
+            {
+                let all_settled = self.are_all_subagents_settled(pid);
+                timers.notify_subagent_settled(pid, all_settled).await;
+            }
         }
         Ok(())
     }
 
     pub async fn delete_agent(self: &Arc<Self>, agent_id: &str) -> anyhow::Result<()> {
+        let prev_parent_id = self
+            .store
+            .get_agent(agent_id)
+            .ok()
+            .flatten()
+            .and_then(|a| a.parent_agent_id);
         let _ = self.kill_agent(agent_id).await;
+        if let Some(timers) = self.conditional_timers().await {
+            timers.cancel_all_for_agent(agent_id, "Agent deleted").await;
+        }
+        let _ = self.store.delete_conditional_timers_for_agent(agent_id);
         if let Ok(removed_hbs) = self.store.delete_heartbeats_for_agent(agent_id) {
             for hb_id in removed_hbs {
                 let _ = self
@@ -3418,6 +3511,12 @@ impl AgentOrchestrator {
             }
         }
         self.store.delete_agent(agent_id)?;
+        if let Some(ref parent_id) = prev_parent_id
+            && let Some(timers) = self.conditional_timers().await
+        {
+            let all_settled = self.are_all_subagents_settled(parent_id);
+            timers.notify_subagent_settled(parent_id, all_settled).await;
+        }
         self.driver_start_locks.write().await.remove(agent_id);
         self.agent_generations.write().await.remove(agent_id);
         self.roster_fingerprints.write().await.remove(agent_id);
@@ -4695,10 +4794,18 @@ impl AgentOrchestrator {
                 return;
             }
             DriverEvent::ProviderSubagentUpsert(desc) => {
+                let parent_id = desc.parent_agent_id.clone();
+                let is_settled = desc.status != orbit_protocol::ProviderSubagentStatus::Running;
                 let _ = self.store.upsert_provider_subagent(&desc);
                 let _ = self
                     .broadcast_tx
                     .send(DaemonBroadcast::ProviderSubagentUpdated(desc));
+                if is_settled && let Some(timers) = self.conditional_timers().await {
+                    let all_settled = self.are_all_subagents_settled(&parent_id);
+                    timers
+                        .notify_subagent_settled(&parent_id, all_settled)
+                        .await;
+                }
                 return;
             }
             DriverEvent::ProviderSubagentTimeline {
@@ -5118,7 +5225,13 @@ impl AgentOrchestrator {
             let finished_idle = should_check_auto_archive && matches!(ag.status, AgentStatus::Idle);
             let ag_handle = ag.handle.clone();
             let ag_bg = ag.background;
-            let ag_is_subagent = ag.parent_agent_id.is_some();
+            let ag_parent_id = ag.parent_agent_id.clone();
+            let ag_settled = ag.archived_at.is_some()
+                || matches!(
+                    ag.status,
+                    AgentStatus::Idle | AgentStatus::Error { .. } | AgentStatus::Closed
+                );
+            let ag_is_subagent = ag_parent_id.is_some();
             let ag_needs_auto_naming = completed_running_turn
                 && !ag_is_subagent
                 && !crate::workspace_organizer::is_auto_named(&ag.labels);
@@ -5191,6 +5304,14 @@ impl AgentOrchestrator {
                 });
             }
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
+
+            if ag_settled
+                && let Some(ref parent_id) = ag_parent_id
+                && let Some(timers) = self.conditional_timers().await
+            {
+                let all_settled = self.are_all_subagents_settled(parent_id);
+                timers.notify_subagent_settled(parent_id, all_settled).await;
+            }
 
             if finished_idle && !ag_bg {
                 let ws_opt = self.store.get_workspace(&ws_id).ok().flatten();

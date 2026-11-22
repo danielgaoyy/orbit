@@ -16,19 +16,20 @@ use orbit_crypto::PairingOffer;
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
-    BackgroundTaskInfo, ConnectedHostSummary, ContextOccupancyBreakdown, DirectoryEntry,
-    DiscoveredProject, ExternalMcpServerRecord, GitStatusSnapshot, HookExecutionRecord, HookScope,
-    HostProjectEntry, HostSyncState, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic,
-    LspLocation, LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption,
-    OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary,
-    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog,
-    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem,
-    QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
-    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
-    TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot,
-    WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
-    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
-    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    BackgroundTaskInfo, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
+    ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, ExternalMcpServerRecord,
+    GitStatusSnapshot, HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState,
+    KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    ManagedSkillRecord, McpProbeResult, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
+    PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord,
+    ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame,
+    TerminalSummary, TimelineEvent, TimelinePayload, TimerCondition, ToolCallDetail,
+    ToolCallStatus, UsageInsightsSnapshot, WireMessage, WorkspaceBoardSnapshot,
+    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
+    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -319,6 +320,8 @@ pub struct HostDetailView {
     pub profiles: Vec<AgentProfile>,
     #[serde(default)]
     pub schedules: Vec<ScheduleSpec>,
+    #[serde(default)]
+    pub conditional_timers: Vec<ConditionalTimerRecord>,
     #[serde(default)]
     pub connected_hosts: Vec<ConnectedHostSummary>,
     #[serde(default)]
@@ -687,6 +690,13 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<LifecycleHooksSnapshotView, String>>>,
     pending_lifecycle_hook_tests:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<HookExecutionRecord, String>>>,
+    pending_timer_creates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ConditionalTimerRecord, String>>>,
+    pending_timer_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<ConditionalTimerRecord>, String>>>,
+    pending_timer_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ConditionalTimerRecord, String>>>,
+    background_timer_list_reqs: HashSet<Uuid>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -723,6 +733,7 @@ struct HostMemoryState {
     workspace_organize_status: HashMap<String, WorkspaceOrganizeEvent>,
     profiles: Vec<AgentProfile>,
     schedules: Vec<ScheduleSpec>,
+    conditional_timers: Vec<ConditionalTimerRecord>,
     schedule_runs: HashMap<String, Vec<ScheduleRunRecord>>,
     connected_hosts: Vec<ConnectedHostSummary>,
     orchestration_config: OrchestrationConfig,
@@ -808,6 +819,10 @@ impl HostMemoryState {
             pending_context_occupancy: HashMap::new(),
             pending_lifecycle_hooks: HashMap::new(),
             pending_lifecycle_hook_tests: HashMap::new(),
+            pending_timer_creates: HashMap::new(),
+            pending_timer_lists: HashMap::new(),
+            pending_timer_updates: HashMap::new(),
+            background_timer_list_reqs: HashSet::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -844,6 +859,7 @@ impl HostMemoryState {
             workspace_organize_status: HashMap::new(),
             profiles: Vec::new(),
             schedules: Vec::new(),
+            conditional_timers: Vec::new(),
             schedule_runs: HashMap::new(),
             connected_hosts: Vec::new(),
             orchestration_config: OrchestrationConfig::default(),
@@ -1511,6 +1527,7 @@ impl OrbitAppCore {
             active_terminal_slot: state.active_terminal_slot,
             profiles: state.profiles.clone(),
             schedules: state.schedules.clone(),
+            conditional_timers: state.conditional_timers.clone(),
             connected_hosts: state.connected_hosts.clone(),
             orchestration_config: state.orchestration_config.clone(),
             orchestration_skills: state.orchestration_skills.clone(),
@@ -3665,6 +3682,22 @@ impl OrbitAppCore {
                         include_completed: true,
                     })
                     .await;
+                let list_timers_req_id = Uuid::new_v4();
+                if let Ok(mut hosts) = self.hosts.write()
+                    && let Some(h) = hosts.get_mut(host_id)
+                {
+                    if h.background_timer_list_reqs.len() >= 64 {
+                        h.background_timer_list_reqs.clear();
+                    }
+                    h.background_timer_list_reqs.insert(list_timers_req_id);
+                }
+                let _ = handle
+                    .send_wire(WireMessage::ListConditionalTimers {
+                        request_id: list_timers_req_id,
+                        agent_id: None,
+                        include_resolved: true,
+                    })
+                    .await;
                 let _ = handle
                     .send_wire(WireMessage::ListConnectedHosts {
                         request_id: Uuid::new_v4(),
@@ -4294,6 +4327,7 @@ impl OrbitAppCore {
                         .and_then(|a| a.parent_agent_id.clone());
                     state.agents.remove(&agent_id);
                     state.timelines.remove(&agent_id);
+                    state.conditional_timers.retain(|t| t.agent_id != agent_id);
                     state.provider_subagents.remove(&agent_id);
                     state
                         .provider_subagent_timelines
@@ -5204,6 +5238,33 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(record));
                     }
                 }
+                WireMessage::ConditionalTimerCreated { request_id, timer } => {
+                    upsert_conditional_timer_record(&mut state.conditional_timers, timer.clone());
+                    if let Some(tx) = state.pending_timer_creates.remove(&request_id) {
+                        let _ = tx.send(Ok(timer));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ConditionalTimersSnapshot { request_id, timers } => {
+                    if state.background_timer_list_reqs.remove(&request_id) {
+                        state.conditional_timers = timers.clone();
+                        notify_host = true;
+                    }
+                    if let Some(tx) = state.pending_timer_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(timers));
+                    }
+                }
+                WireMessage::ConditionalTimerUpdated { request_id, timer } => {
+                    upsert_conditional_timer_record(&mut state.conditional_timers, timer.clone());
+                    if let Some(tx) = state.pending_timer_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(timer));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ConditionalTimerEvent { timer } => {
+                    upsert_conditional_timer_record(&mut state.conditional_timers, timer);
+                    notify_host = true;
+                }
                 WireMessage::SideQuestionDelta {
                     request_id,
                     text_delta,
@@ -5437,6 +5498,23 @@ impl OrbitAppCore {
                         && let Some(tx) = state.pending_lifecycle_hook_tests.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_timer_creates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_timer_lists.remove(&req_id)
+                    {
+                        state.background_timer_list_reqs.remove(&req_id);
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_timer_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && state.background_timer_list_reqs.remove(&req_id)
+                    {
+                        // Ignore unsupported/transient background timer list errors on older daemons.
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_side_questions.remove(&req_id)
                     {
@@ -11347,6 +11425,279 @@ impl OrbitAppCore {
             .map_err(|_| "match path rules task cancelled".to_string())?
     }
 
+    /// Arm a new one-shot conditional timer on any connected host.
+    pub async fn create_conditional_timer_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        duration_seconds: u64,
+        prompt: String,
+        condition: TimerCondition,
+    ) -> Result<ConditionalTimerRecord, String> {
+        let host_id = host_id.to_string();
+        let agent_id = agent_id.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to create a timer".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_timer_creates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before creating timer".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::CreateConditionalTimer {
+                    request_id: req_id,
+                    agent_id,
+                    duration_seconds,
+                    prompt,
+                    condition,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_timer_creates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to create conditional timer: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while creating timer".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_timer_creates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to create timer".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "create conditional timer task cancelled".to_string())?
+    }
+
+    /// List armed (and optionally resolved) one-shot conditional timers on any connected host.
+    pub async fn list_conditional_timers_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: Option<String>,
+        include_resolved: bool,
+    ) -> Result<Vec<ConditionalTimerRecord>, String> {
+        let host_id = host_id.to_string();
+        let update_host_cache = agent_id.is_none() && include_resolved;
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to list timers".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_timer_lists.insert(req_id, ack_tx);
+                        if update_host_cache {
+                            h.background_timer_list_reqs.insert(req_id);
+                        }
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing timers".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListConditionalTimers {
+                    request_id: req_id,
+                    agent_id,
+                    include_resolved,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_timer_lists.remove(&req_id);
+                    h.background_timer_list_reqs.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to list conditional timers: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while listing timers".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_timer_lists.remove(&req_id);
+                        h.background_timer_list_reqs.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to list timers".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "list conditional timers task cancelled".to_string())?
+    }
+
+    /// Manually cancel an armed conditional timer on any connected host.
+    pub async fn cancel_conditional_timer_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        timer_id: &str,
+    ) -> Result<ConditionalTimerRecord, String> {
+        self.dispatch_conditional_timer_update_rpc(
+            host_id.to_string(),
+            {
+                let timer_id = timer_id.to_string();
+                move |request_id| WireMessage::CancelConditionalTimer {
+                    request_id,
+                    timer_id,
+                }
+            },
+            "cancel conditional timer",
+        )
+        .await
+    }
+
+    /// Immediately fire an armed conditional timer on any connected host.
+    pub async fn fire_conditional_timer_now_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        timer_id: &str,
+    ) -> Result<ConditionalTimerRecord, String> {
+        self.dispatch_conditional_timer_update_rpc(
+            host_id.to_string(),
+            {
+                let timer_id = timer_id.to_string();
+                move |request_id| WireMessage::FireConditionalTimerNow {
+                    request_id,
+                    timer_id,
+                }
+            },
+            "fire conditional timer",
+        )
+        .await
+    }
+
+    async fn dispatch_conditional_timer_update_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+    ) -> Result<ConditionalTimerRecord, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_timer_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_timer_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_timer_updates.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for daemon to {op_label}"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
     /// List discovered and active LSP language servers for a workspace on any connected host.
     pub async fn list_lsp_servers_on_host(
         self: &Arc<Self>,
@@ -13477,6 +13828,16 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_lifecycle_hook_tests.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_timer_creates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_timer_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_timer_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.background_timer_list_reqs.clear();
     for (req_id, tx) in h.pending_side_questions.drain() {
         let _ = tx.send(SideQuestionStreamEvent::Done {
             request_id: req_id.to_string(),
@@ -13490,6 +13851,39 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_upgrade_terminals.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+}
+
+fn upsert_conditional_timer_record(
+    timers: &mut Vec<ConditionalTimerRecord>,
+    timer: ConditionalTimerRecord,
+) {
+    if let Some(slot) = timers.iter_mut().find(|t| t.timer_id == timer.timer_id) {
+        *slot = timer;
+    } else {
+        timers.push(timer);
+    }
+    timers.sort_by(|a, b| match (a.state.is_armed(), b.state.is_armed()) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (true, true) => a
+            .fire_at_ms
+            .cmp(&b.fire_at_ms)
+            .then_with(|| a.created_at_ms.cmp(&b.created_at_ms)),
+        (false, false) => b
+            .resolved_at_ms
+            .unwrap_or(b.created_at_ms)
+            .cmp(&a.resolved_at_ms.unwrap_or(a.created_at_ms)),
+    });
+    // Keep all armed timers plus at most 100 recent resolved timers in memory.
+    let mut resolved_seen = 0usize;
+    timers.retain(|t| {
+        if t.state == ConditionalTimerState::Armed {
+            true
+        } else {
+            resolved_seen += 1;
+            resolved_seen <= 100
+        }
+    });
 }
 
 fn version_supports_remote_attachments(raw: &str) -> bool {

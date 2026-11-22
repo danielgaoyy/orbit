@@ -1035,6 +1035,63 @@ export interface ProviderModelCatalog {
   configured_default_effort: ReasoningEffort | null;
 }
 
+export type TimerCondition =
+  | { kind: "never" }
+  | { kind: "any_message" }
+  | { kind: "sender"; sender_id: string }
+  | { kind: "all_subagents_settled" }
+  | { kind: "file_changed"; path: string };
+
+export type ConditionalTimerState =
+  | "armed"
+  | "fired"
+  | "canceled_early"
+  | "canceled_manual";
+
+export interface ConditionalTimerRecord {
+  timer_id: string;
+  agent_id: string;
+  workspace_id: string;
+  prompt: string;
+  duration_seconds: number;
+  condition: TimerCondition;
+  state: ConditionalTimerState;
+  created_at_ms: number;
+  fire_at_ms: number;
+  resolved_at_ms?: number | null;
+  resolved_reason?: string | null;
+}
+
+export function formatTimerConditionLabel(condition: TimerCondition): string {
+  switch (condition.kind) {
+    case "never":
+      return "fixed timer";
+    case "any_message":
+      return "until any message";
+    case "sender":
+      return `until ${condition.sender_id}`;
+    case "all_subagents_settled":
+      return "until subagents settle";
+    case "file_changed": {
+      const leaf = condition.path.split(/[\\/]/).pop() || condition.path;
+      return `until ${leaf} changes`;
+    }
+  }
+}
+
+export function formatTimerCountdown(fireAtMs: number, nowMs: number = Date.now()): string {
+  const remainingSec = Math.max(0, Math.ceil((fireAtMs - nowMs) / 1000));
+  const hrs = Math.floor(remainingSec / 3600);
+  const mins = Math.floor((remainingSec % 3600) / 60);
+  const secs = remainingSec % 60;
+  const mm = String(mins).padStart(2, "0");
+  const ss = String(secs).padStart(2, "0");
+  if (hrs > 0) {
+    return `${String(hrs).padStart(2, "0")}:${mm}:${ss}`;
+  }
+  return `${mm}:${ss}`;
+}
+
 export interface HostDetailView {
   revision: number;
   host: HostCardView;
@@ -1052,6 +1109,7 @@ export interface HostDetailView {
   active_terminal_slot: number;
   profiles?: AgentProfile[];
   schedules?: ScheduleSpec[];
+  conditional_timers?: ConditionalTimerRecord[];
   connected_hosts?: ConnectedHostSummary[];
   orchestration_config?: OrchestrationConfig;
   orchestration_skills?: OrchestrationSkillInfo[];
@@ -4028,6 +4086,64 @@ export const orbitIpc = {
       hostId,
       cwd,
       serverId,
+    });
+  },
+
+  createConditionalTimer: async (params: {
+    hostId: string;
+    agentId: string;
+    durationSeconds: number;
+    prompt: string;
+    condition: TimerCondition;
+  }): Promise<ConditionalTimerRecord> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Tauri runtime unavailable");
+    }
+    return invoke<ConditionalTimerRecord>("create_conditional_timer", {
+      hostId: params.hostId,
+      agentId: params.agentId,
+      durationSeconds: params.durationSeconds,
+      prompt: params.prompt,
+      condition: params.condition,
+    });
+  },
+
+  listConditionalTimers: async (
+    hostId: string,
+    agentId?: string | null,
+    includeResolved = true,
+  ): Promise<ConditionalTimerRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ConditionalTimerRecord[]>("list_conditional_timers", {
+      hostId,
+      agentId: agentId ?? null,
+      includeResolved,
+    });
+  },
+
+  cancelConditionalTimer: async (
+    hostId: string,
+    timerId: string,
+  ): Promise<ConditionalTimerRecord> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Tauri runtime unavailable");
+    }
+    return invoke<ConditionalTimerRecord>("cancel_conditional_timer", {
+      hostId,
+      timerId,
+    });
+  },
+
+  fireConditionalTimerNow: async (
+    hostId: string,
+    timerId: string,
+  ): Promise<ConditionalTimerRecord> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Tauri runtime unavailable");
+    }
+    return invoke<ConditionalTimerRecord>("fire_conditional_timer_now", {
+      hostId,
+      timerId,
     });
   },
   highlightWorkspaceCode: async (

@@ -7070,6 +7070,119 @@ export const orbitActions = {
     }
   },
 
+  async refreshConditionalTimers(
+    hostId: string,
+    agentId?: string | null,
+    includeResolved = true,
+  ): Promise<import("@/lib/orbit-ipc").ConditionalTimerRecord[]> {
+    if (!hostId) return [];
+    const timers = await orbitIpc.listConditionalTimers(hostId, agentId, includeResolved);
+    if (!agentId && includeResolved) {
+      setState((s) => {
+        const detail = s.hostDetails[hostId];
+        if (!detail) return s;
+        return {
+          ...s,
+          hostDetails: {
+            ...s.hostDetails,
+            [hostId]: { ...detail, conditional_timers: timers },
+          },
+        };
+      });
+    }
+    return timers;
+  },
+
+  async createConditionalTimer(params: {
+    hostId: string;
+    agentId: string;
+    durationSeconds: number;
+    prompt: string;
+    condition: import("@/lib/orbit-ipc").TimerCondition;
+  }): Promise<import("@/lib/orbit-ipc").ConditionalTimerRecord> {
+    const created = await orbitIpc.createConditionalTimer(params);
+    setState((s) => {
+      const detail = s.hostDetails[params.hostId];
+      if (!detail) return s;
+      const existing = detail.conditional_timers ?? [];
+      const next = [created, ...existing.filter((t) => t.timer_id !== created.timer_id)].sort(
+        (a, b) => {
+          const aArmed = a.state === "armed";
+          const bArmed = b.state === "armed";
+          if (aArmed !== bArmed) return aArmed ? -1 : 1;
+          if (aArmed) return a.fire_at_ms - b.fire_at_ms;
+          return (b.resolved_at_ms ?? b.created_at_ms) - (a.resolved_at_ms ?? a.created_at_ms);
+        },
+      );
+      return {
+        ...s,
+        hostDetails: {
+          ...s.hostDetails,
+          [params.hostId]: { ...detail, conditional_timers: next },
+        },
+      };
+    });
+    return created;
+  },
+
+  async cancelConditionalTimer(
+    hostId: string,
+    timerId: string,
+  ): Promise<import("@/lib/orbit-ipc").ConditionalTimerRecord> {
+    const updated = await orbitIpc.cancelConditionalTimer(hostId, timerId);
+    setState((s) => {
+      const detail = s.hostDetails[hostId];
+      if (!detail) return s;
+      const existing = detail.conditional_timers ?? [];
+      const next = [updated, ...existing.filter((t) => t.timer_id !== updated.timer_id)].sort(
+        (a, b) => {
+          const aArmed = a.state === "armed";
+          const bArmed = b.state === "armed";
+          if (aArmed !== bArmed) return aArmed ? -1 : 1;
+          if (aArmed) return a.fire_at_ms - b.fire_at_ms;
+          return (b.resolved_at_ms ?? b.created_at_ms) - (a.resolved_at_ms ?? a.created_at_ms);
+        },
+      );
+      return {
+        ...s,
+        hostDetails: {
+          ...s.hostDetails,
+          [hostId]: { ...detail, conditional_timers: next },
+        },
+      };
+    });
+    return updated;
+  },
+
+  async fireConditionalTimerNow(
+    hostId: string,
+    timerId: string,
+  ): Promise<import("@/lib/orbit-ipc").ConditionalTimerRecord> {
+    const updated = await orbitIpc.fireConditionalTimerNow(hostId, timerId);
+    setState((s) => {
+      const detail = s.hostDetails[hostId];
+      if (!detail) return s;
+      const existing = detail.conditional_timers ?? [];
+      const next = [updated, ...existing.filter((t) => t.timer_id !== updated.timer_id)].sort(
+        (a, b) => {
+          const aArmed = a.state === "armed";
+          const bArmed = b.state === "armed";
+          if (aArmed !== bArmed) return aArmed ? -1 : 1;
+          if (aArmed) return a.fire_at_ms - b.fire_at_ms;
+          return (b.resolved_at_ms ?? b.created_at_ms) - (a.resolved_at_ms ?? a.created_at_ms);
+        },
+      );
+      return {
+        ...s,
+        hostDetails: {
+          ...s.hostDetails,
+          [hostId]: { ...detail, conditional_timers: next },
+        },
+      };
+    });
+    return updated;
+  },
+
   async restartLspServer(hostId: string, cwd: string, serverId: string): Promise<void> {
     if (!hostId || !cwd || cwd === "~" || !serverId) return;
     const scopeKey = `${hostId}::${cwd}`;

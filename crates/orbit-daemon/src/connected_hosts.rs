@@ -572,7 +572,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::UsageInsightsResponse { request_id, .. }
         | WireMessage::ContextOccupancyResponse { request_id, .. }
         | WireMessage::LifecycleHooksSnapshot { request_id, .. }
-        | WireMessage::HookTestResultResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::HookTestResultResponse { request_id, .. }
+        | WireMessage::ConditionalTimerCreated { request_id, .. }
+        | WireMessage::ConditionalTimersSnapshot { request_id, .. }
+        | WireMessage::ConditionalTimerUpdated { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }
@@ -1103,5 +1106,44 @@ mod tests {
         };
         assert_eq!(extract_response_request_id(&snap), Some(req_id));
         assert_eq!(extract_response_request_id(&probe), Some(req_id));
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_conditional_timer_responses() {
+        let req_id = Uuid::new_v4();
+        let rec = orbit_protocol::ConditionalTimerRecord {
+            timer_id: "tmr_1".into(),
+            agent_id: "ag_1".into(),
+            workspace_id: "ws_1".into(),
+            prompt: "Ping".into(),
+            duration_seconds: 60,
+            condition: orbit_protocol::TimerCondition::AnyMessage,
+            state: orbit_protocol::ConditionalTimerState::Armed,
+            created_at_ms: 1,
+            fire_at_ms: 61_000,
+            resolved_at_ms: None,
+            resolved_reason: None,
+        };
+        assert_eq!(
+            extract_response_request_id(&WireMessage::ConditionalTimerCreated {
+                request_id: req_id,
+                timer: rec.clone(),
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::ConditionalTimersSnapshot {
+                request_id: req_id,
+                timers: vec![rec.clone()],
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::ConditionalTimerUpdated {
+                request_id: req_id,
+                timer: rec,
+            }),
+            Some(req_id)
+        );
     }
 }

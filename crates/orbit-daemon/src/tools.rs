@@ -1305,6 +1305,125 @@ async fn execute_tool_inner(
             Ok(json!({ "ok": true, "heartbeat_id": hid }))
         }
 
+        // ==================== ONE-SHOT CONDITIONAL TIMERS ====================
+        "create_timer" => {
+            let duration_seconds = args
+                .get("duration_seconds")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("`duration_seconds` integer is required"))?;
+            let prompt = str_arg(args, "prompt")?;
+            let condition = match opt_str(args, "condition") {
+                Some(raw) => raw
+                    .parse::<orbit_protocol::TimerCondition>()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                None => orbit_protocol::TimerCondition::Never,
+            };
+            if let Some(ref remote_host_id) = target_host {
+                let target_agent = opt_str(args, "agent_id").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`create_timer` requires an explicit `agent_id` when targeting a remote `host_id`"
+                    )
+                })?;
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CreateConditionalTimer {
+                            request_id: req_id,
+                            agent_id: target_agent,
+                            duration_seconds,
+                            prompt,
+                            condition,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                return match resp {
+                    WireMessage::ConditionalTimerCreated { timer, .. } => {
+                        Ok(json!({ "host_id": remote_host_id, "timer": timer }))
+                    }
+                    WireMessage::RpcError { message, .. } => anyhow::bail!("{message}"),
+                    other => anyhow::bail!("unexpected response from remote host: {other:?}"),
+                };
+            }
+            let target_agent = opt_str(args, "agent_id")
+                .or_else(|| caller_agent_id.map(ToOwned::to_owned))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("`create_timer` requires an active caller agent or `agent_id`")
+                })?;
+            let timer = rt
+                .conditional_timers
+                .create_timer(&target_agent, duration_seconds, prompt, condition)
+                .await?;
+            Ok(json!({ "host_id": rt.host_info.host_id, "timer": timer }))
+        }
+
+        "list_timers" => {
+            let include_resolved = args
+                .get("include_resolved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ListConditionalTimers {
+                            request_id: req_id,
+                            agent_id: opt_str(args, "agent_id"),
+                            include_resolved,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                return match resp {
+                    WireMessage::ConditionalTimersSnapshot { timers, .. } => {
+                        Ok(json!({ "host_id": remote_host_id, "timers": timers }))
+                    }
+                    WireMessage::RpcError { message, .. } => anyhow::bail!("{message}"),
+                    other => anyhow::bail!("unexpected response from remote host: {other:?}"),
+                };
+            }
+            let target_agent =
+                opt_str(args, "agent_id").or_else(|| caller_agent_id.map(ToOwned::to_owned));
+            let timers = rt
+                .conditional_timers
+                .list_timers(target_agent.as_deref(), include_resolved)?;
+            Ok(json!({ "host_id": rt.host_info.host_id, "timers": timers }))
+        }
+
+        "cancel_timer" => {
+            let timer_id = str_arg(args, "timer_id")?;
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CancelConditionalTimer {
+                            request_id: req_id,
+                            timer_id,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                return match resp {
+                    WireMessage::ConditionalTimerUpdated { timer, .. } => {
+                        Ok(json!({ "host_id": remote_host_id, "timer": timer }))
+                    }
+                    WireMessage::RpcError { message, .. } => anyhow::bail!("{message}"),
+                    other => anyhow::bail!("unexpected response from remote host: {other:?}"),
+                };
+            }
+            let timer = rt.conditional_timers.cancel_timer(&timer_id).await?;
+            Ok(json!({ "host_id": rt.host_info.host_id, "timer": timer }))
+        }
+
         // ==================== PROFILES / DISCOVERY / PERMISSIONS / HOSTS ====================
         "list_profiles" => {
             if let Some(ref remote_host_id) = target_host {
@@ -2949,6 +3068,48 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        ToolDefinition {
+            name: "create_timer",
+            description: "Arm a durable one-shot conditional wakeup timer (1..=86400s) that automatically cancels early if its condition is met (e.g. incoming message, subagents settling, or workspace file change).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "duration_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+                    "prompt": { "type": "string", "description": "Wakeup prompt delivered to the agent if the timer elapses." },
+                    "condition": {
+                        "type": "string",
+                        "description": "Early-cancel condition: `never` (default), `any`, `all_subagents`, `sender:<agent_id>`, or `file:<relative_path>`."
+                    },
+                    "agent_id": { "type": "string", "description": "Optional target agent ID (defaults to calling agent; required when `host_id` targets a remote host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["duration_seconds", "prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "list_timers",
+            description: "List armed (and optionally resolved) one-shot conditional timers on this host or a connected remote host.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "include_resolved": { "type": "boolean" },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "cancel_timer",
+            description: "Manually cancel an armed one-shot conditional timer on this host or a connected remote host.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "timer_id": { "type": "string" },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["timer_id"]
+            }),
+        },
         // --- Profiles / Discovery / Permissions / Hosts (6) ---
         ToolDefinition {
             name: "list_profiles",
@@ -3206,4 +3367,24 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timer_mcp_tools_expose_multi_host_id_schema() {
+        let defs = all_tool_definitions();
+        for name in ["create_timer", "list_timers", "cancel_timer"] {
+            let def = defs
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("missing MCP tool definition `{name}`"));
+            assert!(
+                def.input_schema["properties"].get("host_id").is_some(),
+                "MCP tool `{name}` must expose `host_id` for multi-host routing"
+            );
+        }
+    }
 }

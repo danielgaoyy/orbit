@@ -11,6 +11,7 @@ pub mod media;
 pub mod orchestration;
 pub mod rules;
 pub mod skills;
+pub mod timers;
 pub mod usage;
 pub use acp::*;
 pub use artifacts::*;
@@ -23,6 +24,7 @@ pub use media::*;
 pub use orchestration::*;
 pub use rules::*;
 pub use skills::*;
+pub use timers::*;
 pub use usage::*;
 
 use std::collections::{BTreeMap, HashMap};
@@ -2286,6 +2288,46 @@ pub enum WireMessage {
         record: HookExecutionRecord,
     },
 
+    // Early-Wakeup One-Shot Conditional Timers
+    CreateConditionalTimer {
+        request_id: Uuid,
+        agent_id: String,
+        duration_seconds: u64,
+        prompt: String,
+        #[serde(default)]
+        condition: TimerCondition,
+    },
+    ConditionalTimerCreated {
+        request_id: Uuid,
+        timer: ConditionalTimerRecord,
+    },
+    ListConditionalTimers {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default)]
+        include_resolved: bool,
+    },
+    ConditionalTimersSnapshot {
+        request_id: Uuid,
+        timers: Vec<ConditionalTimerRecord>,
+    },
+    CancelConditionalTimer {
+        request_id: Uuid,
+        timer_id: String,
+    },
+    FireConditionalTimerNow {
+        request_id: Uuid,
+        timer_id: String,
+    },
+    ConditionalTimerUpdated {
+        request_id: Uuid,
+        timer: ConditionalTimerRecord,
+    },
+    ConditionalTimerEvent {
+        timer: ConditionalTimerRecord,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -3644,6 +3686,72 @@ mod tests {
         for msg in messages {
             let encoded = msg.encode_zstd(3).expect("encode usage wire msg");
             let decoded = WireMessage::decode_zstd(&encoded).expect("decode usage wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_timers_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let record = ConditionalTimerRecord {
+            timer_id: "tmr_abc12345".into(),
+            agent_id: "ag_main".into(),
+            workspace_id: "ws_1".into(),
+            prompt: "Follow up on deployment".into(),
+            duration_seconds: 300,
+            condition: TimerCondition::FileChanged {
+                path: "dist/bundle.js".into(),
+            },
+            state: ConditionalTimerState::Armed,
+            created_at_ms: 1_760_000_000_000,
+            fire_at_ms: 1_760_000_300_000,
+            resolved_at_ms: None,
+            resolved_reason: None,
+        };
+        let messages = vec![
+            WireMessage::CreateConditionalTimer {
+                request_id: req_id,
+                agent_id: "ag_main".into(),
+                duration_seconds: 300,
+                prompt: "Follow up on deployment".into(),
+                condition: TimerCondition::AnyMessage,
+            },
+            WireMessage::ConditionalTimerCreated {
+                request_id: req_id,
+                timer: record.clone(),
+            },
+            WireMessage::ListConditionalTimers {
+                request_id: req_id,
+                agent_id: Some("ag_main".into()),
+                include_resolved: true,
+            },
+            WireMessage::ConditionalTimersSnapshot {
+                request_id: req_id,
+                timers: vec![record.clone()],
+            },
+            WireMessage::CancelConditionalTimer {
+                request_id: req_id,
+                timer_id: "tmr_abc12345".into(),
+            },
+            WireMessage::FireConditionalTimerNow {
+                request_id: req_id,
+                timer_id: "tmr_abc12345".into(),
+            },
+            WireMessage::ConditionalTimerUpdated {
+                request_id: req_id,
+                timer: record.clone(),
+            },
+            WireMessage::ConditionalTimerEvent { timer: record },
+        ];
+        for msg in messages {
+            let encoded = msg
+                .encode_zstd(3)
+                .expect("encode conditional timer wire msg");
+            let decoded =
+                WireMessage::decode_zstd(&encoded).expect("decode conditional timer wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

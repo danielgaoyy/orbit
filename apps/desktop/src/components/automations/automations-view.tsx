@@ -15,17 +15,23 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  Timer,
   Trash2,
+  X,
   Zap,
   type LucideIcon,
 } from "lucide-react";
 import {
   PROVIDER_LIST,
   formatProviderLabel,
+  formatTimerConditionLabel,
+  formatTimerCountdown,
+  type ConditionalTimerRecord,
   type ProviderKind,
   type ScheduleRunRecord,
   type ScheduleSpec,
   type SessionMode,
+  type TimerCondition,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isBareHomeDir, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
@@ -305,6 +311,7 @@ interface ProjectChoice {
 export function AutomationsView() {
   const fleet = useOrbitSelector((s) => s.fleet);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const hostDetail = useOrbitSelector((s) =>
     s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
@@ -338,6 +345,135 @@ export function AutomationsView() {
   const [loadingRunsId, setLoadingRunsId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const runsPollTokenRef = useRef(0);
+
+  // Conditional Timers creation dialog state
+  const [timerDialogOpen, setTimerDialogOpen] = useState(false);
+  const [timerAgentId, setTimerAgentId] = useState("");
+  const [timerDurationSec, setTimerDurationSec] = useState("300");
+  const [timerConditionKind, setTimerConditionKind] = useState<TimerCondition["kind"]>("any_message");
+  const [timerConditionArg, setTimerConditionArg] = useState("");
+  const [timerPrompt, setTimerPrompt] = useState("");
+  const [timerSubmitting, setTimerSubmitting] = useState(false);
+  const [timerBusyId, setTimerBusyId] = useState<string | null>(null);
+  const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
+
+  const conditionalTimers = useMemo(
+    () => hostDetail?.conditional_timers ?? [],
+    [hostDetail?.conditional_timers],
+  );
+  const armedTimerCount = useMemo(
+    () => conditionalTimers.filter((t) => t.state === "armed").length,
+    [conditionalTimers],
+  );
+  const hasArmedTimers = armedTimerCount > 0;
+  const activeAgentChoices = useMemo(
+    () =>
+      (hostDetail?.agents ?? []).filter(
+        (a) => !a.archived_at_rfc3339 && !a.background && !a.parent_agent_id,
+      ),
+    [hostDetail?.agents],
+  );
+
+  useEffect(() => {
+    if (!hasArmedTimers) return;
+    setTimerNowMs(Date.now());
+    const id = window.setInterval(() => setTimerNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [hasArmedTimers]);
+
+  useEffect(() => {
+    setTimerDialogOpen(false);
+    setTimerAgentId("");
+    setTimerPrompt("");
+    setTimerConditionArg("");
+    if (!selectedHostId) return;
+    void orbitActions.refreshConditionalTimers(selectedHostId, null, true).catch(() => {});
+  }, [selectedHostId]);
+
+  const openTimerDialog = useCallback(() => {
+    const defaultAgent =
+      (selectedAgentId && activeAgentChoices.some((a) => a.agent_id === selectedAgentId)
+        ? selectedAgentId
+        : activeAgentChoices[0]?.agent_id) ?? "";
+    setTimerAgentId(defaultAgent);
+    setTimerDurationSec("300");
+    setTimerConditionKind("any_message");
+    setTimerConditionArg("");
+    setTimerPrompt("");
+    setTimerDialogOpen(true);
+  }, [selectedAgentId, activeAgentChoices]);
+
+  const submitConditionalTimer = useCallback(async () => {
+    if (!selectedHostId || timerSubmitting) return;
+    const secs = Math.floor(Number(timerDurationSec));
+    if (!Number.isFinite(secs) || secs < 1 || secs > 86400) {
+      orbitActions.showToast("Duration must be between 1 and 86400 seconds");
+      return;
+    }
+    if (!timerAgentId) {
+      orbitActions.showToast("Select a target agent first");
+      return;
+    }
+    const cleanPrompt = timerPrompt.trim();
+    if (!cleanPrompt) {
+      orbitActions.showToast("Enter a wakeup prompt");
+      return;
+    }
+    let condition: TimerCondition;
+    switch (timerConditionKind) {
+      case "never":
+        condition = { kind: "never" };
+        break;
+      case "any_message":
+        condition = { kind: "any_message" };
+        break;
+      case "all_subagents_settled":
+        condition = { kind: "all_subagents_settled" };
+        break;
+      case "sender": {
+        const sid = timerConditionArg.trim();
+        if (!sid) {
+          orbitActions.showToast("Enter a sender agent ID");
+          return;
+        }
+        condition = { kind: "sender", sender_id: sid };
+        break;
+      }
+      case "file_changed": {
+        const path = timerConditionArg.trim();
+        if (!path) {
+          orbitActions.showToast("Enter a workspace-relative file path");
+          return;
+        }
+        condition = { kind: "file_changed", path };
+        break;
+      }
+    }
+    setTimerSubmitting(true);
+    try {
+      await orbitActions.createConditionalTimer({
+        hostId: selectedHostId,
+        agentId: timerAgentId,
+        durationSeconds: secs,
+        prompt: cleanPrompt,
+        condition,
+      });
+      orbitActions.showToast("One-shot timer armed");
+      setTimerDialogOpen(false);
+    } catch (err) {
+      orbitActions.showToast(`Failed to arm timer: ${String(err)}`);
+    } finally {
+      setTimerSubmitting(false);
+    }
+  }, [
+    selectedHostId,
+    timerSubmitting,
+    timerDurationSec,
+    timerAgentId,
+    timerPrompt,
+    timerConditionKind,
+    timerConditionArg,
+  ]);
   const deleteConfirmTimerRef = useRef<number | null>(null);
 
   const allSchedules = useMemo(
@@ -916,6 +1052,159 @@ export function AutomationsView() {
           </div>
         )}
 
+        {/* One-Shot Conditional Timers — Active countdowns & recent history */}
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-2 px-0.5">
+            <div className="text-muted-foreground/80 flex items-center gap-1.5 text-[11.5px] font-medium">
+              <span>Timers</span>
+              {armedTimerCount > 0 && (
+                <span className="text-muted-foreground/60 tabular-nums">
+                  {armedTimerCount} armed
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              disabled={!selectedHostId || activeAgentChoices.length === 0}
+              onClick={openTimerDialog}
+              className="border-border/80 bg-elevated/50 hover:bg-accent text-foreground/85 inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-[7px] border px-2 text-[11.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Plus className="size-3 stroke-[2]" />
+              <span>One-Shot Timer</span>
+            </button>
+          </div>
+
+          {conditionalTimers.length === 0 ? (
+            <div className="border-border/65 text-muted-foreground/75 rounded-xl border border-dashed px-4 py-3 text-[12px]">
+              No active or recent one-shot conditional timers.
+            </div>
+          ) : (
+            <div className="border-border/80 bg-elevated/35 divide-border/70 divide-y overflow-hidden rounded-xl border">
+              {conditionalTimers.slice(0, 20).map((timer: ConditionalTimerRecord) => {
+                const isArmed = timer.state === "armed";
+                const targetAgent = hostDetail?.agents.find((a) => a.agent_id === timer.agent_id);
+                const stateLabel =
+                  timer.state === "fired"
+                    ? "Fired"
+                    : timer.state === "canceled_early"
+                      ? "Canceled early"
+                      : timer.state === "canceled_manual"
+                        ? "Canceled"
+                        : "Armed";
+                const busy = timerBusyId === timer.timer_id;
+                return (
+                  <div
+                    key={timer.timer_id}
+                    className="group flex items-center justify-between gap-3 px-4 py-2.5 transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.025]"
+                  >
+                    <div className="flex min-w-0 items-start gap-2.5">
+                      <Timer
+                        className={cn(
+                          "mt-0.5 size-3.5 shrink-0",
+                          isArmed ? "text-amber-500/85" : "text-muted-foreground/55",
+                        )}
+                      />
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="text-foreground max-w-[320px] truncate text-[12.5px] font-medium">
+                            {timer.prompt}
+                          </span>
+                          {isArmed ? (
+                            <span className="text-foreground/90 tabular-nums shrink-0 rounded-md bg-amber-500/12 px-1.5 py-0.5 font-mono text-[11px] font-medium">
+                              {formatTimerCountdown(timer.fire_at_ms, timerNowMs)}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground bg-muted/70 shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-medium">
+                              {stateLabel}
+                            </span>
+                          )}
+                          <span className="text-muted-foreground/80 border-border/70 shrink-0 rounded-md border px-1.5 py-0.5 text-[10.5px]">
+                            {formatTimerConditionLabel(timer.condition)}
+                          </span>
+                        </div>
+                        <div className="text-muted-foreground/80 flex flex-wrap items-center gap-1.5 text-[11.5px]">
+                          <span className="max-w-[200px] truncate">
+                            {targetAgent?.title ?? timer.agent_id}
+                          </span>
+                          {timer.resolved_reason && (
+                            <>
+                              <span>·</span>
+                              <span className="truncate">{timer.resolved_reason}</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {selectedHostId && (
+                      <div className="flex shrink-0 items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => orbitActions.selectAgent(selectedHostId, timer.agent_id)}
+                          className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors"
+                        >
+                          <span>Open</span>
+                          <ArrowUpRight className="size-3" />
+                        </button>
+                        {isArmed && (
+                          <>
+                            <SimpleTooltip label="Run now">
+                              <button
+                                type="button"
+                                disabled={busy}
+                                aria-label="Run timer now"
+                                onClick={() => {
+                                  setTimerBusyId(timer.timer_id);
+                                  void orbitActions
+                                    .fireConditionalTimerNow(selectedHostId, timer.timer_id)
+                                    .then(
+                                      () => orbitActions.showToast("Timer triggered"),
+                                      (err) =>
+                                        orbitActions.showToast(
+                                          `Failed to trigger timer: ${String(err)}`,
+                                        ),
+                                    )
+                                    .finally(() => setTimerBusyId(null));
+                                }}
+                                className="text-muted-foreground/75 hover:text-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:opacity-40"
+                              >
+                                <Play className="size-3 fill-current" />
+                              </button>
+                            </SimpleTooltip>
+                            <SimpleTooltip label="Cancel timer">
+                              <button
+                                type="button"
+                                disabled={busy}
+                                aria-label="Cancel timer"
+                                onClick={() => {
+                                  setTimerBusyId(timer.timer_id);
+                                  void orbitActions
+                                    .cancelConditionalTimer(selectedHostId, timer.timer_id)
+                                    .then(
+                                      () => orbitActions.showToast("Timer canceled"),
+                                      (err) =>
+                                        orbitActions.showToast(
+                                          `Failed to cancel timer: ${String(err)}`,
+                                        ),
+                                    )
+                                    .finally(() => setTimerBusyId(null));
+                                }}
+                                className="text-muted-foreground/75 hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500 disabled:opacity-40"
+                              >
+                                <X className="size-3.5 stroke-[1.8]" />
+                              </button>
+                            </SimpleTooltip>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
         {/* Live Agent Heartbeats — Unified Hairline List */}
         {heartbeats.length > 0 && (
           <div className="space-y-2">
@@ -1012,6 +1301,132 @@ export function AutomationsView() {
           </div>
         )}
       </div>
+
+      {/* One-Shot Conditional Timer Dialog */}
+      <Dialog open={timerDialogOpen} onOpenChange={setTimerDialogOpen}>
+        <DialogContent className="max-w-[440px] gap-0 p-0">
+          <DialogHeader className="px-5 pt-5 pb-3">
+            <DialogTitle className="text-[15px]">New one-shot timer</DialogTitle>
+            <DialogDescription className="text-[12px]">
+              Wake an agent after a delay unless an early-cancel condition triggers first.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex flex-col gap-3.5 px-5 pb-4">
+            <label className="flex flex-col gap-1.5 text-[12px]">
+              <span className="text-muted-foreground font-medium">Agent</span>
+              <SettingSelect
+                value={timerAgentId}
+                onChange={setTimerAgentId}
+                options={activeAgentChoices.map((a) => ({
+                  value: a.agent_id,
+                  label: a.title || a.agent_id,
+                  description: shortWorkspaceName(a.cwd),
+                }))}
+                placeholder="Select agent"
+              />
+            </label>
+
+            <div className="flex flex-col gap-1.5 text-[12px]">
+              <span className="text-muted-foreground font-medium">Delay (seconds)</span>
+              <div className="flex items-center gap-1.5">
+                {[
+                  { label: "1m", secs: "60" },
+                  { label: "5m", secs: "300" },
+                  { label: "15m", secs: "900" },
+                  { label: "30m", secs: "1800" },
+                  { label: "1h", secs: "3600" },
+                ].map((preset) => (
+                  <button
+                    key={preset.secs}
+                    type="button"
+                    onClick={() => setTimerDurationSec(preset.secs)}
+                    className={cn(
+                      "h-[28px] cursor-pointer rounded-md border px-2 text-[11.5px] font-medium transition-colors",
+                      timerDurationSec === preset.secs
+                        ? "border-foreground/35 bg-accent text-foreground"
+                        : "border-border/75 text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+                <input
+                  type="number"
+                  min={1}
+                  max={86400}
+                  value={timerDurationSec}
+                  onChange={(e) => setTimerDurationSec(e.target.value)}
+                  className="border-border bg-canvas text-foreground focus:border-foreground/30 ml-auto h-[28px] w-[84px] rounded-md border px-2 font-mono text-[12px] outline-none"
+                />
+              </div>
+            </div>
+
+            <label className="flex flex-col gap-1.5 text-[12px]">
+              <span className="text-muted-foreground font-medium">Early-cancel condition</span>
+              <SettingSelect
+                value={timerConditionKind}
+                onChange={(val) => {
+                  setTimerConditionKind(val);
+                  setTimerConditionArg("");
+                }}
+                options={[
+                  { value: "any_message", label: "Any incoming message" },
+                  { value: "all_subagents_settled", label: "All subagents settled" },
+                  { value: "sender", label: "Message from specific sender" },
+                  { value: "file_changed", label: "Workspace file changed" },
+                  { value: "never", label: "Never (fixed timer)" },
+                ]}
+              />
+            </label>
+
+            {(timerConditionKind === "sender" || timerConditionKind === "file_changed") && (
+              <label className="flex flex-col gap-1.5 text-[12px]">
+                <span className="text-muted-foreground font-medium">
+                  {timerConditionKind === "sender" ? "Sender Agent ID" : "Relative Workspace Path"}
+                </span>
+                <input
+                  value={timerConditionArg}
+                  onChange={(e) => setTimerConditionArg(e.target.value)}
+                  placeholder={
+                    timerConditionKind === "sender" ? "e.g. ag_12345678" : "e.g. dist/build.log"
+                  }
+                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[34px] w-full rounded-lg border px-3 font-mono text-[12px] outline-none"
+                />
+              </label>
+            )}
+
+            <label className="flex flex-col gap-1.5 text-[12px]">
+              <span className="text-muted-foreground font-medium">Wakeup prompt</span>
+              <textarea
+                rows={3}
+                value={timerPrompt}
+                onChange={(e) => setTimerPrompt(e.target.value)}
+                placeholder="What should the agent check if this timer elapses?"
+                className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 w-full resize-none rounded-lg border px-3 py-2 text-[12.5px] outline-none"
+              />
+            </label>
+          </div>
+
+          <div className="border-border/70 flex items-center justify-end gap-2 border-t px-5 py-3">
+            <button
+              type="button"
+              onClick={() => setTimerDialogOpen(false)}
+              className="text-muted-foreground hover:text-foreground h-[30px] cursor-pointer rounded-lg px-3 text-[12.5px] font-medium transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={timerSubmitting}
+              onClick={() => void submitConditionalTimer()}
+              className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity disabled:opacity-40"
+            >
+              {timerSubmitting ? "Arming…" : "Arm timer"}
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Unified Create / Edit Automation Dialog */}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>

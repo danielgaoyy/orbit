@@ -11,9 +11,12 @@ import {
   FileDiff,
   FileText,
   MoreHorizontal,
+  Play,
   Square,
   SquareTerminal,
+  Timer,
   Unlink,
+  X,
   type LucideIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -37,8 +40,11 @@ import { SimpleTooltip } from "@/components/ui/overlays";
 import { Separator } from "@/components/ui/separator";
 import {
   type AgentCardView,
+  type ConditionalTimerRecord,
   type DiffFileView,
   type SessionInsightsView,
+  formatTimerConditionLabel,
+  formatTimerCountdown,
   isAgentBackgroundWaiting,
   isAgentForegroundRunning,
   orbitIpc,
@@ -94,6 +100,83 @@ function TaskElapsedLabel({ startedAtMs }: { startedAtMs: number }) {
     </span>
   );
 }
+
+const ArmedTimerRow = memo(function ArmedTimerRow({
+  hostId,
+  timer,
+  nowMs,
+}: {
+  hostId: string;
+  timer: ConditionalTimerRecord;
+  nowMs: number;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  const countdown = formatTimerCountdown(timer.fire_at_ms, nowMs);
+  const conditionLabel = formatTimerConditionLabel(timer.condition);
+
+  return (
+    <div
+      title={timer.prompt}
+      className="group/timerrow hover:bg-accent/65 flex h-[30px] w-full items-center justify-between gap-1.5 rounded-[8px] px-2 transition-colors"
+    >
+      <div className="flex min-w-0 items-center gap-1.5 text-[12px]">
+        <Timer className="text-amber-500/85 size-[13.5px] shrink-0 stroke-[1.8]" />
+        <span className="text-foreground/85 shrink-0 font-medium">Timer</span>
+        <span className="text-muted-foreground/60 shrink-0">·</span>
+        <span className="text-foreground/90 tabular-nums shrink-0 font-mono text-[11.5px]">
+          {countdown}
+        </span>
+        <span className="text-muted-foreground/60 shrink-0">·</span>
+        <span className="text-muted-foreground truncate text-[11.5px]">{conditionLabel}</span>
+      </div>
+      <div className="flex shrink-0 items-center gap-0.5">
+        <SimpleTooltip label="Run now">
+          <button
+            type="button"
+            disabled={busy}
+            aria-label="Run timer now"
+            onClick={() => {
+              if (busy) return;
+              setBusy(true);
+              void orbitActions.fireConditionalTimerNow(hostId, timer.timer_id).then(
+                () => orbitActions.showToast("Timer triggered"),
+                (err) => {
+                  setBusy(false);
+                  orbitActions.showToast(`Failed to trigger timer: ${String(err)}`);
+                },
+              );
+            }}
+            className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[5px] transition-colors disabled:opacity-40"
+          >
+            <Play className="size-[10.5px] fill-current" />
+          </button>
+        </SimpleTooltip>
+        <SimpleTooltip label="Cancel timer">
+          <button
+            type="button"
+            disabled={busy}
+            aria-label="Cancel timer"
+            onClick={() => {
+              if (busy) return;
+              setBusy(true);
+              void orbitActions.cancelConditionalTimer(hostId, timer.timer_id).then(
+                () => orbitActions.showToast("Timer canceled"),
+                (err) => {
+                  setBusy(false);
+                  orbitActions.showToast(`Failed to cancel timer: ${String(err)}`);
+                },
+              );
+            }}
+            className="text-muted-foreground hover:bg-rose-500/12 hover:text-rose-600 dark:hover:text-rose-400 inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[5px] transition-colors disabled:opacity-40"
+          >
+            <X className="size-[12px] stroke-[1.9]" />
+          </button>
+        </SimpleTooltip>
+      </div>
+    </div>
+  );
+});
 
 const OverviewActionRow = memo(function OverviewActionRow({
   icon: Icon,
@@ -342,6 +425,23 @@ const StageOverviewBody = memo(function StageOverviewBody({
     return openForHost.length + detachedCount;
   }, [terminalTabs, hostId, hostDetail?.terminals]);
 
+  const armedTimers = useMemo(
+    () =>
+      (hostDetail?.conditional_timers ?? []).filter(
+        (t) => t.agent_id === agentId && t.state === "armed",
+      ),
+    [hostDetail?.conditional_timers, agentId],
+  );
+  const hasArmedTimers = armedTimers.length > 0;
+  const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!hasArmedTimers) return;
+    setTimerNowMs(Date.now());
+    const id = window.setInterval(() => setTimerNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [hasArmedTimers]);
+
   const [showAllSubagents, setShowAllSubagents] = useState(false);
   const [showAllTasks, setShowAllTasks] = useState(false);
   const layer1Ref = useRef<HTMLDivElement | null>(null);
@@ -361,7 +461,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
     const ro = new ResizeObserver(syncHeight);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [showGroupNotesRow, cwd]);
+  }, [showGroupNotesRow, cwd, armedTimers.length]);
 
   useEffect(() => {
     setShowAllSubagents(false);
@@ -534,6 +634,28 @@ const StageOverviewBody = memo(function StageOverviewBody({
             />
           )}
         </div>
+        {hasArmedTimers && (
+          <div className="mt-1.5 max-h-[96px] space-y-0.5 overflow-y-auto border-t border-black/[0.058] pt-1.5 dark:border-white/[0.07]">
+            {armedTimers.slice(0, 2).map((timer) => (
+              <ArmedTimerRow
+                key={timer.timer_id}
+                hostId={hostId}
+                timer={timer}
+                nowMs={timerNowMs}
+              />
+            ))}
+            {armedTimers.length > 2 && (
+              <button
+                type="button"
+                onClick={() => orbitActions.openAutomations()}
+                className="text-muted-foreground hover:text-foreground hover:bg-accent/65 flex h-[24px] w-full cursor-pointer items-center justify-between rounded-[6px] px-2 text-[11px] font-medium transition-colors"
+              >
+                <span>+{armedTimers.length - 2} more timers</span>
+                <ArrowUpRight className="size-3 shrink-0" />
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Single outer scroll container for secondary sections (dynamically bounded by measured Layer 1 height) */}

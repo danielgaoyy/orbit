@@ -5,6 +5,7 @@
 pub mod artifacts;
 pub mod orchestration;
 pub mod search;
+pub mod timers;
 pub mod usage;
 pub mod workspace_sync;
 pub use artifacts::{
@@ -441,6 +442,7 @@ impl OrbitStore {
         }
         artifacts::migrate_artifacts_schema(&conn)?;
         usage::migrate_usage_schema(&conn)?;
+        timers::migrate_conditional_timers_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

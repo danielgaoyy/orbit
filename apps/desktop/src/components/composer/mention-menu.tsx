@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { MentionCandidateView } from "@/lib/orbit-ipc";
+import { symbolKindGlyph } from "@/lib/symbol-mentions";
 import { cn } from "@/lib/utils";
 
 const LOCKFILE_NAMES = new Set([
@@ -180,6 +181,8 @@ export function MentionMenu({
 
   if (items.length === 0) return null;
 
+  const firstSymbolIdx = items.findIndex((it) => it.kind === "code_symbol");
+
   return (
     <div className="bg-popover text-popover-foreground floating-surface orbit-inline-menu-up absolute right-0 bottom-full left-0 z-40 mb-2 overflow-hidden rounded-[14px] border border-black/[0.09] dark:border-white/[0.10]">
       <ScrollArea viewportRef={listRef} viewportClassName="max-h-64 p-1.5">
@@ -189,6 +192,70 @@ export function MentionMenu({
             "size-4 shrink-0 stroke-[1.75]",
             active ? "text-foreground" : "text-muted-foreground",
           );
+
+          if (item.kind === "code_symbol") {
+            const meta = symbolKindGlyph(item.symbol_kind ?? "symbol");
+            const showHeader = idx === firstSymbolIdx;
+            const locLabel =
+              item.file_path && item.start_line
+                ? `${item.file_path}:L${item.start_line}`
+                : item.subtitle;
+            return (
+              <div key={item.key}>
+                {showHeader && (
+                  <div
+                    className={cn(
+                      "text-muted-foreground/75 px-2.5 pt-1 pb-1 text-[10.5px] font-medium tracking-[0.04em] uppercase select-none",
+                      idx > 0 && "mt-1 border-t border-black/[0.06] pt-2 dark:border-white/[0.07]",
+                    )}
+                  >
+                    Symbols
+                  </div>
+                )}
+                <button
+                  type="button"
+                  data-mention-idx={idx}
+                  title={item.signature || `${item.title} — ${locLabel}`}
+                  onMouseEnter={() => onHoverIndex(idx)}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    onSelect(item);
+                  }}
+                  className={cn(
+                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors",
+                    active
+                      ? "bg-accent text-accent-foreground"
+                      : "text-foreground/90 hover:bg-accent/60",
+                  )}
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span
+                      aria-label={meta.label}
+                      className={cn(
+                        "inline-flex size-[18px] shrink-0 items-center justify-center rounded-[5px] font-mono text-[11px] font-semibold",
+                        active
+                          ? "bg-foreground/12 text-foreground"
+                          : "bg-muted text-muted-foreground dark:bg-white/[0.08]",
+                      )}
+                    >
+                      {meta.glyph}
+                    </span>
+                    <span className="shrink-0 font-mono text-[13px] font-medium">
+                      {item.title}
+                    </span>
+                    {item.container && (
+                      <span className="text-muted-foreground/80 shrink-0 font-mono text-[11px]">
+                        {item.container}
+                      </span>
+                    )}
+                  </div>
+                  <span className="text-muted-foreground truncate font-mono text-[11.5px]">
+                    {locLabel}
+                  </span>
+                </button>
+              </div>
+            );
+          }
 
           if (item.kind === "file") {
             const path = item.file_path || item.title;

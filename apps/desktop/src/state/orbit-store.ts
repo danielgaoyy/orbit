@@ -91,6 +91,7 @@ import {
   normalizeSemver,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import { containsInlineMentionToken, extractLineSnippet } from "@/lib/symbol-mentions";
 
 export interface HostDaemonUpgradeState {
   status: "upgrading" | "done" | "failed" | "skipped";
@@ -165,6 +166,18 @@ export type InlineMentionTarget =
       label: string;
       lineCount: number;
       content: string;
+    }
+  | {
+      token: string;
+      kind: "code_symbol";
+      path: string;
+      startLine: number;
+      endLine: number;
+      symbolName: string;
+      symbolKind: string;
+      signature?: string | null;
+      container?: string | null;
+      language: string;
     };
 
 export interface QueuedPromptItem {
@@ -214,6 +227,19 @@ export type ContextMentionItem =
     }
   | { id: string; kind: "git_diff"; staged: boolean; label: string }
   | { id: string; kind: "terminal_output"; label: string; lineCount: number; content: string }
+  | {
+      id: string;
+      kind: "code_symbol";
+      path: string;
+      startLine: number;
+      endLine: number;
+      symbolName: string;
+      symbolKind: string;
+      signature?: string | null;
+      container?: string | null;
+      language: string;
+      snippet?: string | null;
+    }
   | {
       id: string;
       kind: "image";
@@ -3777,7 +3803,18 @@ export const orbitActions = {
     const key = composerScopeKey(state);
     setState((s) => {
       const prev = s.inlineMentions[key] ?? [];
-      const filtered = prev.filter((m) => m.token !== target.token);
+      const filtered =
+        target.kind === "code_symbol"
+          ? prev.filter(
+              (m) =>
+                !(
+                  m.kind === "code_symbol" &&
+                  m.path === target.path &&
+                  m.symbolName === target.symbolName &&
+                  m.startLine === target.startLine
+                ),
+            )
+          : prev.filter((m) => m.token !== target.token);
       return {
         ...s,
         inlineMentions: {
@@ -4074,7 +4111,7 @@ export const orbitActions = {
     // Resolve any inline `@tokens` still present in `rawDraft` without showing attachment boxes
     const resolvedInlineContexts: ContextMentionItem[] = [];
     for (const m of registeredInline) {
-      if (!rawDraft.includes(m.token)) continue;
+      if (!containsInlineMentionToken(rawDraft, m.token)) continue;
       if (m.kind === "file") {
         resolvedInlineContexts.push({ id: `inl_${m.path}`, kind: "file", path: m.path });
       } else if (m.kind === "git_diff") {
@@ -4092,6 +4129,19 @@ export const orbitActions = {
           lineCount: m.lineCount,
           content: m.content,
         });
+      } else if (m.kind === "code_symbol") {
+        resolvedInlineContexts.push({
+          id: `inl_sym_${m.path}_${m.symbolName}_${m.startLine}`,
+          kind: "code_symbol",
+          path: m.path,
+          startLine: m.startLine,
+          endLine: m.endLine,
+          symbolName: m.symbolName,
+          symbolKind: m.symbolKind,
+          signature: m.signature ?? null,
+          container: m.container ?? null,
+          language: m.language,
+        });
       }
     }
 
@@ -4101,12 +4151,50 @@ export const orbitActions = {
         if (x.kind === "file" && rc.kind === "file") return x.path === rc.path;
         if (x.kind === "git_diff" && rc.kind === "git_diff") return x.staged === rc.staged;
         if (x.kind === "terminal_output" && rc.kind === "terminal_output") return true;
+        if (x.kind === "code_symbol" && rc.kind === "code_symbol") {
+          return (
+            x.path === rc.path &&
+            x.symbolName === rc.symbolName &&
+            x.startLine === rc.startLine
+          );
+        }
         return false;
       });
       if (!dup) mergedContexts.push(rc);
     }
 
     const cwd = submitTarget.workspaceCwd;
+
+    // Resolve line-numbered code snippets for any cited `@symbol` mentions (bounded & file-deduplicated)
+    const symbolContexts = mergedContexts.filter(
+      (c): c is Extract<ContextMentionItem, { kind: "code_symbol" }> =>
+        c.kind === "code_symbol" && !c.snippet,
+    );
+    const resolvedSymbolSnippets = new Map<string, string>();
+    if (symbolContexts.length > 0 && cwd && cwd !== "~") {
+      const uniquePaths = Array.from(new Set(symbolContexts.map((s) => s.path))).slice(0, 8);
+      const fileTextByPath = new Map<string, string>();
+      await Promise.all(
+        uniquePaths.map(async (relPath) => {
+          try {
+            const view = await orbitIpc.readWorkspaceFile(submitTarget.hostId, cwd, relPath);
+            if (view.content_kind === "text" && view.content) {
+              fileTextByPath.set(relPath, view.content);
+            }
+          } catch {
+            // Gracefully fall back to signature + path:lines metadata if file read fails
+          }
+        }),
+      );
+      for (const sym of symbolContexts) {
+        const text = fileTextByPath.get(sym.path);
+        if (!text) continue;
+        const snippet = extractLineSnippet(text, sym.startLine, sym.endLine, 6000);
+        if (snippet) {
+          resolvedSymbolSnippets.set(sym.id, snippet);
+        }
+      }
+    }
     const needsWorkingDiff =
       storedDirective === "review" ||
       (!storedDirective && /^\/review(?:\s|$)/i.test(rawDraft)) ||
@@ -4164,6 +4252,19 @@ export const orbitActions = {
             kind: "terminal_output",
             label: ctx.label,
             content: ctx.content,
+          };
+        case "code_symbol":
+          return {
+            kind: "code_symbol",
+            name: ctx.symbolName,
+            symbol_kind: ctx.symbolKind,
+            path: ctx.path,
+            start_line: ctx.startLine,
+            end_line: ctx.endLine,
+            signature: ctx.signature ?? null,
+            container: ctx.container ?? null,
+            language: ctx.language,
+            snippet: ctx.snippet ?? resolvedSymbolSnippets.get(ctx.id) ?? null,
           };
       }
     });

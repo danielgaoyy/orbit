@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { formatFileSizeCompact } from "@/lib/session-insights";
+import { symbolKindGlyph } from "@/lib/symbol-mentions";
 import {
   type ContextMentionItem,
   type DiffQuoteSnippet,
@@ -225,6 +226,32 @@ export const ContextTray = memo(function ContextTray({
             >
               <SquareTerminal className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
               <span className="font-medium">{item.label}</span>
+              <button
+                type="button"
+                onClick={() => orbitActions.removeContextMention(item.id)}
+                className="text-muted-foreground hover:text-foreground ml-0.5 cursor-pointer rounded-xs"
+              >
+                <X className="size-3" />
+              </button>
+            </span>
+          );
+        }
+
+        if (item.kind === "code_symbol") {
+          const glyphMeta = symbolKindGlyph(item.symbolKind);
+          return (
+            <span
+              key={item.id}
+              title={item.signature || `${item.symbolName} (${item.path}:L${item.startLine})`}
+              className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex max-w-68 items-center gap-1.5 rounded-lg border px-2 py-1 text-[12px]"
+            >
+              <span className="bg-background/80 text-muted-foreground inline-flex size-4 shrink-0 items-center justify-center rounded font-mono text-[10.5px] font-semibold">
+                {glyphMeta.glyph}
+              </span>
+              <span className="truncate font-mono font-medium">{item.symbolName}</span>
+              <span className="text-muted-foreground shrink-0 font-mono text-[11px]">
+                :L{item.startLine}
+              </span>
               <button
                 type="button"
                 onClick={() => orbitActions.removeContextMention(item.id)}

@@ -27,6 +27,10 @@ fn wire_default_true() -> bool {
     true
 }
 
+fn wire_default_symbol_limit() -> u32 {
+    30
+}
+
 /// First-class supported coding agent CLIs in Orbit (native drivers + Universal ACP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -805,6 +809,21 @@ pub struct WorkspaceFileConflict {
     pub current_mtime_unix_ms: Option<i64>,
 }
 
+/// Indexed workspace code symbol entry for `@symbol` fuzzy citation (pure-Rust fast index + optional LSP enrichment).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSymbolEntry {
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    pub language: String,
+}
+
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -983,6 +1002,20 @@ pub enum WireMessage {
         request_id: Uuid,
         cwd: String,
         files: Vec<String>,
+    },
+    SearchWorkspaceSymbols {
+        request_id: Uuid,
+        cwd: String,
+        query: String,
+        #[serde(default = "wire_default_symbol_limit")]
+        limit: u32,
+    },
+    WorkspaceSymbolsResponse {
+        request_id: Uuid,
+        cwd: String,
+        symbols: Vec<WorkspaceSymbolEntry>,
+        #[serde(default)]
+        truncated: bool,
     },
     ReadWorkspaceFile {
         request_id: Uuid,
@@ -2394,6 +2427,82 @@ mod tests {
                 assert_eq!(request_id, req_id);
                 assert_eq!(provider, ProviderKind::ClaudeCode);
                 assert_eq!(question, "Why did we use RwLock here?");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_symbols_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let search_req = WireMessage::SearchWorkspaceSymbols {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            query: "searchSym".into(),
+            limit: 25,
+        };
+        let encoded = search_req.encode_zstd(3).expect("encode symbol search");
+        match WireMessage::decode_zstd(&encoded).expect("decode symbol search") {
+            WireMessage::SearchWorkspaceSymbols {
+                request_id,
+                cwd,
+                query,
+                limit,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(cwd, "/workspace/orbit");
+                assert_eq!(query, "searchSym");
+                assert_eq!(limit, 25);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Backward-compatible default limit when omitted
+        let minimal_req = serde_json::json!({
+            "op": "search_workspace_symbols",
+            "request_id": req_id,
+            "cwd": "/workspace/orbit",
+            "query": "Foo"
+        });
+        match serde_json::from_value::<WireMessage>(minimal_req).expect("decode default limit") {
+            WireMessage::SearchWorkspaceSymbols { limit, .. } => assert_eq!(limit, 30),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let resp = WireMessage::WorkspaceSymbolsResponse {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            symbols: vec![WorkspaceSymbolEntry {
+                name: "search_workspace_symbols".into(),
+                kind: "fn".into(),
+                path: "crates/orbit-daemon/src/symbols.rs".into(),
+                start_line: 42,
+                end_line: 78,
+                signature: Some("pub async fn search_workspace_symbols(...)".into()),
+                container: Some("WorkspaceSymbolIndex".into()),
+                language: "rust".into(),
+            }],
+            truncated: true,
+        };
+        let z_resp = resp.encode_zstd(3).expect("encode symbol response");
+        match WireMessage::decode_zstd(&z_resp).expect("decode symbol response") {
+            WireMessage::WorkspaceSymbolsResponse {
+                request_id,
+                cwd,
+                symbols,
+                truncated,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(cwd, "/workspace/orbit");
+                assert!(truncated);
+                assert_eq!(symbols.len(), 1);
+                assert_eq!(symbols[0].name, "search_workspace_symbols");
+                assert_eq!(
+                    symbols[0].container.as_deref(),
+                    Some("WorkspaceSymbolIndex")
+                );
+                assert_eq!(symbols[0].start_line, 42);
+                assert_eq!(symbols[0].end_line, 78);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

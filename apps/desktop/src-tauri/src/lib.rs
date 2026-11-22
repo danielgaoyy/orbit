@@ -45,9 +45,9 @@ use orbit_client_core::contract::{
     InstructionFileSavedView, InstructionFilesSnapshotView, ListInstructionFilesRequest,
     MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest,
     ReadInstructionFileRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest,
-    RenderDiagramView, SaveInstructionFileRequest, SpawnWorkspacePeerRequest,
-    UpsertArtifactRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
-    WriteWorkspaceFileRequest,
+    RenderDiagramView, SaveInstructionFileRequest, SearchWorkspaceSymbolsRequest,
+    SpawnWorkspacePeerRequest, UpsertArtifactRequest, WorkspaceEntryMutationResultView,
+    WorkspaceFileWriteResultView, WorkspaceSymbolsView, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
@@ -1700,6 +1700,25 @@ async fn read_workspace_file(
 }
 
 #[tauri::command]
+async fn search_workspace_symbols(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    query: String,
+    limit: Option<u32>,
+) -> Result<WorkspaceSymbolsView, String> {
+    state
+        .core
+        .search_workspace_symbols_on_host(SearchWorkspaceSymbolsRequest {
+            host_id,
+            cwd,
+            query,
+            limit: limit.unwrap_or(30),
+        })
+        .await
+}
+
+#[tauri::command]
 async fn write_workspace_file(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -2666,6 +2685,7 @@ pub fn run() {
             save_exported_transcript,
             list_agent_code_blocks,
             get_workspace_files,
+            search_workspace_symbols,
             read_workspace_file,
             write_workspace_file,
             create_workspace_entry,

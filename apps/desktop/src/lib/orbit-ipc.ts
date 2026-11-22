@@ -1790,7 +1790,19 @@ export type ComposerContextInput =
   | { kind: "git_diff"; staged: boolean; label: string; diff_text?: string | null }
   | { kind: "terminal_output"; label: string; content: string }
   | { kind: "assistant_quote"; label: string; content: string }
-  | { kind: "workspace_peer"; handle: string; summary: string };
+  | { kind: "workspace_peer"; handle: string; summary: string }
+  | {
+      kind: "code_symbol";
+      name: string;
+      symbol_kind: string;
+      path: string;
+      start_line: number;
+      end_line: number;
+      signature?: string | null;
+      container?: string | null;
+      language: string;
+      snippet?: string | null;
+    };
 
 export interface ComposerQuoteInput {
   path: string;
@@ -1833,6 +1845,24 @@ export interface ComposedPromptView {
   is_empty: boolean;
 }
 
+export interface WorkspaceSymbolEntry {
+  name: string;
+  kind: string;
+  path: string;
+  start_line: number;
+  end_line: number;
+  signature?: string | null;
+  container?: string | null;
+  language: string;
+}
+
+export interface WorkspaceSymbolsView {
+  host_id: string;
+  cwd: string;
+  symbols: WorkspaceSymbolEntry[];
+  truncated: boolean;
+}
+
 export interface MentionCandidateView {
   key: string;
   kind: string;
@@ -1842,6 +1872,12 @@ export interface MentionCandidateView {
   file_path: string;
   git_status: string;
   score: number;
+  symbol_kind?: string;
+  start_line?: number;
+  end_line?: number;
+  signature?: string | null;
+  container?: string | null;
+  language?: string;
 }
 
 export interface MentionRankRequest {
@@ -3341,6 +3377,23 @@ export const orbitIpc = {
       };
     }
     return invoke<WorkspaceFileView>("read_workspace_file", { hostId, cwd, path });
+  },
+
+  async searchWorkspaceSymbols(
+    hostId: string,
+    cwd: string,
+    query: string,
+    limit = 30,
+  ): Promise<WorkspaceSymbolsView> {
+    if (!isTauriRuntime()) {
+      return { host_id: hostId, cwd, symbols: [], truncated: false };
+    }
+    return invoke<WorkspaceSymbolsView>("search_workspace_symbols", {
+      hostId,
+      cwd,
+      query,
+      limit,
+    });
   },
 
   writeWorkspaceFile: async (params: {

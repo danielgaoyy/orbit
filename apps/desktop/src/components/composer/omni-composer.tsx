@@ -43,6 +43,12 @@ import {
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import {
+  mergeMentionCandidates,
+  parseSymbolMentionQuery,
+  resolveDisambiguatedSymbolToken,
+  workspaceSymbolToMentionCandidate,
+} from "@/lib/symbol-mentions";
+import {
   type ClipboardImagePayload,
   type GitFileEntry,
   type ManagedSkillRecord,
@@ -66,6 +72,7 @@ import {
 import {
   type ContextMentionItem,
   type DiffQuoteSnippet,
+  type InlineMentionTarget,
   type PastedAttachment,
   type QueuedPromptItem,
   composerScopeKey,
@@ -85,6 +92,7 @@ const EMPTY_FILES: readonly string[] = [];
 const EMPTY_GIT_FILES: readonly GitFileEntry[] = [];
 const EMPTY_MENTIONS: MentionCandidateView[] = [];
 const EMPTY_MANAGED_SKILLS: readonly ManagedSkillRecord[] = [];
+const EMPTY_INLINE_MENTIONS: readonly InlineMentionTarget[] = [];
 
 const IMAGE_URI_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|svg|avif|ico)(?:[?#].*)?$/i;
 
@@ -228,6 +236,9 @@ export const OmniComposer = memo(function OmniComposer({
   );
   const contexts = useOrbitSelector(
     (s) => s.contextItems[composerScopeKey(s)] ?? EMPTY_CONTEXTS,
+  );
+  const inlineMentions = useOrbitSelector(
+    (s) => s.inlineMentions[composerScopeKey(s)] ?? EMPTY_INLINE_MENTIONS,
   );
   const pastes = useOrbitSelector(
     (s) => s.pastedAttachments[composerScopeKey(s)] ?? EMPTY_PASTES,
@@ -388,7 +399,9 @@ export const OmniComposer = memo(function OmniComposer({
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [rankedMentions, setRankedMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
+  const [symbolMentions, setSymbolMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
   const mentionReqSeqRef = useRef<number>(0);
+  const symbolReqSeqRef = useRef<number>(0);
 
   const activeMode: SessionMode = normalizePermissionMode(
     !isDraft && activeAgentMode ? activeAgentMode : draftMode,
@@ -513,8 +526,13 @@ export const OmniComposer = memo(function OmniComposer({
     return { atIndex, endIndex: safeOffset, query, tokenKey };
   }, [slashTrigger, draftText, cursorOffset, dismissedToken]);
 
+  const parsedSymbolTrigger = useMemo(
+    () => (mentionTrigger ? parseSymbolMentionQuery(mentionTrigger.query) : null),
+    [mentionTrigger],
+  );
+
   useEffect(() => {
-    if (!mentionTrigger || !selectedHostId) {
+    if (!mentionTrigger || !selectedHostId || parsedSymbolTrigger?.symbolOnly) {
       mentionReqSeqRef.current += 1;
       setRankedMentions(EMPTY_MENTIONS);
       return;
@@ -545,6 +563,7 @@ export const OmniComposer = memo(function OmniComposer({
       });
   }, [
     mentionTrigger,
+    parsedSymbolTrigger,
     selectedHostId,
     selectedCwd,
     workspaceFiles,
@@ -553,6 +572,67 @@ export const OmniComposer = memo(function OmniComposer({
     isDraft,
     selectedAgentId,
   ]);
+
+  // Immediately clear any cached symbol results when switching hosts, workspaces, or threads
+  useEffect(() => {
+    symbolReqSeqRef.current += 1;
+    setSymbolMentions(EMPTY_MENTIONS);
+  }, [selectedHostId, selectedCwd, scopeKey]);
+
+  // Debounced (`120ms`) workspace symbol fuzzy search with stale-response & unmount cancellation guard
+  useEffect(() => {
+    if (
+      !mentionTrigger ||
+      !parsedSymbolTrigger ||
+      !selectedHostId ||
+      !selectedCwd ||
+      selectedCwd === "~" ||
+      (!parsedSymbolTrigger.symbolOnly && parsedSymbolTrigger.query.length === 0)
+    ) {
+      symbolReqSeqRef.current += 1;
+      setSymbolMentions(EMPTY_MENTIONS);
+      return;
+    }
+
+    const reqId = symbolReqSeqRef.current + 1;
+    symbolReqSeqRef.current = reqId;
+    const hostId = selectedHostId;
+    const cwd = selectedCwd;
+    const query = parsedSymbolTrigger.query;
+    const limit = parsedSymbolTrigger.symbolOnly ? 20 : 8;
+
+    const timer = window.setTimeout(() => {
+      void orbitIpc
+        .searchWorkspaceSymbols(hostId, cwd, query, limit)
+        .then((res) => {
+          if (symbolReqSeqRef.current !== reqId) return;
+          const mapped = (res.symbols ?? []).map((entry, idx) =>
+            workspaceSymbolToMentionCandidate(entry, idx),
+          );
+          setSymbolMentions(mapped);
+        })
+        .catch(() => {
+          if (symbolReqSeqRef.current === reqId) {
+            setSymbolMentions(EMPTY_MENTIONS);
+          }
+        });
+    }, 120);
+
+    return () => {
+      symbolReqSeqRef.current += 1;
+      window.clearTimeout(timer);
+    };
+  }, [mentionTrigger, parsedSymbolTrigger, selectedHostId, selectedCwd]);
+
+  const combinedMentions = useMemo(() => {
+    if (!mentionTrigger) return EMPTY_MENTIONS;
+    return mergeMentionCandidates(
+      rankedMentions,
+      symbolMentions,
+      Boolean(parsedSymbolTrigger?.symbolOnly),
+      16,
+    );
+  }, [mentionTrigger, rankedMentions, symbolMentions, parsedSymbolTrigger]);
 
   const hasSubstantiveInput =
     draftText.trim().length > 0 ||
@@ -719,7 +799,33 @@ export const OmniComposer = memo(function OmniComposer({
       });
     };
 
-    if (candidate.kind === "file") {
+    if (candidate.kind === "code_symbol") {
+      const symbolName = candidate.title;
+      const startLine = candidate.start_line ?? 1;
+      const token = resolveDisambiguatedSymbolToken(
+        {
+          symbolName,
+          path: candidate.file_path,
+          startLine,
+          container: candidate.container ?? null,
+        },
+        inlineMentions,
+        draftText,
+      );
+      orbitActions.registerInlineMention({
+        token,
+        kind: "code_symbol",
+        path: candidate.file_path,
+        startLine,
+        endLine: candidate.end_line ?? startLine,
+        symbolName,
+        symbolKind: candidate.symbol_kind ?? "symbol",
+        signature: candidate.signature ?? null,
+        container: candidate.container ?? null,
+        language: candidate.language ?? "",
+      });
+      insertInlineToken(token);
+    } else if (candidate.kind === "file") {
       const filePath = candidate.file_path || candidate.title;
       const slashIdx = filePath.lastIndexOf("/");
       const basename = slashIdx >= 0 ? filePath.slice(slashIdx + 1) : filePath;
@@ -995,8 +1101,8 @@ export const OmniComposer = memo(function OmniComposer({
       return;
     }
 
-    if (mentionTrigger && rankedMentions.length > 0) {
-      const len = rankedMentions.length;
+    if (mentionTrigger && combinedMentions.length > 0) {
+      const len = combinedMentions.length;
       const safeIdx = Math.min(menuHighlightIdx, len - 1);
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -1010,7 +1116,7 @@ export const OmniComposer = memo(function OmniComposer({
       }
       if (e.key === "Enter" || e.key === "Tab") {
         e.preventDefault();
-        executeMentionSelect(rankedMentions[safeIdx]);
+        executeMentionSelect(combinedMentions[safeIdx]);
         return;
       }
       if (e.key === "Escape") {
@@ -1277,10 +1383,10 @@ export const OmniComposer = memo(function OmniComposer({
             />
           )}
 
-          {mentionTrigger && rankedMentions.length > 0 && (
+          {mentionTrigger && combinedMentions.length > 0 && (
             <MentionMenu
-              items={rankedMentions}
-              activeIndex={Math.min(menuHighlightIdx, rankedMentions.length - 1)}
+              items={combinedMentions}
+              activeIndex={Math.min(menuHighlightIdx, combinedMentions.length - 1)}
               onHoverIndex={setMenuHighlightIdx}
               onSelect={executeMentionSelect}
             />

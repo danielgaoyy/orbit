@@ -162,6 +162,29 @@ pub struct ReadWorkspaceFileRequest {
     pub path: String,
 }
 
+fn default_symbol_search_limit() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchWorkspaceSymbolsRequest {
+    pub host_id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default = "default_symbol_search_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSymbolsView {
+    pub host_id: String,
+    pub cwd: String,
+    pub symbols: Vec<orbit_protocol::WorkspaceSymbolEntry>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteWorkspaceFileRequest {
     pub host_id: String,

@@ -588,6 +588,9 @@ type PendingManagedSkillsListEntry = (
     tokio::sync::oneshot::Sender<Result<Vec<ManagedSkillRecord>, String>>,
 );
 
+type PendingSymbolSearchTx =
+    tokio::sync::oneshot::Sender<Result<(Vec<orbit_protocol::WorkspaceSymbolEntry>, bool), String>>;
+
 struct HostMemoryState {
     profile: SavedHostProfile,
     is_local: bool,
@@ -612,6 +615,7 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AttachmentStageAck, String>>>,
     pending_file_reads:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RawFileReadResponse, String>>>,
+    pending_symbol_searches: HashMap<Uuid, PendingSymbolSearchTx>,
     pending_file_writes:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorkspaceFileWriteResultView, String>>>,
     pending_file_mutations: HashMap<
@@ -737,6 +741,7 @@ impl HostMemoryState {
             pending_queue_reorders: HashMap::new(),
             pending_attachment_acks: HashMap::new(),
             pending_file_reads: HashMap::new(),
+            pending_symbol_searches: HashMap::new(),
             pending_file_writes: HashMap::new(),
             pending_file_mutations: HashMap::new(),
             pending_instruction_lists: HashMap::new(),
@@ -4869,6 +4874,16 @@ impl OrbitAppCore {
                     state.workspace_files.insert(cwd.clone(), files);
                     notify_git_cwd = Some(cwd);
                 }
+                WireMessage::WorkspaceSymbolsResponse {
+                    request_id,
+                    symbols,
+                    truncated,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_symbol_searches.remove(&request_id) {
+                        let _ = tx.send(Ok((symbols, truncated)));
+                    }
+                }
                 WireMessage::WorkspaceFileContentResponse {
                     request_id,
                     resolved_path,
@@ -5090,6 +5105,10 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_file_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_symbol_searches.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -10195,6 +10214,112 @@ impl OrbitAppCore {
             .map_err(|_| "file read task cancelled".to_string())?
     }
 
+    /// Fuzzy-search workspace code symbols on any connected local or remote Orbit host.
+    pub async fn search_workspace_symbols_on_host(
+        self: &Arc<Self>,
+        req: crate::contract::SearchWorkspaceSymbolsRequest,
+    ) -> Result<crate::contract::WorkspaceSymbolsView, String> {
+        let (session, is_local) = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            (h.session.clone(), h.is_local)
+        };
+
+        let Some(session) = session else {
+            return Ok(crate::contract::WorkspaceSymbolsView {
+                host_id: req.host_id,
+                cwd: req.cwd,
+                symbols: Vec::new(),
+                truncated: false,
+            });
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = req.host_id.clone();
+        let owned_cwd = req.cwd.clone();
+        let owned_query = req.query.clone();
+        let limit = if req.limit == 0 {
+            30
+        } else {
+            req.limit.min(100)
+        };
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_symbol_searches.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before searching symbols".to_string()),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let send_res = session
+                .send_wire(WireMessage::SearchWorkspaceSymbols {
+                    request_id: req_id,
+                    cwd: owned_cwd.clone(),
+                    query: owned_query,
+                    limit,
+                })
+                .await;
+
+            if let Err(e) = send_res {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_symbol_searches.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to request symbol search: {e}")));
+                return;
+            }
+
+            let timeout_secs = if is_local { 6 } else { 15 };
+            let outcome =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
+                    Ok(Ok(Ok((symbols, truncated)))) => Ok(crate::contract::WorkspaceSymbolsView {
+                        host_id: owned_host_id,
+                        cwd: owned_cwd,
+                        symbols,
+                        truncated,
+                    }),
+                    Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                    Ok(Err(_)) => Err("Host disconnected while searching symbols".to_string()),
+                    Err(_) => {
+                        if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&owned_host_id)
+                        {
+                            h.pending_symbol_searches.remove(&req_id);
+                        }
+                        Err("Timed out waiting for workspace symbol search".to_string())
+                    }
+                };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "symbol search task cancelled".to_string())?
+    }
+
     /// Atomically write UTF-8 content to a workspace file on any connected host with optimistic concurrency.
     pub async fn write_workspace_file_on_host(
         self: &Arc<Self>,
@@ -10569,6 +10694,14 @@ impl OrbitAppCore {
     ) -> Result<WorkspaceFileView, String> {
         self.runtime
             .block_on(self.read_workspace_file_on_host(host_id, cwd, path))
+    }
+
+    pub fn search_workspace_symbols_blocking(
+        self: &Arc<Self>,
+        req: crate::contract::SearchWorkspaceSymbolsRequest,
+    ) -> Result<crate::contract::WorkspaceSymbolsView, String> {
+        self.runtime
+            .block_on(self.search_workspace_symbols_on_host(req))
     }
 
     pub fn write_workspace_file_blocking(
@@ -11796,6 +11929,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_file_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_symbol_searches.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_file_writes.drain() {

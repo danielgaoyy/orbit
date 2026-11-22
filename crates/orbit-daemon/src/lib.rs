@@ -23,6 +23,7 @@ pub mod messaging;
 pub mod scheduler;
 pub mod skills;
 pub mod skills_manager;
+pub mod symbols;
 pub mod tools;
 pub mod workspace_board;
 pub mod workspace_cluster;
@@ -87,6 +88,7 @@ use crate::messaging::{
     AgentMessageDelivery, AgentPromptSource, DEFAULT_COALESCE_WINDOW, QueuedAgentMessage,
 };
 use crate::scheduler::ScheduleEngine;
+use crate::symbols::WorkspaceSymbolIndex;
 use crate::workspace_files::{
     canonicalize_workspace_root, create_workspace_entry, delete_workspace_entry,
     rename_workspace_entry, write_workspace_file,
@@ -213,6 +215,7 @@ pub struct DaemonRuntime {
     pub scheduler: Arc<ScheduleEngine>,
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
     pub keep_awake: Arc<KeepAwakeManager>,
+    pub symbol_index: Arc<WorkspaceSymbolIndex>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     catalog_refresh_lock: AsyncMutex<()>,
     upgrade_lock: AsyncMutex<()>,
@@ -341,6 +344,7 @@ impl DaemonRuntime {
             scheduler,
             idle_cleanup,
             keep_awake,
+            symbol_index: Arc::new(WorkspaceSymbolIndex::new()),
             provider_catalogs,
             catalog_refresh_lock: AsyncMutex::new(()),
             upgrade_lock: AsyncMutex::new(()),
@@ -1601,6 +1605,39 @@ async fn handle_wire_rpc(
             });
             None
         }
+        WireMessage::SearchWorkspaceSymbols {
+            request_id,
+            cwd,
+            query,
+            limit,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(authorized_cwd) => {
+                        match symbol_index
+                            .search(&authorized_cwd, &query, limit as usize)
+                            .await
+                        {
+                            Ok(res) => WireMessage::WorkspaceSymbolsResponse {
+                                request_id,
+                                cwd,
+                                symbols: res.symbols,
+                                truncated: res.truncated,
+                            },
+                            Err(e) => rpc_err(request_id, "search_symbols_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "search_symbols_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::ReadWorkspaceFile {
             request_id,
             cwd,
@@ -1652,6 +1689,7 @@ async fn handle_wire_rpc(
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
             tokio::spawn(async move {
                 let resolved_cwd = expand_host_path(&cwd);
                 let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
@@ -1664,15 +1702,20 @@ async fn handle_wire_rpc(
                     )
                     .await
                     {
-                        Ok(outcome) => WireMessage::WorkspaceFileWritten {
-                            request_id,
-                            cwd,
-                            path,
-                            etag: outcome.etag,
-                            size_bytes: outcome.size_bytes,
-                            mtime_unix_ms: outcome.mtime_unix_ms,
-                            conflict: outcome.conflict,
-                        },
+                        Ok(outcome) => {
+                            if outcome.conflict.is_none() {
+                                symbol_index.invalidate(&authorized_cwd);
+                            }
+                            WireMessage::WorkspaceFileWritten {
+                                request_id,
+                                cwd,
+                                path,
+                                etag: outcome.etag,
+                                size_bytes: outcome.size_bytes,
+                                mtime_unix_ms: outcome.mtime_unix_ms,
+                                conflict: outcome.conflict,
+                            }
+                        }
                         Err(e) => rpc_err(request_id, "write_file_failed", e),
                     },
                     Err(e) => rpc_err(request_id, "write_file_denied", e),
@@ -1691,6 +1734,7 @@ async fn handle_wire_rpc(
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
             tokio::spawn(async move {
                 let resolved_cwd = expand_host_path(&cwd);
                 let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
@@ -1702,13 +1746,16 @@ async fn handle_wire_rpc(
                     )
                     .await
                     {
-                        Ok(outcome) => WireMessage::WorkspaceEntryMutated {
-                            request_id,
-                            cwd,
-                            path: outcome.path,
-                            new_path: outcome.new_path,
-                            action: outcome.action,
-                        },
+                        Ok(outcome) => {
+                            symbol_index.invalidate(&authorized_cwd);
+                            WireMessage::WorkspaceEntryMutated {
+                                request_id,
+                                cwd,
+                                path: outcome.path,
+                                new_path: outcome.new_path,
+                                action: outcome.action,
+                            }
+                        }
                         Err(e) => rpc_err(request_id, "create_entry_failed", e),
                     },
                     Err(e) => rpc_err(request_id, "create_entry_denied", e),
@@ -1726,18 +1773,22 @@ async fn handle_wire_rpc(
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
             tokio::spawn(async move {
                 let resolved_cwd = expand_host_path(&cwd);
                 let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
                     Ok(authorized_cwd) => {
                         match rename_workspace_entry(&authorized_cwd, &old_path, &new_path).await {
-                            Ok(outcome) => WireMessage::WorkspaceEntryMutated {
-                                request_id,
-                                cwd,
-                                path: outcome.path,
-                                new_path: outcome.new_path,
-                                action: outcome.action,
-                            },
+                            Ok(outcome) => {
+                                symbol_index.invalidate(&authorized_cwd);
+                                WireMessage::WorkspaceEntryMutated {
+                                    request_id,
+                                    cwd,
+                                    path: outcome.path,
+                                    new_path: outcome.new_path,
+                                    action: outcome.action,
+                                }
+                            }
                             Err(e) => rpc_err(request_id, "rename_entry_failed", e),
                         }
                     }
@@ -1755,18 +1806,22 @@ async fn handle_wire_rpc(
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
             tokio::spawn(async move {
                 let resolved_cwd = expand_host_path(&cwd);
                 let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
                     Ok(authorized_cwd) => {
                         match delete_workspace_entry(&authorized_cwd, &path).await {
-                            Ok(outcome) => WireMessage::WorkspaceEntryMutated {
-                                request_id,
-                                cwd,
-                                path: outcome.path,
-                                new_path: outcome.new_path,
-                                action: outcome.action,
-                            },
+                            Ok(outcome) => {
+                                symbol_index.invalidate(&authorized_cwd);
+                                WireMessage::WorkspaceEntryMutated {
+                                    request_id,
+                                    cwd,
+                                    path: outcome.path,
+                                    new_path: outcome.new_path,
+                                    action: outcome.action,
+                                }
+                            }
                             Err(e) => rpc_err(request_id, "delete_entry_failed", e),
                         }
                     }
@@ -4145,6 +4200,52 @@ mod self_upgrade_tests {
         assert!(authorize_workspace_mutation_cwd_sync(&store, &unregistered).is_err());
         assert!(authorize_workspace_mutation_cwd_sync(&store, &registered.join(".git")).is_err());
         assert!(authorize_workspace_mutation_cwd_sync(&store, Path::new("/")).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn search_workspace_symbols_authorization_denies_unregistered_and_allows_registered() {
+        let root = std::env::temp_dir().join(format!("orbit_sym_auth_{}", Uuid::new_v4()));
+        let registered = root.join("repo_ok");
+        let unregistered = root.join("repo_unregistered");
+        std::fs::create_dir_all(&registered).expect("mkdir registered");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+        std::fs::write(registered.join("lib.rs"), "pub fn authorized_symbol() {}\n")
+            .expect("write lib.rs");
+        std::fs::write(
+            unregistered.join("secret.rs"),
+            "pub fn forbidden_symbol() {}\n",
+        )
+        .expect("write secret.rs");
+
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "repo_ok".into(),
+                name: "Repo OK".into(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert project");
+
+        let index = WorkspaceSymbolIndex::new();
+        assert!(
+            authorize_workspace_mutation_cwd(&store, &unregistered)
+                .await
+                .is_err()
+        );
+        let auth_dir = authorize_workspace_mutation_cwd(&store, &registered)
+            .await
+            .expect("registered project authorized");
+        let res = index
+            .search(&auth_dir, "authorized", 10)
+            .await
+            .expect("search authorized dir");
+        assert_eq!(res.symbols.len(), 1);
+        assert_eq!(res.symbols[0].name, "authorized_symbol");
 
         let _ = std::fs::remove_dir_all(&root);
     }

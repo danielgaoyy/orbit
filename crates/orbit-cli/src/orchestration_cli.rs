@@ -14,7 +14,8 @@ use orbit_client_core::{ClientInboundEvent, HostSessionHandle};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentProfile, AgentStatus, ForkTarget, McpToolPolicy, ProviderKind,
     ReasoningEffort, ScheduleKind, ScheduleNewAgentConfig, ScheduleTarget, SessionMode,
-    TimelinePayload, WireMessage, WorkspaceIsolation, WorktreeCreateMode,
+    TimelinePayload, WireMessage, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection,
+    WorktreeHandoffMode,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -168,6 +169,37 @@ pub enum WorkspaceAction {
     Archive { workspace_id: String },
     /// Unarchive a workspace.
     Unarchive { workspace_id: String },
+    /// Sync or move changes bidirectionally between a Git worktree and local checkout.
+    Handoff {
+        workspace_id: String,
+        /// Transfer changes from a worktree back to the local checkout.
+        #[arg(long = "to-local", conflicts_with = "to_worktree")]
+        to_local: bool,
+        /// Transfer local uncommitted changes into a new or existing worktree.
+        #[arg(long = "to-worktree", conflicts_with = "to_local")]
+        to_worktree: bool,
+        /// Copy/apply changes while keeping the source working tree intact (default).
+        #[arg(long, conflicts_with = "move_changes")]
+        apply: bool,
+        /// Apply changes and cleanly reset uncommitted source changes after verified success.
+        #[arg(long = "move", conflicts_with = "apply")]
+        move_changes: bool,
+        /// Preview diff statistics and conflicts without modifying any files on disk.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Optional branch name when creating a new worktree (`--to-worktree`).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Optional explicit target workspace ID.
+        #[arg(long = "target-workspace-id")]
+        target_workspace_id: Option<String>,
+        /// Only include uncommitted working-tree changes (exclude worktree commits).
+        #[arg(long = "no-commits")]
+        no_commits: bool,
+        /// Fall back to `git apply --3way` conflict markers when clean apply has conflicts.
+        #[arg(long = "allow-three-way-conflicts")]
+        allow_three_way_conflicts: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -431,7 +463,9 @@ fn matches_rpc_response(w: &WireMessage, req_id: Uuid) -> bool {
         | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
         | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
         | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
-        | WireMessage::ProviderSubagentsSnapshot { request_id, .. } => *request_id == req_id,
+        | WireMessage::ProviderSubagentsSnapshot { request_id, .. }
+        | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }
+        | WireMessage::WorktreeHandoffExecuted { request_id, .. } => *request_id == req_id,
         WireMessage::RpcError {
             request_id: Some(r),
             ..
@@ -928,6 +962,130 @@ pub async fn cmd_workspace(
                 &json!({ "ok": true, "workspace_id": workspace_id }),
                 &format!("[✓] Unarchived workspace `{workspace_id}`"),
             );
+        }
+        WorkspaceAction::Handoff {
+            workspace_id,
+            to_local,
+            to_worktree,
+            apply: _,
+            move_changes,
+            dry_run,
+            branch,
+            target_workspace_id,
+            no_commits,
+            allow_three_way_conflicts,
+        } => {
+            let direction = match (to_local, to_worktree) {
+                (true, false) => WorktreeHandoffDirection::WorktreeToLocal,
+                (false, true) => WorktreeHandoffDirection::LocalToWorktree,
+                _ => anyhow::bail!(
+                    "specify exactly one direction flag: `--to-local` or `--to-worktree`"
+                ),
+            };
+            let mode = if move_changes {
+                WorktreeHandoffMode::Move
+            } else {
+                WorktreeHandoffMode::Apply
+            };
+            let include_committed =
+                !no_commits && direction == WorktreeHandoffDirection::WorktreeToLocal;
+
+            if dry_run {
+                let req_id = Uuid::new_v4();
+                let resp = send_rpc(
+                    &client,
+                    req_id,
+                    WireMessage::PreviewWorktreeHandoff {
+                        request_id: req_id,
+                        workspace_id,
+                        direction,
+                        target_workspace_id,
+                        include_committed,
+                    },
+                    30,
+                )
+                .await?;
+                if let WireMessage::WorktreeHandoffPreviewResult { preview, .. } = resp {
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(&preview)?);
+                    } else {
+                        let src_label = preview
+                            .source_branch
+                            .as_deref()
+                            .unwrap_or(&preview.source_cwd);
+                        let tgt_label = preview
+                            .target_branch
+                            .as_deref()
+                            .unwrap_or(&preview.target_cwd);
+                        println!(
+                            "Handoff Preview: {} -> {} ({} file(s), +{} / -{})",
+                            src_label,
+                            tgt_label,
+                            preview.files.len(),
+                            preview.total_insertions,
+                            preview.total_deletions
+                        );
+                        if preview.commit_count > 0 {
+                            println!("  Commits ahead: {}", preview.commit_count);
+                        }
+                        for f in &preview.files {
+                            let marker = if f.has_conflict { " [CONFLICT]" } else { "" };
+                            println!(
+                                "  {:<2} {} (+{} / -{}){}",
+                                f.status, f.path, f.insertions, f.deletions, marker
+                            );
+                        }
+                        if let Some(ref w) = preview.warning {
+                            println!("  Warning: {w}");
+                        }
+                        println!(
+                            "  Status: {}",
+                            if preview.can_apply_cleanly {
+                                "clean"
+                            } else {
+                                "conflicts detected"
+                            }
+                        );
+                    }
+                }
+            } else {
+                let req_id = Uuid::new_v4();
+                let resp = send_rpc(
+                    &client,
+                    req_id,
+                    WireMessage::ExecuteWorktreeHandoff {
+                        request_id: req_id,
+                        workspace_id,
+                        direction,
+                        mode,
+                        target_workspace_id,
+                        include_committed,
+                        branch,
+                        allow_three_way_conflicts,
+                    },
+                    60,
+                )
+                .await?;
+                if let WireMessage::WorktreeHandoffExecuted { outcome, .. } = resp {
+                    let mut human = format!("[✓] {}", outcome.summary);
+                    if let Some(ref backup) = outcome.backup_ref {
+                        human.push_str(&format!("\n    Backup ref: {backup}"));
+                    }
+                    if let Some(ref ws) = outcome.target_workspace {
+                        human.push_str(&format!(
+                            "\n    Target workspace: {} ({})",
+                            ws.workspace_id, ws.cwd
+                        ));
+                    }
+                    if outcome.had_conflicts && !outcome.conflict_files.is_empty() {
+                        human.push_str(&format!(
+                            "\n    Conflicts: {}",
+                            outcome.conflict_files.join(", ")
+                        ));
+                    }
+                    print_out(json_mode, &serde_json::to_value(&outcome)?, &human);
+                }
+            }
         }
     }
     Ok(())
@@ -2278,5 +2436,48 @@ mod fork_rpc_tests {
         };
         assert!(matches_rpc_response(&msg, req_id));
         assert!(!matches_rpc_response(&msg, other_id));
+    }
+
+    #[test]
+    fn matches_rpc_response_accepts_worktree_handoff_replies() {
+        let req_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let preview_msg = WireMessage::WorktreeHandoffPreviewResult {
+            request_id: req_id,
+            preview: orbit_protocol::WorktreeHandoffPreview {
+                direction: WorktreeHandoffDirection::WorktreeToLocal,
+                source_cwd: "/tmp/wt".into(),
+                target_cwd: "/tmp/local".into(),
+                source_branch: Some("feat/a".into()),
+                target_branch: Some("main".into()),
+                commit_count: 1,
+                files: Vec::new(),
+                total_insertions: 0,
+                total_deletions: 0,
+                target_dirty: false,
+                conflicts: Vec::new(),
+                can_apply_cleanly: true,
+                warning: None,
+            },
+        };
+        assert!(matches_rpc_response(&preview_msg, req_id));
+        assert!(!matches_rpc_response(&preview_msg, other_id));
+
+        let exec_msg = WireMessage::WorktreeHandoffExecuted {
+            request_id: req_id,
+            outcome: orbit_protocol::WorktreeHandoffOutcome {
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                applied_files: 2,
+                backup_ref: Some("refs/orbit/handoff-backup/1-abcd".into()),
+                target_workspace: None,
+                target_cwd: "/tmp/wt-new".into(),
+                had_conflicts: false,
+                conflict_files: Vec::new(),
+                summary: "Moved 2 files to worktree".into(),
+            },
+        };
+        assert!(matches_rpc_response(&exec_msg, req_id));
+        assert!(!matches_rpc_response(&exec_msg, other_id));
     }
 }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   Archive,
+  ArrowLeftRight,
   CheckCircle2,
   Circle,
   Columns2,
@@ -289,6 +290,27 @@ export function SharedConversationMenu({
             <span className="flex items-center gap-2 whitespace-nowrap">
               <GitBranch className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
               <span>Fork in worktree</span>
+            </span>
+          </DropdownMenuItem>
+        )}
+
+        {activeWs?.is_worktree && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onClose();
+              orbitActions.openWorktreeHandoffDialog({
+                hostId: host.host_id,
+                workspaceId: activeWs.workspace_id,
+                direction: "worktree_to_local",
+                defaultMode: "apply",
+                sourceCwd: activeWs.cwd,
+              });
+            }}
+            className={COMPACT_MENU_ITEM_CLASS}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <ArrowLeftRight className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+              <span>Apply to Local…</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -944,8 +966,17 @@ export function SharedWorkspaceMenu({
   onClose: () => void;
   onStartRenameWorkspace: (workspaceId: string) => void;
 }) {
+  const wsSummary = useOrbitSelector((s) =>
+    target
+      ? (s.hostDetails[target.project.host_id]?.workspaces.find(
+          (w) => w.workspace_id === target.workspace.workspace_id,
+        ) ?? null)
+      : null,
+  );
   if (!target) return null;
   const { workspace: ws, project: proj, anchor } = target;
+  const isWorktreeWs = Boolean(wsSummary?.is_worktree);
+  const canHandoff = isWorktreeWs || Boolean(proj.is_git_repo);
   const siblingWorkspaces = (proj.workspaces ?? []).filter(
     (w) => w.workspace_id !== ws.workspace_id && w.is_curated !== false,
   );
@@ -1019,6 +1050,26 @@ export function SharedWorkspaceMenu({
             <span>Group notes</span>
           </span>
         </DropdownMenuItem>
+
+        {canHandoff && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onClose();
+              orbitActions.openWorktreeHandoffDialog({
+                hostId: proj.host_id,
+                workspaceId: ws.workspace_id,
+                direction: isWorktreeWs ? "worktree_to_local" : "local_to_worktree",
+                defaultMode: isWorktreeWs ? "apply" : "move",
+                sourceCwd: wsSummary?.cwd || ws.cwd || proj.primary_cwd,
+              });
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <ArrowLeftRight className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+              <span>{isWorktreeWs ? "Apply to Local…" : "Move to Worktree…"}</span>
+            </span>
+          </DropdownMenuItem>
+        )}
 
         {siblingWorkspaces.length > 0 && (
           <>

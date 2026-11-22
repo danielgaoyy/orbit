@@ -1,8 +1,10 @@
 //! Core wire types, state machines, timeline events, git/worktree models, orchestration models, and binary terminal framing.
 
 pub mod acp;
+pub mod handoff;
 pub mod orchestration;
 pub use acp::*;
+pub use handoff::*;
 pub use orchestration::*;
 
 use std::collections::HashMap;
@@ -1739,6 +1741,39 @@ pub enum WireMessage {
         registry_url: Option<String>,
     },
 
+    // Bidirectional Git Worktree <-> Local Handoff (Preview & Atomic Execution)
+    PreviewWorktreeHandoff {
+        request_id: Uuid,
+        workspace_id: String,
+        direction: WorktreeHandoffDirection,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_workspace_id: Option<String>,
+        #[serde(default = "wire_default_true")]
+        include_committed: bool,
+    },
+    WorktreeHandoffPreviewResult {
+        request_id: Uuid,
+        preview: WorktreeHandoffPreview,
+    },
+    ExecuteWorktreeHandoff {
+        request_id: Uuid,
+        workspace_id: String,
+        direction: WorktreeHandoffDirection,
+        mode: WorktreeHandoffMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_workspace_id: Option<String>,
+        #[serde(default = "wire_default_true")]
+        include_committed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default)]
+        allow_three_way_conflicts: bool,
+    },
+    WorktreeHandoffExecuted {
+        request_id: Uuid,
+        outcome: WorktreeHandoffOutcome,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -2608,5 +2643,77 @@ mod tests {
             "\"acp\""
         );
         assert_eq!(ProviderKind::Acp.display_name(), "ACP Agent");
+    }
+
+    #[test]
+    fn worktree_handoff_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let messages = vec![
+            WireMessage::PreviewWorktreeHandoff {
+                request_id: req_id,
+                workspace_id: "ws_wt".into(),
+                direction: WorktreeHandoffDirection::WorktreeToLocal,
+                target_workspace_id: None,
+                include_committed: true,
+            },
+            WireMessage::WorktreeHandoffPreviewResult {
+                request_id: req_id,
+                preview: WorktreeHandoffPreview {
+                    direction: WorktreeHandoffDirection::WorktreeToLocal,
+                    source_cwd: "/tmp/wt".into(),
+                    target_cwd: "/tmp/local".into(),
+                    source_branch: Some("feat/handoff".into()),
+                    target_branch: Some("main".into()),
+                    commit_count: 2,
+                    files: vec![HandoffFileChange {
+                        path: "src/lib.rs".into(),
+                        status: "M".into(),
+                        insertions: 12,
+                        deletions: 3,
+                        is_untracked: false,
+                        has_conflict: false,
+                    }],
+                    total_insertions: 12,
+                    total_deletions: 3,
+                    target_dirty: false,
+                    conflicts: Vec::new(),
+                    can_apply_cleanly: true,
+                    warning: None,
+                },
+            },
+            WireMessage::ExecuteWorktreeHandoff {
+                request_id: req_id,
+                workspace_id: "ws_local".into(),
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                target_workspace_id: None,
+                include_committed: false,
+                branch: Some("orbit/handoff-1".into()),
+                allow_three_way_conflicts: false,
+            },
+            WireMessage::WorktreeHandoffExecuted {
+                request_id: req_id,
+                outcome: WorktreeHandoffOutcome {
+                    direction: WorktreeHandoffDirection::LocalToWorktree,
+                    mode: WorktreeHandoffMode::Move,
+                    applied_files: 3,
+                    backup_ref: Some("refs/orbit/handoff-backup/123456-abcd1234".into()),
+                    target_workspace: None,
+                    target_cwd: "/tmp/wt-new".into(),
+                    had_conflicts: false,
+                    conflict_files: Vec::new(),
+                    summary: "Moved 3 files to worktree `orbit/handoff-1`".into(),
+                },
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode handoff wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode handoff wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
     }
 }

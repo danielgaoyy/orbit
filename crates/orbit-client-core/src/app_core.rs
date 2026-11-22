@@ -25,6 +25,7 @@ use orbit_protocol::{
     TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceBoardSnapshot,
     WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
     WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -41,7 +42,10 @@ use crate::cloud_sync::{
     save_sync_meta_to_store, save_sync_prefs_to_store, stored_host_from_synced,
     unlock_remote_vault_with_passphrase,
 };
-pub use crate::contract::{ConversationSearchHit, ForkAgentRequest, ForkAgentResultView};
+pub use crate::contract::{
+    ConversationSearchHit, ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
+    PreviewWorktreeHandoffRequest,
+};
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
 use crate::desktop_ops::{
@@ -549,6 +553,10 @@ struct HostMemoryState {
     pending_rewinds:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RewindAgentResultView, String>>>,
     pending_forks: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ForkAgentResultView, String>>>,
+    pending_handoff_previews:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorktreeHandoffPreview, String>>>,
+    pending_handoff_executes:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorktreeHandoffOutcome, String>>>,
     pending_daemon_upgrades: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<(), String>>>,
     pending_upgrade_terminals: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     pending_git_repo_inspections:
@@ -639,6 +647,8 @@ impl HostMemoryState {
             pending_side_questions: HashMap::new(),
             pending_rewinds: HashMap::new(),
             pending_forks: HashMap::new(),
+            pending_handoff_previews: HashMap::new(),
+            pending_handoff_executes: HashMap::new(),
             pending_daemon_upgrades: HashMap::new(),
             pending_upgrade_terminals: HashMap::new(),
             pending_git_repo_inspections: HashMap::new(),
@@ -3862,6 +3872,35 @@ impl OrbitAppCore {
                     notify_host = true;
                     push_notify_timeline(ag_id);
                 }
+                WireMessage::WorktreeHandoffPreviewResult {
+                    request_id,
+                    preview,
+                } => {
+                    if let Some(tx) = state.pending_handoff_previews.remove(&request_id) {
+                        let _ = tx.send(Ok(preview));
+                    }
+                }
+                WireMessage::WorktreeHandoffExecuted {
+                    request_id,
+                    outcome,
+                } => {
+                    if let Some(ref ws) = outcome.target_workspace {
+                        if let Some(slot) = state
+                            .workspaces
+                            .iter_mut()
+                            .find(|w| w.workspace_id == ws.workspace_id)
+                        {
+                            *slot = ws.clone();
+                        } else {
+                            state.workspaces.push(ws.clone());
+                        }
+                        notify_host = true;
+                        notify_fleet = true;
+                    }
+                    if let Some(tx) = state.pending_handoff_executes.remove(&request_id) {
+                        let _ = tx.send(Ok(outcome));
+                    }
+                }
                 WireMessage::AgentUpdated { mut agent } => {
                     reconcile_pending_queue_ops(state, &mut agent);
                     let ag_id = agent.agent_id.clone();
@@ -4509,6 +4548,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_forks.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_handoff_previews.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_handoff_executes.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -8191,6 +8238,181 @@ impl OrbitAppCore {
             .map_err(|_| "Fork task terminated unexpectedly".to_string())?
     }
 
+    /// Non-mutating dry-run preview of a bidirectional Worktree <-> Local handoff on `req.host_id`.
+    pub async fn preview_worktree_handoff_on_host(
+        self: &Arc<Self>,
+        req: PreviewWorktreeHandoffRequest,
+    ) -> Result<WorktreeHandoffPreview, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to preview worktree handoff".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = req.host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_handoff_previews.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before previewing handoff".to_string()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::PreviewWorktreeHandoff {
+                    request_id: req_id,
+                    workspace_id: req.workspace_id,
+                    direction: req.direction,
+                    target_workspace_id: req.target_workspace_id,
+                    include_committed: req.include_committed,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_handoff_previews.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send handoff preview request: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
+                Ok(Ok(Ok(preview))) => Ok(preview),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while previewing handoff".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_handoff_previews.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon handoff preview (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Handoff preview task terminated unexpectedly".to_string())?
+    }
+
+    /// Execute a backup-protected bidirectional Worktree <-> Local handoff on `req.host_id`.
+    pub async fn execute_worktree_handoff_on_host(
+        self: &Arc<Self>,
+        req: ExecuteWorktreeHandoffRequest,
+    ) -> Result<WorktreeHandoffOutcome, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to execute worktree handoff".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = req.host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_handoff_executes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before executing handoff".to_string()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::ExecuteWorktreeHandoff {
+                    request_id: req_id,
+                    workspace_id: req.workspace_id,
+                    direction: req.direction,
+                    mode: req.mode,
+                    target_workspace_id: req.target_workspace_id,
+                    include_committed: req.include_committed,
+                    branch: req.branch,
+                    allow_three_way_conflicts: req.allow_three_way_conflicts,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_handoff_executes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send handoff execute request: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(60), ack_rx).await {
+                Ok(Ok(Ok(result))) => Ok(result),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while executing handoff".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_handoff_executes.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon handoff execution (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Handoff execute task terminated unexpectedly".to_string())?
+    }
+
     /// Upgrade a remote Orbit daemon directly over the existing E2EE WebSocket/Relay channel
     /// (works even without SSH access!).
     ///
@@ -8659,6 +8881,22 @@ impl OrbitAppCore {
         req: ForkAgentRequest,
     ) -> Result<ForkAgentResultView, String> {
         self.runtime.block_on(self.fork_agent_on_host(req))
+    }
+
+    pub fn preview_worktree_handoff_blocking(
+        self: &Arc<Self>,
+        req: PreviewWorktreeHandoffRequest,
+    ) -> Result<WorktreeHandoffPreview, String> {
+        self.runtime
+            .block_on(self.preview_worktree_handoff_on_host(req))
+    }
+
+    pub fn execute_worktree_handoff_blocking(
+        self: &Arc<Self>,
+        req: ExecuteWorktreeHandoffRequest,
+    ) -> Result<WorktreeHandoffOutcome, String> {
+        self.runtime
+            .block_on(self.execute_worktree_handoff_on_host(req))
     }
 
     pub fn read_workspace_file_blocking(
@@ -9534,6 +9772,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_forks.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_handoff_previews.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_handoff_executes.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_git_repo_inspections.drain() {

@@ -32,8 +32,9 @@ function DialogTrigger({ asChild, render, children, nativeButton, ...props }: Di
 function DialogContent({
   className,
   children,
+  closeDisabled = false,
   ...props
-}: React.ComponentProps<typeof BaseDialog.Popup>) {
+}: React.ComponentProps<typeof BaseDialog.Popup> & { closeDisabled?: boolean }) {
   return (
     <BaseDialog.Portal>
       <BaseDialog.Backdrop className="orbit-dialog-overlay fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
@@ -46,7 +47,10 @@ function DialogContent({
         {...props}
       >
         {children}
-        <BaseDialog.Close className="text-muted-foreground hover:text-foreground absolute top-4 right-4 cursor-pointer rounded-md opacity-70 transition-opacity hover:opacity-100">
+        <BaseDialog.Close
+          disabled={closeDisabled}
+          className="text-muted-foreground hover:text-foreground absolute top-4 right-4 cursor-pointer rounded-md opacity-70 transition-opacity hover:opacity-100 disabled:pointer-events-none disabled:opacity-30"
+        >
           <X className="h-[16px] w-[16px]" />
           <span className="sr-only">Close</span>
         </BaseDialog.Close>

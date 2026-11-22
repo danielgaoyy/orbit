@@ -5,7 +5,7 @@
 
 use orbit_protocol::{
     AcpAgentAvailability, ForkTarget, NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort,
-    SessionMode, WorkspaceSummary,
+    SessionMode, WorkspaceSummary, WorktreeHandoffDirection, WorktreeHandoffMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -234,4 +234,35 @@ pub struct SpawnWorkspacePeerRequest {
     pub handle: Option<String>,
     #[serde(default)]
     pub profile_id: Option<String>,
+}
+
+fn default_include_committed_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewWorktreeHandoffRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub direction: WorktreeHandoffDirection,
+    #[serde(default)]
+    pub target_workspace_id: Option<String>,
+    #[serde(default = "default_include_committed_true")]
+    pub include_committed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteWorktreeHandoffRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub direction: WorktreeHandoffDirection,
+    pub mode: WorktreeHandoffMode,
+    #[serde(default)]
+    pub target_workspace_id: Option<String>,
+    #[serde(default = "default_include_committed_true")]
+    pub include_committed: bool,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub allow_three_way_conflicts: bool,
 }

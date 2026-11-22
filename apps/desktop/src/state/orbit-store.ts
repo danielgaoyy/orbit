@@ -63,6 +63,8 @@ import {
   type SlashDirective,
   type SpawnWorkspacePeerRequest,
   type SshHostItem,
+  type WorktreeHandoffDirection,
+  type WorktreeHandoffMode,
   type WorkspaceFileView,
   isAgentBackgroundWaiting,
   isAgentForegroundRunning,
@@ -336,6 +338,15 @@ export interface PendingJumpTarget {
   nonce: number;
 }
 
+export interface WorktreeHandoffDialogTarget {
+  hostId: string;
+  workspaceId: string;
+  direction: WorktreeHandoffDirection;
+  defaultMode?: WorktreeHandoffMode;
+  sourceCwd?: string;
+  targetWorkspaceId?: string | null;
+}
+
 export interface OrbitUiState {
   fleet: FleetOverviewView;
   fleetHydrated: boolean;
@@ -442,6 +453,7 @@ export interface OrbitUiState {
     agentId: string;
     blocks: ExtractedCodeBlock[];
   } | null;
+  handoffDialogTarget: WorktreeHandoffDialogTarget | null;
   sshHosts: SshHostItem[];
   externalEditors: ExternalEditorInfo[];
   toastNotice: string | null;
@@ -800,6 +812,7 @@ const defaultInitialState: OrbitUiState = {
   remoteFolderPickerHostId: null,
   exportDialogTarget: null,
   copyCodeBlocksTarget: null,
+  handoffDialogTarget: null,
   sshHosts: [],
   externalEditors: [],
   toastNotice: null,
@@ -4278,6 +4291,17 @@ export const orbitActions = {
 
   closeExportDialog(): void {
     setState((s) => (s.exportDialogTarget ? { ...s, exportDialogTarget: null } : s));
+  },
+
+  openWorktreeHandoffDialog(target: WorktreeHandoffDialogTarget): void {
+    setState((s) => ({
+      ...s,
+      handoffDialogTarget: target,
+    }));
+  },
+
+  closeWorktreeHandoffDialog(): void {
+    setState((s) => (s.handoffDialogTarget ? { ...s, handoffDialogTarget: null } : s));
   },
 
   async openCopyCodeBlocksModal(hostId: string, agentId: string): Promise<void> {

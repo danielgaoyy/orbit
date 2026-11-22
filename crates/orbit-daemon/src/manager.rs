@@ -16,7 +16,8 @@ use orbit_protocol::{
     TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceEventKind,
     WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
     WorkspaceScriptKind, WorkspaceScriptStatus, WorkspaceSetupProgress, WorkspaceSetupStatus,
-    WorkspaceSummary, WorktreeCreateMode,
+    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffDirection, WorktreeHandoffMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, SessionLaunchConfig,
@@ -49,6 +50,11 @@ use crate::workspace_runtime::{
     run_worktree_setup_hooks, teardown_and_remove_worktree, validate_git_base_ref,
     validate_git_branch_name,
 };
+use crate::worktree_handoff::{
+    HandoffExecutePathsSpec, HandoffPreviewPathsSpec, execute_worktree_handoff_paths,
+    force_delete_git_branch, preflight_validate_source_safety, preview_worktree_handoff_paths,
+    resolve_git_checkout_info, validate_handoff_branch_name,
+};
 use crate::worktree_pool::WorktreePool;
 
 #[derive(Debug, Clone)]
@@ -73,6 +79,24 @@ pub struct ForkAgentSpec {
 pub struct ForkAgentOutcome {
     pub agent: AgentSummary,
     pub workspace: Option<WorkspaceSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecuteWorktreeHandoffSpec {
+    pub workspace_id: String,
+    pub direction: WorktreeHandoffDirection,
+    pub mode: WorktreeHandoffMode,
+    pub target_workspace_id: Option<String>,
+    pub include_committed: bool,
+    pub branch: Option<String>,
+    pub allow_three_way_conflicts: bool,
+}
+
+struct DeferredWorktreeSetup {
+    workspace_id: String,
+    source_cwd: PathBuf,
+    worktree_cwd: PathBuf,
+    branch_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -617,6 +641,15 @@ impl AgentOrchestrator {
         &self,
         spec: CreateWorkspaceSpec,
     ) -> anyhow::Result<WorkspaceSummary> {
+        let (ws, _) = self.create_workspace_v2_inner(spec, false).await?;
+        Ok(ws)
+    }
+
+    async fn create_workspace_v2_inner(
+        &self,
+        spec: CreateWorkspaceSpec,
+        defer_setup: bool,
+    ) -> anyhow::Result<(WorkspaceSummary, Option<DeferredWorktreeSetup>)> {
         let src_path = crate::expand_host_path(&spec.source_cwd);
         let use_worktree =
             spec.isolation == WorkspaceIsolation::Worktree || spec.worktree_branch.is_some();
@@ -649,7 +682,7 @@ impl AgentOrchestrator {
             && spec.allow_reuse_existing
             && let Ok(Some(existing)) = self.store.find_workspace_by_cwd(&cwd_str)
         {
-            return Ok(existing);
+            return Ok((existing, None));
         }
 
         let git_stat = inspect_git_status(&final_path).await;
@@ -699,7 +732,7 @@ impl AgentOrchestrator {
             parent_workspace_id: spec.parent_workspace_id,
             archived_at: None,
             background: spec.background,
-            setup_status: if has_setup {
+            setup_status: if has_setup && !defer_setup {
                 WorkspaceSetupStatus::Running
             } else {
                 WorkspaceSetupStatus::Idle
@@ -740,38 +773,60 @@ impl AgentOrchestrator {
             .broadcast_tx
             .send(DaemonBroadcast::WorkspaceUpdated(ws.clone()));
 
-        // Execute `worktree.setup` asynchronously so workspace readiness publishes immediately
-        if has_setup {
-            let store_bg = Arc::clone(&self.store);
-            let bcast_bg = self.broadcast_tx.clone();
-            let ws_id = ws.workspace_id.clone();
-            let src_bg = src_path;
-            let wt_bg = final_path;
-            let br_bg = branch_final;
-            tokio::spawn(async move {
-                let res = run_worktree_setup_hooks(
-                    &ws_id,
-                    &src_bg,
-                    &wt_bg,
-                    br_bg.as_deref(),
-                    |progress| {
-                        let _ = bcast_bg.send(DaemonBroadcast::WorkspaceSetupProgress(progress));
-                    },
-                )
-                .await;
-                let final_status = if res.is_ok() {
-                    WorkspaceSetupStatus::Succeeded
-                } else {
-                    WorkspaceSetupStatus::Failed
-                };
-                let _ = store_bg.set_workspace_setup_status(&ws_id, final_status);
-                if let Ok(Some(updated_ws)) = store_bg.get_workspace(&ws_id) {
-                    let _ = bcast_bg.send(DaemonBroadcast::WorkspaceUpdated(updated_ws));
-                }
-            });
-        }
+        let deferred = if has_setup {
+            let hook = DeferredWorktreeSetup {
+                workspace_id: ws.workspace_id.clone(),
+                source_cwd: src_path,
+                worktree_cwd: final_path,
+                branch_name: branch_final,
+            };
+            if defer_setup {
+                Some(hook)
+            } else {
+                self.spawn_deferred_worktree_setup(hook, false);
+                None
+            }
+        } else {
+            None
+        };
 
-        Ok(ws)
+        Ok((ws, deferred))
+    }
+
+    fn spawn_deferred_worktree_setup(&self, hook: DeferredWorktreeSetup, mark_running: bool) {
+        if mark_running {
+            let _ = self
+                .store
+                .set_workspace_setup_status(&hook.workspace_id, WorkspaceSetupStatus::Running);
+            if let Ok(Some(updated_ws)) = self.store.get_workspace(&hook.workspace_id) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceUpdated(updated_ws));
+            }
+        }
+        let store_bg = Arc::clone(&self.store);
+        let bcast_bg = self.broadcast_tx.clone();
+        tokio::spawn(async move {
+            let res = run_worktree_setup_hooks(
+                &hook.workspace_id,
+                &hook.source_cwd,
+                &hook.worktree_cwd,
+                hook.branch_name.as_deref(),
+                |progress| {
+                    let _ = bcast_bg.send(DaemonBroadcast::WorkspaceSetupProgress(progress));
+                },
+            )
+            .await;
+            let final_status = if res.is_ok() {
+                WorkspaceSetupStatus::Succeeded
+            } else {
+                WorkspaceSetupStatus::Failed
+            };
+            let _ = store_bg.set_workspace_setup_status(&hook.workspace_id, final_status);
+            if let Ok(Some(updated_ws)) = store_bg.get_workspace(&hook.workspace_id) {
+                let _ = bcast_bg.send(DaemonBroadcast::WorkspaceUpdated(updated_ws));
+            }
+        });
     }
 
     pub async fn rename_workspace(
@@ -788,6 +843,210 @@ impl AgentOrchestrator {
             .broadcast_tx
             .send(DaemonBroadcast::WorkspaceUpdated(ws.clone()));
         Ok(ws)
+    }
+
+    /// Preview a bidirectional Git Worktree <-> Local checkout handoff without mutating disk.
+    pub async fn preview_worktree_handoff(
+        &self,
+        workspace_id: &str,
+        direction: WorktreeHandoffDirection,
+        target_workspace_id: Option<&str>,
+        include_committed: bool,
+    ) -> anyhow::Result<WorktreeHandoffPreview> {
+        let source_ws = self
+            .store
+            .get_workspace(workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace `{workspace_id}` not found"))?;
+        let source_cwd = crate::expand_host_path(&source_ws.cwd);
+
+        let target_cwd =
+            if let Some(tid) = target_workspace_id.map(str::trim).filter(|s| !s.is_empty()) {
+                let target_ws = self
+                    .store
+                    .get_workspace(tid)?
+                    .ok_or_else(|| anyhow::anyhow!("target workspace `{tid}` not found"))?;
+                Some(crate::expand_host_path(&target_ws.cwd))
+            } else if direction == WorktreeHandoffDirection::WorktreeToLocal {
+                if let Some(candidate) = source_ws
+                    .source_cwd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(crate::expand_host_path)
+                    .filter(|p| *p != source_cwd)
+                    && tokio::fs::try_exists(&candidate).await.unwrap_or(false)
+                {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        preview_worktree_handoff_paths(HandoffPreviewPathsSpec {
+            source_cwd,
+            target_cwd,
+            direction,
+            include_committed,
+            base_ref: source_ws.base_ref.clone(),
+        })
+        .await
+    }
+
+    /// Execute a backup-protected bidirectional Git Worktree <-> Local checkout handoff.
+    pub async fn execute_worktree_handoff(
+        self: &Arc<Self>,
+        spec: ExecuteWorktreeHandoffSpec,
+    ) -> anyhow::Result<WorktreeHandoffOutcome> {
+        let source_ws = self
+            .store
+            .get_workspace(&spec.workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace `{}` not found", spec.workspace_id))?;
+        let source_cwd = crate::expand_host_path(&source_ws.cwd);
+
+        match spec.direction {
+            WorktreeHandoffDirection::WorktreeToLocal => {
+                let target_cwd = if let Some(tid) = spec
+                    .target_workspace_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let target_ws = self
+                        .store
+                        .get_workspace(tid)?
+                        .ok_or_else(|| anyhow::anyhow!("target workspace `{tid}` not found"))?;
+                    crate::expand_host_path(&target_ws.cwd)
+                } else if let Some(src_dir) = source_ws
+                    .source_cwd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(crate::expand_host_path)
+                    .filter(|p| *p != source_cwd)
+                    && tokio::fs::try_exists(&src_dir).await.unwrap_or(false)
+                {
+                    src_dir
+                } else {
+                    crate::worktree_handoff::resolve_primary_local_checkout(&source_cwd).await?
+                };
+
+                execute_worktree_handoff_paths(HandoffExecutePathsSpec {
+                    source_cwd,
+                    target_cwd,
+                    direction: WorktreeHandoffDirection::WorktreeToLocal,
+                    mode: spec.mode,
+                    include_committed: spec.include_committed,
+                    base_ref: source_ws.base_ref.clone(),
+                    allow_three_way_conflicts: spec.allow_three_way_conflicts,
+                    target_workspace: None,
+                    backup_source_as_primary: false,
+                })
+                .await
+            }
+            WorktreeHandoffDirection::LocalToWorktree => {
+                if let Some(tid) = spec
+                    .target_workspace_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let target_ws = self
+                        .store
+                        .get_workspace(tid)?
+                        .ok_or_else(|| anyhow::anyhow!("target workspace `{tid}` not found"))?;
+                    let target_cwd = crate::expand_host_path(&target_ws.cwd);
+                    return execute_worktree_handoff_paths(HandoffExecutePathsSpec {
+                        source_cwd,
+                        target_cwd,
+                        direction: WorktreeHandoffDirection::LocalToWorktree,
+                        mode: spec.mode,
+                        include_committed: false,
+                        base_ref: None,
+                        allow_three_way_conflicts: spec.allow_three_way_conflicts,
+                        target_workspace: Some(target_ws),
+                        backup_source_as_primary: false,
+                    })
+                    .await;
+                }
+
+                // Provision a fresh isolated worktree off current local HEAD.
+                // Validate branch & tracked/untracked symlinks BEFORE provisioning the worktree!
+                let source_info = resolve_git_checkout_info(&source_cwd).await?;
+                let validated_branch = match spec
+                    .branch
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(b) => Some(validate_handoff_branch_name(&source_info.toplevel, b).await?),
+                    None => None,
+                };
+                preflight_validate_source_safety(&source_info.toplevel).await?;
+
+                let project_root = source_ws
+                    .project_root
+                    .clone()
+                    .or_else(|| Some(source_info.toplevel.to_string_lossy().to_string()));
+                let (new_ws, deferred_setup) = self
+                    .create_workspace_v2_inner(
+                        CreateWorkspaceSpec {
+                            source_cwd: source_info.toplevel.to_string_lossy().to_string(),
+                            title: validated_branch.clone(),
+                            worktree_branch: validated_branch,
+                            base_ref: source_info.head_oid.clone(),
+                            isolation: WorkspaceIsolation::Worktree,
+                            worktree_mode: WorktreeCreateMode::BranchOff,
+                            pr_number: None,
+                            parent_workspace_id: Some(source_ws.workspace_id.clone()),
+                            background: source_ws.background,
+                            project_root,
+                            mission_goal: None,
+                            allow_reuse_existing: false,
+                            is_curated: false,
+                        },
+                        true,
+                    )
+                    .await?;
+                let new_ws_id = new_ws.workspace_id.clone();
+                let new_ws_branch = new_ws.git_branch.clone();
+                let target_cwd = crate::expand_host_path(&new_ws.cwd);
+
+                let exec_res = execute_worktree_handoff_paths(HandoffExecutePathsSpec {
+                    source_cwd: source_info.toplevel.clone(),
+                    target_cwd,
+                    direction: WorktreeHandoffDirection::LocalToWorktree,
+                    mode: spec.mode,
+                    include_committed: false,
+                    base_ref: None,
+                    allow_three_way_conflicts: spec.allow_three_way_conflicts,
+                    target_workspace: Some(new_ws),
+                    backup_source_as_primary: true,
+                })
+                .await;
+
+                match exec_res {
+                    Ok(mut outcome) => {
+                        if let Some(hook) = deferred_setup {
+                            self.spawn_deferred_worktree_setup(hook, true);
+                            if let Some(ref mut ws_out) = outcome.target_workspace {
+                                ws_out.setup_status = WorkspaceSetupStatus::Running;
+                            }
+                        }
+                        Ok(outcome)
+                    }
+                    Err(err) => {
+                        // Roll back the orphaned workspace, worktree directory, and newly generated branch
+                        let _ = self.archive_workspace(&new_ws_id).await;
+                        if let Some(ref br) = new_ws_branch {
+                            force_delete_git_branch(&source_info.toplevel, br).await;
+                        }
+                        Err(err)
+                    }
+                }
+            }
+        }
     }
 
     pub async fn archive_workspace(self: &Arc<Self>, workspace_id: &str) -> anyhow::Result<()> {
@@ -6048,5 +6307,241 @@ mod fast_mode_orchestrator_tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_local_to_worktree_handoff_creates_worktree_moves_changes_and_cleans_local()
+     {
+        let root = std::env::temp_dir().join(format!("orbit_mgr_handoff_{}", Uuid::new_v4()));
+        let repo_dir = root.join("demo-repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "test@orbit.local"],
+            vec!["config", "user.name", "Orbit Test"],
+        ] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git init/config");
+            assert!(st.success());
+        }
+        std::fs::write(repo_dir.join("main.rs"), "fn main() {}\n").expect("write main.rs");
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "init"]] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git commit");
+            assert!(st.success());
+        }
+
+        let (home_dir, _store, orch) = test_orchestrator("handoff").await;
+        let local_ws = orch
+            .ensure_workspace(repo_dir.to_str().expect("utf8"), None, None, None)
+            .await
+            .expect("ensure local workspace");
+
+        // Create staged + unstaged + untracked edits in local checkout
+        std::fs::write(
+            repo_dir.join("main.rs"),
+            "fn main() { println!(\"moved\"); }\n",
+        )
+        .expect("edit main");
+        let st_add = tokio::process::Command::new("git")
+            .args(["add", "main.rs"])
+            .current_dir(&repo_dir)
+            .status()
+            .await
+            .expect("git add");
+        assert!(st_add.success());
+        std::fs::write(repo_dir.join("extra.txt"), "untracked-note\n").expect("write extra");
+
+        // Preview Local -> New worktree
+        let preview = orch
+            .preview_worktree_handoff(
+                &local_ws.workspace_id,
+                WorktreeHandoffDirection::LocalToWorktree,
+                None,
+                false,
+            )
+            .await
+            .expect("preview");
+        assert!(preview.can_apply_cleanly);
+        assert_eq!(preview.files.len(), 2);
+
+        // Reject flag-injection branch name upfront
+        let bad = orch
+            .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                workspace_id: local_ws.workspace_id.clone(),
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                target_workspace_id: None,
+                include_committed: false,
+                branch: Some("--bad-branch".into()),
+                allow_three_way_conflicts: false,
+            })
+            .await;
+        assert!(bad.is_err());
+
+        // Execute Local -> New worktree Move
+        let outcome = orch
+            .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                workspace_id: local_ws.workspace_id.clone(),
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                target_workspace_id: None,
+                include_committed: false,
+                branch: Some("feat/from-local".into()),
+                allow_three_way_conflicts: false,
+            })
+            .await
+            .expect("execute move to new worktree");
+
+        assert_eq!(outcome.applied_files, 2);
+        assert!(outcome.backup_ref.is_some());
+        let new_ws = outcome.target_workspace.expect("created target workspace");
+        assert!(new_ws.is_worktree);
+        assert_eq!(new_ws.git_branch.as_deref(), Some("feat/from-local"));
+
+        // Verify new worktree has both files
+        let wt_path = PathBuf::from(&new_ws.cwd);
+        assert_eq!(
+            std::fs::read_to_string(wt_path.join("main.rs")).expect("wt main"),
+            "fn main() { println!(\"moved\"); }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt_path.join("extra.txt")).expect("wt extra"),
+            "untracked-note\n"
+        );
+
+        // Verify local checkout is clean
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.join("main.rs")).expect("local main"),
+            "fn main() {}\n"
+        );
+        assert!(!repo_dir.join("extra.txt").exists());
+        let status = inspect_git_status(&repo_dir).await;
+        assert!(status.files.is_empty(), "local checkout must be clean");
+
+        orch.shutdown_worktree_pool().await;
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_local_to_worktree_failure_rolls_back_worktree_and_branch() {
+        let root = std::env::temp_dir().join(format!("orbit_mgr_handoff_rb_{}", Uuid::new_v4()));
+        let repo_dir = root.join("demo-repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "test@orbit.local"],
+            vec!["config", "user.name", "Orbit Test"],
+        ] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git init/config");
+            assert!(st.success());
+        }
+        std::fs::write(repo_dir.join("main.rs"), "fn main() { /* v1 */ }\n")
+            .expect("write main.rs");
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "init"]] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git commit");
+            assert!(st.success());
+        }
+
+        // Trigger a genuine post-provision conflict: `.worktreeinclude` copies modified `main.rs`
+        // into the freshly created worktree, causing `git apply` of the `HEAD -> modified` diff
+        // to fail cleanly inside `execute_worktree_handoff_paths`.
+        std::fs::write(repo_dir.join(".worktreeinclude"), "main.rs\n")
+            .expect("write .worktreeinclude");
+        std::fs::write(
+            repo_dir.join("main.rs"),
+            "fn main() { println!(\"v2-dirty\"); }\n",
+        )
+        .expect("modify main.rs");
+
+        let (home_dir, store, orch) = test_orchestrator("handoff_rollback").await;
+        let local_ws = orch
+            .ensure_workspace(repo_dir.to_str().expect("utf8"), None, None, None)
+            .await
+            .expect("ensure local workspace");
+
+        let err = orch
+            .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                workspace_id: local_ws.workspace_id.clone(),
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                target_workspace_id: None,
+                include_committed: false,
+                branch: Some("feat/rollback-branch".into()),
+                allow_three_way_conflicts: false,
+            })
+            .await
+            .expect_err("must fail due to post-provision patch conflict");
+        assert!(err.to_string().contains("handoff_conflict"));
+
+        // 1. No active worktree workspace left in store
+        let active_ws = store
+            .list_workspaces_filtered(false, true)
+            .expect("list active ws");
+        assert!(
+            active_ws.iter().all(|w| !w.is_worktree),
+            "orphaned worktree workspace must be archived on rollback"
+        );
+
+        // 2. Newly created branch MUST be deleted on rollback
+        let branch_check = tokio::process::Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feat/rollback-branch",
+            ])
+            .current_dir(&repo_dir)
+            .status()
+            .await
+            .expect("show-ref");
+        assert!(
+            !branch_check.success(),
+            "newly created branch `feat/rollback-branch` must be deleted on rollback"
+        );
+
+        // 3. No linked worktree directory remains in `git worktree list`
+        let wt_list = tokio::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&repo_dir)
+            .output()
+            .await
+            .expect("worktree list");
+        let wt_text = String::from_utf8_lossy(&wt_list.stdout);
+        assert!(
+            !wt_text.contains("feat/rollback-branch"),
+            "orphaned worktree must be removed: {wt_text}"
+        );
+
+        // 4. Local dirty changes were NEVER reset
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.join("main.rs")).expect("local main intact"),
+            "fn main() { println!(\"v2-dirty\"); }\n"
+        );
+
+        orch.shutdown_worktree_pool().await;
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -12,7 +12,8 @@ use chrono::{DateTime, Utc};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentMessageKind, ForkTarget, McpToolPolicy, ProviderKind, ReasoningEffort,
     ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode, TimelinePayload,
-    ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode,
+    ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection,
+    WorktreeHandoffMode,
 };
 use orbit_store::ReceiptOutcome;
 use serde_json::{Value, json};
@@ -20,7 +21,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::DaemonRuntime;
-use crate::manager::{CreateAgentSpec, CreateWorkspaceSpec, ForkAgentSpec};
+use crate::manager::{
+    CreateAgentSpec, CreateWorkspaceSpec, ExecuteWorktreeHandoffSpec, ForkAgentSpec,
+};
 use crate::messaging::{AgentPromptSource, QueuedAgentMessage};
 
 #[derive(Debug, Clone)]
@@ -892,6 +895,144 @@ async fn execute_tool_inner(
                 rt.orchestrator.archive_workspace(&workspace_id).await?;
             }
             Ok(json!({ "ok": true, "workspace_id": workspace_id, "archived": true }))
+        }
+
+        "handoff_worktree" => {
+            let workspace_id = opt_str(args, "workspace_id")
+                .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            let direction = match opt_str(args, "direction")
+                .as_deref()
+                .unwrap_or("worktree_to_local")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "worktree_to_local" | "to_local" | "to-local" => {
+                    WorktreeHandoffDirection::WorktreeToLocal
+                }
+                "local_to_worktree" | "to_worktree" | "to-worktree" => {
+                    WorktreeHandoffDirection::LocalToWorktree
+                }
+                other => anyhow::bail!(
+                    "invalid `direction` `{other}` (expected `worktree_to_local` or `local_to_worktree`)"
+                ),
+            };
+            let mode = match opt_str(args, "mode")
+                .as_deref()
+                .unwrap_or("apply")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "apply" => WorktreeHandoffMode::Apply,
+                "move" => WorktreeHandoffMode::Move,
+                other => anyhow::bail!("invalid `mode` `{other}` (expected `apply` or `move`)"),
+            };
+            let target_workspace_id = opt_str(args, "target_workspace_id");
+            let include_committed = args
+                .get("include_committed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(direction == WorktreeHandoffDirection::WorktreeToLocal);
+            let dry_run = args
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let branch = opt_str(args, "branch");
+            let allow_three_way_conflicts = args
+                .get("allow_three_way_conflicts")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let resolved_host_id = target_host
+                .clone()
+                .unwrap_or_else(|| rt.host_info.host_id.clone());
+
+            if dry_run {
+                let preview = if let Some(ref remote_host_id) = target_host {
+                    let req_id = Uuid::new_v4();
+                    match rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            req_id,
+                            WireMessage::PreviewWorktreeHandoff {
+                                request_id: req_id,
+                                workspace_id,
+                                direction,
+                                target_workspace_id,
+                                include_committed,
+                            },
+                            Duration::from_secs(30),
+                        )
+                        .await?
+                    {
+                        WireMessage::WorktreeHandoffPreviewResult { preview, .. } => preview,
+                        WireMessage::RpcError { message, .. } => {
+                            anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                        }
+                        _ => anyhow::bail!("unexpected remote reply to handoff_worktree preview"),
+                    }
+                } else {
+                    rt.orchestrator
+                        .preview_worktree_handoff(
+                            &workspace_id,
+                            direction,
+                            target_workspace_id.as_deref(),
+                            include_committed,
+                        )
+                        .await?
+                };
+                return Ok(json!({
+                    "host_id": resolved_host_id,
+                    "dry_run": true,
+                    "preview": preview,
+                }));
+            }
+
+            let outcome = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ExecuteWorktreeHandoff {
+                            request_id: req_id,
+                            workspace_id,
+                            direction,
+                            mode,
+                            target_workspace_id,
+                            include_committed,
+                            branch,
+                            allow_three_way_conflicts,
+                        },
+                        Duration::from_secs(60),
+                    )
+                    .await?
+                {
+                    WireMessage::WorktreeHandoffExecuted { outcome, .. } => outcome,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to handoff_worktree execute"),
+                }
+            } else {
+                rt.orchestrator
+                    .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                        workspace_id,
+                        direction,
+                        mode,
+                        target_workspace_id,
+                        include_committed,
+                        branch,
+                        allow_three_way_conflicts,
+                    })
+                    .await?
+            };
+            Ok(json!({
+                "host_id": resolved_host_id,
+                "dry_run": false,
+                "outcome": outcome,
+            }))
         }
 
         "list_workspace_scripts" => {
@@ -2144,6 +2285,24 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "host_id": { "type": "string" }
                 },
                 "required": ["workspace_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_worktree",
+            description: "Bidirectional Git Worktree <-> Local checkout sync/handoff (`apply` or `move`) with non-mutating conflict dry-run (`dry_run: true`) and automatic hidden Git backup ref creation (`refs/orbit/handoff-backup/...`).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": { "type": "string", "description": "Source workspace ID (defaults to calling agent's workspace)." },
+                    "direction": { "type": "string", "enum": ["worktree_to_local", "local_to_worktree"], "default": "worktree_to_local" },
+                    "mode": { "type": "string", "enum": ["apply", "move"], "default": "apply" },
+                    "target_workspace_id": { "type": "string", "description": "Optional explicit target workspace ID (omit for Local -> new worktree or Worktree -> primary local checkout)." },
+                    "include_committed": { "type": "boolean", "description": "Include worktree commits ahead of local HEAD when direction is `worktree_to_local`." },
+                    "branch": { "type": "string", "description": "Optional branch name when creating a new worktree for `local_to_worktree`." },
+                    "allow_three_way_conflicts": { "type": "boolean", "default": false, "description": "When true, falls back to `git apply --3way` and writes conflict markers if clean apply fails." },
+                    "dry_run": { "type": "boolean", "default": false, "description": "Preview changed files and conflicts without mutating disk." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
             }),
         },
         ToolDefinition {

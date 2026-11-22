@@ -545,7 +545,9 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
         | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
         | WireMessage::ProviderSubagentsSnapshot { request_id, .. }
-        | WireMessage::ProviderSubagentTimelineCatchup { request_id, .. } => Some(*request_id),
+        | WireMessage::ProviderSubagentTimelineCatchup { request_id, .. }
+        | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }
+        | WireMessage::WorktreeHandoffExecuted { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. } | WireMessage::RpcError { request_id, .. } => {
             *request_id
         }

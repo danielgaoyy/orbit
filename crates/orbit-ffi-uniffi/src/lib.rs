@@ -30,8 +30,9 @@ use orbit_client_core::composer::{
 };
 use orbit_client_core::contract::{
     AgentStageDeltaRequest, BridgeInfoView, ConversationSearchHit, CreateSessionRequest,
-    FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView, GitReposInspectionView,
-    MentionRankRequest, ModelSelectionRequest, ReadWorkspaceFileRequest, RenderDiagramRequest,
+    ExecuteWorktreeHandoffRequest, FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView,
+    GitReposInspectionView, MentionRankRequest, ModelSelectionRequest,
+    PreviewWorktreeHandoffRequest, ReadWorkspaceFileRequest, RenderDiagramRequest,
     RenderDiagramView, RewindAgentRequest, SendPromptRequest, SpawnWorkspacePeerRequest,
     UpdateHostConfigRequest,
 };
@@ -61,15 +62,16 @@ use orbit_client_core::stage::{
 use orbit_client_core::{HostConnectionState, HostRouteMode};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSource, AcpAgentSpec, AcpProbeResult, AgentMessageKind,
-    AttentionState, DirectoryEntry, DiscoveredProject, ForkTarget, NestedGitRepo,
-    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
-    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    AttentionState, DirectoryEntry, DiscoveredProject, ForkTarget, HandoffFileChange,
+    NestedGitRepo, PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog,
+    ProviderModelSpec, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
     ProviderSubagentStatus, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
     ScheduleNewAgentConfig, ScheduleRunRecord, ScheduleRunStatus, ScheduleSpec, ScheduleStatus,
     ScheduleTarget, SessionMode, TerminalSummary, ThinkingOptionSpec, TimelinePayload,
     ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
     WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
-    WorkspaceOrganizePhase, WorkspaceSummary,
+    WorkspaceOrganizePhase, WorkspaceSummary, WorktreeHandoffDirection, WorktreeHandoffMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 
 uniffi::setup_scaffolding!();
@@ -3110,6 +3112,143 @@ impl From<ForkAgentResultView> for FfiForkAgentResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorktreeHandoffDirection {
+    WorktreeToLocal,
+    LocalToWorktree,
+}
+
+impl From<FfiWorktreeHandoffDirection> for WorktreeHandoffDirection {
+    fn from(v: FfiWorktreeHandoffDirection) -> Self {
+        match v {
+            FfiWorktreeHandoffDirection::WorktreeToLocal => Self::WorktreeToLocal,
+            FfiWorktreeHandoffDirection::LocalToWorktree => Self::LocalToWorktree,
+        }
+    }
+}
+
+impl From<WorktreeHandoffDirection> for FfiWorktreeHandoffDirection {
+    fn from(v: WorktreeHandoffDirection) -> Self {
+        match v {
+            WorktreeHandoffDirection::WorktreeToLocal => Self::WorktreeToLocal,
+            WorktreeHandoffDirection::LocalToWorktree => Self::LocalToWorktree,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorktreeHandoffMode {
+    Apply,
+    Move,
+}
+
+impl From<FfiWorktreeHandoffMode> for WorktreeHandoffMode {
+    fn from(v: FfiWorktreeHandoffMode) -> Self {
+        match v {
+            FfiWorktreeHandoffMode::Apply => Self::Apply,
+            FfiWorktreeHandoffMode::Move => Self::Move,
+        }
+    }
+}
+
+impl From<WorktreeHandoffMode> for FfiWorktreeHandoffMode {
+    fn from(v: WorktreeHandoffMode) -> Self {
+        match v {
+            WorktreeHandoffMode::Apply => Self::Apply,
+            WorktreeHandoffMode::Move => Self::Move,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiHandoffFileChange {
+    pub path: String,
+    pub status: String,
+    pub insertions: u32,
+    pub deletions: u32,
+    pub is_untracked: bool,
+    pub has_conflict: bool,
+}
+
+impl From<HandoffFileChange> for FfiHandoffFileChange {
+    fn from(v: HandoffFileChange) -> Self {
+        Self {
+            path: v.path,
+            status: v.status,
+            insertions: v.insertions,
+            deletions: v.deletions,
+            is_untracked: v.is_untracked,
+            has_conflict: v.has_conflict,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorktreeHandoffPreview {
+    pub direction: FfiWorktreeHandoffDirection,
+    pub source_cwd: String,
+    pub target_cwd: String,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub commit_count: u32,
+    pub files: Vec<FfiHandoffFileChange>,
+    pub total_insertions: u32,
+    pub total_deletions: u32,
+    pub target_dirty: bool,
+    pub conflicts: Vec<String>,
+    pub can_apply_cleanly: bool,
+    pub warning: Option<String>,
+}
+
+impl From<WorktreeHandoffPreview> for FfiWorktreeHandoffPreview {
+    fn from(v: WorktreeHandoffPreview) -> Self {
+        Self {
+            direction: v.direction.into(),
+            source_cwd: v.source_cwd,
+            target_cwd: v.target_cwd,
+            source_branch: v.source_branch,
+            target_branch: v.target_branch,
+            commit_count: v.commit_count,
+            files: v.files.into_iter().map(Into::into).collect(),
+            total_insertions: v.total_insertions,
+            total_deletions: v.total_deletions,
+            target_dirty: v.target_dirty,
+            conflicts: v.conflicts,
+            can_apply_cleanly: v.can_apply_cleanly,
+            warning: v.warning,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorktreeHandoffOutcome {
+    pub direction: FfiWorktreeHandoffDirection,
+    pub mode: FfiWorktreeHandoffMode,
+    pub applied_files: u32,
+    pub backup_ref: Option<String>,
+    pub target_workspace: Option<FfiWorkspaceSummary>,
+    pub target_cwd: String,
+    pub had_conflicts: bool,
+    pub conflict_files: Vec<String>,
+    pub summary: String,
+}
+
+impl From<WorktreeHandoffOutcome> for FfiWorktreeHandoffOutcome {
+    fn from(v: WorktreeHandoffOutcome) -> Self {
+        Self {
+            direction: v.direction.into(),
+            mode: v.mode.into(),
+            applied_files: v.applied_files,
+            backup_ref: v.backup_ref,
+            target_workspace: v.target_workspace.map(Into::into),
+            target_cwd: v.target_cwd,
+            had_conflicts: v.had_conflicts,
+            conflict_files: v.conflict_files,
+            summary: v.summary,
+        }
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiWorkspaceFile {
     pub host_id: String,
@@ -3851,6 +3990,54 @@ impl From<FfiForkAgentRequest> for ForkAgentRequest {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPreviewWorktreeHandoffRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub direction: FfiWorktreeHandoffDirection,
+    pub target_workspace_id: Option<String>,
+    pub include_committed: bool,
+}
+
+impl From<FfiPreviewWorktreeHandoffRequest> for PreviewWorktreeHandoffRequest {
+    fn from(v: FfiPreviewWorktreeHandoffRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            workspace_id: v.workspace_id,
+            direction: v.direction.into(),
+            target_workspace_id: v.target_workspace_id,
+            include_committed: v.include_committed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiExecuteWorktreeHandoffRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub direction: FfiWorktreeHandoffDirection,
+    pub mode: FfiWorktreeHandoffMode,
+    pub target_workspace_id: Option<String>,
+    pub include_committed: bool,
+    pub branch: Option<String>,
+    pub allow_three_way_conflicts: bool,
+}
+
+impl From<FfiExecuteWorktreeHandoffRequest> for ExecuteWorktreeHandoffRequest {
+    fn from(v: FfiExecuteWorktreeHandoffRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            workspace_id: v.workspace_id,
+            direction: v.direction.into(),
+            mode: v.mode.into(),
+            target_workspace_id: v.target_workspace_id,
+            include_committed: v.include_committed,
+            branch: v.branch,
+            allow_three_way_conflicts: v.allow_three_way_conflicts,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiReadWorkspaceFileRequest {
     pub host_id: String,
     pub cwd: String,
@@ -4275,6 +4462,26 @@ impl OrbitMobileCore {
     ) -> Result<FfiForkAgentResult, FfiOrbitError> {
         self.inner
             .fork_agent_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn preview_worktree_handoff(
+        &self,
+        req: FfiPreviewWorktreeHandoffRequest,
+    ) -> Result<FfiWorktreeHandoffPreview, FfiOrbitError> {
+        self.inner
+            .preview_worktree_handoff_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn execute_worktree_handoff(
+        &self,
+        req: FfiExecuteWorktreeHandoffRequest,
+    ) -> Result<FfiWorktreeHandoffOutcome, FfiOrbitError> {
+        self.inner
+            .execute_worktree_handoff_blocking(req.into())
             .map(Into::into)
             .map_err(|detail| FfiOrbitError::Core { detail })
     }

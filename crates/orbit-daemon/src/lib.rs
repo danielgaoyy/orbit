@@ -25,6 +25,7 @@ pub mod workspace_board;
 pub mod workspace_cluster;
 pub mod workspace_organizer;
 pub mod workspace_runtime;
+pub mod worktree_handoff;
 pub mod worktree_pool;
 
 use std::collections::{HashMap, HashSet};
@@ -1358,6 +1359,110 @@ async fn handle_wire_rpc(
             Ok(_) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "stop_script_failed", e)),
         },
+        WireMessage::PreviewWorktreeHandoff {
+            request_id,
+            workspace_id,
+            direction,
+            target_workspace_id,
+            include_committed,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match orch
+                    .preview_worktree_handoff(
+                        &workspace_id,
+                        direction,
+                        target_workspace_id.as_deref(),
+                        include_committed,
+                    )
+                    .await
+                {
+                    Ok(preview) => WireMessage::WorktreeHandoffPreviewResult {
+                        request_id,
+                        preview,
+                    },
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let code = if msg.contains("unrelated_git_repo") {
+                            "unrelated_git_repo"
+                        } else if msg.contains("not_a_git_repo") {
+                            "not_a_git_repo"
+                        } else if msg.contains("not_a_worktree") {
+                            "not_a_worktree"
+                        } else if msg.contains("same_directory") {
+                            "same_directory"
+                        } else if msg.contains("directory_not_found") {
+                            "directory_not_found"
+                        } else {
+                            "handoff_preview_failed"
+                        };
+                        rpc_err(request_id, code, e)
+                    }
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ExecuteWorktreeHandoff {
+            request_id,
+            workspace_id,
+            direction,
+            mode,
+            target_workspace_id,
+            include_committed,
+            branch,
+            allow_three_way_conflicts,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match orch
+                    .execute_worktree_handoff(crate::manager::ExecuteWorktreeHandoffSpec {
+                        workspace_id,
+                        direction,
+                        mode,
+                        target_workspace_id,
+                        include_committed,
+                        branch,
+                        allow_three_way_conflicts,
+                    })
+                    .await
+                {
+                    Ok(outcome) => WireMessage::WorktreeHandoffExecuted {
+                        request_id,
+                        outcome,
+                    },
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let code = if msg.contains("handoff_conflict") {
+                            "handoff_conflict"
+                        } else if msg.contains("escaping_symlink") {
+                            "escaping_symlink"
+                        } else if msg.contains("unrelated_git_repo") {
+                            "unrelated_git_repo"
+                        } else if msg.contains("invalid_git_ref") {
+                            "invalid_git_ref"
+                        } else if msg.contains("not_a_git_repo") {
+                            "not_a_git_repo"
+                        } else if msg.contains("not_a_worktree") {
+                            "not_a_worktree"
+                        } else if msg.contains("same_directory") {
+                            "same_directory"
+                        } else if msg.contains("directory_not_found") {
+                            "directory_not_found"
+                        } else {
+                            "handoff_execute_failed"
+                        };
+                        rpc_err(request_id, code, e)
+                    }
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::GetGitStatus { request_id, cwd } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;

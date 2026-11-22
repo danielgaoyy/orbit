@@ -19,8 +19,9 @@ use orbit_client_core::catalog::{
 };
 use orbit_client_core::composer::{ClientPlatform, ComposePromptRequest};
 use orbit_client_core::contract::{
-    AgentStageDeltaRequest, CreateSessionRequest, FleetSidebarRequest, ForkAgentRequest,
-    MentionRankRequest, ModelSelectionRequest, RenderDiagramRequest, SendPromptRequest,
+    AgentStageDeltaRequest, CreateSessionRequest, ExecuteWorktreeHandoffRequest,
+    FleetSidebarRequest, ForkAgentRequest, MentionRankRequest, ModelSelectionRequest,
+    PreviewWorktreeHandoffRequest, RenderDiagramRequest, SendPromptRequest,
     UpdateHostConfigRequest,
 };
 use orbit_client_core::diagram::{
@@ -900,6 +901,20 @@ impl OhosCoreFacade {
         serde_json::to_string(&res).map_err(|e| e.to_string())
     }
 
+    pub fn preview_worktree_handoff_json(&self, req_json: &str) -> Result<String, String> {
+        let req: PreviewWorktreeHandoffRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid PreviewWorktreeHandoffRequest: {e}"))?;
+        let res = self.inner.preview_worktree_handoff_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn execute_worktree_handoff_json(&self, req_json: &str) -> Result<String, String> {
+        let req: ExecuteWorktreeHandoffRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid ExecuteWorktreeHandoffRequest: {e}"))?;
+        let res = self.inner.execute_worktree_handoff_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
     pub fn read_workspace_file_json(
         &self,
         host_id: &str,
@@ -1255,6 +1270,46 @@ mod ohos_napi {
         fn compute(&mut self) -> Result<Self::Output> {
             self.facade
                 .fork_agent_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct PreviewWorktreeHandoffTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for PreviewWorktreeHandoffTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .preview_worktree_handoff_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ExecuteWorktreeHandoffTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for ExecuteWorktreeHandoffTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .execute_worktree_handoff_json(&self.req_json)
                 .map_err(Error::from_reason)
         }
 
@@ -2042,6 +2097,28 @@ mod ohos_napi {
         #[napi]
         pub fn fork_agent_json(&self, req_json: String) -> AsyncTask<ForkAgentTask> {
             AsyncTask::new(ForkAgentTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn preview_worktree_handoff_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<PreviewWorktreeHandoffTask> {
+            AsyncTask::new(PreviewWorktreeHandoffTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn execute_worktree_handoff_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<ExecuteWorktreeHandoffTask> {
+            AsyncTask::new(ExecuteWorktreeHandoffTask {
                 facade: self.facade.clone(),
                 req_json,
             })

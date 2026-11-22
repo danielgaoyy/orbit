@@ -702,6 +702,65 @@ export interface WorkspaceSummary {
   updated_at: string;
 }
 
+export type WorktreeHandoffDirection = "worktree_to_local" | "local_to_worktree";
+export type WorktreeHandoffMode = "apply" | "move";
+
+export interface HandoffFileChange {
+  path: string;
+  status: string;
+  insertions: number;
+  deletions: number;
+  is_untracked: boolean;
+  has_conflict: boolean;
+}
+
+export interface WorktreeHandoffPreview {
+  direction: WorktreeHandoffDirection;
+  source_cwd: string;
+  target_cwd: string;
+  source_branch?: string | null;
+  target_branch?: string | null;
+  commit_count: number;
+  files: HandoffFileChange[];
+  total_insertions: number;
+  total_deletions: number;
+  target_dirty: boolean;
+  conflicts: string[];
+  can_apply_cleanly: boolean;
+  warning?: string | null;
+}
+
+export interface WorktreeHandoffOutcome {
+  direction: WorktreeHandoffDirection;
+  mode: WorktreeHandoffMode;
+  applied_files: number;
+  backup_ref?: string | null;
+  target_workspace?: WorkspaceSummary | null;
+  target_cwd: string;
+  had_conflicts: boolean;
+  conflict_files: string[];
+  summary: string;
+}
+
+export interface PreviewWorktreeHandoffRequest {
+  host_id: string;
+  workspace_id: string;
+  direction: WorktreeHandoffDirection;
+  target_workspace_id?: string | null;
+  include_committed: boolean;
+}
+
+export interface ExecuteWorktreeHandoffRequest {
+  host_id: string;
+  workspace_id: string;
+  direction: WorktreeHandoffDirection;
+  mode: WorktreeHandoffMode;
+  target_workspace_id?: string | null;
+  include_committed: boolean;
+  branch?: string | null;
+  allow_three_way_conflicts: boolean;
+}
+
 export interface QueuedPromptView {
   queue_id: string;
   display_text: string;
@@ -2505,6 +2564,24 @@ export const orbitIpc = {
   unarchiveWorkspace: async (hostId: string, workspaceId: string): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("unarchive_workspace", { hostId, workspaceId });
+  },
+
+  previewWorktreeHandoff: async (
+    req: PreviewWorktreeHandoffRequest,
+  ): Promise<WorktreeHandoffPreview> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Worktree handoff requires the Orbit desktop runtime");
+    }
+    return invoke<WorktreeHandoffPreview>("preview_worktree_handoff", { req });
+  },
+
+  executeWorktreeHandoff: async (
+    req: ExecuteWorktreeHandoffRequest,
+  ): Promise<WorktreeHandoffOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Worktree handoff requires the Orbit desktop runtime");
+    }
+    return invoke<WorktreeHandoffOutcome>("execute_worktree_handoff", { req });
   },
 
   listWorkspaceScripts: async (hostId: string, workspaceId: string): Promise<void> => {

@@ -38,9 +38,10 @@ use orbit_client_core::composer::{
     SlashCommandView,
 };
 use orbit_client_core::contract::{
-    AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, FleetSidebarRequest,
-    ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, MentionRankRequest,
-    ModelSelectionRequest, RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
+    AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, ExecuteWorktreeHandoffRequest,
+    FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView, GitReposInspectionView,
+    MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest, RenderDiagramRequest,
+    RenderDiagramView, SpawnWorkspacePeerRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
@@ -58,7 +59,8 @@ use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
     OrchestrationConfig, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
     ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode, WorkspaceBoardSnapshot,
-    WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
+    WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome,
+    WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -1354,6 +1356,22 @@ async fn fork_agent(
 }
 
 #[tauri::command]
+async fn preview_worktree_handoff(
+    state: State<'_, DesktopAppState>,
+    req: PreviewWorktreeHandoffRequest,
+) -> Result<WorktreeHandoffPreview, String> {
+    state.core.preview_worktree_handoff_on_host(req).await
+}
+
+#[tauri::command]
+async fn execute_worktree_handoff(
+    state: State<'_, DesktopAppState>,
+    req: ExecuteWorktreeHandoffRequest,
+) -> Result<WorktreeHandoffOutcome, String> {
+    state.core.execute_worktree_handoff_on_host(req).await
+}
+
+#[tauri::command]
 fn resolve_permission(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -2309,6 +2327,8 @@ pub fn run() {
             refresh_pending_permissions,
             rewind_agent,
             fork_agent,
+            preview_worktree_handoff,
+            execute_worktree_handoff,
             resolve_permission,
             answer_question,
             fetch_git_status,

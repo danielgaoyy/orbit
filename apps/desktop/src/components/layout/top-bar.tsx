@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { Code2, Copy, Download, FileText, MoreHorizontal, Sparkles } from "lucide-react";
+import { ArrowLeftRight, Code2, Copy, Download, FileText, MoreHorizontal, Sparkles } from "lucide-react";
 import { isAgentBackgroundWaiting, isMacDesktop } from "@/lib/orbit-ipc";
 import { modSymbol } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
@@ -28,6 +28,22 @@ export const TopBar = memo(function TopBar() {
     !isDraft &&
     Boolean(selectedHostId) &&
     Boolean(selectedAgentId);
+
+  const activeWorktreeWorkspace = useOrbitSelector((s) => {
+    if (
+      s.workspacePanel !== "conversation" ||
+      s.isDraftNewSession ||
+      !s.selectedHostId ||
+      !s.selectedAgentId
+    ) {
+      return null;
+    }
+    const detail = s.hostDetails[s.selectedHostId];
+    const ag = detail?.agents.find((a) => a.agent_id === s.selectedAgentId);
+    if (!ag || !detail) return null;
+    const ws = detail.workspaces.find((w) => w.workspace_id === ag.workspace_id);
+    return ws?.is_worktree ? ws : null;
+  });
   // Primitive return keeps TopBar free from re-renders on unrelated store updates
   const overviewBadgeTone = useOrbitSelector<
     "none" | "approval" | "subagent_running" | "bg_running"
@@ -164,6 +180,26 @@ export const TopBar = memo(function TopBar() {
       >
         {hasActiveSession && selectedHostId && selectedAgentId && (
           <>
+            {activeWorktreeWorkspace && (
+              <SimpleTooltip label="Apply or move worktree changes to local checkout">
+                <button
+                  type="button"
+                  onClick={() =>
+                    orbitActions.openWorktreeHandoffDialog({
+                      hostId: selectedHostId,
+                      workspaceId: activeWorktreeWorkspace.workspace_id,
+                      direction: "worktree_to_local",
+                      defaultMode: "apply",
+                      sourceCwd: activeWorktreeWorkspace.cwd,
+                    })
+                  }
+                  className="border-border text-foreground/78 hover:text-foreground inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] border px-2 text-[11.5px] font-medium transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+                >
+                  <ArrowLeftRight className="h-[12px] w-[12px] shrink-0 stroke-[1.75] opacity-75" />
+                  <span>Apply to Local</span>
+                </button>
+              </SimpleTooltip>
+            )}
             <StandaloneGroupButton />
             <DropdownMenu>
               <DropdownMenuTrigger asChild>

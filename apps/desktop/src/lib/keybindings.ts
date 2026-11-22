@@ -76,6 +76,7 @@ export function useGlobalErgonomicKeybindings(): void {
         snap.remoteFolderPickerHostId !== null ||
         snap.exportDialogTarget !== null ||
         snap.copyCodeBlocksTarget !== null ||
+        snap.handoffDialogTarget !== null ||
         Boolean(document.querySelector('[data-slot="dialog-content"]'));
 
       if (isModalOverlayOpen) {
@@ -176,7 +177,8 @@ export function useGlobalErgonomicKeybindings(): void {
           !snap.pairDialogOpen &&
           !snap.relayDialogOpen &&
           !snap.exportDialogTarget &&
-          !snap.copyCodeBlocksTarget
+          !snap.copyCodeBlocksTarget &&
+          !snap.handoffDialogTarget
         ) {
           e.preventDefault();
           orbitActions.cycleActiveMode();
@@ -259,7 +261,8 @@ export function useGlobalErgonomicKeybindings(): void {
         !snap.pairDialogOpen &&
         !snap.relayDialogOpen &&
         !snap.exportDialogTarget &&
-        !snap.copyCodeBlocksTarget
+        !snap.copyCodeBlocksTarget &&
+        !snap.handoffDialogTarget
       ) {
         const now = Date.now();
         if (now - lastEscTimeRef.current < 420) {

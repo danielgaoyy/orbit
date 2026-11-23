@@ -2518,7 +2518,7 @@ export const orbitActions = {
       },
     }));
     try {
-      await orbitIpc.performAppSelfUpdate(release, (ev) => {
+      await orbitIpc.performAppSelfUpdate(release.tag_name, (ev) => {
         const rawProgress = Number.isFinite(ev.progress) ? ev.progress : 0;
         const normalized = rawProgress > 1 ? Math.min(1, rawProgress / 100) : Math.max(0, rawProgress);
         const pct = Math.round(normalized * 100);

@@ -54,21 +54,67 @@ pub struct LocalDaemonSyncResult {
 }
 
 pub fn compare_semver(a: &str, b: &str) -> Ordering {
-    fn parse_parts(v: &str) -> [u32; 3] {
-        let clean = v
+    fn split_semver(v: &str) -> ([u32; 3], Option<&str>) {
+        let without_build = v
             .trim()
             .trim_start_matches(['v', 'V'])
-            .split(['+', '-'])
+            .split('+')
             .next()
             .unwrap_or("0.0.0");
-        let mut it = clean.split('.');
-        [
+        let (core, pre) = match without_build.split_once('-') {
+            Some((c, p)) if !p.is_empty() => (c, Some(p)),
+            Some((c, _)) => (c, None),
+            None => (without_build, None),
+        };
+        let mut it = core.split('.');
+        let parts = [
             it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
-        ]
+        ];
+        (parts, pre)
     }
-    parse_parts(a).cmp(&parse_parts(b))
+
+    fn cmp_prerelease(a: &str, b: &str) -> Ordering {
+        let mut a_ids = a.split('.');
+        let mut b_ids = b.split('.');
+        loop {
+            match (a_ids.next(), b_ids.next()) {
+                (Some(ai), Some(bi)) => {
+                    let a_num = ai.parse::<u64>().ok();
+                    let b_num = bi.parse::<u64>().ok();
+                    let ord = match (a_num, b_num) {
+                        (Some(an), Some(bn)) => an.cmp(&bn),
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => ai.cmp(bi),
+                    };
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                (Some(_), None) => return Ordering::Greater,
+                (None, Some(_)) => return Ordering::Less,
+                (None, None) => return Ordering::Equal,
+            }
+        }
+    }
+
+    let (a_parts, a_pre) = split_semver(a);
+    let (b_parts, b_pre) = split_semver(b);
+    match a_parts.cmp(&b_parts) {
+        Ordering::Equal => match (a_pre, b_pre) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(ap), Some(bp)) => cmp_prerelease(ap, bp),
+        },
+        ord => ord,
+    }
+}
+
+pub fn is_newer_version(candidate: &str, current: &str) -> bool {
+    compare_semver(candidate, current) == Ordering::Greater
 }
 
 fn resolve_github_token() -> Option<String> {
@@ -343,22 +389,179 @@ fn parse_github_release_json(json: &serde_json::Value, current_version: &str) ->
     }
 }
 
+/// Strictly validate a GitHub release tag (`vX.Y.Z` with optional `-prerelease` / `.prerelease`,
+/// disallowing path traversal or control characters).
+fn normalize_and_validate_release_tag(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return Err(format!("Invalid release tag: {raw}"));
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix(['v', 'V']) {
+        format!("v{rest}")
+    } else {
+        format!("v{trimmed}")
+    };
+    let ver = &normalized[1..];
+    let (core, suffix) = match ver.split_once('-') {
+        Some((c, s)) => (c, Some(s)),
+        None => (ver, None),
+    };
+    let mut parts = core.split('.');
+    let valid_core = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), None)
+            if !a.is_empty()
+                && !b.is_empty()
+                && !c.is_empty()
+                && a.bytes().all(|ch| ch.is_ascii_digit())
+                && b.bytes().all(|ch| ch.is_ascii_digit())
+                && c.bytes().all(|ch| ch.is_ascii_digit())
+    );
+    if !valid_core {
+        return Err(format!("Invalid release tag: {raw}"));
+    }
+    if let Some(pre) = suffix
+        && (pre.is_empty()
+            || pre.contains("..")
+            || !pre
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'.' || ch == b'-'))
+    {
+        return Err(format!("Invalid release tag: {raw}"));
+    }
+    Ok(normalized)
+}
+
+/// Strict allowlist for HTTPS GitHub release-download hosts (blocks SSRF / arbitrary redirects).
+fn is_allowed_github_release_download_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "github.com" | "objects.githubusercontent.com" | "release-assets.githubusercontent.com"
+    )
+}
+
+fn build_github_release_download_client(
+    connect_timeout: Duration,
+    total_timeout: Option<Duration>,
+) -> Result<reqwest::Client, String> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects while downloading GitHub release");
+        }
+        if !is_allowed_github_release_download_url(attempt.url()) {
+            let blocked = attempt.url().to_string();
+            return attempt.error(format!("blocked redirect to untrusted host: {blocked}"));
+        }
+        attempt.follow()
+    });
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .redirect(policy)
+        .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"));
+    if let Some(t) = total_timeout {
+        builder = builder.timeout(t);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to create download client: {e}"))
+}
+
+/// Create a private `0700` unique staging directory inside `std::env::temp_dir()` using atomic
+/// `mkdir` (never follows pre-existing symlinks or reuses predictable PID-named directories).
+fn create_private_update_staging_dir() -> Result<PathBuf, String> {
+    let base = std::env::temp_dir();
+    for _ in 0..16 {
+        let rand_hex =
+            orbit_crypto::sha256_hex_bytes(orbit_crypto::generate_vault_salt_b64().as_bytes());
+        let dir_name = format!("orbit-update-{}", &rand_hex[..24]);
+        let candidate = base.join(dir_name);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to create private update staging directory: {e}"
+                ));
+            }
+        }
+    }
+    Err("Failed to allocate unique private update staging directory".to_string())
+}
+
+fn create_private_subdir(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let path = parent.join(name);
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&path).map_err(|e| {
+        format!(
+            "Failed to create temporary subdirectory {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn fixed_release_download_urls(tag_name: &str, asset_name: &str) -> (String, String) {
+    let base = format!("https://github.com/{GITHUB_REPO}/releases/download/{tag_name}");
+    (
+        format!("{base}/{asset_name}"),
+        format!("{base}/{}", orbit_crypto::SHA256SUMS_FILENAME),
+    )
+}
+
+fn validate_upgrade_target_tag(raw_tag: &str, current_version: &str) -> Result<String, String> {
+    let normalized = normalize_and_validate_release_tag(raw_tag)?;
+    let target_version = normalized.trim_start_matches(['v', 'V']);
+    if !is_newer_version(target_version, current_version) {
+        let cur_clean = current_version.trim().trim_start_matches(['v', 'V']);
+        return Err(format!(
+            "Refusing downgrade or reinstall: target {normalized} is not newer than current v{cur_clean}"
+        ));
+    }
+    Ok(normalized)
+}
+
 pub async fn perform_one_click_update(
-    release: ReleaseUpdateInfo,
+    target_tag: Option<String>,
     on_progress: Channel<AppUpdateProgress>,
 ) -> Result<(), String> {
+    let raw_tag = match target_tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => raw.to_string(),
+        None => resolve_latest_tag_via_web_redirect().await?,
+    };
+    let tag_name = validate_upgrade_target_tag(&raw_tag, CURRENT_APP_VERSION)?;
+
     if cfg!(target_os = "macos") {
-        return update_macos_dmg_and_relaunch(&release, &on_progress).await;
+        return update_macos_dmg_and_relaunch(&tag_name, &on_progress).await;
     }
     if cfg!(target_os = "linux") {
-        return update_linux_deb_and_relaunch(&release, &on_progress).await;
+        return update_linux_deb_and_relaunch(&tag_name, &on_progress).await;
     }
     if cfg!(target_os = "windows") {
-        return update_windows_installer_and_relaunch(&release, &on_progress).await;
+        return update_windows_installer_and_relaunch(&tag_name, &on_progress).await;
     }
     Err(format!(
-        "Automatic updates are not supported on this platform. Download from {}",
-        release.html_url
+        "Automatic updates are not supported on this platform. Download from https://github.com/{GITHUB_REPO}/releases/tag/{tag_name}"
     ))
 }
 
@@ -375,27 +578,46 @@ fn emit_progress(
     });
 }
 
-async fn download_with_progress(
-    url: &str,
-    tag_name: &str,
-    dest_path: &Path,
-    on_progress: &Channel<AppUpdateProgress>,
-) -> Result<(), String> {
-    emit_progress(
-        on_progress,
-        0.03,
-        format!("Connecting to GitHub Releases for {tag_name}…"),
-        false,
-    );
+async fn fetch_expected_release_sha256(
+    client: &reqwest::Client,
+    sums_url: &str,
+    asset_name: &str,
+) -> Result<String, String> {
+    let resp = client
+        .get(sums_url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch SHA-256 checksum manifest ({sums_url}): {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Failed to fetch SHA-256 checksum manifest ({sums_url}, HTTP {}); refusing unverified update",
+            resp.status()
+        ));
+    }
+    let sums_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read SHA-256 checksum manifest: {e}"))?;
+    orbit_crypto::find_expected_sha256(&sums_text, asset_name).map_err(|e| {
+        format!("SHA-256 checksum manifest does not contain a valid entry for {asset_name}: {e}")
+    })
+}
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
-        .build()
-        .map_err(|e| format!("Failed to create download client: {e}"))?;
+async fn download_and_verify_release_file<F>(
+    client: &reqwest::Client,
+    asset_url: &str,
+    sums_url: &str,
+    asset_name: &str,
+    dest_path: &Path,
+    mut on_chunk_progress: F,
+) -> Result<String, String>
+where
+    F: FnMut(u64, u64),
+{
+    let expected_sha256 = fetch_expected_release_sha256(client, sums_url, asset_name).await?;
 
     let resp = client
-        .get(url)
+        .get(asset_url)
         .send()
         .await
         .map_err(|e| format!("Download request failed: {e}"))?;
@@ -415,44 +637,107 @@ async fn download_with_progress(
         )
     })?;
 
+    let mut hasher = orbit_crypto::Sha256Hasher::new();
     let mut stream = resp.bytes_stream();
-    let mut last_emit_bytes: u64 = 0;
+    let mut stream_err: Option<String> = None;
 
     while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res.map_err(|e| format!("Download stream interrupted: {e}"))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("Failed to write installer: {e}"))?;
-        received_bytes += chunk.len() as u64;
-
-        if received_bytes.saturating_sub(last_emit_bytes) >= 128 * 1024
-            || received_bytes == total_bytes
-        {
-            last_emit_bytes = received_bytes;
-            let mb_done = received_bytes as f64 / (1024.0 * 1024.0);
-            if total_bytes > 0 {
-                let ratio = (received_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0);
-                let mb_total = total_bytes as f64 / (1024.0 * 1024.0);
-                emit_progress(
-                    on_progress,
-                    0.05 + ratio * 0.80,
-                    format!("Downloading {tag_name} ({mb_done:.1} / {mb_total:.1} MB)…"),
-                    false,
-                );
-            } else {
-                emit_progress(
-                    on_progress,
-                    0.50,
-                    format!("Downloading {tag_name} ({mb_done:.1} MB)…"),
-                    false,
-                );
+        let chunk = match chunk_res {
+            Ok(c) => c,
+            Err(e) => {
+                stream_err = Some(format!("Download stream interrupted: {e}"));
+                break;
             }
+        };
+        hasher.update(&chunk);
+        if let Err(e) = file.write_all(&chunk).await {
+            stream_err = Some(format!("Failed to write installer: {e}"));
+            break;
         }
+        received_bytes += chunk.len() as u64;
+        on_chunk_progress(received_bytes, total_bytes);
     }
 
-    file.flush()
-        .await
-        .map_err(|e| format!("Failed to flush temporary installer: {e}"))?;
+    if let Some(err) = stream_err {
+        let _ = tokio::fs::remove_file(dest_path).await;
+        return Err(err);
+    }
+
+    if let Err(e) = file.flush().await {
+        let _ = tokio::fs::remove_file(dest_path).await;
+        return Err(format!("Failed to flush temporary installer: {e}"));
+    }
+    drop(file);
+
+    let actual_sha256 = hasher.finalize_hex();
+    if let Err(e) = orbit_crypto::verify_sha256_hex(asset_name, &expected_sha256, &actual_sha256) {
+        let _ = tokio::fs::remove_file(dest_path).await;
+        return Err(format!(
+            "Installer SHA-256 integrity verification failed; update aborted: {e}"
+        ));
+    }
+
+    Ok(actual_sha256)
+}
+
+async fn download_with_progress(
+    tag_name: &str,
+    asset_name: &str,
+    dest_path: &Path,
+    on_progress: &Channel<AppUpdateProgress>,
+) -> Result<(), String> {
+    let (asset_url, sums_url) = fixed_release_download_urls(tag_name, asset_name);
+
+    emit_progress(
+        on_progress,
+        0.03,
+        format!("Fetching SHA-256 checksum manifest for {tag_name}…"),
+        false,
+    );
+
+    let client = build_github_release_download_client(Duration::from_secs(15), None)?;
+
+    let mut last_emit_bytes: u64 = 0;
+    download_and_verify_release_file(
+        &client,
+        &asset_url,
+        &sums_url,
+        asset_name,
+        dest_path,
+        |received_bytes, total_bytes| {
+            if received_bytes.saturating_sub(last_emit_bytes) >= 128 * 1024
+                || (total_bytes > 0 && received_bytes == total_bytes)
+            {
+                last_emit_bytes = received_bytes;
+                let mb_done = received_bytes as f64 / (1024.0 * 1024.0);
+                if total_bytes > 0 {
+                    let ratio = (received_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0);
+                    let mb_total = total_bytes as f64 / (1024.0 * 1024.0);
+                    emit_progress(
+                        on_progress,
+                        0.05 + ratio * 0.80,
+                        format!("Downloading {tag_name} ({mb_done:.1} / {mb_total:.1} MB)…"),
+                        false,
+                    );
+                } else {
+                    emit_progress(
+                        on_progress,
+                        0.50,
+                        format!("Downloading {tag_name} ({mb_done:.1} MB)…"),
+                        false,
+                    );
+                }
+            }
+        },
+    )
+    .await?;
+
+    emit_progress(
+        on_progress,
+        0.87,
+        format!("Verified SHA-256 checksum for {tag_name}…"),
+        false,
+    );
     Ok(())
 }
 
@@ -496,38 +781,36 @@ fn spawn_detached_shell(script: &str) -> Result<(), String> {
 }
 
 async fn update_windows_installer_and_relaunch(
-    release: &ReleaseUpdateInfo,
+    tag_name: &str,
     on_progress: &Channel<AppUpdateProgress>,
 ) -> Result<(), String> {
-    let installer_url = release
-        .windows_nsis_url
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .or_else(|| release.windows_msi_url.as_deref().filter(|s| !s.is_empty()))
-        .ok_or_else(|| "No Windows installer URL found for this release".to_string())?;
+    let staging_dir = create_private_update_staging_dir()?;
+    let nsis_asset = "Orbit-Windows-x64-setup.exe";
+    let msi_asset = "Orbit-Windows-x64.msi";
 
-    let ext = if installer_url.to_ascii_lowercase().ends_with(".msi") {
-        "msi"
-    } else {
-        "exe"
-    };
-    let tmp_dir = std::env::temp_dir();
-    let my_pid = std::process::id();
-    let installer_path = tmp_dir.join(format!(
-        "Orbit-{}-{my_pid}-setup.{ext}",
-        release.latest_version
-    ));
+    let nsis_path = staging_dir.join("installer.exe");
+    let (installer_path, is_msi) =
+        match download_with_progress(tag_name, nsis_asset, &nsis_path, on_progress).await {
+            Ok(()) => (nsis_path, false),
+            Err(nsis_err) if nsis_err.contains("HTTP 404") || nsis_err.contains("not found") => {
+                let msi_path = staging_dir.join("installer.msi");
+                if let Err(msi_err) =
+                    download_with_progress(tag_name, msi_asset, &msi_path, on_progress).await
+                {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(format!("{nsis_err}; MSI fallback failed: {msi_err}"));
+                }
+                (msi_path, true)
+            }
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(err);
+            }
+        };
 
-    download_with_progress(
-        installer_url,
-        &release.tag_name,
-        &installer_path,
-        on_progress,
-    )
-    .await?;
     emit_progress(on_progress, 0.96, "Launching Windows installer…", true);
 
-    let mut cmd = if ext == "msi" {
+    let mut cmd = if is_msi {
         let mut c = Command::new("msiexec");
         c.args(["/i", &installer_path.to_string_lossy()]);
         c
@@ -542,29 +825,34 @@ async fn update_windows_installer_and_relaunch(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0000_0200);
     }
-    cmd.spawn()
-        .map_err(|e| format!("Failed to launch Windows installer: {e}"))?;
+    if let Err(e) = cmd.spawn() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(format!("Failed to launch Windows installer: {e}"));
+    }
 
     tokio::time::sleep(Duration::from_millis(280)).await;
     std::process::exit(0);
 }
 
 async fn update_macos_dmg_and_relaunch(
-    release: &ReleaseUpdateInfo,
+    tag_name: &str,
     on_progress: &Channel<AppUpdateProgress>,
 ) -> Result<(), String> {
-    let dmg_url = release
-        .macos_dmg_url
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "No macOS installer URL found for this release".to_string())?;
-
-    let tmp_dir = std::env::temp_dir();
+    let staging_dir = create_private_update_staging_dir()?;
     let my_pid = std::process::id();
-    let dmg_path = tmp_dir.join(format!("Orbit-{}-{my_pid}.dmg", release.latest_version));
-    let mount_dir = tmp_dir.join(format!("orbit_mnt_{my_pid}"));
+    let dmg_path = staging_dir.join("installer.dmg");
 
-    download_with_progress(dmg_url, &release.tag_name, &dmg_path, on_progress).await?;
+    if let Err(e) = download_with_progress(
+        tag_name,
+        "Orbit-macOS-AppleSilicon.dmg",
+        &dmg_path,
+        on_progress,
+    )
+    .await
+    {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(e);
+    }
 
     emit_progress(
         on_progress,
@@ -572,8 +860,13 @@ async fn update_macos_dmg_and_relaunch(
         "Mounting and verifying macOS package…",
         false,
     );
-    std::fs::create_dir_all(&mount_dir)
-        .map_err(|e| format!("Failed to create mount directory: {e}"))?;
+    let mount_dir = match create_private_subdir(&staging_dir, "mount") {
+        Ok(dir) => dir,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(e);
+        }
+    };
 
     let attach_out = tokio::process::Command::new("hdiutil")
         .args([
@@ -586,9 +879,13 @@ async fn update_macos_dmg_and_relaunch(
         ])
         .output()
         .await
-        .map_err(|e| format!("Failed to invoke hdiutil: {e}"))?;
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            format!("Failed to invoke hdiutil: {e}")
+        })?;
 
     if !attach_out.status.success() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
         return Err(format!(
             "Failed to mount DMG: {}",
             String::from_utf8_lossy(&attach_out.stderr).trim()
@@ -618,6 +915,7 @@ async fn update_macos_dmg_and_relaunch(
         let _ = Command::new("hdiutil")
             .args(["detach", &mount_dir.to_string_lossy(), "-force", "-quiet"])
             .status();
+        let _ = std::fs::remove_dir_all(&staging_dir);
         return Err("Orbit.app was not found inside the downloaded package".into());
     };
 
@@ -635,7 +933,7 @@ async fn update_macos_dmg_and_relaunch(
     let sq_target = shell_single_quote(&target_app.to_string_lossy());
     let sq_src_app = shell_single_quote(&src_app.to_string_lossy());
     let sq_mount = shell_single_quote(&mount_dir.to_string_lossy());
-    let sq_dmg = shell_single_quote(&dmg_path.to_string_lossy());
+    let sq_staging = shell_single_quote(&staging_dir.to_string_lossy());
 
     let updater_script = format!(
         "(
@@ -664,34 +962,40 @@ async fn update_macos_dmg_and_relaunch(
             fi
           fi
           hdiutil detach {sq_mount} -quiet 2>/dev/null || hdiutil detach {sq_mount} -force -quiet 2>/dev/null || true
-          rm -f {sq_dmg}
+          rm -rf {sq_staging}
           open \"$DEST\"
         ) >/dev/null 2>&1 &"
     );
 
-    spawn_detached_shell(&updater_script)?;
+    if let Err(e) = spawn_detached_shell(&updater_script) {
+        let _ = Command::new("hdiutil")
+            .args(["detach", &mount_dir.to_string_lossy(), "-force", "-quiet"])
+            .status();
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(e);
+    }
     tokio::time::sleep(Duration::from_millis(280)).await;
     std::process::exit(0);
 }
 
 async fn update_linux_deb_and_relaunch(
-    release: &ReleaseUpdateInfo,
+    tag_name: &str,
     on_progress: &Channel<AppUpdateProgress>,
 ) -> Result<(), String> {
-    let deb_url = if std::env::consts::ARCH == "aarch64" {
-        release.linux_arm64_deb_url.as_deref()
+    let deb_asset = if std::env::consts::ARCH == "aarch64" {
+        "Orbit-Linux-arm64.deb"
     } else {
-        release.linux_x64_deb_url.as_deref()
-    }
-    .filter(|s| !s.is_empty())
-    .ok_or_else(|| "No Linux desktop package URL found for this architecture".to_string())?;
+        "Orbit-Linux-x64.deb"
+    };
 
-    let tmp_dir = std::env::temp_dir();
+    let staging_dir = create_private_update_staging_dir()?;
     let my_pid = std::process::id();
-    let deb_path = tmp_dir.join(format!("Orbit-{}-{my_pid}.deb", release.latest_version));
-    let stage_dir = tmp_dir.join(format!("orbit_deb_stage_{my_pid}"));
+    let deb_path = staging_dir.join("installer.deb");
 
-    download_with_progress(deb_url, &release.tag_name, &deb_path, on_progress).await?;
+    if let Err(e) = download_with_progress(tag_name, deb_asset, &deb_path, on_progress).await {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(e);
+    }
 
     emit_progress(
         on_progress,
@@ -699,8 +1003,13 @@ async fn update_linux_deb_and_relaunch(
         "Extracting and verifying Linux package…",
         false,
     );
-    std::fs::create_dir_all(&stage_dir)
-        .map_err(|e| format!("Failed to create temporary directory: {e}"))?;
+    let stage_dir = match create_private_subdir(&staging_dir, "stage") {
+        Ok(dir) => dir,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(e);
+        }
+    };
 
     let extract_out = tokio::process::Command::new("dpkg-deb")
         .args([
@@ -710,8 +1019,12 @@ async fn update_linux_deb_and_relaunch(
         ])
         .output()
         .await
-        .map_err(|e| format!("Failed to invoke dpkg-deb: {e}"))?;
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            format!("Failed to invoke dpkg-deb: {e}")
+        })?;
     if !extract_out.status.success() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
         return Err(format!(
             "Failed to extract .deb package: {}",
             String::from_utf8_lossy(&extract_out.stderr).trim()
@@ -720,6 +1033,7 @@ async fn update_linux_deb_and_relaunch(
 
     let extracted_bin = stage_dir.join("usr/bin/orbit-desktop");
     if !extracted_bin.is_file() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
         return Err("usr/bin/orbit-desktop was not found inside the downloaded package".into());
     }
 
@@ -734,6 +1048,7 @@ async fn update_linux_deb_and_relaunch(
 
     let sq_deb = shell_single_quote(&deb_path.to_string_lossy());
     let sq_stage = shell_single_quote(&stage_dir.to_string_lossy());
+    let sq_staging = shell_single_quote(&staging_dir.to_string_lossy());
     let sq_extracted = shell_single_quote(&extracted_bin.to_string_lossy());
     let sq_cur_exe = shell_single_quote(&cur_exe.to_string_lossy());
 
@@ -781,12 +1096,15 @@ async fn update_linux_deb_and_relaunch(
               fi
             fi
           fi
-          rm -rf {sq_stage} {sq_deb}
+          rm -rf {sq_staging}
           MALLOC_ARENA_MAX=\"${{MALLOC_ARENA_MAX:-2}}\" nohup \"$LAUNCH_TARGET\" >/dev/null 2>&1 &
         ) >/dev/null 2>&1 &"
     );
 
-    spawn_detached_shell(&updater_script)?;
+    if let Err(e) = spawn_detached_shell(&updater_script) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(e);
+    }
     tokio::time::sleep(Duration::from_millis(280)).await;
     std::process::exit(0);
 }
@@ -941,71 +1259,109 @@ fn atomic_install_executable(src: &Path, dst: &Path) -> Result<(), String> {
 
 async fn download_orbit_cli_binary(dst_tmp: &Path) -> Result<(), String> {
     let asset = orbit_cli_release_asset_name()?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(90))
-        .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let client = build_github_release_download_client(
+        Duration::from_secs(15),
+        Some(Duration::from_secs(90)),
+    )?;
 
-    let candidates = [
-        format!(
-            "https://github.com/{GITHUB_REPO}/releases/download/v{CURRENT_APP_VERSION}/{asset}"
-        ),
-        format!("https://github.com/{GITHUB_REPO}/releases/latest/download/{asset}"),
-    ];
+    let mut release_tags = vec![normalize_and_validate_release_tag(CURRENT_APP_VERSION)?];
+    if let Ok(latest_tag) = resolve_latest_tag_via_web_redirect().await
+        && let Ok(valid_latest) = normalize_and_validate_release_tag(&latest_tag)
+        && !release_tags.iter().any(|t| t == &valid_latest)
+    {
+        release_tags.push(valid_latest);
+    }
 
     let mut last_err = String::from("Failed to download Orbit daemon binary");
-    for url in candidates {
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let mut file = tokio::fs::File::create(dst_tmp)
-                    .await
-                    .map_err(|e| format!("Failed to create temp binary: {e}"))?;
-                let mut stream = resp.bytes_stream();
-                let mut write_failed: Option<String> = None;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if let Err(e) = file.write_all(&bytes).await {
-                                write_failed = Some(format!("Failed to write binary: {e}"));
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            write_failed = Some(format!("Download interrupted: {e}"));
-                            break;
-                        }
-                    }
-                }
-                if let Some(err) = write_failed {
-                    let _ = tokio::fs::remove_file(dst_tmp).await;
-                    last_err = err;
-                    continue;
-                }
-                if let Err(e) = file.flush().await {
-                    let _ = tokio::fs::remove_file(dst_tmp).await;
-                    return Err(format!("Failed to flush binary: {e}"));
-                }
-                drop(file);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Err(e) =
-                        std::fs::set_permissions(dst_tmp, std::fs::Permissions::from_mode(0o755))
-                    {
-                        let _ = std::fs::remove_file(dst_tmp);
-                        return Err(format!("Failed to chmod downloaded binary: {e}"));
-                    }
-                }
-                return Ok(());
+    for tag in release_tags {
+        let base = format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}");
+        let sums_url = format!("{base}/{}", orbit_crypto::SHA256SUMS_FILENAME);
+        let asset_url = format!("{base}/{asset}");
+
+        // Probe whether this release tag exists before failing; never ignore SHA-256 errors
+        // once a release tag is present.
+        let sums_resp = match client.get(&sums_url).send().await {
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                last_err = format!("Release checksums not found at {sums_url} (HTTP 404)");
+                continue;
             }
-            Ok(resp) => {
-                last_err = format!("HTTP {} fetching {url}", resp.status());
+            Ok(resp) if !resp.status().is_success() => {
+                return Err(format!(
+                    "Failed to fetch release checksums {sums_url} (HTTP {}); refusing unverified daemon sync",
+                    resp.status()
+                ));
             }
+            Ok(resp) => resp,
             Err(e) => {
-                last_err = format!("Network error fetching {url}: {e}");
+                last_err = format!("Network error fetching {sums_url}: {e}");
+                continue;
+            }
+        };
+
+        let sums_text = sums_resp
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read {sums_url}: {e}"))?;
+        let expected_sha256 = orbit_crypto::find_expected_sha256(&sums_text, asset)
+            .map_err(|e| format!("Release checksum manifest {sums_url} rejected `{asset}`: {e}"))?;
+
+        let resp = client
+            .get(&asset_url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error fetching {asset_url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {} fetching {asset_url}", resp.status()));
+        }
+
+        let mut file = tokio::fs::File::create(dst_tmp)
+            .await
+            .map_err(|e| format!("Failed to create temp binary: {e}"))?;
+        let mut hasher = orbit_crypto::Sha256Hasher::new();
+        let mut stream = resp.bytes_stream();
+        let mut write_failed: Option<String> = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    hasher.update(&bytes);
+                    if let Err(e) = file.write_all(&bytes).await {
+                        write_failed = Some(format!("Failed to write binary: {e}"));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    write_failed = Some(format!("Download interrupted: {e}"));
+                    break;
+                }
             }
         }
+        if let Some(err) = write_failed {
+            let _ = tokio::fs::remove_file(dst_tmp).await;
+            return Err(err);
+        }
+        if let Err(e) = file.flush().await {
+            let _ = tokio::fs::remove_file(dst_tmp).await;
+            return Err(format!("Failed to flush binary: {e}"));
+        }
+        drop(file);
+
+        let actual_sha256 = hasher.finalize_hex();
+        if let Err(e) = orbit_crypto::verify_sha256_hex(asset, &expected_sha256, &actual_sha256) {
+            let _ = tokio::fs::remove_file(dst_tmp).await;
+            return Err(format!("SHA-256 verification failed for {asset_url}: {e}"));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(dst_tmp, std::fs::Permissions::from_mode(0o755))
+            {
+                let _ = std::fs::remove_file(dst_tmp);
+                return Err(format!("Failed to chmod downloaded binary: {e}"));
+            }
+        }
+        return Ok(());
     }
     Err(last_err)
 }
@@ -1151,6 +1507,46 @@ mod tests {
         assert_eq!(compare_semver("0.2.3", "v0.2.3"), Ordering::Equal);
         assert_eq!(compare_semver("0.2.2", "0.2.3"), Ordering::Less);
         assert_eq!(compare_semver("1.0.0", "0.9.9"), Ordering::Greater);
+        assert_eq!(compare_semver("v0.9.1-rc.1", "0.9.1"), Ordering::Less);
+        assert_eq!(compare_semver("0.9.1", "0.9.1-rc.1"), Ordering::Greater);
+        assert_eq!(
+            compare_semver("0.9.1-rc.2", "0.9.1-rc.1"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_semver("0.9.1-rc.10", "0.9.1-rc.2"),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn validate_upgrade_target_tag_rejects_older_and_equal_versions() {
+        assert_eq!(
+            validate_upgrade_target_tag("v0.9.2", "0.9.1").as_deref(),
+            Ok("v0.9.2")
+        );
+        assert_eq!(
+            validate_upgrade_target_tag("0.9.2-rc-1", "0.9.1").as_deref(),
+            Ok("v0.9.2-rc-1")
+        );
+        assert_eq!(
+            validate_upgrade_target_tag("v0.9.1", "0.9.1-rc.1").as_deref(),
+            Ok("v0.9.1")
+        );
+        for blocked in [
+            "v0.9.1",
+            "0.9.1",
+            "v0.9.0",
+            "0.1.0",
+            "v0.9.1-rc.1",
+            "v0.9.1-alpha-1",
+            "../v9.9.9",
+        ] {
+            assert!(
+                validate_upgrade_target_tag(blocked, "0.9.1").is_err(),
+                "expected downgrade/equal/invalid tag `{blocked}` to be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1201,5 +1597,184 @@ mod tests {
                 "https://github.com/danielgaoyy/orbit/releases/download/v0.5.4/Orbit-Linux-x64.deb"
             )
         );
+    }
+
+    #[test]
+    fn release_tag_validation_and_github_redirect_allowlist_block_ssrf() {
+        assert_eq!(
+            normalize_and_validate_release_tag("v0.9.1").as_deref(),
+            Ok("v0.9.1")
+        );
+        assert_eq!(
+            normalize_and_validate_release_tag("0.9.2-rc.1").as_deref(),
+            Ok("v0.9.2-rc.1")
+        );
+        for bad in [
+            "",
+            "../evil",
+            "v0.9.1/../../etc/passwd",
+            "v0.9.1?foo=bar",
+            "https://evil.example/v0.9.1",
+            "v0.9.1-a..b",
+        ] {
+            assert!(
+                normalize_and_validate_release_tag(bad).is_err(),
+                "expected invalid tag `{bad}` to be rejected"
+            );
+        }
+
+        for ok_url in [
+            "https://github.com/danielgaoyy/orbit/releases/download/v0.9.1/Orbit-macOS-AppleSilicon.dmg",
+            "https://objects.githubusercontent.com/github-production-release-asset-123/file",
+            "https://release-assets.githubusercontent.com/github-production-release-asset-123/file",
+        ] {
+            let parsed = reqwest::Url::parse(ok_url).expect("parse ok url");
+            assert!(
+                is_allowed_github_release_download_url(&parsed),
+                "expected `{ok_url}` to be allowed"
+            );
+        }
+        for bad_url in [
+            "http://github.com/danielgaoyy/orbit/releases/download/v0.9.1/a.dmg",
+            "https://github.com.evil.example/file",
+            "https://127.0.0.1:8080/SHA256SUMS.txt",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://evil.example/Orbit-macOS-AppleSilicon.dmg",
+        ] {
+            let parsed = reqwest::Url::parse(bad_url).expect("parse bad url");
+            assert!(
+                !is_allowed_github_release_download_url(&parsed),
+                "expected `{bad_url}` to be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn private_update_staging_dir_is_unique_and_mode_0700() {
+        let dir1 = create_private_update_staging_dir().expect("create staging dir 1");
+        let dir2 = create_private_update_staging_dir().expect("create staging dir 2");
+        assert_ne!(dir1, dir2);
+        assert!(dir1.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir1)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "staging dir must be strictly 0700");
+        }
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn desktop_installer_download_enforces_sha256sums() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let genuine: &'static [u8] = b"genuine-orbit-desktop-dmg-payload-bytes";
+        let tampered: &'static [u8] = b"tampered-orbit-desktop-dmg-payload-bytes";
+        let genuine_sha = orbit_crypto::sha256_hex_bytes(genuine);
+        let valid_sums = format!("{genuine_sha}  Orbit-macOS-AppleSilicon.dmg\n");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let sums = valid_sums.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, body): (&str, Vec<u8>) = match path {
+                        "/ok/SHA256SUMS.txt" | "/tampered/SHA256SUMS.txt" => {
+                            ("200 OK", sums.into_bytes())
+                        }
+                        "/ok/Orbit-macOS-AppleSilicon.dmg"
+                        | "/no-sums/Orbit-macOS-AppleSilicon.dmg" => ("200 OK", genuine.to_vec()),
+                        "/tampered/Orbit-macOS-AppleSilicon.dmg" => ("200 OK", tampered.to_vec()),
+                        _ => ("404 Not Found", b"not found".to_vec()),
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "orbit_desktop_updater_sha256_{}",
+            next_unique_temp_suffix()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+
+        // 1. Valid SHA256 passes
+        let ok_dest = tmp_dir.join("ok.dmg");
+        let verified = download_and_verify_release_file(
+            &client,
+            &format!("http://{addr}/ok/Orbit-macOS-AppleSilicon.dmg"),
+            &format!("http://{addr}/ok/SHA256SUMS.txt"),
+            "Orbit-macOS-AppleSilicon.dmg",
+            &ok_dest,
+            |_, _| {},
+        )
+        .await
+        .expect("matching sha256 must pass");
+        assert_eq!(verified, genuine_sha);
+        assert_eq!(std::fs::read(&ok_dest).expect("read ok"), genuine);
+
+        // 2. Tampered DMG fails and deletes staged file before mount/launch
+        let bad_dest = tmp_dir.join("tampered.dmg");
+        let err = download_and_verify_release_file(
+            &client,
+            &format!("http://{addr}/tampered/Orbit-macOS-AppleSilicon.dmg"),
+            &format!("http://{addr}/tampered/SHA256SUMS.txt"),
+            "Orbit-macOS-AppleSilicon.dmg",
+            &bad_dest,
+            |_, _| {},
+        )
+        .await
+        .expect_err("tampered dmg must fail");
+        assert!(err.contains("SHA-256"), "unexpected error: {err}");
+        assert!(!bad_dest.exists(), "tampered installer must be removed");
+
+        // 3. Missing SHA256SUMS.txt fails cleanly
+        let nosums_dest = tmp_dir.join("nosums.dmg");
+        let err = download_and_verify_release_file(
+            &client,
+            &format!("http://{addr}/no-sums/Orbit-macOS-AppleSilicon.dmg"),
+            &format!("http://{addr}/no-sums/SHA256SUMS.txt"),
+            "Orbit-macOS-AppleSilicon.dmg",
+            &nosums_dest,
+            |_, _| {},
+        )
+        .await
+        .expect_err("missing SHA256SUMS.txt must fail");
+        assert!(err.contains("404"), "unexpected error: {err}");
+        assert!(!nosums_dest.exists());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

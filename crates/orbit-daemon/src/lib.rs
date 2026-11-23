@@ -6174,15 +6174,14 @@ fn daemon_release_asset_name() -> anyhow::Result<&'static str> {
 }
 
 impl DaemonRuntime {
-    /// Download the matching Orbit release binary, verify `--version`, atomically install to
+    /// Download the matching Orbit release binary, verify its SHA-256 against `SHA256SUMS.txt`
+    /// from the exact same GitHub Release, verify `--version`, atomically install to
     /// `~/.local/bin/orbit` (or `%USERPROFILE%\.local\bin\orbit.exe` on Windows), and trigger a
     /// detached `orbit daemon up` hot-restart so all `orbit shim` agent & PTY sessions stay alive.
     pub async fn self_upgrade_and_restart(
         &self,
         target_version: Option<String>,
     ) -> anyhow::Result<()> {
-        use tokio::io::AsyncWriteExt;
-
         let _upgrade_guard = self.upgrade_lock.lock().await;
 
         let asset = daemon_release_asset_name()?;
@@ -6212,88 +6211,30 @@ impl DaemonRuntime {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "danielgaoyy/orbit".to_string());
 
-        let mut urls: Vec<String> = Vec::new();
-        if let Some(raw_ver) = target_version
+        let release_tag = match target_version
             .as_deref()
             .map(str::trim)
             .map(|s| s.trim_start_matches(['v', 'V']))
             .filter(|s| !s.is_empty())
         {
-            if !is_valid_release_semver(raw_ver) {
-                anyhow::bail!("Invalid target version format: {raw_ver}");
+            Some(raw_ver) => {
+                if !is_valid_release_semver(raw_ver) {
+                    anyhow::bail!("Invalid target version format: {raw_ver}");
+                }
+                format!("v{raw_ver}")
             }
-            urls.push(format!(
-                "https://github.com/{repo}/releases/download/v{raw_ver}/{asset}"
-            ));
-        }
-        urls.push(format!(
-            "https://github.com/{repo}/releases/latest/download/{asset}"
-        ));
+            None => resolve_latest_github_release_tag(&repo).await?,
+        };
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(90))
             .user_agent(format!("orbit-daemon/{}", env!("CARGO_PKG_VERSION")))
             .build()?;
 
-        let mut downloaded = false;
-        let mut last_err = anyhow::anyhow!("Failed to download Orbit binary");
-        for url in &urls {
-            match client.get(url).send().await {
-                Ok(mut resp) if resp.status().is_success() => {
-                    let mut file = tokio::fs::File::create(&tmp_path).await?;
-                    let mut stream_err: Option<anyhow::Error> = None;
-                    loop {
-                        match resp.chunk().await {
-                            Ok(Some(bytes)) => {
-                                if let Err(e) = file.write_all(&bytes).await {
-                                    stream_err = Some(e.into());
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                stream_err = Some(e.into());
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(err) = stream_err {
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                        last_err = err;
-                        continue;
-                    }
-                    if let Err(e) = file.flush().await {
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                        return Err(e.into());
-                    }
-                    drop(file);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Err(e) = std::fs::set_permissions(
-                            &tmp_path,
-                            std::fs::Permissions::from_mode(0o755),
-                        ) {
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err(e.into());
-                        }
-                    }
-                    downloaded = true;
-                    break;
-                }
-                Ok(resp) => {
-                    last_err = anyhow::anyhow!("HTTP {} downloading {url}", resp.status());
-                }
-                Err(e) => {
-                    last_err = anyhow::anyhow!("Network error downloading {url}: {e}");
-                }
-            }
-        }
-
-        if !downloaded {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(last_err);
-        }
+        let release_base_url = format!("https://github.com/{repo}/releases/download/{release_tag}");
+        let verified_sha256 =
+            download_and_verify_release_binary(&client, &release_base_url, asset, &tmp_path)
+                .await?;
 
         let check = tokio::process::Command::new(&tmp_path)
             .arg("--version")
@@ -6388,6 +6329,8 @@ impl DaemonRuntime {
 
         tracing::info!(
             install_path = %install_path.display(),
+            release_tag = %release_tag,
+            sha256 = %verified_sha256,
             port,
             restart_relay,
             "Scheduled self-upgrade hot-restart via `orbit daemon up`"
@@ -6396,10 +6339,192 @@ impl DaemonRuntime {
     }
 }
 
-fn parse_relay_port_from_json(raw: &str) -> Option<u16> {
+fn extract_tag_from_github_release_url(url: &str) -> Option<String> {
+    let clean = url.split(['?', '#']).next()?.trim().trim_end_matches('/');
+    let (_, after_tag) = clean.rsplit_once("/releases/tag/")?;
+    let tag = after_tag.split('/').next()?.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    Some(tag.to_string())
+}
+
+async fn resolve_latest_github_release_tag(repo: &str) -> anyhow::Result<String> {
+    let latest_web_url = format!("https://github.com/{repo}/releases/latest");
+    let no_redirect = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(format!("orbit-daemon/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let mut web_err: Option<String> = None;
+    for use_head in [true, false] {
+        let req = if use_head {
+            no_redirect.head(&latest_web_url)
+        } else {
+            no_redirect.get(&latest_web_url)
+        };
+        match req.send().await {
+            Ok(resp) => {
+                if resp.status().is_redirection()
+                    && let Some(loc) = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                    && let Some(tag) = extract_tag_from_github_release_url(loc)
+                {
+                    return Ok(tag);
+                }
+                if let Some(tag) = extract_tag_from_github_release_url(resp.url().as_str()) {
+                    return Ok(tag);
+                }
+                if !use_head {
+                    web_err = Some(format!(
+                        "HTTP {} without release tag redirect",
+                        resp.status()
+                    ));
+                }
+            }
+            Err(e) if !use_head => {
+                web_err = Some(e.to_string());
+            }
+            Err(_) => {}
+        }
+    }
+
+    let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let api_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(format!("orbit-daemon/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let resp = api_client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to resolve latest Orbit release tag (web redirect: {}; API: {e})",
+                web_err.as_deref().unwrap_or("unknown")
+            )
+        })?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "Failed to resolve latest Orbit release tag (web redirect: {}; API HTTP {})",
+            web_err.as_deref().unwrap_or("unknown"),
+            resp.status()
+        );
+    }
+    let meta: serde_json::Value = resp.json().await?;
+    meta.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Missing tag_name in GitHub release metadata"))
+}
+
+/// Fetch `SHA256SUMS.txt` and `asset` from the exact same release base URL, streaming the binary
+/// to `tmp_path` while hashing, and verifying SHA-256 BEFORE marking executable or executing.
+async fn download_and_verify_release_binary(
+    client: &reqwest::Client,
+    release_base_url: &str,
+    asset: &str,
+    tmp_path: &Path,
+) -> anyhow::Result<String> {
+    use tokio::io::AsyncWriteExt;
+
+    let base = release_base_url.trim_end_matches('/');
+    let sums_url = format!("{base}/{}", orbit_crypto::SHA256SUMS_FILENAME);
+    let asset_url = format!("{base}/{asset}");
+
+    let sums_resp = client
+        .get(&sums_url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Network error downloading checksums {sums_url}: {e}"))?;
+    if !sums_resp.status().is_success() {
+        anyhow::bail!(
+            "Failed to fetch release checksums {sums_url} (HTTP {}); refusing unverified upgrade",
+            sums_resp.status()
+        );
+    }
+    let sums_text = sums_resp
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read {sums_url}: {e}"))?;
+    let expected_sha256 = orbit_crypto::find_expected_sha256(&sums_text, asset).map_err(|e| {
+        anyhow::anyhow!("Release checksum manifest {sums_url} rejected `{asset}`: {e}")
+    })?;
+
+    let mut resp = client
+        .get(&asset_url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Network error downloading {asset_url}: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HTTP {} downloading {asset_url}", resp.status());
+    }
+
+    let mut file = tokio::fs::File::create(tmp_path).await?;
+    let mut hasher = orbit_crypto::Sha256Hasher::new();
+    let mut stream_err: Option<anyhow::Error> = None;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(bytes)) => {
+                hasher.update(&bytes);
+                if let Err(e) = file.write_all(&bytes).await {
+                    stream_err = Some(e.into());
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                stream_err = Some(e.into());
+                break;
+            }
+        }
+    }
+    if let Some(err) = stream_err {
+        let _ = tokio::fs::remove_file(tmp_path).await;
+        return Err(err);
+    }
+    if let Err(e) = file.flush().await {
+        let _ = tokio::fs::remove_file(tmp_path).await;
+        return Err(e.into());
+    }
+    drop(file);
+
+    let actual_sha256 = hasher.finalize_hex();
+    if let Err(err) = orbit_crypto::verify_sha256_hex(asset, &expected_sha256, &actual_sha256) {
+        let _ = tokio::fs::remove_file(tmp_path).await;
+        anyhow::bail!("SHA-256 verification failed for {asset_url}: {err}");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(tmp_path, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(e.into());
+        }
+    }
+
+    Ok(actual_sha256)
+}
+
+fn parse_relay_probe_addr_from_json(raw: &str) -> Option<SocketAddr> {
     let val: serde_json::Value = serde_json::from_str(raw).ok()?;
     let addr_str = val.get("listen_addr")?.as_str()?;
-    addr_str.parse::<SocketAddr>().ok().map(|a| a.port())
+    let addr = addr_str.parse::<SocketAddr>().ok()?;
+    Some(match addr {
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+            SocketAddr::from(([127, 0, 0, 1], v4.port()))
+        }
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, v6.port()))
+        }
+        explicit => explicit,
+    })
 }
 
 async fn detect_running_local_relay(home_dir: &Path) -> bool {
@@ -6407,18 +6532,32 @@ async fn detect_running_local_relay(home_dir: &Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(&relay_cfg_path) else {
         return false;
     };
-    let port = parse_relay_port_from_json(&raw).unwrap_or(7878);
+    let probe_addr = parse_relay_probe_addr_from_json(&raw)
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7878)));
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     else {
         return false;
     };
-    client
-        .get(format!("http://127.0.0.1:{port}/health"))
+    let Ok(resp) = client
+        .get(format!("http://{probe_addr}/healthz"))
         .send()
         .await
-        .map(|r| r.status().is_success())
+    else {
+        return false;
+    };
+    if resp.status() != reqwest::StatusCode::OK {
+        return false;
+    }
+    if resp.content_length().is_some_and(|len| len > 64) {
+        return false;
+    }
+    resp.text()
+        .await
+        .map(|body| body.trim() == "ok")
         .unwrap_or(false)
 }
 
@@ -6801,16 +6940,26 @@ mod self_upgrade_tests {
     }
 
     #[test]
-    fn parse_relay_port_from_json_reads_listen_addr() {
+    fn parse_relay_probe_addr_from_json_reads_listen_addr() {
         assert_eq!(
-            parse_relay_port_from_json(r#"{"listen_addr":"0.0.0.0:7878","allowed_pubkeys":[]}"#),
-            Some(7878)
+            parse_relay_probe_addr_from_json(
+                r#"{"listen_addr":"0.0.0.0:7878","allowed_pubkeys":[]}"#
+            ),
+            Some(SocketAddr::from(([127, 0, 0, 1], 7878)))
         );
         assert_eq!(
-            parse_relay_port_from_json(r#"{"listen_addr":"127.0.0.1:9001"}"#),
-            Some(9001)
+            parse_relay_probe_addr_from_json(r#"{"listen_addr":"[::]:7879"}"#),
+            Some(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 7879)))
         );
-        assert_eq!(parse_relay_port_from_json("not json"), None);
+        assert_eq!(
+            parse_relay_probe_addr_from_json(r#"{"listen_addr":"[::1]:9001"}"#),
+            Some(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 9001)))
+        );
+        assert_eq!(
+            parse_relay_probe_addr_from_json(r#"{"listen_addr":"127.0.0.2:7880"}"#),
+            Some(SocketAddr::from(([127, 0, 0, 2], 7880)))
+        );
+        assert_eq!(parse_relay_probe_addr_from_json("not json"), None);
     }
 
     #[test]
@@ -7380,5 +7529,301 @@ mod self_upgrade_tests {
         }
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn detect_running_local_relay_probes_healthz_endpoint() {
+        let base = std::env::temp_dir().join(format!(
+            "orbit_relay_healthz_test_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).expect("mkdir");
+
+        // 1. Missing relay.json -> false
+        assert!(!detect_running_local_relay(&base).await);
+
+        // 2. Local server serving `/healthz` (matching `orbit-relay`, wildcard 0.0.0.0 -> 127.0.0.1) -> true
+        let healthz_app = Router::new().route("/healthz", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind healthz");
+        let healthz_addr = listener.local_addr().expect("addr");
+        let healthz_srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, healthz_app).await;
+        });
+
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": format!("0.0.0.0:{}", healthz_addr.port()),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write relay.json");
+        assert!(
+            detect_running_local_relay(&base).await,
+            "expected local relay serving /healthz to be detected"
+        );
+        healthz_srv.abort();
+
+        // 3. IPv6 loopback listener (`[::1]`) -> true
+        if let Ok(v6_listener) = tokio::net::TcpListener::bind("[::1]:0").await {
+            let v6_addr = v6_listener.local_addr().expect("v6 addr");
+            let v6_app = Router::new().route("/healthz", get(|| async { "ok" }));
+            let v6_srv = tokio::spawn(async move {
+                let _ = axum::serve(v6_listener, v6_app).await;
+            });
+            std::fs::write(
+                base.join("relay.json"),
+                serde_json::json!({
+                    "listen_addr": v6_addr.to_string(),
+                    "allowed_pubkeys": []
+                })
+                .to_string(),
+            )
+            .expect("write v6 relay.json");
+            assert!(
+                detect_running_local_relay(&base).await,
+                "expected IPv6 loopback relay serving /healthz to be detected"
+            );
+            v6_srv.abort();
+        }
+
+        // 4. Redirect on `/healthz` must NOT be followed -> false
+        let redirect_app = Router::new()
+            .route(
+                "/healthz",
+                get(|| async { axum::response::Redirect::temporary("/ok") }),
+            )
+            .route("/ok", get(|| async { "ok" }));
+        let redir_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect");
+        let redir_addr = redir_listener.local_addr().expect("redir addr");
+        let redir_srv = tokio::spawn(async move {
+            let _ = axum::serve(redir_listener, redirect_app).await;
+        });
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": redir_addr.to_string(),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write redirect relay.json");
+        assert!(
+            !detect_running_local_relay(&base).await,
+            "redirecting /healthz response must not pass health probe"
+        );
+        redir_srv.abort();
+
+        // 5. Server serving only legacy `/health` (404 on `/healthz`) -> false
+        let legacy_app = Router::new().route("/health", get(|| async { "ok" }));
+        let legacy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind legacy");
+        let legacy_addr = legacy_listener.local_addr().expect("legacy addr");
+        let legacy_srv = tokio::spawn(async move {
+            let _ = axum::serve(legacy_listener, legacy_app).await;
+        });
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": legacy_addr.to_string(),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write legacy relay.json");
+        assert!(
+            !detect_running_local_relay(&base).await,
+            "server without /healthz must not be treated as healthy orbit-relay"
+        );
+        legacy_srv.abort();
+
+        // 6. Server returning HTTP 200 JSON on `/healthz` (e.g. daemon or unrelated service) -> false
+        let json_app = Router::new().route(
+            "/healthz",
+            get(|| async { axum::Json(serde_json::json!({ "status": "ok" })) }),
+        );
+        let json_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind json healthz");
+        let json_addr = json_listener.local_addr().expect("json addr");
+        let json_srv = tokio::spawn(async move {
+            let _ = axum::serve(json_listener, json_app).await;
+        });
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": json_addr.to_string(),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write json relay.json");
+        assert!(
+            !detect_running_local_relay(&base).await,
+            "200 JSON /healthz body must not be treated as healthy orbit-relay"
+        );
+        json_srv.abort();
+
+        // 7. Server returning HTTP 204 No Content on `/healthz` -> false
+        let no_content_app = Router::new().route(
+            "/healthz",
+            get(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let nc_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 204 healthz");
+        let nc_addr = nc_listener.local_addr().expect("204 addr");
+        let nc_srv = tokio::spawn(async move {
+            let _ = axum::serve(nc_listener, no_content_app).await;
+        });
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": nc_addr.to_string(),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write 204 relay.json");
+        assert!(
+            !detect_running_local_relay(&base).await,
+            "204 /healthz must not be treated as healthy orbit-relay"
+        );
+        nc_srv.abort();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_release_binary_enforces_sha256sums() {
+        const GENUINE_BYTES: &[u8] = b"genuine-orbit-daemon-release-binary-v0.9.2";
+        const TAMPERED_BYTES: &[u8] = b"tampered-orbit-daemon-release-binary-v0.9.2";
+        let genuine_sha = orbit_crypto::sha256_hex_bytes(GENUINE_BYTES);
+        let valid_sums = format!("{genuine_sha}  orbit-cli-linux-x64\n");
+        let missing_asset_sums = format!("{genuine_sha}  other-asset\n");
+
+        let app = Router::new()
+            .route(
+                "/ok/SHA256SUMS.txt",
+                get({
+                    let s = valid_sums.clone();
+                    move || async move { s }
+                }),
+            )
+            .route("/ok/orbit-cli-linux-x64", get(|| async { GENUINE_BYTES }))
+            .route(
+                "/tampered/SHA256SUMS.txt",
+                get({
+                    let s = valid_sums.clone();
+                    move || async move { s }
+                }),
+            )
+            .route(
+                "/tampered/orbit-cli-linux-x64",
+                get(|| async { TAMPERED_BYTES }),
+            )
+            .route(
+                "/missing-entry/SHA256SUMS.txt",
+                get({
+                    let s = missing_asset_sums.clone();
+                    move || async move { s }
+                }),
+            )
+            .route(
+                "/missing-entry/orbit-cli-linux-x64",
+                get(|| async { GENUINE_BYTES }),
+            )
+            .route(
+                "/no-sums/orbit-cli-linux-x64",
+                get(|| async { GENUINE_BYTES }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock release server");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "orbit_daemon_sha256_test_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+
+        // 1. Valid SHA256SUMS.txt + matching binary -> succeeds
+        let ok_path = tmp_dir.join("orbit.ok");
+        let verified = download_and_verify_release_binary(
+            &client,
+            &format!("http://{addr}/ok"),
+            "orbit-cli-linux-x64",
+            &ok_path,
+        )
+        .await
+        .expect("matching sha256 must succeed");
+        assert_eq!(verified, genuine_sha);
+        assert_eq!(std::fs::read(&ok_path).expect("read ok"), GENUINE_BYTES);
+
+        // 2. Tampered binary -> aborts with mismatch error & deletes temp file
+        let bad_path = tmp_dir.join("orbit.tampered");
+        let err = download_and_verify_release_binary(
+            &client,
+            &format!("http://{addr}/tampered"),
+            "orbit-cli-linux-x64",
+            &bad_path,
+        )
+        .await
+        .expect_err("tampered binary must be rejected");
+        assert!(err.to_string().contains("SHA-256"), "unexpected err: {err}");
+        assert!(
+            !bad_path.exists(),
+            "tampered temp file must be removed immediately"
+        );
+
+        // 3. Missing SHA256SUMS.txt -> aborts cleanly
+        let no_sums_path = tmp_dir.join("orbit.nosums");
+        let err = download_and_verify_release_binary(
+            &client,
+            &format!("http://{addr}/no-sums"),
+            "orbit-cli-linux-x64",
+            &no_sums_path,
+        )
+        .await
+        .expect_err("missing SHA256SUMS.txt must fail");
+        assert!(
+            err.to_string().contains("refusing unverified upgrade"),
+            "unexpected err: {err}"
+        );
+        assert!(!no_sums_path.exists());
+
+        // 4. Missing asset entry in SHA256SUMS.txt -> aborts cleanly
+        let missing_path = tmp_dir.join("orbit.missing");
+        let err = download_and_verify_release_binary(
+            &client,
+            &format!("http://{addr}/missing-entry"),
+            "orbit-cli-linux-x64",
+            &missing_path,
+        )
+        .await
+        .expect_err("missing asset entry must fail");
+        assert!(
+            err.to_string().contains("not found in SHA256SUMS.txt"),
+            "unexpected err: {err}"
+        );
+        assert!(!missing_path.exists());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

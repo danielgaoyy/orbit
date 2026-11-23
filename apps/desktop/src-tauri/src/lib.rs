@@ -3159,10 +3159,10 @@ async fn check_app_update() -> Result<ReleaseUpdateInfo, String> {
 
 #[tauri::command]
 async fn perform_app_self_update(
-    release: ReleaseUpdateInfo,
+    target_tag: Option<String>,
     on_progress: Channel<AppUpdateProgress>,
 ) -> Result<(), String> {
-    perform_one_click_update(release, on_progress).await
+    perform_one_click_update(target_tag, on_progress).await
 }
 
 #[tauri::command]

@@ -4,7 +4,12 @@
 //! Ensures the Relay and Cloud Storage providers are strictly zero-knowledge and allows strict
 //! `--allow-pubkey` admission control.
 
+pub mod checksum;
 pub mod vault;
+pub use checksum::{
+    ChecksumError, SHA256SUMS_FILENAME, Sha256Hasher, find_expected_sha256, parse_sha256sums,
+    sha256_hex_bytes, verify_sha256_hex,
+};
 pub use vault::{
     CLOUD_VAULT_CIPHER, CLOUD_VAULT_ENVELOPE_FORMAT, CLOUD_VAULT_KDF, DerivedVaultKey,
     EncryptedVaultEnvelope, VaultCryptoError, VaultKdfParams, decrypt_vault_bytes,

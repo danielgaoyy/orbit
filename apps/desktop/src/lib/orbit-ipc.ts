@@ -4867,13 +4867,13 @@ export const orbitIpc = {
   },
 
   performAppSelfUpdate: async (
-    release: ReleaseUpdateInfo,
+    targetTag: string | null | undefined,
     onProgress: (ev: AppUpdateProgress) => void,
   ): Promise<void> => {
     const ch = new Channel<AppUpdateProgress>();
     ch.onmessage = onProgress;
     return invoke<void>("perform_app_self_update", {
-      release,
+      targetTag: targetTag ?? null,
       onProgress: ch,
     });
   },

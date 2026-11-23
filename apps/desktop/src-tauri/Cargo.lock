@@ -3193,6 +3193,7 @@ dependencies = [
  "gdk",
  "gtk",
  "orbit-client-core",
+ "orbit-crypto",
  "orbit-protocol",
  "orbit-providers",
  "reqwest 0.12.28",
@@ -3242,7 +3243,9 @@ version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
+ "hmac",
  "russh",
+ "sha1 0.11.0",
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",

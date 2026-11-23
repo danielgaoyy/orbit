@@ -5,6 +5,7 @@
 
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -15,6 +16,7 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
 use futures_util::{Sink, Stream};
+use hmac::{Hmac, KeyInit, Mac};
 use russh::ChannelStream;
 use russh::client::{self, AuthResult, Handler};
 use russh::keys::ssh_key::{
@@ -22,6 +24,7 @@ use russh::keys::ssh_key::{
     private::{Ed25519Keypair, Ed25519PrivateKey, KeypairData},
 };
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, key::safe_rng};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -56,6 +59,27 @@ pub enum RelayTransportError {
     Ssh(#[from] russh::Error),
     #[error("SSH key error: {0}")]
     SshKey(#[from] russh::keys::ssh_key::Error),
+    #[error(
+        "SSH host key mismatch for {host}:{port} (possible MITM attack): {detail} (observed server fingerprint: {observed_fp})"
+    )]
+    HostKeyMismatch {
+        host: String,
+        port: u16,
+        observed_fp: String,
+        detail: String,
+    },
+    #[error(
+        "untrusted SSH host key for {host}:{port} (observed fingerprint: {observed_fp}): not found in {known_hosts_path} and no `&fp=` pin provided. Verify the host key out-of-band, then either run `{ssh_hint}` / add it to ~/.ssh/known_hosts or pin `&fp={observed_fp}` in the ssh+relay:// URL"
+    )]
+    HostKeyUnknown {
+        host: String,
+        port: u16,
+        observed_fp: String,
+        known_hosts_path: String,
+        ssh_hint: String,
+    },
+    #[error("SSH host key verification failed: {0}")]
+    HostKeyVerification(String),
     #[error("SSH authentication failed")]
     SshAuthFailed,
     #[error("SSH connection timed out")]
@@ -372,7 +396,12 @@ impl SshRelaySession {
             nodelay: true,
             ..Default::default()
         });
-        let handler = OrbitSshHandler { expected_fps };
+        let handler = OrbitSshHandler {
+            ssh_host: spec.ssh_host.clone(),
+            ssh_port: spec.ssh_port,
+            expected_fps,
+            known_hosts_path: None,
+        };
         let target = (spec.ssh_host.as_str(), spec.ssh_port);
 
         let mut handle = tokio::time::timeout(
@@ -425,26 +454,371 @@ impl SshRelaySession {
 }
 
 struct OrbitSshHandler {
+    ssh_host: String,
+    ssh_port: u16,
     expected_fps: Vec<[u8; 32]>,
+    known_hosts_path: Option<PathBuf>,
+}
+
+impl OrbitSshHandler {
+    fn verify_server_key(
+        &self,
+        server_public_key: &PublicKeyOrCertificate,
+    ) -> Result<(), RelayTransportError> {
+        let pk = server_public_key.public_key();
+        let digest = pk.fingerprint(HashAlg::Sha256).sha256().ok_or_else(|| {
+            RelayTransportError::HostKeyVerification(format!(
+                "failed to compute SHA-256 fingerprint for {}:{}",
+                self.ssh_host, self.ssh_port
+            ))
+        })?;
+        let observed_fp = format_openssh_sha256_fingerprint(&digest);
+
+        if !self.expected_fps.is_empty() {
+            let matched = self.expected_fps.iter().any(|fp| fp == &digest);
+            if matched {
+                return Ok(());
+            }
+            return Err(RelayTransportError::HostKeyMismatch {
+                host: self.ssh_host.clone(),
+                port: self.ssh_port,
+                observed_fp,
+                detail: "server host key does not match any pinned `&fp=` fingerprint".to_string(),
+            });
+        }
+
+        let known_hosts_path = match &self.known_hosts_path {
+            Some(path) => path.clone(),
+            None => resolve_default_known_hosts_path().ok_or_else(|| {
+                RelayTransportError::HostKeyUnknown {
+                    host: self.ssh_host.clone(),
+                    port: self.ssh_port,
+                    observed_fp: observed_fp.clone(),
+                    known_hosts_path: "~/.ssh/known_hosts (home directory unavailable)".to_string(),
+                    ssh_hint: format_ssh_trust_hint(&self.ssh_host, self.ssh_port),
+                }
+            })?,
+        };
+
+        verify_against_known_hosts_file(
+            &self.ssh_host,
+            self.ssh_port,
+            &pk,
+            &digest,
+            &known_hosts_path,
+            &observed_fp,
+        )
+    }
 }
 
 impl Handler for OrbitSshHandler {
-    type Error = russh::Error;
+    type Error = RelayTransportError;
 
     fn check_server_key(
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        let accepted = if self.expected_fps.is_empty() {
-            true
-        } else {
-            let pk = server_public_key.public_key();
-            pk.fingerprint(HashAlg::Sha256)
-                .sha256()
-                .is_some_and(|digest| self.expected_fps.iter().any(|fp| fp == &digest))
-        };
-        async move { Ok(accepted) }
+        let result = self.verify_server_key(server_public_key).map(|()| true);
+        async move { result }
     }
+}
+
+fn resolve_default_known_hosts_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(|home| PathBuf::from(home).join(".ssh").join("known_hosts"))
+}
+
+fn format_ssh_trust_hint(host: &str, port: u16) -> String {
+    if port == DEFAULT_SSH_PORT {
+        format!("ssh {host}")
+    } else {
+        format!("ssh -p {port} {host}")
+    }
+}
+
+/// Pure-Rust OpenSSH `known_hosts` verification with strict `@revoked` precedence, multi-key
+/// rotation support, space/tab field parsing, HMAC-SHA1 hashed (`|1|...`) host matching, and
+/// explicit propagation of non-`NotFound` I/O errors.
+fn verify_against_known_hosts_file(
+    host: &str,
+    port: u16,
+    pubkey: &russh::keys::ssh_key::PublicKey,
+    server_sha256: &[u8; 32],
+    known_hosts_path: &Path,
+    observed_fp: &str,
+) -> Result<(), RelayTransportError> {
+    use std::io::BufRead;
+
+    let file = match std::fs::File::open(known_hosts_path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RelayTransportError::HostKeyUnknown {
+                host: host.to_string(),
+                port,
+                observed_fp: observed_fp.to_string(),
+                known_hosts_path: known_hosts_path.display().to_string(),
+                ssh_hint: format_ssh_trust_hint(host, port),
+            });
+        }
+        Err(err) => {
+            return Err(RelayTransportError::HostKeyVerification(format!(
+                "failed to read {} while verifying {}:{} (observed fingerprint: {}): {err}",
+                known_hosts_path.display(),
+                host,
+                port,
+                observed_fp
+            )));
+        }
+    };
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut line_buf = String::new();
+    let mut line_no: usize = 0;
+
+    let mut revoked_line: Option<usize> = None;
+    let mut matched_valid = false;
+    let mut first_mismatch_line: Option<usize> = None;
+
+    loop {
+        line_buf.clear();
+        let bytes_read = reader.read_line(&mut line_buf).map_err(|err| {
+            RelayTransportError::HostKeyVerification(format!(
+                "I/O error reading {} at line {} while verifying {}:{} (observed fingerprint: {}): {err}",
+                known_hosts_path.display(),
+                line_no + 1,
+                host,
+                port,
+                observed_fp
+            ))
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_no += 1;
+
+        let trimmed = line_buf.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let mut tokens = trimmed.split_whitespace();
+        let Some(first) = tokens.next() else {
+            continue;
+        };
+
+        let (is_revoked, host_patterns, key_type, key_b64) = if first == "@revoked" {
+            let (Some(hp), Some(kt), Some(kb)) = (tokens.next(), tokens.next(), tokens.next())
+            else {
+                continue;
+            };
+            (true, hp, kt, kb)
+        } else if first == "@cert-authority" {
+            // Certificate authority entries are not direct host keys.
+            continue;
+        } else if first.starts_with('@') {
+            // Unknown OpenSSH marker: ignore safely.
+            continue;
+        } else {
+            let (Some(kt), Some(kb)) = (tokens.next(), tokens.next()) else {
+                continue;
+            };
+            (false, first, kt, kb)
+        };
+
+        if !known_hosts_pattern_list_matches(host_patterns, host, port) {
+            continue;
+        }
+
+        let Some(key_matches) =
+            verify_known_hosts_entry_key(is_revoked, key_type, key_b64, pubkey, server_sha256)
+        else {
+            continue;
+        };
+        if is_revoked {
+            if key_matches && revoked_line.is_none() {
+                revoked_line = Some(line_no);
+            }
+        } else if key_matches {
+            matched_valid = true;
+        } else if first_mismatch_line.is_none() {
+            first_mismatch_line = Some(line_no);
+        }
+    }
+
+    if let Some(line) = revoked_line {
+        return Err(RelayTransportError::HostKeyMismatch {
+            host: host.to_string(),
+            port,
+            observed_fp: observed_fp.to_string(),
+            detail: format!(
+                "server host key is marked @revoked at {}:{}",
+                known_hosts_path.display(),
+                line
+            ),
+        });
+    }
+
+    if matched_valid {
+        return Ok(());
+    }
+
+    if let Some(line) = first_mismatch_line {
+        return Err(RelayTransportError::HostKeyMismatch {
+            host: host.to_string(),
+            port,
+            observed_fp: observed_fp.to_string(),
+            detail: format!(
+                "remote host identification has changed compared to {}:{}",
+                known_hosts_path.display(),
+                line
+            ),
+        });
+    }
+
+    Err(RelayTransportError::HostKeyUnknown {
+        host: host.to_string(),
+        port,
+        observed_fp: observed_fp.to_string(),
+        known_hosts_path: known_hosts_path.display().to_string(),
+        ssh_hint: format_ssh_trust_hint(host, port),
+    })
+}
+
+const OPENSSH_HASHED_HOST_SHA1_LEN: usize = 20;
+
+fn format_openssh_sha256_fingerprint(digest: &[u8; 32]) -> String {
+    format!("SHA256:{}", STANDARD_NO_PAD.encode(digest))
+}
+
+fn verify_known_hosts_entry_key(
+    is_revoked: bool,
+    key_type: &str,
+    key_b64: &str,
+    server_pubkey: &russh::keys::ssh_key::PublicKey,
+    server_sha256: &[u8; 32],
+) -> Option<bool> {
+    let openssh_line = format!("{key_type} {key_b64}");
+    if let Ok(recorded) = russh::keys::ssh_key::PublicKey::from_openssh(&openssh_line)
+        && recorded.algorithm().as_str() == key_type
+    {
+        return Some(&recorded == server_pubkey);
+    }
+    if is_revoked {
+        // Fail closed for `@revoked` entries with exotic/unparsed key types (e.g. `sk-*`)
+        // by comparing the raw RFC 4253 wire key blob SHA-256. Never used for positive trust.
+        let revoked_blob_matches = STANDARD
+            .decode(key_b64)
+            .or_else(|_| STANDARD_NO_PAD.decode(key_b64))
+            .ok()
+            .is_some_and(|blob| Sha256::digest(&blob).as_slice() == server_sha256);
+        return Some(revoked_blob_matches);
+    }
+    // Unparseable or key-type-mismatched ordinary entries are ignored cleanly and never trusted.
+    None
+}
+
+fn canonical_known_hosts_lookup_name(host: &str, port: u16) -> String {
+    let clean_host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if port == DEFAULT_SSH_PORT {
+        clean_host
+    } else {
+        format!("[{clean_host}]:{port}")
+    }
+}
+
+fn known_hosts_pattern_list_matches(pattern_list: &str, host: &str, port: u16) -> bool {
+    let lookup_name = canonical_known_hosts_lookup_name(host, port);
+
+    let mut positive_match = false;
+    for raw_entry in pattern_list.split(',').filter(|s| !s.is_empty()) {
+        let (negated, pattern) = match raw_entry.strip_prefix('!') {
+            Some(p) => (true, p),
+            None => (false, raw_entry),
+        };
+        if pattern.is_empty() {
+            continue;
+        }
+        let entry_matches = if pattern.starts_with("|1|") {
+            hashed_known_host_matches(pattern, &lookup_name)
+        } else {
+            wildcard_match(&pattern.to_ascii_lowercase(), &lookup_name)
+        };
+        if entry_matches {
+            if negated {
+                return false;
+            }
+            positive_match = true;
+        }
+    }
+    positive_match
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_idx: Option<usize> = None;
+    let mut match_ti = 0usize;
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_idx = Some(pi);
+            pi += 1;
+            match_ti = ti;
+        } else if let Some(s) = star_idx {
+            pi = s + 1;
+            match_ti += 1;
+            ti = match_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn hashed_known_host_matches(pattern: &str, candidate_host: &str) -> bool {
+    let Some(rest) = pattern.strip_prefix("|1|") else {
+        return false;
+    };
+    let Some((salt_b64, hash_b64)) = rest.split_once('|') else {
+        return false;
+    };
+    if hash_b64.contains('|') {
+        return false;
+    }
+    let Ok(salt) = STANDARD
+        .decode(salt_b64)
+        .or_else(|_| STANDARD_NO_PAD.decode(salt_b64))
+    else {
+        return false;
+    };
+    let Ok(expected) = STANDARD
+        .decode(hash_b64)
+        .or_else(|_| STANDARD_NO_PAD.decode(hash_b64))
+    else {
+        return false;
+    };
+    if salt.len() != OPENSSH_HASHED_HOST_SHA1_LEN || expected.len() != OPENSSH_HASHED_HOST_SHA1_LEN
+    {
+        return false;
+    }
+    let Ok(mut mac) = Hmac::<Sha1>::new_from_slice(&salt) else {
+        return false;
+    };
+    mac.update(candidate_host.as_bytes());
+    mac.verify_slice(&expected).is_ok()
 }
 
 /// Async stream over an SSH `direct-tcpip` channel that keeps the parent `SshRelaySession` alive.
@@ -783,8 +1157,50 @@ fn decode_32_bytes_flexible(raw: &str) -> Result<[u8; 32], RelayTransportError> 
     })
 }
 
+fn decode_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_fp(raw: &str) -> Result<String, RelayTransportError> {
+    let bytes = raw.as_bytes();
+    if !bytes.contains(&b'%') {
+        return Ok(raw.to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(RelayTransportError::InvalidKey(
+                    "truncated percent-encoding in fingerprint".into(),
+                ));
+            }
+            let hi = decode_hex_nibble(bytes[i + 1]).ok_or_else(|| {
+                RelayTransportError::InvalidKey("invalid percent-encoding in fingerprint".into())
+            })?;
+            let lo = decode_hex_nibble(bytes[i + 2]).ok_or_else(|| {
+                RelayTransportError::InvalidKey("invalid percent-encoding in fingerprint".into())
+            })?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| {
+        RelayTransportError::InvalidKey("non-UTF-8 percent-encoded fingerprint".into())
+    })
+}
+
 fn normalize_sha256_fp(raw: &str) -> Result<String, RelayTransportError> {
-    let trimmed = raw.trim();
+    let decoded = percent_decode_fp(raw.trim())?;
+    let trimmed = decoded.trim();
     let without_prefix = if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("SHA256:") {
         &trimmed[7..]
     } else {
@@ -916,5 +1332,585 @@ mod tests {
                 .as_deref(),
             Some("wss://relay.example.com")
         );
+    }
+
+    #[tokio::test]
+    async fn ssh_host_key_verification_pinned_fp_match_and_mismatch() {
+        let server_key = generate_ssh_tunnel_key().expect("server keygen");
+        let server_pk = russh::keys::ssh_key::PublicKey::from_openssh(&server_key.openssh_pubkey)
+            .expect("parse server pk");
+        let expected_display_fp = server_pk.fingerprint(HashAlg::Sha256).to_string();
+        let expected_fp_b64 =
+            compute_openssh_pubkey_sha256_b64(&server_key.openssh_pubkey).expect("fp");
+        let expected_fp_bytes = decode_32_bytes_flexible(&expected_fp_b64).expect("decode fp");
+        let cert_or_pk = PublicKeyOrCertificate::from(server_pk);
+
+        // Matching pinned `&fp=` passes
+        let mut ok_handler = OrbitSshHandler {
+            ssh_host: "relay.example.com".into(),
+            ssh_port: 22,
+            expected_fps: vec![expected_fp_bytes],
+            known_hosts_path: None,
+        };
+        assert!(
+            ok_handler
+                .check_server_key(&cert_or_pk)
+                .await
+                .expect("pinned fp match must succeed")
+        );
+
+        // Mismatched pinned `&fp=` fails with HostKeyMismatch containing ssh-keygen STANDARD_NO_PAD fingerprint
+        let mut bad_handler = OrbitSshHandler {
+            ssh_host: "relay.example.com".into(),
+            ssh_port: 22,
+            expected_fps: vec![[0xAA; 32]],
+            known_hosts_path: None,
+        };
+        let err = bad_handler
+            .check_server_key(&cert_or_pk)
+            .await
+            .expect_err("wrong pinned fp must fail");
+        assert!(matches!(err, RelayTransportError::HostKeyMismatch { .. }));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&expected_display_fp),
+            "error must include OpenSSH STANDARD_NO_PAD observed fingerprint ({expected_display_fp}), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ssh_fp_display_uses_standard_no_pad_and_uri_parses_all_variants() {
+        // Choose bytes whose STANDARD_NO_PAD encoding contains both '+' and '/'
+        let digest: [u8; 32] = [
+            0xfb, 0xff, 0xfe, 0x3e, 0x3f, 0xfb, 0xff, 0xfe, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+            0x15, 0x16, 0x17, 0x18,
+        ];
+        let displayed = format_openssh_sha256_fingerprint(&digest);
+        assert!(displayed.starts_with("SHA256:"));
+        assert!(
+            displayed.contains('+') && displayed.contains('/'),
+            "expected STANDARD_NO_PAD characters '+' and '/' in {displayed}"
+        );
+        assert!(
+            !displayed.ends_with('='),
+            "OpenSSH SHA256 display must be unpadded, got {displayed}"
+        );
+
+        let url_safe = URL_SAFE_NO_PAD.encode(digest);
+        let pct_encoded = displayed
+            .replace(':', "%3A")
+            .replace('+', "%2B")
+            .replace('/', "%2F");
+        let padded_std = format!("SHA256:{}", STANDARD.encode(digest));
+        let key = generate_ssh_tunnel_key().expect("keygen");
+
+        for fp_param in [
+            displayed.as_str(),
+            pct_encoded.as_str(),
+            padded_std.as_str(),
+            url_safe.as_str(),
+            &format!("SHA256:{url_safe}"),
+        ] {
+            let uri = format!(
+                "ssh+relay://user@relay.example.com:22/7878?key={}&fp={fp_param}",
+                key.seed_b64
+            );
+            let spec = SshRelaySpec::parse(&uri).expect("parse fp variant");
+            assert_eq!(spec.host_key_fps_b64, vec![url_safe.clone()]);
+            assert_eq!(spec.decoded_host_key_fps().expect("decode"), vec![digest]);
+        }
+
+        // Malformed percent-encoding must be rejected
+        assert!(
+            SshRelaySpec::parse(&format!(
+                "ssh+relay://user@relay.example.com:22/7878?key={}&fp=SHA256%3Aabc%ZZ",
+                key.seed_b64
+            ))
+            .is_err()
+        );
+        assert!(
+            SshRelaySpec::parse(&format!(
+                "ssh+relay://user@relay.example.com:22/7878?key={}&fp=SHA256%2",
+                key.seed_b64
+            ))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_host_key_verification_empty_fp_enforces_known_hosts() {
+        let server_key = generate_ssh_tunnel_key().expect("server keygen");
+        let other_key = generate_ssh_tunnel_key().expect("other keygen");
+        let server_pk = russh::keys::ssh_key::PublicKey::from_openssh(&server_key.openssh_pubkey)
+            .expect("parse server pk");
+        let other_pk = russh::keys::ssh_key::PublicKey::from_openssh(&other_key.openssh_pubkey)
+            .expect("parse other pk");
+        let server_display_fp = server_pk.fingerprint(HashAlg::Sha256).to_string();
+        let other_display_fp = other_pk.fingerprint(HashAlg::Sha256).to_string();
+        let server_fp_url =
+            compute_openssh_pubkey_sha256_b64(&server_key.openssh_pubkey).expect("fp");
+
+        let kh_path = std::env::temp_dir().join(format!(
+            "orbit_known_hosts_test_{}_{}",
+            std::process::id(),
+            server_fp_url.chars().take(8).collect::<String>()
+        ));
+        let hashed_openssh_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF";
+        let hashed_pk = russh::keys::ssh_key::PublicKey::from_openssh(hashed_openssh_key)
+            .expect("parse hashed pk");
+        let hashed_cert_or_pk = PublicKeyOrCertificate::from(hashed_pk);
+
+        let kh_content = format!(
+            "relay.example.com {}\n[custom.example.com]:2222 {}\n|1|O33ESRMWPVkMYIwJ1Uw+n877jTo=|nuuC5vEqXlEZ/8BXQR7m619W6Ak= {}\n",
+            server_key.openssh_pubkey, server_key.openssh_pubkey, hashed_openssh_key
+        );
+        std::fs::write(&kh_path, kh_content).expect("write known_hosts");
+
+        let server_cert_or_pk = PublicKeyOrCertificate::from(server_pk);
+        let other_cert_or_pk = PublicKeyOrCertificate::from(other_pk);
+
+        // 1. Empty `&fp=` against matching port-22 known_hosts entry passes
+        let mut match_22 = OrbitSshHandler {
+            ssh_host: "relay.example.com".into(),
+            ssh_port: 22,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_path.clone()),
+        };
+        assert!(
+            match_22
+                .check_server_key(&server_cert_or_pk)
+                .await
+                .expect("matching known_hosts port 22 must pass")
+        );
+
+        // 2. Empty `&fp=` against matching non-22 `[host]:port` known_hosts entry passes
+        let mut match_2222 = OrbitSshHandler {
+            ssh_host: "custom.example.com".into(),
+            ssh_port: 2222,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_path.clone()),
+        };
+        assert!(
+            match_2222
+                .check_server_key(&server_cert_or_pk)
+                .await
+                .expect("matching known_hosts custom port must pass")
+        );
+
+        // 2b. Empty `&fp=` against matching HMAC-SHA1 hashed `|1|...` known_hosts entry passes
+        let mut match_hashed = OrbitSshHandler {
+            ssh_host: "example.com".into(),
+            ssh_port: 22,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_path.clone()),
+        };
+        assert!(
+            match_hashed
+                .check_server_key(&hashed_cert_or_pk)
+                .await
+                .expect("matching hashed known_hosts entry must pass")
+        );
+
+        // 3. Empty `&fp=` against MISMATCHED key in known_hosts fails with MITM error + observed fp
+        let mut mismatch_handler = OrbitSshHandler {
+            ssh_host: "relay.example.com".into(),
+            ssh_port: 22,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_path.clone()),
+        };
+        let mismatch_err = mismatch_handler
+            .check_server_key(&other_cert_or_pk)
+            .await
+            .expect_err("mismatched known_hosts key must be rejected");
+        assert!(matches!(
+            mismatch_err,
+            RelayTransportError::HostKeyMismatch { .. }
+        ));
+        let mismatch_msg = mismatch_err.to_string();
+        assert!(
+            mismatch_msg.contains("MITM") && mismatch_msg.contains(&other_display_fp),
+            "expected MITM error with observed fingerprint ({other_display_fp}), got: {mismatch_msg}"
+        );
+
+        // 4. Empty `&fp=` against UNKNOWN host fails with actionable error + observed fp
+        let mut unknown_handler = OrbitSshHandler {
+            ssh_host: "unknown.example.com".into(),
+            ssh_port: 2222,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_path.clone()),
+        };
+        let unknown_err = unknown_handler
+            .check_server_key(&server_cert_or_pk)
+            .await
+            .expect_err("unknown host must be rejected when no &fp= is pinned");
+        assert!(matches!(
+            unknown_err,
+            RelayTransportError::HostKeyUnknown { .. }
+        ));
+        let unknown_msg = unknown_err.to_string();
+        assert!(
+            unknown_msg.contains(&format!("&fp={server_display_fp}")),
+            "unknown host error must suggest &fp={server_display_fp}, got: {unknown_msg}"
+        );
+        // Pasting the suggested `&fp={observed_fp}` straight back into ssh+relay:// must parse and verify
+        let pinned_uri = format!(
+            "ssh+relay://user@unknown.example.com:2222/7878?key={}&fp={server_display_fp}",
+            server_key.seed_b64
+        );
+        let parsed_pinned = SshRelaySpec::parse(&pinned_uri).expect("parse suggested fp pin");
+        let mut pinned_handler = OrbitSshHandler {
+            ssh_host: parsed_pinned.ssh_host.clone(),
+            ssh_port: parsed_pinned.ssh_port,
+            expected_fps: parsed_pinned.decoded_host_key_fps().expect("decode fps"),
+            known_hosts_path: None,
+        };
+        assert!(
+            pinned_handler
+                .check_server_key(&server_cert_or_pk)
+                .await
+                .expect("pasted observed_fp pin must authorize matching server key")
+        );
+        assert!(
+            unknown_msg.contains("ssh -p 2222 unknown.example.com")
+                && unknown_msg.contains("known_hosts"),
+            "unknown host error must suggest ssh/known_hosts, got: {unknown_msg}"
+        );
+
+        // 5. Missing known_hosts file also rejects with HostKeyUnknown (never silent Ok(true))
+        let missing_kh = kh_path.with_extension("does_not_exist");
+        let mut missing_handler = OrbitSshHandler {
+            ssh_host: "relay.example.com".into(),
+            ssh_port: 22,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(missing_kh),
+        };
+        let missing_err = missing_handler
+            .check_server_key(&server_cert_or_pk)
+            .await
+            .expect_err("missing known_hosts must reject unknown host");
+        assert!(matches!(
+            missing_err,
+            RelayTransportError::HostKeyUnknown { .. }
+        ));
+        assert!(
+            missing_err
+                .to_string()
+                .contains(&format!("&fp={server_display_fp}"))
+        );
+
+        let _ = std::fs::remove_file(&kh_path);
+    }
+
+    #[tokio::test]
+    async fn ssh_known_hosts_handles_revoked_rotation_tabs_ipv6_and_io_errors() {
+        let key_old = generate_ssh_tunnel_key().expect("old key");
+        let key_new = generate_ssh_tunnel_key().expect("new key");
+        let key_revoked = generate_ssh_tunnel_key().expect("revoked key");
+
+        let pk_old = PublicKeyOrCertificate::from(
+            russh::keys::ssh_key::PublicKey::from_openssh(&key_old.openssh_pubkey).expect("old pk"),
+        );
+        let pk_new = PublicKeyOrCertificate::from(
+            russh::keys::ssh_key::PublicKey::from_openssh(&key_new.openssh_pubkey).expect("new pk"),
+        );
+        let revoked_pubkey =
+            russh::keys::ssh_key::PublicKey::from_openssh(&key_revoked.openssh_pubkey)
+                .expect("revoked pk");
+        let revoked_display_fp = revoked_pubkey.fingerprint(HashAlg::Sha256).to_string();
+        let pk_revoked = PublicKeyOrCertificate::from(revoked_pubkey);
+        let revoked_fp_url =
+            compute_openssh_pubkey_sha256_b64(&key_revoked.openssh_pubkey).expect("fp");
+
+        let kh_dir = std::env::temp_dir().join(format!(
+            "orbit_kh_edge_{}_{}",
+            std::process::id(),
+            revoked_fp_url.chars().take(8).collect::<String>()
+        ));
+        std::fs::create_dir_all(&kh_dir).expect("mkdir");
+        let kh_path = kh_dir.join("known_hosts");
+
+        let kh_content = format!(
+            "# Rotation: two Ed25519 keys for the same host\n\
+             rotate.example.com {}\n\
+             rotate.example.com {}\n\
+             # Tab-separated fields and IPv6 custom port\n\
+             tabs.example.com\t{}\n\
+             [2001:db8::1]:2222 {}\n\
+             # Revoked key ALSO present as ordinary entry (revoked MUST win regardless of order)\n\
+             revoked-after.example.com {}\n\
+             @revoked revoked-after.example.com {}\n\
+             @revoked revoked-before.example.com {}\n\
+             revoked-before.example.com {}\n",
+            key_old.openssh_pubkey,
+            key_new.openssh_pubkey,
+            key_new.openssh_pubkey.replace(' ', "\t"),
+            key_old.openssh_pubkey,
+            key_revoked.openssh_pubkey,
+            key_revoked.openssh_pubkey,
+            key_revoked.openssh_pubkey,
+            key_revoked.openssh_pubkey,
+        );
+        std::fs::write(&kh_path, kh_content).expect("write known_hosts");
+
+        // 1. Key rotation: BOTH keys of the same algorithm pass
+        for pk in [&pk_old, &pk_new] {
+            let mut h = OrbitSshHandler {
+                ssh_host: "rotate.example.com".into(),
+                ssh_port: 22,
+                expected_fps: Vec::new(),
+                known_hosts_path: Some(kh_path.clone()),
+            };
+            assert!(
+                h.check_server_key(pk)
+                    .await
+                    .expect("rotated key must be accepted")
+            );
+        }
+        // Unrelated key against rotated host still fails as HostKeyMismatch
+        let mut h_rot_bad = OrbitSshHandler {
+            ssh_host: "rotate.example.com".into(),
+            ssh_port: 22,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_path.clone()),
+        };
+        assert!(matches!(
+            h_rot_bad.check_server_key(&pk_revoked).await,
+            Err(RelayTransportError::HostKeyMismatch { .. })
+        ));
+
+        // 2. Tab-separated known_hosts line passes
+        let mut h_tabs = OrbitSshHandler {
+            ssh_host: "tabs.example.com".into(),
+            ssh_port: 22,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_path.clone()),
+        };
+        assert!(
+            h_tabs
+                .check_server_key(&pk_new)
+                .await
+                .expect("tab-separated known_hosts line must pass")
+        );
+
+        // 3. IPv6 `[2001:db8::1]:2222` passes
+        let mut h_v6 = OrbitSshHandler {
+            ssh_host: "2001:db8::1".into(),
+            ssh_port: 2222,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_path.clone()),
+        };
+        assert!(
+            h_v6.check_server_key(&pk_old)
+                .await
+                .expect("IPv6 custom port known_hosts must pass")
+        );
+
+        // 4. `@revoked` precedence wins whether placed BEFORE or AFTER a matching ordinary line
+        for host in ["revoked-after.example.com", "revoked-before.example.com"] {
+            let mut h_rev = OrbitSshHandler {
+                ssh_host: host.into(),
+                ssh_port: 22,
+                expected_fps: Vec::new(),
+                known_hosts_path: Some(kh_path.clone()),
+            };
+            let err = h_rev
+                .check_server_key(&pk_revoked)
+                .await
+                .expect_err("revoked key must be rejected");
+            assert!(matches!(err, RelayTransportError::HostKeyMismatch { .. }));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("@revoked") && msg.contains(&revoked_display_fp),
+                "expected @revoked error with observed fp ({revoked_display_fp}), got: {msg}"
+            );
+        }
+
+        // 5. Non-NotFound read error (known_hosts path is a directory) -> HostKeyVerification, NOT HostKeyUnknown
+        let mut h_io_err = OrbitSshHandler {
+            ssh_host: "rotate.example.com".into(),
+            ssh_port: 22,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_dir.clone()),
+        };
+        let io_err = h_io_err
+            .check_server_key(&pk_old)
+            .await
+            .expect_err("directory as known_hosts must fail with HostKeyVerification");
+        assert!(
+            matches!(io_err, RelayTransportError::HostKeyVerification(_)),
+            "expected HostKeyVerification, got: {io_err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&kh_dir);
+    }
+
+    #[tokio::test]
+    async fn ssh_known_hosts_rejects_malformed_ordinary_entries_and_enforces_canonical_port22_and_salt_len()
+     {
+        let server_key = generate_ssh_tunnel_key().expect("server key");
+        let server_pk = russh::keys::ssh_key::PublicKey::from_openssh(&server_key.openssh_pubkey)
+            .expect("parse server pk");
+        let server_b64 = server_key
+            .openssh_pubkey
+            .split_whitespace()
+            .nth(1)
+            .expect("key b64");
+        let server_cert = PublicKeyOrCertificate::from(server_pk);
+
+        let build_hashed = |salt: &[u8], host_entry: &str| -> String {
+            let mut mac = Hmac::<Sha1>::new_from_slice(salt).expect("hmac");
+            mac.update(host_entry.as_bytes());
+            let tag = mac.finalize().into_bytes();
+            format!("|1|{}|{}", STANDARD.encode(salt), STANDARD.encode(tag))
+        };
+
+        let valid_salt_20 = [0x11u8; 20];
+        let short_salt_16 = [0x22u8; 16];
+        let long_salt_24 = [0x33u8; 24];
+
+        // 1. Canonical port-22 lookup name & wildcard/negation semantics
+        assert!(known_hosts_pattern_list_matches(
+            "relay.example.com",
+            "relay.example.com",
+            22
+        ));
+        assert!(
+            !known_hosts_pattern_list_matches("[relay.example.com]:22", "relay.example.com", 22),
+            "port 22 must only match canonical bare host, never [host]:22"
+        );
+        assert!(
+            !known_hosts_pattern_list_matches("*,!relay.example.com", "relay.example.com", 22),
+            "port 22 negation must exclude relay.example.com"
+        );
+        assert!(known_hosts_pattern_list_matches(
+            "*,!relay.example.com",
+            "other.example.com",
+            22
+        ));
+        assert!(
+            !known_hosts_pattern_list_matches(
+                "*.example.com,!blocked.example.com",
+                "blocked.example.com",
+                22
+            ),
+            "wildcard + negation on port 22 must reject negated host"
+        );
+        assert!(known_hosts_pattern_list_matches(
+            "*.example.com,!blocked.example.com",
+            "allowed.example.com",
+            22
+        ));
+        assert!(
+            !known_hosts_pattern_list_matches("[*]:22", "relay.example.com", 22),
+            "bracketed port-22 wildcard must not match canonical port-22 host"
+        );
+        assert!(known_hosts_pattern_list_matches(
+            "[*.example.com]:2222,![blocked.example.com]:2222",
+            "allowed.example.com",
+            2222
+        ));
+        assert!(!known_hosts_pattern_list_matches(
+            "[*.example.com]:2222,![blocked.example.com]:2222",
+            "blocked.example.com",
+            2222
+        ));
+        assert!(!known_hosts_pattern_list_matches(
+            "*.example.com",
+            "allowed.example.com",
+            2222
+        ));
+
+        // 2. Strict 20-byte salt enforcement for |1|salt|hash
+        let valid_hash_22 = build_hashed(&valid_salt_20, "hashed22.example.com");
+        let valid_hash_2222 = build_hashed(&valid_salt_20, "[hashed2222.example.com]:2222");
+        let short_salt_hash = build_hashed(&short_salt_16, "short-salt.example.com");
+        let long_salt_hash = build_hashed(&long_salt_24, "long-salt.example.com");
+
+        assert!(known_hosts_pattern_list_matches(
+            &valid_hash_22,
+            "hashed22.example.com",
+            22
+        ));
+        assert!(known_hosts_pattern_list_matches(
+            &valid_hash_2222,
+            "hashed2222.example.com",
+            2222
+        ));
+        assert!(
+            !known_hosts_pattern_list_matches(&short_salt_hash, "short-salt.example.com", 22),
+            "16-byte salt must be rejected"
+        );
+        assert!(
+            !known_hosts_pattern_list_matches(&long_salt_hash, "long-salt.example.com", 22),
+            "24-byte salt must be rejected"
+        );
+
+        // 3. End-to-end known_hosts file checks: malformed ordinary entries never authorize,
+        //    non-20-byte salts never authorize, and @revoked exotic fallback still fails closed.
+        let kh_path = std::env::temp_dir().join(format!(
+            "orbit_kh_strict_{}_{}",
+            std::process::id(),
+            server_key.seed_b64.chars().take(8).collect::<String>()
+        ));
+        let kh_content = format!(
+            "bad-type.example.com ssh-rsa {server_b64}\n\
+             exotic-ordinary.example.com sk-ssh-ed25519@openssh.com {server_b64}\n\
+             corrupt-b64.example.com ssh-ed25519 !!!not-base64!!!\n\
+             [port22-bracket.example.com]:22 {}\n\
+             {short_salt_hash} {}\n\
+             {long_salt_hash} {}\n\
+             @revoked exotic-revoked.example.com sk-ssh-ed25519@openssh.com {server_b64}\n\
+             exotic-revoked.example.com {}\n",
+            server_key.openssh_pubkey,
+            server_key.openssh_pubkey,
+            server_key.openssh_pubkey,
+            server_key.openssh_pubkey,
+        );
+        std::fs::write(&kh_path, kh_content).expect("write strict known_hosts");
+
+        for rejected_host in [
+            "bad-type.example.com",
+            "exotic-ordinary.example.com",
+            "corrupt-b64.example.com",
+            "port22-bracket.example.com",
+            "short-salt.example.com",
+            "long-salt.example.com",
+        ] {
+            let mut h = OrbitSshHandler {
+                ssh_host: rejected_host.into(),
+                ssh_port: 22,
+                expected_fps: Vec::new(),
+                known_hosts_path: Some(kh_path.clone()),
+            };
+            let err = h
+                .check_server_key(&server_cert)
+                .await
+                .expect_err("malformed/non-canonical/bad-salt entry must never authorize");
+            assert!(
+                matches!(err, RelayTransportError::HostKeyUnknown { .. }),
+                "expected HostKeyUnknown for {rejected_host}, got: {err:?}"
+            );
+        }
+
+        // Exotic @revoked entry still fails closed even when a valid ordinary entry exists
+        let mut h_exotic_rev = OrbitSshHandler {
+            ssh_host: "exotic-revoked.example.com".into(),
+            ssh_port: 22,
+            expected_fps: Vec::new(),
+            known_hosts_path: Some(kh_path.clone()),
+        };
+        let rev_err = h_exotic_rev
+            .check_server_key(&server_cert)
+            .await
+            .expect_err("exotic @revoked entry must still fail closed");
+        assert!(matches!(
+            rev_err,
+            RelayTransportError::HostKeyMismatch { .. }
+        ));
+        assert!(rev_err.to_string().contains("@revoked"));
+
+        let _ = std::fs::remove_file(&kh_path);
     }
 }

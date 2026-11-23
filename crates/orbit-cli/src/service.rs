@@ -839,6 +839,47 @@ async fn resolve_latest_release_tag(current_ver: &str) -> anyhow::Result<String>
         .ok_or_else(|| anyhow::anyhow!("missing tag_name in GitHub release metadata"))
 }
 
+async fn download_and_verify_release_asset(
+    client: &reqwest::Client,
+    release_base_url: &str,
+    asset_name: &str,
+) -> anyhow::Result<(impl AsRef<[u8]> + std::fmt::Debug + use<>, String)> {
+    let base = release_base_url.trim_end_matches('/');
+    let sums_url = format!("{base}/{}", orbit_crypto::SHA256SUMS_FILENAME);
+    let download_url = format!("{base}/{asset_name}");
+
+    let sums_resp = client
+        .get(&sums_url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch release checksums {sums_url}: {e}"))?;
+    if !sums_resp.status().is_success() {
+        anyhow::bail!(
+            "failed to fetch release checksums {sums_url} (HTTP {}); refusing unverified upgrade",
+            sums_resp.status()
+        );
+    }
+    let sums_text = sums_resp.text().await?;
+    let expected_sha256 =
+        orbit_crypto::find_expected_sha256(&sums_text, asset_name).map_err(|e| {
+            anyhow::anyhow!("release checksum manifest {sums_url} rejected `{asset_name}`: {e}")
+        })?;
+
+    let bytes = client
+        .get(&download_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let actual_sha256 = orbit_crypto::sha256_hex_bytes(bytes.as_ref());
+    orbit_crypto::verify_sha256_hex(asset_name, &expected_sha256, &actual_sha256)
+        .map_err(|e| anyhow::anyhow!("SHA-256 verification failed for {download_url}: {e}"))?;
+
+    Ok((bytes, actual_sha256))
+}
+
 pub async fn self_upgrade_cli(
     home_dir: &Path,
     force: bool,
@@ -914,16 +955,11 @@ pub async fn self_upgrade_cli(
         (os, arch) => anyhow::bail!("unsupported auto-upgrade platform: {os}/{arch}"),
     };
 
-    let download_url =
-        format!("https://github.com/danielgaoyy/orbit/releases/download/{tag}/{asset_name}");
-    println!("Downloading Orbit {tag} ({asset_name}) from GitHub Releases...");
-    let bytes = client
-        .get(&download_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let release_base_url = format!("https://github.com/danielgaoyy/orbit/releases/download/{tag}");
+    println!("Downloading & verifying Orbit {tag} ({asset_name}) from GitHub Releases...");
+    let (bytes, verified_sha256) =
+        download_and_verify_release_asset(&client, &release_base_url, asset_name).await?;
+    println!("[✓] Verified SHA-256 checksum for {asset_name} ({verified_sha256})");
 
     let target_exe = fs::canonicalize(std::env::current_exe()?)?;
     let parent_dir = target_exe
@@ -1176,5 +1212,117 @@ mod tests {
             daemon_unit.contains("KillMode=process\n"),
             "daemon systemd unit must set KillMode=process:\n{daemon_unit}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_download_and_verify_release_asset_enforces_sha256sums() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let genuine: &'static [u8] = b"genuine-orbit-cli-binary-payload";
+        let tampered: &'static [u8] = b"tampered-orbit-cli-binary-payload";
+        let genuine_sha = orbit_crypto::sha256_hex_bytes(genuine);
+        let valid_sums = format!("{genuine_sha}  orbit-cli-macos-arm64\n");
+        let missing_entry_sums = format!("{genuine_sha}  other-binary\n");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let sums_ok = valid_sums.clone();
+                let sums_missing = missing_entry_sums.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, body): (&str, Vec<u8>) = match path {
+                        "/ok/SHA256SUMS.txt" | "/tampered/SHA256SUMS.txt" => {
+                            ("200 OK", sums_ok.into_bytes())
+                        }
+                        "/ok/orbit-cli-macos-arm64"
+                        | "/no-sums/orbit-cli-macos-arm64"
+                        | "/missing/orbit-cli-macos-arm64" => ("200 OK", genuine.to_vec()),
+                        "/tampered/orbit-cli-macos-arm64" => ("200 OK", tampered.to_vec()),
+                        "/missing/SHA256SUMS.txt" => ("200 OK", sums_missing.into_bytes()),
+                        _ => ("404 Not Found", b"not found".to_vec()),
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+
+        // 1. Valid SHA256SUMS.txt + matching binary -> succeeds
+        let (bytes, sha) = download_and_verify_release_asset(
+            &client,
+            &format!("http://{addr}/ok"),
+            "orbit-cli-macos-arm64",
+        )
+        .await
+        .expect("valid sha256 must pass");
+        assert_eq!(bytes.as_ref(), genuine);
+        assert_eq!(sha, genuine_sha);
+
+        // 2. Tampered binary -> fails with SHA-256 mismatch
+        let err = download_and_verify_release_asset(
+            &client,
+            &format!("http://{addr}/tampered"),
+            "orbit-cli-macos-arm64",
+        )
+        .await
+        .expect_err("tampered binary must be rejected");
+        assert!(
+            err.to_string().contains("SHA-256"),
+            "unexpected error: {err}"
+        );
+
+        // 3. Missing SHA256SUMS.txt -> fails cleanly
+        let err = download_and_verify_release_asset(
+            &client,
+            &format!("http://{addr}/no-sums"),
+            "orbit-cli-macos-arm64",
+        )
+        .await
+        .expect_err("missing SHA256SUMS.txt must be rejected");
+        assert!(
+            err.to_string().contains("refusing unverified upgrade"),
+            "unexpected error: {err}"
+        );
+
+        // 4. Missing asset entry in SHA256SUMS.txt -> fails cleanly
+        let err = download_and_verify_release_asset(
+            &client,
+            &format!("http://{addr}/missing"),
+            "orbit-cli-macos-arm64",
+        )
+        .await
+        .expect_err("missing asset entry must be rejected");
+        assert!(
+            err.to_string().contains("not found in SHA256SUMS.txt"),
+            "unexpected error: {err}"
+        );
+
+        server.abort();
     }
 }

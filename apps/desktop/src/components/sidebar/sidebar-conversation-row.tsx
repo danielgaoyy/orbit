@@ -8,6 +8,7 @@ import {
 } from "@/lib/orbit-ipc";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { useI18n } from "@/lib/i18n";
+import { splitHighlightSegments } from "@/lib/fuzzy-match";
 import type { MenuAnchorBox } from "@/components/sidebar/sidebar-menus";
 import {
   ConversationStatusGlyph,
@@ -29,6 +30,8 @@ export interface SidebarConversationRowProps {
   isPinned: boolean;
   isUnread: boolean;
   selected: boolean;
+  keyboardFocused?: boolean;
+  highlightIndices?: readonly number[];
   isChild: boolean;
   peerHandle?: string | null;
   nowMs: number;
@@ -61,6 +64,8 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   isPinned,
   isUnread,
   selected,
+  keyboardFocused = false,
+  highlightIndices,
   isChild,
   peerHandle,
   nowMs,
@@ -145,6 +150,8 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
           : isUnread
             ? "text-foreground font-medium hover:bg-black/[0.038] dark:hover:bg-white/[0.05]"
             : "text-foreground/76 hover:text-foreground hover:bg-black/[0.038] dark:hover:bg-white/[0.05]",
+        keyboardFocused &&
+          "bg-black/[0.055] text-foreground ring-foreground/20 ring-1 ring-inset dark:bg-white/[0.085]",
       )}
     >
       {dropIndicator === "before" && (
@@ -207,7 +214,22 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
                 {peerHandle}
               </span>
             )}
-            <span className="truncate">{effectiveTitle}</span>
+            <span className="truncate">
+              {highlightIndices && highlightIndices.length > 0
+                ? splitHighlightSegments(effectiveTitle, highlightIndices).map((seg, idx) =>
+                    seg.matched ? (
+                      <mark
+                        key={idx}
+                        className="text-foreground rounded-[2px] bg-foreground/[0.08] font-semibold dark:bg-foreground/[0.15]"
+                      >
+                        {seg.text}
+                      </mark>
+                    ) : (
+                      <span key={idx}>{seg.text}</span>
+                    ),
+                  )
+                : effectiveTitle}
+            </span>
           </span>
         )}
       </div>

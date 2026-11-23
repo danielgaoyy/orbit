@@ -987,6 +987,7 @@ export interface WorkspaceScriptInfo {
   terminal_id: string | null;
   port: number | null;
   proxy_url: string | null;
+  last_error?: string | null;
 }
 
 export interface ProviderSubagentDescriptor {

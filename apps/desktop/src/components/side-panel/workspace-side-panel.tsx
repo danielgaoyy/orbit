@@ -26,6 +26,7 @@ import { SubagentTab } from "@/components/side-panel/subagent-tab";
 import { TerminalTab } from "@/components/side-panel/terminal-tab";
 import { WorkspaceBoardTab } from "@/components/side-panel/workspace-board-tab";
 import { SidePanelLaunchpad } from "@/components/side-panel/side-panel-launchpad";
+import { WorkspaceScriptsPopover } from "@/components/side-panel/scripts-panel";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
 import { type MessageKey, useI18n } from "@/lib/i18n";
@@ -400,6 +401,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         ) : (
           <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
         )}
+        {tabs.length > 0 && <WorkspaceScriptsPopover hostId={selectedHostId} />}
       </div>
 
       {/* Tab Body Area */}

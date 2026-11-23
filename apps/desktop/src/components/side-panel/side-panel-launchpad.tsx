@@ -15,6 +15,10 @@ import {
 } from "lucide-react";
 
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
+import {
+  WorkspaceScriptsSection,
+  useWorkspaceScripts,
+} from "@/components/side-panel/scripts-panel";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -529,6 +533,8 @@ export function SidePanelLaunchpad({
     ? backgroundTasks
     : backgroundTasks.slice(0, 4);
   const recentFiles = insights.touched_files.slice(0, 5);
+  const { scripts: workspaceScripts } = useWorkspaceScripts(selectedHostId);
+  const hasWorkspaceScripts = workspaceScripts.length > 0;
 
   return (
     <ScrollArea className="h-full w-full">
@@ -726,8 +732,10 @@ export function SidePanelLaunchpad({
               })}
             </div>
 
-            {(backgroundTasks.length > 0 || recentFiles.length > 0) && (
+            {(hasWorkspaceScripts || backgroundTasks.length > 0 || recentFiles.length > 0) && (
               <div className="border-border/60 mt-4 flex flex-col gap-5 border-t pt-4">
+                {/* Workspace Services & Scripts (orbit.json / paseo.json — 0px when none configured) */}
+                <WorkspaceScriptsSection hostId={selectedHostId} />
                 {/* Background Tasks */}
                 {backgroundTasks.length > 0 && (
                   <section>

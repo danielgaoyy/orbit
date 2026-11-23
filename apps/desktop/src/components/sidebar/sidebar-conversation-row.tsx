@@ -16,7 +16,6 @@ import {
 } from "@/components/sidebar/sidebar-primitives";
 import type { ThreadDragSource } from "@/components/sidebar/use-sidebar-drag";
 import { IconButton } from "@/components/ui/icon-button";
-import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { orbitActions, useHasThreadDraft } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -237,7 +236,12 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
           ? "bg-accent text-ink-primary font-medium"
           : isUnread
             ? "text-ink-primary hover:bg-accent/55 font-medium"
-            : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
+            : isForegroundRunning ||
+                hasRunningSubagents ||
+                agent.is_awaiting_permission ||
+                agent.status_label === "Error"
+              ? "text-ink-primary hover:bg-accent/55"
+              : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
         keyboardFocused && "bg-accent text-ink-primary ring-border-strong ring-1 ring-inset",
       )}
     >
@@ -248,7 +252,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         <div className="bg-primary pointer-events-none absolute right-1.5 -bottom-[1px] left-1.5 z-20 h-[2px] rounded-full" />
       )}
 
-      {/* Left Status Gutter (`16×16` on top-level rows; zero blank gutter on idle grouped/child rows) + Title */}
+      {/* Unified Left Status Rail (`16×16` on top-level rows; inline-only on active grouped/child rows) + Title */}
       <div
         className={cn(
           "flex min-w-0 flex-1 items-center",
@@ -259,6 +263,8 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
           <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
             <ConversationStatusGlyph
               agent={agent}
+              isForegroundRunning={isForegroundRunning}
+              hasRunningSubagents={hasRunningSubagents}
               isWorktree={isWorktree}
               isUnread={isUnread}
             />
@@ -266,6 +272,8 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         ) : (
           <ConversationStatusGlyph
             agent={agent}
+            isForegroundRunning={isForegroundRunning}
+            hasRunningSubagents={hasRunningSubagents}
             isWorktree={isWorktree}
             isUnread={isUnread}
           />
@@ -334,22 +342,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
             </span>
           )}
 
-          {isForegroundRunning || hasRunningSubagents ? (
-            <span
-              title={!isForegroundRunning && hasRunningSubagents ? t("sidebar.subagentRunning") : undefined}
-              className={cn(
-                "text-ink-secondary items-center justify-center gap-1.5",
-                menuOpen ? "hidden" : "inline-flex group-hover/item:hidden",
-              )}
-            >
-              {hasUnsentDraft && (
-                <span data-draft-indicator="true" className={DRAFT_BADGE_CLASS}>
-                  {t("sidebar.draft")}
-                </span>
-              )}
-              <OrbitSpinner size={13.5} />
-            </span>
-          ) : hasUnsentDraft ? (
+          {hasUnsentDraft ? (
             <span
               data-draft-indicator="true"
               className={cn(

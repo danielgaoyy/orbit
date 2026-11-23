@@ -1,16 +1,15 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { Avatar, type AvatarHandle } from "@oneworks/avatar-react/renderer";
+import { Suspense, lazy, memo, useEffect, useMemo, useRef, useState } from "react";
 import { Check, X } from "lucide-react";
 import type { ResolvedSubagentStatus } from "@/lib/subagents";
 import {
-  SUBAGENT_AWAITING_CLIP,
-  SUBAGENT_WORKING_CLIP,
   type SubagentCharacterSpec,
-  buildSubagentAvatarDefinition,
   resolveSubagentCharacter,
 } from "@/lib/subagent-avatar";
+import { SUBAGENT_AVATAR_PORTRAITS } from "@/components/ui/subagent-avatar-portraits";
 import { useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+
+const LazyLiveSubagentAvatar = lazy(() => import("@/components/ui/subagent-avatar-live"));
 
 export type SubagentAvatarSize = "xs" | "sm" | "md" | "lg";
 
@@ -62,10 +61,14 @@ export interface SubagentAvatarProps {
 
 /**
  * Living OneWorks 3D Subagent portrait:
- * - Animates cheerfully while `running` (bouncy head bob + look-around)
- * - Tilts inquisitively with an amber halo when `awaiting_permission`
- * - Immediately stops & resets upright on `completed` / `failed` / `canceled` (zero background rAF)
- * - Automatically pauses on window hide or `prefers-reduced-motion: reduce`
+ * - Resting (`completed` / `failed` / `canceled`) or off-screen portraits render an instant
+ *   pre-baked 128x128 transparent portrait (<0.05ms, zero Marching Tetrahedra CPU compilation,
+ *   zero inline SVG polygon DOM bloat) with live theme-matched circular backdrops.
+ * - Active (`running` / `awaiting_permission`) portraits paint frame 0 instantaneously with the
+ *   identical static portrait and seamlessly upgrade on the next animation frame (while in view)
+ *   to the lazily-loaded live animated OneWorks 3D `<Avatar>`.
+ * - Automatically pauses & tears down live animation on completion, window hide, or
+ *   `prefers-reduced-motion: reduce`.
  */
 export const SubagentAvatar = memo(function SubagentAvatar({
   character,
@@ -77,38 +80,95 @@ export const SubagentAvatar = memo(function SubagentAvatar({
 }: SubagentAvatarProps) {
   const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme, "preferences");
   const motionAllowed = useAvatarMotionAllowed();
-  const handleRef = useRef<AvatarHandle | null>(null);
+  const rootRef = useRef<HTMLSpanElement | null>(null);
 
   const spec = useMemo(
     () => character ?? resolveSubagentCharacter(seedKey ?? "subagent"),
     [character, seedKey],
   );
 
-  const definition = useMemo(
-    () => buildSubagentAvatarDefinition(spec, resolvedTheme),
-    [spec, resolvedTheme],
-  );
-
+  const staticPortraitUrl = SUBAGENT_AVATAR_PORTRAITS[spec.id] ?? null;
   const isWorking = status === "running";
   const isAwaiting = status === "awaiting_permission";
-  const shouldAnimate = motionAllowed && (isWorking || isAwaiting);
-  const activeClip = !shouldAnimate
-    ? null
-    : isAwaiting
-      ? SUBAGENT_AWAITING_CLIP
-      : SUBAGENT_WORKING_CLIP;
+  const wantsLiveAnimation = motionAllowed && (isWorking || isAwaiting);
+
+  // Defer live 3D mount by 1 animation frame and gate on viewport visibility so thread switches
+  // paint frame 0 at 60fps and off-screen running subagents never burn CPU.
+  const [liveMounted, setLiveMounted] = useState(false);
 
   useEffect(() => {
-    if (!shouldAnimate) {
-      handleRef.current?.stop({ reset: true });
+    if (!wantsLiveAnimation) {
+      setLiveMounted(false);
+      return;
     }
-  }, [shouldAnimate, status]);
+
+    let cancelled = false;
+    let rafId: number | null = null;
+    const scheduleMount = () => {
+      if (cancelled || rafId !== null) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        if (!cancelled) setLiveMounted(true);
+      });
+    };
+
+    const el = rootRef.current;
+    if (el && typeof IntersectionObserver !== "undefined") {
+      const observer = new IntersectionObserver(
+        (entries) => {
+          const visible = entries.some((entry) => entry.isIntersecting);
+          if (visible) {
+            scheduleMount();
+          } else {
+            if (rafId !== null) {
+              window.cancelAnimationFrame(rafId);
+              rafId = null;
+            }
+            setLiveMounted(false);
+          }
+        },
+        { rootMargin: "64px" },
+      );
+      observer.observe(el);
+      return () => {
+        cancelled = true;
+        if (rafId !== null) window.cancelAnimationFrame(rafId);
+        observer.disconnect();
+      };
+    }
+
+    scheduleMount();
+    return () => {
+      cancelled = true;
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+    };
+  }, [wantsLiveAnimation]);
 
   const px = SIZE_PX[size];
   const badgeSize = size === "lg" ? "size-[11px]" : "size-[10px]";
+  const backdropColor = resolvedTheme === "dark" ? spec.darkBg : spec.lightBg;
+
+  const staticPortraitEl = staticPortraitUrl ? (
+    <span
+      style={{ backgroundColor: backdropColor }}
+      className="block size-full rounded-full"
+    >
+      <img
+        src={staticPortraitUrl}
+        alt=""
+        aria-hidden="true"
+        draggable={false}
+        decoding="async"
+        className="pointer-events-none block size-full select-none object-cover"
+      />
+    </span>
+  ) : null;
+
+  const shouldRenderLive = (wantsLiveAnimation && liveMounted) || !staticPortraitUrl;
 
   return (
     <span
+      ref={rootRef}
       data-slot="subagent-avatar"
       data-status={status}
       data-character={spec.id}
@@ -122,16 +182,18 @@ export const SubagentAvatar = memo(function SubagentAvatar({
           status === "canceled" && "opacity-75 grayscale-[35%]",
         )}
       >
-        <Avatar
-          ref={handleRef}
-          definition={definition}
-          interactive={false}
-          animation={activeClip}
-          autoplay={shouldAnimate}
-          theme={resolvedTheme}
-          aria-hidden="true"
-          className="block size-full"
-        />
+        {shouldRenderLive ? (
+          <Suspense fallback={staticPortraitEl}>
+            <LazyLiveSubagentAvatar
+              spec={spec}
+              resolvedTheme={resolvedTheme}
+              status={status}
+              shouldAnimate={wantsLiveAnimation}
+            />
+          </Suspense>
+        ) : (
+          staticPortraitEl
+        )}
       </span>
 
       {showStatusBadge && status === "completed" && (

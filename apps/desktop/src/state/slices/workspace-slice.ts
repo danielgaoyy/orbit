@@ -1542,15 +1542,28 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    openSideQuestionTab(): void {
+    openSideQuestionTab(opts?: { entryId?: string }): void {
       const tabId = "tab:side_question";
       setState((s) => {
         const exists = s.sidePanelTabs.some((t) => t.id === tabId);
         const nextTabs = exists
-          ? s.sidePanelTabs
+          ? s.sidePanelTabs.map((t) =>
+              t.id === tabId
+                ? {
+                    ...t,
+                    sideQuestionEntryId:
+                      opts?.entryId !== undefined ? opts.entryId : t.sideQuestionEntryId,
+                  }
+                : t,
+            )
           : [
               ...s.sidePanelTabs,
-              { id: tabId, kind: "side_question" as const, title: "Side Question" },
+              {
+                id: tabId,
+                kind: "side_question" as const,
+                title: "Side Question",
+                sideQuestionEntryId: opts?.entryId,
+              },
             ];
         const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
         return {
@@ -1963,6 +1976,56 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         }),
         true,
       );
+    },
+
+
+    recordSessionPullRequest(pr: {
+      url: string;
+      number?: number | null;
+      title?: string | null;
+    }): void {
+      const snap = getState();
+      const hostId = snap.selectedHostId;
+      const agentId = snap.selectedAgentId;
+      if (!hostId || !agentId || snap.isDraftNewSession || !pr.url?.trim()) return;
+      const cleanUrl = pr.url.trim();
+      let repo = "";
+      let parsedNumber = pr.number ?? 0;
+      try {
+        const parsed = new URL(cleanUrl);
+        const segs = parsed.pathname.split("/").filter(Boolean);
+        const dashIdx = segs.indexOf("-");
+        if (dashIdx >= 2 && segs[dashIdx + 1] === "merge_requests") {
+          repo = `${segs[dashIdx - 2]}/${segs[dashIdx - 1]}`;
+          if (!parsedNumber) parsedNumber = Number.parseInt(segs[dashIdx + 2] ?? "0", 10) || 0;
+        } else if (segs.length >= 4) {
+          repo = `${segs[0]}/${segs[1]}`;
+          if (!parsedNumber) parsedNumber = Number.parseInt(segs[3] ?? "0", 10) || 0;
+        }
+      } catch {
+        // Keep fallback fields when URL parsing fails
+      }
+      const key = `${hostId}::${agentId}`;
+      const entry = {
+        url: cleanUrl,
+        number: parsedNumber,
+        repo,
+        title: pr.title?.trim() || null,
+        last_seq: Number.MAX_SAFE_INTEGER - 1,
+      };
+      setState((s) => {
+        const existing = s.sessionCreatedPrs[key] ?? [];
+        const deduped = existing.filter(
+          (item) => item.url.toLowerCase() !== cleanUrl.toLowerCase(),
+        );
+        return {
+          ...s,
+          sessionCreatedPrs: {
+            ...s.sessionCreatedPrs,
+            [key]: [entry, ...deduped].slice(0, 12),
+          },
+        };
+      });
     },
 
 

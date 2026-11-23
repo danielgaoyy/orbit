@@ -113,6 +113,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   overviewPopoverOpen: "workspace",
   stageCanDockOverview: "workspace",
   overviewCollapsedSections: "workspace",
+  sessionCreatedPrs: "workspace",
   quickOpenFilesOpen: "workspace",
 
   // sidebar

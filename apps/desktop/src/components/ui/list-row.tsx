@@ -48,7 +48,14 @@ export const ListRow = React.forwardRef<HTMLButtonElement, ListRowProps>(functio
     >
       <span className="flex min-w-0 flex-1 items-center gap-2.5">
         {leading && (
-          <span className="text-ink-tertiary group-hover/listrow:text-ink-primary flex shrink-0 items-center justify-center transition-colors">
+          <span
+            className={cn(
+              "flex shrink-0 items-center justify-center transition-colors",
+              selected
+                ? "text-ink-primary"
+                : "text-ink-tertiary group-hover/listrow:text-ink-primary",
+            )}
+          >
             {leading}
           </span>
         )}

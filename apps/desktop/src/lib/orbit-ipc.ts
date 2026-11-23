@@ -2247,11 +2247,28 @@ export interface SessionSubagentEntryView {
   last_seq: number;
 }
 
+export interface SessionPullRequestView {
+  url: string;
+  number: number;
+  repo: string;
+  title?: string | null;
+  last_seq: number;
+}
+
+export interface SessionLinkView {
+  url: string;
+  label: string;
+  host: string;
+  last_seq: number;
+}
+
 export interface SessionInsightsView {
   touched_files: SessionTouchedFileView[];
   background_tasks: SessionBackgroundTaskView[];
   subagents: SessionSubagentEntryView[];
   detected_local_urls: string[];
+  pull_requests?: SessionPullRequestView[];
+  detected_links?: SessionLinkView[];
 }
 
 export interface AgentStageView {

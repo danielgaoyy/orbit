@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import { AlertTriangle, ArrowUpRight, Loader2, Plus, Trash2 } from "lucide-react";
 import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
 import { ComposerModelPicker } from "@/components/composer/composer-model-picker";
@@ -33,6 +33,19 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
   const entries = useOrbitSelector((s) => s.sideQuestionsByScope[scope] ?? EMPTY_ENTRIES);
   const draft = useOrbitSelector((s) => s.sideQuestionDrafts[scope] ?? "");
   const focusNonce = useOrbitSelector((s) => s.sideQuestionFocusNonce);
+  const targetEntryId = useOrbitSelector(
+    (s) =>
+      s.sidePanelTabs.find((tab) => tab.kind === "side_question")?.sideQuestionEntryId ?? null,
+  );
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!targetEntryId || !rootRef.current) return;
+    const el = rootRef.current.querySelector<HTMLElement>(
+      `[data-side-question-id="${CSS.escape(targetEntryId)}"]`,
+    );
+    el?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [targetEntryId, focusNonce]);
 
   const activeProviderLabel = useOrbitSelector((s) => {
     if (!s.selectedHostId) return "Assistant";
@@ -70,7 +83,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
   };
 
   return (
-    <div className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div ref={rootRef} className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
       {/* Shared Conversation Viewport matching main StreamStage prose & bubbles */}
       <ConversationViewport
         hostId={hostId}
@@ -109,7 +122,11 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         ) : (
           <div className="space-y-7">
             {entries.map((entry) => (
-              <div key={entry.id} className="orbit-bubble-enter space-y-4">
+              <div
+                key={entry.id}
+                data-side-question-id={entry.id}
+                className="orbit-bubble-enter space-y-4"
+              >
                 <ConversationUserBubble text={entry.question} />
 
                 {/* Assistant Side Answer (full primary conversation typography) */}

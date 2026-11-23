@@ -178,7 +178,7 @@ export interface OrbitCrossSliceActions {
   ): Promise<BrowserActionResponseView | null>;
   openTerminalTab(opts?: { spawnIfEmpty?: boolean }): void;
   openBrowserTab(initialUrl?: string): void;
-  openSideQuestionTab(): void;
+  openSideQuestionTab(opts?: { entryId?: string }): void;
   submitSideQuestion(
     rawQuestion?: string,
     targetOverride?: {

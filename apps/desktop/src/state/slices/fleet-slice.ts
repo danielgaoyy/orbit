@@ -1803,6 +1803,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             queuedPrompts: omitRecordKeys(s.queuedPrompts, deletedThreadKeys),
             sideQuestionsByScope: omitRecordKeys(s.sideQuestionsByScope, deletedThreadKeys),
             sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, deletedThreadKeys),
+            sessionCreatedPrs: omitRecordKeys(s.sessionCreatedPrs, deletedThreadKeys),
             rewoundSessions: omitRecordKeys(s.rewoundSessions, deletedThreadKeys),
           };
         },
@@ -1887,6 +1888,8 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           delete nextSideQ[tKey];
           const nextSideQDrafts = { ...s.sideQuestionDrafts };
           delete nextSideQDrafts[tKey];
+          const nextCreatedPrs = { ...s.sessionCreatedPrs };
+          delete nextCreatedPrs[tKey];
           const nextRewound = { ...s.rewoundSessions };
           delete nextRewound[tKey];
           const nextRunningMeta =
@@ -1908,6 +1911,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             queuedPrompts: nextQueued,
             sideQuestionsByScope: nextSideQ,
             sideQuestionDrafts: nextSideQDrafts,
+            sessionCreatedPrs: nextCreatedPrs,
             rewoundSessions: nextRewound,
             ...(wasSelected ? { selectedAgentId: null, isDraftNewSession: true } : {}),
           };

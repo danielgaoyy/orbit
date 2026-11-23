@@ -43,6 +43,7 @@ import type {
   ReleaseUpdateInfo,
   RichBlockView,
   SessionMode,
+  SessionPullRequestView,
   SlashCommandView,
   SlashDirective,
   SshHostItem,
@@ -247,6 +248,7 @@ export interface SidePanelTab {
   workspaceId?: string;
   peerAgentId?: string;
   artifactId?: string;
+  sideQuestionEntryId?: string;
 }
 
 export interface FileViewCacheEntry {
@@ -307,11 +309,13 @@ export interface SideQuestionEntry {
 }
 
 export type OverviewSectionId =
-  | "review"
-  | "files"
-  | "terminal"
-  | "tasks"
+  | "pull_requests"
   | "subagents"
+  | "side_questions"
+  | "goals"
+  | "tasks"
+  | "artifacts"
+  | "links"
   | "touched_files";
 
 export type ReviewScope = "working_tree" | "session_turns";
@@ -447,6 +451,7 @@ export interface OrbitUiState {
   overviewPopoverOpen: boolean;
   stageCanDockOverview: boolean;
   overviewCollapsedSections: Record<OverviewSectionId, boolean>;
+  sessionCreatedPrs: Record<string, SessionPullRequestView[]>;
   quickOpenFilesOpen: boolean;
 
   // Sidebar & Layout

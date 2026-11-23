@@ -744,6 +744,7 @@ export const ReviewTab = memo(function ReviewTab({
 
   const handlePrCreated = useCallback(
     (result: GitCreatePrResult) => {
+      orbitActions.recordSessionPullRequest(result);
       orbitActions.showToast(
         result.number != null
           ? t("review.prCreatedWithNumberToast", { number: result.number })

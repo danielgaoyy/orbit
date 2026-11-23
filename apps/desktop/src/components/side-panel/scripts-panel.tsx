@@ -407,8 +407,8 @@ export const WorkspaceScriptsPopover = memo(function WorkspaceScriptsPopover({
         </PopoverTrigger>
       </SimpleTooltip>
 
-      <PopoverContent align="end" sideOffset={6} className="w-[310px] p-2">
-        <div className="mb-1.5 flex items-center justify-between px-2 pt-0.5">
+      <PopoverContent align="end" sideOffset={6} className="w-[310px] overflow-hidden p-0">
+        <div className="flex items-center justify-between px-4 pt-2.5 pb-1.5">
           <span className="text-muted-foreground text-[11.5px] font-medium">
             {t("sidePanel.scriptsTitle")}
           </span>
@@ -423,7 +423,7 @@ export const WorkspaceScriptsPopover = memo(function WorkspaceScriptsPopover({
             </button>
           </SimpleTooltip>
         </div>
-        <div className="flex max-h-[280px] flex-col gap-0.5 overflow-y-auto">
+        <div className="orbit-native-scroll flex max-h-[280px] flex-col gap-0.5 overflow-y-auto overscroll-contain px-2 pb-2">
           {scripts.map((script) => (
             <WorkspaceScriptRow
               key={script.name}

@@ -857,7 +857,7 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
       {selectorOpen && (
         <div
           role="listbox"
-          className="border-border/80 bg-elevated/45 max-h-[196px] shrink-0 overflow-y-auto border-b p-1.5"
+          className="orbit-native-scroll border-border/80 bg-elevated/45 max-h-[196px] shrink-0 overflow-y-auto overscroll-contain border-b p-1.5"
         >
           <div className="flex flex-col gap-0.5">
             {artifacts.map((item) => {

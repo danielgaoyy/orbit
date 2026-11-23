@@ -577,7 +577,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
           )}
         </div>
         {hasArmedTimers && (
-          <div className="mt-1.5 max-h-[96px] space-y-0.5 overflow-y-auto border-t border-black/[0.058] pt-1.5 dark:border-white/[0.07]">
+          <div className="orbit-native-scroll -mx-2.5 mt-1.5 max-h-[96px] space-y-0.5 overflow-y-auto overscroll-contain border-t border-black/[0.058] px-2.5 pt-1.5 dark:border-white/[0.07]">
             {armedTimers.slice(0, 2).map((timer) => (
               <ArmedTimerRow
                 key={timer.timer_id}
@@ -600,11 +600,11 @@ const StageOverviewBody = memo(function StageOverviewBody({
         )}
       </div>
 
-      {/* Single outer scroll container for secondary sections (dynamically bounded by measured Layer 1 height) */}
+      {/* Single outer scroll container for secondary sections (dynamically bounded by measured Layer 1 height + 2px Card border) */}
       {hasSecondarySections && (
         <div
-          style={{ maxHeight: `calc(${cardMaxHeightExpr} - ${layer1HeightPx}px)` }}
-          className="min-h-0 flex-1 overflow-y-auto overscroll-contain select-none"
+          style={{ maxHeight: `calc(${cardMaxHeightExpr} - ${layer1HeightPx + 2}px)` }}
+          className="orbit-native-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain select-none"
         >
           {/* Layer 2: Background Tasks (minimal single-line rows; actions appear quietly on hover) */}
       {backgroundTasks.length > 0 && (
@@ -620,7 +620,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
               <div
                 className={cn(
                   showAllTasks
-                    ? "bg-elevated/95 sticky bottom-0 z-[2] -mx-2.5 pt-0.5 pr-2.5 pb-2 pl-[18px] backdrop-blur-[6px]"
+                    ? "bg-elevated/95 sticky bottom-0 z-[2] -mx-2.5 pt-1 pr-2.5 pb-2 pl-[18px] backdrop-blur-[6px]"
                     : "pt-0.5 pb-2 pl-2",
                 )}
               >
@@ -635,7 +635,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
             ) : undefined
           }
         >
-          <div className="space-y-0.5">
+          <div className="space-y-0.5 pb-1.5">
             {visibleTasks.map((task) => {
             const cleanPreview = cleanBackgroundOutputPreview(task.output_preview);
             const hasDetails = Boolean(task.command || cleanPreview || task.log_path);
@@ -672,7 +672,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
                         <Clock className="text-muted-foreground/75 size-[13.5px] stroke-[1.7]" />
                       )}
                     </span>
-                    <span className="text-foreground/86 min-w-0 flex-1 truncate font-mono text-[12px] leading-[18px]">
+                    <span className="text-foreground/88 min-w-0 flex-1 truncate text-[12.5px] leading-[18px] font-normal">
                       {task.title}
                     </span>
                   </button>

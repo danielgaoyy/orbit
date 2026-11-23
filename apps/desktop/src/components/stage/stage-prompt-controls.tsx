@@ -858,7 +858,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
             )}
 
             {slashBadge && SlashIcon ? (
-              <p className="selectable-text text-foreground text-[14.5px] leading-[1.64] whitespace-pre-wrap">
+              <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
                 <span className="mr-1.5 inline-flex items-center gap-1.5 align-baseline select-none">
                   <SlashIcon className="text-muted-foreground relative top-[2px] size-[14px] shrink-0 stroke-[1.75]" />
                   <span className="text-foreground font-medium">{slashLabel}</span>
@@ -868,7 +868,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
             ) : (
               cleanText.length > 0 &&
               (sanitizedLegacy ? (
-                <p className="selectable-text text-foreground text-[14.5px] leading-[1.64] whitespace-pre-wrap">
+                <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
                   {cleanText}
                 </p>
               ) : (
@@ -1084,10 +1084,10 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
               </span>
             </label>
 
-            <div className="relative min-w-0">
+            <div className="relative -mx-5 min-w-0">
               <div
                 className={cn(
-                  "max-h-[216px] space-y-1.5 overflow-y-auto pr-3.5 transition-opacity duration-150",
+                  "orbit-native-scroll max-h-[216px] space-y-1.5 overflow-y-auto overscroll-contain px-5 transition-opacity duration-150",
                   !restoreFiles && "opacity-45",
                 )}
               >
@@ -1125,7 +1125,7 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
               </div>
               {files.length > 7 && (
                 <div
-                  className="pointer-events-none absolute right-3.5 bottom-0 left-0 h-7"
+                  className="pointer-events-none absolute inset-x-0 bottom-0 h-7"
                   style={{
                     background:
                       "linear-gradient(to top, var(--surface-elevated) 0%, transparent 100%)",
@@ -1216,7 +1216,8 @@ export const TurnFooter = memo(function TurnFooter({
     [onRequestFork, isLastTurn, forkUpToSeq],
   );
 
-  if (isTurnActive || (!replyText && resolvedCompletedAtMs === null && !showFork)) {
+  const hasReply = Boolean(replyText && replyText.trim().length > 0);
+  if (isTurnActive || !hasReply) {
     return null;
   }
 

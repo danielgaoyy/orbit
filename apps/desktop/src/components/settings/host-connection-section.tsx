@@ -369,7 +369,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               </button>
 
               {showSshDeploy && (
-                <div className="border-border divide-border mt-2 max-h-40 divide-y overflow-y-auto rounded-[10px] border">
+                <div className="orbit-native-scroll border-border divide-border mt-2 max-h-40 divide-y overflow-y-auto overscroll-contain rounded-[10px] border">
                   {sshHosts.map((s) => (
                     <div
                       key={s.alias}

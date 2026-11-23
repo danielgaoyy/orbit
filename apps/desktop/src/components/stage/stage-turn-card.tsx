@@ -50,6 +50,33 @@ import {
   WakeupEventRow,
 } from "./stage-step-group";
 
+interface InlineAgentMessageSegment {
+  kind: "agent_message";
+  key: string;
+  item: Extract<TimelineItemView, { item_type: "agent_message" }>;
+}
+
+/**
+ * Type-safe runtime guard for inline `agent_message` segments emitted by the stage
+ * builder (compatible both before and after `TurnLiveSegmentView` includes `"agent_message"`).
+ */
+function asInlineAgentMessageSegment(seg: unknown): InlineAgentMessageSegment | null {
+  if (!seg || typeof seg !== "object") return null;
+  const candidate = seg as { kind?: unknown; key?: unknown; item?: TimelineItemView };
+  if (
+    candidate.kind === "agent_message" &&
+    typeof candidate.key === "string" &&
+    candidate.item?.item_type === "agent_message"
+  ) {
+    return {
+      kind: "agent_message",
+      key: candidate.key,
+      item: candidate.item,
+    };
+  }
+  return null;
+}
+
 const StageNoticeSegment = memo(function StageNoticeSegment({
   item,
 }: {
@@ -276,6 +303,7 @@ export const TurnStageSection = memo(function TurnStageSection({
       lastRawSeg.kind === "notice" ||
       lastRawSeg.kind === "wakeup" ||
       lastRawSeg.kind === "compaction" ||
+      asInlineAgentMessageSegment(lastRawSeg) !== null ||
       isTrailingSettledDelegation);
 
   const hasBody = segments.length > 0 || needsTrailingActivity;
@@ -284,7 +312,7 @@ export const TurnStageSection = memo(function TurnStageSection({
     turn.user_prompt?.item_type === "user_prompt" ? turn.user_prompt : null;
   const lastReplyText =
     !isTurnActive && turn.last_assistant_reply?.item_type === "assistant_message"
-      ? turn.last_assistant_reply.text
+      ? turn.last_assistant_reply.text.trim() || null
       : null;
   const turnForkSeq = useMemo(() => resolveTurnForkSeq(turn), [turn]);
 
@@ -307,7 +335,7 @@ export const TurnStageSection = memo(function TurnStageSection({
       )}
 
       {turn.agent_message?.item_type === "agent_message" && (
-        <AgentMessageCard hostId={hostId} item={turn.agent_message} />
+        <AgentMessageCard hostId={hostId} agentId={agentId} item={turn.agent_message} />
       )}
 
       {hasBody && (
@@ -346,6 +374,21 @@ export const TurnStageSection = memo(function TurnStageSection({
                     />
                   );
                 }
+
+                const inlineAgentMsg = asInlineAgentMessageSegment(seg);
+                if (inlineAgentMsg) {
+                  return (
+                    <AgentMessageCard
+                      key={inlineAgentMsg.key}
+                      hostId={hostId}
+                      agentId={agentId}
+                      item={inlineAgentMsg.item}
+                      inline
+                    />
+                  );
+                }
+
+                if (seg.kind !== "step_group") return null;
 
                 const split =
                   stepGroupSplits.get(seg.key) ?? splitStepGroupChronologically(seg.items);

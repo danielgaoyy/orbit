@@ -378,9 +378,9 @@ function McpServerModal({
         role="dialog"
         aria-modal="true"
         aria-label={isEdit ? "Edit MCP Server" : "Add MCP Server"}
-        className="border-border bg-elevated text-foreground floating-surface max-h-[85vh] w-full max-w-[490px] overflow-y-auto rounded-[14px] border p-5"
+        className="border-border bg-elevated text-foreground floating-surface flex max-h-[85vh] w-full max-w-[490px] flex-col overflow-hidden rounded-[14px] border p-0"
       >
-        <div className="mb-4 flex items-center justify-between">
+        <div className="flex items-center justify-between px-5 pt-5 pb-4">
           <div>
             <h3 className="text-[15px] font-semibold tracking-[-0.01em]">
               {isEdit
@@ -405,7 +405,10 @@ function McpServerModal({
           </button>
         </div>
 
-        <form onSubmit={(e) => void handleSubmit(e)} className="space-y-3.5">
+        <form
+          onSubmit={(e) => void handleSubmit(e)}
+          className="orbit-native-scroll min-h-0 flex-1 space-y-3.5 overflow-y-auto overscroll-contain px-5 pb-5"
+        >
           {/* Scope + Transport toggles */}
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1">
@@ -1082,7 +1085,7 @@ export function HostMcpSection({ hostId }: { hostId: string }) {
                             Server reported no tools.
                           </div>
                         ) : (
-                          <div className="border-border/60 bg-background/50 max-h-[210px] divide-y divide-border/50 overflow-y-auto rounded-lg border">
+                          <div className="orbit-native-scroll border-border/60 bg-background/50 max-h-[210px] divide-y divide-border/50 overflow-y-auto overscroll-contain rounded-lg border">
                             {probe.tools.map((tool) => (
                               <div key={tool.name} className="px-2.5 py-1.5">
                                 <div className="text-foreground font-mono text-[11.5px] font-medium">

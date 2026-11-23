@@ -44,8 +44,17 @@ pub struct SessionLaunchConfig {
     pub attachments_dir: Option<PathBuf>,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
+    pub fast_mode: bool,
     pub mode: SessionMode,
     pub resume_session_id: Option<String>,
+    /// Optional upstream session ID to natively fork from on startup (full-tail forks only).
+    /// When unsupported or evicted upstream, drivers fall back cleanly to a fresh session seeded
+    /// with `fallback_handoff_context` (unless `native_fork_only` is set).
+    pub fork_from_session_id: Option<String>,
+    /// When `true` and `fork_from_session_id` is `Some`, exit cleanly without emitting
+    /// `SessionInitialized` if native fork is unavailable or returns the parent session ID,
+    /// avoiding persisting a blank fallback session before the user sends a prompt.
+    pub native_fork_only: bool,
     pub mcp_spec: Option<OrbitMcpLaunchSpec>,
     pub system_prompt_append: Option<String>,
     pub extra_env: HashMap<String, String>,
@@ -66,6 +75,10 @@ pub struct SessionLaunchConfig {
     pub persisted_running_bg_tasks: Vec<PersistedBackgroundTask>,
     /// True when the persisted `AgentStatus` in SQLite was `AutonomousWakeup { source: "waiting:..." }`.
     pub persisted_bg_wait: bool,
+    /// Optional ACP registry agent ID when `provider == ProviderKind::Acp`.
+    pub acp_agent_id: Option<String>,
+    /// Optional pre-resolved `AcpAgentSpec` when `provider == ProviderKind::Acp`.
+    pub acp_spec: Option<orbit_protocol::AcpAgentSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +95,7 @@ pub enum DriverCommand {
     SetConfig {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        fast_mode: Option<bool>,
     },
     ResolvePermission {
         request_id: String,
@@ -140,6 +154,17 @@ pub enum DriverEvent {
     /// Settle stale historical `Running` background-task tool calls in place without appending
     /// out-of-order cards to the latest turn.
     ReconcileBackgroundTasks(Vec<(String, ToolCallStatus)>),
+    /// Provider-reported token telemetry for a completed turn.
+    TurnUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        /// Instantaneous prompt token count of the most recent single LLM API call in the turn
+        /// (distinct from cumulative multi-step turn sums).
+        last_call_prompt_tokens: Option<u64>,
+        model: Option<String>,
+    },
     Exited {
         code: Option<i32>,
     },

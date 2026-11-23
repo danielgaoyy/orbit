@@ -398,6 +398,11 @@ struct StageTurnView: View {
                 if !cleanCode.isEmpty {
                     parts.append(cleanCode)
                 }
+            case let .mathBlock(tex, _):
+                let cleanTex = tex.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleanTex.isEmpty {
+                    parts.append("$$\n\(cleanTex)\n$$")
+                }
             case let .table(_, headers, rows):
                 var tableLines: [String] = []
                 let headerLine = headers
@@ -860,7 +865,7 @@ struct UserPromptBubbleView: View {
         switch first {
         case let .paragraph(spans):
             return spans.contains { $0.bold || $0.italic || $0.strikethrough || $0.inlineCode || $0.linkUrl != nil }
-        case .heading, .listItem, .blockQuote, .codeBlock, .table, .horizontalRule:
+        case .heading, .listItem, .blockQuote, .codeBlock, .table, .horizontalRule, .mathBlock:
             return true
         }
     }

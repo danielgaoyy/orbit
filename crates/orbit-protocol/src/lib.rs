@@ -1,9 +1,47 @@
 //! Core wire types, state machines, timeline events, git/worktree models, orchestration models, and binary terminal framing.
 
+pub mod acp;
+pub mod artifacts;
+pub mod browser;
+pub mod goals;
+pub mod guardian;
+pub mod handoff;
+pub mod hooks;
+pub mod im_channels;
+pub mod instructions;
+pub mod lsp;
+pub mod mcp_servers;
+pub mod media;
 pub mod orchestration;
+pub mod push;
+pub mod rules;
+pub mod skills;
+pub mod timers;
+pub mod triggers;
+pub mod usage;
+pub mod workflows;
+pub use acp::*;
+pub use artifacts::*;
+pub use browser::*;
+pub use goals::*;
+pub use guardian::*;
+pub use handoff::*;
+pub use hooks::*;
+pub use im_channels::*;
+pub use instructions::*;
+pub use lsp::*;
+pub use mcp_servers::*;
+pub use media::*;
 pub use orchestration::*;
+pub use push::*;
+pub use rules::*;
+pub use skills::*;
+pub use timers::*;
+pub use triggers::*;
+pub use usage::*;
+pub use workflows::*;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,38 +53,272 @@ fn wire_default_true() -> bool {
     true
 }
 
-/// First-class supported coding agent CLIs in Orbit Phase 1.
+fn wire_default_symbol_limit() -> u32 {
+    30
+}
+
+fn wire_default_lsp_limit() -> u32 {
+    50
+}
+
+fn wire_default_usage_days() -> u32 {
+    7
+}
+
+fn wire_default_workflow_concurrency() -> u32 {
+    3
+}
+
+/// First-class supported coding agent CLIs in Orbit (native drivers + Universal ACP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    #[serde(alias = "agy")]
     Antigravity,
+    #[serde(alias = "openai")]
     Codex,
+    #[serde(alias = "claude", alias = "claude-code")]
     ClaudeCode,
+    #[serde(rename = "opencode", alias = "open_code", alias = "open-code")]
+    OpenCode,
+    #[serde(alias = "gemini", alias = "gemini-cli")]
+    GeminiCli,
+    #[serde(alias = "cursor", alias = "cursor-agent")]
+    CursorAgent,
+    #[serde(alias = "github_copilot", alias = "github-copilot")]
+    Copilot,
+    Goose,
+    #[serde(alias = "pi-coding-agent", alias = "pi_coding_agent")]
+    Pi,
+    #[serde(alias = "kimi_cli", alias = "kimi-cli")]
+    Kimi,
+    Cline,
+    #[serde(
+        alias = "vibe",
+        alias = "vibe_acp",
+        alias = "vibe-acp",
+        alias = "mistral-vibe"
+    )]
+    MistralVibe,
+    #[serde(alias = "auggie", alias = "augment_code", alias = "augment-code")]
+    Augment,
+    Acp,
 }
 
 impl ProviderKind {
-    pub fn default_binary(self) -> &'static str {
+    const NATIVE_PROVIDERS: [Self; 13] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Antigravity,
+        Self::OpenCode,
+        Self::GeminiCli,
+        Self::CursorAgent,
+        Self::Copilot,
+        Self::Goose,
+        Self::Pi,
+        Self::Kimi,
+        Self::Cline,
+        Self::MistralVibe,
+        Self::Augment,
+    ];
+
+    const ALL_PROVIDERS: [Self; 14] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Antigravity,
+        Self::OpenCode,
+        Self::GeminiCli,
+        Self::CursorAgent,
+        Self::Copilot,
+        Self::Goose,
+        Self::Pi,
+        Self::Kimi,
+        Self::Cline,
+        Self::MistralVibe,
+        Self::Augment,
+        Self::Acp,
+    ];
+
+    /// All 13 first-class native coding agent providers in canonical display order.
+    pub const fn native_all() -> &'static [Self] {
+        &Self::NATIVE_PROVIDERS
+    }
+
+    /// All 14 coding agent providers (13 native + Universal ACP) in canonical display order.
+    pub const fn all() -> &'static [Self] {
+        &Self::ALL_PROVIDERS
+    }
+
+    /// Canonical wire/config slug matching serde serialization.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Antigravity => "antigravity",
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude_code",
+            Self::OpenCode => "opencode",
+            Self::GeminiCli => "gemini_cli",
+            Self::CursorAgent => "cursor_agent",
+            Self::Copilot => "copilot",
+            Self::Goose => "goose",
+            Self::Pi => "pi",
+            Self::Kimi => "kimi",
+            Self::Cline => "cline",
+            Self::MistralVibe => "mistral_vibe",
+            Self::Augment => "augment",
+            Self::Acp => "acp",
+        }
+    }
+
+    /// Parse a provider slug or common CLI alias (case-insensitive).
+    pub fn from_slug(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "antigravity" | "agy" => Some(Self::Antigravity),
+            "codex" | "openai" => Some(Self::Codex),
+            "claude_code" | "claude-code" | "claude" => Some(Self::ClaudeCode),
+            "opencode" | "open_code" | "open-code" => Some(Self::OpenCode),
+            "gemini_cli" | "gemini-cli" | "gemini" => Some(Self::GeminiCli),
+            "cursor_agent" | "cursor-agent" | "cursor" => Some(Self::CursorAgent),
+            "copilot" | "github_copilot" | "github-copilot" | "gh-copilot" => Some(Self::Copilot),
+            "goose" => Some(Self::Goose),
+            "pi" | "pi-coding-agent" | "pi_coding_agent" => Some(Self::Pi),
+            "kimi" | "kimi_cli" | "kimi-cli" => Some(Self::Kimi),
+            "cline" => Some(Self::Cline),
+            "mistral_vibe" | "mistral-vibe" | "vibe" | "vibe-acp" | "vibe_acp" => {
+                Some(Self::MistralVibe)
+            }
+            "augment" | "auggie" | "augment_code" | "augment-code" => Some(Self::Augment),
+            "acp" => Some(Self::Acp),
+            _ => None,
+        }
+    }
+
+    pub const fn default_binary(self) -> &'static str {
         match self {
             Self::Antigravity => "agy",
             Self::Codex => "codex",
             Self::ClaudeCode => "claude",
+            Self::OpenCode => "opencode",
+            Self::GeminiCli => "gemini",
+            Self::CursorAgent => "cursor-agent",
+            Self::Copilot => "copilot",
+            Self::Goose => "goose",
+            Self::Pi => "pi",
+            Self::Kimi => "kimi",
+            Self::Cline => "cline",
+            Self::MistralVibe => "vibe-acp",
+            Self::Augment => "auggie",
+            Self::Acp => "acp",
         }
     }
 
-    pub fn display_name(self) -> &'static str {
+    /// Alternate binary names checked during PATH discovery when `default_binary()` is absent.
+    pub const fn fallback_binaries(self) -> &'static [&'static str] {
+        match self {
+            Self::MistralVibe => &["vibe"],
+            _ => &[],
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
         match self {
             Self::Antigravity => "Antigravity",
             Self::Codex => "Codex",
             Self::ClaudeCode => "Claude Code",
+            Self::OpenCode => "OpenCode",
+            Self::GeminiCli => "Gemini CLI",
+            Self::CursorAgent => "Cursor Agent",
+            Self::Copilot => "GitHub Copilot",
+            Self::Goose => "Goose",
+            Self::Pi => "Pi",
+            Self::Kimi => "Kimi CLI",
+            Self::Cline => "Cline",
+            Self::MistralVibe => "Mistral Vibe",
+            Self::Augment => "Augment",
+            Self::Acp => "ACP Agent",
         }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Antigravity => "AGY",
+            Self::Codex => "Codex",
+            Self::ClaudeCode => "Claude",
+            Self::OpenCode => "OpenCode",
+            Self::GeminiCli => "Gemini",
+            Self::CursorAgent => "Cursor",
+            Self::Copilot => "Copilot",
+            Self::Goose => "Goose",
+            Self::Pi => "Pi",
+            Self::Kimi => "Kimi",
+            Self::Cline => "Cline",
+            Self::MistralVibe => "Vibe",
+            Self::Augment => "Augment",
+            Self::Acp => "ACP",
+        }
+    }
+
+    pub const fn env_override_key(self) -> &'static str {
+        match self {
+            Self::Antigravity => "ORBIT_AGY_BIN",
+            Self::Codex => "ORBIT_CODEX_BIN",
+            Self::ClaudeCode => "ORBIT_CLAUDE_BIN",
+            Self::OpenCode => "ORBIT_OPENCODE_BIN",
+            Self::GeminiCli => "ORBIT_GEMINI_BIN",
+            Self::CursorAgent => "ORBIT_CURSOR_AGENT_BIN",
+            Self::Copilot => "ORBIT_COPILOT_BIN",
+            Self::Goose => "ORBIT_GOOSE_BIN",
+            Self::Pi => "ORBIT_PI_BIN",
+            Self::Kimi => "ORBIT_KIMI_BIN",
+            Self::Cline => "ORBIT_CLINE_BIN",
+            Self::MistralVibe => "ORBIT_VIBE_BIN",
+            Self::Augment => "ORBIT_AUGGIE_BIN",
+            Self::Acp => "ORBIT_ACP_BIN",
+        }
+    }
+
+    pub const fn protocol_transport(self) -> &'static str {
+        match self {
+            Self::Antigravity => "acp-stdio + transcript",
+            Self::Codex => "app-server json-rpc",
+            Self::ClaudeCode => "stream-json control",
+            Self::Pi => "pi-rpc jsonl",
+            Self::OpenCode
+            | Self::GeminiCli
+            | Self::CursorAgent
+            | Self::Copilot
+            | Self::Goose
+            | Self::Kimi
+            | Self::Cline
+            | Self::MistralVibe
+            | Self::Augment => "acp-stdio",
+            Self::Acp => "acp-generic-stdio",
+        }
+    }
+
+    /// Returns `true` for the 9 first-class ACP stdio providers powered by `acp_providers`.
+    pub const fn is_acp_stdio_provider(self) -> bool {
+        matches!(
+            self,
+            Self::OpenCode
+                | Self::GeminiCli
+                | Self::CursorAgent
+                | Self::Copilot
+                | Self::Goose
+                | Self::Kimi
+                | Self::Cline
+                | Self::MistralVibe
+                | Self::Augment
+        )
     }
 }
 
-/// Normalized permission/execution mode across all three providers.
+/// Normalized permission/execution mode across all providers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
     Default,
+    #[serde(rename = "auto")]
+    Auto,
     Plan,
     AcceptEdits,
     FullAccess,
@@ -118,6 +390,8 @@ pub struct ProviderModelSpec {
     pub default_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub thinking_options: Vec<ThinkingOptionSpec>,
+    #[serde(default)]
+    pub supports_fast_mode: bool,
 }
 
 /// Dynamic model & thinking catalog for a single provider on a specific Orbit host.
@@ -308,6 +582,8 @@ pub struct AgentSummary {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub mode: SessionMode,
     pub status: AgentStatus,
     pub parent_agent_id: Option<String>,
@@ -354,6 +630,29 @@ pub struct AgentSummary {
     /// Concise 1-line AI-generated (or user-edited) summary of what this conversation is currently doing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_summary: Option<String>,
+    /// Optional source agent ID when this conversation was branched/forked from another thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_agent_id: Option<String>,
+    /// Optional source timeline sequence number at which this conversation forked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_at_seq: Option<u64>,
+    /// Optional ACP registry agent ID when `provider == ProviderKind::Acp` (e.g. `"opencode"`, `"gemini-cli"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_agent_id: Option<String>,
+}
+
+/// Destination workspace strategy when forking/branching an existing conversation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ForkTarget {
+    #[default]
+    SameDirectory,
+    NewWorktree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_ref: Option<String>,
+    },
 }
 
 /// Active detached PTY terminal summary.
@@ -501,6 +800,8 @@ pub enum TimelinePayload {
         title: String,
         detail: ToolCallDetail,
         allowed_decisions: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guardian_assessment: Option<GuardianAssessment>,
     },
     PermissionResolved {
         request_id: String,
@@ -536,6 +837,33 @@ pub enum TimelinePayload {
     StatusChanged {
         status: AgentStatus,
     },
+}
+
+/// Optimistic concurrency conflict returned when saving a workspace file whose on-disk
+/// SHA-256 `etag` changed since it was loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceFileConflict {
+    pub current_etag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_content: Option<String>,
+    pub current_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_mtime_unix_ms: Option<i64>,
+}
+
+/// Indexed workspace code symbol entry for `@symbol` fuzzy citation (pure-Rust fast index + optional LSP enrichment).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSymbolEntry {
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    pub language: String,
 }
 
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
@@ -717,6 +1045,20 @@ pub enum WireMessage {
         cwd: String,
         files: Vec<String>,
     },
+    SearchWorkspaceSymbols {
+        request_id: Uuid,
+        cwd: String,
+        query: String,
+        #[serde(default = "wire_default_symbol_limit")]
+        limit: u32,
+    },
+    WorkspaceSymbolsResponse {
+        request_id: Uuid,
+        cwd: String,
+        symbols: Vec<WorkspaceSymbolEntry>,
+        #[serde(default)]
+        truncated: bool,
+    },
     ReadWorkspaceFile {
         request_id: Uuid,
         cwd: String,
@@ -729,13 +1071,73 @@ pub enum WireMessage {
         cwd: String,
         path: String,
         resolved_path: String,
-        /// `"text"` | `"image"` | `"binary"`
+        /// `"text"` | `"image"` | `"pdf"` | `"audio"` | `"video"` | `"binary"`
         content_kind: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
         content: String,
         size_bytes: u64,
         truncated: bool,
+        /// SHA-256 hex digest of exact disk bytes for optimistic concurrency.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        etag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mtime_unix_ms: Option<i64>,
+        #[serde(default)]
+        writable: bool,
+        /// `"lf"` | `"crlf"` | `"mixed"`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line_ending: Option<String>,
+    },
+    WriteWorkspaceFile {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
+        #[serde(default)]
+        force: bool,
+    },
+    WorkspaceFileWritten {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        etag: String,
+        size_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mtime_unix_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conflict: Option<WorkspaceFileConflict>,
+    },
+    CreateWorkspaceEntry {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        #[serde(default)]
+        is_dir: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_content: Option<String>,
+    },
+    RenameWorkspaceEntry {
+        request_id: Uuid,
+        cwd: String,
+        old_path: String,
+        new_path: String,
+    },
+    DeleteWorkspaceEntry {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+    },
+    WorkspaceEntryMutated {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_path: Option<String>,
+        /// `"created_file"` | `"created_dir"` | `"renamed"` | `"deleted"`
+        action: String,
     },
 
     // Agents & Interactive Orchestration
@@ -799,10 +1201,36 @@ pub enum WireMessage {
         /// Override automatic clustering into an existing Mission Workspace (defaults to host config).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auto_cluster: Option<bool>,
+        /// Enable Fast output mode (lower latency, higher quota usage) when supported by the model.
+        /// `None` inherits the profile default; `Some(false)` explicitly disables fast mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast_mode: Option<bool>,
+        /// Optional ACP registry agent ID when `provider == ProviderKind::Acp`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acp_agent_id: Option<String>,
     },
     AgentCreated {
         request_id: Uuid,
         agent: AgentSummary,
+    },
+    /// Fork/branch an existing conversation into a new session (same directory or fresh git worktree).
+    ForkAgent {
+        request_id: Uuid,
+        source_agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        up_to_seq: Option<u64>,
+        #[serde(default)]
+        target: ForkTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_prompt: Option<String>,
+    },
+    AgentForked {
+        request_id: Uuid,
+        agent: AgentSummary,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<WorkspaceSummary>,
     },
     AgentUpdated {
         agent: AgentSummary,
@@ -886,6 +1314,8 @@ pub enum WireMessage {
         model: Option<String>,
         #[serde(default)]
         effort: Option<ReasoningEffort>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acp_agent_id: Option<String>,
     },
     ArchiveAgent {
         request_id: Uuid,
@@ -938,6 +1368,8 @@ pub enum WireMessage {
         handle: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast_mode: Option<bool>,
     },
     ListPendingPermissions {
         request_id: Uuid,
@@ -1214,6 +1646,76 @@ pub enum WireMessage {
         skill_ids: Vec<String>,
     },
 
+    // Skills Ecosystem & Managed Skills CRUD
+    ListManagedSkills {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ManagedSkillsSnapshot {
+        request_id: Uuid,
+        skills: Vec<ManagedSkillRecord>,
+    },
+    ReadManagedSkill {
+        request_id: Uuid,
+        skill_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ManagedSkillContentResponse {
+        request_id: Uuid,
+        skill_id: String,
+        content: String,
+        etag: String,
+    },
+    UpsertManagedSkill {
+        request_id: Uuid,
+        scope: SkillWriteScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        slug: String,
+        name: String,
+        description: String,
+        content: String,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
+    },
+    ToggleManagedSkill {
+        request_id: Uuid,
+        skill_id: String,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    DeleteManagedSkill {
+        request_id: Uuid,
+        skill_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ImportManagedSkill {
+        request_id: Uuid,
+        scope: SkillWriteScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        source_markdown_or_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slug_override: Option<String>,
+    },
+
+    // System Keep-Awake (OS Sleep Prevention)
+    GetKeepAwakeStatus {
+        request_id: Uuid,
+    },
+    KeepAwakeStatusSnapshot {
+        request_id: Uuid,
+        status: KeepAwakeStatus,
+    },
+    KeepAwakeStatusUpdated {
+        status: KeepAwakeStatus,
+    },
+
     // Provider-Native Subagent Observability
     ListProviderSubagents {
         request_id: Uuid,
@@ -1418,6 +1920,778 @@ pub enum WireMessage {
         event: WorkspaceOrganizeEvent,
     },
 
+    // Universal ACP Agent Registry & Live Probing
+    ListAcpAgents {
+        request_id: Uuid,
+    },
+    AcpAgentsSnapshot {
+        request_id: Uuid,
+        agents: Vec<AcpAgentAvailability>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    UpsertCustomAcpAgent {
+        request_id: Uuid,
+        spec: AcpAgentSpec,
+    },
+    DeleteCustomAcpAgent {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    TestAcpAgent {
+        request_id: Uuid,
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    AcpAgentProbeResult {
+        request_id: Uuid,
+        result: AcpProbeResult,
+    },
+    RefreshAcpRegistry {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registry_url: Option<String>,
+    },
+
+    // Bidirectional Git Worktree <-> Local Handoff (Preview & Atomic Execution)
+    PreviewWorktreeHandoff {
+        request_id: Uuid,
+        workspace_id: String,
+        direction: WorktreeHandoffDirection,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_workspace_id: Option<String>,
+        #[serde(default = "wire_default_true")]
+        include_committed: bool,
+    },
+    WorktreeHandoffPreviewResult {
+        request_id: Uuid,
+        preview: WorktreeHandoffPreview,
+    },
+    ExecuteWorktreeHandoff {
+        request_id: Uuid,
+        workspace_id: String,
+        direction: WorktreeHandoffDirection,
+        mode: WorktreeHandoffMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_workspace_id: Option<String>,
+        #[serde(default = "wire_default_true")]
+        include_committed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default)]
+        allow_three_way_conflicts: bool,
+    },
+    WorktreeHandoffExecuted {
+        request_id: Uuid,
+        outcome: WorktreeHandoffOutcome,
+    },
+
+    // First-Class Artifacts & SEP-1865 MCP Apps
+    ListArtifacts {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+    },
+    ArtifactsSnapshot {
+        request_id: Uuid,
+        artifacts: Vec<ArtifactSummary>,
+    },
+    GetArtifact {
+        request_id: Uuid,
+        artifact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u32>,
+    },
+    ArtifactContent {
+        request_id: Uuid,
+        artifact: ArtifactDetail,
+    },
+    UpsertArtifact {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_id: Option<String>,
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        title: String,
+        kind: ArtifactKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource_uri: Option<String>,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_note: Option<String>,
+    },
+    ArtifactUpdated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<Uuid>,
+        artifact: ArtifactSummary,
+    },
+    DeleteArtifact {
+        request_id: Uuid,
+        artifact_id: String,
+    },
+    ArtifactDeleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<Uuid>,
+        artifact_id: String,
+    },
+
+    // Project Instruction Hierarchy Discovery & Atomic Editing
+    ListInstructionFiles {
+        request_id: Uuid,
+        cwd: String,
+    },
+    InstructionFilesSnapshot {
+        request_id: Uuid,
+        cwd: String,
+        files: Vec<InstructionFileEntry>,
+        #[serde(default)]
+        total_tokens: u32,
+        #[serde(default)]
+        merged_preview: String,
+    },
+    ReadInstructionFile {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+    },
+    InstructionFileContentResponse {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        etag: Option<String>,
+        exists: bool,
+    },
+    SaveInstructionFile {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
+    },
+    InstructionFileSavedResponse {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        etag: String,
+        size_bytes: u64,
+        approx_tokens: u32,
+    },
+
+    // External MCP Server Manager (stdio + Streamable HTTP/SSE + live probe)
+    ListExternalMcpServers {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ExternalMcpServersSnapshot {
+        request_id: Uuid,
+        servers: Vec<ExternalMcpServerRecord>,
+    },
+    UpsertExternalMcpServer {
+        request_id: Uuid,
+        scope: McpWriteScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        name: String,
+        transport: McpTransportKind,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        #[serde(default)]
+        keep_existing_secrets: bool,
+        #[serde(default = "wire_default_true")]
+        enabled: bool,
+    },
+    ToggleExternalMcpServer {
+        request_id: Uuid,
+        server_id: String,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    DeleteExternalMcpServer {
+        request_id: Uuid,
+        server_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ProbeExternalMcpServer {
+        request_id: Uuid,
+        server_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    ExternalMcpProbeResponse {
+        request_id: Uuid,
+        server_id: String,
+        result: McpProbeResult,
+    },
+
+    // Path-Scoped Glob Rules (.orbit/rules/*.md, .claude/rules/*.md, .cursor/rules/*.mdc)
+    ListPathRules {
+        request_id: Uuid,
+        cwd: String,
+    },
+    PathRulesSnapshot {
+        request_id: Uuid,
+        cwd: String,
+        rules: Vec<PathScopedRule>,
+        #[serde(default)]
+        total_always_tokens: u32,
+        #[serde(default)]
+        token_budget_warning: bool,
+    },
+    UpsertPathRule {
+        request_id: Uuid,
+        cwd: String,
+        scope: RuleScope,
+        name: String,
+        #[serde(default)]
+        description: String,
+        trigger_mode: RuleTriggerMode,
+        #[serde(default)]
+        globs: Vec<String>,
+        #[serde(default = "wire_default_true")]
+        enabled: bool,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
+    },
+    DeletePathRule {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+    },
+    MatchPathRules {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default)]
+        active_paths: Vec<String>,
+        #[serde(default)]
+        manual_rule_names: Vec<String>,
+    },
+    MatchedPathRulesResponse {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default)]
+        matched: Vec<MatchedRuleSummary>,
+        #[serde(default)]
+        injected_markdown: String,
+        #[serde(default)]
+        total_tokens: u32,
+    },
+
+    // Pure-Rust LSP Language Server Integration
+    ListLspServers {
+        request_id: Uuid,
+        cwd: String,
+    },
+    LspServersSnapshot {
+        request_id: Uuid,
+        cwd: String,
+        servers: Vec<LspServerStatus>,
+    },
+    LspQuerySymbols {
+        request_id: Uuid,
+        cwd: String,
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default = "wire_default_lsp_limit")]
+        limit: u32,
+    },
+    LspSymbolsResponse {
+        request_id: Uuid,
+        cwd: String,
+        symbols: Vec<LspSymbolInfo>,
+    },
+    LspGetDiagnostics {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    LspDiagnosticsResponse {
+        request_id: Uuid,
+        cwd: String,
+        diagnostics: Vec<LspDiagnostic>,
+    },
+    LspGotoDefinition {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+    },
+    LspLocationsResponse {
+        request_id: Uuid,
+        cwd: String,
+        locations: Vec<LspLocation>,
+    },
+    RestartLspServer {
+        request_id: Uuid,
+        cwd: String,
+        server_id: String,
+    },
+
+    // Usage Insights, Cost Ledger & Context Occupancy Telemetry
+    GetUsageInsights {
+        request_id: Uuid,
+        #[serde(default = "wire_default_usage_days")]
+        days: u32,
+    },
+    UsageInsightsResponse {
+        request_id: Uuid,
+        snapshot: UsageInsightsSnapshot,
+    },
+    GetContextOccupancy {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    ContextOccupancyResponse {
+        request_id: Uuid,
+        breakdown: ContextOccupancyBreakdown,
+    },
+
+    // Deterministic Lifecycle Hooks (`$ORBIT_HOME/hooks.json` & `<cwd>/.orbit/hooks.json`)
+    ListLifecycleHooks {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    LifecycleHooksSnapshot {
+        request_id: Uuid,
+        hooks: Vec<LifecycleHookRule>,
+        #[serde(default)]
+        recent_executions: Vec<HookExecutionRecord>,
+        #[serde(default)]
+        project_hooks_trusted: bool,
+    },
+    UpsertLifecycleHook {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        hook: LifecycleHookRule,
+    },
+    DeleteLifecycleHook {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        hook_id: String,
+        scope: HookScope,
+    },
+    SetProjectHooksTrust {
+        request_id: Uuid,
+        cwd: String,
+        trusted: bool,
+    },
+    TestLifecycleHook {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        hook_id: String,
+        #[serde(default)]
+        sample_payload: serde_json::Value,
+    },
+    HookTestResultResponse {
+        request_id: Uuid,
+        record: HookExecutionRecord,
+    },
+
+    // Early-Wakeup One-Shot Conditional Timers
+    CreateConditionalTimer {
+        request_id: Uuid,
+        agent_id: String,
+        duration_seconds: u64,
+        prompt: String,
+        #[serde(default)]
+        condition: TimerCondition,
+    },
+    ConditionalTimerCreated {
+        request_id: Uuid,
+        timer: ConditionalTimerRecord,
+    },
+    ListConditionalTimers {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default)]
+        include_resolved: bool,
+    },
+    ConditionalTimersSnapshot {
+        request_id: Uuid,
+        timers: Vec<ConditionalTimerRecord>,
+    },
+    CancelConditionalTimer {
+        request_id: Uuid,
+        timer_id: String,
+    },
+    FireConditionalTimerNow {
+        request_id: Uuid,
+        timer_id: String,
+    },
+    ConditionalTimerUpdated {
+        request_id: Uuid,
+        timer: ConditionalTimerRecord,
+    },
+    ConditionalTimerEvent {
+        timer: ConditionalTimerRecord,
+    },
+
+    // Guardian AI Risk-Assessment Auto-Approval Policy & Audit Log
+    GetGuardianConfig {
+        request_id: Uuid,
+    },
+    UpdateGuardianConfig {
+        request_id: Uuid,
+        config: GuardianPolicyConfig,
+    },
+    GuardianConfigSnapshot {
+        request_id: Uuid,
+        config: GuardianPolicyConfig,
+        #[serde(default)]
+        recent_audits: Vec<GuardianAuditEntry>,
+    },
+
+    // --- Unattended Autonomous Goal Mode & Streaming Monitor Engine ---
+    StartGoalRun {
+        request_id: Uuid,
+        agent_id: String,
+        objective: String,
+        #[serde(default)]
+        criteria: Vec<String>,
+        #[serde(default)]
+        verify_command: Option<String>,
+        #[serde(default)]
+        max_iterations: Option<u32>,
+        #[serde(default)]
+        max_duration_secs: Option<u64>,
+    },
+    ListGoalRuns {
+        request_id: Uuid,
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    ControlGoalRun {
+        request_id: Uuid,
+        goal_id: String,
+        action: GoalControlAction,
+    },
+    GoalRunUpdated {
+        request_id: Uuid,
+        goal: GoalRunRecord,
+    },
+    GoalRunsSnapshot {
+        request_id: Uuid,
+        goals: Vec<GoalRunRecord>,
+    },
+    GoalRunEvent {
+        goal: GoalRunRecord,
+    },
+    StartMonitorWatch {
+        request_id: Uuid,
+        agent_id: String,
+        name: String,
+        kind: MonitorKind,
+        #[serde(default)]
+        expires_in_secs: Option<u64>,
+    },
+    ListMonitorWatches {
+        request_id: Uuid,
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    StopMonitorWatch {
+        request_id: Uuid,
+        monitor_id: String,
+    },
+    MonitorWatchUpdated {
+        request_id: Uuid,
+        monitor: MonitorWatchRecord,
+    },
+    MonitorWatchesSnapshot {
+        request_id: Uuid,
+        monitors: Vec<MonitorWatchRecord>,
+    },
+    MonitorWatchEvent {
+        monitor: MonitorWatchRecord,
+    },
+
+    // --- External Event Triggers (GitHub, Slack, Linear, Generic Webhook + GitHub PR Polling) ---
+    ListEventTriggers {
+        request_id: Uuid,
+    },
+    EventTriggersSnapshot {
+        request_id: Uuid,
+        triggers: Vec<EventTriggerRecord>,
+        #[serde(default)]
+        recent_deliveries: Vec<EventTriggerDelivery>,
+        #[serde(default)]
+        base_webhook_url: String,
+    },
+    UpsertEventTrigger {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_id: Option<String>,
+        name: String,
+        source: TriggerSourceKind,
+        #[serde(default)]
+        event_filters: Vec<String>,
+        prompt_template: String,
+        target: TriggerDispatchTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
+        #[serde(default)]
+        keep_existing_secret: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github_poll: Option<GitHubPollConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github_token: Option<String>,
+        #[serde(default)]
+        keep_existing_token: bool,
+        enabled: bool,
+    },
+    DeleteEventTrigger {
+        request_id: Uuid,
+        trigger_id: String,
+    },
+    TestEventTrigger {
+        request_id: Uuid,
+        trigger_id: String,
+        sample_event_type: String,
+        #[serde(default)]
+        sample_payload: serde_json::Value,
+    },
+    EventTriggerTestResponse {
+        request_id: Uuid,
+        delivery: EventTriggerDelivery,
+    },
+
+    // --- Pure-Rust CDP Browser Automation & Guarded Computer Use ---
+    ListBrowserSessions {
+        request_id: Uuid,
+        #[serde(default = "wire_default_true")]
+        include_screenshots: bool,
+    },
+    BrowserSessionsSnapshot {
+        request_id: Uuid,
+        sessions: Vec<BrowserSessionSummary>,
+        policy: BrowserPolicyConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chrome_binary: Option<String>,
+    },
+    CreateBrowserSession {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        headless: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewport_width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewport_height: Option<u32>,
+    },
+    BrowserSessionUpdated {
+        request_id: Uuid,
+        session: BrowserSessionSummary,
+    },
+    ExecuteBrowserAction {
+        request_id: Uuid,
+        session_id: String,
+        action: BrowserActionRequest,
+    },
+    BrowserActionResponse {
+        request_id: Uuid,
+        session: BrowserSessionSummary,
+        #[serde(default)]
+        elements: Vec<BrowserElementRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screenshot_base64: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_excerpt: Option<String>,
+        #[serde(default)]
+        captcha_detected: bool,
+    },
+    CloseBrowserSession {
+        request_id: Uuid,
+        session_id: String,
+    },
+    UpdateBrowserPolicy {
+        request_id: Uuid,
+        policy: BrowserPolicyConfig,
+    },
+
+    // --- Batch CSV Fan-Out, Programmable DAG Workflows & Best-of-N Parallel Arena ---
+    StartBatchFanout {
+        request_id: Uuid,
+        name: String,
+        cwd: String,
+        csv_content: String,
+        prompt_template: String,
+        provider: ProviderKind,
+        #[serde(default)]
+        model: Option<String>,
+        mode: SessionMode,
+        #[serde(default = "wire_default_workflow_concurrency")]
+        max_concurrency: u32,
+        #[serde(default)]
+        isolated_worktree: bool,
+    },
+    StartDagWorkflow {
+        request_id: Uuid,
+        name: String,
+        cwd: String,
+        steps: Vec<DagStepSpec>,
+        default_provider: ProviderKind,
+        default_mode: SessionMode,
+        #[serde(default = "wire_default_workflow_concurrency")]
+        max_concurrency: u32,
+    },
+    StartBestOfN {
+        request_id: Uuid,
+        name: String,
+        cwd: String,
+        prompt: String,
+        candidates: Vec<BestOfNCandidateSpec>,
+        mode: SessionMode,
+        #[serde(default)]
+        verify_command: Option<String>,
+    },
+    ListWorkflowRuns {
+        request_id: Uuid,
+        #[serde(default)]
+        include_completed: bool,
+    },
+    CancelWorkflowRun {
+        request_id: Uuid,
+        run_id: String,
+    },
+    SelectBestOfNWinner {
+        request_id: Uuid,
+        run_id: String,
+        winner_step_id: String,
+        #[serde(default)]
+        apply_to_workspace: bool,
+    },
+    WorkflowRunUpdated {
+        request_id: Uuid,
+        run: WorkflowRunRecord,
+    },
+    WorkflowRunsSnapshot {
+        request_id: Uuid,
+        runs: Vec<WorkflowRunRecord>,
+    },
+    WorkflowRunEvent {
+        run: WorkflowRunRecord,
+    },
+
+    // Bidirectional IM Channels (Lark / Feishu, Telegram, Slack, Discord + Remote Approvals)
+    ListImChannels {
+        request_id: Uuid,
+    },
+    ImChannelsSnapshot {
+        request_id: Uuid,
+        channels: Vec<ImChannelRecord>,
+        bindings: Vec<ImThreadBinding>,
+        base_webhook_url: String,
+    },
+    UpsertImChannel {
+        request_id: Uuid,
+        #[serde(default)]
+        channel_id: Option<String>,
+        name: String,
+        platform: ImPlatform,
+        enabled: bool,
+        #[serde(default)]
+        app_id: Option<String>,
+        #[serde(default)]
+        primary_secret: Option<String>,
+        #[serde(default)]
+        signing_secret: Option<String>,
+        #[serde(default = "wire_default_true")]
+        keep_existing_secrets: bool,
+        #[serde(default)]
+        allowed_chat_ids: Vec<String>,
+        #[serde(default)]
+        allowed_user_ids: Vec<String>,
+        default_workspace_cwd: String,
+        default_provider: ProviderKind,
+        default_mode: SessionMode,
+        #[serde(default = "wire_default_true")]
+        forward_approvals: bool,
+    },
+    DeleteImChannel {
+        request_id: Uuid,
+        channel_id: String,
+    },
+    TestImChannel {
+        request_id: Uuid,
+        channel_id: String,
+        target_chat_id: String,
+        message: String,
+    },
+    ImChannelTestResponse {
+        request_id: Uuid,
+        ok: bool,
+        detail: String,
+    },
+
+    // Enhanced Desktop Notifications & Native Mobile Background Push (APNs / FCM / HarmonyOS Push Kit)
+    RegisterPushDevice {
+        request_id: Uuid,
+        device_id: String,
+        platform: PushPlatform,
+        device_name: String,
+        device_token: String,
+        #[serde(default)]
+        sandbox: bool,
+    },
+    UnregisterPushDevice {
+        request_id: Uuid,
+        device_id: String,
+    },
+    ListPushDevices {
+        request_id: Uuid,
+    },
+    UpdatePushPreferences {
+        request_id: Uuid,
+        preferences: PushPreferences,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway_auth_token: Option<String>,
+        #[serde(default = "wire_default_true")]
+        keep_existing_gateway_token: bool,
+    },
+    PushDevicesSnapshot {
+        request_id: Uuid,
+        devices: Vec<PushDeviceRecord>,
+        preferences: PushPreferences,
+    },
+    TestPushNotification {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
+    },
+    PushTestResponse {
+        request_id: Uuid,
+        attempted: u32,
+        delivered: u32,
+        detail: String,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -1444,8 +2718,12 @@ pub enum ProtocolError {
     InvalidBinaryFrame,
 }
 
-/// Anti-bomb upper bound on a single decompressed Zstd `WireMessage` payload (32 MiB).
-pub const MAX_ZSTD_WIRE_DECODE_BYTES: usize = 32 * 1024 * 1024;
+/// Anti-bomb upper bound on a single decompressed Zstd `WireMessage` payload (40 MiB,
+/// accommodating up to 25 MiB base64-encoded media responses plus JSON envelope).
+pub const MAX_ZSTD_WIRE_DECODE_BYTES: usize = 40 * 1024 * 1024;
+/// WebSocket frame/message size cap shared across daemon, relay, client, and relay-transport
+/// endpoints (48 MiB, safely carrying 25 MiB base64/E2EE frames without tearing down sessions).
+pub const MAX_WS_FRAME_BYTES: usize = 48 * 1024 * 1024;
 /// Target uncompressed JSON byte budget per paginated timeline batch (`TimelineCatchup` / `AgentRewound`).
 pub const MAX_WIRE_TIMELINE_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -1576,14 +2854,21 @@ mod tests {
             branch: None,
             handle: Some("lead".into()),
             auto_cluster: None,
+            fast_mode: Some(true),
+            acp_agent_id: None,
         };
         let raw_json = serde_json::to_vec(&msg).expect("serialize");
         let compressed = msg.encode_zstd(3).expect("compress");
         assert!(compressed.len() < raw_json.len());
         let decoded = WireMessage::decode_zstd(&compressed).expect("decompress");
         match decoded {
-            WireMessage::CreateAgent { provider, .. } => {
+            WireMessage::CreateAgent {
+                provider,
+                fast_mode,
+                ..
+            } => {
                 assert_eq!(provider, ProviderKind::Antigravity);
+                assert_eq!(fast_mode, Some(true));
             }
             _ => panic!("unexpected variant"),
         }
@@ -1662,7 +2947,12 @@ mod tests {
         let cfg = OrchestrationConfig::default();
         assert!(cfg.mcp_inject_enabled);
         assert!(cfg.idle_cleanup_enabled);
+        assert!(cfg.keep_awake_while_running);
         assert_eq!(cfg.idle_timeout_secs, 3600);
+
+        let legacy_cfg: OrchestrationConfig =
+            serde_json::from_str("{}").expect("deserialize legacy empty OrchestrationConfig");
+        assert!(legacy_cfg.keep_awake_while_running);
     }
 
     #[test]
@@ -1789,6 +3079,237 @@ mod tests {
     }
 
     #[test]
+    fn workspace_symbols_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let search_req = WireMessage::SearchWorkspaceSymbols {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            query: "searchSym".into(),
+            limit: 25,
+        };
+        let encoded = search_req.encode_zstd(3).expect("encode symbol search");
+        match WireMessage::decode_zstd(&encoded).expect("decode symbol search") {
+            WireMessage::SearchWorkspaceSymbols {
+                request_id,
+                cwd,
+                query,
+                limit,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(cwd, "/workspace/orbit");
+                assert_eq!(query, "searchSym");
+                assert_eq!(limit, 25);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Backward-compatible default limit when omitted
+        let minimal_req = serde_json::json!({
+            "op": "search_workspace_symbols",
+            "request_id": req_id,
+            "cwd": "/workspace/orbit",
+            "query": "Foo"
+        });
+        match serde_json::from_value::<WireMessage>(minimal_req).expect("decode default limit") {
+            WireMessage::SearchWorkspaceSymbols { limit, .. } => assert_eq!(limit, 30),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let resp = WireMessage::WorkspaceSymbolsResponse {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            symbols: vec![WorkspaceSymbolEntry {
+                name: "search_workspace_symbols".into(),
+                kind: "fn".into(),
+                path: "crates/orbit-daemon/src/symbols.rs".into(),
+                start_line: 42,
+                end_line: 78,
+                signature: Some("pub async fn search_workspace_symbols(...)".into()),
+                container: Some("WorkspaceSymbolIndex".into()),
+                language: "rust".into(),
+            }],
+            truncated: true,
+        };
+        let z_resp = resp.encode_zstd(3).expect("encode symbol response");
+        match WireMessage::decode_zstd(&z_resp).expect("decode symbol response") {
+            WireMessage::WorkspaceSymbolsResponse {
+                request_id,
+                cwd,
+                symbols,
+                truncated,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(cwd, "/workspace/orbit");
+                assert!(truncated);
+                assert_eq!(symbols.len(), 1);
+                assert_eq!(symbols[0].name, "search_workspace_symbols");
+                assert_eq!(
+                    symbols[0].container.as_deref(),
+                    Some("WorkspaceSymbolIndex")
+                );
+                assert_eq!(symbols[0].start_line, 42);
+                assert_eq!(symbols[0].end_line, 78);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_file_mutations_and_legacy_content_compat_roundtrip() {
+        let req_id = Uuid::new_v4();
+
+        // 1. Legacy WorkspaceFileContentResponse JSON without new metadata fields must deserialize cleanly
+        let legacy_json = serde_json::json!({
+            "op": "workspace_file_content_response",
+            "request_id": req_id,
+            "cwd": "/workspace/orbit",
+            "path": "src/main.rs",
+            "resolved_path": "/workspace/orbit/src/main.rs",
+            "content_kind": "text",
+            "mime_type": "text/plain",
+            "content": "fn main() {}\n",
+            "size_bytes": 13,
+            "truncated": false
+        });
+        let decoded_legacy: WireMessage =
+            serde_json::from_value(legacy_json).expect("decode legacy file content");
+        match decoded_legacy {
+            WireMessage::WorkspaceFileContentResponse {
+                request_id,
+                etag,
+                mtime_unix_ms,
+                writable,
+                line_ending,
+                ..
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(etag, None);
+                assert_eq!(mtime_unix_ms, None);
+                assert!(!writable);
+                assert_eq!(line_ending, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // 2. Enriched WorkspaceFileContentResponse roundtrip
+        let enriched = WireMessage::WorkspaceFileContentResponse {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            path: "src/main.rs".into(),
+            resolved_path: "/workspace/orbit/src/main.rs".into(),
+            content_kind: "text".into(),
+            mime_type: Some("text/plain".into()),
+            content: "fn main() {}\n".into(),
+            size_bytes: 13,
+            truncated: false,
+            etag: Some("a".repeat(64)),
+            mtime_unix_ms: Some(1_730_000_000_000),
+            writable: true,
+            line_ending: Some("lf".into()),
+        };
+        let z = enriched.encode_zstd(3).expect("encode enriched");
+        match WireMessage::decode_zstd(&z).expect("decode enriched") {
+            WireMessage::WorkspaceFileContentResponse {
+                etag,
+                mtime_unix_ms,
+                writable,
+                line_ending,
+                ..
+            } => {
+                assert_eq!(etag.as_deref(), Some("a".repeat(64).as_str()));
+                assert_eq!(mtime_unix_ms, Some(1_730_000_000_000));
+                assert!(writable);
+                assert_eq!(line_ending.as_deref(), Some("lf"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // 3. WriteWorkspaceFile & WorkspaceFileWritten (with conflict)
+        let write_req = WireMessage::WriteWorkspaceFile {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            path: "src/lib.rs".into(),
+            content: "pub fn hi() {}\n".into(),
+            expected_etag: Some("deadbeef".into()),
+            force: false,
+        };
+        let z_write = write_req.encode_zstd(3).expect("encode write");
+        match WireMessage::decode_zstd(&z_write).expect("decode write") {
+            WireMessage::WriteWorkspaceFile {
+                request_id,
+                path,
+                expected_etag,
+                force,
+                ..
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(expected_etag.as_deref(), Some("deadbeef"));
+                assert!(!force);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let written_conflict = WireMessage::WorkspaceFileWritten {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            path: "src/lib.rs".into(),
+            etag: "newetag".into(),
+            size_bytes: 20,
+            mtime_unix_ms: Some(1_730_000_000_123),
+            conflict: Some(WorkspaceFileConflict {
+                current_etag: "newetag".into(),
+                current_content: Some("pub fn disk() {}\n".into()),
+                current_size_bytes: 17,
+                current_mtime_unix_ms: Some(1_730_000_000_123),
+            }),
+        };
+        let z_written = written_conflict.encode_zstd(3).expect("encode written");
+        match WireMessage::decode_zstd(&z_written).expect("decode written") {
+            WireMessage::WorkspaceFileWritten {
+                conflict: Some(c), ..
+            } => {
+                assert_eq!(c.current_etag, "newetag");
+                assert_eq!(c.current_content.as_deref(), Some("pub fn disk() {}\n"));
+                assert_eq!(c.current_size_bytes, 17);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // 4. Create / Rename / Delete / Mutated roundtrip
+        for msg in [
+            WireMessage::CreateWorkspaceEntry {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/new.rs".into(),
+                is_dir: false,
+                initial_content: Some("// hi\n".into()),
+            },
+            WireMessage::RenameWorkspaceEntry {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                old_path: "src/new.rs".into(),
+                new_path: "src/renamed.rs".into(),
+            },
+            WireMessage::DeleteWorkspaceEntry {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/renamed.rs".into(),
+            },
+            WireMessage::WorkspaceEntryMutated {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/new.rs".into(),
+                new_path: Some("src/renamed.rs".into()),
+                action: "renamed".into(),
+            },
+        ] {
+            let enc = msg.encode_zstd(3).expect("encode mutation msg");
+            let _ = WireMessage::decode_zstd(&enc).expect("decode mutation msg");
+        }
+    }
+
+    #[test]
     fn rewind_agent_wire_roundtrip() {
         let req_id = Uuid::new_v4();
         let req = WireMessage::RewindAgent {
@@ -1824,6 +3345,7 @@ mod tests {
                 provider: ProviderKind::ClaudeCode,
                 model: Some("sonnet".into()),
                 effort: None,
+                fast_mode: false,
                 mode: SessionMode::Default,
                 status: AgentStatus::Idle,
                 parent_agent_id: None,
@@ -1846,6 +3368,9 @@ mod tests {
                 handle: Some("lead".into()),
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: None,
             },
             to_before_seq: 42,
             events: Vec::new(),
@@ -1868,6 +3393,1280 @@ mod tests {
                 assert_eq!(restored_prompt.as_deref(), Some("Update layout"));
             }
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_kind_all_14_metadata_slugs_and_serde_roundtrip() {
+        assert_eq!(ProviderKind::native_all().len(), 13);
+        assert_eq!(ProviderKind::all().len(), 14);
+        let mut seen_slugs = std::collections::HashSet::new();
+        let mut seen_env_keys = std::collections::HashSet::new();
+        for &kind in ProviderKind::all() {
+            assert!(
+                seen_slugs.insert(kind.slug()),
+                "duplicate slug for {kind:?}"
+            );
+            assert!(
+                seen_env_keys.insert(kind.env_override_key()),
+                "duplicate env key for {kind:?}"
+            );
+            assert!(!kind.default_binary().is_empty());
+            assert!(!kind.display_name().is_empty());
+            assert!(!kind.short_label().is_empty());
+            assert!(!kind.protocol_transport().is_empty());
+            assert_eq!(ProviderKind::from_slug(kind.slug()), Some(kind));
+
+            let serialized = serde_json::to_string(&kind).expect("serialize provider");
+            assert_eq!(serialized, format!("\"{}\"", kind.slug()));
+            let deserialized: ProviderKind =
+                serde_json::from_str(&serialized).expect("deserialize provider");
+            assert_eq!(deserialized, kind);
+        }
+
+        // Alias parsing & serde deserialization
+        let aliases = [
+            ("agy", ProviderKind::Antigravity),
+            ("claude", ProviderKind::ClaudeCode),
+            ("open_code", ProviderKind::OpenCode),
+            ("opencode", ProviderKind::OpenCode),
+            ("gemini", ProviderKind::GeminiCli),
+            ("cursor", ProviderKind::CursorAgent),
+            ("github_copilot", ProviderKind::Copilot),
+            ("kimi_cli", ProviderKind::Kimi),
+            ("vibe", ProviderKind::MistralVibe),
+            ("vibe_acp", ProviderKind::MistralVibe),
+            ("auggie", ProviderKind::Augment),
+            ("acp", ProviderKind::Acp),
+        ];
+        for (alias, expected) in aliases {
+            assert_eq!(ProviderKind::from_slug(alias), Some(expected));
+            let wire = format!("\"{alias}\"");
+            let parsed: ProviderKind =
+                serde_json::from_str(&wire).expect("deserialize provider alias");
+            assert_eq!(parsed, expected);
+        }
+        assert_eq!(ProviderKind::MistralVibe.fallback_binaries(), &["vibe"]);
+    }
+
+    #[test]
+    fn fork_agent_wire_roundtrip_and_legacy_compat() {
+        let req_id = Uuid::new_v4();
+        let req = WireMessage::ForkAgent {
+            request_id: req_id,
+            source_agent_id: "ag_source".into(),
+            up_to_seq: Some(15),
+            target: ForkTarget::NewWorktree {
+                branch: Some("orbit/fork-exp".into()),
+                base_ref: Some("main".into()),
+            },
+            title: Some("Experiment".into()),
+            initial_prompt: Some("Try approach B".into()),
+        };
+        let encoded = req.encode_zstd(3).expect("encode fork request");
+        match WireMessage::decode_zstd(&encoded).expect("decode fork request") {
+            WireMessage::ForkAgent {
+                request_id,
+                source_agent_id,
+                up_to_seq,
+                target,
+                title,
+                initial_prompt,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(source_agent_id, "ag_source");
+                assert_eq!(up_to_seq, Some(15));
+                assert_eq!(
+                    target,
+                    ForkTarget::NewWorktree {
+                        branch: Some("orbit/fork-exp".into()),
+                        base_ref: Some("main".into()),
+                    }
+                );
+                assert_eq!(title.as_deref(), Some("Experiment"));
+                assert_eq!(initial_prompt.as_deref(), Some("Try approach B"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Minimal legacy-style JSON without optional fields defaults to SameDirectory
+        let minimal_json = serde_json::json!({
+            "op": "fork_agent",
+            "request_id": req_id,
+            "source_agent_id": "ag_source"
+        });
+        match serde_json::from_value::<WireMessage>(minimal_json).expect("deserialize minimal fork")
+        {
+            WireMessage::ForkAgent {
+                up_to_seq,
+                target,
+                title,
+                initial_prompt,
+                ..
+            } => {
+                assert!(up_to_seq.is_none());
+                assert_eq!(target, ForkTarget::SameDirectory);
+                assert!(title.is_none());
+                assert!(initial_prompt.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let now = Utc::now();
+        let reply = WireMessage::AgentForked {
+            request_id: req_id,
+            agent: AgentSummary {
+                agent_id: "ag_forked".into(),
+                workspace_id: "ws_wt".into(),
+                cwd: "/tmp/wt".into(),
+                title: "Experiment".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: Some("sonnet".into()),
+                effort: Some(ReasoningEffort::High),
+                fast_mode: false,
+                mode: SessionMode::AcceptEdits,
+                status: AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 15,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
+                read_seq: 15,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: Some("fork".into()),
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: Some("ag_source".into()),
+                forked_at_seq: Some(15),
+                acp_agent_id: None,
+            },
+            workspace: Some(WorkspaceSummary {
+                workspace_id: "ws_wt".into(),
+                title: "Experiment".into(),
+                cwd: "/tmp/wt".into(),
+                git_branch: Some("orbit/fork-exp".into()),
+                is_worktree: true,
+                updated_at: now,
+                source_cwd: Some("/tmp/repo".into()),
+                base_ref: Some("main".into()),
+                parent_workspace_id: Some("ws_1".into()),
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: Some("/tmp/repo".into()),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            }),
+        };
+        let encoded_reply = reply.encode_zstd(3).expect("encode fork reply");
+        match WireMessage::decode_zstd(&encoded_reply).expect("decode fork reply") {
+            WireMessage::AgentForked {
+                request_id,
+                agent,
+                workspace,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(agent.agent_id, "ag_forked");
+                assert_eq!(agent.forked_from_agent_id.as_deref(), Some("ag_source"));
+                assert_eq!(agent.forked_at_seq, Some(15));
+                assert_eq!(
+                    workspace.as_ref().map(|w| w.workspace_id.as_str()),
+                    Some("ws_wt")
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Legacy AgentSummary JSON without fork provenance fields deserializes cleanly
+        let legacy_agent = serde_json::json!({
+            "agent_id": "ag_old",
+            "workspace_id": "ws_1",
+            "cwd": "/tmp/demo",
+            "title": "Old",
+            "provider": "codex",
+            "model": null,
+            "mode": "default",
+            "status": { "state": "idle" },
+            "parent_agent_id": null,
+            "latest_seq": 3,
+            "created_at": now,
+            "updated_at": now
+        });
+        let parsed: AgentSummary = serde_json::from_value(legacy_agent).expect("legacy agent");
+        assert!(parsed.forked_from_agent_id.is_none());
+        assert!(parsed.forked_at_seq.is_none());
+    }
+
+    #[test]
+    fn fast_mode_legacy_wire_deserialization_defaults_false() {
+        let legacy_agent_json = r#"{
+            "agent_id": "ag_legacy",
+            "workspace_id": "ws_1",
+            "cwd": "/repo",
+            "title": "Legacy",
+            "provider": "claude_code",
+            "model": "claude-opus-4-6",
+            "mode": "accept_edits",
+            "status": { "state": "idle" },
+            "parent_agent_id": null,
+            "latest_seq": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let agent: AgentSummary = serde_json::from_str(legacy_agent_json).expect("legacy agent");
+        assert!(!agent.fast_mode);
+
+        let legacy_create_json = format!(
+            r#"{{
+                "op": "create_agent",
+                "request_id": "{}",
+                "cwd": "/repo",
+                "title": null,
+                "provider": "codex",
+                "model": "gpt-5.4",
+                "mode": "accept_edits",
+                "initial_prompt": "hello"
+            }}"#,
+            Uuid::new_v4()
+        );
+        match serde_json::from_str::<WireMessage>(&legacy_create_json).expect("legacy create") {
+            WireMessage::CreateAgent { fast_mode, .. } => assert_eq!(fast_mode, None),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let explicit_false_create_json = format!(
+            r#"{{
+                "op": "create_agent",
+                "request_id": "{}",
+                "cwd": "/repo",
+                "title": null,
+                "provider": "codex",
+                "model": "gpt-5.4",
+                "mode": "accept_edits",
+                "initial_prompt": "hello",
+                "fast_mode": false
+            }}"#,
+            Uuid::new_v4()
+        );
+        match serde_json::from_str::<WireMessage>(&explicit_false_create_json)
+            .expect("explicit false create")
+        {
+            WireMessage::CreateAgent { fast_mode, .. } => assert_eq!(fast_mode, Some(false)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy_update_json = format!(
+            r#"{{
+                "op": "update_agent",
+                "request_id": "{}",
+                "agent_id": "ag_legacy",
+                "title": "Renamed"
+            }}"#,
+            Uuid::new_v4()
+        );
+        match serde_json::from_str::<WireMessage>(&legacy_update_json).expect("legacy update") {
+            WireMessage::UpdateAgent { fast_mode, .. } => assert_eq!(fast_mode, None),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let update_fast = WireMessage::UpdateAgent {
+            request_id: Uuid::new_v4(),
+            agent_id: "ag_legacy".into(),
+            title: None,
+            model: None,
+            effort: None,
+            mode: None,
+            labels: None,
+            handle: None,
+            task_summary: None,
+            fast_mode: Some(true),
+        };
+        let encoded = update_fast.encode_zstd(3).expect("encode update fast");
+        match WireMessage::decode_zstd(&encoded).expect("decode update fast") {
+            WireMessage::UpdateAgent { fast_mode, .. } => assert_eq!(fast_mode, Some(true)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy_model_json = r#"{
+            "id": "claude-opus-4-6",
+            "label": "Opus 4.6"
+        }"#;
+        let spec: ProviderModelSpec =
+            serde_json::from_str(legacy_model_json).expect("legacy model spec");
+        assert!(!spec.supports_fast_mode);
+
+        let legacy_profile_json = r#"{
+            "profile_id": "p1",
+            "name": "Reviewer",
+            "provider": "codex",
+            "mode": "plan",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let prof: AgentProfile = serde_json::from_str(legacy_profile_json).expect("legacy profile");
+        assert!(!prof.fast_mode);
+    }
+
+    #[test]
+    fn acp_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let spec = AcpAgentSpec {
+            id: "opencode".into(),
+            name: "OpenCode".into(),
+            description: "Open-source terminal coding agent".into(),
+            command: "opencode".into(),
+            args: vec!["acp".into()],
+            env: HashMap::from([("OPENCODE_MODE".into(), "acp".into())]),
+            install_hint: Some("brew install opencode".into()),
+            homepage: Some("https://opencode.ai".into()),
+            version: Some("1.0.0".into()),
+            source: AcpAgentSource::Custom,
+            enabled: true,
+        };
+        let messages = vec![
+            WireMessage::ListAcpAgents { request_id: req_id },
+            WireMessage::AcpAgentsSnapshot {
+                request_id: req_id,
+                agents: vec![AcpAgentAvailability {
+                    spec: spec.clone(),
+                    installed: true,
+                    resolved_path: Some("/usr/local/bin/opencode".into()),
+                }],
+                warning: Some("offline fallback".into()),
+            },
+            WireMessage::UpsertCustomAcpAgent {
+                request_id: req_id,
+                spec: spec.clone(),
+            },
+            WireMessage::DeleteCustomAcpAgent {
+                request_id: req_id,
+                agent_id: "opencode".into(),
+            },
+            WireMessage::TestAcpAgent {
+                request_id: req_id,
+                agent_id: "opencode".into(),
+                cwd: Some("/workspace/orbit".into()),
+            },
+            WireMessage::AcpAgentProbeResult {
+                request_id: req_id,
+                result: AcpProbeResult {
+                    agent_id: "opencode".into(),
+                    ok: true,
+                    protocol_version: Some("1".into()),
+                    server_name: Some("opencode".into()),
+                    server_version: Some("1.2.3".into()),
+                    capabilities_summary: vec!["loadSession".into(), "mcp.http".into()],
+                    auth_methods: vec!["oauth".into()],
+                    latency_ms: 42,
+                    error: None,
+                },
+            },
+            WireMessage::RefreshAcpRegistry {
+                request_id: req_id,
+                registry_url: Some(
+                    "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json".into(),
+                ),
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode acp wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode acp wire msg");
+            let orig_json = serde_json::to_value(&msg).expect("orig json");
+            let dec_json = serde_json::to_value(&decoded).expect("dec json");
+            assert_eq!(orig_json, dec_json);
+        }
+
+        // Verify ProviderKind::Acp serde & display
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::Acp).expect("serialize provider"),
+            "\"acp\""
+        );
+        assert_eq!(ProviderKind::Acp.display_name(), "ACP Agent");
+    }
+
+    #[test]
+    fn worktree_handoff_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let messages = vec![
+            WireMessage::PreviewWorktreeHandoff {
+                request_id: req_id,
+                workspace_id: "ws_wt".into(),
+                direction: WorktreeHandoffDirection::WorktreeToLocal,
+                target_workspace_id: None,
+                include_committed: true,
+            },
+            WireMessage::WorktreeHandoffPreviewResult {
+                request_id: req_id,
+                preview: WorktreeHandoffPreview {
+                    direction: WorktreeHandoffDirection::WorktreeToLocal,
+                    source_cwd: "/tmp/wt".into(),
+                    target_cwd: "/tmp/local".into(),
+                    source_branch: Some("feat/handoff".into()),
+                    target_branch: Some("main".into()),
+                    commit_count: 2,
+                    files: vec![HandoffFileChange {
+                        path: "src/lib.rs".into(),
+                        status: "M".into(),
+                        insertions: 12,
+                        deletions: 3,
+                        is_untracked: false,
+                        has_conflict: false,
+                    }],
+                    total_insertions: 12,
+                    total_deletions: 3,
+                    target_dirty: false,
+                    conflicts: Vec::new(),
+                    can_apply_cleanly: true,
+                    warning: None,
+                },
+            },
+            WireMessage::ExecuteWorktreeHandoff {
+                request_id: req_id,
+                workspace_id: "ws_local".into(),
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                target_workspace_id: None,
+                include_committed: false,
+                branch: Some("orbit/handoff-1".into()),
+                allow_three_way_conflicts: false,
+            },
+            WireMessage::WorktreeHandoffExecuted {
+                request_id: req_id,
+                outcome: WorktreeHandoffOutcome {
+                    direction: WorktreeHandoffDirection::LocalToWorktree,
+                    mode: WorktreeHandoffMode::Move,
+                    applied_files: 3,
+                    backup_ref: Some("refs/orbit/handoff-backup/123456-abcd1234".into()),
+                    target_workspace: None,
+                    target_cwd: "/tmp/wt-new".into(),
+                    had_conflicts: false,
+                    conflict_files: Vec::new(),
+                    summary: "Moved 3 files to worktree `orbit/handoff-1`".into(),
+                },
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode handoff wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode handoff wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn external_mcp_servers_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let probe = McpProbeResult {
+            ok: true,
+            server_name: Some("github-mcp".into()),
+            server_version: Some("1.0.0".into()),
+            protocol_version: Some("2025-03-26".into()),
+            tools: vec![McpToolSummary {
+                name: "create_issue".into(),
+                description: "Create a GitHub issue".into(),
+            }],
+            latency_ms: 42,
+            error: None,
+            probed_at_ms: 1_760_000_000_000,
+        };
+        let record = ExternalMcpServerRecord {
+            id: "orbit_user:github".into(),
+            name: "github".into(),
+            scope: McpServerScope::OrbitUser,
+            transport: McpTransportKind::StreamableHttp {
+                url: "https://mcp.example.com/mcp".into(),
+                header_keys: vec!["Authorization".into()],
+            },
+            env_keys: vec!["GITHUB_TOKEN".into()],
+            masked_env: BTreeMap::from([("GITHUB_TOKEN".into(), "••••1234".into())]),
+            masked_headers: BTreeMap::from([("Authorization".into(), "••••5678".into())]),
+            enabled: true,
+            editable: true,
+            source_path: "/home/user/.orbit/mcp-servers.json".into(),
+            last_probe: Some(probe.clone()),
+        };
+
+        let messages = vec![
+            WireMessage::ListExternalMcpServers {
+                request_id: req_id,
+                cwd: Some("/workspace/orbit".into()),
+            },
+            WireMessage::ExternalMcpServersSnapshot {
+                request_id: req_id,
+                servers: vec![record],
+            },
+            WireMessage::UpsertExternalMcpServer {
+                request_id: req_id,
+                scope: McpWriteScope::User,
+                cwd: None,
+                name: "github".into(),
+                transport: McpTransportKind::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                },
+                env: BTreeMap::from([("LOG_LEVEL".into(), "info".into())]),
+                headers: BTreeMap::new(),
+                keep_existing_secrets: true,
+                enabled: true,
+            },
+            WireMessage::ToggleExternalMcpServer {
+                request_id: req_id,
+                server_id: "orbit_user:github".into(),
+                enabled: false,
+                cwd: None,
+            },
+            WireMessage::DeleteExternalMcpServer {
+                request_id: req_id,
+                server_id: "orbit_user:github".into(),
+                cwd: None,
+            },
+            WireMessage::ProbeExternalMcpServer {
+                request_id: req_id,
+                server_id: "orbit_user:github".into(),
+                cwd: Some("/workspace/orbit".into()),
+            },
+            WireMessage::ExternalMcpProbeResponse {
+                request_id: req_id,
+                server_id: "orbit_user:github".into(),
+                result: probe,
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode external mcp wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode external mcp wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn usage_insights_and_context_occupancy_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let messages = vec![
+            WireMessage::GetUsageInsights {
+                request_id: req_id,
+                days: 30,
+            },
+            WireMessage::UsageInsightsResponse {
+                request_id: req_id,
+                snapshot: UsageInsightsSnapshot {
+                    days: 30,
+                    total_cost_usd: 12.45,
+                    total_cache_savings_usd: 4.18,
+                    total_input_tokens: 1_250_000,
+                    total_output_tokens: 185_000,
+                    total_cache_read_tokens: 920_000,
+                    total_turns: 42,
+                    daily: vec![UsageDailyPoint {
+                        date: "2026-11-22".into(),
+                        input_tokens: 120_000,
+                        output_tokens: 24_000,
+                        cache_read_tokens: 80_000,
+                        cost_usd: 1.42,
+                        turns: 5,
+                    }],
+                    by_model: vec![UsageModelBreakdown {
+                        provider: "claude_code".into(),
+                        model: "claude-sonnet-4-5".into(),
+                        input_tokens: 800_000,
+                        output_tokens: 120_000,
+                        cache_read_tokens: 600_000,
+                        cost_usd: 4.38,
+                        turns: 25,
+                    }],
+                    by_project: vec![UsageProjectBreakdown {
+                        workspace_cwd: "/workspace/orbit".into(),
+                        cost_usd: 12.45,
+                        total_tokens: 2_355_000,
+                        turns: 42,
+                    }],
+                    forecasts: vec![QuotaDepletionForecast {
+                        provider: "claude_code".into(),
+                        window_label: "5h window".into(),
+                        remaining_percent: 42.0,
+                        burn_rate_pct_per_hour: 12.5,
+                        estimated_depletion_secs: Some(12_096),
+                        resets_in_secs: Some(14_400),
+                        likely_to_exhaust_before_reset: true,
+                    }],
+                },
+            },
+            WireMessage::GetContextOccupancy {
+                request_id: req_id,
+                agent_id: "ag_ctx".into(),
+            },
+            WireMessage::ContextOccupancyResponse {
+                request_id: req_id,
+                breakdown: ContextOccupancyBreakdown {
+                    agent_id: "ag_ctx".into(),
+                    model: "claude-opus-4-6".into(),
+                    context_window_tokens: 200_000,
+                    total_used_tokens: 68_000,
+                    occupancy_percent: 34.0,
+                    segments: vec![
+                        ContextSegment {
+                            category: "instructions".into(),
+                            label: "Instructions".into(),
+                            tokens: 4_000,
+                            percent: 2.0,
+                        },
+                        ContextSegment {
+                            category: "history".into(),
+                            label: "History".into(),
+                            tokens: 64_000,
+                            percent: 32.0,
+                        },
+                        ContextSegment {
+                            category: "free".into(),
+                            label: "Free".into(),
+                            tokens: 132_000,
+                            percent: 66.0,
+                        },
+                    ],
+                },
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode usage wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode usage wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_timers_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let record = ConditionalTimerRecord {
+            timer_id: "tmr_abc12345".into(),
+            agent_id: "ag_main".into(),
+            workspace_id: "ws_1".into(),
+            prompt: "Follow up on deployment".into(),
+            duration_seconds: 300,
+            condition: TimerCondition::FileChanged {
+                path: "dist/bundle.js".into(),
+            },
+            state: ConditionalTimerState::Armed,
+            created_at_ms: 1_760_000_000_000,
+            fire_at_ms: 1_760_000_300_000,
+            resolved_at_ms: None,
+            resolved_reason: None,
+        };
+        let messages = vec![
+            WireMessage::CreateConditionalTimer {
+                request_id: req_id,
+                agent_id: "ag_main".into(),
+                duration_seconds: 300,
+                prompt: "Follow up on deployment".into(),
+                condition: TimerCondition::AnyMessage,
+            },
+            WireMessage::ConditionalTimerCreated {
+                request_id: req_id,
+                timer: record.clone(),
+            },
+            WireMessage::ListConditionalTimers {
+                request_id: req_id,
+                agent_id: Some("ag_main".into()),
+                include_resolved: true,
+            },
+            WireMessage::ConditionalTimersSnapshot {
+                request_id: req_id,
+                timers: vec![record.clone()],
+            },
+            WireMessage::CancelConditionalTimer {
+                request_id: req_id,
+                timer_id: "tmr_abc12345".into(),
+            },
+            WireMessage::FireConditionalTimerNow {
+                request_id: req_id,
+                timer_id: "tmr_abc12345".into(),
+            },
+            WireMessage::ConditionalTimerUpdated {
+                request_id: req_id,
+                timer: record.clone(),
+            },
+            WireMessage::ConditionalTimerEvent { timer: record },
+        ];
+        for msg in messages {
+            let encoded = msg
+                .encode_zstd(3)
+                .expect("encode conditional timer wire msg");
+            let decoded =
+                WireMessage::decode_zstd(&encoded).expect("decode conditional timer wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn guardian_session_mode_auto_and_wire_roundtrip() {
+        let mode_json = serde_json::to_string(&SessionMode::Auto).expect("serialize auto mode");
+        assert_eq!(mode_json, "\"auto\"");
+        let parsed_mode: SessionMode =
+            serde_json::from_str(&mode_json).expect("deserialize auto mode");
+        assert_eq!(parsed_mode, SessionMode::Auto);
+
+        let req_id = Uuid::new_v4();
+        let cfg = GuardianPolicyConfig {
+            enabled: true,
+            auto_approve_max_risk: GuardianRiskLevel::Low,
+            use_ai_classifier_for_medium: true,
+            classifier_timeout_ms: 4_000,
+            allow_read_only_tools: true,
+            allow_workspace_tests: true,
+            blocked_command_patterns: vec!["rm -rf".into()],
+            trusted_command_prefixes: vec!["just test".into()],
+        };
+        let audit = GuardianAuditEntry {
+            id: "ga_1".into(),
+            agent_id: "ag_1".into(),
+            request_id: "perm_1".into(),
+            tool_name: "shell".into(),
+            target_summary: "cargo test".into(),
+            assessment: GuardianAssessment {
+                risk_level: GuardianRiskLevel::Low,
+                decision: GuardianDecision::AutoAllow,
+                confidence: 0.99,
+                classifier_tier: "deterministic".into(),
+                reason: "Safe workspace test command".into(),
+                signals: vec!["workspace_test".into()],
+                latency_ms: 0,
+            },
+            decided_at_ms: 1_760_000_000_000,
+        };
+        let messages = vec![
+            WireMessage::GetGuardianConfig { request_id: req_id },
+            WireMessage::UpdateGuardianConfig {
+                request_id: req_id,
+                config: cfg.clone(),
+            },
+            WireMessage::GuardianConfigSnapshot {
+                request_id: req_id,
+                config: cfg,
+                recent_audits: vec![audit],
+            },
+        ];
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode guardian wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode guardian wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn goal_and_monitor_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let goal = GoalRunRecord {
+            goal_id: "goal_abc".into(),
+            agent_id: "ag_1".into(),
+            workspace_id: "ws_1".into(),
+            objective: "Make tests green".into(),
+            criteria: vec![GoalCriterion {
+                id: "c1".into(),
+                label: "cargo test exits 0".into(),
+                passed: false,
+            }],
+            verify_command: Some("cargo test".into()),
+            max_iterations: 10,
+            current_iteration: 1,
+            max_duration_secs: 3600,
+            status: GoalStatus::Running,
+            last_verify_exit_code: Some(1),
+            last_verify_output: Some("1 failed".into()),
+            consecutive_identical_failures: 1,
+            started_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_005_000,
+            finished_at_ms: None,
+        };
+        let monitor = MonitorWatchRecord {
+            monitor_id: "mon_xyz".into(),
+            agent_id: "ag_1".into(),
+            name: "Health".into(),
+            kind: MonitorKind::HttpHealth {
+                url: "https://example.com/health".into(),
+                expect_status: 200,
+                interval_secs: 30,
+            },
+            status: MonitorStatus::Active,
+            match_count: 0,
+            last_event_preview: None,
+            last_triggered_at_ms: None,
+            expires_at_ms: Some(1_760_003_600_000),
+            created_at_ms: 1_760_000_000_000,
+        };
+
+        let messages = vec![
+            WireMessage::StartGoalRun {
+                request_id: req_id,
+                agent_id: "ag_1".into(),
+                objective: "Make tests green".into(),
+                criteria: vec!["cargo test exits 0".into()],
+                verify_command: Some("cargo test".into()),
+                max_iterations: Some(10),
+                max_duration_secs: Some(3600),
+            },
+            WireMessage::ListGoalRuns {
+                request_id: req_id,
+                agent_id: Some("ag_1".into()),
+            },
+            WireMessage::ControlGoalRun {
+                request_id: req_id,
+                goal_id: "goal_abc".into(),
+                action: GoalControlAction::VerifyNow,
+            },
+            WireMessage::GoalRunUpdated {
+                request_id: req_id,
+                goal: goal.clone(),
+            },
+            WireMessage::GoalRunsSnapshot {
+                request_id: req_id,
+                goals: vec![goal.clone()],
+            },
+            WireMessage::GoalRunEvent { goal },
+            WireMessage::StartMonitorWatch {
+                request_id: req_id,
+                agent_id: "ag_1".into(),
+                name: "Health".into(),
+                kind: MonitorKind::LogFileTail {
+                    path: "logs/app.log".into(),
+                    pattern: "ERROR".into(),
+                },
+                expires_in_secs: Some(3600),
+            },
+            WireMessage::ListMonitorWatches {
+                request_id: req_id,
+                agent_id: None,
+            },
+            WireMessage::StopMonitorWatch {
+                request_id: req_id,
+                monitor_id: "mon_xyz".into(),
+            },
+            WireMessage::MonitorWatchUpdated {
+                request_id: req_id,
+                monitor: monitor.clone(),
+            },
+            WireMessage::MonitorWatchesSnapshot {
+                request_id: req_id,
+                monitors: vec![monitor.clone()],
+            },
+            WireMessage::MonitorWatchEvent { monitor },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode goal/monitor wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode goal/monitor wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn event_triggers_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let poll = GitHubPollConfig {
+            repo: "octocat/orbit".into(),
+            poll_interval_secs: 120,
+            watch_prs: true,
+            watch_issues: true,
+            watch_ci_failures: false,
+            has_token: true,
+        };
+        let trigger = EventTriggerRecord {
+            trigger_id: "trg_abc12345".into(),
+            name: "PR Auto-Review".into(),
+            source: TriggerSourceKind::GitHub,
+            event_filters: vec![
+                "pull_request.opened".into(),
+                "pull_request.synchronize".into(),
+            ],
+            prompt_template: "Review {{title}} at {{url}} by {{actor}}".into(),
+            target: TriggerDispatchTarget::SpawnWorkspaceAgent {
+                cwd: "/workspace/orbit".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: Some("claude-sonnet-4-5".into()),
+                mode: SessionMode::AcceptEdits,
+            },
+            webhook_path: "/webhooks/trg_abc12345".into(),
+            has_secret: true,
+            masked_secret: Some("••••".into()),
+            github_poll: Some(poll.clone()),
+            enabled: true,
+            trigger_count: 3,
+            last_triggered_at_ms: Some(1_760_000_005_000),
+            created_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_005_000,
+        };
+        let delivery = EventTriggerDelivery {
+            delivery_id: "del_xyz".into(),
+            trigger_id: "trg_abc12345".into(),
+            source: TriggerSourceKind::GitHub,
+            event_type: "pull_request.opened".into(),
+            status: "dispatched".into(),
+            summary: "Dispatched to agent ag_1".into(),
+            dispatched_agent_id: Some("ag_1".into()),
+            received_at_ms: 1_760_000_005_000,
+        };
+
+        let messages = vec![
+            WireMessage::ListEventTriggers { request_id: req_id },
+            WireMessage::EventTriggersSnapshot {
+                request_id: req_id,
+                triggers: vec![trigger],
+                recent_deliveries: vec![delivery.clone()],
+                base_webhook_url: "http://127.0.0.1:6868".into(),
+            },
+            WireMessage::UpsertEventTrigger {
+                request_id: req_id,
+                trigger_id: Some("trg_abc12345".into()),
+                name: "PR Auto-Review".into(),
+                source: TriggerSourceKind::GitHub,
+                event_filters: vec!["pull_request.opened".into()],
+                prompt_template: "Review {{title}}".into(),
+                target: TriggerDispatchTarget::ExistingAgent {
+                    agent_id: "ag_main".into(),
+                },
+                secret: None,
+                keep_existing_secret: true,
+                github_poll: Some(poll),
+                github_token: None,
+                keep_existing_token: true,
+                enabled: true,
+            },
+            WireMessage::DeleteEventTrigger {
+                request_id: req_id,
+                trigger_id: "trg_abc12345".into(),
+            },
+            WireMessage::TestEventTrigger {
+                request_id: req_id,
+                trigger_id: "trg_abc12345".into(),
+                sample_event_type: "pull_request.opened".into(),
+                sample_payload: serde_json::json!({ "title": "Fix bug" }),
+            },
+            WireMessage::EventTriggerTestResponse {
+                request_id: req_id,
+                delivery,
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode event trigger wire msg");
+            let decoded =
+                WireMessage::decode_zstd(&encoded).expect("decode event trigger wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let run = WorkflowRunRecord {
+            run_id: "wf_abc".into(),
+            name: "Best-of-2".into(),
+            kind: WorkflowKind::BestOfN,
+            workspace_cwd: "/tmp/repo".into(),
+            owner_agent_id: Some("ag_owner".into()),
+            status: WorkflowRunStatus::Running,
+            max_concurrency: 2,
+            verify_command: Some("cargo test".into()),
+            winner_step_id: None,
+            steps: vec![WorkflowStepRecord {
+                run_id: "wf_abc".into(),
+                step_id: "cand_1".into(),
+                name: "Claude".into(),
+                status: WorkflowStepStatus::Succeeded,
+                depends_on: Vec::new(),
+                agent_id: Some("ag_1".into()),
+                worktree_cwd: Some("/tmp/wt-1".into()),
+                provider: ProviderKind::ClaudeCode,
+                model: Some("claude-opus-4-6".into()),
+                output_preview: Some("Done".into()),
+                diff_additions: 12,
+                diff_deletions: 4,
+                diff_files: 2,
+                verify_passed: Some(true),
+                verify_output: Some("ok".into()),
+                error: None,
+                is_winner: false,
+                started_at_ms: Some(1_760_000_001_000),
+                finished_at_ms: Some(1_760_000_010_000),
+            }],
+            created_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_010_000,
+            finished_at_ms: None,
+        };
+
+        let messages = vec![
+            WireMessage::StartBatchFanout {
+                request_id: req_id,
+                name: "Migrate endpoints".into(),
+                cwd: "/tmp/repo".into(),
+                csv_content: "file,owner\nsrc/a.rs,alice".into(),
+                prompt_template: "Migrate {{file}} for {{owner}}".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: None,
+                mode: SessionMode::AcceptEdits,
+                max_concurrency: 4,
+                isolated_worktree: true,
+            },
+            WireMessage::StartDagWorkflow {
+                request_id: req_id,
+                name: "Build & Verify".into(),
+                cwd: "/tmp/repo".into(),
+                steps: vec![DagStepSpec {
+                    step_id: "plan".into(),
+                    name: "Plan".into(),
+                    depends_on: Vec::new(),
+                    prompt_template: "Draft plan".into(),
+                    provider: Some(ProviderKind::ClaudeCode),
+                    model: None,
+                    isolated_worktree: false,
+                    retry_count: 1,
+                    timeout_secs: 600,
+                }],
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::AcceptEdits,
+                max_concurrency: 3,
+            },
+            WireMessage::StartBestOfN {
+                request_id: req_id,
+                name: "Arena".into(),
+                cwd: "/tmp/repo".into(),
+                prompt: "Implement feature".into(),
+                candidates: vec![
+                    BestOfNCandidateSpec {
+                        label: "Claude".into(),
+                        provider: ProviderKind::ClaudeCode,
+                        model: None,
+                        effort: Some("high".into()),
+                    },
+                    BestOfNCandidateSpec {
+                        label: "Codex".into(),
+                        provider: ProviderKind::Codex,
+                        model: None,
+                        effort: None,
+                    },
+                ],
+                mode: SessionMode::AcceptEdits,
+                verify_command: Some("cargo test".into()),
+            },
+            WireMessage::ListWorkflowRuns {
+                request_id: req_id,
+                include_completed: true,
+            },
+            WireMessage::CancelWorkflowRun {
+                request_id: req_id,
+                run_id: "wf_abc".into(),
+            },
+            WireMessage::SelectBestOfNWinner {
+                request_id: req_id,
+                run_id: "wf_abc".into(),
+                winner_step_id: "cand_1".into(),
+                apply_to_workspace: true,
+            },
+            WireMessage::WorkflowRunUpdated {
+                request_id: req_id,
+                run: run.clone(),
+            },
+            WireMessage::WorkflowRunsSnapshot {
+                request_id: req_id,
+                runs: vec![run.clone()],
+            },
+            WireMessage::WorkflowRunEvent { run },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode workflow wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode workflow wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn im_channels_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let ch = ImChannelRecord {
+            channel_id: "im_lark_01".into(),
+            name: "Feishu Eng".into(),
+            platform: ImPlatform::Lark,
+            enabled: true,
+            status: ImConnectionStatus::Connected,
+            status_message: Some("Listening".into()),
+            webhook_path: "/im/lark/im_lark_01".into(),
+            app_id: Some("cli_12345".into()),
+            has_primary_secret: true,
+            has_signing_secret: true,
+            masked_primary_secret: Some("••••9999".into()),
+            masked_signing_secret: Some("••••8888".into()),
+            allowed_chat_ids: vec!["oc_1".into()],
+            allowed_user_ids: vec!["ou_1".into()],
+            default_workspace_cwd: "/workspace/orbit".into(),
+            default_provider: ProviderKind::ClaudeCode,
+            default_mode: SessionMode::Default,
+            forward_approvals: true,
+            message_count: 5,
+            last_activity_at_ms: Some(1_760_000_005_000),
+            created_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_005_000,
+        };
+        let binding = ImThreadBinding {
+            channel_id: "im_lark_01".into(),
+            external_chat_id: "oc_1".into(),
+            external_thread_id: "om_root".into(),
+            agent_id: "ag_1".into(),
+            updated_at_ms: 1_760_000_005_000,
+        };
+        let messages = vec![
+            WireMessage::ListImChannels { request_id: req_id },
+            WireMessage::ImChannelsSnapshot {
+                request_id: req_id,
+                channels: vec![ch],
+                bindings: vec![binding],
+                base_webhook_url: "http://127.0.0.1:7788".into(),
+            },
+            WireMessage::UpsertImChannel {
+                request_id: req_id,
+                channel_id: Some("im_lark_01".into()),
+                name: "Feishu Eng".into(),
+                platform: ImPlatform::Lark,
+                enabled: true,
+                app_id: Some("cli_12345".into()),
+                primary_secret: None,
+                signing_secret: None,
+                keep_existing_secrets: true,
+                allowed_chat_ids: vec!["oc_1".into()],
+                allowed_user_ids: vec!["ou_1".into()],
+                default_workspace_cwd: "/workspace/orbit".into(),
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::Default,
+                forward_approvals: true,
+            },
+            WireMessage::DeleteImChannel {
+                request_id: req_id,
+                channel_id: "im_lark_01".into(),
+            },
+            WireMessage::TestImChannel {
+                request_id: req_id,
+                channel_id: "im_lark_01".into(),
+                target_chat_id: "oc_1".into(),
+                message: "Orbit test".into(),
+            },
+            WireMessage::ImChannelTestResponse {
+                request_id: req_id,
+                ok: true,
+                detail: "Delivered".into(),
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode im_channels wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode im_channels wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn push_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let device = PushDeviceRecord {
+            device_id: "ios_1".into(),
+            platform: PushPlatform::Apns,
+            device_name: "Jess iPhone".into(),
+            masked_token: "••••abcdef".into(),
+            sandbox: false,
+            enabled: true,
+            last_delivered_at_ms: Some(1_760_000_005_000),
+            last_error: None,
+            registered_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_005_000,
+        };
+        let prefs = PushPreferences {
+            push_gateway_url: Some("https://push.orbit.example/v1/dispatch".into()),
+            has_gateway_auth_token: true,
+            ..PushPreferences::default()
+        };
+        let messages = vec![
+            WireMessage::RegisterPushDevice {
+                request_id: req_id,
+                device_id: "ios_1".into(),
+                platform: PushPlatform::Apns,
+                device_name: "Jess iPhone".into(),
+                device_token: "apns_token_123456abcdef".into(),
+                sandbox: false,
+            },
+            WireMessage::UnregisterPushDevice {
+                request_id: req_id,
+                device_id: "ios_1".into(),
+            },
+            WireMessage::ListPushDevices { request_id: req_id },
+            WireMessage::UpdatePushPreferences {
+                request_id: req_id,
+                preferences: prefs.clone(),
+                gateway_auth_token: Some("secret_token".into()),
+                keep_existing_gateway_token: false,
+            },
+            WireMessage::PushDevicesSnapshot {
+                request_id: req_id,
+                devices: vec![device],
+                preferences: prefs,
+            },
+            WireMessage::TestPushNotification {
+                request_id: req_id,
+                device_id: Some("ios_1".into()),
+            },
+            WireMessage::PushTestResponse {
+                request_id: req_id,
+                attempted: 1,
+                delivered: 1,
+                detail: "Delivered to 1/1 devices".into(),
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode push wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode push wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
         }
     }
 }

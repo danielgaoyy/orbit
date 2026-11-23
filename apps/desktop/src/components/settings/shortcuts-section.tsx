@@ -6,6 +6,7 @@ import {
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
 import { modSymbol } from "@/lib/keybindings";
+import { isMacDesktop } from "@/lib/orbit-ipc";
 import { ShortcutKbd } from "@/components/ui/overlays";
 import { useOrbitSelector } from "@/state/orbit-store";
 
@@ -18,23 +19,28 @@ interface ShortcutItem {
 export function ShortcutsSection() {
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const [query, setQuery] = useState("");
+  const isMac = isMacDesktop();
   const mod = modSymbol();
+  const shift = isMac ? "⇧" : "Shift+";
+  const alt = isMac ? "⌥" : "Alt+";
+  const ctrl = isMac ? "⌃" : "Ctrl+";
+  const backspace = isMac ? "⌫" : "Backspace";
 
   const groups = useMemo(() => {
     const all: ShortcutItem[] = [
       { group: "Navigation", action: "Command Palette", keys: `${mod}K` },
       { group: "Navigation", action: "Settings", keys: `${mod},` },
       { group: "Navigation", action: "New Conversation", keys: `${mod}N` },
-      { group: "Navigation", action: "Next Pending Approval", keys: `${mod}⇧A` },
+      { group: "Navigation", action: "Next Pending Approval", keys: `${mod}${shift}A` },
       { group: "Navigation", action: "Switch Conversation 1–9", keys: `${mod}1 .. ${mod}9` },
 
       { group: "Panels", action: "Toggle Sidebar", keys: `${mod}B` },
       { group: "Panels", action: "Toggle Right Side Panel", keys: `${mod}\\` },
       { group: "Panels", action: "New Side Panel Tab", keys: `${mod}T` },
-      { group: "Panels", action: "Toggle Stage Overview", keys: `${mod}⌥O` },
+      { group: "Panels", action: "Toggle Stage Overview", keys: `${mod}${alt}O` },
       { group: "Panels", action: "Quick Open File", keys: `${mod}P` },
       { group: "Panels", action: "Toggle Diff Review", keys: `${mod}D` },
-      { group: "Panels", action: "Toggle Terminal", keys: `${mod}J / ⌃\`` },
+      { group: "Panels", action: "Toggle Terminal", keys: `${mod}J / ${ctrl}\`` },
       { group: "Panels", action: "Side Question (/btw)", keys: `${mod};` },
       { group: "Panels", action: "Open in External Editor", keys: `${mod}O` },
 
@@ -46,15 +52,15 @@ export function ShortcutsSection() {
       {
         group: "Composer",
         action: "Insert New Line",
-        keys: enterToSend ? "⇧Enter" : "Enter",
+        keys: enterToSend ? `${shift}Enter` : "Enter",
       },
-      { group: "Composer", action: "Cycle Access Permissions", keys: "⇧Tab" },
+      { group: "Composer", action: "Cycle Access Permissions", keys: `${shift}Tab` },
       { group: "Composer", action: "Steer Running Agent", keys: `${mod}Enter` },
       { group: "Composer", action: "Stop Generation", keys: "Esc Esc" },
 
       { group: "Approvals", action: "Allow Request", keys: `${mod}Y` },
-      { group: "Approvals", action: "Always Allow in Session", keys: `${mod}⇧Y` },
-      { group: "Approvals", action: "Deny Request", keys: `${mod}⌫` },
+      { group: "Approvals", action: "Always Allow in Session", keys: `${mod}${shift}Y` },
+      { group: "Approvals", action: "Deny Request", keys: `${mod}${backspace}` },
     ];
 
     const q = query.trim().toLowerCase();
@@ -74,7 +80,7 @@ export function ShortcutsSection() {
       map.set(item.group, list);
     }
     return Array.from(map.entries());
-  }, [mod, query, enterToSend]);
+  }, [mod, shift, alt, ctrl, backspace, query, enterToSend]);
 
   return (
     <div className="space-y-5">

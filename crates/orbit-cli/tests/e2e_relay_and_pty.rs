@@ -24,6 +24,9 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
+    orbit_daemon::manager::set_orbit_exe_override(std::path::PathBuf::from(env!(
+        "CARGO_BIN_EXE_orbit"
+    )));
     let base_tmp = if std::path::Path::new("/tmp").is_dir() {
         std::path::PathBuf::from("/tmp")
     } else {
@@ -167,7 +170,7 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
                 cols: 80,
                 rows: 24,
             },
-            Duration::from_secs(5),
+            Duration::from_secs(20),
             |w| matches!(w, WireMessage::TerminalAttached { request_id, .. } if *request_id == term_req),
         )
         .await
@@ -178,16 +181,24 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
         other => panic!("unexpected terminal response: {other:?}"),
     };
 
+    let pty_cmd: Vec<u8> = if cfg!(windows) {
+        b"echo ORBIT_E2EE_PTY_OK\r\n".to_vec()
+    } else {
+        b"printf 'ORBIT_E2EE_PTY_OK\\n'\n".to_vec()
+    };
     session
         .send_terminal(TerminalBinaryFrame::Input {
             slot,
-            data: b"printf 'ORBIT_E2EE_PTY_OK\\n'\n".to_vec(),
+            data: pty_cmd.clone(),
         })
         .await
         .expect("send pty input");
 
     let mut collected = String::new();
-    let pty_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let pty_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(if cfg!(windows) { 25 } else { 10 });
+    let mut last_resend = tokio::time::Instant::now();
+    let mut dsr_answered = false;
     while tokio::time::Instant::now() < pty_deadline {
         if let Ok(Ok(ev)) =
             tokio::time::timeout(Duration::from_millis(250), term_events.recv()).await
@@ -196,29 +207,50 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
                 | TerminalBinaryFrame::Snapshot { data, .. },
             ) = ev
         {
-            collected.push_str(&String::from_utf8_lossy(&data));
+            let chunk = String::from_utf8_lossy(&data);
+            collected.push_str(&chunk);
+            if !dsr_answered && collected.contains("\x1b[6n") {
+                dsr_answered = true;
+                let _ = session
+                    .send_terminal(TerminalBinaryFrame::Input {
+                        slot,
+                        data: b"\x1b[1;1R".to_vec(),
+                    })
+                    .await;
+            }
             if collected.contains("ORBIT_E2EE_PTY_OK") {
                 break;
             }
         }
+        if cfg!(windows) && last_resend.elapsed() >= Duration::from_secs(2) {
+            last_resend = tokio::time::Instant::now();
+            let _ = session
+                .send_terminal(TerminalBinaryFrame::Input {
+                    slot,
+                    data: pty_cmd.clone(),
+                })
+                .await;
+        }
     }
-    assert!(
-        collected.contains("ORBIT_E2EE_PTY_OK"),
-        "expected PTY output over E2EE relay, got: {collected}"
-    );
 
     let kill_req = Uuid::new_v4();
-    let _ = session
+    let kill_res = session
         .request(
             WireMessage::KillTerminal {
                 request_id: kill_req,
                 terminal_id: term_id,
             },
-            Duration::from_secs(5),
+            Duration::from_secs(10),
             |w| matches!(w, WireMessage::Ack { request_id } if *request_id == kill_req),
         )
-        .await
-        .expect("kill terminal");
+        .await;
+    assert!(
+        collected.contains("ORBIT_E2EE_PTY_OK"),
+        "expected PTY output over E2EE relay (bytes={}), got: {:?}",
+        collected.len(),
+        collected
+    );
+    kill_res.expect("kill terminal");
 
     let _ = std::fs::remove_dir_all(&temp_home);
 }

@@ -1,15 +1,18 @@
 import { useEffect, useState } from "react";
 import {
   Archive,
+  ArrowLeftRight,
   CheckCircle2,
   Circle,
   Columns2,
   Copy,
+  Download,
   FileText,
   FolderInput,
   FolderOpen,
   FolderPlus,
   GitBranch,
+  GitFork,
   GitMerge,
   Hash,
   Inbox,
@@ -30,6 +33,7 @@ import {
 import {
   type AgentCardView,
   type HostCardView,
+  isWindowsDesktop,
   type SidebarProjectGroupView,
   type SidebarWorkspaceGroupView,
   isAgentBackgroundWaiting,
@@ -37,7 +41,7 @@ import {
   orbitIpc,
   semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
-import { isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
+import { isAgentInGitRepo, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -132,6 +136,7 @@ export function SharedConversationMenu({
   const customTitle = useOrbitSelector((s) =>
     target ? s.threadCustomTitles[target.threadKey] : undefined,
   );
+  const sidebarView = useOrbitSelector((s) => s.sidebarView);
   if (!target) return null;
   const { threadKey, host, agent, isPinned, isUnread, anchor } = target;
   const effectiveTitle = customTitle || agent.title;
@@ -140,6 +145,7 @@ export function SharedConversationMenu({
   const isCuratedWs = Boolean(activeWs?.is_curated);
   const projectRoot = activeWs?.project_root || activeWs?.source_cwd || activeWs?.cwd || agent.cwd;
   const normRoot = normalizeProjectPath(projectRoot);
+  const isGitRepo = isAgentInGitRepo(host.host_id, agent, hostDetail, sidebarView);
   const otherWorkspaces = (hostDetail?.workspaces ?? [])
     .filter((w) => {
       if (!w.is_curated || w.workspace_id === agent.workspace_id || w.archived_at || w.background) {
@@ -159,7 +165,10 @@ export function SharedConversationMenu({
     hostDetail?.host.available_providers.length
       ? hostDetail.host.available_providers
       : [agent.provider];
-  const altProvider = availableProviders.find((p) => p !== agent.provider) ?? agent.provider;
+  const directProviders = availableProviders.filter((p) => p !== "acp");
+  const altProvider =
+    directProviders.find((p) => p !== agent.provider) ??
+    (agent.provider !== "acp" ? agent.provider : (directProviders[0] ?? "claude_code"));
   const tabLabel = semanticAgentTabLabel(agent);
 
   return (
@@ -252,6 +261,60 @@ export function SharedConversationMenu({
             <span>Open split</span>
           </span>
         </DropdownMenuItem>
+
+        <DropdownMenuItem
+          onSelect={() => {
+            void orbitActions.forkAgent({
+              hostId: host.host_id,
+              sourceAgentId: agent.agent_id,
+            });
+          }}
+          className={COMPACT_MENU_ITEM_CLASS}
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+            <span>Fork</span>
+          </span>
+        </DropdownMenuItem>
+
+        {isGitRepo && (
+          <DropdownMenuItem
+            onSelect={() => {
+              void orbitActions.forkAgent({
+                hostId: host.host_id,
+                sourceAgentId: agent.agent_id,
+                worktree: true,
+              });
+            }}
+            className={COMPACT_MENU_ITEM_CLASS}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <GitBranch className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+              <span>Fork in worktree</span>
+            </span>
+          </DropdownMenuItem>
+        )}
+
+        {activeWs?.is_worktree && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onClose();
+              orbitActions.openWorktreeHandoffDialog({
+                hostId: host.host_id,
+                workspaceId: activeWs.workspace_id,
+                direction: "worktree_to_local",
+                defaultMode: "apply",
+                sourceCwd: activeWs.cwd,
+              });
+            }}
+            className={COMPACT_MENU_ITEM_CLASS}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <ArrowLeftRight className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+              <span>Apply to Local…</span>
+            </span>
+          </DropdownMenuItem>
+        )}
 
         <DropdownMenuSub>
           <DropdownMenuSubTrigger className={COMPACT_MENU_ITEM_CLASS}>
@@ -414,6 +477,19 @@ export function SharedConversationMenu({
 
             <DropdownMenuItem
               onSelect={() => {
+                onClose();
+                orbitActions.openExportDialog(host.host_id, agent.agent_id);
+              }}
+              className={COMPACT_MENU_ITEM_CLASS}
+            >
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <Download className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                <span>Export…</span>
+              </span>
+            </DropdownMenuItem>
+
+            <DropdownMenuItem
+              onSelect={() => {
                 void orbitActions.copyThread(host.host_id, agent.agent_id);
               }}
               className={COMPACT_MENU_ITEM_CLASS}
@@ -560,7 +636,13 @@ export function SharedProjectMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <FolderOpen className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{isMac ? "Reveal in Finder" : "Open folder"}</span>
+              <span>
+                {isMac
+                  ? "Reveal in Finder"
+                  : isWindowsDesktop()
+                    ? "Reveal in File Explorer"
+                    : "Open folder"}
+              </span>
             </span>
           </DropdownMenuItem>
         )}
@@ -891,8 +973,17 @@ export function SharedWorkspaceMenu({
   onClose: () => void;
   onStartRenameWorkspace: (workspaceId: string) => void;
 }) {
+  const wsSummary = useOrbitSelector((s) =>
+    target
+      ? (s.hostDetails[target.project.host_id]?.workspaces.find(
+          (w) => w.workspace_id === target.workspace.workspace_id,
+        ) ?? null)
+      : null,
+  );
   if (!target) return null;
   const { workspace: ws, project: proj, anchor } = target;
+  const isWorktreeWs = Boolean(wsSummary?.is_worktree);
+  const canHandoff = isWorktreeWs || Boolean(proj.is_git_repo);
   const siblingWorkspaces = (proj.workspaces ?? []).filter(
     (w) => w.workspace_id !== ws.workspace_id && w.is_curated !== false,
   );
@@ -966,6 +1057,26 @@ export function SharedWorkspaceMenu({
             <span>Group notes</span>
           </span>
         </DropdownMenuItem>
+
+        {canHandoff && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onClose();
+              orbitActions.openWorktreeHandoffDialog({
+                hostId: proj.host_id,
+                workspaceId: ws.workspace_id,
+                direction: isWorktreeWs ? "worktree_to_local" : "local_to_worktree",
+                defaultMode: isWorktreeWs ? "apply" : "move",
+                sourceCwd: wsSummary?.cwd || ws.cwd || proj.primary_cwd,
+              });
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <ArrowLeftRight className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+              <span>{isWorktreeWs ? "Apply to Local…" : "Move to Worktree…"}</span>
+            </span>
+          </DropdownMenuItem>
+        )}
 
         {siblingWorkspaces.length > 0 && (
           <>

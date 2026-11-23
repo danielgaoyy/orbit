@@ -10,18 +10,29 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, McpToolPolicy, ProviderKind, ReasoningEffort,
+    ActiveTurnBehavior, AgentMessageKind, ArtifactKind, BestOfNCandidateSpec, BrowserActionRequest,
+    DagStepSpec, ForkTarget, McpToolPolicy, MonitorKind, ProviderKind, ReasoningEffort,
     ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode, TimelinePayload,
-    ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode,
+    ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection,
+    WorktreeHandoffMode,
 };
-use orbit_store::ReceiptOutcome;
+use orbit_store::{ReceiptOutcome, UpsertArtifactInput};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::DaemonRuntime;
-use crate::manager::{CreateAgentSpec, CreateWorkspaceSpec};
+use crate::browser::CreateBrowserSessionSpec;
+use crate::goals::{GoalCriterionPatch, StartGoalSpec, StartMonitorSpec, authorize_agent_control};
+use crate::manager::{
+    CreateAgentSpec, CreateWorkspaceSpec, ExecuteWorktreeHandoffSpec, ForkAgentSpec,
+};
 use crate::messaging::{AgentPromptSource, QueuedAgentMessage};
+use crate::workflows::{
+    StartBatchFanoutSpec, StartBestOfNSpec, StartDagWorkflowSpec, authorize_workflow_cancel,
+    authorize_workflow_launch_from_caller, clamp_workflow_session_mode,
+    validate_mcp_verify_command,
+};
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
@@ -152,6 +163,7 @@ async fn execute_tool_inner(
             let effort = opt_str(args, "effort")
                 .and_then(|s| ReasoningEffort::from_slug(&s))
                 .or_else(|| local_profile.as_ref().and_then(|p| p.effort));
+            let fast_mode = args.get("fast_mode").and_then(|v| v.as_bool());
             let mode = opt_str(args, "mode")
                 .map(|s| parse_session_mode(&s))
                 .or_else(|| local_profile.as_ref().map(|p| p.mode.clone()))
@@ -218,6 +230,7 @@ async fn execute_tool_inner(
                             provider,
                             model,
                             effort,
+                            fast_mode,
                             mode,
                             initial_prompt,
                             initial_display_prompt: None,
@@ -241,6 +254,7 @@ async fn execute_tool_inner(
                             branch: opt_str(args, "branch"),
                             handle: opt_str(args, "handle"),
                             auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
+                            acp_agent_id: opt_str(args, "acp_agent_id"),
                         },
                         Duration::from_secs(30),
                     )
@@ -274,6 +288,7 @@ async fn execute_tool_inner(
                         provider,
                         model,
                         effort,
+                        fast_mode,
                         mode,
                         initial_prompt,
                         initial_display_prompt: None,
@@ -299,6 +314,7 @@ async fn execute_tool_inner(
                             .map(|n| n as u32),
                         handle: opt_str(args, "handle"),
                         auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
+                        acp_agent_id: opt_str(args, "acp_agent_id"),
                     })
                     .await;
                 match res {
@@ -649,6 +665,7 @@ async fn execute_tool_inner(
             let title = opt_str(args, "title");
             let model = opt_str(args, "model");
             let effort = opt_str(args, "effort").and_then(|s| ReasoningEffort::from_slug(&s));
+            let fast_mode = args.get("fast_mode").and_then(|v| v.as_bool());
             let mode = opt_str(args, "mode").map(|s| parse_session_mode(&s));
             let labels: Option<HashMap<String, String>> = args
                 .get("labels")
@@ -666,6 +683,7 @@ async fn execute_tool_inner(
                             title,
                             model,
                             effort,
+                            fast_mode,
                             mode,
                             labels,
                             handle: opt_str(args, "handle"),
@@ -683,6 +701,7 @@ async fn execute_tool_inner(
                     title,
                     model,
                     effort,
+                    fast_mode,
                     mode,
                     labels,
                     opt_str(args, "handle"),
@@ -886,6 +905,144 @@ async fn execute_tool_inner(
             Ok(json!({ "ok": true, "workspace_id": workspace_id, "archived": true }))
         }
 
+        "handoff_worktree" => {
+            let workspace_id = opt_str(args, "workspace_id")
+                .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            let direction = match opt_str(args, "direction")
+                .as_deref()
+                .unwrap_or("worktree_to_local")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "worktree_to_local" | "to_local" | "to-local" => {
+                    WorktreeHandoffDirection::WorktreeToLocal
+                }
+                "local_to_worktree" | "to_worktree" | "to-worktree" => {
+                    WorktreeHandoffDirection::LocalToWorktree
+                }
+                other => anyhow::bail!(
+                    "invalid `direction` `{other}` (expected `worktree_to_local` or `local_to_worktree`)"
+                ),
+            };
+            let mode = match opt_str(args, "mode")
+                .as_deref()
+                .unwrap_or("apply")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "apply" => WorktreeHandoffMode::Apply,
+                "move" => WorktreeHandoffMode::Move,
+                other => anyhow::bail!("invalid `mode` `{other}` (expected `apply` or `move`)"),
+            };
+            let target_workspace_id = opt_str(args, "target_workspace_id");
+            let include_committed = args
+                .get("include_committed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(direction == WorktreeHandoffDirection::WorktreeToLocal);
+            let dry_run = args
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let branch = opt_str(args, "branch");
+            let allow_three_way_conflicts = args
+                .get("allow_three_way_conflicts")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let resolved_host_id = target_host
+                .clone()
+                .unwrap_or_else(|| rt.host_info.host_id.clone());
+
+            if dry_run {
+                let preview = if let Some(ref remote_host_id) = target_host {
+                    let req_id = Uuid::new_v4();
+                    match rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            req_id,
+                            WireMessage::PreviewWorktreeHandoff {
+                                request_id: req_id,
+                                workspace_id,
+                                direction,
+                                target_workspace_id,
+                                include_committed,
+                            },
+                            Duration::from_secs(30),
+                        )
+                        .await?
+                    {
+                        WireMessage::WorktreeHandoffPreviewResult { preview, .. } => preview,
+                        WireMessage::RpcError { message, .. } => {
+                            anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                        }
+                        _ => anyhow::bail!("unexpected remote reply to handoff_worktree preview"),
+                    }
+                } else {
+                    rt.orchestrator
+                        .preview_worktree_handoff(
+                            &workspace_id,
+                            direction,
+                            target_workspace_id.as_deref(),
+                            include_committed,
+                        )
+                        .await?
+                };
+                return Ok(json!({
+                    "host_id": resolved_host_id,
+                    "dry_run": true,
+                    "preview": preview,
+                }));
+            }
+
+            let outcome = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ExecuteWorktreeHandoff {
+                            request_id: req_id,
+                            workspace_id,
+                            direction,
+                            mode,
+                            target_workspace_id,
+                            include_committed,
+                            branch,
+                            allow_three_way_conflicts,
+                        },
+                        Duration::from_secs(60),
+                    )
+                    .await?
+                {
+                    WireMessage::WorktreeHandoffExecuted { outcome, .. } => outcome,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to handoff_worktree execute"),
+                }
+            } else {
+                rt.orchestrator
+                    .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                        workspace_id,
+                        direction,
+                        mode,
+                        target_workspace_id,
+                        include_committed,
+                        branch,
+                        allow_three_way_conflicts,
+                    })
+                    .await?
+            };
+            Ok(json!({
+                "host_id": resolved_host_id,
+                "dry_run": false,
+                "outcome": outcome,
+            }))
+        }
+
         "list_workspace_scripts" => {
             let workspace_id = opt_str(args, "workspace_id")
                 .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
@@ -1009,8 +1166,13 @@ async fn execute_tool_inner(
                 cwd,
                 workspace_id: opt_str(args, "workspace_id"),
                 provider,
+                acp_agent_id: opt_str(args, "acp_agent_id"),
                 model,
                 effort,
+                fast_mode: args
+                    .get("fast_mode")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 mode,
                 profile_id: opt_str(args, "profile_id"),
                 worktree: args
@@ -1151,6 +1313,125 @@ async fn execute_tool_inner(
             Ok(json!({ "ok": true, "heartbeat_id": hid }))
         }
 
+        // ==================== ONE-SHOT CONDITIONAL TIMERS ====================
+        "create_timer" => {
+            let duration_seconds = args
+                .get("duration_seconds")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("`duration_seconds` integer is required"))?;
+            let prompt = str_arg(args, "prompt")?;
+            let condition = match opt_str(args, "condition") {
+                Some(raw) => raw
+                    .parse::<orbit_protocol::TimerCondition>()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                None => orbit_protocol::TimerCondition::Never,
+            };
+            if let Some(ref remote_host_id) = target_host {
+                let target_agent = opt_str(args, "agent_id").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`create_timer` requires an explicit `agent_id` when targeting a remote `host_id`"
+                    )
+                })?;
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CreateConditionalTimer {
+                            request_id: req_id,
+                            agent_id: target_agent,
+                            duration_seconds,
+                            prompt,
+                            condition,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                return match resp {
+                    WireMessage::ConditionalTimerCreated { timer, .. } => {
+                        Ok(json!({ "host_id": remote_host_id, "timer": timer }))
+                    }
+                    WireMessage::RpcError { message, .. } => anyhow::bail!("{message}"),
+                    other => anyhow::bail!("unexpected response from remote host: {other:?}"),
+                };
+            }
+            let target_agent = opt_str(args, "agent_id")
+                .or_else(|| caller_agent_id.map(ToOwned::to_owned))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("`create_timer` requires an active caller agent or `agent_id`")
+                })?;
+            let timer = rt
+                .conditional_timers
+                .create_timer(&target_agent, duration_seconds, prompt, condition)
+                .await?;
+            Ok(json!({ "host_id": rt.host_info.host_id, "timer": timer }))
+        }
+
+        "list_timers" => {
+            let include_resolved = args
+                .get("include_resolved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ListConditionalTimers {
+                            request_id: req_id,
+                            agent_id: opt_str(args, "agent_id"),
+                            include_resolved,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                return match resp {
+                    WireMessage::ConditionalTimersSnapshot { timers, .. } => {
+                        Ok(json!({ "host_id": remote_host_id, "timers": timers }))
+                    }
+                    WireMessage::RpcError { message, .. } => anyhow::bail!("{message}"),
+                    other => anyhow::bail!("unexpected response from remote host: {other:?}"),
+                };
+            }
+            let target_agent =
+                opt_str(args, "agent_id").or_else(|| caller_agent_id.map(ToOwned::to_owned));
+            let timers = rt
+                .conditional_timers
+                .list_timers(target_agent.as_deref(), include_resolved)?;
+            Ok(json!({ "host_id": rt.host_info.host_id, "timers": timers }))
+        }
+
+        "cancel_timer" => {
+            let timer_id = str_arg(args, "timer_id")?;
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CancelConditionalTimer {
+                            request_id: req_id,
+                            timer_id,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                return match resp {
+                    WireMessage::ConditionalTimerUpdated { timer, .. } => {
+                        Ok(json!({ "host_id": remote_host_id, "timer": timer }))
+                    }
+                    WireMessage::RpcError { message, .. } => anyhow::bail!("{message}"),
+                    other => anyhow::bail!("unexpected response from remote host: {other:?}"),
+                };
+            }
+            let timer = rt.conditional_timers.cancel_timer(&timer_id).await?;
+            Ok(json!({ "host_id": rt.host_info.host_id, "timer": timer }))
+        }
+
         // ==================== PROFILES / DISCOVERY / PERMISSIONS / HOSTS ====================
         "list_profiles" => {
             if let Some(ref remote_host_id) = target_host {
@@ -1173,7 +1454,10 @@ async fn execute_tool_inner(
         }
 
         "list_providers" => {
-            let installed = orbit_providers::discover_installed_providers();
+            let installed =
+                tokio::task::spawn_blocking(orbit_providers::discover_installed_providers)
+                    .await
+                    .unwrap_or_default();
             let list: Vec<Value> = installed
                 .into_iter()
                 .map(|p| {
@@ -1182,7 +1466,7 @@ async fn execute_tool_inner(
                         "display_name": p.kind.display_name(),
                         "binary": p.executable_path,
                         "transport": p.protocol_transport,
-                        "modes": ["default", "plan", "accept_edits", "full_access"],
+                        "modes": ["default", "auto", "plan", "accept_edits", "full_access"],
                     })
                 })
                 .collect();
@@ -1559,6 +1843,7 @@ async fn execute_tool_inner(
             let effort = opt_str(args, "effort")
                 .and_then(|s| ReasoningEffort::from_slug(&s))
                 .or_else(|| local_profile.as_ref().and_then(|p| p.effort));
+            let fast_mode = args.get("fast_mode").and_then(|v| v.as_bool());
             let mode = opt_str(args, "mode")
                 .map(|s| parse_session_mode(&s))
                 .or_else(|| local_profile.as_ref().map(|p| p.mode.clone()))
@@ -1588,6 +1873,7 @@ async fn execute_tool_inner(
                     provider,
                     model,
                     effort,
+                    fast_mode,
                     mode,
                     initial_prompt,
                     initial_display_prompt: None,
@@ -1606,6 +1892,7 @@ async fn execute_tool_inner(
                     pr_number: None,
                     handle,
                     auto_cluster: Some(false),
+                    acp_agent_id: opt_str(args, "acp_agent_id"),
                 })
                 .await?;
             if notify_on_finish && let Some(cid) = caller_agent_id {
@@ -1621,6 +1908,82 @@ async fn execute_tool_inner(
                 "handle": peer.handle,
                 "cwd": peer.cwd,
                 "agent": peer,
+            }))
+        }
+
+        "fork_agent" => {
+            let source_agent_id = opt_str(args, "source_agent_id")
+                .or_else(|| opt_str(args, "agent_id"))
+                .or_else(|| caller_agent_id.map(ToOwned::to_owned))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing required string argument `source_agent_id`")
+                })?;
+            let up_to_seq = args.get("up_to_seq").and_then(|v| v.as_u64());
+            let worktree = args
+                .get("worktree")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let branch = opt_str(args, "branch");
+            let base_ref = opt_str(args, "base_ref");
+            let target = if worktree || branch.is_some() || base_ref.is_some() {
+                ForkTarget::NewWorktree { branch, base_ref }
+            } else {
+                ForkTarget::SameDirectory
+            };
+            let title = opt_str(args, "title");
+            let initial_prompt =
+                opt_str(args, "initial_prompt").or_else(|| opt_str(args, "prompt"));
+
+            let (agent, workspace) = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ForkAgent {
+                            request_id: req_id,
+                            source_agent_id,
+                            up_to_seq,
+                            target,
+                            title,
+                            initial_prompt,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::AgentForked {
+                        agent, workspace, ..
+                    } => (agent, workspace),
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to fork_agent"),
+                }
+            } else {
+                let outcome = rt
+                    .orchestrator
+                    .fork_agent(ForkAgentSpec {
+                        source_agent_id,
+                        up_to_seq,
+                        target,
+                        title,
+                        initial_prompt,
+                    })
+                    .await?;
+                (outcome.agent, outcome.workspace)
+            };
+
+            Ok(json!({
+                "ok": true,
+                "agent_id": agent.agent_id,
+                "workspace_id": agent.workspace_id,
+                "cwd": agent.cwd,
+                "forked_from_agent_id": agent.forked_from_agent_id,
+                "forked_at_seq": agent.forked_at_seq,
+                "agent": agent,
+                "workspace": workspace,
             }))
         }
 
@@ -1640,8 +2003,1647 @@ async fn execute_tool_inner(
             }))
         }
 
+        // ==================== ARTIFACTS & SEP-1865 MCP APPS ====================
+        "publish_artifact" => {
+            let title = str_arg(args, "title")?;
+            let kind_raw = str_arg(args, "kind")?;
+            let kind = ArtifactKind::from_slug(&kind_raw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported artifact kind `{kind_raw}` (expected: markdown, html, code, svg, mermaid, mcp_app)"
+                )
+            })?;
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `content`"))?
+                .to_string();
+            let artifact_id = opt_str(args, "artifact_id");
+            let language = opt_str(args, "language");
+            let mime_type = opt_str(args, "mime_type");
+            let resource_uri = opt_str(args, "resource_uri");
+            let summary_note = opt_str(args, "summary_note");
+            let agent_id = opt_str(args, "agent_id").or_else(|| {
+                if target_host.is_none() {
+                    caller_agent_id.map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            });
+
+            let artifact = if let Some(ref remote_host_id) = target_host {
+                let workspace_id = opt_str(args, "workspace_id").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "remote `publish_artifact` requires `workspace_id` on host `{remote_host_id}`"
+                    )
+                })?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::UpsertArtifact {
+                            request_id: req_id,
+                            artifact_id,
+                            workspace_id,
+                            agent_id,
+                            title,
+                            kind,
+                            language,
+                            mime_type,
+                            resource_uri,
+                            content,
+                            summary_note,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::ArtifactUpdated { artifact, .. } => artifact,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to publish_artifact"),
+                }
+            } else {
+                let workspace_id = opt_str(args, "workspace_id")
+                    .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`workspace_id` is required when called outside an agent session"
+                        )
+                    })?;
+                let orch = Arc::clone(&rt.orchestrator);
+                tokio::task::spawn_blocking(move || {
+                    orch.upsert_artifact(UpsertArtifactInput {
+                        artifact_id,
+                        workspace_id,
+                        agent_id,
+                        title,
+                        kind,
+                        language,
+                        mime_type,
+                        resource_uri,
+                        content,
+                        summary_note,
+                    })
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("publish_artifact worker failed: {e}"))??
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "artifact": artifact,
+            }))
+        }
+
+        "list_artifacts" => {
+            let workspace_id = opt_str(args, "workspace_id");
+            let agent_id = opt_str(args, "agent_id");
+            let artifacts = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ListArtifacts {
+                            request_id: req_id,
+                            workspace_id,
+                            agent_id,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?
+                {
+                    WireMessage::ArtifactsSnapshot { artifacts, .. } => artifacts,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to list_artifacts"),
+                }
+            } else {
+                let orch = Arc::clone(&rt.orchestrator);
+                tokio::task::spawn_blocking(move || {
+                    orch.list_artifacts(workspace_id.as_deref(), agent_id.as_deref())
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("list_artifacts worker failed: {e}"))??
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "artifacts": artifacts,
+            }))
+        }
+
+        "read_artifact" => {
+            let artifact_id = str_arg(args, "artifact_id")?;
+            let version = match args.get("version") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let raw = v
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("`version` must be a positive integer"))?;
+                    if raw == 0 {
+                        anyhow::bail!("`version` must be >= 1");
+                    }
+                    let parsed = u32::try_from(raw)
+                        .map_err(|_| anyhow::anyhow!("`version` exceeds u32 range"))?;
+                    Some(parsed)
+                }
+            };
+            let artifact = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::GetArtifact {
+                            request_id: req_id,
+                            artifact_id: artifact_id.clone(),
+                            version,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?
+                {
+                    WireMessage::ArtifactContent { artifact, .. } => artifact,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to read_artifact"),
+                }
+            } else {
+                let orch = Arc::clone(&rt.orchestrator);
+                let aid_owned = artifact_id.clone();
+                tokio::task::spawn_blocking(move || orch.get_artifact(&aid_owned, version))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read_artifact worker failed: {e}"))??
+                    .ok_or_else(|| anyhow::anyhow!("artifact `{artifact_id}` not found"))?
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "artifact": artifact,
+            }))
+        }
+
+        "delete_artifact" => {
+            let artifact_id = str_arg(args, "artifact_id")?;
+            let deleted = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::DeleteArtifact {
+                            request_id: req_id,
+                            artifact_id: artifact_id.clone(),
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?
+                {
+                    WireMessage::ArtifactDeleted { .. } => true,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to delete_artifact"),
+                }
+            } else {
+                let orch = Arc::clone(&rt.orchestrator);
+                let aid_owned = artifact_id.clone();
+                tokio::task::spawn_blocking(move || orch.delete_artifact(&aid_owned))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("delete_artifact worker failed: {e}"))??
+            };
+            Ok(json!({
+                "ok": true,
+                "deleted": deleted,
+                "artifact_id": artifact_id,
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+            }))
+        }
+
+        "lsp_diagnostics" => {
+            let path = opt_str(args, "path");
+            let cwd = opt_str(args, "cwd")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller.as_ref().map(|c| c.cwd.clone())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing required parameter `cwd` (workspace root directory)")
+                })?;
+
+            let diagnostics = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::LspGetDiagnostics {
+                            request_id: req_id,
+                            cwd: cwd.clone(),
+                            path: path.clone(),
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::LspDiagnosticsResponse { diagnostics, .. } => diagnostics,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to lsp_diagnostics"),
+                }
+            } else {
+                let resolved_cwd = crate::expand_host_path(&cwd);
+                let authorized_cwd =
+                    crate::authorize_workspace_mutation_cwd(&rt.store, &resolved_cwd)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.lsp
+                    .get_diagnostics(&authorized_cwd, path.as_deref())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "cwd": cwd,
+                "path": path,
+                "count": diagnostics.len(),
+                "diagnostics": diagnostics,
+            }))
+        }
+
+        "lsp_symbols" => {
+            let query = opt_str(args, "query").unwrap_or_default();
+            let path = opt_str(args, "path");
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(50)
+                .clamp(1, 200);
+            let cwd = opt_str(args, "cwd")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller.as_ref().map(|c| c.cwd.clone())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing required parameter `cwd` (workspace root directory)")
+                })?;
+
+            let symbols = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::LspQuerySymbols {
+                            request_id: req_id,
+                            cwd: cwd.clone(),
+                            query: query.clone(),
+                            path: path.clone(),
+                            limit,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::LspSymbolsResponse { symbols, .. } => symbols,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to lsp_symbols"),
+                }
+            } else {
+                let resolved_cwd = crate::expand_host_path(&cwd);
+                let authorized_cwd =
+                    crate::authorize_workspace_mutation_cwd(&rt.store, &resolved_cwd)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.lsp
+                    .query_symbols(&authorized_cwd, &query, path.as_deref(), limit)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "cwd": cwd,
+                "query": query,
+                "path": path,
+                "count": symbols.len(),
+                "symbols": symbols,
+            }))
+        }
+
+        "lsp_goto_definition" => {
+            let path = str_arg(args, "path")?;
+            let line = args
+                .get("line")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|&v| v >= 1)
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid 1-based integer `line`"))?;
+            let col = args
+                .get("col")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|&v| v >= 1)
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid 1-based integer `col`"))?;
+            let cwd = opt_str(args, "cwd")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller.as_ref().map(|c| c.cwd.clone())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing required parameter `cwd` (workspace root directory)")
+                })?;
+
+            let locations = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::LspGotoDefinition {
+                            request_id: req_id,
+                            cwd: cwd.clone(),
+                            path: path.clone(),
+                            line,
+                            col,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::LspLocationsResponse { locations, .. } => locations,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to lsp_goto_definition"),
+                }
+            } else {
+                let resolved_cwd = crate::expand_host_path(&cwd);
+                let authorized_cwd =
+                    crate::authorize_workspace_mutation_cwd(&rt.store, &resolved_cwd)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.lsp
+                    .goto_definition(&authorized_cwd, &path, line, col)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "cwd": cwd,
+                "path": path,
+                "line": line,
+                "col": col,
+                "locations": locations,
+            }))
+        }
+
+        // ==================== AUTONOMOUS GOAL MODE & MONITORS ====================
+        "start_goal" => {
+            let objective = str_arg(args, "objective")?;
+            let agent_id = opt_str(args, "agent_id")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller_agent_id.map(ToOwned::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `agent_id`"))?;
+            let criteria: Vec<String> = args
+                .get("criteria")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::trim))
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let verify_command = opt_str(args, "verify_command");
+            let max_iterations = args
+                .get("max_iterations")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok());
+            let max_duration_secs = args.get("max_duration_secs").and_then(Value::as_u64);
+
+            let goal = if let Some(ref remote_host_id) = target_host {
+                authorize_remote_agent_control(rt, remote_host_id, caller_agent_id, &agent_id)
+                    .await?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartGoalRun {
+                            request_id: req_id,
+                            agent_id,
+                            objective,
+                            criteria,
+                            verify_command,
+                            max_iterations,
+                            max_duration_secs,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::GoalRunUpdated { goal, .. } => goal,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to start_goal"),
+                }
+            } else {
+                authorize_agent_control(&rt.store, caller_agent_id, &agent_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let is_self_call = caller_agent_id == Some(agent_id.as_str());
+                rt.goals
+                    .start_goal(StartGoalSpec {
+                        agent_id,
+                        objective,
+                        criteria,
+                        verify_command,
+                        max_iterations,
+                        max_duration_secs,
+                        // Don't interrupt the calling agent's own active turn
+                        dispatch_initial_prompt: !is_self_call,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "goal": goal,
+            }))
+        }
+
+        "update_goal_progress" => {
+            if target_host.is_some() {
+                anyhow::bail!("`update_goal_progress` operates on the local host goal run");
+            }
+            let goal_id = opt_str(args, "goal_id");
+            let agent_id =
+                opt_str(args, "agent_id").or_else(|| caller_agent_id.map(ToOwned::to_owned));
+            let note = opt_str(args, "note");
+            let mut patches = Vec::new();
+            if let Some(arr) = args.get("criteria").and_then(Value::as_array) {
+                for item in arr {
+                    let key = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("label").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .trim();
+                    let passed = item.get("passed").and_then(Value::as_bool).unwrap_or(true);
+                    if !key.is_empty() {
+                        patches.push(GoalCriterionPatch {
+                            id_or_label: key.to_string(),
+                            passed,
+                        });
+                    }
+                }
+            }
+            if let Some(single_id) =
+                opt_str(args, "criterion_id").or_else(|| opt_str(args, "criterion"))
+            {
+                let passed = args.get("passed").and_then(Value::as_bool).unwrap_or(true);
+                patches.push(GoalCriterionPatch {
+                    id_or_label: single_id,
+                    passed,
+                });
+            }
+            let goal = rt
+                .goals
+                .update_goal_progress(
+                    caller_agent_id,
+                    goal_id.as_deref(),
+                    agent_id.as_deref(),
+                    patches,
+                    note,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(json!({ "goal": goal }))
+        }
+
+        "complete_goal" => {
+            if target_host.is_some() {
+                anyhow::bail!("`complete_goal` operates on the local host goal run");
+            }
+            let goal_id = opt_str(args, "goal_id");
+            let agent_id =
+                opt_str(args, "agent_id").or_else(|| caller_agent_id.map(ToOwned::to_owned));
+            let summary = opt_str(args, "summary");
+            let failed = args.get("failed").and_then(Value::as_bool).unwrap_or(false);
+            let goal = rt
+                .goals
+                .complete_goal(
+                    caller_agent_id,
+                    goal_id.as_deref(),
+                    agent_id.as_deref(),
+                    summary,
+                    failed,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(json!({ "goal": goal }))
+        }
+
+        "start_monitor" => {
+            let agent_id = opt_str(args, "agent_id")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller_agent_id.map(ToOwned::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `agent_id`"))?;
+            let name = opt_str(args, "name").unwrap_or_default();
+            let expires_in_secs = args.get("expires_in_secs").and_then(Value::as_u64);
+            let kind_str = str_arg(args, "kind")?.to_ascii_lowercase();
+            let kind = match kind_str.as_str() {
+                "command_stream" | "command" => {
+                    let command = str_arg(args, "command")?;
+                    let cmd_args: Vec<String> = args
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let pattern = opt_str(args, "pattern");
+                    MonitorKind::CommandStream {
+                        command,
+                        args: cmd_args,
+                        pattern,
+                    }
+                }
+                "log_file_tail" | "log_tail" | "file" => {
+                    let path = str_arg(args, "path")?;
+                    let pattern = str_arg(args, "pattern")?;
+                    MonitorKind::LogFileTail { path, pattern }
+                }
+                "http_health" | "http" => {
+                    let url = str_arg(args, "url")?;
+                    let expect_status = args
+                        .get("expect_status")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u16::try_from(v).ok())
+                        .unwrap_or(200);
+                    let interval_secs = args
+                        .get("interval_secs")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(30);
+                    MonitorKind::HttpHealth {
+                        url,
+                        expect_status,
+                        interval_secs,
+                    }
+                }
+                other => {
+                    anyhow::bail!(
+                        "unsupported monitor kind `{other}`; expected `command_stream`, `log_file_tail`, or `http_health`"
+                    )
+                }
+            };
+
+            let monitor = if let Some(ref remote_host_id) = target_host {
+                authorize_remote_agent_control(rt, remote_host_id, caller_agent_id, &agent_id)
+                    .await?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartMonitorWatch {
+                            request_id: req_id,
+                            agent_id,
+                            name,
+                            kind,
+                            expires_in_secs,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::MonitorWatchUpdated { monitor, .. } => monitor,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to start_monitor"),
+                }
+            } else {
+                authorize_agent_control(&rt.store, caller_agent_id, &agent_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.goals
+                    .start_monitor(StartMonitorSpec {
+                        agent_id,
+                        name,
+                        kind,
+                        expires_in_secs,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "monitor": monitor,
+            }))
+        }
+
+        "stop_monitor" => {
+            let monitor_id = str_arg(args, "monitor_id")?;
+            let monitor = if let Some(ref remote_host_id) = target_host {
+                if caller_agent_id.is_some() {
+                    let list_req = Uuid::new_v4();
+                    let owner_agent_id = match rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            list_req,
+                            WireMessage::ListMonitorWatches {
+                                request_id: list_req,
+                                agent_id: None,
+                            },
+                            Duration::from_secs(15),
+                        )
+                        .await?
+                    {
+                        WireMessage::MonitorWatchesSnapshot { monitors, .. } => monitors
+                            .into_iter()
+                            .find(|m| m.monitor_id == monitor_id)
+                            .map(|m| m.agent_id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "monitor `{monitor_id}` not found on host `{remote_host_id}`"
+                                )
+                            })?,
+                        WireMessage::RpcError { message, .. } => {
+                            anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                        }
+                        _ => anyhow::bail!("unexpected remote reply to list_monitor_watches"),
+                    };
+                    authorize_remote_agent_control(
+                        rt,
+                        remote_host_id,
+                        caller_agent_id,
+                        &owner_agent_id,
+                    )
+                    .await?;
+                }
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StopMonitorWatch {
+                            request_id: req_id,
+                            monitor_id,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::MonitorWatchUpdated { monitor, .. } => monitor,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to stop_monitor"),
+                }
+            } else {
+                let existing = rt
+                    .store
+                    .get_monitor_watch(&monitor_id)?
+                    .ok_or_else(|| anyhow::anyhow!("monitor `{monitor_id}` not found"))?;
+                authorize_agent_control(&rt.store, caller_agent_id, &existing.agent_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.goals
+                    .stop_monitor(&monitor_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "monitor": monitor,
+            }))
+        }
+
+        // ==================== PURE-RUST CDP BROWSER AUTOMATION ====================
+        "browser_open" => {
+            let url = opt_str(args, "url");
+            let existing_session_id = opt_str(args, "session_id");
+            if let Some(session_id) = existing_session_id {
+                let target_url = url.ok_or_else(|| {
+                    anyhow::anyhow!("`url` is required when navigating an existing `session_id`")
+                })?;
+                authorize_browser_session_access(
+                    rt,
+                    target_host.as_deref(),
+                    caller_agent_id,
+                    &session_id,
+                )
+                .await?;
+                let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                    execute_browser_action_tool(
+                        rt,
+                        target_host.as_deref(),
+                        &session_id,
+                        BrowserActionRequest::Navigate { url: target_url },
+                    )
+                    .await?;
+                session.last_screenshot_base64 = None;
+                return Ok(json!({
+                    "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                    "session": session,
+                    "elements": elements,
+                    "text_excerpt": text_excerpt,
+                    "captcha_detected": captcha_detected,
+                }));
+            }
+
+            let headless = args.get("headless").and_then(Value::as_bool);
+            let viewport_width = args
+                .get("viewport_width")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok());
+            let viewport_height = args
+                .get("viewport_height")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok());
+            let owner_agent_id = caller_agent_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
+            let mut session = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CreateBrowserSession {
+                            request_id: req_id,
+                            agent_id: owner_agent_id,
+                            initial_url: url,
+                            headless,
+                            viewport_width,
+                            viewport_height,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::BrowserSessionUpdated { session, .. } => session,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to browser_open"),
+                }
+            } else {
+                rt.browser
+                    .create_session(CreateBrowserSessionSpec {
+                        agent_id: owner_agent_id,
+                        initial_url: url,
+                        headless,
+                        viewport_width,
+                        viewport_height,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+            session.last_screenshot_base64 = None;
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+            }))
+        }
+
+        "browser_snapshot" => {
+            let session_id = str_arg(args, "session_id")?;
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Snapshot,
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_screenshot" => {
+            let session_id = str_arg(args, "session_id")?;
+            let full_page = args
+                .get("full_page")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Screenshot { full_page },
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "screenshot_base64": screenshot_base64,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_click" => {
+            let session_id = str_arg(args, "session_id")?;
+            let ref_id = opt_str(args, "ref_id");
+            let x = args.get("x").and_then(Value::as_f64);
+            let y = args.get("y").and_then(Value::as_f64);
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Click { ref_id, x, y },
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_type" => {
+            let session_id = str_arg(args, "session_id")?;
+            let ref_id = opt_str(args, "ref_id");
+            let text = str_arg(args, "text")?;
+            let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Type {
+                        ref_id,
+                        text,
+                        submit,
+                    },
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_scroll" => {
+            let session_id = str_arg(args, "session_id")?;
+            let delta_x = args.get("delta_x").and_then(Value::as_f64).unwrap_or(0.0);
+            let delta_y = args.get("delta_y").and_then(Value::as_f64).unwrap_or(400.0);
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
+                execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    &session_id,
+                    BrowserActionRequest::Scroll { delta_x, delta_y },
+                )
+                .await?;
+            session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": session,
+                "elements": elements,
+                "text_excerpt": text_excerpt,
+                "captcha_detected": captcha_detected,
+            }))
+        }
+
+        "browser_close" => {
+            let session_id = str_arg(args, "session_id")?;
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let remaining = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CloseBrowserSession {
+                            request_id: req_id,
+                            session_id: session_id.clone(),
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::BrowserSessionsSnapshot { sessions, .. } => sessions.len(),
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to browser_close"),
+                }
+            } else {
+                rt.browser
+                    .close_session(&session_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .sessions
+                    .len()
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "closed_session_id": session_id,
+                "active_sessions": remaining,
+            }))
+        }
+
+        // ==================== BATCH CSV, DAG WORKFLOWS & BEST-OF-N ARENA ====================
+        "run_batch_fanout" => {
+            authorize_workflow_launch_from_caller(&rt.store, caller_agent_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let caller = caller_agent_id.and_then(|cid| rt.store.get_agent(cid).ok().flatten());
+            let name = opt_str(args, "name").unwrap_or_default();
+            let csv_content = str_arg(args, "csv_content")?;
+            let prompt_template = str_arg(args, "prompt_template")?;
+            let (provider, inline_model) = if let Some(p_raw) = opt_str(args, "provider") {
+                parse_provider_and_model(&p_raw)?
+            } else if let Some(ref c) = caller {
+                (c.provider, None)
+            } else {
+                (ProviderKind::ClaudeCode, None)
+            };
+            let model = opt_str(args, "model").or(inline_model);
+            let requested_mode = opt_str(args, "mode")
+                .map(|s| parse_session_mode(&s))
+                .unwrap_or_else(|| {
+                    caller
+                        .as_ref()
+                        .map(|c| c.mode.clone())
+                        .unwrap_or(SessionMode::AcceptEdits)
+                });
+            let mode = match caller.as_ref() {
+                Some(c) => clamp_workflow_session_mode(&c.mode, requested_mode),
+                None => requested_mode,
+            };
+            let max_concurrency = args
+                .get("max_concurrency")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(3)
+                .clamp(1, 8);
+            let isolated_worktree = args
+                .get("isolated_worktree")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            let run = if let Some(ref remote_host_id) = target_host {
+                let cwd = str_arg(args, "cwd")?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartBatchFanout {
+                            request_id: req_id,
+                            name,
+                            cwd,
+                            csv_content,
+                            prompt_template,
+                            provider,
+                            model,
+                            mode,
+                            max_concurrency,
+                            isolated_worktree,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunUpdated { run, .. } => run,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to run_batch_fanout"),
+                }
+            } else {
+                let cwd = opt_str(args, "cwd")
+                    .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
+                    .ok_or_else(|| anyhow::anyhow!("missing required parameter `cwd`"))?;
+                rt.workflows
+                    .start_batch_fanout(StartBatchFanoutSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: caller_agent_id.map(ToOwned::to_owned),
+                        csv_content,
+                        prompt_template,
+                        provider,
+                        model,
+                        mode,
+                        max_concurrency,
+                        isolated_worktree,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "run": run,
+            }))
+        }
+
+        "run_dag_workflow" => {
+            authorize_workflow_launch_from_caller(&rt.store, caller_agent_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let caller = caller_agent_id.and_then(|cid| rt.store.get_agent(cid).ok().flatten());
+            let name = opt_str(args, "name").unwrap_or_default();
+            let raw_steps = args
+                .get("steps")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `steps`"))?;
+            let steps: Vec<DagStepSpec> = serde_json::from_value(raw_steps)
+                .map_err(|e| anyhow::anyhow!("invalid `steps` array: {e}"))?;
+            let default_provider = if let Some(p_raw) = opt_str(args, "default_provider") {
+                parse_provider_and_model(&p_raw)?.0
+            } else if let Some(ref c) = caller {
+                c.provider
+            } else {
+                ProviderKind::ClaudeCode
+            };
+            let requested_mode = opt_str(args, "default_mode")
+                .map(|s| parse_session_mode(&s))
+                .unwrap_or_else(|| {
+                    caller
+                        .as_ref()
+                        .map(|c| c.mode.clone())
+                        .unwrap_or(SessionMode::AcceptEdits)
+                });
+            let default_mode = match caller.as_ref() {
+                Some(c) => clamp_workflow_session_mode(&c.mode, requested_mode),
+                None => requested_mode,
+            };
+            let max_concurrency = args
+                .get("max_concurrency")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(3)
+                .clamp(1, 8);
+
+            let run = if let Some(ref remote_host_id) = target_host {
+                let cwd = str_arg(args, "cwd")?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartDagWorkflow {
+                            request_id: req_id,
+                            name,
+                            cwd,
+                            steps,
+                            default_provider,
+                            default_mode,
+                            max_concurrency,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunUpdated { run, .. } => run,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to run_dag_workflow"),
+                }
+            } else {
+                let cwd = opt_str(args, "cwd")
+                    .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
+                    .ok_or_else(|| anyhow::anyhow!("missing required parameter `cwd`"))?;
+                rt.workflows
+                    .start_dag_workflow(StartDagWorkflowSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: caller_agent_id.map(ToOwned::to_owned),
+                        steps,
+                        default_provider,
+                        default_mode,
+                        max_concurrency,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "run": run,
+            }))
+        }
+
+        "run_best_of_n" => {
+            authorize_workflow_launch_from_caller(&rt.store, caller_agent_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let caller = caller_agent_id.and_then(|cid| rt.store.get_agent(cid).ok().flatten());
+            let name = opt_str(args, "name").unwrap_or_default();
+            let prompt = str_arg(args, "prompt")?;
+            let raw_candidates = args
+                .get("candidates")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `candidates`"))?;
+            let candidates: Vec<BestOfNCandidateSpec> = serde_json::from_value(raw_candidates)
+                .map_err(|e| anyhow::anyhow!("invalid `candidates` array: {e}"))?;
+            let requested_mode = opt_str(args, "mode")
+                .map(|s| parse_session_mode(&s))
+                .unwrap_or_else(|| {
+                    caller
+                        .as_ref()
+                        .map(|c| c.mode.clone())
+                        .unwrap_or(SessionMode::AcceptEdits)
+                });
+            let mode = match caller.as_ref() {
+                Some(c) => clamp_workflow_session_mode(&c.mode, requested_mode),
+                None => requested_mode,
+            };
+            let verify_command = opt_str(args, "verify_command");
+            validate_mcp_verify_command(
+                caller.as_ref().map(|c| &c.mode),
+                verify_command.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let run = if let Some(ref remote_host_id) = target_host {
+                let cwd = str_arg(args, "cwd")?;
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::StartBestOfN {
+                            request_id: req_id,
+                            name,
+                            cwd,
+                            prompt,
+                            candidates,
+                            mode,
+                            verify_command,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunUpdated { run, .. } => run,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to run_best_of_n"),
+                }
+            } else {
+                let cwd = opt_str(args, "cwd")
+                    .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
+                    .ok_or_else(|| anyhow::anyhow!("missing required parameter `cwd`"))?;
+                rt.workflows
+                    .start_best_of_n(StartBestOfNSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: caller_agent_id.map(ToOwned::to_owned),
+                        prompt,
+                        candidates,
+                        mode,
+                        verify_command,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "run": run,
+            }))
+        }
+
+        "get_workflow_status" => {
+            let run_id = opt_str(args, "run_id");
+            let include_completed = args
+                .get("include_completed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let runs = match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ListWorkflowRuns {
+                            request_id: req_id,
+                            include_completed: true,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunsSnapshot { runs, .. } => runs,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to get_workflow_status"),
+                };
+                if let Some(rid) = run_id {
+                    let run = runs.into_iter().find(|r| r.run_id == rid).ok_or_else(|| {
+                        anyhow::anyhow!("workflow run `{rid}` not found on host `{remote_host_id}`")
+                    })?;
+                    return Ok(json!({
+                        "host_id": remote_host_id,
+                        "run": run,
+                    }));
+                }
+                let filtered: Vec<_> = if include_completed {
+                    runs
+                } else {
+                    runs.into_iter().filter(|r| r.status.is_active()).collect()
+                };
+                return Ok(json!({
+                    "host_id": remote_host_id,
+                    "runs": filtered,
+                }));
+            }
+
+            if let Some(rid) = run_id {
+                let run = rt
+                    .workflows
+                    .get_run(&rid)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("workflow run `{rid}` not found"))?;
+                Ok(json!({
+                    "host_id": rt.host_info.host_id.clone(),
+                    "run": run,
+                }))
+            } else {
+                let runs = rt
+                    .workflows
+                    .list_runs(include_completed)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(json!({
+                    "host_id": rt.host_info.host_id.clone(),
+                    "runs": runs,
+                }))
+            }
+        }
+
+        "cancel_workflow" => {
+            let run_id = str_arg(args, "run_id")?;
+            let run = if let Some(ref remote_host_id) = target_host {
+                if caller_agent_id.is_some() {
+                    // Enforce caller ownership before forwarding cancel to remote host.
+                    let list_req = Uuid::new_v4();
+                    let remote_runs = match rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            list_req,
+                            WireMessage::ListWorkflowRuns {
+                                request_id: list_req,
+                                include_completed: true,
+                            },
+                            Duration::from_secs(20),
+                        )
+                        .await?
+                    {
+                        WireMessage::WorkflowRunsSnapshot { runs, .. } => runs,
+                        WireMessage::RpcError { message, .. } => {
+                            anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                        }
+                        _ => anyhow::bail!("unexpected remote reply to list_workflow_runs"),
+                    };
+                    let target_run = remote_runs
+                        .into_iter()
+                        .find(|r| r.run_id == run_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "workflow run `{run_id}` not found on host `{remote_host_id}`"
+                            )
+                        })?;
+                    authorize_workflow_cancel(caller_agent_id, &target_run)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::CancelWorkflowRun {
+                            request_id: req_id,
+                            run_id,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?
+                {
+                    WireMessage::WorkflowRunUpdated { run, .. } => run,
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to cancel_workflow"),
+                }
+            } else {
+                let existing = rt
+                    .workflows
+                    .get_run(&run_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("workflow run `{run_id}` not found"))?;
+                authorize_workflow_cancel(caller_agent_id, &existing)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rt.workflows
+                    .cancel_run(&run_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "run": run,
+            }))
+        }
+
         other => anyhow::bail!("unknown Orbit tool `{other}`"),
     }
+}
+
+async fn authorize_browser_session_access(
+    rt: &DaemonRuntime,
+    remote_host_id: Option<&str>,
+    caller_agent_id: Option<&str>,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let Some(caller_id) = caller_agent_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if let Some(remote_id) = remote_host_id {
+        let req_id = Uuid::new_v4();
+        let owner = match rt
+            .connected_hosts
+            .send_rpc(
+                remote_id,
+                req_id,
+                WireMessage::ListBrowserSessions {
+                    request_id: req_id,
+                    include_screenshots: false,
+                },
+                Duration::from_secs(15),
+            )
+            .await?
+        {
+            WireMessage::BrowserSessionsSnapshot { sessions, .. } => {
+                sessions
+                    .into_iter()
+                    .find(|s| s.session_id == session_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "browser session `{session_id}` not found on host `{remote_id}`"
+                        )
+                    })?
+                    .agent_id
+            }
+            WireMessage::RpcError { message, .. } => {
+                anyhow::bail!("remote host `{remote_id}` error: {message}")
+            }
+            _ => anyhow::bail!("unexpected remote reply while verifying browser session ownership"),
+        };
+        let Some(owner_id) = owner else {
+            anyhow::bail!(
+                "caller agent `{caller_id}` is not authorized to access unowned browser session `{session_id}`"
+            );
+        };
+        if owner_id != caller_id {
+            authorize_remote_agent_control(rt, remote_id, Some(caller_id), &owner_id).await?;
+        }
+        return Ok(());
+    }
+
+    let owner = rt
+        .browser
+        .get_session_owner(session_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let Some(owner_id) = owner else {
+        anyhow::bail!(
+            "caller agent `{caller_id}` is not authorized to access unowned browser session `{session_id}`"
+        );
+    };
+    authorize_agent_control(&rt.store, Some(caller_id), &owner_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+type BrowserToolActionResult = (
+    orbit_protocol::BrowserSessionSummary,
+    Vec<orbit_protocol::BrowserElementRef>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
+async fn execute_browser_action_tool(
+    rt: &DaemonRuntime,
+    remote_host_id: Option<&str>,
+    session_id: &str,
+    action: BrowserActionRequest,
+) -> anyhow::Result<BrowserToolActionResult> {
+    if let Some(remote_id) = remote_host_id {
+        let req_id = Uuid::new_v4();
+        match rt
+            .connected_hosts
+            .send_rpc(
+                remote_id,
+                req_id,
+                WireMessage::ExecuteBrowserAction {
+                    request_id: req_id,
+                    session_id: session_id.to_string(),
+                    action,
+                },
+                Duration::from_secs(30),
+            )
+            .await?
+        {
+            WireMessage::BrowserActionResponse {
+                session,
+                elements,
+                screenshot_base64,
+                text_excerpt,
+                captcha_detected,
+                ..
+            } => Ok((
+                session,
+                elements,
+                screenshot_base64,
+                text_excerpt,
+                captcha_detected,
+            )),
+            WireMessage::RpcError { message, .. } => {
+                anyhow::bail!("remote host `{remote_id}` error: {message}")
+            }
+            _ => anyhow::bail!("unexpected remote reply to browser action"),
+        }
+    } else {
+        let outcome = rt
+            .browser
+            .execute_action(session_id, action)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok((
+            outcome.session,
+            outcome.elements,
+            outcome.screenshot_base64,
+            outcome.text_excerpt,
+            outcome.captcha_detected,
+        ))
+    }
+}
+
+async fn authorize_remote_agent_control(
+    rt: &DaemonRuntime,
+    remote_host_id: &str,
+    caller_agent_id: Option<&str>,
+    target_agent_id: &str,
+) -> anyhow::Result<()> {
+    let Some(caller_id) = caller_agent_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let req_id = Uuid::new_v4();
+    let resp = rt
+        .connected_hosts
+        .send_rpc(
+            remote_host_id,
+            req_id,
+            WireMessage::ListAgents {
+                request_id: req_id,
+                workspace_id: None,
+                include_archived: true,
+                include_background: true,
+                parent_agent_id: None,
+            },
+            Duration::from_secs(15),
+        )
+        .await?;
+    let agents = match resp {
+        WireMessage::AgentsSnapshot { agents, .. } => agents,
+        WireMessage::RpcError { message, .. } => {
+            anyhow::bail!("remote host `{remote_host_id}` error: {message}")
+        }
+        _ => anyhow::bail!("unexpected remote reply while verifying agent ownership"),
+    };
+    let target = agents
+        .into_iter()
+        .find(|a| a.agent_id == target_agent_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("target agent `{target_agent_id}` not found on host `{remote_host_id}`")
+        })?;
+    if target.parent_agent_id.as_deref() == Some(caller_id)
+        && target.parent_host_id.as_deref() == Some(rt.host_info.host_id.as_str())
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "caller agent `{caller_id}` is not authorized to control remote agent `{target_agent_id}` on host `{remote_host_id}`"
+    )
 }
 
 async fn resolve_target_host_id(
@@ -1685,20 +3687,20 @@ fn parse_provider_and_model(raw: &str) -> anyhow::Result<(ProviderKind, Option<S
         ),
         None => (raw.trim(), None),
     };
-    let provider = match prov_part.to_ascii_lowercase().as_str() {
-        "claude" | "claude_code" | "claude-code" => ProviderKind::ClaudeCode,
-        "codex" | "openai" => ProviderKind::Codex,
-        "antigravity" | "agy" | "gemini" => ProviderKind::Antigravity,
-        other => anyhow::bail!(
-            "unsupported provider `{other}` (expected `claude_code`, `codex`, or `antigravity`, optionally as `provider/model`)"
-        ),
-    };
+    let provider = ProviderKind::from_slug(prov_part).ok_or_else(|| {
+        let supported: Vec<&str> = ProviderKind::all().iter().map(|p| p.slug()).collect();
+        anyhow::anyhow!(
+            "unsupported provider `{prov_part}` (expected one of: {}, optionally as `provider/model`)",
+            supported.join(", ")
+        )
+    })?;
     Ok((provider, model_part))
 }
 
 fn parse_session_mode(raw: &str) -> SessionMode {
     match raw.trim().to_ascii_lowercase().as_str() {
         "default" => SessionMode::Default,
+        "auto" | "guardian" => SessionMode::Auto,
         "plan" => SessionMode::Plan,
         "accept_edits" | "accept-edits" => SessionMode::AcceptEdits,
         "full_access" | "full-access" | "bypass" => SessionMode::FullAccess,
@@ -1830,10 +3832,12 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`) or `provider/model` pair." },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`, `acp`) or `provider/model` pair." },
+                    "acp_agent_id": { "type": "string", "description": "ACP agent ID from the host ACP registry (required when `provider` is `acp`)." },
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
-                    "mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
+                    "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
+                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
                     "profile_id": { "type": "string", "description": "Optional saved profile ID or name from `list_profiles`." },
                     "workspace_id": { "type": "string", "description": "Existing workspace ID from `create_workspace` or `list_workspaces`." },
                     "cwd": { "type": "string", "description": "Working directory (defaults to caller's directory on local host)." },
@@ -1852,6 +3856,23 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "fork_agent",
+            description: "Fork/branch an existing agent conversation into a new session (either in the same directory or inside a freshly created isolated git worktree), optionally truncating history at `up_to_seq`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "source_agent_id": { "type": "string", "description": "Source agent ID to fork from (defaults to the calling agent)." },
+                    "up_to_seq": { "type": "integer", "description": "Optional timeline sequence upper bound (inclusive). Omit to fork the full conversation." },
+                    "worktree": { "type": "boolean", "description": "When true, creates a fresh isolated git worktree workspace for the branch." },
+                    "branch": { "type": "string", "description": "Optional git branch name when forking into a worktree." },
+                    "base_ref": { "type": "string", "description": "Optional git base ref when forking into a worktree." },
+                    "title": { "type": "string", "description": "Optional custom title for the forked conversation." },
+                    "initial_prompt": { "type": "string", "description": "Optional immediate follow-up prompt to dispatch on the forked branch." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
             name: "send_agent_prompt",
             description: "Send a follow-up prompt or message to another agent by ID (supports steering a running turn, queueing, or interrupting, and optional finish notification).",
             input_schema: json!({
@@ -1860,7 +3881,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "agent_id": { "type": "string" },
                     "prompt": { "type": "string" },
                     "active_turn_behavior": { "type": "string", "enum": ["steer", "queue", "interrupt"], "default": "steer" },
-                    "session_mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
+                    "session_mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
                     "notify_on_finish": { "type": "boolean", "default": true },
                     "host_id": { "type": "string" },
                     "message_id": { "type": "string" }
@@ -1947,7 +3968,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "update_agent",
-            description: "Update an agent's title, model, reasoning effort, session mode, or labels.",
+            description: "Update an agent's title, model, reasoning effort, fast mode, session mode, or labels.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1955,6 +3976,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "title": { "type": "string" },
                     "model": { "type": "string" },
                     "effort": { "type": "string" },
+                    "fast_mode": { "type": "boolean", "description": "Toggle Fast output mode (lower latency, higher quota usage)." },
                     "mode": { "type": "string" },
                     "labels": { "type": "object" },
                     "host_id": { "type": "string" }
@@ -2030,6 +4052,24 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "host_id": { "type": "string" }
                 },
                 "required": ["workspace_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_worktree",
+            description: "Bidirectional Git Worktree <-> Local checkout sync/handoff (`apply` or `move`) with non-mutating conflict dry-run (`dry_run: true`) and automatic hidden Git backup ref creation (`refs/orbit/handoff-backup/...`).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": { "type": "string", "description": "Source workspace ID (defaults to calling agent's workspace)." },
+                    "direction": { "type": "string", "enum": ["worktree_to_local", "local_to_worktree"], "default": "worktree_to_local" },
+                    "mode": { "type": "string", "enum": ["apply", "move"], "default": "apply" },
+                    "target_workspace_id": { "type": "string", "description": "Optional explicit target workspace ID (omit for Local -> new worktree or Worktree -> primary local checkout)." },
+                    "include_committed": { "type": "boolean", "description": "Include worktree commits ahead of local HEAD when direction is `worktree_to_local`." },
+                    "branch": { "type": "string", "description": "Optional branch name when creating a new worktree for `local_to_worktree`." },
+                    "allow_three_way_conflicts": { "type": "boolean", "default": false, "description": "When true, falls back to `git apply --3way` and writes conflict markers if clean apply fails." },
+                    "dry_run": { "type": "boolean", "default": false, "description": "Preview changed files and conflicts without mutating disk." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
             }),
         },
         ToolDefinition {
@@ -2133,9 +4173,11 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "prompt": { "type": "string" },
                     "cwd": { "type": "string" },
                     "workspace_id": { "type": "string" },
-                    "provider": { "type": "string" },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `acp`)." },
+                    "acp_agent_id": { "type": "string", "description": "ACP agent ID from the host ACP registry (required when `provider` is `acp`)." },
                     "model": { "type": "string" },
                     "effort": { "type": "string" },
+                    "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
                     "mode": { "type": "string" },
                     "profile_id": { "type": "string" },
                     "worktree": { "type": "boolean" },
@@ -2252,6 +4294,48 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "heartbeat_id": { "type": "string" },
                     "schedule_id": { "type": "string" }
                 }
+            }),
+        },
+        ToolDefinition {
+            name: "create_timer",
+            description: "Arm a durable one-shot conditional wakeup timer (1..=86400s) that automatically cancels early if its condition is met (e.g. incoming message, subagents settling, or workspace file change).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "duration_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+                    "prompt": { "type": "string", "description": "Wakeup prompt delivered to the agent if the timer elapses." },
+                    "condition": {
+                        "type": "string",
+                        "description": "Early-cancel condition: `never` (default), `any`, `all_subagents`, `sender:<agent_id>`, or `file:<relative_path>`."
+                    },
+                    "agent_id": { "type": "string", "description": "Optional target agent ID (defaults to calling agent; required when `host_id` targets a remote host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["duration_seconds", "prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "list_timers",
+            description: "List armed (and optionally resolved) one-shot conditional timers on this host or a connected remote host.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "include_resolved": { "type": "boolean" },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "cancel_timer",
+            description: "Manually cancel an armed one-shot conditional timer on this host or a connected remote host.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "timer_id": { "type": "string" },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["timer_id"]
             }),
         },
         // --- Profiles / Discovery / Permissions / Hosts (6) ---
@@ -2378,10 +4462,12 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "handle": { "type": "string", "description": "Short peer handle (e.g. `reviewer`, `backend`, `tester`)." },
-                    "provider": { "type": "string", "description": "`claude_code`, `codex`, `antigravity`, or `provider/model`." },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`, `acp`) or `provider/model`." },
+                    "acp_agent_id": { "type": "string", "description": "ACP agent ID from the host ACP registry (required when `provider` is `acp`)." },
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
-                    "mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
+                    "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
+                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
                     "profile_id": { "type": "string" },
                     "cwd": { "type": "string" },
                     "worktree": { "type": "boolean", "description": "Isolate this peer in its own git worktree while staying in the same Mission Workspace." },
@@ -2407,5 +4493,534 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        // --- First-Class Artifacts & SEP-1865 MCP Apps (4) ---
+        ToolDefinition {
+            name: "publish_artifact",
+            description: "Publish or update a versioned Artifact (Markdown, interactive sandboxed HTML, Code, SVG, Mermaid diagram, or SEP-1865 MCP App) in a workspace.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": { "type": "string", "description": "Optional existing artifact ID to update (increments revision)." },
+                    "workspace_id": { "type": "string", "description": "Target workspace ID (defaults to calling agent's workspace on local host)." },
+                    "agent_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["markdown", "html", "code", "svg", "mermaid", "mcp_app"] },
+                    "content": { "type": "string" },
+                    "language": { "type": "string" },
+                    "mime_type": { "type": "string" },
+                    "resource_uri": { "type": "string", "description": "Optional SEP-1865 MCP App URI (e.g. `ui://dashboard/metrics`)." },
+                    "summary_note": { "type": "string", "description": "Short revision note describing this update." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["title", "kind", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "list_artifacts",
+            description: "List versioned Artifacts on this host or a connected remote host, optionally filtered by workspace or agent.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": { "type": "string" },
+                    "agent_id": { "type": "string" },
+                    "host_id": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "read_artifact",
+            description: "Read the full content and revision history of an Artifact (optionally at a specific historical version).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": { "type": "string" },
+                    "version": { "type": "integer", "description": "Optional specific revision number to inspect." },
+                    "host_id": { "type": "string" }
+                },
+                "required": ["artifact_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "delete_artifact",
+            description: "Permanently delete an Artifact and all of its stored revisions.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": { "type": "string" },
+                    "host_id": { "type": "string" }
+                },
+                "required": ["artifact_id"]
+            }),
+        },
+        // --- Pure-Rust LSP Language Server Intelligence (3) ---
+        ToolDefinition {
+            name: "lsp_diagnostics",
+            description: "Return compiler and language server diagnostics (errors, warnings, info, hints) for a file or workspace via Orbit's host-local LSP manager.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string", "description": "Workspace root directory (defaults to calling agent's cwd on local host)." },
+                    "path": { "type": "string", "description": "Optional workspace-relative file path to inspect." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "lsp_symbols",
+            description: "Search symbols across a workspace (`workspace/symbol`) or list symbols inside a single file (`textDocument/documentSymbol`) via LSP.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Symbol name substring filter (empty lists all document symbols when `path` is set)." },
+                    "path": { "type": "string", "description": "Optional workspace-relative file path for document-level symbols." },
+                    "limit": { "type": "integer", "default": 50, "description": "Maximum number of symbols to return (1-200)." },
+                    "cwd": { "type": "string", "description": "Workspace root directory (defaults to calling agent's cwd on local host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "lsp_goto_definition",
+            description: "Resolve Go-to-Definition target locations (with 1-based line/col and line preview) for a symbol at `(path, line, col)` via LSP.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace-relative path to the source file." },
+                    "line": { "type": "integer", "description": "1-based line number." },
+                    "col": { "type": "integer", "description": "1-based UTF-16 code-unit column number." },
+                    "cwd": { "type": "string", "description": "Workspace root directory (defaults to calling agent's cwd on local host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["path", "line", "col"]
+            }),
+        },
+        // --- Autonomous Goal Mode & Streaming Monitor Engine (5) ---
+        ToolDefinition {
+            name: "start_goal",
+            description: "Start an unattended autonomous `/goal` verification loop on an agent until acceptance criteria or `verify_command` exits 0 (with automatic circuit-breaker & Keep-Awake).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "objective": { "type": "string", "description": "Clear goal objective to accomplish autonomously." },
+                    "criteria": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of acceptance criteria."
+                    },
+                    "verify_command": { "type": "string", "description": "Optional shell command run in the agent's workspace after each turn (exit 0 = goal succeeded)." },
+                    "max_iterations": { "type": "integer", "default": 10, "description": "Maximum verification retry iterations (1-50)." },
+                    "max_duration_secs": { "type": "integer", "default": 3600, "description": "Maximum wall-clock duration in seconds (60-86400)." },
+                    "agent_id": { "type": "string", "description": "Target agent ID (defaults to calling agent on local host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["objective"]
+            }),
+        },
+        ToolDefinition {
+            name: "update_goal_progress",
+            description: "Update pass/fail status on one or more criteria of an active Goal run.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "goal_id": { "type": "string", "description": "Optional Goal ID (defaults to calling agent's active goal)." },
+                    "agent_id": { "type": "string", "description": "Optional agent ID." },
+                    "criterion_id": { "type": "string", "description": "Single criterion ID or label to update." },
+                    "passed": { "type": "boolean", "default": true },
+                    "criteria": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "label": { "type": "string" },
+                                "passed": { "type": "boolean" }
+                            }
+                        },
+                        "description": "Batch of criterion progress updates."
+                    },
+                    "note": { "type": "string", "description": "Optional concise status note." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "complete_goal",
+            description: "Mark an active Goal run as completed (or trigger its configured `verify_command` before marking succeeded).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "goal_id": { "type": "string", "description": "Optional Goal ID (defaults to calling agent's active goal)." },
+                    "agent_id": { "type": "string", "description": "Optional agent ID." },
+                    "summary": { "type": "string", "description": "Concise completion or failure summary." },
+                    "failed": { "type": "boolean", "default": false, "description": "Set true to terminate the goal as failed." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "start_monitor",
+            description: "Start a streaming background Monitor watch (`command_stream`, `log_file_tail`, or `http_health`) that wakes the owning agent on matching events or HTTP transitions.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["command_stream", "log_file_tail", "http_health"],
+                        "description": "Monitor source kind."
+                    },
+                    "name": { "type": "string", "description": "Human-readable monitor label." },
+                    "command": { "type": "string", "description": "Non-shell executable for `command_stream`." },
+                    "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for `command_stream`." },
+                    "path": { "type": "string", "description": "Workspace-relative file path for `log_file_tail`." },
+                    "pattern": { "type": "string", "description": "Linear-time regex/substring match pattern." },
+                    "url": { "type": "string", "description": "Public HTTP/HTTPS URL for `http_health`." },
+                    "expect_status": { "type": "integer", "default": 200, "description": "Expected HTTP status code." },
+                    "interval_secs": { "type": "integer", "default": 30, "description": "HTTP poll interval in seconds (5-3600)." },
+                    "expires_in_secs": { "type": "integer", "description": "Optional auto-expiry TTL in seconds." },
+                    "agent_id": { "type": "string", "description": "Owning agent ID (defaults to calling agent on local host)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["kind"]
+            }),
+        },
+        ToolDefinition {
+            name: "stop_monitor",
+            description: "Stop a running background Monitor watch and terminate any associated process group.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "monitor_id": { "type": "string", "description": "Monitor ID to stop." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["monitor_id"]
+            }),
+        },
+        // --- Pure-Rust CDP Browser Automation & Guarded Computer Use (7) ---
+        ToolDefinition {
+            name: "browser_open",
+            description: "Start a new isolated pure-Rust CDP browser session (or navigate an existing `session_id`) with strict URL/SSRF/domain guards.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Optional http:// or https:// URL to open." },
+                    "session_id": { "type": "string", "description": "Optional existing browser session ID to navigate instead of launching a new session." },
+                    "headless": { "type": "boolean", "description": "Override host headless mode default." },
+                    "viewport_width": { "type": "integer", "description": "Viewport width in CSS pixels (320-3840)." },
+                    "viewport_height": { "type": "integer", "description": "Viewport height in CSS pixels (240-2160)." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "browser_snapshot",
+            description: "Capture compact numbered interactive DOM element refs (`e1`..`e80`), visible text excerpt, console errors, and CAPTCHA detection status for a live CDP session.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_screenshot",
+            description: "Capture a PNG screenshot (base64, capped at 8 MiB) of a live CDP browser session.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "full_page": { "type": "boolean", "default": false, "description": "Capture beyond viewport height." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_click",
+            description: "Click an interactive element by snapshot `ref_id` (e.g. `e1`) or explicit viewport `(x, y)` coordinates.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "ref_id": { "type": "string", "description": "Element reference ID from `browser_snapshot` (e.g. `e1`)." },
+                    "x": { "type": "number", "description": "Optional X coordinate when `ref_id` is omitted." },
+                    "y": { "type": "number", "description": "Optional Y coordinate when `ref_id` is omitted." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_type",
+            description: "Type text into a non-sensitive input field (refuses password and credit-card fields by default under host policy).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "ref_id": { "type": "string", "description": "Optional element ref ID to focus before typing." },
+                    "text": { "type": "string", "description": "Text to insert." },
+                    "submit": { "type": "boolean", "default": false, "description": "Press Enter after inserting text." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id", "text"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_scroll",
+            description: "Scroll the active viewport by `(delta_x, delta_y)` pixels.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID." },
+                    "delta_x": { "type": "number", "default": 0, "description": "Horizontal scroll delta in pixels." },
+                    "delta_y": { "type": "number", "default": 400, "description": "Vertical scroll delta in pixels." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_close",
+            description: "Close a live CDP browser session, terminate its isolated process group, and clean up its temporary profile directory.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Live browser session ID to close." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        // --- Batch CSV Fan-Out, Programmable DAG Workflows & Best-of-N Arena (5) ---
+        ToolDefinition {
+            name: "run_batch_fanout",
+            description: "Launch a bounded-concurrency Batch CSV Fan-Out workflow (up to 200 rows, RFC 4180 CSV with `{{col}}` interpolation).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Optional human-readable workflow run title." },
+                    "cwd": { "type": "string", "description": "Workspace directory (defaults to calling agent's cwd on local host)." },
+                    "csv_content": { "type": "string", "description": "RFC 4180 CSV text with header row and 1..=200 data rows." },
+                    "prompt_template": { "type": "string", "description": "Prompt template using `{{column}}` placeholders." },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, etc., or `provider/model`)." },
+                    "model": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"], "default": "accept_edits" },
+                    "max_concurrency": { "type": "integer", "default": 3, "description": "Parallel worker limit (1..=8)." },
+                    "isolated_worktree": { "type": "boolean", "default": false, "description": "Run each CSV row inside its own isolated Git worktree." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["csv_content", "prompt_template"]
+            }),
+        },
+        ToolDefinition {
+            name: "run_dag_workflow",
+            description: "Launch a topologically validated Programmable DAG Workflow (up to 64 nodes) with `{{step.<id>.output}}` interpolation and bounded concurrency.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "cwd": { "type": "string", "description": "Workspace directory (defaults to calling agent's cwd on local host)." },
+                    "steps": {
+                        "type": "array",
+                        "description": "1..=64 DAG step specifications.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step_id": { "type": "string" },
+                                "name": { "type": "string" },
+                                "depends_on": { "type": "array", "items": { "type": "string" } },
+                                "prompt_template": { "type": "string" },
+                                "provider": { "type": "string" },
+                                "model": { "type": "string" },
+                                "isolated_worktree": { "type": "boolean" },
+                                "retry_count": { "type": "integer" },
+                                "timeout_secs": { "type": "integer" }
+                            },
+                            "required": ["step_id", "name", "prompt_template"]
+                        }
+                    },
+                    "default_provider": { "type": "string" },
+                    "default_mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"], "default": "accept_edits" },
+                    "max_concurrency": { "type": "integer", "default": 3 },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["steps"]
+            }),
+        },
+        ToolDefinition {
+            name: "run_best_of_n",
+            description: "Launch a Best-of-N Parallel Arena (2..=5 candidates) where each model solves the same prompt in an isolated Git worktree with optional verification command.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "cwd": { "type": "string", "description": "Git workspace directory (defaults to calling agent's cwd on local host)." },
+                    "prompt": { "type": "string", "description": "Shared task prompt sent to every candidate." },
+                    "candidates": {
+                        "type": "array",
+                        "description": "2..=5 candidate specs (`label`, `provider`, optional `model` and `effort`).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string" },
+                                "provider": { "type": "string" },
+                                "model": { "type": "string" },
+                                "effort": { "type": "string" }
+                            },
+                            "required": ["label", "provider"]
+                        }
+                    },
+                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"], "default": "accept_edits" },
+                    "verify_command": { "type": "string", "description": "Optional scrubbed shell verification command run in each candidate worktree after completion." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["prompt", "candidates"]
+            }),
+        },
+        ToolDefinition {
+            name: "get_workflow_status",
+            description: "Inspect a specific workflow run by `run_id` or list recent Batch/DAG/Best-of-N workflow runs.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string", "description": "Optional workflow run ID to inspect." },
+                    "include_completed": { "type": "boolean", "default": true },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "cancel_workflow",
+            description: "Cancel an active Batch CSV, DAG, or Best-of-N workflow run and interrupt in-flight steps.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string", "description": "Workflow run ID to cancel." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                },
+                "required": ["run_id"]
+            }),
+        },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timer_mcp_tools_expose_multi_host_id_schema() {
+        let defs = all_tool_definitions();
+        for name in [
+            "create_timer",
+            "list_timers",
+            "cancel_timer",
+            "run_batch_fanout",
+            "run_dag_workflow",
+            "run_best_of_n",
+            "get_workflow_status",
+            "cancel_workflow",
+        ] {
+            let def = defs
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("missing MCP tool definition `{name}`"));
+            assert!(
+                def.input_schema["properties"].get("host_id").is_some(),
+                "MCP tool `{name}` must expose `host_id` for multi-host routing"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_mcp_tools_expose_multi_host_id_schema() {
+        let defs = all_tool_definitions();
+        for name in [
+            "browser_open",
+            "browser_snapshot",
+            "browser_screenshot",
+            "browser_click",
+            "browser_type",
+            "browser_scroll",
+            "browser_close",
+        ] {
+            let def = defs
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("missing MCP tool definition `{name}`"));
+            assert!(
+                def.input_schema["properties"].get("host_id").is_some(),
+                "MCP tool `{name}` must expose `host_id` for multi-host routing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_cannot_access_unowned_human_browser_session() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message as TungMsg;
+
+        let tmp_home =
+            std::env::temp_dir().join(format!("orbit-tools-browser-auth-{}", Uuid::new_v4()));
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+
+        // Minimal loopback mock CDP endpoint
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let ws_url = format!("ws://127.0.0.1:{port}/devtools/page/auth_test");
+        let server_task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sink, mut rx) = ws.split();
+            while let Some(Ok(TungMsg::Text(txt))) = rx.next().await {
+                let Ok(val) = serde_json::from_str::<Value>(&txt) else {
+                    continue;
+                };
+                let id = val.get("id").and_then(Value::as_u64).unwrap_or(0);
+                let reply = json!({ "id": id, "result": {} });
+                if sink
+                    .send(TungMsg::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Create an unowned (human desktop) browser session (`agent_id: None`).
+        let sess = rt
+            .browser
+            .create_session_from_cdp_ws_url(&ws_url, CreateBrowserSessionSpec::default())
+            .await
+            .expect("create unowned session");
+
+        // An agent caller MUST be denied access to an unowned session (P0 #4).
+        let err =
+            authorize_browser_session_access(&rt, None, Some("ag_intruder"), &sess.session_id)
+                .await
+                .expect_err("agent must not access unowned browser session");
+        assert!(
+            err.to_string()
+                .contains("not authorized to access unowned browser session"),
+            "unexpected error: {err}"
+        );
+
+        // Human operator (`caller_agent_id: None`) is permitted.
+        authorize_browser_session_access(&rt, None, None, &sess.session_id)
+            .await
+            .expect("operator must be allowed");
+
+        rt.browser.shutdown_all().await;
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
 }

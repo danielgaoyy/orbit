@@ -26,12 +26,23 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async, connect_async};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message, protocol::WebSocketConfig};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, client_async_with_config, connect_async_with_config,
+};
 
 const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_RELAY_PORT: u16 = 7878;
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+/// Max WebSocket frame/message size (48 MiB) so 25 MiB base64/E2EE payloads never drop sessions.
+pub const MAX_RELAY_TRANSPORT_WS_FRAME_BYTES: usize = 48 * 1024 * 1024;
+
+fn relay_ws_config() -> WebSocketConfig {
+    let mut cfg = WebSocketConfig::default();
+    cfg.max_frame_size = Some(MAX_RELAY_TRANSPORT_WS_FRAME_BYTES);
+    cfg.max_message_size = Some(MAX_RELAY_TRANSPORT_WS_FRAME_BYTES);
+    cfg
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RelayTransportError {
@@ -564,7 +575,8 @@ impl RelayConnector {
         match self {
             Self::Direct { base_url } => {
                 let url = format!("{}{}", base_url.trim_end_matches('/'), suffix);
-                let (ws, _) = connect_async(&url).await?;
+                let (ws, _) =
+                    connect_async_with_config(&url, Some(relay_ws_config()), false).await?;
                 Ok(RelayWsStream::Direct(Box::new(ws)))
             }
             Self::Ssh {
@@ -573,7 +585,8 @@ impl RelayConnector {
             } => {
                 let guard = session.open_channel().await?;
                 let ws_url = format!("ws://127.0.0.1:{relay_port}{suffix}");
-                let (ws, _) = client_async(&ws_url, guard).await?;
+                let (ws, _) =
+                    client_async_with_config(&ws_url, guard, Some(relay_ws_config())).await?;
                 Ok(RelayWsStream::Ssh(Box::new(ws)))
             }
         }

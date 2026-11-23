@@ -22,13 +22,118 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
-use crate::attachments::build_codex_input_items;
+use crate::attachments::build_codex_input_items_async;
 use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
 
 /// Serialize concurrent `codex app-server` SQLite state runtime startups.
 fn codex_startup_mutex() -> &'static AsyncMutex<()> {
     static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
+fn build_codex_launch_args(fast_mode: bool) -> Vec<String> {
+    let mut args = vec!["app-server".to_string()];
+    if fast_mode {
+        args.push("-c".to_string());
+        args.push("service_tier=\"fast\"".to_string());
+    }
+    args
+}
+
+fn build_codex_thread_start_params(
+    cfg: &SessionLaunchConfig,
+    approval_policy: &str,
+    start_sandbox: &str,
+    inner_config: &serde_json::Map<String, Value>,
+) -> Value {
+    let mut params = json!({
+        "cwd": cfg.cwd.to_string_lossy(),
+        "approvalPolicy": approval_policy,
+        "sandbox": start_sandbox,
+        "approvalsReviewer": "user",
+        "ephemeral": false
+    });
+    if let Some(ref m) = cfg.model {
+        params["model"] = Value::String(m.clone());
+    }
+    if cfg.fast_mode {
+        params["serviceTier"] = Value::String("fast".to_string());
+    }
+    if !inner_config.is_empty() {
+        params["config"] = Value::Object(inner_config.clone());
+    }
+    params
+}
+
+fn build_codex_thread_resume_params(
+    tid: &str,
+    fast_mode: bool,
+    inner_config: &serde_json::Map<String, Value>,
+) -> Value {
+    let mut params = json!({
+        "threadId": tid,
+        "excludeTurns": true
+    });
+    if fast_mode {
+        params["serviceTier"] = Value::String("fast".to_string());
+    }
+    if !inner_config.is_empty() {
+        params["config"] = Value::Object(inner_config.clone());
+    }
+    params
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_codex_turn_start_params(
+    cfg: &SessionLaunchConfig,
+    thread_id: &str,
+    mode: &SessionMode,
+    resolved_model: &Option<String>,
+    current_effort: Option<ReasoningEffort>,
+    fast_mode: bool,
+    service_tier_explicitly_controlled: bool,
+    input_items: Value,
+) -> Value {
+    let (pol, sandbox_policy) = codex_turn_policies(mode, &cfg.extra_dirs);
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": input_items,
+        "cwd": cfg.cwd.to_string_lossy(),
+        "approvalPolicy": pol,
+        "approvalsReviewer": "user",
+        "sandboxPolicy": sandbox_policy
+    });
+    if let Some(m) = resolved_model {
+        params["model"] = Value::String(m.clone());
+    }
+    if let Some(eff) = current_effort {
+        let eff_str = match eff {
+            ReasoningEffort::Off => Some("none"),
+            ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Xhigh => Some("xhigh"),
+            ReasoningEffort::Max => Some("max"),
+            ReasoningEffort::Ultra => Some("ultra"),
+        };
+        if let Some(s) = eff_str {
+            params["effort"] = Value::String(s.to_string());
+        }
+    }
+    if fast_mode {
+        params["serviceTier"] = Value::String("fast".to_string());
+    } else if service_tier_explicitly_controlled {
+        // Codex app-server uses three-state `Option<Option<ServiceTier>>`:
+        // explicit `null` clears `-c service_tier="fast"` / thread / user config.
+        params["serviceTier"] = Value::Null;
+    }
+    if matches!(mode, SessionMode::Plan) {
+        params["collaborationMode"] = json!({
+            "mode": "plan",
+            "settings": {}
+        });
+    }
+    params
 }
 
 pub async fn spawn_codex_session(
@@ -47,12 +152,13 @@ pub async fn spawn_codex_session(
 
         let mut env = cfg.extra_env.clone();
         env.insert("NO_COLOR".into(), "1".into());
+        crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
 
         let spec = ShimSpawnSpec {
             shim_id: format!("codex_{}", cfg.agent_id),
             mode: ShimMode::Stdio,
             program: cfg.executable.to_string_lossy().to_string(),
-            args: vec!["app-server".to_string()],
+            args: build_codex_launch_args(cfg.fast_mode),
             cwd: cfg.cwd.clone(),
             env,
         };
@@ -79,22 +185,25 @@ pub async fn spawn_codex_session(
         })
         .to_string();
 
-        fresh
-            .write_stdin_line(init_req)
-            .await
-            .map_err(|e| format!("codex write initialize failed: {e}"))?;
+        if let Err(e) = fresh.write_stdin_line(init_req).await {
+            let _ = fresh.kill().await;
+            return Err(format!("codex write initialize failed: {e}"));
+        }
 
-        wait_codex_id_response(&mut fresh, 1, &cfg.shim_seq_tracker).await?;
+        if let Err(e) = wait_codex_id_response(&mut fresh, 1, &cfg.shim_seq_tracker).await {
+            let _ = fresh.kill().await;
+            return Err(e);
+        }
 
         let initialized_notif = json!({
             "method": "initialized",
             "params": {}
         })
         .to_string();
-        fresh
-            .write_stdin_line(initialized_notif)
-            .await
-            .map_err(|e| format!("codex write initialized failed: {e}"))?;
+        if let Err(e) = fresh.write_stdin_line(initialized_notif).await {
+            let _ = fresh.kill().await;
+            return Err(format!("codex write initialized failed: {e}"));
+        }
 
         drop(startup_guard);
         (fresh, false)
@@ -164,22 +273,16 @@ async fn run_codex_actor(
             );
         }
 
-        let build_start_msg = |req_id: u64, resume_tid: Option<&str>| {
-            if let Some(tid) = resume_tid {
+        enum CodexThreadOpenMode<'a> {
+            Start,
+            Resume(&'a str),
+            Fork(&'a str),
+        }
+
+        let build_open_msg = |req_id: u64, open_mode: CodexThreadOpenMode<'_>| match open_mode {
+            CodexThreadOpenMode::Fork(tid) => {
                 let mut params = json!({
                     "threadId": tid,
-                    "excludeTurns": true
-                });
-                if !inner_config.is_empty() {
-                    params["config"] = Value::Object(inner_config.clone());
-                }
-                json!({
-                    "id": req_id,
-                    "method": "thread/resume",
-                    "params": params
-                })
-            } else {
-                let mut params = json!({
                     "cwd": cfg.cwd.to_string_lossy(),
                     "approvalPolicy": approval_policy,
                     "sandbox": start_sandbox,
@@ -189,9 +292,33 @@ async fn run_codex_actor(
                 if let Some(ref m) = cfg.model {
                     params["model"] = Value::String(m.clone());
                 }
+                if cfg.fast_mode {
+                    params["serviceTier"] = Value::String("fast".to_string());
+                }
                 if !inner_config.is_empty() {
                     params["config"] = Value::Object(inner_config.clone());
                 }
+                json!({
+                    "id": req_id,
+                    "method": "thread/fork",
+                    "params": params
+                })
+            }
+            CodexThreadOpenMode::Resume(tid) => {
+                let params = build_codex_thread_resume_params(tid, cfg.fast_mode, &inner_config);
+                json!({
+                    "id": req_id,
+                    "method": "thread/resume",
+                    "params": params
+                })
+            }
+            CodexThreadOpenMode::Start => {
+                let params = build_codex_thread_start_params(
+                    &cfg,
+                    approval_policy,
+                    start_sandbox,
+                    &inner_config,
+                );
                 json!({
                     "id": req_id,
                     "method": "thread/start",
@@ -200,8 +327,19 @@ async fn run_codex_actor(
             }
         };
 
-        let start_msg = build_start_msg(thread_req_id, cfg.resume_session_id.as_deref());
+        let initial_open = if let Some(ref fork_tid) = cfg.fork_from_session_id {
+            CodexThreadOpenMode::Fork(fork_tid.as_str())
+        } else if let Some(ref resume_tid) = cfg.resume_session_id {
+            CodexThreadOpenMode::Resume(resume_tid.as_str())
+        } else {
+            CodexThreadOpenMode::Start
+        };
+
+        let start_msg = build_open_msg(thread_req_id, initial_open);
         if shim.write_stdin_line(start_msg.to_string()).await.is_err() {
+            if !is_reattached {
+                let _ = shim.kill().await;
+            }
             return;
         }
 
@@ -212,47 +350,93 @@ async fn run_codex_actor(
         )
         .await
         {
-            Ok(v) => v,
-            Err(first_err) if cfg.resume_session_id.is_some() => {
+            Ok(v)
+                if cfg.fork_from_session_id.is_none()
+                    || v.pointer("/thread/id")
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|tid| {
+                            !tid.is_empty() && cfg.fork_from_session_id.as_deref() != Some(tid)
+                        }) =>
+            {
+                if cfg.fork_from_session_id.is_none()
+                    && cfg.resume_session_id.is_none()
+                    && cfg.fallback_handoff_context.is_some()
+                {
+                    inject_handoff_on_next_prompt = true;
+                }
+                v
+            }
+            first_outcome
+                if cfg.fork_from_session_id.is_some() || cfg.resume_session_id.is_some() =>
+            {
+                let first_err = match first_outcome {
+                    Err(e) => e,
+                    Ok(_) => "upstream thread/fork did not return a distinct thread id".to_string(),
+                };
+                let is_fork = cfg.fork_from_session_id.is_some();
+                if is_fork && cfg.native_fork_only {
+                    tracing::warn!(
+                        agent_id = %cfg.agent_id,
+                        error = %first_err,
+                        "Codex native thread/fork unavailable during eager fork; deferring fresh session until first prompt"
+                    );
+                    let _ = shim.kill().await;
+                    return;
+                }
                 let fallback_id = next_id;
                 next_id += 1;
-                let fallback_msg = build_start_msg(fallback_id, None);
+                let fallback_msg = build_open_msg(fallback_id, CodexThreadOpenMode::Start);
                 if shim
                     .write_stdin_line(fallback_msg.to_string())
                     .await
                     .is_err()
                 {
+                    if !is_reattached {
+                        let _ = shim.kill().await;
+                    }
                     return;
                 }
                 match wait_codex_id_response(&mut shim, fallback_id, &cfg.shim_seq_tracker).await {
                     Ok(v) => {
                         inject_handoff_on_next_prompt = true;
                         let old_short: String = cfg
-                            .resume_session_id
+                            .fork_from_session_id
                             .as_deref()
+                            .or(cfg.resume_session_id.as_deref())
                             .unwrap_or_default()
                             .chars()
                             .take(8)
                             .collect();
+                        let notice_msg = if is_fork {
+                            format!(
+                                "Native Codex thread fork ({old_short}…) fell back to a fresh session with conversation context restored."
+                            )
+                        } else {
+                            format!(
+                                "Previous Codex session ({old_short}…) could not be resumed ({first_err}); started a fresh session with recent conversation context restored."
+                            )
+                        };
                         let _ = evt_tx
-                                    .send(DriverEvent::Notice {
-                                        level: "info".into(),
-                                        message: format!(
-                                            "Previous Codex session ({old_short}…) could not be resumed ({first_err}); started a fresh session with recent conversation context restored."
-                                        ),
-                                    })
-                                    .await;
+                            .send(DriverEvent::Notice {
+                                level: "info".into(),
+                                message: notice_msg,
+                            })
+                            .await;
                         v
                     }
                     Err(e) => {
+                        let op_label = if is_fork { "fork" } else { "resume" };
                         let _ = evt_tx
-                                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                                        message: format!(
-                                            "Codex thread resume failed ({first_err}); fresh thread start also failed: {e}"
-                                        ),
-                                        recoverable: false,
-                                    }))
-                                    .await;
+                            .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                message: format!(
+                                    "Codex thread {op_label} failed ({first_err}); fresh thread start also failed: {e}"
+                                ),
+                                recoverable: false,
+                            }))
+                            .await;
+                        if !is_reattached {
+                            let _ = shim.kill().await;
+                        }
                         return;
                     }
                 }
@@ -264,18 +448,24 @@ async fn run_codex_actor(
                         recoverable: false,
                     }))
                     .await;
+                if !is_reattached {
+                    let _ = shim.kill().await;
+                }
                 return;
             }
+            Ok(v) => v,
         };
 
         let tid = thread_res
             .pointer("/thread/id")
             .and_then(|v| v.as_str())
-            .or(if inject_handoff_on_next_prompt {
-                None
-            } else {
-                cfg.resume_session_id.as_deref()
-            })
+            .or(
+                if inject_handoff_on_next_prompt || cfg.fork_from_session_id.is_some() {
+                    None
+                } else {
+                    cfg.resume_session_id.as_deref()
+                },
+            )
             .unwrap_or("unknown")
             .to_string();
         let model = thread_res
@@ -286,6 +476,8 @@ async fn run_codex_actor(
         (tid, model)
     };
     let mut current_effort = cfg.effort;
+    let mut current_fast_mode = cfg.fast_mode;
+    let mut service_tier_explicitly_controlled = cfg.fast_mode;
 
     let _ = evt_tx
         .send(DriverEvent::SessionInitialized {
@@ -311,6 +503,7 @@ async fn run_codex_actor(
     let mut pending_approvals: HashMap<String, PendingCodexApproval> = HashMap::new();
     let mut pending_questions: HashMap<String, PendingCodexQuestion> = HashMap::new();
     let mut queued_prompts: VecDeque<(String, String)> = VecDeque::new();
+    let mut usage_tracker = CodexTurnUsageTracker::default();
 
     loop {
         tokio::select! {
@@ -327,8 +520,11 @@ async fn run_codex_actor(
                                 prompt = format!("{ctx}\n\n{prompt}");
                             }
                         }
-                        let input_items =
-                            build_codex_input_items(&prompt, cfg.attachments_dir.as_deref());
+                        let input_items = build_codex_input_items_async(
+                            prompt.clone(),
+                            cfg.attachments_dir.clone(),
+                        )
+                        .await;
                         if let Some(ref active_nat_tid) = native_turn_id {
                             match behavior {
                                 ActiveTurnBehavior::Steer => {
@@ -382,6 +578,8 @@ async fn run_codex_actor(
                             &mode,
                             &resolved_model,
                             current_effort,
+                            current_fast_mode,
+                            service_tier_explicitly_controlled,
                             &turn_id,
                             &prompt,
                             &mut next_id,
@@ -415,9 +613,21 @@ async fn run_codex_actor(
                     DriverCommand::SetMode { mode: new_mode } => {
                         mode = new_mode;
                     }
-                    DriverCommand::SetConfig { model, effort } => {
-                        resolved_model = model;
-                        current_effort = effort;
+                    DriverCommand::SetConfig {
+                        model,
+                        effort,
+                        fast_mode,
+                    } => {
+                        if model.is_some() {
+                            resolved_model = model;
+                        }
+                        if effort.is_some() {
+                            current_effort = effort;
+                        }
+                        if let Some(fm) = fast_mode {
+                            current_fast_mode = fm;
+                            service_tier_explicitly_controlled = true;
+                        }
                     }
                     DriverCommand::ResolvePermission { request_id, decision } => {
                         if let Some(app) = pending_approvals.remove(&request_id) {
@@ -505,6 +715,7 @@ async fn run_codex_actor(
                                 &mut msg_accum,
                                 &mut thought_accum,
                                 &mut file_change_cache,
+                                &mut usage_tracker,
                                 &evt_tx,
                             )
                             .await;
@@ -516,6 +727,8 @@ async fn run_codex_actor(
                                     &mode,
                                     &resolved_model,
                                     current_effort,
+                                    current_fast_mode,
+                                    service_tier_explicitly_controlled,
                                     &next_tid,
                                     &next_prompt,
                                     &mut next_id,
@@ -605,6 +818,8 @@ fn codex_thread_mode_strings(mode: &SessionMode) -> (&'static str, &'static str)
     match mode {
         SessionMode::FullAccess => ("never", "danger-full-access"),
         SessionMode::Plan => ("on-request", "read-only"),
+        // Auto (Guardian) keeps approval policy `on-request` so Orbit's daemon classifies requests.
+        SessionMode::Auto => ("on-request", "workspace-write"),
         _ => ("on-request", "workspace-write"),
     }
 }
@@ -617,7 +832,10 @@ fn codex_turn_policies(mode: &SessionMode, extra_dirs: &[PathBuf]) -> (&'static 
     match mode {
         SessionMode::FullAccess => ("never", json!({ "type": "dangerFullAccess" })),
         SessionMode::Plan => ("on-request", json!({ "type": "readOnly" })),
-        _ => (
+        SessionMode::Auto
+        | SessionMode::Default
+        | SessionMode::AcceptEdits
+        | SessionMode::Custom(_) => (
             "on-request",
             json!({
                 "type": "workspaceWrite",
@@ -637,6 +855,8 @@ async fn dispatch_codex_turn(
     mode: &SessionMode,
     resolved_model: &Option<String>,
     current_effort: Option<ReasoningEffort>,
+    fast_mode: bool,
+    service_tier_explicitly_controlled: bool,
     turn_id: &str,
     prompt: &str,
     next_id: &mut u64,
@@ -646,7 +866,8 @@ async fn dispatch_codex_turn(
     shim: &orbit_shim::ShimClient,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) -> Result<(), ()> {
-    let input_items = build_codex_input_items(prompt, cfg.attachments_dir.as_deref());
+    let input_items =
+        build_codex_input_items_async(prompt.to_string(), cfg.attachments_dir.clone()).await;
     *client_turn_id = Some(turn_id.to_string());
     msg_accum.clear();
     thought_accum.clear();
@@ -656,40 +877,18 @@ async fn dispatch_codex_turn(
         }))
         .await;
 
-    let (pol, sandbox_policy) = codex_turn_policies(mode, &cfg.extra_dirs);
     let req_id = *next_id;
     *next_id += 1;
-    let mut params = json!({
-        "threadId": thread_id,
-        "input": input_items,
-        "cwd": cfg.cwd.to_string_lossy(),
-        "approvalPolicy": pol,
-        "approvalsReviewer": "user",
-        "sandboxPolicy": sandbox_policy
-    });
-    if let Some(m) = resolved_model {
-        params["model"] = Value::String(m.clone());
-    }
-    if let Some(eff) = current_effort {
-        let eff_str = match eff {
-            ReasoningEffort::Off => Some("none"),
-            ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium => Some("medium"),
-            ReasoningEffort::High => Some("high"),
-            ReasoningEffort::Xhigh => Some("xhigh"),
-            ReasoningEffort::Max => Some("max"),
-            ReasoningEffort::Ultra => Some("ultra"),
-        };
-        if let Some(s) = eff_str {
-            params["effort"] = Value::String(s.to_string());
-        }
-    }
-    if matches!(mode, SessionMode::Plan) {
-        params["collaborationMode"] = json!({
-            "mode": "plan",
-            "settings": {}
-        });
-    }
+    let params = build_codex_turn_start_params(
+        cfg,
+        thread_id,
+        mode,
+        resolved_model,
+        current_effort,
+        fast_mode,
+        service_tier_explicitly_controlled,
+        Value::Array(input_items),
+    );
 
     let req = json!({
         "id": req_id,
@@ -697,6 +896,165 @@ async fn dispatch_codex_turn(
         "params": params
     });
     shim.write_stdin_line(req.to_string()).await.map_err(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CodexUsageBreakdown {
+    /// Total prompt/input tokens reported by Codex (includes cached input tokens).
+    raw_input_tokens: u64,
+    /// Output tokens reported by Codex (already includes reasoning output tokens).
+    output_tokens: u64,
+    /// Cached portion of `raw_input_tokens`.
+    cache_read_tokens: u64,
+}
+
+impl CodexUsageBreakdown {
+    fn from_value(u: &Value) -> Option<Self> {
+        let raw_input_tokens = u
+            .get("inputTokens")
+            .or_else(|| u.get("input_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let output_tokens = u
+            .get("outputTokens")
+            .or_else(|| u.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_read_tokens = u
+            .get("cachedInputTokens")
+            .or_else(|| u.get("cached_input_tokens"))
+            .or_else(|| u.get("cache_read_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if raw_input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 {
+            return None;
+        }
+        Some(Self {
+            raw_input_tokens,
+            output_tokens,
+            cache_read_tokens,
+        })
+    }
+
+    fn is_non_zero(self) -> bool {
+        self.raw_input_tokens > 0 || self.output_tokens > 0 || self.cache_read_tokens > 0
+    }
+
+    fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            raw_input_tokens: self.raw_input_tokens.saturating_add(rhs.raw_input_tokens),
+            output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_add(rhs.cache_read_tokens),
+        }
+    }
+
+    fn delta_since(self, prev: Self) -> Self {
+        if self.raw_input_tokens < prev.raw_input_tokens || self.output_tokens < prev.output_tokens
+        {
+            return self;
+        }
+        Self {
+            raw_input_tokens: self.raw_input_tokens.saturating_sub(prev.raw_input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(prev.output_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_sub(prev.cache_read_tokens),
+        }
+    }
+
+    fn uncached_input_tokens(self) -> u64 {
+        self.raw_input_tokens.saturating_sub(self.cache_read_tokens)
+    }
+}
+
+/// Tracks Codex per-turn token usage across multi-step tool loops so exactly one
+/// `DriverEvent::TurnUsage` is emitted per completed turn with accurate turn delta
+/// and instantaneous single-call prompt occupancy.
+#[derive(Debug, Default)]
+struct CodexTurnUsageTracker {
+    prev_total: Option<CodexUsageBreakdown>,
+    latest_total: Option<CodexUsageBreakdown>,
+    accum_last: CodexUsageBreakdown,
+    last_call_prompt_tokens: Option<u64>,
+    model: Option<String>,
+}
+
+impl CodexTurnUsageTracker {
+    fn on_token_usage_updated(&mut self, params: &Value) {
+        if let Some(m) = params
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        {
+            self.model = Some(m.to_string());
+        }
+        let total = params
+            .pointer("/tokenUsage/total")
+            .or_else(|| params.pointer("/token_usage/total"))
+            .or_else(|| params.get("total"))
+            .and_then(CodexUsageBreakdown::from_value);
+        let last = params
+            .pointer("/tokenUsage/last")
+            .or_else(|| params.pointer("/token_usage/last"))
+            .or_else(|| params.get("last"))
+            .and_then(CodexUsageBreakdown::from_value);
+
+        if let Some(l) = last {
+            if l.raw_input_tokens > 0 {
+                self.last_call_prompt_tokens = Some(l.raw_input_tokens);
+            }
+            if total.is_none() {
+                self.accum_last = self.accum_last.saturating_add(l);
+            }
+        }
+        if let Some(t) = total {
+            self.latest_total = Some(t);
+        }
+    }
+
+    fn finalize_turn(&mut self, params: &Value) -> Option<DriverEvent> {
+        let completed_usage = params
+            .pointer("/turn/usage")
+            .or_else(|| params.get("usage"))
+            .and_then(CodexUsageBreakdown::from_value);
+        let model = params
+            .pointer("/turn/model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| self.model.take());
+
+        let latest_total = self.latest_total.take();
+        let accum_last = std::mem::take(&mut self.accum_last);
+        let last_call_prompt_tokens = self.last_call_prompt_tokens.take();
+
+        let breakdown = if let Some(u) = completed_usage {
+            if let Some(t) = latest_total {
+                self.prev_total = Some(t);
+            }
+            Some(u)
+        } else if let Some(t) = latest_total {
+            let delta = match self.prev_total {
+                Some(prev) => t.delta_since(prev),
+                None => t,
+            };
+            self.prev_total = Some(t);
+            delta.is_non_zero().then_some(delta)
+        } else if accum_last.is_non_zero() {
+            Some(accum_last)
+        } else {
+            None
+        }?;
+
+        Some(DriverEvent::TurnUsage {
+            input_tokens: breakdown.uncached_input_tokens(),
+            output_tokens: breakdown.output_tokens,
+            cache_read_tokens: breakdown.cache_read_tokens,
+            cache_write_tokens: 0,
+            last_call_prompt_tokens,
+            model,
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -709,6 +1067,7 @@ async fn handle_codex_notification(
     msg_accum: &mut HashMap<String, String>,
     thought_accum: &mut HashMap<String, String>,
     file_change_cache: &mut HashMap<String, ToolCallDetail>,
+    usage_tracker: &mut CodexTurnUsageTracker,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) -> bool {
     match method {
@@ -856,7 +1215,10 @@ async fn handle_codex_notification(
                         unified_diff: if combined_diff.is_empty() {
                             None
                         } else {
-                            Some(combined_diff)
+                            Some(crate::compact_unified_diff(
+                                &combined_diff,
+                                crate::MAX_UNIFIED_DIFF_BYTES,
+                            ))
                         },
                     };
                     file_change_cache.insert(item_id.clone(), detail.clone());
@@ -977,9 +1339,15 @@ async fn handle_codex_notification(
                 _ => {}
             }
         }
+        "thread/tokenUsage/updated" => {
+            usage_tracker.on_token_usage_updated(params);
+        }
         "turn/completed" => {
             *native_turn_id = None;
             *client_turn_id = None;
+            if let Some(usage_evt) = usage_tracker.finalize_turn(params) {
+                let _ = evt_tx.send(usage_evt).await;
+            }
             let status_str = params
                 .pointer("/turn/status")
                 .and_then(|v| v.as_str())
@@ -1221,6 +1589,8 @@ pub async fn probe_codex_quota() -> ProviderQuotaSnapshot {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".codex")
@@ -1398,6 +1768,8 @@ fn resolve_codex_home_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".codex")
@@ -1501,6 +1873,34 @@ fn build_codex_thinking_options(
     out
 }
 
+pub fn codex_model_supports_fast_mode(model_id: &str, item: Option<&Value>) -> bool {
+    if let Some(obj) = item {
+        if let Some(explicit) = obj
+            .get("supportsFastMode")
+            .or_else(|| obj.get("supports_fast_mode"))
+            .and_then(|v| v.as_bool())
+        {
+            return explicit;
+        }
+        if let Some(tiers) = obj
+            .get("supportedServiceTiers")
+            .or_else(|| obj.get("supported_service_tiers"))
+            .or_else(|| obj.get("service_tiers"))
+            .and_then(|v| v.as_array())
+        {
+            return tiers
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|t| t.eq_ignore_ascii_case("fast"));
+        }
+    }
+    let lower = model_id.trim().to_ascii_lowercase();
+    if lower.starts_with("gpt-oss") {
+        return false;
+    }
+    lower.starts_with("gpt-5") || lower.starts_with("gpt-6") || lower.contains("codex")
+}
+
 pub async fn fallback_codex_models() -> ProviderModelCatalog {
     let (cfg_model, cfg_effort) = read_codex_config_toml_defaults().await;
 
@@ -1577,6 +1977,7 @@ pub async fn fallback_codex_models() -> ProviderModelCatalog {
                 is_default: false,
                 default_effort: resolved_eff,
                 thinking_options: build_codex_thinking_options(&effort_entries, resolved_eff),
+                supports_fast_mode: codex_model_supports_fast_mode(id, Some(item)),
             });
         }
 
@@ -1697,6 +2098,7 @@ pub async fn fallback_codex_models() -> ProviderModelCatalog {
                 },
                 default_effort: Some(resolved_eff),
                 thinking_options: build_codex_thinking_options(&full_efforts, Some(resolved_eff)),
+                supports_fast_mode: codex_model_supports_fast_mode(id, None),
             }
         })
         .collect();
@@ -1716,15 +2118,15 @@ pub async fn probe_codex_models(executable: Option<&Path>) -> ProviderModelCatal
 
     let rpc_res = tokio::time::timeout(Duration::from_secs(6), async {
         let _startup_guard = codex_startup_mutex().lock().await;
-        let mut child = Command::new(exe)
-            .arg("app-server")
+        let mut cmd = Command::new(exe);
+        cmd.arg("app-server")
             .env("NO_COLOR", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .kill_on_drop(true);
+        crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
 
         let Some(mut stdin) = child.stdin.take() else {
             return Err("codex stdin unavailable".to_string());
@@ -1894,6 +2296,7 @@ pub async fn probe_codex_models(executable: Option<&Path>) -> ProviderModelCatal
                 &effort_entries,
                 resolved_default_effort,
             ),
+            supports_fast_mode: codex_model_supports_fast_mode(id, Some(item)),
         });
     }
 
@@ -1912,5 +2315,576 @@ pub async fn probe_codex_models(executable: Option<&Path>) -> ProviderModelCatal
         models,
         configured_default_model: configured_model,
         configured_default_effort: configured_effort,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    fn sample_cfg(fast_mode: bool) -> SessionLaunchConfig {
+        SessionLaunchConfig {
+            agent_id: "ag_codex_test".into(),
+            provider: ProviderKind::Codex,
+            executable: PathBuf::from("/usr/bin/codex"),
+            orbit_exe: PathBuf::from("/usr/bin/orbit"),
+            shim_socket: PathBuf::from("/tmp/codex.sock"),
+            cwd: PathBuf::from("/repo"),
+            extra_dirs: Vec::new(),
+            attachments_dir: None,
+            model: Some("gpt-5.4".into()),
+            effort: Some(ReasoningEffort::Medium),
+            fast_mode,
+            mode: SessionMode::AcceptEdits,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: Vec::new(),
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        }
+    }
+
+    #[test]
+    fn launch_args_and_rpc_params_respect_fast_mode() {
+        assert_eq!(build_codex_launch_args(false), vec!["app-server"]);
+        assert_eq!(
+            build_codex_launch_args(true),
+            vec!["app-server", "-c", "service_tier=\"fast\""]
+        );
+
+        let empty_cfg = serde_json::Map::new();
+        let off_thread = build_codex_thread_start_params(
+            &sample_cfg(false),
+            "on-request",
+            "workspace-write",
+            &empty_cfg,
+        );
+        assert!(off_thread.get("serviceTier").is_none());
+        assert!(off_thread.get("service_tier").is_none());
+
+        let on_thread = build_codex_thread_start_params(
+            &sample_cfg(true),
+            "on-request",
+            "workspace-write",
+            &empty_cfg,
+        );
+        assert_eq!(on_thread["serviceTier"], json!("fast"));
+        assert!(on_thread.get("service_tier").is_none());
+
+        let resume_off = build_codex_thread_resume_params("thr_old", false, &empty_cfg);
+        assert!(resume_off.get("serviceTier").is_none());
+        let resume_on = build_codex_thread_resume_params("thr_old", true, &empty_cfg);
+        assert_eq!(resume_on["serviceTier"], json!("fast"));
+
+        let cfg = sample_cfg(false);
+        let turn_uncontrolled_off = build_codex_turn_start_params(
+            &cfg,
+            "thr_1",
+            &SessionMode::AcceptEdits,
+            &Some("gpt-5.4".into()),
+            Some(ReasoningEffort::High),
+            false,
+            false,
+            json!([]),
+        );
+        assert!(turn_uncontrolled_off.get("serviceTier").is_none());
+
+        let turn_on = build_codex_turn_start_params(
+            &cfg,
+            "thr_1",
+            &SessionMode::AcceptEdits,
+            &Some("gpt-5.4".into()),
+            Some(ReasoningEffort::High),
+            true,
+            true,
+            json!([]),
+        );
+        assert_eq!(turn_on["serviceTier"], json!("fast"));
+
+        let turn_explicit_reset = build_codex_turn_start_params(
+            &cfg,
+            "thr_1",
+            &SessionMode::AcceptEdits,
+            &Some("gpt-5.4".into()),
+            Some(ReasoningEffort::High),
+            false,
+            true,
+            json!([]),
+        );
+        assert_eq!(
+            turn_explicit_reset
+                .as_object()
+                .expect("object")
+                .get("serviceTier"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[test]
+    fn codex_catalog_marks_gpt5_and_codex_models_as_fast_capable() {
+        assert!(codex_model_supports_fast_mode("gpt-5.4", None));
+        assert!(codex_model_supports_fast_mode("gpt-5.3-codex", None));
+        assert!(codex_model_supports_fast_mode("gpt-6.2-sol", None));
+        assert!(!codex_model_supports_fast_mode("gpt-oss-120b", None));
+        assert!(!codex_model_supports_fast_mode("o3-mini", None));
+        assert!(codex_model_supports_fast_mode(
+            "custom-model",
+            Some(&json!({ "supportedServiceTiers": ["standard", "fast"] }))
+        ));
+        assert!(!codex_model_supports_fast_mode(
+            "gpt-5.4",
+            Some(&json!({ "supportsFastMode": false }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_live_fast_mode_toggle_updates_subsequent_turn_start() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_codex_fast_toggle_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let observed_turns: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_turns);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "thread/start" => {
+                        assert!(rpc["params"].get("serviceTier").is_none());
+                        assert!(rpc["params"].get("service_tier").is_none());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "thread": { "id": "thr_live_1" },
+                                    "model": "gpt-5.4"
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "turn/start" => {
+                        let turn_idx = {
+                            let mut guard = observed_bg.lock().await;
+                            guard.push(rpc["params"].clone());
+                            guard.len()
+                        };
+                        let nat_tid = format!("nat_turn_{turn_idx}");
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": id,
+                                "result": { "turn": { "id": nat_tid } }
+                            }),
+                        )
+                        .await;
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "method": "turn/completed",
+                                "params": { "turn": { "id": nat_tid, "status": "completed" } }
+                            }),
+                        )
+                        .await;
+                        if turn_idx >= 2 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut cfg = sample_cfg(false);
+        cfg.shim_socket = sock_path.clone();
+
+        let actor = tokio::spawn(run_codex_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // Toggle fast mode ON without specifying model/effort -> must preserve existing model & effort!
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(true),
+            })
+            .await
+            .expect("toggle on");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t1".into(),
+                prompt: "first".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("prompt 1");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn 1 timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // Toggle fast mode OFF -> next turn omits service_tier
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(false),
+            })
+            .await
+            .expect("toggle off");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t2".into(),
+                prompt: "second".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("prompt 2");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn 2 timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        let turns = observed_turns.lock().await;
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["serviceTier"], json!("fast"));
+        assert!(turns[0].get("service_tier").is_none());
+        assert_eq!(turns[0]["model"], json!("gpt-5.4"));
+        assert_eq!(turns[0]["effort"], json!("medium"));
+        assert_eq!(
+            turns[1].as_object().expect("turn 2 obj").get("serviceTier"),
+            Some(&Value::Null)
+        );
+        assert_eq!(turns[1]["model"], json!("gpt-5.4"));
+        assert_eq!(turns[1]["effort"], json!("medium"));
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn codex_start_fast_true_then_toggle_false_sends_null_service_tier() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_codex_fast_reset_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let observed_thread_start: Arc<tokio::sync::Mutex<Option<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let observed_turns: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_ts_bg = Arc::clone(&observed_thread_start);
+        let observed_turns_bg = Arc::clone(&observed_turns);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "thread/start" => {
+                        *observed_ts_bg.lock().await = Some(rpc["params"].clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "thread": { "id": "thr_fast_init" },
+                                    "model": "gpt-5.4"
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "turn/start" => {
+                        observed_turns_bg.lock().await.push(rpc["params"].clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": id,
+                                "result": { "turn": { "id": "nat_turn_reset" } }
+                            }),
+                        )
+                        .await;
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "method": "turn/completed",
+                                "params": { "turn": { "id": "nat_turn_reset", "status": "completed" } }
+                            }),
+                        )
+                        .await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut cfg = sample_cfg(true);
+        cfg.shim_socket = sock_path.clone();
+
+        let actor = tokio::spawn(run_codex_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // Disable fast mode on a session that booted with `fast_mode: true`
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(false),
+            })
+            .await
+            .expect("toggle off");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_reset".into(),
+                prompt: "standard tier please".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("prompt");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        let ts = observed_thread_start
+            .lock()
+            .await
+            .clone()
+            .expect("thread/start observed");
+        assert_eq!(ts["serviceTier"], json!("fast"));
+
+        let turns = observed_turns.lock().await;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].as_object().expect("turn obj").get("serviceTier"),
+            Some(&Value::Null),
+            "toggling true -> false must emit explicit null serviceTier to override -c service_tier=fast"
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn codex_turn_usage_tracker_emits_once_per_turn_without_reasoning_double_count() {
+        let mut tracker = CodexTurnUsageTracker::default();
+
+        // Turn 1: 3 tool-call steps. `outputTokens` ALREADY includes `reasoningOutputTokens`.
+        // `tokenUsage.total` is cumulative across the thread; `tokenUsage.last` is the single call.
+        tracker.on_token_usage_updated(&json!({
+            "model": "gpt-5.4",
+            "tokenUsage": {
+                "last": { "inputTokens": 20000, "cachedInputTokens": 12000, "outputTokens": 800, "reasoningOutputTokens": 500 },
+                "total": { "inputTokens": 20000, "cachedInputTokens": 12000, "outputTokens": 800, "reasoningOutputTokens": 500 }
+            }
+        }));
+        tracker.on_token_usage_updated(&json!({
+            "tokenUsage": {
+                "last": { "inputTokens": 28000, "cachedInputTokens": 20000, "outputTokens": 1100, "reasoningOutputTokens": 700 },
+                "total": { "inputTokens": 48000, "cachedInputTokens": 32000, "outputTokens": 1900, "reasoningOutputTokens": 1200 }
+            }
+        }));
+        tracker.on_token_usage_updated(&json!({
+            "tokenUsage": {
+                "last": { "inputTokens": 35000, "cachedInputTokens": 30000, "outputTokens": 900, "reasoningOutputTokens": 400 },
+                "total": { "inputTokens": 83000, "cachedInputTokens": 62000, "outputTokens": 2800, "reasoningOutputTokens": 1600 }
+            }
+        }));
+
+        // Emit once on `turn/completed` (without inline turn.usage -> uses total delta)
+        let ev1 = tracker
+            .finalize_turn(&json!({ "turn": { "status": "completed" } }))
+            .expect("turn 1 usage");
+        match ev1 {
+            DriverEvent::TurnUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                last_call_prompt_tokens,
+                model,
+            } => {
+                // Uncached input = 83000 - 62000 = 21000
+                assert_eq!(input_tokens, 21_000);
+                // Output is 2800 (NOT 2800 + 1600!)
+                assert_eq!(output_tokens, 2_800);
+                assert_eq!(cache_read_tokens, 62_000);
+                assert_eq!(cache_write_tokens, 0);
+                // Instantaneous single-call prompt occupancy is 35000 (NOT 83000!)
+                assert_eq!(last_call_prompt_tokens, Some(35_000));
+                assert_eq!(model.as_deref(), Some("gpt-5.4"));
+            }
+            other => panic!("expected TurnUsage, got {other:?}"),
+        }
+
+        // Turn 2: `total` continues growing cumulatively; tracker must emit ONLY the delta for Turn 2.
+        tracker.on_token_usage_updated(&json!({
+            "tokenUsage": {
+                "last": { "inputTokens": 42000, "cachedInputTokens": 36000, "outputTokens": 600, "reasoningOutputTokens": 200 },
+                "total": { "inputTokens": 125000, "cachedInputTokens": 98000, "outputTokens": 3400, "reasoningOutputTokens": 1800 }
+            }
+        }));
+        let ev2 = tracker
+            .finalize_turn(&json!({ "turn": { "status": "completed" } }))
+            .expect("turn 2 usage");
+        match ev2 {
+            DriverEvent::TurnUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                last_call_prompt_tokens,
+                ..
+            } => {
+                // Delta total input = 125000 - 83000 = 42000; delta cache = 98000 - 62000 = 36000; uncached = 6000
+                assert_eq!(input_tokens, 6_000);
+                assert_eq!(output_tokens, 600);
+                assert_eq!(cache_read_tokens, 36_000);
+                assert_eq!(last_call_prompt_tokens, Some(42_000));
+            }
+            other => panic!("expected TurnUsage, got {other:?}"),
+        }
     }
 }

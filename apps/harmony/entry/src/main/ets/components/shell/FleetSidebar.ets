@@ -893,6 +893,40 @@ export struct FleetSidebar {
           })
         }
 
+        if (this.store.hosts.length > 0) {
+          Button({ type: ButtonType.Circle, stateEffect: true }) {
+            SymbolGlyph($r('sys.symbol.clock'))
+              .fontSize(18)
+              .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+              .fontColor([this.store.palette.iconPrimary])
+          }
+          .width(OrbitTokens.HIT_COMPACT)
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding(0)
+          .backgroundColor(this.store.palette.subtleSurface)
+          .accessibilityText('Automations')
+          .onClick(() => {
+            dismissHarmonyKeyboard(this.getUIContext());
+            this.store.openAutomationsSheet();
+          })
+
+          Button({ type: ButtonType.Circle, stateEffect: true }) {
+            SymbolGlyph($r('sys.symbol.archivebox'))
+              .fontSize(18)
+              .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+              .fontColor([this.store.palette.iconPrimary])
+          }
+          .width(OrbitTokens.HIT_COMPACT)
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding(0)
+          .backgroundColor(this.store.palette.subtleSurface)
+          .accessibilityText('Archived sessions')
+          .onClick(() => {
+            dismissHarmonyKeyboard(this.getUIContext());
+            this.store.openArchivedSessions();
+          })
+        }
+
         Button({ type: ButtonType.Circle, stateEffect: true }) {
           SymbolGlyph($r('sys.symbol.gearshape'))
             .fontSize(19)

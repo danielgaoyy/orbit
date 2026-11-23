@@ -1,12 +1,21 @@
 import type { TimelineItemView } from "@/lib/orbit-ipc";
+import { stripWindowsVerbatimPrefix } from "@/lib/stage-cache";
 
 export function stripWorkspacePrefix(filePath: string, cwd?: string | null): string {
   if (!filePath) return filePath;
-  const cleanCwd = (cwd ?? "").replace(/\/+$/, "");
-  if (cleanCwd && cleanCwd !== "~" && filePath.startsWith(`${cleanCwd}/`)) {
-    return filePath.slice(cleanCwd.length + 1);
+  const cleanPath = stripWindowsVerbatimPrefix(filePath);
+  const cleanCwd = stripWindowsVerbatimPrefix(cwd ?? "").replace(/[/\\]+$/, "");
+  if (cleanCwd && cleanCwd !== "~") {
+    if (cleanPath.startsWith(`${cleanCwd}/`) || cleanPath.startsWith(`${cleanCwd}\\`)) {
+      return cleanPath.slice(cleanCwd.length + 1);
+    }
+    const normPath = cleanPath.replace(/\\/g, "/");
+    const normCwd = cleanCwd.replace(/\\/g, "/");
+    if (normPath.startsWith(`${normCwd}/`)) {
+      return normPath.slice(normCwd.length + 1);
+    }
   }
-  return filePath;
+  return cleanPath;
 }
 
 export function basenameOfPath(filePath: string): string {

@@ -2,15 +2,20 @@
 //! `schedule`, `heartbeat`, `profile`, `host`, `permit`, `config`, `skill`, plus `wait`,
 //! `stop`, `inspect`, `archive`, `unarchive`, `detach`, `delete`, `mode`).
 
-use std::path::Path;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Subcommand, ValueEnum};
+use orbit_client_core::export::{
+    ExportAgentMeta, ExportFormat, ExportOptions, export_timeline_transcript, write_file_atomically,
+};
 use orbit_client_core::{ClientInboundEvent, HostSessionHandle};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentProfile, AgentStatus, McpToolPolicy, ProviderKind, ReasoningEffort,
-    ScheduleKind, ScheduleNewAgentConfig, ScheduleTarget, SessionMode, TimelinePayload,
-    WireMessage, WorkspaceIsolation, WorktreeCreateMode,
+    ActiveTurnBehavior, AgentProfile, AgentStatus, ForkTarget, McpToolPolicy, ProviderKind,
+    ReasoningEffort, ScheduleKind, ScheduleNewAgentConfig, ScheduleTarget, SessionMode,
+    TimelinePayload, WireMessage, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection,
+    WorktreeHandoffMode,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -70,6 +75,69 @@ impl From<CliWorktreeMode> for WorktreeCreateMode {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+pub enum CliExportFormat {
+    #[value(alias = "markdown")]
+    Md,
+    Json,
+    Html,
+}
+
+impl From<CliExportFormat> for ExportFormat {
+    fn from(v: CliExportFormat) -> Self {
+        match v {
+            CliExportFormat::Md => ExportFormat::Markdown,
+            CliExportFormat::Json => ExportFormat::Json,
+            CliExportFormat::Html => ExportFormat::Html,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum AgentAction {
+    /// Export an agent conversation transcript to Markdown, JSON, or self-contained HTML.
+    Export {
+        agent_id: String,
+        /// Output format: `md` (default), `json`, or `html`.
+        #[arg(short = 'f', long, value_enum, default_value = "md")]
+        format: CliExportFormat,
+        /// Exclude assistant thinking / reasoning blocks.
+        #[arg(long)]
+        no_thinking: bool,
+        /// Exclude tool call details.
+        #[arg(long)]
+        no_tools: bool,
+        /// Exclude timestamps from the exported transcript.
+        #[arg(long)]
+        no_timestamps: bool,
+        /// Output file path (writes atomically; omit to write to stdout).
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
+    /// Fork/branch an existing agent conversation in the same directory or into a new git worktree.
+    Fork {
+        agent_id: String,
+        /// Optional timeline sequence upper bound (inclusive). Omit to fork full history.
+        #[arg(long = "at-seq")]
+        at_seq: Option<u64>,
+        /// Create a fresh isolated git worktree workspace for the forked branch.
+        #[arg(long)]
+        worktree: bool,
+        /// Optional git branch name when forking into a worktree.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Optional git base ref when forking into a worktree.
+        #[arg(long = "base-ref")]
+        base_ref: Option<String>,
+        /// Optional custom title for the forked conversation.
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional initial follow-up prompt to dispatch immediately on the forked branch.
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum WorkspaceAction {
     /// List workspaces.
@@ -101,6 +169,37 @@ pub enum WorkspaceAction {
     Archive { workspace_id: String },
     /// Unarchive a workspace.
     Unarchive { workspace_id: String },
+    /// Sync or move changes bidirectionally between a Git worktree and local checkout.
+    Handoff {
+        workspace_id: String,
+        /// Transfer changes from a worktree back to the local checkout.
+        #[arg(long = "to-local", conflicts_with = "to_worktree")]
+        to_local: bool,
+        /// Transfer local uncommitted changes into a new or existing worktree.
+        #[arg(long = "to-worktree", conflicts_with = "to_local")]
+        to_worktree: bool,
+        /// Copy/apply changes while keeping the source working tree intact (default).
+        #[arg(long, conflicts_with = "move_changes")]
+        apply: bool,
+        /// Apply changes and cleanly reset uncommitted source changes after verified success.
+        #[arg(long = "move", conflicts_with = "apply")]
+        move_changes: bool,
+        /// Preview diff statistics and conflicts without modifying any files on disk.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Optional branch name when creating a new worktree (`--to-worktree`).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Optional explicit target workspace ID.
+        #[arg(long = "target-workspace-id")]
+        target_workspace_id: Option<String>,
+        /// Only include uncommitted working-tree changes (exclude worktree commits).
+        #[arg(long = "no-commits")]
+        no_commits: bool,
+        /// Fall back to `git apply --3way` conflict markers when clean apply has conflicts.
+        #[arg(long = "allow-three-way-conflicts")]
+        allow_three_way_conflicts: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -245,6 +344,9 @@ pub enum ProfileAction {
         model: Option<String>,
         #[arg(long, value_enum)]
         effort: Option<CliEffort>,
+        /// Enable Fast output mode by default for agents using this profile.
+        #[arg(long)]
+        fast: bool,
         #[arg(short, long, value_enum, default_value = "accept-edits")]
         mode: CliMode,
         #[arg(long, default_value = "")]
@@ -313,6 +415,8 @@ pub enum ConfigAction {
         idle_timeout: Option<u64>,
         #[arg(long)]
         resume_on_startup: Option<bool>,
+        #[arg(long)]
+        keep_awake: Option<bool>,
     },
 }
 
@@ -335,6 +439,43 @@ pub fn resolve_server_url(home_dir: &Path, explicit_server: Option<String>) -> S
     format!("ws://127.0.0.1:{port}/ws")
 }
 
+fn matches_rpc_response(w: &WireMessage, req_id: Uuid) -> bool {
+    match w {
+        WireMessage::Ack { request_id }
+        | WireMessage::WorkspacesSnapshot { request_id, .. }
+        | WireMessage::WorkspaceCreated { request_id, .. }
+        | WireMessage::WorkspaceScriptsSnapshot { request_id, .. }
+        | WireMessage::AgentsSnapshot { request_id, .. }
+        | WireMessage::AgentCreated { request_id, .. }
+        | WireMessage::AgentForked { request_id, .. }
+        | WireMessage::PendingPermissionsSnapshot { request_id, .. }
+        | WireMessage::TimelineCatchup { request_id, .. }
+        | WireMessage::TerminalsSnapshot { request_id, .. }
+        | WireMessage::TerminalAttached { request_id, .. }
+        | WireMessage::TerminalCaptured { request_id, .. }
+        | WireMessage::ProfilesSnapshot { request_id, .. }
+        | WireMessage::ProfileUpserted { request_id, .. }
+        | WireMessage::SchedulesSnapshot { request_id, .. }
+        | WireMessage::ScheduleCreated { request_id, .. }
+        | WireMessage::ScheduleRunsSnapshot { request_id, .. }
+        | WireMessage::ConnectedHostsSnapshot { request_id, .. }
+        | WireMessage::ConnectedHostAdded { request_id, .. }
+        | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
+        | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
+        | WireMessage::ManagedSkillsSnapshot { request_id, .. }
+        | WireMessage::ManagedSkillContentResponse { request_id, .. }
+        | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
+        | WireMessage::ProviderSubagentsSnapshot { request_id, .. }
+        | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }
+        | WireMessage::WorktreeHandoffExecuted { request_id, .. } => *request_id == req_id,
+        WireMessage::RpcError {
+            request_id: Some(r),
+            ..
+        } => *r == req_id,
+        _ => false,
+    }
+}
+
 async fn send_rpc(
     client: &HostSessionHandle,
     req_id: Uuid,
@@ -342,33 +483,8 @@ async fn send_rpc(
     timeout_secs: u64,
 ) -> anyhow::Result<WireMessage> {
     let resp = client
-        .request(msg, Duration::from_secs(timeout_secs), |w| match w {
-            WireMessage::Ack { request_id }
-            | WireMessage::WorkspacesSnapshot { request_id, .. }
-            | WireMessage::WorkspaceCreated { request_id, .. }
-            | WireMessage::WorkspaceScriptsSnapshot { request_id, .. }
-            | WireMessage::AgentsSnapshot { request_id, .. }
-            | WireMessage::AgentCreated { request_id, .. }
-            | WireMessage::PendingPermissionsSnapshot { request_id, .. }
-            | WireMessage::TimelineCatchup { request_id, .. }
-            | WireMessage::TerminalsSnapshot { request_id, .. }
-            | WireMessage::TerminalAttached { request_id, .. }
-            | WireMessage::TerminalCaptured { request_id, .. }
-            | WireMessage::ProfilesSnapshot { request_id, .. }
-            | WireMessage::ProfileUpserted { request_id, .. }
-            | WireMessage::SchedulesSnapshot { request_id, .. }
-            | WireMessage::ScheduleCreated { request_id, .. }
-            | WireMessage::ScheduleRunsSnapshot { request_id, .. }
-            | WireMessage::ConnectedHostsSnapshot { request_id, .. }
-            | WireMessage::ConnectedHostAdded { request_id, .. }
-            | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
-            | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
-            | WireMessage::ProviderSubagentsSnapshot { request_id, .. } => *request_id == req_id,
-            WireMessage::RpcError {
-                request_id: Some(r),
-                ..
-            } => *r == req_id,
-            _ => false,
+        .request(msg, Duration::from_secs(timeout_secs), |w| {
+            matches_rpc_response(w, req_id)
         })
         .await?;
     if let WireMessage::RpcError { code, message, .. } = resp {
@@ -849,6 +965,130 @@ pub async fn cmd_workspace(
                 &format!("[✓] Unarchived workspace `{workspace_id}`"),
             );
         }
+        WorkspaceAction::Handoff {
+            workspace_id,
+            to_local,
+            to_worktree,
+            apply: _,
+            move_changes,
+            dry_run,
+            branch,
+            target_workspace_id,
+            no_commits,
+            allow_three_way_conflicts,
+        } => {
+            let direction = match (to_local, to_worktree) {
+                (true, false) => WorktreeHandoffDirection::WorktreeToLocal,
+                (false, true) => WorktreeHandoffDirection::LocalToWorktree,
+                _ => anyhow::bail!(
+                    "specify exactly one direction flag: `--to-local` or `--to-worktree`"
+                ),
+            };
+            let mode = if move_changes {
+                WorktreeHandoffMode::Move
+            } else {
+                WorktreeHandoffMode::Apply
+            };
+            let include_committed =
+                !no_commits && direction == WorktreeHandoffDirection::WorktreeToLocal;
+
+            if dry_run {
+                let req_id = Uuid::new_v4();
+                let resp = send_rpc(
+                    &client,
+                    req_id,
+                    WireMessage::PreviewWorktreeHandoff {
+                        request_id: req_id,
+                        workspace_id,
+                        direction,
+                        target_workspace_id,
+                        include_committed,
+                    },
+                    30,
+                )
+                .await?;
+                if let WireMessage::WorktreeHandoffPreviewResult { preview, .. } = resp {
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(&preview)?);
+                    } else {
+                        let src_label = preview
+                            .source_branch
+                            .as_deref()
+                            .unwrap_or(&preview.source_cwd);
+                        let tgt_label = preview
+                            .target_branch
+                            .as_deref()
+                            .unwrap_or(&preview.target_cwd);
+                        println!(
+                            "Handoff Preview: {} -> {} ({} file(s), +{} / -{})",
+                            src_label,
+                            tgt_label,
+                            preview.files.len(),
+                            preview.total_insertions,
+                            preview.total_deletions
+                        );
+                        if preview.commit_count > 0 {
+                            println!("  Commits ahead: {}", preview.commit_count);
+                        }
+                        for f in &preview.files {
+                            let marker = if f.has_conflict { " [CONFLICT]" } else { "" };
+                            println!(
+                                "  {:<2} {} (+{} / -{}){}",
+                                f.status, f.path, f.insertions, f.deletions, marker
+                            );
+                        }
+                        if let Some(ref w) = preview.warning {
+                            println!("  Warning: {w}");
+                        }
+                        println!(
+                            "  Status: {}",
+                            if preview.can_apply_cleanly {
+                                "clean"
+                            } else {
+                                "conflicts detected"
+                            }
+                        );
+                    }
+                }
+            } else {
+                let req_id = Uuid::new_v4();
+                let resp = send_rpc(
+                    &client,
+                    req_id,
+                    WireMessage::ExecuteWorktreeHandoff {
+                        request_id: req_id,
+                        workspace_id,
+                        direction,
+                        mode,
+                        target_workspace_id,
+                        include_committed,
+                        branch,
+                        allow_three_way_conflicts,
+                    },
+                    60,
+                )
+                .await?;
+                if let WireMessage::WorktreeHandoffExecuted { outcome, .. } = resp {
+                    let mut human = format!("[✓] {}", outcome.summary);
+                    if let Some(ref backup) = outcome.backup_ref {
+                        human.push_str(&format!("\n    Backup ref: {backup}"));
+                    }
+                    if let Some(ref ws) = outcome.target_workspace {
+                        human.push_str(&format!(
+                            "\n    Target workspace: {} ({})",
+                            ws.workspace_id, ws.cwd
+                        ));
+                    }
+                    if outcome.had_conflicts && !outcome.conflict_files.is_empty() {
+                        human.push_str(&format!(
+                            "\n    Conflicts: {}",
+                            outcome.conflict_files.join(", ")
+                        ));
+                    }
+                    print_out(json_mode, &serde_json::to_value(&outcome)?, &human);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1123,8 +1363,10 @@ pub async fn cmd_schedule(
                 cwd,
                 workspace_id: None,
                 provider: provider.into(),
+                acp_agent_id: None,
                 model,
                 effort: None,
+                fast_mode: false,
                 profile_id: profile,
                 mode: mode.into(),
                 worktree,
@@ -1484,6 +1726,7 @@ pub async fn cmd_profile(
             id,
             model,
             effort,
+            fast,
             mode,
             when_to_use,
             system_prompt,
@@ -1497,8 +1740,10 @@ pub async fn cmd_profile(
                 }),
                 name,
                 provider: ProviderKind::from(provider),
+                acp_agent_id: None,
                 model,
                 effort: effort.map(Into::into),
+                fast_mode: fast,
                 mode: SessionMode::from(mode),
                 when_to_use,
                 system_prompt_append: system_prompt,
@@ -1788,6 +2033,7 @@ pub async fn cmd_config(
             idle_cleanup,
             idle_timeout,
             resume_on_startup,
+            keep_awake,
         } => {
             let get_id = Uuid::new_v4();
             let cur = match send_rpc(
@@ -1814,6 +2060,9 @@ pub async fn cmd_config(
             if let Some(v) = resume_on_startup {
                 next.resume_on_startup = v;
             }
+            if let Some(v) = keep_awake {
+                next.keep_awake_while_running = v;
+            }
             let set_id = Uuid::new_v4();
             let resp = send_rpc(
                 &client,
@@ -1836,6 +2085,118 @@ pub async fn cmd_config(
                 );
             }
         }
+    }
+    Ok(())
+}
+
+pub async fn cmd_agent(
+    server: &str,
+    via_relay: bool,
+    json_mode: bool,
+    action: AgentAction,
+) -> anyhow::Result<()> {
+    match action {
+        AgentAction::Export {
+            agent_id,
+            format,
+            no_thinking,
+            no_tools,
+            no_timestamps,
+            output,
+        } => {
+            cmd_export_agent(
+                server,
+                via_relay,
+                agent_id,
+                format,
+                no_thinking,
+                no_tools,
+                no_timestamps,
+                output,
+            )
+            .await
+        }
+        AgentAction::Fork {
+            agent_id,
+            at_seq,
+            worktree,
+            branch,
+            base_ref,
+            title,
+            prompt,
+        } => {
+            cmd_fork_agent(
+                server, via_relay, json_mode, agent_id, at_seq, worktree, branch, base_ref, title,
+                prompt,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_fork_agent(
+    server: &str,
+    via_relay: bool,
+    json_mode: bool,
+    source_agent_id: String,
+    at_seq: Option<u64>,
+    worktree: bool,
+    branch: Option<String>,
+    base_ref: Option<String>,
+    title: Option<String>,
+    initial_prompt: Option<String>,
+) -> anyhow::Result<()> {
+    let client = connect_cli_server(server, via_relay).await?;
+    let req_id = Uuid::new_v4();
+    let target = if worktree || branch.is_some() || base_ref.is_some() {
+        ForkTarget::NewWorktree { branch, base_ref }
+    } else {
+        ForkTarget::SameDirectory
+    };
+    let resp = send_rpc(
+        &client,
+        req_id,
+        WireMessage::ForkAgent {
+            request_id: req_id,
+            source_agent_id,
+            up_to_seq: at_seq,
+            target,
+            title,
+            initial_prompt,
+        },
+        60,
+    )
+    .await?;
+    if let WireMessage::AgentForked {
+        agent, workspace, ..
+    } = resp
+    {
+        let payload = json!({
+            "agent": agent,
+            "workspace": workspace,
+        });
+        let summary = if let Some(ref ws) = workspace
+            && ws.is_worktree
+        {
+            format!(
+                "[✓] Forked `{}` -> `{}` in worktree `{}` (branch: {})",
+                agent.forked_from_agent_id.as_deref().unwrap_or("source"),
+                agent.agent_id,
+                ws.cwd,
+                ws.git_branch.as_deref().unwrap_or("detached")
+            )
+        } else {
+            format!(
+                "[✓] Forked `{}` -> `{}` ({})",
+                agent.forked_from_agent_id.as_deref().unwrap_or("source"),
+                agent.agent_id,
+                agent.title
+            )
+        };
+        print_out(json_mode, &payload, &summary);
+    } else {
+        anyhow::bail!("unexpected response to fork_agent");
     }
     Ok(())
 }
@@ -1895,4 +2256,230 @@ pub async fn cmd_skill(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_export_agent(
+    server: &str,
+    via_relay: bool,
+    agent_id: String,
+    format: CliExportFormat,
+    no_thinking: bool,
+    no_tools: bool,
+    no_timestamps: bool,
+    output: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let client = connect_cli_server(server, via_relay).await?;
+    let agents_req = Uuid::new_v4();
+    let agents_resp = send_rpc(
+        &client,
+        agents_req,
+        WireMessage::ListAgents {
+            request_id: agents_req,
+            workspace_id: None,
+            include_archived: true,
+            include_background: true,
+            parent_agent_id: None,
+        },
+        15,
+    )
+    .await?;
+    let agent = if let WireMessage::AgentsSnapshot { agents, .. } = agents_resp {
+        agents
+            .into_iter()
+            .find(|a| a.agent_id == agent_id)
+            .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?
+    } else {
+        anyhow::bail!("unexpected response when fetching agent metadata");
+    };
+
+    let ws_title = {
+        let ws_req = Uuid::new_v4();
+        match send_rpc(
+            &client,
+            ws_req,
+            WireMessage::ListWorkspaces {
+                request_id: ws_req,
+                include_archived: true,
+                include_background: true,
+            },
+            10,
+        )
+        .await
+        {
+            Ok(WireMessage::WorkspacesSnapshot { workspaces, .. }) => workspaces
+                .into_iter()
+                .find(|w| w.workspace_id == agent.workspace_id)
+                .map(|w| w.title),
+            _ => None,
+        }
+    };
+
+    let mut all_events = Vec::new();
+    let mut since_seq = 0u64;
+    loop {
+        let tl_req = Uuid::new_v4();
+        let resp = send_rpc(
+            &client,
+            tl_req,
+            WireMessage::SubscribeTimeline {
+                request_id: tl_req,
+                agent_id: agent_id.clone(),
+                since_seq,
+            },
+            20,
+        )
+        .await?;
+        match resp {
+            WireMessage::TimelineCatchup {
+                events, has_more, ..
+            } => {
+                let last_seq = events.last().map(|e| e.seq).unwrap_or(since_seq);
+                all_events.extend(events);
+                if !has_more || last_seq <= since_seq {
+                    break;
+                }
+                since_seq = last_seq;
+            }
+            _ => anyhow::bail!("unexpected response when fetching timeline"),
+        }
+    }
+
+    let meta = ExportAgentMeta {
+        host_id: client
+            .welcome_host
+            .as_ref()
+            .map(|h| h.host_id.clone())
+            .unwrap_or_default(),
+        host_name: client.welcome_host.as_ref().map(|h| h.hostname.clone()),
+        agent_id: agent.agent_id.clone(),
+        title: agent.title.clone(),
+        provider: Some(agent.provider),
+        model: agent.model.clone(),
+        cwd: Some(agent.cwd.clone()),
+        workspace_title: ws_title,
+        task_summary: agent.task_summary.clone(),
+        created_at: Some(agent.created_at),
+        exported_at: None,
+    };
+    let opts = ExportOptions {
+        format: format.into(),
+        include_thinking: !no_thinking,
+        include_tool_calls: !no_tools,
+        include_timestamps: !no_timestamps,
+    };
+    let exported = export_timeline_transcript(&meta, &all_events, &opts);
+
+    if let Some(path) = output {
+        write_file_atomically(&path, exported.content.as_bytes()).map_err(anyhow::Error::msg)?;
+        eprintln!(
+            "[✓] Exported {} ({} turns, {} bytes) -> {}",
+            exported.suggested_filename,
+            exported.turn_count,
+            exported.byte_len,
+            path.display()
+        );
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(exported.content.as_bytes())?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fork_rpc_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn matches_rpc_response_accepts_agent_forked() {
+        let req_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let msg = WireMessage::AgentForked {
+            request_id: req_id,
+            agent: orbit_protocol::AgentSummary {
+                agent_id: "ag_fork".into(),
+                workspace_id: "ws_1".into(),
+                cwd: "/tmp/repo".into(),
+                title: "Forked".into(),
+                provider: orbit_protocol::ProviderKind::ClaudeCode,
+                model: None,
+                effort: None,
+                fast_mode: false,
+                mode: orbit_protocol::SessionMode::Default,
+                status: orbit_protocol::AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 1,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: orbit_protocol::AttentionState::None,
+                last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
+                read_seq: 1,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: Some("ag_src".into()),
+                forked_at_seq: Some(1),
+                acp_agent_id: None,
+            },
+            workspace: None,
+        };
+        assert!(matches_rpc_response(&msg, req_id));
+        assert!(!matches_rpc_response(&msg, other_id));
+    }
+
+    #[test]
+    fn matches_rpc_response_accepts_worktree_handoff_replies() {
+        let req_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let preview_msg = WireMessage::WorktreeHandoffPreviewResult {
+            request_id: req_id,
+            preview: orbit_protocol::WorktreeHandoffPreview {
+                direction: WorktreeHandoffDirection::WorktreeToLocal,
+                source_cwd: "/tmp/wt".into(),
+                target_cwd: "/tmp/local".into(),
+                source_branch: Some("feat/a".into()),
+                target_branch: Some("main".into()),
+                commit_count: 1,
+                files: Vec::new(),
+                total_insertions: 0,
+                total_deletions: 0,
+                target_dirty: false,
+                conflicts: Vec::new(),
+                can_apply_cleanly: true,
+                warning: None,
+            },
+        };
+        assert!(matches_rpc_response(&preview_msg, req_id));
+        assert!(!matches_rpc_response(&preview_msg, other_id));
+
+        let exec_msg = WireMessage::WorktreeHandoffExecuted {
+            request_id: req_id,
+            outcome: orbit_protocol::WorktreeHandoffOutcome {
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                applied_files: 2,
+                backup_ref: Some("refs/orbit/handoff-backup/1-abcd".into()),
+                target_workspace: None,
+                target_cwd: "/tmp/wt-new".into(),
+                had_conflicts: false,
+                conflict_files: Vec::new(),
+                summary: "Moved 2 files to worktree".into(),
+            },
+        };
+        assert!(matches_rpc_response(&exec_msg, req_id));
+        assert!(!matches_rpc_response(&exec_msg, other_id));
+    }
 }

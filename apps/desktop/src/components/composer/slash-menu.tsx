@@ -1,9 +1,12 @@
 import { useEffect, useRef } from "react";
 import {
+  Copy,
+  Download,
   FileSearch,
   FoldVertical,
   FolderTree,
   GitCompareArrows,
+  GitFork,
   Globe,
   Layers,
   ListTodo,
@@ -16,8 +19,10 @@ import {
   Sparkles,
   SquarePen,
   SquareTerminal,
+  Target,
   Terminal,
   Users,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { modSymbol } from "@/lib/keybindings";
@@ -27,11 +32,18 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 
 function resolveSlashCommandIcon(cmd: SlashCommandView): LucideIcon {
+  if (cmd.icon_key === "skill") {
+    return Sparkles;
+  }
   switch (cmd.id || cmd.icon_key) {
+    case "fork":
+      return GitFork;
     case "btw":
       return MessageCircleQuestion;
     case "plan":
       return ListTodo;
+    case "goal":
+      return Target;
     case "review":
       return FileSearch;
     case "diff":
@@ -42,6 +54,13 @@ function resolveSlashCommandIcon(cmd: SlashCommandView): LucideIcon {
       return Globe;
     case "compact":
       return FoldVertical;
+    case "export":
+      return Download;
+    case "copy":
+      return Copy;
+    case "fast":
+    case "zap":
+      return Zap;
     case "orbit":
       return Layers;
     case "orbit-handoff":
@@ -148,7 +167,13 @@ export function SlashCommandMenu({
                   </span>
                 </div>
               </div>
-              {shortcut && <ShortcutKbd keys={shortcut} className="shrink-0" />}
+              {shortcut ? (
+                <ShortcutKbd keys={shortcut} className="shrink-0" />
+              ) : cmd.icon_key === "skill" ? (
+                <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium">
+                  Skill
+                </span>
+              ) : null}
             </button>
           );
         })}

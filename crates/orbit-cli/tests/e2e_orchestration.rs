@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Comprehensive 10-scenario End-to-End Orchestration Integration Test Suite.
 //!
 //! Uses a deterministic Python3 mock Claude Code stream-json provider (injected via safe
@@ -421,6 +422,7 @@ async fn create_agent_rpc(
                 provider: ProviderKind::ClaudeCode,
                 model: None,
                 effort: None,
+                fast_mode: None,
                 mode,
                 initial_prompt: prompt.to_string(),
                 initial_display_prompt: None,
@@ -439,6 +441,7 @@ async fn create_agent_rpc(
                 branch: None,
                 handle: None,
                 auto_cluster: Some(false),
+                acp_agent_id: None,
             },
             Duration::from_secs(20),
             |w| matches!(w, WireMessage::AgentCreated { request_id, .. } if *request_id == req_id),
@@ -474,8 +477,10 @@ async fn scenario_01_single_host_delegation_worktree_and_auto_finish_wakeup() {
         profile_id: "prof_worker".into(),
         name: "Specialist Worker".into(),
         provider: ProviderKind::ClaudeCode,
+        acp_agent_id: None,
         model: Some("mock-claude".into()),
         effort: None,
+        fast_mode: false,
         mode: SessionMode::AcceptEdits,
         when_to_use: "Use for isolated worktree implementation".into(),
         system_prompt_append: Some("Be concise.".into()),
@@ -587,8 +592,10 @@ async fn scenario_02_permission_checkpoint_forwarding_and_continued_watch() {
             profile_id: "prof_perm".into(),
             name: "Default Perm Worker".into(),
             provider: ProviderKind::ClaudeCode,
+            acp_agent_id: None,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::Default,
             when_to_use: "Needs approval".into(),
             system_prompt_append: None,
@@ -1204,8 +1211,10 @@ async fn scenario_08_cron_schedules_auto_archive_and_heartbeat_busy_skip() {
                 cwd: repo.to_string_lossy().to_string(),
                 workspace_id: None,
                 provider: ProviderKind::ClaudeCode,
+                acp_agent_id: None,
                 model: None,
                 effort: None,
+                fast_mode: false,
                 mode: SessionMode::AcceptEdits,
                 profile_id: None,
                 worktree: false,

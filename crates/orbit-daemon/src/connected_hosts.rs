@@ -20,8 +20,10 @@ use orbit_relay_transport::RelayConnector;
 use orbit_store::{OrbitStore, StoredConnectedHost};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::AbortHandle;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message as TungMsg;
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{Message as TungMsg, protocol::WebSocketConfig},
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -33,11 +35,11 @@ const E2EE_FRAME_WIRE: u8 = 0x00;
 pub enum RemoteHostEvent {
     AgentUpdated {
         host_id: String,
-        agent: AgentSummary,
+        agent: Box<AgentSummary>,
     },
     TimelineLive {
         host_id: String,
-        event: TimelineEvent,
+        event: Box<TimelineEvent>,
     },
     HostDisconnected {
         host_id: String,
@@ -398,13 +400,13 @@ impl ConnectedHostsManager {
                                     WireMessage::AgentUpdated { agent } => {
                                         let _ = self.remote_events_tx.send(RemoteHostEvent::AgentUpdated {
                                             host_id: remote_host_id.clone(),
-                                            agent,
+                                            agent: Box::new(agent),
                                         });
                                     }
                                     WireMessage::TimelineLive { event } => {
                                         let _ = self.remote_events_tx.send(RemoteHostEvent::TimelineLive {
                                             host_id: remote_host_id.clone(),
-                                            event,
+                                            event: Box::new(event),
                                         });
                                     }
                                     _ => {}
@@ -523,8 +525,13 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::GitStatusResponse { request_id, .. }
         | WireMessage::GitDiffResponse { request_id, .. }
         | WireMessage::WorkspaceFilesResponse { request_id, .. }
+        | WireMessage::WorkspaceSymbolsResponse { request_id, .. }
+        | WireMessage::WorkspaceFileContentResponse { request_id, .. }
+        | WireMessage::WorkspaceFileWritten { request_id, .. }
+        | WireMessage::WorkspaceEntryMutated { request_id, .. }
         | WireMessage::AgentsSnapshot { request_id, .. }
         | WireMessage::AgentCreated { request_id, .. }
+        | WireMessage::AgentForked { request_id, .. }
         | WireMessage::PendingPermissionsSnapshot { request_id, .. }
         | WireMessage::Ack { request_id }
         | WireMessage::TimelineCatchup { request_id, .. }
@@ -542,11 +549,53 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ConnectedHostAdded { request_id, .. }
         | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
         | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
+        | WireMessage::ManagedSkillsSnapshot { request_id, .. }
+        | WireMessage::ManagedSkillContentResponse { request_id, .. }
+        | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
         | WireMessage::ProviderSubagentsSnapshot { request_id, .. }
-        | WireMessage::ProviderSubagentTimelineCatchup { request_id, .. } => Some(*request_id),
-        WireMessage::QuotaReport { request_id, .. } | WireMessage::RpcError { request_id, .. } => {
-            *request_id
-        }
+        | WireMessage::ProviderSubagentTimelineCatchup { request_id, .. }
+        | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }
+        | WireMessage::WorktreeHandoffExecuted { request_id, .. }
+        | WireMessage::ArtifactsSnapshot { request_id, .. }
+        | WireMessage::ArtifactContent { request_id, .. }
+        | WireMessage::InstructionFilesSnapshot { request_id, .. }
+        | WireMessage::InstructionFileContentResponse { request_id, .. }
+        | WireMessage::InstructionFileSavedResponse { request_id, .. }
+        | WireMessage::ExternalMcpServersSnapshot { request_id, .. }
+        | WireMessage::ExternalMcpProbeResponse { request_id, .. }
+        | WireMessage::PathRulesSnapshot { request_id, .. }
+        | WireMessage::MatchedPathRulesResponse { request_id, .. }
+        | WireMessage::LspServersSnapshot { request_id, .. }
+        | WireMessage::LspSymbolsResponse { request_id, .. }
+        | WireMessage::LspDiagnosticsResponse { request_id, .. }
+        | WireMessage::LspLocationsResponse { request_id, .. }
+        | WireMessage::UsageInsightsResponse { request_id, .. }
+        | WireMessage::ContextOccupancyResponse { request_id, .. }
+        | WireMessage::LifecycleHooksSnapshot { request_id, .. }
+        | WireMessage::HookTestResultResponse { request_id, .. }
+        | WireMessage::ConditionalTimerCreated { request_id, .. }
+        | WireMessage::ConditionalTimersSnapshot { request_id, .. }
+        | WireMessage::ConditionalTimerUpdated { request_id, .. }
+        | WireMessage::GuardianConfigSnapshot { request_id, .. }
+        | WireMessage::GoalRunUpdated { request_id, .. }
+        | WireMessage::GoalRunsSnapshot { request_id, .. }
+        | WireMessage::MonitorWatchUpdated { request_id, .. }
+        | WireMessage::MonitorWatchesSnapshot { request_id, .. }
+        | WireMessage::EventTriggersSnapshot { request_id, .. }
+        | WireMessage::EventTriggerTestResponse { request_id, .. }
+        | WireMessage::BrowserSessionsSnapshot { request_id, .. }
+        | WireMessage::BrowserSessionUpdated { request_id, .. }
+        | WireMessage::BrowserActionResponse { request_id, .. }
+        | WireMessage::WorkflowRunUpdated { request_id, .. }
+        | WireMessage::WorkflowRunsSnapshot { request_id, .. }
+        | WireMessage::ImChannelsSnapshot { request_id, .. }
+        | WireMessage::ImChannelTestResponse { request_id, .. }
+        | WireMessage::PushDevicesSnapshot { request_id, .. }
+        | WireMessage::PushTestResponse { request_id, .. } => Some(*request_id),
+        WireMessage::QuotaReport { request_id, .. }
+        | WireMessage::ArtifactUpdated { request_id, .. }
+        | WireMessage::ArtifactDeleted { request_id, .. }
+        | WireMessage::RpcError { request_id, .. } => *request_id,
         _ => None,
     }
 }
@@ -600,7 +649,14 @@ async fn connect_direct_peer(
     mpsc::Sender<WireMessage>,
     mpsc::Receiver<WireMessage>,
 )> {
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(2), connect_async(ws_url)).await??;
+    let mut ws_cfg = WebSocketConfig::default();
+    ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+    ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_async_with_config(ws_url, Some(ws_cfg), false),
+    )
+    .await??;
     let (mut sink, mut stream) = ws.split();
 
     let hello = WireMessage::Hello {
@@ -955,6 +1011,235 @@ mod tests {
         assert_eq!(
             compare_semver_triplet("0.8.0-rc.1", "0.7.9"),
             std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_agent_forked() {
+        let req_id = Uuid::new_v4();
+        let now = Utc::now();
+        let msg = WireMessage::AgentForked {
+            request_id: req_id,
+            agent: orbit_protocol::AgentSummary {
+                agent_id: "ag_fork".into(),
+                workspace_id: "ws_1".into(),
+                cwd: "/tmp/repo".into(),
+                title: "Forked".into(),
+                provider: orbit_protocol::ProviderKind::ClaudeCode,
+                model: None,
+                effort: None,
+                fast_mode: false,
+                mode: orbit_protocol::SessionMode::Default,
+                status: orbit_protocol::AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 2,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: orbit_protocol::AttentionState::None,
+                last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
+                read_seq: 2,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: Some("ag_src".into()),
+                forked_at_seq: Some(2),
+                acp_agent_id: None,
+            },
+            workspace: None,
+        };
+        assert_eq!(extract_response_request_id(&msg), Some(req_id));
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_workspace_file_responses() {
+        let req_id = Uuid::new_v4();
+        let read_resp = WireMessage::WorkspaceFileContentResponse {
+            request_id: req_id,
+            cwd: "/tmp/repo".into(),
+            path: "a.rs".into(),
+            resolved_path: "/tmp/repo/a.rs".into(),
+            content_kind: "text".into(),
+            mime_type: Some("text/plain".into()),
+            content: "fn main() {}\n".into(),
+            size_bytes: 13,
+            truncated: false,
+            etag: Some("abc".into()),
+            mtime_unix_ms: Some(1),
+            writable: true,
+            line_ending: Some("lf".into()),
+        };
+        let write_resp = WireMessage::WorkspaceFileWritten {
+            request_id: req_id,
+            cwd: "/tmp/repo".into(),
+            path: "a.rs".into(),
+            etag: "def".into(),
+            size_bytes: 14,
+            mtime_unix_ms: Some(2),
+            conflict: None,
+        };
+        let mutate_resp = WireMessage::WorkspaceEntryMutated {
+            request_id: req_id,
+            cwd: "/tmp/repo".into(),
+            path: "a.rs".into(),
+            new_path: Some("b.rs".into()),
+            action: "renamed".into(),
+        };
+        assert_eq!(extract_response_request_id(&read_resp), Some(req_id));
+        assert_eq!(extract_response_request_id(&write_resp), Some(req_id));
+        assert_eq!(extract_response_request_id(&mutate_resp), Some(req_id));
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_external_mcp_responses() {
+        let req_id = Uuid::new_v4();
+        let snap = WireMessage::ExternalMcpServersSnapshot {
+            request_id: req_id,
+            servers: Vec::new(),
+        };
+        let probe = WireMessage::ExternalMcpProbeResponse {
+            request_id: req_id,
+            server_id: "orbit_user:github".into(),
+            result: orbit_protocol::McpProbeResult {
+                ok: true,
+                server_name: Some("github".into()),
+                server_version: Some("1.0.0".into()),
+                protocol_version: Some("2025-03-26".into()),
+                tools: Vec::new(),
+                latency_ms: 12,
+                error: None,
+                probed_at_ms: 1_760_000_000_000,
+            },
+        };
+        assert_eq!(extract_response_request_id(&snap), Some(req_id));
+        assert_eq!(extract_response_request_id(&probe), Some(req_id));
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_conditional_timer_responses() {
+        let req_id = Uuid::new_v4();
+        let rec = orbit_protocol::ConditionalTimerRecord {
+            timer_id: "tmr_1".into(),
+            agent_id: "ag_1".into(),
+            workspace_id: "ws_1".into(),
+            prompt: "Ping".into(),
+            duration_seconds: 60,
+            condition: orbit_protocol::TimerCondition::AnyMessage,
+            state: orbit_protocol::ConditionalTimerState::Armed,
+            created_at_ms: 1,
+            fire_at_ms: 61_000,
+            resolved_at_ms: None,
+            resolved_reason: None,
+        };
+        assert_eq!(
+            extract_response_request_id(&WireMessage::ConditionalTimerCreated {
+                request_id: req_id,
+                timer: rec.clone(),
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::ConditionalTimersSnapshot {
+                request_id: req_id,
+                timers: vec![rec.clone()],
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::ConditionalTimerUpdated {
+                request_id: req_id,
+                timer: rec,
+            }),
+            Some(req_id)
+        );
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_browser_responses() {
+        let req_id = Uuid::new_v4();
+        let sess = orbit_protocol::BrowserSessionSummary {
+            session_id: "br_1".into(),
+            agent_id: Some("ag_1".into()),
+            url: "http://localhost:3000".into(),
+            title: "App".into(),
+            viewport_width: 1280,
+            viewport_height: 800,
+            headless: true,
+            element_count: 1,
+            console_errors: Vec::new(),
+            recent_actions: Vec::new(),
+            last_screenshot_base64: None,
+            updated_at_ms: 1,
+        };
+        assert_eq!(
+            extract_response_request_id(&WireMessage::BrowserSessionsSnapshot {
+                request_id: req_id,
+                sessions: vec![sess.clone()],
+                policy: orbit_protocol::BrowserPolicyConfig::default(),
+                chrome_binary: None,
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::BrowserSessionUpdated {
+                request_id: req_id,
+                session: sess.clone(),
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::BrowserActionResponse {
+                request_id: req_id,
+                session: sess,
+                elements: Vec::new(),
+                screenshot_base64: None,
+                text_excerpt: None,
+                captcha_detected: false,
+            }),
+            Some(req_id)
+        );
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_workflow_responses() {
+        let req_id = Uuid::new_v4();
+        let run = orbit_protocol::WorkflowRunRecord {
+            run_id: "wf_1".into(),
+            name: "Batch".into(),
+            kind: orbit_protocol::WorkflowKind::BatchCsv,
+            workspace_cwd: "/tmp/repo".into(),
+            owner_agent_id: None,
+            status: orbit_protocol::WorkflowRunStatus::Running,
+            max_concurrency: 2,
+            verify_command: None,
+            winner_step_id: None,
+            steps: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            finished_at_ms: None,
+        };
+        assert_eq!(
+            extract_response_request_id(&WireMessage::WorkflowRunUpdated {
+                request_id: req_id,
+                run: run.clone(),
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::WorkflowRunsSnapshot {
+                request_id: req_id,
+                runs: vec![run],
+            }),
+            Some(req_id)
         );
     }
 }

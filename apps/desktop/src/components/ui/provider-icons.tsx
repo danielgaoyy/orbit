@@ -97,5 +97,213 @@ export const ProviderIcon = memo(function ProviderIcon({
         </svg>
       );
     }
+
+    case "opencode":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <path
+            fill="currentColor"
+            fillRule="evenodd"
+            clipRule="evenodd"
+            d="M4 4.5A1.5 1.5 0 0 1 5.5 3h13A1.5 1.5 0 0 1 20 4.5v15a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19.5v-15Zm3 1.5v12h10V6H7Z"
+          />
+          <rect x="9.5" y="10" width="5" height="5.5" rx="0.75" fill="currentColor" opacity="0.55" />
+        </svg>
+      );
+
+    case "gemini_cli": {
+      const gradId = `gemini_grad_${uid}`;
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <path
+            fill={`url(#${gradId})`}
+            d="M12 2c.6 5.2 4.8 9.4 10 10-5.2.6-9.4 4.8-10 10-.6-5.2-4.8-9.4-10-10 5.2-.6 9.4-4.8 10-10Z"
+          />
+          <defs>
+            <linearGradient id={gradId} x1="3" y1="3" x2="21" y2="21" gradientUnits="userSpaceOnUse">
+              <stop stopColor="#4E8CFF" />
+              <stop offset="1" stopColor="#8B7BFF" />
+            </linearGradient>
+          </defs>
+        </svg>
+      );
+    }
+
+    case "cursor_agent":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <path fill="currentColor" opacity="0.35" d="M12 2.2 20.5 7.1v9.8L12 21.8 3.5 16.9V7.1L12 2.2Z" />
+          <path fill="currentColor" d="M12 2.2 20.5 7.1 12 12 3.5 7.1 12 2.2Z" />
+          <path fill="currentColor" opacity="0.72" d="M12 12v9.8l8.5-4.9V7.1L12 12Z" />
+        </svg>
+      );
+
+    case "copilot":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <path
+            fill="currentColor"
+            fillRule="evenodd"
+            clipRule="evenodd"
+            d="M7.5 6.2C9 5.4 10.5 5 12 5s3 .4 4.5 1.2c2.1 1.1 3.7 3.1 4.2 5.4l.7 3.1a2 2 0 0 1-1.9 2.4h-1.8a3.2 3.2 0 0 1-2.8 1.9H9.1a3.2 3.2 0 0 1-2.8-1.9H4.5a2 2 0 0 1-1.9-2.4l.7-3.1c.5-2.3 2.1-4.3 4.2-5.4ZM7.8 11a2.2 2.2 0 0 0-2.1 1.7l-.3 1.4A1.5 1.5 0 0 0 6.9 16h10.2a1.5 1.5 0 0 0 1.5-1.9l-.3-1.4A2.2 2.2 0 0 0 16.2 11H7.8Z"
+          />
+          <rect x="8.6" y="12.4" width="1.8" height="2.4" rx="0.9" fill="currentColor" />
+          <rect x="13.6" y="12.4" width="1.8" height="2.4" rx="0.9" fill="currentColor" />
+        </svg>
+      );
+
+    case "goose":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <path
+            fill="currentColor"
+            d="M15.6 4.2a3.4 3.4 0 0 1 3.3 2.7l2.1.7-2.2 1.2a5.8 5.8 0 0 1-3 3.7l-1.3.7c.7 2.2-.3 4.8-2.6 5.9L5 20.4l3.5-4.1c-2.5-.8-4.1-3.3-3.7-6 .5-3.2 3.5-5.3 6.7-4.8l1.2.2c.6-.9 1.7-1.5 2.9-1.5Z"
+          />
+        </svg>
+      );
+
+    case "pi":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <path
+            fill="currentColor"
+            d="M4.5 7.2c0-.7.6-1.2 1.2-1.2h12.6a1.2 1.2 0 1 1 0 2.4h-2v7.2c0 .9.4 1.3 1.1 1.3.4 0 .7-.1 1-.3a1 1 0 0 1 1.1 1.6c-.7.5-1.6.8-2.6.8-1.9 0-3.1-1.2-3.1-3.3V8.4h-3.6v6.5c0 2.1-.9 3.6-2.5 4.4a1.2 1.2 0 0 1-1.1-2.1c.8-.4 1.2-1.1 1.2-2.3V8.4H5.7c-.6 0-1.2-.5-1.2-1.2Z"
+          />
+        </svg>
+      );
+
+    case "kimi":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <path
+            fill="currentColor"
+            d="M6.2 4.5a1.3 1.3 0 0 1 2.6 0v6.2l6.1-6.2a1.3 1.3 0 1 1 1.9 1.8l-5.3 5.4 5.7 6.5a1.3 1.3 0 1 1-2 1.7l-6.4-7.3v6.9a1.3 1.3 0 1 1-2.6 0v-15Z"
+          />
+          <circle cx="18.2" cy="5.2" r="1.6" fill="currentColor" opacity="0.6" />
+        </svg>
+      );
+
+    case "cline":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <rect
+            x="2.8"
+            y="4.2"
+            width="18.4"
+            height="15.6"
+            rx="3.2"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+          />
+          <path
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="m7.5 9.5 3 2.5-3 2.5M12.5 14.5h4"
+          />
+        </svg>
+      );
+
+    case "mistral_vibe":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <rect x="3" y="4" width="3.6" height="3.2" fill="#F59E0B" />
+          <rect x="17.4" y="4" width="3.6" height="3.2" fill="#F59E0B" />
+          <rect x="3" y="7.6" width="7.2" height="3.2" fill="#F97316" />
+          <rect x="13.8" y="7.6" width="7.2" height="3.2" fill="#F97316" />
+          <rect x="3" y="11.2" width="18" height="3.2" fill="#EA580C" />
+          <rect x="3" y="14.8" width="3.6" height="4.8" fill="#C2410C" />
+          <rect x="10.2" y="14.8" width="3.6" height="4.8" fill="#C2410C" />
+          <rect x="17.4" y="14.8" width="3.6" height="4.8" fill="#C2410C" />
+        </svg>
+      );
+
+    case "augment":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", className)}
+        >
+          <path
+            fill="currentColor"
+            d="M12 3.2 20.2 19.5h-3.4l-1.8-3.7H9l-1.8 3.7H3.8L12 3.2Zm0 5.5-1.9 4.3h3.8L12 8.7Z"
+          />
+        </svg>
+      );
+
+    case "acp":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0 text-foreground/80", className)}
+        >
+          <path
+            d="M12 2.5L20.2 7.25V16.75L12 21.5L3.8 16.75V7.25L12 2.5Z"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinejoin="round"
+          />
+          <circle cx="12" cy="12" r="2.6" fill="currentColor" />
+          <path
+            d="M12 5.4V9.2M17.5 15.2L14.3 13.3M6.5 15.2L9.7 13.3"
+            stroke="currentColor"
+            strokeWidth="1.7"
+            strokeLinecap="round"
+          />
+        </svg>
+      );
   }
 });

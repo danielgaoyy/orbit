@@ -45,6 +45,8 @@ export struct HostSettingsSheet {
   @Local portDraft: string = '6868';
   @Local directEndpointDraft: string = '';
   @Local relayUrlDraft: string = '';
+  @Local cloudTokenDraft: string = '';
+  @Local cloudPassphraseDraft: string = '';
   @Local appearanceItems: SegmentButtonV2Items = new SegmentButtonV2Items([
     { text: 'System' },
     { text: 'Light' },
@@ -160,9 +162,51 @@ export struct HostSettingsSheet {
   }
 
   aboutToAppear(): void {
+    this.store.refreshCloudSyncStatus();
+    this.store.probeNotificationPermission();
     if (this.store.selectedHostId.length > 0) {
       this.store.refreshActiveQuotas();
     }
+  }
+
+  private cloudSyncSummaryLabel(): string {
+    const st = this.store.cloudSyncStatus;
+    if (st === null || st.state === 'signed_out') {
+      return 'Not connected';
+    }
+    if (st.state === 'locked') {
+      return st.account_login !== null ? `@${st.account_login} · Locked` : 'Locked';
+    }
+    if (st.state === 'syncing') {
+      return 'Syncing…';
+    }
+    if (st.state === 'error') {
+      return 'Sync error';
+    }
+    const login = st.account_login !== null ? `@${st.account_login}` : 'Connected';
+    return `${login} · Rev ${st.last_vault_revision}`;
+  }
+
+  private confirmDisconnectCloudSync(): void {
+    this.getUIContext().showAlertDialog({
+      title: 'Disconnect Cloud Sync?',
+      message: 'Your encrypted GitHub Gist vault remains intact, and local hosts are preserved.',
+      autoCancel: true,
+      primaryButton: {
+        value: 'Cancel',
+        fontColor: this.store.palette.fgSecondary,
+        action: () => {
+          // Dismissed
+        }
+      },
+      secondaryButton: {
+        value: 'Disconnect',
+        fontColor: this.store.palette.statusDanger,
+        action: () => {
+          this.store.cloudSyncDisconnect(false);
+        }
+      }
+    });
   }
 
   @Builder
@@ -480,7 +524,106 @@ export struct HostSettingsSheet {
         })
       }
 
-      // 4. About
+      // 4. Cloud Sync (GitHub Gist E2EE) & Push Notifications
+      ListItem() {
+        OrbitSectionHeader({ title: 'Sync & Alerts' })
+      }
+
+      ListItemGroup() {
+        ListItem() {
+          Button({ type: ButtonType.Normal, stateEffect: true }) {
+            Row({ space: 10 }) {
+              Row() {
+                SymbolGlyph($r('sys.symbol.cloud'))
+                  .fontSize(16)
+                  .fontColor([this.store.palette.iconPrimary])
+              }
+              .width(20)
+              .justifyContent(FlexAlign.Center)
+
+              Column({ space: 2 }) {
+                Text('Cloud Sync (E2EE)')
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+                Text(this.cloudSyncSummaryLabel())
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(13)
+                .fontColor([this.store.palette.fgMuted])
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+          }
+          .width('100%')
+          .constraintSize({ minHeight: 56 })
+          .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 8, bottom: 8 })
+          .backgroundColor(Color.Transparent)
+          .onClick(() => {
+            this.store.refreshCloudSyncStatus();
+            this.navPathStack.pushPathByName('cloud_sync', null);
+            this.store.triggerHaptic(6);
+          })
+        }
+
+        ListItem() {
+          Button({ type: ButtonType.Normal, stateEffect: true }) {
+            Row({ space: 10 }) {
+              Row() {
+                SymbolGlyph($r('sys.symbol.bell'))
+                  .fontSize(16)
+                  .fontColor([this.store.palette.iconPrimary])
+              }
+              .width(20)
+              .justifyContent(FlexAlign.Center)
+
+              Column({ space: 2 }) {
+                Text('Push Kit & Notifications')
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+                Text(
+                  this.store.pushToken.length > 0
+                    ? `Token ${this.store.pushToken.substring(0, 12)}…`
+                    : (this.store.pushStatusMessage.length > 0
+                      ? this.store.pushStatusMessage
+                      : 'Tap to register Push Kit token')
+                )
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              Text(this.store.notificationsEnabled ? 'Enabled' : 'Enable')
+                .attributeModifier(orbitTextMeta(this.store.palette.accentPrimary, FontWeight.Medium))
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+          }
+          .width('100%')
+          .constraintSize({ minHeight: 56 })
+          .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 8, bottom: 8 })
+          .backgroundColor(Color.Transparent)
+          .onClick(() => {
+            this.store.configurePushAndNotifications(this.getUIContext().getHostContext());
+          })
+        }
+      }
+      .backgroundColor(this.store.palette.listCard)
+      .borderRadius(OrbitTokens.RADIUS_LG)
+      .clip(true)
+      .divider({
+        strokeWidth: OrbitTokens.HAIRLINE,
+        color: this.store.palette.hairline,
+        startMargin: 46,
+        endMargin: OrbitTokens.SPACE_LG
+      })
+
+      // 5. About
       ListItem() {
         OrbitSectionHeader({ title: 'About' })
       }
@@ -1031,11 +1174,243 @@ export struct HostSettingsSheet {
   }
 
   @Builder
+  private renderCloudSyncDestination() {
+    NavDestination() {
+      List({ space: OrbitTokens.SPACE_MD }) {
+        ListItem() {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              Text('Status')
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+              Blank()
+              Text(this.cloudSyncSummaryLabel())
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+            }
+            .width('100%')
+
+            if (this.store.cloudSyncStatus !== null && this.store.cloudSyncStatus.state === 'ready') {
+              Row({ space: OrbitTokens.SPACE_SM }) {
+                Text('Synced Fleet')
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+                Blank()
+                Text(
+                  `${this.store.cloudSyncStatus.synced_host_count} hosts · ${this.store.cloudSyncStatus.synced_project_count} projects`
+                )
+                  .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+              }
+              .width('100%')
+
+              Row() {
+                Text('Auto-Sync')
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+                  .layoutWeight(1)
+                Toggle({
+                  type: ToggleType.Switch,
+                  isOn: this.store.cloudSyncStatus.auto_sync_enabled
+                })
+                  .onChange((isOn: boolean) => {
+                    this.store.cloudSyncSetAutoSync(isOn);
+                  })
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
+            }
+
+            if (
+              this.store.cloudSyncStatus !== null &&
+              this.store.cloudSyncStatus.last_error !== null &&
+              this.store.cloudSyncStatus.last_error.length > 0
+            ) {
+              Text(this.store.cloudSyncStatus.last_error)
+                .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
+                .width('100%')
+            }
+          }
+          .width('100%')
+          .padding(OrbitTokens.SPACE_LG)
+          .backgroundColor(this.store.palette.listCard)
+          .borderRadius(OrbitTokens.RADIUS_LG)
+          .alignItems(HorizontalAlign.Start)
+        }
+
+        if (this.store.cloudSyncStatus === null || this.store.cloudSyncStatus.state === 'signed_out') {
+          ListItem() {
+            Column({ space: OrbitTokens.SPACE_SM }) {
+              Text('GitHub Personal Access Token')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
+              Text('Requires gist scope. Vault payloads are compressed and AES-256-GCM encrypted locally before upload.')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+              TextInput({ placeholder: 'ghp_…', text: this.cloudTokenDraft })
+                .type(InputType.Password)
+                .attributeModifier(
+                  orbitInputMono(
+                    this.store.palette.fgPrimary,
+                    this.store.palette.fgMuted,
+                    this.store.palette.subtleSurface
+                  )
+                )
+                .height(42)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+                .width('100%')
+                .onChange((val: string) => {
+                  this.cloudTokenDraft = val;
+                })
+
+              Button(this.store.cloudSyncBusy ? 'Connecting…' : 'Connect GitHub', {
+                type: ButtonType.Normal,
+                stateEffect: true
+              })
+                .attributeModifier(
+                  orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+                )
+                .width('100%')
+                .height(OrbitTokens.HIT_MIN)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .enabled(!this.store.cloudSyncBusy && this.cloudTokenDraft.trim().length > 0)
+                .onClick(() => {
+                  dismissHarmonyKeyboard(this.getUIContext());
+                  const tokenVal = this.cloudTokenDraft;
+                  this.store.cloudSyncLoginWithToken(tokenVal).then((ok: boolean) => {
+                    if (ok) {
+                      this.cloudTokenDraft = '';
+                    }
+                  });
+                })
+            }
+            .width('100%')
+            .padding(OrbitTokens.SPACE_LG)
+            .backgroundColor(this.store.palette.listCard)
+            .borderRadius(OrbitTokens.RADIUS_LG)
+            .alignItems(HorizontalAlign.Start)
+          }
+        } else if (this.store.cloudSyncStatus.state === 'locked') {
+          ListItem() {
+            Column({ space: OrbitTokens.SPACE_SM }) {
+              Row() {
+                Text('Vault Passphrase')
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
+                  .layoutWeight(1)
+                Button('Generate', { type: ButtonType.Capsule, stateEffect: true })
+                  .attributeModifier(
+                    orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.subtleSurface)
+                  )
+                  .height(30)
+                  .padding({ left: 10, right: 10 })
+                  .onClick(() => {
+                    const generated = this.store.generateCloudSyncPassphrase();
+                    if (generated.length > 0) {
+                      this.cloudPassphraseDraft = generated;
+                      this.store.copyToClipboard(generated, 'Generated & copied passphrase');
+                    }
+                  })
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
+
+              TextInput({ placeholder: 'Enter E2EE passphrase', text: this.cloudPassphraseDraft })
+                .attributeModifier(
+                  orbitInputMono(
+                    this.store.palette.fgPrimary,
+                    this.store.palette.fgMuted,
+                    this.store.palette.subtleSurface
+                  )
+                )
+                .height(42)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+                .width('100%')
+                .onChange((val: string) => {
+                  this.cloudPassphraseDraft = val;
+                })
+
+              Button(this.store.cloudSyncBusy ? 'Unlocking…' : 'Unlock & Sync', {
+                type: ButtonType.Normal,
+                stateEffect: true
+              })
+                .attributeModifier(
+                  orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+                )
+                .width('100%')
+                .height(OrbitTokens.HIT_MIN)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .enabled(!this.store.cloudSyncBusy && this.cloudPassphraseDraft.trim().length > 0)
+                .onClick(() => {
+                  dismissHarmonyKeyboard(this.getUIContext());
+                  const passVal = this.cloudPassphraseDraft;
+                  this.store.cloudSyncUnlockWithPassphrase(passVal).then((ok: boolean) => {
+                    if (ok) {
+                      this.cloudPassphraseDraft = '';
+                    }
+                  });
+                })
+            }
+            .width('100%')
+            .padding(OrbitTokens.SPACE_LG)
+            .backgroundColor(this.store.palette.listCard)
+            .borderRadius(OrbitTokens.RADIUS_LG)
+            .alignItems(HorizontalAlign.Start)
+          }
+        } else {
+          ListItem() {
+            Button(this.store.cloudSyncBusy ? 'Syncing…' : 'Sync Now', {
+              type: ButtonType.Normal,
+              stateEffect: true
+            })
+              .attributeModifier(
+                orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+              )
+              .width('100%')
+              .height(OrbitTokens.HIT_MIN)
+              .borderRadius(OrbitTokens.RADIUS_LG)
+              .enabled(!this.store.cloudSyncBusy)
+              .onClick(() => {
+                this.store.cloudSyncNow();
+              })
+          }
+        }
+
+        if (this.store.cloudSyncStatus !== null && this.store.cloudSyncStatus.state !== 'signed_out') {
+          ListItem() {
+            Button('Disconnect Cloud Sync', { type: ButtonType.Normal, stateEffect: true })
+              .attributeModifier(orbitButtonSubhead(this.store.palette.statusDanger, this.store.palette.listCard))
+              .width('100%')
+              .height(OrbitTokens.HIT_MIN)
+              .borderRadius(OrbitTokens.RADIUS_LG)
+              .onClick(() => {
+                this.confirmDisconnectCloudSync();
+              })
+          }
+        }
+      }
+      .width('100%')
+      .height('100%')
+      .padding({
+        left: OrbitTokens.SPACE_LG,
+        right: OrbitTokens.SPACE_LG,
+        top: OrbitTokens.SPACE_MD,
+        bottom: this.store.keyboardHeightVp > 0
+          ? OrbitTokens.SPACE_MD
+          : Math.max(OrbitTokens.SPACE_XL, this.store.safeBottomVp)
+      })
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring)
+      .onScrollStart(() => {
+        dismissHarmonyKeyboard(this.getUIContext());
+      })
+    }
+    .title('Cloud Sync')
+    .backgroundColor(this.store.palette.drawer)
+  }
+
+  @Builder
   private buildNavDestination(name: string, _param: Object | null) {
     if (name === 'host_detail' && this.inspectedHost !== null) {
       this.renderHostDetailDestination(this.inspectedHost)
     } else if (name === 'pair_host') {
       this.renderPairHostDestination()
+    } else if (name === 'cloud_sync') {
+      this.renderCloudSyncDestination()
     }
   }
 

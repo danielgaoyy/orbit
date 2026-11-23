@@ -3,6 +3,10 @@ import { PanelLeft, PanelRight } from "lucide-react";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/command/command-palette";
 import { MarkdownThemeProvider } from "@/components/markdown-blocks";
+import { CopyCodeBlocksModal } from "@/components/modals/copy-code-blocks-modal";
+import { ExportTranscriptModal } from "@/components/modals/export-transcript-modal";
+import { WorktreeHandoffModal } from "@/components/modals/worktree-handoff-modal";
+import { MediaPreviewModal } from "@/components/viewers/media-preview-modal";
 import { ConnectionStatusBanner } from "@/components/layout/connection-status-banner";
 import { TopBar } from "@/components/layout/top-bar";
 import { SettingsView } from "@/components/settings/settings-view";
@@ -174,10 +178,14 @@ export default function App() {
           <WorkspaceShellLayout isSettingsOpen={isSettingsOpen} workspacePanel={workspacePanel} />
         </WorkspaceMotionProvider>
 
-        {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`) & Remote Folder Browser */}
+        {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`), Export & Code Picker */}
         <CommandPalette />
         <QuickOpenFileDialog />
         <RemoteFolderPickerDialog />
+        <ExportTranscriptModal />
+        <CopyCodeBlocksModal />
+        <WorktreeHandoffModal />
+        <MediaPreviewModal />
 
         {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit & Undo Archive */}
         {renderedToast && (

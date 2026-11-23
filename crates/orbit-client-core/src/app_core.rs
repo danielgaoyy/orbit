@@ -14,16 +14,25 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, AgentProfile, AgentStatus, AgentSummary, AttentionState,
-    BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot,
-    HostProjectEntry, HostSyncState, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
+    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
+    AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
+    BackgroundTaskInfo, BrowserPolicyConfig, BrowserSessionSummary, ConditionalTimerRecord,
+    ConditionalTimerState, ConnectedHostSummary, ContextOccupancyBreakdown, DirectoryEntry,
+    DiscoveredProject, EventTriggerDelivery, ExternalMcpServerRecord, GitStatusSnapshot,
+    GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
+    HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform,
+    ImThreadBinding, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation,
+    LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption,
+    MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
     PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord, ScheduleSpec,
-    ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
-    TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceBoardSnapshot,
-    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
-    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
+    PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem, QueuedPromptView,
+    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
+    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload,
+    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
+    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
+    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
+    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -39,6 +48,21 @@ use crate::cloud_sync::{
     push_vault_payload, resolve_github_client_id, save_sync_config_to_store,
     save_sync_meta_to_store, save_sync_prefs_to_store, stored_host_from_synced,
     unlock_remote_vault_with_passphrase,
+};
+pub use crate::contract::{
+    BrowserActionResponseView, BrowserSessionsSnapshotView, CancelWorkflowRunRequest,
+    ControlGoalRunRequest, ConversationSearchHit, CreateBrowserSessionRequest,
+    CreateWorkspaceEntryRequest, DeletePathRuleRequest, DeleteWorkspaceEntryRequest,
+    EventTriggersSnapshotView, ExecuteBrowserActionRequest, ExecuteWorktreeHandoffRequest,
+    ForkAgentRequest, ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
+    InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
+    MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
+    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
+    SaveInstructionFileRequest, SelectBestOfNWinnerRequest, StartBatchFanoutRequest,
+    StartBestOfNRequest, StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
+    StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
+    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
+    WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
@@ -178,6 +202,8 @@ pub struct AgentCardView {
     pub provider_label: String,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub mode: SessionMode,
     pub status: AgentStatus,
     pub status_label: String,
@@ -220,6 +246,12 @@ pub struct AgentCardView {
     pub worktree_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_at_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_agent_id: Option<String>,
 }
 
 pub struct CreateAgentRequest<'a> {
@@ -227,8 +259,10 @@ pub struct CreateAgentRequest<'a> {
     pub cwd: &'a str,
     pub extra_dirs: Vec<String>,
     pub provider: ProviderKind,
+    pub acp_agent_id: Option<String>,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
+    pub fast_mode: Option<bool>,
     pub mode: SessionMode,
     pub initial_prompt: &'a str,
     pub initial_display_prompt: Option<String>,
@@ -237,6 +271,39 @@ pub struct CreateAgentRequest<'a> {
     pub workspace_id: Option<&'a str>,
     pub handle: Option<String>,
     pub auto_cluster: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedSkillContentView {
+    pub skill_id: String,
+    pub content: String,
+    pub etag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertManagedSkillRequest {
+    pub host_id: String,
+    pub scope: SkillWriteScope,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub expected_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportManagedSkillRequest {
+    pub host_id: String,
+    pub scope: SkillWriteScope,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub source_markdown_or_path: String,
+    #[serde(default)]
+    pub slug_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,11 +328,17 @@ pub struct HostDetailView {
     #[serde(default)]
     pub schedules: Vec<ScheduleSpec>,
     #[serde(default)]
+    pub conditional_timers: Vec<ConditionalTimerRecord>,
+    #[serde(default)]
     pub connected_hosts: Vec<ConnectedHostSummary>,
     #[serde(default)]
     pub orchestration_config: OrchestrationConfig,
     #[serde(default)]
     pub orchestration_skills: Vec<OrchestrationSkillInfo>,
+    #[serde(default)]
+    pub managed_skills: Vec<ManagedSkillRecord>,
+    #[serde(default)]
+    pub keep_awake_status: Option<KeepAwakeStatus>,
     #[serde(default)]
     pub workspace_scripts: HashMap<String, Vec<WorkspaceScriptInfo>>,
     #[serde(default)]
@@ -282,6 +355,16 @@ pub struct HostDetailView {
     pub workspace_organize_status: HashMap<String, WorkspaceOrganizeEvent>,
     #[serde(default)]
     pub host_sync_state: HostSyncState,
+    #[serde(default)]
+    pub acp_agents: Vec<AcpAgentAvailability>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactSummary>,
+    #[serde(default)]
+    pub goal_runs: Vec<GoalRunRecord>,
+    #[serde(default)]
+    pub monitor_watches: Vec<MonitorWatchRecord>,
+    #[serde(default)]
+    pub workflow_runs: Vec<WorkflowRunRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +417,8 @@ pub enum TimelineItemView {
         detail: ToolCallDetail,
         allowed_decisions: Vec<String>,
         resolved_decision: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guardian_assessment: Option<GuardianAssessment>,
         #[serde(default)]
         timestamp_ms: Option<i64>,
     },
@@ -371,6 +456,142 @@ pub enum TimelineItemView {
         #[serde(default)]
         timestamp_ms: Option<i64>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardianConfigSnapshotView {
+    pub config: GuardianPolicyConfig,
+    pub recent_audits: Vec<GuardianAuditEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImChannelsSnapshotView {
+    pub channels: Vec<ImChannelRecord>,
+    pub bindings: Vec<ImThreadBinding>,
+    pub base_webhook_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImChannelTestResultView {
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UpsertImChannelRequest {
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    pub name: String,
+    pub platform: ImPlatform,
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub primary_secret: Option<String>,
+    #[serde(default)]
+    pub signing_secret: Option<String>,
+    #[serde(default = "default_keep_existing_secrets")]
+    pub keep_existing_secrets: bool,
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<String>,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+    pub default_workspace_cwd: String,
+    pub default_provider: ProviderKind,
+    pub default_mode: SessionMode,
+    #[serde(default = "default_keep_existing_secrets")]
+    pub forward_approvals: bool,
+}
+
+impl std::fmt::Debug for UpsertImChannelRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpsertImChannelRequest")
+            .field("channel_id", &self.channel_id)
+            .field("name", &self.name)
+            .field("platform", &self.platform)
+            .field("enabled", &self.enabled)
+            .field("app_id", &self.app_id)
+            .field(
+                "primary_secret",
+                &self.primary_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "signing_secret",
+                &self.signing_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("keep_existing_secrets", &self.keep_existing_secrets)
+            .field("allowed_chat_ids", &self.allowed_chat_ids)
+            .field("allowed_user_ids", &self.allowed_user_ids)
+            .field("default_workspace_cwd", &self.default_workspace_cwd)
+            .field("default_provider", &self.default_provider)
+            .field("default_mode", &self.default_mode)
+            .field("forward_approvals", &self.forward_approvals)
+            .finish()
+    }
+}
+
+fn default_keep_existing_secrets() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushDevicesSnapshotView {
+    pub devices: Vec<PushDeviceRecord>,
+    pub preferences: PushPreferences,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushTestResultView {
+    pub attempted: u32,
+    pub delivered: u32,
+    pub detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RegisterPushDeviceRequest {
+    pub device_id: String,
+    pub platform: PushPlatform,
+    pub device_name: String,
+    pub device_token: String,
+    #[serde(default)]
+    pub sandbox: bool,
+}
+
+impl std::fmt::Debug for RegisterPushDeviceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterPushDeviceRequest")
+            .field("device_id", &self.device_id)
+            .field("platform", &self.platform)
+            .field("device_name", &self.device_name)
+            .field("device_token", &"[REDACTED]")
+            .field("sandbox", &self.sandbox)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UpdatePushPreferencesRequest {
+    pub preferences: PushPreferences,
+    #[serde(default)]
+    pub gateway_auth_token: Option<String>,
+    #[serde(default = "default_keep_existing_secrets")]
+    pub keep_existing_gateway_token: bool,
+}
+
+impl std::fmt::Debug for UpdatePushPreferencesRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdatePushPreferencesRequest")
+            .field("preferences", &self.preferences)
+            .field(
+                "gateway_auth_token",
+                &self.gateway_auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "keep_existing_gateway_token",
+                &self.keep_existing_gateway_token,
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,12 +643,20 @@ pub struct WorkspaceFileView {
     pub path: String,
     pub resolved_path: String,
     pub language: String,
-    /// `"text"` | `"image"` | `"binary"`
+    /// `"text"` | `"image"` | `"pdf"` | `"audio"` | `"video"` | `"binary"`
     pub content_kind: String,
     pub mime_type: Option<String>,
     pub content: String,
     pub size_bytes: u64,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub writable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_ending: Option<String>,
     pub highlighted_lines: Vec<HighlightedLineView>,
     pub markdown_blocks: Vec<RichBlockView>,
 }
@@ -468,6 +697,10 @@ struct RawFileReadResponse {
     content: String,
     size_bytes: u64,
     truncated: bool,
+    etag: Option<String>,
+    mtime_unix_ms: Option<i64>,
+    writable: bool,
+    line_ending: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +737,19 @@ struct CachedAgentStage {
     latest_seq: u64,
 }
 
+type PendingArtifactListEntry = (
+    bool,
+    tokio::sync::oneshot::Sender<Result<Vec<ArtifactSummary>, String>>,
+);
+
+type PendingManagedSkillsListEntry = (
+    Option<String>,
+    tokio::sync::oneshot::Sender<Result<Vec<ManagedSkillRecord>, String>>,
+);
+
+type PendingSymbolSearchTx =
+    tokio::sync::oneshot::Sender<Result<(Vec<orbit_protocol::WorkspaceSymbolEntry>, bool), String>>;
+
 struct HostMemoryState {
     profile: SavedHostProfile,
     is_local: bool,
@@ -528,14 +774,112 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AttachmentStageAck, String>>>,
     pending_file_reads:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RawFileReadResponse, String>>>,
+    pending_symbol_searches: HashMap<Uuid, PendingSymbolSearchTx>,
+    pending_file_writes:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorkspaceFileWriteResultView, String>>>,
+    pending_file_mutations: HashMap<
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<WorkspaceEntryMutationResultView, String>>,
+    >,
+    pending_instruction_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<InstructionFilesSnapshotView, String>>>,
+    pending_instruction_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<InstructionFileContentView, String>>>,
+    pending_instruction_saves:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<InstructionFileSavedView, String>>>,
     pending_side_questions:
         HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>>,
     pending_rewinds:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RewindAgentResultView, String>>>,
+    pending_forks: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ForkAgentResultView, String>>>,
+    pending_handoff_previews:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorktreeHandoffPreview, String>>>,
+    pending_handoff_executes:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorktreeHandoffOutcome, String>>>,
     pending_daemon_upgrades: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<(), String>>>,
     pending_upgrade_terminals: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     pending_git_repo_inspections:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GitReposInspectionView, String>>>,
+    pending_acp_probes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AcpProbeResult, String>>>,
+    pending_acp_snapshots: HashMap<
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<crate::contract::AcpRegistryRefreshView, String>>,
+    >,
+    pending_mcp_snapshots:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<ExternalMcpServerRecord>, String>>>,
+    pending_mcp_probes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<McpProbeResult, String>>>,
+    pending_artifact_lists: HashMap<Uuid, PendingArtifactListEntry>,
+    unsolicited_unfiltered_artifact_reqs: HashSet<Uuid>,
+    pending_artifact_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ArtifactDetail, String>>>,
+    pending_artifact_upserts:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ArtifactSummary, String>>>,
+    pending_artifact_deletes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
+    pending_managed_skills_lists: HashMap<Uuid, PendingManagedSkillsListEntry>,
+    background_managed_skills_reqs: HashSet<Uuid>,
+    active_managed_skills_cwd: Option<String>,
+    pending_managed_skill_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ManagedSkillContentView, String>>>,
+    pending_path_rules:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PathRulesSnapshotView, String>>>,
+    pending_path_rule_matches:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<MatchedPathRulesView, String>>>,
+    path_rules_by_cwd: HashMap<String, Vec<PathScopedRule>>,
+    pending_lsp_servers:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspServerStatus>, String>>>,
+    pending_lsp_symbols:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspSymbolInfo>, String>>>,
+    pending_lsp_diagnostics:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspDiagnostic>, String>>>,
+    pending_lsp_locations:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspLocation>, String>>>,
+    pending_usage_insights:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<UsageInsightsSnapshot, String>>>,
+    pending_context_occupancy:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ContextOccupancyBreakdown, String>>>,
+    pending_lifecycle_hooks:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<LifecycleHooksSnapshotView, String>>>,
+    pending_lifecycle_hook_tests:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<HookExecutionRecord, String>>>,
+    pending_timer_creates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ConditionalTimerRecord, String>>>,
+    pending_timer_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<ConditionalTimerRecord>, String>>>,
+    pending_timer_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ConditionalTimerRecord, String>>>,
+    background_timer_list_reqs: HashSet<Uuid>,
+    pending_guardian_configs:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GuardianConfigSnapshotView, String>>>,
+    pending_goal_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GoalRunRecord, String>>>,
+    pending_goal_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<GoalRunRecord>, String>>>,
+    pending_monitor_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<MonitorWatchRecord, String>>>,
+    pending_monitor_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<MonitorWatchRecord>, String>>>,
+    pending_event_triggers:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<EventTriggersSnapshotView, String>>>,
+    pending_event_trigger_tests:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<EventTriggerDelivery, String>>>,
+    pending_browser_snapshots:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserSessionsSnapshotView, String>>>,
+    pending_browser_sessions:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserSessionSummary, String>>>,
+    pending_browser_actions:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserActionResponseView, String>>>,
+    pending_workflow_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorkflowRunRecord, String>>>,
+    pending_workflow_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<WorkflowRunRecord>, String>>>,
+    pending_im_channels:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ImChannelsSnapshotView, String>>>,
+    pending_im_channel_tests:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ImChannelTestResultView, String>>>,
+    pending_push_snapshots:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PushDevicesSnapshotView, String>>>,
+    pending_push_tests:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PushTestResultView, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -572,14 +916,25 @@ struct HostMemoryState {
     workspace_organize_status: HashMap<String, WorkspaceOrganizeEvent>,
     profiles: Vec<AgentProfile>,
     schedules: Vec<ScheduleSpec>,
+    conditional_timers: Vec<ConditionalTimerRecord>,
     schedule_runs: HashMap<String, Vec<ScheduleRunRecord>>,
     connected_hosts: Vec<ConnectedHostSummary>,
     orchestration_config: OrchestrationConfig,
     orchestration_skills: Vec<OrchestrationSkillInfo>,
+    managed_skills: Vec<ManagedSkillRecord>,
+    keep_awake_status: Option<KeepAwakeStatus>,
     workspace_scripts: HashMap<String, Vec<WorkspaceScriptInfo>>,
     pending_permissions: Vec<PendingPermissionSummary>,
     provider_subagents: HashMap<String, Vec<ProviderSubagentDescriptor>>,
     provider_subagent_timelines: HashMap<(String, String), Vec<ProviderSubagentEvent>>,
+    provider_subagent_access_order: VecDeque<(String, String)>,
+    active_provider_subagent: Option<(String, String)>,
+    subscribed_provider_subagents: HashSet<(String, String)>,
+    acp_agents: Vec<AcpAgentAvailability>,
+    artifacts: Vec<ArtifactSummary>,
+    goal_runs: Vec<GoalRunRecord>,
+    monitor_watches: Vec<MonitorWatchRecord>,
+    workflow_runs: Vec<WorkflowRunRecord>,
 }
 
 impl HostMemoryState {
@@ -612,11 +967,64 @@ impl HostMemoryState {
             pending_queue_reorders: HashMap::new(),
             pending_attachment_acks: HashMap::new(),
             pending_file_reads: HashMap::new(),
+            pending_symbol_searches: HashMap::new(),
+            pending_file_writes: HashMap::new(),
+            pending_file_mutations: HashMap::new(),
+            pending_instruction_lists: HashMap::new(),
+            pending_instruction_reads: HashMap::new(),
+            pending_instruction_saves: HashMap::new(),
             pending_side_questions: HashMap::new(),
             pending_rewinds: HashMap::new(),
+            pending_forks: HashMap::new(),
+            pending_handoff_previews: HashMap::new(),
+            pending_handoff_executes: HashMap::new(),
             pending_daemon_upgrades: HashMap::new(),
             pending_upgrade_terminals: HashMap::new(),
             pending_git_repo_inspections: HashMap::new(),
+            pending_acp_probes: HashMap::new(),
+            pending_acp_snapshots: HashMap::new(),
+            pending_mcp_snapshots: HashMap::new(),
+            pending_mcp_probes: HashMap::new(),
+            pending_artifact_lists: HashMap::new(),
+            unsolicited_unfiltered_artifact_reqs: HashSet::new(),
+            pending_artifact_reads: HashMap::new(),
+            pending_artifact_upserts: HashMap::new(),
+            pending_artifact_deletes: HashMap::new(),
+            pending_managed_skills_lists: HashMap::new(),
+            background_managed_skills_reqs: HashSet::new(),
+            active_managed_skills_cwd: None,
+            pending_managed_skill_reads: HashMap::new(),
+            pending_path_rules: HashMap::new(),
+            pending_path_rule_matches: HashMap::new(),
+            path_rules_by_cwd: HashMap::new(),
+            pending_lsp_servers: HashMap::new(),
+            pending_lsp_symbols: HashMap::new(),
+            pending_lsp_diagnostics: HashMap::new(),
+            pending_lsp_locations: HashMap::new(),
+            pending_usage_insights: HashMap::new(),
+            pending_context_occupancy: HashMap::new(),
+            pending_lifecycle_hooks: HashMap::new(),
+            pending_lifecycle_hook_tests: HashMap::new(),
+            pending_timer_creates: HashMap::new(),
+            pending_timer_lists: HashMap::new(),
+            pending_timer_updates: HashMap::new(),
+            background_timer_list_reqs: HashSet::new(),
+            pending_guardian_configs: HashMap::new(),
+            pending_goal_updates: HashMap::new(),
+            pending_goal_lists: HashMap::new(),
+            pending_monitor_updates: HashMap::new(),
+            pending_monitor_lists: HashMap::new(),
+            pending_event_triggers: HashMap::new(),
+            pending_event_trigger_tests: HashMap::new(),
+            pending_browser_snapshots: HashMap::new(),
+            pending_browser_sessions: HashMap::new(),
+            pending_browser_actions: HashMap::new(),
+            pending_workflow_updates: HashMap::new(),
+            pending_workflow_lists: HashMap::new(),
+            pending_im_channels: HashMap::new(),
+            pending_im_channel_tests: HashMap::new(),
+            pending_push_snapshots: HashMap::new(),
+            pending_push_tests: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -653,14 +1061,25 @@ impl HostMemoryState {
             workspace_organize_status: HashMap::new(),
             profiles: Vec::new(),
             schedules: Vec::new(),
+            conditional_timers: Vec::new(),
             schedule_runs: HashMap::new(),
             connected_hosts: Vec::new(),
             orchestration_config: OrchestrationConfig::default(),
             orchestration_skills: Vec::new(),
+            managed_skills: Vec::new(),
+            keep_awake_status: None,
             workspace_scripts: HashMap::new(),
             pending_permissions: Vec::new(),
             provider_subagents: HashMap::new(),
             provider_subagent_timelines: HashMap::new(),
+            provider_subagent_access_order: VecDeque::new(),
+            active_provider_subagent: None,
+            subscribed_provider_subagents: HashSet::new(),
+            acp_agents: Vec::new(),
+            artifacts: Vec::new(),
+            goal_runs: Vec::new(),
+            monitor_watches: Vec::new(),
+            workflow_runs: Vec::new(),
         }
     }
 
@@ -708,6 +1127,90 @@ impl HostMemoryState {
                     | AgentStatus::AwaitingPermission { .. }
             )
         })
+    }
+
+    fn touch_provider_subagent_lru(&mut self, key: &(String, String)) {
+        if let Some(pos) = self
+            .provider_subagent_access_order
+            .iter()
+            .position(|k| k == key)
+        {
+            self.provider_subagent_access_order.remove(pos);
+        }
+        self.provider_subagent_access_order.push_back(key.clone());
+    }
+
+    fn is_provider_subagent_running(&self, parent_agent_id: &str, subagent_id: &str) -> bool {
+        self.provider_subagents
+            .get(parent_agent_id)
+            .is_some_and(|list| {
+                list.iter().any(|ps| {
+                    ps.subagent_id == subagent_id
+                        && ps.status == orbit_protocol::ProviderSubagentStatus::Running
+                })
+            })
+    }
+
+    fn enforce_provider_subagent_timeline_bounds(&mut self, keep_key: Option<&(String, String)>) {
+        const MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST: usize = 8;
+
+        // Drop stale access-order entries no longer present in the map.
+        self.provider_subagent_access_order
+            .retain(|k| self.provider_subagent_timelines.contains_key(k));
+
+        if self.provider_subagent_timelines.len() <= MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST {
+            return;
+        }
+
+        // First evict oldest finished entries tracked in LRU order.
+        let mut idx = 0;
+        while self.provider_subagent_timelines.len() > MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST
+            && idx < self.provider_subagent_access_order.len()
+        {
+            let candidate = self.provider_subagent_access_order[idx].clone();
+            let is_pinned = keep_key.is_some_and(|k| k == &candidate)
+                || self
+                    .active_provider_subagent
+                    .as_ref()
+                    .is_some_and(|active| active == &candidate);
+            if is_pinned || self.is_provider_subagent_running(&candidate.0, &candidate.1) {
+                idx += 1;
+                continue;
+            }
+            self.provider_subagent_access_order.remove(idx);
+            self.provider_subagent_timelines.remove(&candidate);
+            self.subscribed_provider_subagents.remove(&candidate);
+        }
+
+        // Fallback: evict any untracked finished keys (e.g. inserted directly without LRU touch).
+        if self.provider_subagent_timelines.len() > MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST {
+            let extra: Vec<(String, String)> = self
+                .provider_subagent_timelines
+                .keys()
+                .filter(|k| {
+                    !keep_key.is_some_and(|keep| keep == *k)
+                        && !self
+                            .active_provider_subagent
+                            .as_ref()
+                            .is_some_and(|active| active == *k)
+                        && !self.is_provider_subagent_running(&k.0, &k.1)
+                        && !self.provider_subagent_access_order.contains(*k)
+                })
+                .cloned()
+                .collect();
+            let mut to_remove = self
+                .provider_subagent_timelines
+                .len()
+                .saturating_sub(MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST);
+            for k in extra {
+                if to_remove == 0 {
+                    break;
+                }
+                self.provider_subagent_timelines.remove(&k);
+                self.subscribed_provider_subagents.remove(&k);
+                to_remove -= 1;
+            }
+        }
     }
 
     fn enforce_memory_cache_bounds(&mut self, keep_agent_id: &str) {
@@ -763,6 +1266,7 @@ impl HostMemoryState {
         if self.streaming_markdown_cache.len() > MAX_STREAMING_MARKDOWN_CACHE_ENTRIES {
             self.streaming_markdown_cache.clear();
         }
+        self.enforce_provider_subagent_timeline_bounds(None);
     }
 
     fn emulator_slot_mut(&mut self, slot: u8) -> &mut TerminalGridEmulator {
@@ -1007,7 +1511,7 @@ impl OrbitAppCore {
             .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
             .unwrap_or_default();
 
-        Ok(Arc::new(Self {
+        let core = Arc::new(Self {
             runtime,
             store,
             hosts: Arc::new(RwLock::new(initial_hosts)),
@@ -1021,7 +1525,57 @@ impl OrbitAppCore {
             cloud_sync_in_flight: Arc::new(AtomicBool::new(false)),
             cloud_sync_last_auto_ms: Arc::new(AtomicU64::new(0)),
             cloud_sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
-        }))
+        });
+        if !core.store.is_replica_fts_backfill_done() {
+            let store_bg = Arc::clone(&core.store);
+            core.runtime.spawn(async move {
+                const BACKFILL_BATCH_SIZE: usize = 200;
+                const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+                let mut consecutive_errors: u32 = 0;
+                loop {
+                    let store_step = Arc::clone(&store_bg);
+                    let step = tokio::task::spawn_blocking(move || {
+                        store_step.backfill_replica_fts_batch(BACKFILL_BATCH_SIZE)
+                    })
+                    .await;
+                    match step {
+                        Ok(Ok(progress)) => {
+                            consecutive_errors = 0;
+                            if progress.done {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        Ok(Err(err)) => {
+                            consecutive_errors += 1;
+                            tracing::warn!(
+                                error = %err,
+                                attempt = consecutive_errors,
+                                "replica FTS5 backfill batch failed"
+                            );
+                            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                tracing::warn!(
+                                    "aborting replica FTS5 background backfill after repeated errors"
+                                );
+                                break;
+                            }
+                            let backoff_ms = 50u64
+                                .saturating_mul(1u64 << (consecutive_errors - 1).min(4))
+                                .min(1000);
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(
+                                error = %join_err,
+                                "replica FTS5 backfill worker task aborted"
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        Ok(core)
     }
 
     pub fn subscribe(&self, sub: Arc<dyn CoreEventSubscriber>) {
@@ -1178,9 +1732,12 @@ impl OrbitAppCore {
             active_terminal_slot: state.active_terminal_slot,
             profiles: state.profiles.clone(),
             schedules: state.schedules.clone(),
+            conditional_timers: state.conditional_timers.clone(),
             connected_hosts: state.connected_hosts.clone(),
             orchestration_config: state.orchestration_config.clone(),
             orchestration_skills: state.orchestration_skills.clone(),
+            managed_skills: state.managed_skills.clone(),
+            keep_awake_status: state.keep_awake_status.clone(),
             workspace_scripts: state.workspace_scripts.clone(),
             pending_permissions: state.pending_permissions.clone(),
             provider_subagents: state.provider_subagents.clone(),
@@ -1189,6 +1746,11 @@ impl OrbitAppCore {
             workspace_events: state.workspace_events.clone(),
             workspace_organize_status: state.workspace_organize_status.clone(),
             host_sync_state: state.host_sync_state.clone(),
+            acp_agents: state.acp_agents.clone(),
+            artifacts: state.artifacts.clone(),
+            goal_runs: state.goal_runs.clone(),
+            monitor_watches: state.monitor_watches.clone(),
+            workflow_runs: state.workflow_runs.clone(),
         })
     }
 
@@ -1980,11 +2542,11 @@ impl OrbitAppCore {
     }
 
     pub fn fallback_provider_catalogs(&self) -> Vec<ProviderModelCatalog> {
-        vec![
-            crate::catalog::fallback_provider_catalog(ProviderKind::Antigravity),
-            crate::catalog::fallback_provider_catalog(ProviderKind::Codex),
-            crate::catalog::fallback_provider_catalog(ProviderKind::ClaudeCode),
-        ]
+        ProviderKind::all()
+            .iter()
+            .copied()
+            .map(crate::catalog::fallback_provider_catalog)
+            .collect()
     }
 
     pub fn bridge_info(&self) -> crate::contract::BridgeInfoView {
@@ -2002,8 +2564,245 @@ impl OrbitAppCore {
                 "side_question".into(),
                 "rewind".into(),
                 "native_diagrams".into(),
+                "fts5_search".into(),
+                "transcript_export".into(),
             ],
         }
+    }
+
+    fn load_full_agent_export_context(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<(crate::export::ExportAgentMeta, Vec<TimelineEvent>), String> {
+        let mut meta = crate::export::ExportAgentMeta {
+            host_id: host_id.to_string(),
+            agent_id: agent_id.to_string(),
+            title: String::new(),
+            ..Default::default()
+        };
+        let mut mem_events: Vec<TimelineEvent> = Vec::new();
+        let mut found_agent = false;
+
+        if let Ok(guard) = self.hosts.read()
+            && let Some(host_state) = guard.get(host_id)
+        {
+            let hname = host_state.profile.effective_display_name();
+            if !hname.trim().is_empty() {
+                meta.host_name = Some(hname);
+            }
+            if let Some(ag) = host_state.agents.get(agent_id) {
+                found_agent = true;
+                meta.title = ag.title.clone();
+                meta.provider = Some(ag.provider);
+                meta.model = ag.model.clone();
+                meta.cwd = Some(ag.cwd.clone());
+                meta.task_summary = ag.task_summary.clone();
+                meta.created_at = Some(ag.created_at);
+                meta.workspace_title = host_state
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace_id == ag.workspace_id)
+                    .map(|w| w.title.clone());
+            }
+            if let Some(list) = host_state.timelines.get(agent_id) {
+                mem_events = list.clone();
+            }
+        }
+
+        // Fall back to persisted replica metadata if this host/agent is not yet hydrated in memory.
+        if !found_agent
+            && let Ok(replica_agents) = self.store.list_replica_agents(host_id)
+            && let Some(ag) = replica_agents.into_iter().find(|a| a.agent_id == agent_id)
+        {
+            found_agent = true;
+            meta.title = ag.title.clone();
+            meta.provider = Some(ag.provider);
+            meta.model = ag.model.clone();
+            meta.cwd = Some(ag.cwd.clone());
+            meta.task_summary = ag.task_summary.clone();
+            meta.created_at = Some(ag.created_at);
+            if let Ok(ws_list) = self.store.list_replica_workspaces(host_id) {
+                meta.workspace_title = ws_list
+                    .into_iter()
+                    .find(|w| w.workspace_id == ag.workspace_id)
+                    .map(|w| w.title);
+            }
+            if meta.host_name.is_none()
+                && let Ok(saved_hosts) = self.store.list_client_hosts()
+                && let Some(h) = saved_hosts.into_iter().find(|h| h.host_id == host_id)
+            {
+                let label = h
+                    .meta
+                    .custom_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        h.meta
+                            .ssh_alias
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or(h.display_name.trim());
+                if !label.is_empty() {
+                    meta.host_name = Some(label.to_string());
+                }
+            }
+        }
+
+        // Strict multi-host isolation: NEVER query replica events unless this `host_id` owns `agent_id`.
+        if !found_agent && mem_events.is_empty() {
+            return Err(format!(
+                "conversation `{agent_id}` not found on host `{host_id}`"
+            ));
+        }
+
+        // Read the complete persisted local replica timeline so long virtualized conversations export in full.
+        let persisted = self
+            .store
+            .fetch_replica_timeline_all(agent_id)
+            .map_err(|e| format!("failed to load replica timeline for `{agent_id}`: {e}"))?;
+
+        let combined = merge_persisted_and_memory_timeline(persisted, mem_events);
+        Ok((meta, combined))
+    }
+
+    /// Export a complete conversation transcript (Markdown, JSON, or self-contained HTML5)
+    /// directly from the local SQLite replica + live in-memory tail so virtualized threads never truncate.
+    pub fn export_agent_transcript(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        opts: &crate::export::ExportOptions,
+    ) -> Result<crate::export::ExportedTranscript, String> {
+        let (meta, events) = self.load_full_agent_export_context(host_id, agent_id)?;
+        Ok(crate::export::export_timeline_transcript(
+            &meta, &events, opts,
+        ))
+    }
+
+    /// Extract all fenced code blocks from assistant replies in reverse-chronological order.
+    pub fn list_agent_code_blocks(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<crate::export::ExtractedCodeBlock>, String> {
+        let (_meta, events) = self.load_full_agent_export_context(host_id, agent_id)?;
+        Ok(crate::export::extract_code_blocks_from_timeline(&events))
+    }
+
+    /// Cross-conversation full-text search across all locally replicated timeline messages,
+    /// backed by SQLite FTS5 + BM25 ranking and enriched with host/project/title metadata.
+    pub fn search_messages(
+        &self,
+        query: impl AsRef<str>,
+        limit: u32,
+    ) -> Vec<ConversationSearchHit> {
+        let q = query.as_ref().trim();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let max_hits = if limit == 0 {
+            20
+        } else {
+            (limit as usize).min(100)
+        };
+        let raw_hits = match self.store.search_replica_messages(q, max_hits) {
+            Ok(hits) => hits,
+            Err(err) => {
+                tracing::warn!(query = %q, error = %err, "FTS5 message search failed");
+                return Vec::new();
+            }
+        };
+        if raw_hits.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(hosts_guard) = self.hosts.read() else {
+            return Vec::new();
+        };
+        let projects_guard = self.projects.read().ok();
+        let mut results = Vec::with_capacity(raw_hits.len());
+
+        for hit in raw_hits {
+            let matched_pair = if !hit.host_id.is_empty() {
+                hosts_guard
+                    .get(&hit.host_id)
+                    .map(|mem| (hit.host_id.as_str(), mem))
+            } else {
+                hosts_guard
+                    .iter()
+                    .find(|(_, mem)| mem.agents.contains_key(&hit.agent_id))
+                    .map(|(hid, mem)| (hid.as_str(), mem))
+            };
+
+            let Some((hid, mem)) = matched_pair else {
+                continue;
+            };
+            if hid.is_empty() {
+                continue;
+            }
+            let Some(ag) = mem.agents.get(&hit.agent_id) else {
+                continue;
+            };
+
+            let resolved_host_id = hid.to_string();
+            let mut host_name = mem.profile.effective_display_name();
+            if host_name.is_empty() {
+                host_name = resolved_host_id.clone();
+            }
+            let title = if ag.title.trim().is_empty() {
+                "Conversation".to_string()
+            } else {
+                ag.title.clone()
+            };
+            let mut updated_at_rfc3339 = hit.timestamp_rfc3339.clone().unwrap_or_default();
+            if updated_at_rfc3339.is_empty() {
+                updated_at_rfc3339 = ag.last_activity_at.unwrap_or(ag.updated_at).to_rfc3339();
+            }
+            let effective_cwd = mem
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == ag.workspace_id)
+                .and_then(|w| {
+                    w.project_root
+                        .as_deref()
+                        .or(w.source_cwd.as_deref())
+                        .or(Some(w.cwd.as_str()))
+                })
+                .unwrap_or(ag.cwd.as_str());
+
+            let mut project_name = String::new();
+            if let Some(ref projects) = projects_guard
+                && let Some(proj) = projects.values().find(|p| {
+                    p.host_id == resolved_host_id
+                        && p.directories.iter().any(|dir| {
+                            cwd_paths_equivalent(effective_cwd, dir)
+                                || cwd_paths_equivalent(&ag.cwd, dir)
+                        })
+                })
+            {
+                project_name = proj.name.clone();
+            }
+            if project_name.is_empty() {
+                project_name = crate::sidebar::basename_of_project_path(effective_cwd);
+            }
+
+            results.push(ConversationSearchHit {
+                host_id: resolved_host_id,
+                host_name,
+                agent_id: hit.agent_id,
+                seq: hit.seq,
+                role: hit.role,
+                title,
+                project_name,
+                snippet: hit.snippet,
+                updated_at_rfc3339,
+            });
+        }
+        results
     }
 
     pub fn render_diagram(
@@ -2045,8 +2844,10 @@ impl OrbitAppCore {
             cwd: &req.cwd,
             extra_dirs: req.extra_dirs,
             provider: req.provider,
+            acp_agent_id: req.acp_agent_id,
             model: req.model,
             effort: req.effort,
+            fast_mode: req.fast_mode,
             mode: req.mode,
             initial_prompt: &req.initial_prompt,
             initial_display_prompt: req.initial_display_prompt,
@@ -2138,7 +2939,7 @@ impl OrbitAppCore {
         req: &crate::contract::MentionRankRequest,
     ) -> Vec<crate::composer::MentionCandidateView> {
         let files = self.workspace_files(&req.host_id, &req.cwd);
-        let (git_files, workspace_peers) = self
+        let (git_files, workspace_peers, path_rules) = self
             .hosts
             .read()
             .ok()
@@ -2188,15 +2989,42 @@ impl OrbitAppCore {
                         .collect(),
                     _ => Vec::new(),
                 };
-                Some((gfiles, peers))
+                let rules: Vec<crate::composer::PathRuleMentionInput> = h
+                    .path_rules_by_cwd
+                    .get(&req.cwd)
+                    .or_else(|| {
+                        h.path_rules_by_cwd
+                            .iter()
+                            .find(|(k, _)| cwd_paths_equivalent(k, &req.cwd))
+                            .map(|(_, v)| v)
+                    })
+                    .map(|list| {
+                        list.iter()
+                            .filter(|r| r.enabled)
+                            .map(|r| crate::composer::PathRuleMentionInput {
+                                name: r.name.clone(),
+                                description: r.description.clone(),
+                                relative_path: r.relative_path.clone(),
+                                trigger_label: match r.trigger_mode {
+                                    RuleTriggerMode::Always => "Always".into(),
+                                    RuleTriggerMode::GlobAutoAttach => "Glob".into(),
+                                    RuleTriggerMode::AgentDecided => "Agent".into(),
+                                    RuleTriggerMode::Manual => "Manual".into(),
+                                },
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some((gfiles, peers, rules))
             })
             .unwrap_or_default();
 
-        crate::composer::rank_mention_candidates_with_peers(
+        crate::composer::rank_mention_candidates_with_peers_and_rules(
             &req.query,
             &files,
             &git_files,
             &workspace_peers,
+            &path_rules,
             req.limit,
         )
     }
@@ -2954,7 +3782,7 @@ impl OrbitAppCore {
             Ok(handle) => {
                 let mut rx = handle.subscribe();
                 let welcome_host = handle.welcome_host.clone();
-                let (queued_outbox, resub_timelines, conn_gen) = {
+                let (queued_outbox, resub_timelines, resub_provider_subagents, conn_gen) = {
                     let Ok(mut guard) = self.hosts.write() else {
                         return;
                     };
@@ -2983,7 +3811,8 @@ impl OrbitAppCore {
                             (aid.clone(), self.safe_catchup_since_seq(aid, max_seq))
                         })
                         .collect();
-                    (outbox, resubs, conn_gen)
+                    let resub_subagents = collect_provider_subagent_resubscriptions(h);
+                    (outbox, resubs, resub_subagents, conn_gen)
                 };
                 if let Some(host_info) = welcome_host {
                     self.handle_inbound_wire(host_id, WireMessage::Welcome { host: host_info });
@@ -3034,7 +3863,63 @@ impl OrbitAppCore {
                     })
                     .await;
                 let _ = handle
+                    .send_wire(WireMessage::ListAcpAgents {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let list_artifacts_req_id = Uuid::new_v4();
+                if let Ok(mut hosts) = self.hosts.write()
+                    && let Some(h) = hosts.get_mut(host_id)
+                {
+                    if h.unsolicited_unfiltered_artifact_reqs.len() >= 64 {
+                        h.unsolicited_unfiltered_artifact_reqs.clear();
+                    }
+                    h.unsolicited_unfiltered_artifact_reqs
+                        .insert(list_artifacts_req_id);
+                }
+                let _ = handle
+                    .send_wire(WireMessage::ListArtifacts {
+                        request_id: list_artifacts_req_id,
+                        workspace_id: None,
+                        agent_id: None,
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::ListSchedules {
+                        request_id: Uuid::new_v4(),
+                        include_completed: true,
+                    })
+                    .await;
+                let list_timers_req_id = Uuid::new_v4();
+                if let Ok(mut hosts) = self.hosts.write()
+                    && let Some(h) = hosts.get_mut(host_id)
+                {
+                    if h.background_timer_list_reqs.len() >= 64 {
+                        h.background_timer_list_reqs.clear();
+                    }
+                    h.background_timer_list_reqs.insert(list_timers_req_id);
+                }
+                let _ = handle
+                    .send_wire(WireMessage::ListConditionalTimers {
+                        request_id: list_timers_req_id,
+                        agent_id: None,
+                        include_resolved: true,
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListGoalRuns {
+                        request_id: Uuid::new_v4(),
+                        agent_id: None,
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListMonitorWatches {
+                        request_id: Uuid::new_v4(),
+                        agent_id: None,
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListWorkflowRuns {
                         request_id: Uuid::new_v4(),
                         include_completed: true,
                     })
@@ -3050,8 +3935,28 @@ impl OrbitAppCore {
                     })
                     .await;
                 let _ = handle
+                    .send_wire(WireMessage::GetKeepAwakeStatus {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::ListOrchestrationSkills {
                         request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let bg_skills_req_id = Uuid::new_v4();
+                if let Ok(mut hosts) = self.hosts.write()
+                    && let Some(h) = hosts.get_mut(host_id)
+                {
+                    if h.background_managed_skills_reqs.len() >= 64 {
+                        h.background_managed_skills_reqs.clear();
+                    }
+                    h.background_managed_skills_reqs.insert(bg_skills_req_id);
+                }
+                let _ = handle
+                    .send_wire(WireMessage::ListManagedSkills {
+                        request_id: bg_skills_req_id,
+                        cwd: None,
                     })
                     .await;
                 let _ = handle
@@ -3082,6 +3987,16 @@ impl OrbitAppCore {
                         .send_wire(WireMessage::SubscribeTimeline {
                             request_id: Uuid::new_v4(),
                             agent_id,
+                            since_seq,
+                        })
+                        .await;
+                }
+                for (parent_agent_id, subagent_id, since_seq) in resub_provider_subagents {
+                    let _ = handle
+                        .send_wire(WireMessage::SubscribeProviderSubagent {
+                            request_id: Uuid::new_v4(),
+                            parent_agent_id,
+                            subagent_id,
                             since_seq,
                         })
                         .await;
@@ -3294,10 +4209,12 @@ impl OrbitAppCore {
         let mut notify_git_cwd: Option<String> = None;
         let mut auto_subscribe_agent: Option<String> = None;
         let mut continue_catchup: Option<(String, u64)> = None;
+        let mut continue_subagent_catchup: Option<(String, String, u64)> = None;
         let mut catchup_completed_cursor: Option<(String, u64)> = None;
         let mut live_event_cursor: Option<(String, u64)> = None;
         let mut host_to_persist: Option<StoredHostProfile> = None;
         let mut rewound_to_persist: Option<(AgentSummary, Vec<TimelineEvent>, bool, bool)> = None;
+        let mut forked_to_persist: Option<(AgentSummary, Option<WorkspaceSummary>)> = None;
         let mut stale_replica_agents: Vec<(String, bool)> = Vec::new();
         let mut initial_seen_seeds: Vec<(String, u64)> = Vec::new();
         type ServerPrefSync = (String, u64, Option<(bool, i64)>);
@@ -3490,6 +4407,76 @@ impl OrbitAppCore {
                     notify_host = true;
                     push_notify_timeline(ag_id);
                 }
+                WireMessage::AgentForked {
+                    request_id,
+                    agent,
+                    workspace,
+                } => {
+                    let ag_id = agent.agent_id.clone();
+                    if let Some(ref ws) = workspace {
+                        state
+                            .workspaces
+                            .retain(|w| w.workspace_id != ws.workspace_id);
+                        state.workspaces.insert(0, ws.clone());
+                    }
+                    let agent_card = {
+                        let prefs_guard = self.thread_prefs.read().ok();
+                        let existing_pref = prefs_guard
+                            .as_ref()
+                            .and_then(|p| p.get(&(host_id.to_string(), ag_id.clone())));
+                        agent_to_card_view(&agent, existing_pref)
+                    };
+                    if agent.read_seq > 0 || agent.is_pinned {
+                        server_pref_syncs.push((
+                            ag_id.clone(),
+                            agent.read_seq,
+                            agent.is_pinned.then_some((true, agent.pinned_order)),
+                        ));
+                    }
+                    state.mark_stage_dirty(&ag_id, 0, true);
+                    state.last_created_agent_id = Some(ag_id.clone());
+                    state.agents.insert(ag_id.clone(), agent.clone());
+                    forked_to_persist = Some((agent, workspace.clone()));
+                    auto_subscribe_agent = Some(ag_id.clone());
+                    if let Some(tx) = state.pending_forks.remove(&request_id) {
+                        let _ = tx.send(Ok(ForkAgentResultView {
+                            agent: agent_card,
+                            workspace,
+                        }));
+                    }
+                    notify_fleet = true;
+                    notify_host = true;
+                    push_notify_timeline(ag_id);
+                }
+                WireMessage::WorktreeHandoffPreviewResult {
+                    request_id,
+                    preview,
+                } => {
+                    if let Some(tx) = state.pending_handoff_previews.remove(&request_id) {
+                        let _ = tx.send(Ok(preview));
+                    }
+                }
+                WireMessage::WorktreeHandoffExecuted {
+                    request_id,
+                    outcome,
+                } => {
+                    if let Some(ref ws) = outcome.target_workspace {
+                        if let Some(slot) = state
+                            .workspaces
+                            .iter_mut()
+                            .find(|w| w.workspace_id == ws.workspace_id)
+                        {
+                            *slot = ws.clone();
+                        } else {
+                            state.workspaces.push(ws.clone());
+                        }
+                        notify_host = true;
+                        notify_fleet = true;
+                    }
+                    if let Some(tx) = state.pending_handoff_executes.remove(&request_id) {
+                        let _ = tx.send(Ok(outcome));
+                    }
+                }
                 WireMessage::AgentUpdated { mut agent } => {
                     reconcile_pending_queue_ops(state, &mut agent);
                     let ag_id = agent.agent_id.clone();
@@ -3566,7 +4553,29 @@ impl OrbitAppCore {
                         .and_then(|a| a.parent_agent_id.clone());
                     state.agents.remove(&agent_id);
                     state.timelines.remove(&agent_id);
+                    state.conditional_timers.retain(|t| t.agent_id != agent_id);
                     state.provider_subagents.remove(&agent_id);
+                    state
+                        .provider_subagent_timelines
+                        .retain(|(pid, _), _| pid != &agent_id);
+                    state
+                        .provider_subagent_access_order
+                        .retain(|(pid, _)| pid != &agent_id);
+                    if state
+                        .active_provider_subagent
+                        .as_ref()
+                        .is_some_and(|(pid, _)| pid == &agent_id)
+                    {
+                        state.active_provider_subagent = None;
+                    }
+                    state
+                        .subscribed_provider_subagents
+                        .retain(|(pid, _)| pid != &agent_id);
+                    state.stage_cache.remove(&agent_id);
+                    state.stage_access_order.retain(|id| id != &agent_id);
+                    state.stage_dirty.remove(&agent_id);
+                    state.caught_up_agents.remove(&agent_id);
+                    state.rewound_agents.remove(&agent_id);
                     if let Some(pid) = parent_id {
                         state.mark_stage_meta_dirty(&pid);
                         push_notify_timeline(pid);
@@ -3591,6 +4600,130 @@ impl OrbitAppCore {
                         *slot = profile;
                     } else {
                         state.profiles.push(profile);
+                    }
+                    notify_host = true;
+                }
+                WireMessage::AcpAgentsSnapshot {
+                    request_id,
+                    agents,
+                    warning,
+                } => {
+                    let has_installed = agents.iter().any(|a| a.installed && a.spec.enabled);
+                    if has_installed && !state.available_providers.contains(&ProviderKind::Acp) {
+                        state.available_providers.push(ProviderKind::Acp);
+                        notify_fleet = true;
+                    } else if !has_installed
+                        && state.available_providers.contains(&ProviderKind::Acp)
+                    {
+                        state
+                            .available_providers
+                            .retain(|p| *p != ProviderKind::Acp);
+                        notify_fleet = true;
+                    }
+                    state.acp_agents = agents.clone();
+                    if let Some(tx) = state.pending_acp_snapshots.remove(&request_id) {
+                        let _ = tx.send(Ok(crate::contract::AcpRegistryRefreshView {
+                            agents,
+                            warning,
+                        }));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::AcpAgentProbeResult { request_id, result } => {
+                    if let Some(tx) = state.pending_acp_probes.remove(&request_id) {
+                        let _ = tx.send(Ok(result));
+                    }
+                }
+                WireMessage::ExternalMcpServersSnapshot {
+                    request_id,
+                    servers,
+                } => {
+                    if let Some(tx) = state.pending_mcp_snapshots.remove(&request_id) {
+                        let _ = tx.send(Ok(servers));
+                    }
+                }
+                WireMessage::ExternalMcpProbeResponse {
+                    request_id,
+                    server_id: _,
+                    result,
+                } => {
+                    if let Some(tx) = state.pending_mcp_probes.remove(&request_id) {
+                        let _ = tx.send(Ok(result));
+                    }
+                }
+                WireMessage::ArtifactsSnapshot {
+                    request_id,
+                    artifacts,
+                } => {
+                    let pending = state.pending_artifact_lists.remove(&request_id);
+                    let was_unsolicited_unfiltered = state
+                        .unsolicited_unfiltered_artifact_reqs
+                        .remove(&request_id);
+                    let is_unfiltered = pending.as_ref().is_some_and(|(unfiltered, _)| *unfiltered)
+                        || was_unsolicited_unfiltered;
+                    if is_unfiltered {
+                        state.artifacts = artifacts.clone();
+                    } else {
+                        for item in &artifacts {
+                            upsert_cached_artifact(&mut state.artifacts, item.clone());
+                        }
+                    }
+                    state.artifacts.sort_by(|a, b| {
+                        b.updated_at
+                            .cmp(&a.updated_at)
+                            .then_with(|| a.artifact_id.cmp(&b.artifact_id))
+                    });
+                    if let Some((_, tx)) = pending {
+                        let _ = tx.send(Ok(artifacts));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ArtifactContent {
+                    request_id,
+                    artifact,
+                } => {
+                    let latest_rev = artifact
+                        .revisions
+                        .first()
+                        .map(|r| r.version)
+                        .unwrap_or(artifact.summary.version);
+                    let cached_ver = state
+                        .artifacts
+                        .iter()
+                        .find(|a| a.artifact_id == artifact.summary.artifact_id)
+                        .map(|a| a.version)
+                        .unwrap_or(0);
+                    if artifact.summary.version >= latest_rev
+                        && artifact.summary.version >= cached_ver
+                    {
+                        upsert_cached_artifact(&mut state.artifacts, artifact.summary.clone());
+                    }
+                    if let Some(tx) = state.pending_artifact_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(artifact));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ArtifactUpdated {
+                    request_id,
+                    artifact,
+                } => {
+                    upsert_cached_artifact(&mut state.artifacts, artifact.clone());
+                    if let Some(rid) = request_id
+                        && let Some(tx) = state.pending_artifact_upserts.remove(&rid)
+                    {
+                        let _ = tx.send(Ok(artifact));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ArtifactDeleted {
+                    request_id,
+                    artifact_id,
+                } => {
+                    state.artifacts.retain(|a| a.artifact_id != artifact_id);
+                    if let Some(rid) = request_id
+                        && let Some(tx) = state.pending_artifact_deletes.remove(&rid)
+                    {
+                        let _ = tx.send(Ok(artifact_id));
                     }
                     notify_host = true;
                 }
@@ -3649,9 +4782,49 @@ impl OrbitAppCore {
                     state.orchestration_config = config;
                     notify_host = true;
                 }
+                WireMessage::KeepAwakeStatusSnapshot { status, .. }
+                | WireMessage::KeepAwakeStatusUpdated { status } => {
+                    state.orchestration_config.keep_awake_while_running = status.enabled;
+                    state.keep_awake_status = Some(status);
+                    notify_host = true;
+                }
                 WireMessage::OrchestrationSkillsSnapshot { skills, .. } => {
                     state.orchestration_skills = skills;
                     notify_host = true;
+                }
+                WireMessage::ManagedSkillsSnapshot { request_id, skills } => {
+                    if let Some((req_cwd, tx)) =
+                        state.pending_managed_skills_lists.remove(&request_id)
+                    {
+                        if req_cwd == state.active_managed_skills_cwd {
+                            state.managed_skills = skills.clone();
+                            notify_host = true;
+                        }
+                        let _ = tx.send(Ok(skills));
+                    } else if state.background_managed_skills_reqs.remove(&request_id) {
+                        // Never let an unsolicited `cwd: None` boot/refresh snapshot clobber an active project-scoped skills list.
+                        if state.active_managed_skills_cwd.is_none() {
+                            state.managed_skills = skills;
+                            notify_host = true;
+                        }
+                    } else if state.active_managed_skills_cwd.is_none() {
+                        state.managed_skills = skills;
+                        notify_host = true;
+                    }
+                }
+                WireMessage::ManagedSkillContentResponse {
+                    request_id,
+                    skill_id,
+                    content,
+                    etag,
+                } => {
+                    if let Some(tx) = state.pending_managed_skill_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(ManagedSkillContentView {
+                            skill_id,
+                            content,
+                            etag,
+                        }));
+                    }
                 }
                 WireMessage::ProviderSubagentsSnapshot {
                     parent_agent_id,
@@ -3661,10 +4834,13 @@ impl OrbitAppCore {
                     state.mark_stage_meta_dirty(&parent_agent_id);
                     push_notify_timeline(parent_agent_id.clone());
                     state.provider_subagents.insert(parent_agent_id, subagents);
+                    state.enforce_provider_subagent_timeline_bounds(None);
                     notify_host = true;
                 }
                 WireMessage::ProviderSubagentUpdated { subagent } => {
                     let parent_id = subagent.parent_agent_id.clone();
+                    let finished =
+                        subagent.status != orbit_protocol::ProviderSubagentStatus::Running;
                     let list = state
                         .provider_subagents
                         .entry(parent_id.clone())
@@ -3677,6 +4853,9 @@ impl OrbitAppCore {
                     } else {
                         list.push(subagent);
                     }
+                    if finished {
+                        state.enforce_provider_subagent_timeline_bounds(None);
+                    }
                     state.mark_stage_meta_dirty(&parent_id);
                     push_notify_timeline(parent_id);
                     notify_host = true;
@@ -3685,28 +4864,97 @@ impl OrbitAppCore {
                     parent_agent_id,
                     subagent_id,
                     events,
+                    has_more,
                     ..
                 } => {
                     let key = (parent_agent_id, subagent_id);
-                    let list = state.provider_subagent_timelines.entry(key).or_default();
+                    let list = state
+                        .provider_subagent_timelines
+                        .entry(key.clone())
+                        .or_default();
+                    let prev_max_seq = list.iter().map(|e| e.seq).max().unwrap_or(0);
+                    let batch_max_seq = events.iter().map(|e| e.seq).max();
+                    let mut seq_to_idx: HashMap<u64, usize> = list
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, e)| (e.seq, idx))
+                        .collect();
+                    let mut logical_to_idx: HashMap<(&'static str, String), usize> = list
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, e)| {
+                            provider_subagent_logical_key(&e.payload).map(|k| (k, idx))
+                        })
+                        .collect();
+                    let mut advanced = false;
+                    let mut inserted_any = false;
                     for ev in events {
-                        if let Some(slot) = list.iter_mut().find(|e| e.seq == ev.seq) {
-                            *slot = ev;
+                        if ev.seq > prev_max_seq {
+                            advanced = true;
+                        }
+                        let lkey = provider_subagent_logical_key(&ev.payload);
+                        if let Some(&idx) = seq_to_idx.get(&ev.seq) {
+                            list[idx] = ev;
+                            if let Some(k) = lkey {
+                                logical_to_idx.insert(k, idx);
+                            }
+                        } else if let Some(ref k) = lkey
+                            && let Some(&idx) = logical_to_idx.get(k)
+                        {
+                            if ev.seq >= list[idx].seq {
+                                seq_to_idx.remove(&list[idx].seq);
+                                seq_to_idx.insert(ev.seq, idx);
+                                if ev.seq > list[idx].seq {
+                                    inserted_any = true;
+                                }
+                                list[idx] = ev;
+                            }
                         } else {
+                            let idx = list.len();
+                            seq_to_idx.insert(ev.seq, idx);
+                            if let Some(k) = lkey {
+                                logical_to_idx.insert(k, idx);
+                            }
                             list.push(ev);
+                            inserted_any = true;
                         }
                     }
                     list.sort_by_key(|e| e.seq);
+                    if has_more
+                        && let Some(next_since) = batch_max_seq
+                        && next_since > 0
+                        && (advanced || inserted_any)
+                    {
+                        continue_subagent_catchup =
+                            Some((key.0.clone(), key.1.clone(), next_since));
+                    }
+                    state.touch_provider_subagent_lru(&key);
+                    state.enforce_provider_subagent_timeline_bounds(Some(&key));
                     notify_host = true;
                 }
                 WireMessage::ProviderSubagentTimelineLive { event } => {
                     let key = (event.parent_agent_id.clone(), event.subagent_id.clone());
-                    let list = state.provider_subagent_timelines.entry(key).or_default();
+                    let list = state
+                        .provider_subagent_timelines
+                        .entry(key.clone())
+                        .or_default();
+                    let lkey = provider_subagent_logical_key(&event.payload);
                     if let Some(slot) = list.iter_mut().find(|e| e.seq == event.seq) {
                         *slot = event;
+                    } else if let Some(ref k) = lkey
+                        && let Some(slot) = list
+                            .iter_mut()
+                            .find(|e| provider_subagent_logical_key(&e.payload).as_ref() == Some(k))
+                    {
+                        if event.seq >= slot.seq {
+                            *slot = event;
+                            list.sort_by_key(|e| e.seq);
+                        }
                     } else {
                         list.push(event);
                     }
+                    state.touch_provider_subagent_lru(&key);
+                    state.enforce_provider_subagent_timeline_bounds(Some(&key));
                     notify_host = true;
                 }
                 WireMessage::AgentRewound {
@@ -3972,6 +5220,16 @@ impl OrbitAppCore {
                     state.workspace_files.insert(cwd.clone(), files);
                     notify_git_cwd = Some(cwd);
                 }
+                WireMessage::WorkspaceSymbolsResponse {
+                    request_id,
+                    symbols,
+                    truncated,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_symbol_searches.remove(&request_id) {
+                        let _ = tx.send(Ok((symbols, truncated)));
+                    }
+                }
                 WireMessage::WorkspaceFileContentResponse {
                     request_id,
                     resolved_path,
@@ -3980,6 +5238,10 @@ impl OrbitAppCore {
                     content,
                     size_bytes,
                     truncated,
+                    etag,
+                    mtime_unix_ms,
+                    writable,
+                    line_ending,
                     ..
                 } => {
                     if let Some(tx) = state.pending_file_reads.remove(&request_id) {
@@ -3990,8 +5252,432 @@ impl OrbitAppCore {
                             content,
                             size_bytes,
                             truncated,
+                            etag,
+                            mtime_unix_ms,
+                            writable,
+                            line_ending,
                         }));
                     }
+                }
+                WireMessage::WorkspaceFileWritten {
+                    request_id,
+                    cwd,
+                    path,
+                    etag,
+                    size_bytes,
+                    mtime_unix_ms,
+                    conflict,
+                } => {
+                    if let Some(tx) = state.pending_file_writes.remove(&request_id) {
+                        let _ = tx.send(Ok(WorkspaceFileWriteResultView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            path,
+                            etag,
+                            size_bytes,
+                            mtime_unix_ms,
+                            conflict,
+                        }));
+                    }
+                }
+                WireMessage::WorkspaceEntryMutated {
+                    request_id,
+                    cwd,
+                    path,
+                    new_path,
+                    action,
+                } => {
+                    if let Some(tx) = state.pending_file_mutations.remove(&request_id) {
+                        let _ = tx.send(Ok(WorkspaceEntryMutationResultView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            path,
+                            new_path,
+                            action,
+                        }));
+                    }
+                }
+                WireMessage::InstructionFilesSnapshot {
+                    request_id,
+                    cwd,
+                    files,
+                    total_tokens,
+                    merged_preview,
+                } => {
+                    if let Some(tx) = state.pending_instruction_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(InstructionFilesSnapshotView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            files,
+                            total_tokens,
+                            merged_preview,
+                        }));
+                    }
+                }
+                WireMessage::InstructionFileContentResponse {
+                    request_id,
+                    cwd,
+                    path,
+                    content,
+                    etag,
+                    exists,
+                } => {
+                    if let Some(tx) = state.pending_instruction_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(InstructionFileContentView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            path,
+                            content,
+                            etag,
+                            exists,
+                        }));
+                    }
+                }
+                WireMessage::InstructionFileSavedResponse {
+                    request_id,
+                    cwd,
+                    path,
+                    etag,
+                    size_bytes,
+                    approx_tokens,
+                } => {
+                    if let Some(tx) = state.pending_instruction_saves.remove(&request_id) {
+                        let _ = tx.send(Ok(InstructionFileSavedView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            path,
+                            etag,
+                            size_bytes,
+                            approx_tokens,
+                        }));
+                    }
+                }
+                WireMessage::PathRulesSnapshot {
+                    request_id,
+                    cwd,
+                    rules,
+                    total_always_tokens,
+                    token_budget_warning,
+                } => {
+                    if !state.path_rules_by_cwd.contains_key(&cwd)
+                        && state.path_rules_by_cwd.len() >= 24
+                        && let Some(evict_key) = state.path_rules_by_cwd.keys().next().cloned()
+                    {
+                        state.path_rules_by_cwd.remove(&evict_key);
+                    }
+                    state.path_rules_by_cwd.insert(cwd.clone(), rules.clone());
+                    if let Some(tx) = state.pending_path_rules.remove(&request_id) {
+                        let _ = tx.send(Ok(PathRulesSnapshotView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            rules,
+                            total_always_tokens,
+                            token_budget_warning,
+                        }));
+                    }
+                }
+                WireMessage::MatchedPathRulesResponse {
+                    request_id,
+                    cwd,
+                    matched,
+                    injected_markdown,
+                    total_tokens,
+                } => {
+                    if let Some(tx) = state.pending_path_rule_matches.remove(&request_id) {
+                        let _ = tx.send(Ok(MatchedPathRulesView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            matched,
+                            injected_markdown,
+                            total_tokens,
+                        }));
+                    }
+                }
+                WireMessage::LspServersSnapshot {
+                    request_id,
+                    servers,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_servers.remove(&request_id) {
+                        let _ = tx.send(Ok(servers));
+                    }
+                }
+                WireMessage::LspSymbolsResponse {
+                    request_id,
+                    symbols,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_symbols.remove(&request_id) {
+                        let _ = tx.send(Ok(symbols));
+                    }
+                }
+                WireMessage::LspDiagnosticsResponse {
+                    request_id,
+                    diagnostics,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_diagnostics.remove(&request_id) {
+                        let _ = tx.send(Ok(diagnostics));
+                    }
+                }
+                WireMessage::LspLocationsResponse {
+                    request_id,
+                    locations,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_locations.remove(&request_id) {
+                        let _ = tx.send(Ok(locations));
+                    }
+                }
+                WireMessage::UsageInsightsResponse {
+                    request_id,
+                    snapshot,
+                } => {
+                    if let Some(tx) = state.pending_usage_insights.remove(&request_id) {
+                        let _ = tx.send(Ok(snapshot));
+                    }
+                }
+                WireMessage::ContextOccupancyResponse {
+                    request_id,
+                    breakdown,
+                } => {
+                    if let Some(tx) = state.pending_context_occupancy.remove(&request_id) {
+                        let _ = tx.send(Ok(breakdown));
+                    }
+                }
+                WireMessage::LifecycleHooksSnapshot {
+                    request_id,
+                    hooks,
+                    recent_executions,
+                    project_hooks_trusted,
+                } => {
+                    if let Some(tx) = state.pending_lifecycle_hooks.remove(&request_id) {
+                        let _ = tx.send(Ok(LifecycleHooksSnapshotView {
+                            hooks,
+                            recent_executions,
+                            project_hooks_trusted,
+                        }));
+                    }
+                }
+                WireMessage::HookTestResultResponse { request_id, record } => {
+                    if let Some(tx) = state.pending_lifecycle_hook_tests.remove(&request_id) {
+                        let _ = tx.send(Ok(record));
+                    }
+                }
+                WireMessage::EventTriggersSnapshot {
+                    request_id,
+                    triggers,
+                    recent_deliveries,
+                    base_webhook_url,
+                } => {
+                    if let Some(tx) = state.pending_event_triggers.remove(&request_id) {
+                        let _ = tx.send(Ok(EventTriggersSnapshotView {
+                            triggers,
+                            recent_deliveries,
+                            base_webhook_url,
+                        }));
+                    }
+                }
+                WireMessage::EventTriggerTestResponse {
+                    request_id,
+                    delivery,
+                } => {
+                    if let Some(tx) = state.pending_event_trigger_tests.remove(&request_id) {
+                        let _ = tx.send(Ok(delivery));
+                    }
+                }
+                WireMessage::ConditionalTimerCreated { request_id, timer } => {
+                    upsert_conditional_timer_record(&mut state.conditional_timers, timer.clone());
+                    if let Some(tx) = state.pending_timer_creates.remove(&request_id) {
+                        let _ = tx.send(Ok(timer));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ConditionalTimersSnapshot { request_id, timers } => {
+                    if state.background_timer_list_reqs.remove(&request_id) {
+                        state.conditional_timers = timers.clone();
+                        notify_host = true;
+                    }
+                    if let Some(tx) = state.pending_timer_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(timers));
+                    }
+                }
+                WireMessage::ConditionalTimerUpdated { request_id, timer } => {
+                    upsert_conditional_timer_record(&mut state.conditional_timers, timer.clone());
+                    if let Some(tx) = state.pending_timer_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(timer));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ConditionalTimerEvent { timer } => {
+                    upsert_conditional_timer_record(&mut state.conditional_timers, timer);
+                    notify_host = true;
+                }
+                WireMessage::GuardianConfigSnapshot {
+                    request_id,
+                    config,
+                    recent_audits,
+                } => {
+                    if let Some(tx) = state.pending_guardian_configs.remove(&request_id) {
+                        let _ = tx.send(Ok(GuardianConfigSnapshotView {
+                            config,
+                            recent_audits,
+                        }));
+                    }
+                }
+                WireMessage::ImChannelsSnapshot {
+                    request_id,
+                    channels,
+                    bindings,
+                    base_webhook_url,
+                } => {
+                    if let Some(tx) = state.pending_im_channels.remove(&request_id) {
+                        let _ = tx.send(Ok(ImChannelsSnapshotView {
+                            channels,
+                            bindings,
+                            base_webhook_url,
+                        }));
+                    }
+                }
+                WireMessage::ImChannelTestResponse {
+                    request_id,
+                    ok,
+                    detail,
+                } => {
+                    if let Some(tx) = state.pending_im_channel_tests.remove(&request_id) {
+                        let _ = tx.send(Ok(ImChannelTestResultView { ok, detail }));
+                    }
+                }
+                WireMessage::PushDevicesSnapshot {
+                    request_id,
+                    devices,
+                    preferences,
+                } => {
+                    if let Some(tx) = state.pending_push_snapshots.remove(&request_id) {
+                        let _ = tx.send(Ok(PushDevicesSnapshotView {
+                            devices,
+                            preferences,
+                        }));
+                    }
+                }
+                WireMessage::PushTestResponse {
+                    request_id,
+                    attempted,
+                    delivered,
+                    detail,
+                } => {
+                    if let Some(tx) = state.pending_push_tests.remove(&request_id) {
+                        let _ = tx.send(Ok(PushTestResultView {
+                            attempted,
+                            delivered,
+                            detail,
+                        }));
+                    }
+                }
+                WireMessage::GoalRunsSnapshot { request_id, goals } => {
+                    if let Some(tx) = state.pending_goal_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(goals.clone()));
+                    } else {
+                        state.goal_runs = goals;
+                        notify_host = true;
+                    }
+                }
+                WireMessage::GoalRunUpdated { request_id, goal } => {
+                    upsert_cached_goal(&mut state.goal_runs, goal.clone());
+                    if let Some(tx) = state.pending_goal_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(goal));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::GoalRunEvent { goal } => {
+                    upsert_cached_goal(&mut state.goal_runs, goal);
+                    notify_host = true;
+                }
+                WireMessage::MonitorWatchesSnapshot {
+                    request_id,
+                    monitors,
+                } => {
+                    if let Some(tx) = state.pending_monitor_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(monitors.clone()));
+                    } else {
+                        state.monitor_watches = monitors;
+                        notify_host = true;
+                    }
+                }
+                WireMessage::MonitorWatchUpdated {
+                    request_id,
+                    monitor,
+                } => {
+                    upsert_cached_monitor(&mut state.monitor_watches, monitor.clone());
+                    if let Some(tx) = state.pending_monitor_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(monitor));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::MonitorWatchEvent { monitor } => {
+                    upsert_cached_monitor(&mut state.monitor_watches, monitor);
+                    notify_host = true;
+                }
+                WireMessage::BrowserSessionsSnapshot {
+                    request_id,
+                    sessions,
+                    policy,
+                    chrome_binary,
+                } => {
+                    if let Some(tx) = state.pending_browser_snapshots.remove(&request_id) {
+                        let _ = tx.send(Ok(BrowserSessionsSnapshotView {
+                            host_id: host_id.to_string(),
+                            sessions,
+                            policy,
+                            chrome_binary,
+                        }));
+                    }
+                }
+                WireMessage::BrowserSessionUpdated {
+                    request_id,
+                    session,
+                } => {
+                    if let Some(tx) = state.pending_browser_sessions.remove(&request_id) {
+                        let _ = tx.send(Ok(session));
+                    }
+                }
+                WireMessage::BrowserActionResponse {
+                    request_id,
+                    session,
+                    elements,
+                    screenshot_base64,
+                    text_excerpt,
+                    captcha_detected,
+                } => {
+                    if let Some(tx) = state.pending_browser_actions.remove(&request_id) {
+                        let _ = tx.send(Ok(BrowserActionResponseView {
+                            host_id: host_id.to_string(),
+                            session,
+                            elements,
+                            screenshot_base64,
+                            text_excerpt,
+                            captcha_detected,
+                        }));
+                    }
+                }
+                WireMessage::WorkflowRunsSnapshot { request_id, runs } => {
+                    if let Some(tx) = state.pending_workflow_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(runs.clone()));
+                    } else {
+                        state.workflow_runs = runs;
+                        notify_host = true;
+                    }
+                }
+                WireMessage::WorkflowRunUpdated { request_id, run } => {
+                    upsert_cached_workflow_run(&mut state.workflow_runs, run.clone());
+                    if let Some(tx) = state.pending_workflow_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(run));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::WorkflowRunEvent { run } => {
+                    upsert_cached_workflow_run(&mut state.workflow_runs, run);
+                    notify_host = true;
                 }
                 WireMessage::SideQuestionDelta {
                     request_id,
@@ -4095,7 +5781,43 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_symbol_searches.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_file_writes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_file_mutations.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_instruction_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_instruction_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_instruction_saves.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_rewinds.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_forks.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_handoff_previews.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_handoff_executes.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -4108,6 +5830,167 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_git_repo_inspections.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_acp_probes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_acp_snapshots.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_mcp_snapshots.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_mcp_probes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some((_, tx)) = state.pending_artifact_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_artifact_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_artifact_upserts.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_path_rules.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_path_rule_matches.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_artifact_deletes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some((_, tx)) = state.pending_managed_skills_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_managed_skill_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_servers.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_symbols.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_diagnostics.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_locations.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_usage_insights.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_context_occupancy.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lifecycle_hooks.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lifecycle_hook_tests.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_event_triggers.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_event_trigger_tests.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_timer_creates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_timer_lists.remove(&req_id)
+                    {
+                        state.background_timer_list_reqs.remove(&req_id);
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_timer_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && state.background_timer_list_reqs.remove(&req_id)
+                    {
+                        // Ignore unsupported/transient background timer list errors on older daemons.
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_guardian_configs.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_goal_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_goal_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_monitor_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_monitor_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_browser_snapshots.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_browser_sessions.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_browser_actions.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_workflow_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_workflow_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_im_channels.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_im_channel_tests.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_push_snapshots.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_push_tests.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -4279,8 +6162,16 @@ impl OrbitAppCore {
                 entry.updated_at_ms = now_ms;
             }
         }
+        if let Some((ag, ws_opt)) = forked_to_persist {
+            if let Some(ref ws) = ws_opt {
+                let _ = self.store.upsert_single_replica_workspace(host_id, ws);
+            }
+            let _ = self.store.upsert_single_replica_agent(host_id, &ag);
+        }
         if let Some((ag, evs, files_restored, is_complete)) = rewound_to_persist {
-            let _ = self.store.replace_replica_timeline(&ag.agent_id, &evs);
+            let _ = self
+                .store
+                .replace_replica_timeline_for_host(host_id, &ag.agent_id, &evs);
             if is_complete {
                 let _ = self
                     .store
@@ -4321,7 +6212,9 @@ impl OrbitAppCore {
             }
         }
         for (stale_ag_id, should_resubscribe) in stale_replica_agents {
-            let _ = self.store.replace_replica_timeline(&stale_ag_id, &[]);
+            let _ = self
+                .store
+                .replace_replica_timeline_for_host(host_id, &stale_ag_id, &[]);
             if should_resubscribe {
                 self.dispatch_wire(
                     host_id,
@@ -4342,6 +6235,17 @@ impl OrbitAppCore {
                 WireMessage::SubscribeTimeline {
                     request_id: Uuid::new_v4(),
                     agent_id: catchup_agent_id,
+                    since_seq,
+                },
+            );
+        }
+        if let Some((parent_agent_id, subagent_id, since_seq)) = continue_subagent_catchup {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::SubscribeProviderSubagent {
+                    request_id: Uuid::new_v4(),
+                    parent_agent_id,
+                    subagent_id,
                     since_seq,
                 },
             );
@@ -4652,6 +6556,30 @@ impl OrbitAppCore {
         );
         self.dispatch_wire(
             host_id,
+            WireMessage::ListAcpAgents {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        let list_artifacts_req_id = Uuid::new_v4();
+        if let Ok(mut hosts) = self.hosts.write()
+            && let Some(h) = hosts.get_mut(host_id)
+        {
+            if h.unsolicited_unfiltered_artifact_reqs.len() >= 64 {
+                h.unsolicited_unfiltered_artifact_reqs.clear();
+            }
+            h.unsolicited_unfiltered_artifact_reqs
+                .insert(list_artifacts_req_id);
+        }
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListArtifacts {
+                request_id: list_artifacts_req_id,
+                workspace_id: None,
+                agent_id: None,
+            },
+        );
+        self.dispatch_wire(
+            host_id,
             WireMessage::ListSchedules {
                 request_id: Uuid::new_v4(),
                 include_completed: true,
@@ -4671,8 +6599,30 @@ impl OrbitAppCore {
         );
         self.dispatch_wire(
             host_id,
+            WireMessage::GetKeepAwakeStatus {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
             WireMessage::ListOrchestrationSkills {
                 request_id: Uuid::new_v4(),
+            },
+        );
+        let bg_skills_req_id = Uuid::new_v4();
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if h.background_managed_skills_reqs.len() >= 64 {
+                h.background_managed_skills_reqs.clear();
+            }
+            h.background_managed_skills_reqs.insert(bg_skills_req_id);
+        }
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListManagedSkills {
+                request_id: bg_skills_req_id,
+                cwd: None,
             },
         );
         self.dispatch_wire(
@@ -4725,8 +6675,10 @@ impl OrbitAppCore {
             cwd,
             extra_dirs: Vec::new(),
             provider,
+            acp_agent_id: None,
             model: None,
             effort: None,
+            fast_mode: None,
             mode,
             initial_prompt,
             initial_display_prompt: None,
@@ -4756,8 +6708,10 @@ impl OrbitAppCore {
             cwd,
             extra_dirs,
             provider,
+            acp_agent_id: None,
             model,
             effort: None,
+            fast_mode: None,
             mode,
             initial_prompt,
             initial_display_prompt: None,
@@ -4791,6 +6745,10 @@ impl OrbitAppCore {
         let opt_id = format!("opt_{req_id}");
         let now = Utc::now();
         let clean_model = req.model.filter(|m| !m.trim().is_empty());
+        let clean_acp_agent_id = req
+            .acp_agent_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
         let clean_handle = req
             .handle
             .map(|h| h.trim().trim_start_matches('@').to_string())
@@ -4816,6 +6774,17 @@ impl OrbitAppCore {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(req.host_id)
         {
+            let opt_fast_mode = req.fast_mode.unwrap_or_else(|| {
+                profile_id
+                    .as_deref()
+                    .and_then(|pid| {
+                        h.profiles
+                            .iter()
+                            .find(|p| p.profile_id == pid || p.name == pid)
+                            .map(|p| p.fast_mode)
+                    })
+                    .unwrap_or(false)
+            });
             let opt_agent = AgentSummary {
                 agent_id: opt_id.clone(),
                 workspace_id: explicit_ws
@@ -4826,6 +6795,7 @@ impl OrbitAppCore {
                 provider: req.provider,
                 model: clean_model.clone(),
                 effort: req.effort,
+                fast_mode: opt_fast_mode,
                 mode: req.mode.clone(),
                 status: AgentStatus::Initializing,
                 parent_agent_id: None,
@@ -4845,6 +6815,9 @@ impl OrbitAppCore {
                 handle: clean_handle.clone(),
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: clean_acp_agent_id.clone(),
                 timeline_epoch: 0,
                 created_at: now,
                 updated_at: now,
@@ -4895,6 +6868,7 @@ impl OrbitAppCore {
                 provider: req.provider,
                 model: clean_model,
                 effort: req.effort,
+                fast_mode: req.fast_mode,
                 mode: req.mode,
                 initial_prompt: req.initial_prompt.to_string(),
                 initial_display_prompt: req.initial_display_prompt,
@@ -4913,6 +6887,7 @@ impl OrbitAppCore {
                 branch: clean_branch.filter(|b| *b != "auto").map(ToOwned::to_owned),
                 handle: clean_handle,
                 auto_cluster: req.auto_cluster,
+                acp_agent_id: clean_acp_agent_id,
             },
         );
 
@@ -5355,7 +7330,7 @@ impl OrbitAppCore {
         agent_id: &str,
         provider: ProviderKind,
     ) {
-        self.switch_agent_provider_with_config(host_id, agent_id, provider, None, None);
+        self.switch_agent_provider_with_config(host_id, agent_id, provider, None, None, None);
     }
 
     pub fn switch_agent_provider_with_config(
@@ -5365,9 +7340,17 @@ impl OrbitAppCore {
         provider: ProviderKind,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        acp_agent_id: Option<String>,
     ) {
         let req_id = Uuid::new_v4();
         let clean_model = model.filter(|m| !m.trim().is_empty());
+        let clean_acp_id = if provider == ProviderKind::Acp {
+            acp_agent_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
@@ -5375,6 +7358,7 @@ impl OrbitAppCore {
                 ag.provider = provider;
                 ag.model = clean_model.clone();
                 ag.effort = effort;
+                ag.acp_agent_id = clean_acp_id.clone();
             }
             h.mark_stage_meta_dirty(agent_id);
             if !agent_id.starts_with("opt_") {
@@ -5390,6 +7374,7 @@ impl OrbitAppCore {
                     provider,
                     model: clean_model,
                     effort,
+                    acp_agent_id: clean_acp_id,
                 },
             );
         }
@@ -5532,39 +7517,88 @@ impl OrbitAppCore {
         labels: Option<HashMap<String, String>>,
         handle: Option<String>,
     ) {
+        self.update_agent_full(
+            host_id, agent_id, title, model, effort, None, mode, labels, handle,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_agent_full(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        title: Option<String>,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+        fast_mode: Option<bool>,
+        mode: Option<SessionMode>,
+        labels: Option<HashMap<String, String>>,
+        handle: Option<String>,
+    ) {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
-            && let Some(ag) = h.agents.get_mut(agent_id)
         {
-            if let Some(ref t) = title {
-                ag.title = t.clone();
-            }
-            if let Some(ref h_val) = handle {
-                let clean = h_val.trim().trim_start_matches('@');
-                if !clean.is_empty() {
-                    ag.handle = Some(clean.to_string());
+            if let Some(ag) = h.agents.get_mut(agent_id) {
+                if let Some(ref t) = title {
+                    ag.title = t.clone();
+                }
+                if let Some(ref m) = model {
+                    ag.model = Some(m.clone());
+                }
+                if let Some(e) = effort {
+                    ag.effort = Some(e);
+                }
+                if let Some(fm) = fast_mode {
+                    ag.fast_mode = fm;
+                }
+                if let Some(ref md) = mode {
+                    ag.mode = md.clone();
+                }
+                if let Some(ref h_val) = handle {
+                    let clean = h_val.trim().trim_start_matches('@');
+                    if !clean.is_empty() {
+                        ag.handle = Some(clean.to_string());
+                    }
                 }
             }
+            h.mark_stage_meta_dirty(agent_id);
         }
-        self.dispatch_wire_queued(
-            host_id,
-            WireMessage::UpdateAgent {
-                request_id: Uuid::new_v4(),
-                agent_id: agent_id.to_string(),
-                title,
-                model,
-                effort,
-                mode,
-                labels,
-                handle,
-                task_summary: None,
-            },
-        );
+        if !agent_id.starts_with("opt_") {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::UpdateAgent {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                    title,
+                    model,
+                    effort,
+                    fast_mode,
+                    mode,
+                    labels,
+                    handle,
+                    task_summary: None,
+                },
+            );
+        }
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
             host_id: host_id.to_string(),
         });
+    }
+
+    pub fn set_agent_fast_mode(self: &Arc<Self>, host_id: &str, agent_id: &str, fast_mode: bool) {
+        self.update_agent_full(
+            host_id,
+            agent_id,
+            None,
+            None,
+            None,
+            Some(fast_mode),
+            None,
+            None,
+            None,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5616,6 +7650,7 @@ impl OrbitAppCore {
                 title,
                 model: None,
                 effort: None,
+                fast_mode: None,
                 mode: None,
                 labels: (!labels.is_empty()).then_some(labels),
                 handle: clean_handle,
@@ -5982,8 +8017,10 @@ impl OrbitAppCore {
                 cwd: &req.cwd,
                 extra_dirs: req.extra_dirs,
                 provider: req.provider,
+                acp_agent_id: req.acp_agent_id,
                 model: req.model,
                 effort: req.effort,
+                fast_mode: req.fast_mode,
                 mode: req.mode,
                 initial_prompt: &req.initial_prompt,
                 initial_display_prompt: None,
@@ -6199,6 +8236,913 @@ impl OrbitAppCore {
             revision,
             host_id: host_id.to_string(),
         });
+    }
+
+    // --- First-Class Artifacts & SEP-1865 MCP Apps ---
+
+    pub fn cached_artifacts(
+        &self,
+        host_id: &str,
+        workspace_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Vec<ArtifactSummary> {
+        let ws = workspace_id.map(str::trim).filter(|s| !s.is_empty());
+        let ag = agent_id.map(str::trim).filter(|s| !s.is_empty());
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.get(host_id).map(|h| {
+                    h.artifacts
+                        .iter()
+                        .filter(|a| ws.is_none_or(|w| a.workspace_id == w))
+                        .filter(|a| ag.is_none_or(|id| a.agent_id.as_deref() == Some(id)))
+                        .cloned()
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    pub async fn list_artifacts_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<Vec<ArtifactSummary>, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Ok(self.cached_artifacts(
+                host_id,
+                workspace_id.as_deref(),
+                agent_id.as_deref(),
+            ));
+        };
+
+        let unfiltered = workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+            && agent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none();
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_lists
+                            .insert(req_id, (unfiltered, ack_tx));
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListArtifacts {
+                    request_id: req_id,
+                    workspace_id,
+                    agent_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListArtifacts: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(list))) => Ok(list),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while listing artifacts".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for artifacts snapshot".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "list_artifacts task cancelled".to_string())?
+    }
+
+    pub fn list_artifacts_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<Vec<ArtifactSummary>, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        self.runtime.block_on(async move {
+            core.list_artifacts_async(&host, workspace_id, agent_id)
+                .await
+        })
+    }
+
+    pub async fn get_artifact_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+        version: Option<u32>,
+    ) -> Result<ArtifactDetail, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_id = artifact_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_reads.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::GetArtifact {
+                    request_id: req_id,
+                    artifact_id: owned_id,
+                    version,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send GetArtifact: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(detail))) => Ok(detail),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while loading artifact".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_reads.remove(&req_id);
+                    }
+                    Err("Timed out waiting for artifact content".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "get_artifact task cancelled".to_string())?
+    }
+
+    pub fn get_artifact_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+        version: Option<u32>,
+    ) -> Result<ArtifactDetail, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        let aid = artifact_id.to_string();
+        self.runtime
+            .block_on(async move { core.get_artifact_async(&host, &aid, version).await })
+    }
+
+    pub async fn upsert_artifact_async(
+        self: &Arc<Self>,
+        req: UpsertArtifactRequest,
+    ) -> Result<ArtifactSummary, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = req.host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_upserts.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::UpsertArtifact {
+                    request_id: req_id,
+                    artifact_id: req.artifact_id,
+                    workspace_id: req.workspace_id,
+                    agent_id: req.agent_id,
+                    title: req.title,
+                    kind: req.kind,
+                    language: req.language,
+                    mime_type: req.mime_type,
+                    resource_uri: req.resource_uri,
+                    content: req.content,
+                    summary_note: req.summary_note,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_upserts.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send UpsertArtifact: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(Ok(summary))) => Ok(summary),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while saving artifact".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_upserts.remove(&req_id);
+                    }
+                    Err("Timed out waiting for artifact update".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "upsert_artifact task cancelled".to_string())?
+    }
+
+    pub fn upsert_artifact_blocking(
+        self: &Arc<Self>,
+        req: UpsertArtifactRequest,
+    ) -> Result<ArtifactSummary, String> {
+        let core = Arc::clone(self);
+        self.runtime
+            .block_on(async move { core.upsert_artifact_async(req).await })
+    }
+
+    pub async fn delete_artifact_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+    ) -> Result<String, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_id = artifact_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_deletes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::DeleteArtifact {
+                    request_id: req_id,
+                    artifact_id: owned_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_deletes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send DeleteArtifact: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(deleted_id))) => Ok(deleted_id),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while deleting artifact".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_deletes.remove(&req_id);
+                    }
+                    Err("Timed out waiting for artifact deletion".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "delete_artifact task cancelled".to_string())?
+    }
+
+    pub fn delete_artifact_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+    ) -> Result<String, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        let aid = artifact_id.to_string();
+        self.runtime
+            .block_on(async move { core.delete_artifact_async(&host, &aid).await })
+    }
+
+    // --- Universal ACP Agent Registry & Live Probing ---
+
+    pub fn list_acp_agents(&self, host_id: &str) -> Vec<AcpAgentAvailability> {
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(host_id).map(|h| h.acp_agents.clone()))
+            .unwrap_or_default()
+    }
+
+    pub fn refresh_acp_agents(self: &Arc<Self>, host_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ListAcpAgents {
+                request_id: Uuid::new_v4(),
+            },
+        );
+    }
+
+    async fn send_acp_snapshot_rpc(
+        self: &Arc<Self>,
+        host_id: &str,
+        make_msg: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        timeout_secs: u64,
+    ) -> Result<crate::contract::AcpRegistryRefreshView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_acp_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(make_msg(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_acp_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ACP RPC: {e}")));
+                return;
+            }
+            let outcome =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
+                    Ok(Ok(Ok(view))) => Ok(view),
+                    Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                    Ok(Err(_)) => Err("Host disconnected while updating ACP registry".to_string()),
+                    Err(_) => {
+                        if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&owned_host)
+                        {
+                            h.pending_acp_snapshots.remove(&req_id);
+                        }
+                        Err("Timed out waiting for daemon ACP registry response".to_string())
+                    }
+                };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "ACP registry task cancelled".to_string())?
+    }
+
+    pub async fn upsert_custom_acp_agent_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        spec: AcpAgentSpec,
+    ) -> Result<Vec<AcpAgentAvailability>, String> {
+        self.send_acp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::UpsertCustomAcpAgent { request_id, spec },
+            10,
+        )
+        .await
+        .map(|v| v.agents)
+    }
+
+    pub fn upsert_custom_acp_agent_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        spec: AcpAgentSpec,
+    ) -> Result<Vec<AcpAgentAvailability>, String> {
+        self.runtime
+            .block_on(self.upsert_custom_acp_agent_async(host_id, spec))
+    }
+
+    pub async fn delete_custom_acp_agent_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<AcpAgentAvailability>, String> {
+        let owned_id = agent_id.to_string();
+        self.send_acp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::DeleteCustomAcpAgent {
+                request_id,
+                agent_id: owned_id,
+            },
+            10,
+        )
+        .await
+        .map(|v| v.agents)
+    }
+
+    pub fn delete_custom_acp_agent_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<AcpAgentAvailability>, String> {
+        self.runtime
+            .block_on(self.delete_custom_acp_agent_async(host_id, agent_id))
+    }
+
+    pub async fn refresh_acp_registry_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        registry_url: Option<String>,
+    ) -> Result<crate::contract::AcpRegistryRefreshView, String> {
+        self.send_acp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::RefreshAcpRegistry {
+                request_id,
+                registry_url,
+            },
+            20,
+        )
+        .await
+    }
+
+    pub fn refresh_acp_registry_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        registry_url: Option<String>,
+    ) -> Result<crate::contract::AcpRegistryRefreshView, String> {
+        self.runtime
+            .block_on(self.refresh_acp_registry_async(host_id, registry_url))
+    }
+
+    pub async fn test_acp_agent_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        cwd: Option<String>,
+    ) -> Result<AcpProbeResult, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_id = agent_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_acp_probes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::TestAcpAgent {
+                    request_id: req_id,
+                    agent_id: owned_id,
+                    cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_acp_probes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send TestAcpAgent: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(res))) => Ok(res),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while probing ACP agent".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_acp_probes.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ACP handshake probe".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "ACP probe task cancelled".to_string())?
+    }
+
+    pub fn test_acp_agent_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        cwd: Option<String>,
+    ) -> Result<AcpProbeResult, String> {
+        self.runtime
+            .block_on(self.test_acp_agent_async(host_id, agent_id, cwd))
+    }
+
+    // --- External MCP Server Manager (stdio + Streamable HTTP/SSE + live probe) ---
+
+    async fn send_external_mcp_snapshot_rpc(
+        self: &Arc<Self>,
+        host_id: &str,
+        make_msg: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        timeout_secs: u64,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_mcp_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(make_msg(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_mcp_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send MCP server RPC: {e}")));
+                return;
+            }
+            let outcome =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
+                    Ok(Ok(Ok(servers))) => Ok(servers),
+                    Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                    Ok(Err(_)) => Err("Host disconnected while updating MCP servers".to_string()),
+                    Err(_) => {
+                        if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&owned_host)
+                        {
+                            h.pending_mcp_snapshots.remove(&req_id);
+                        }
+                        Err("Timed out waiting for daemon MCP servers response".to_string())
+                    }
+                };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "External MCP server task cancelled".to_string())?
+    }
+
+    pub async fn list_external_mcp_servers_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        self.send_external_mcp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::ListExternalMcpServers { request_id, cwd },
+            10,
+        )
+        .await
+    }
+
+    pub async fn upsert_external_mcp_server_async(
+        self: &Arc<Self>,
+        req: UpsertExternalMcpServerRequest,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        let host_id = req.host_id.clone();
+        self.send_external_mcp_snapshot_rpc(
+            &host_id,
+            move |request_id| WireMessage::UpsertExternalMcpServer {
+                request_id,
+                scope: req.scope,
+                cwd: req.cwd,
+                name: req.name,
+                transport: req.transport,
+                env: req.env,
+                headers: req.headers,
+                keep_existing_secrets: req.keep_existing_secrets,
+                enabled: req.enabled,
+            },
+            10,
+        )
+        .await
+    }
+
+    pub async fn toggle_external_mcp_server_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        server_id: &str,
+        enabled: bool,
+        cwd: Option<String>,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        let owned_id = server_id.to_string();
+        self.send_external_mcp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::ToggleExternalMcpServer {
+                request_id,
+                server_id: owned_id,
+                enabled,
+                cwd,
+            },
+            10,
+        )
+        .await
+    }
+
+    pub async fn delete_external_mcp_server_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        server_id: &str,
+        cwd: Option<String>,
+    ) -> Result<Vec<ExternalMcpServerRecord>, String> {
+        let owned_id = server_id.to_string();
+        self.send_external_mcp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::DeleteExternalMcpServer {
+                request_id,
+                server_id: owned_id,
+                cwd,
+            },
+            10,
+        )
+        .await
+    }
+
+    pub async fn probe_external_mcp_server_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        server_id: &str,
+        cwd: Option<String>,
+    ) -> Result<McpProbeResult, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_id = server_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_mcp_probes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ProbeExternalMcpServer {
+                    request_id: req_id,
+                    server_id: owned_id,
+                    cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_mcp_probes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ProbeExternalMcpServer: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(12), ack_rx).await {
+                Ok(Ok(Ok(res))) => Ok(res),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while probing MCP server".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_mcp_probes.remove(&req_id);
+                    }
+                    Err("Timed out waiting for MCP server probe".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "MCP probe task cancelled".to_string())?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6432,6 +9376,12 @@ impl OrbitAppCore {
             && let Some(h) = guard.get_mut(host_id)
         {
             h.orchestration_config = config.clone();
+            if let Some(ref mut ka) = h.keep_awake_status {
+                ka.enabled = config.keep_awake_while_running;
+                if !ka.enabled {
+                    ka.active = false;
+                }
+            }
         }
         self.dispatch_wire_queued(
             host_id,
@@ -6456,6 +9406,255 @@ impl OrbitAppCore {
         );
     }
 
+    fn normalize_managed_skills_cwd(cwd: Option<&str>) -> Option<String> {
+        cwd.map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "~")
+            .map(ToString::to_string)
+    }
+
+    async fn request_managed_skills_snapshot(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+        build_wire: impl FnOnce(Uuid, Option<String>) -> WireMessage + Send + 'static,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let normalized_cwd = Self::normalize_managed_skills_cwd(cwd.as_deref());
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to manage skills".to_string());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.active_managed_skills_cwd = normalized_cwd.clone();
+                        h.pending_managed_skills_lists
+                            .insert(req_id, (normalized_cwd.clone(), ack_tx));
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id, normalized_cwd)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_managed_skills_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send skills RPC: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(skills))) => Ok(skills),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while updating skills".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_managed_skills_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for managed skills snapshot".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "managed skills request cancelled".to_string())?
+    }
+
+    pub async fn list_managed_skills_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        self.request_managed_skills_snapshot(host_id, cwd, move |request_id, cwd| {
+            WireMessage::ListManagedSkills { request_id, cwd }
+        })
+        .await
+    }
+
+    pub async fn read_managed_skill_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        skill_id: &str,
+        cwd: Option<String>,
+    ) -> Result<ManagedSkillContentView, String> {
+        let normalized_cwd = Self::normalize_managed_skills_cwd(cwd.as_deref());
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to read skill".to_string());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_skill_id = skill_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_managed_skill_reads.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ReadManagedSkill {
+                    request_id: req_id,
+                    skill_id: owned_skill_id,
+                    cwd: normalized_cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_managed_skill_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ReadManagedSkill: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(content))) => Ok(content),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while reading skill".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_managed_skill_reads.remove(&req_id);
+                    }
+                    Err("Timed out waiting for managed skill content".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "read_managed_skill task cancelled".to_string())?
+    }
+
+    pub async fn upsert_managed_skill_async(
+        self: &Arc<Self>,
+        req: UpsertManagedSkillRequest,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let host_id = req.host_id.clone();
+        let cwd = req.cwd.clone();
+        self.request_managed_skills_snapshot(&host_id, cwd, move |request_id, cwd| {
+            WireMessage::UpsertManagedSkill {
+                request_id,
+                scope: req.scope,
+                cwd,
+                slug: req.slug,
+                name: req.name,
+                description: req.description,
+                content: req.content,
+                enabled: req.enabled,
+                expected_etag: req.expected_etag,
+            }
+        })
+        .await
+    }
+
+    pub async fn toggle_managed_skill_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        skill_id: &str,
+        enabled: bool,
+        cwd: Option<String>,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let owned_skill_id = skill_id.to_string();
+        self.request_managed_skills_snapshot(host_id, cwd, move |request_id, cwd| {
+            WireMessage::ToggleManagedSkill {
+                request_id,
+                skill_id: owned_skill_id,
+                enabled,
+                cwd,
+            }
+        })
+        .await
+    }
+
+    pub async fn delete_managed_skill_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        skill_id: &str,
+        cwd: Option<String>,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let owned_skill_id = skill_id.to_string();
+        self.request_managed_skills_snapshot(host_id, cwd, move |request_id, cwd| {
+            WireMessage::DeleteManagedSkill {
+                request_id,
+                skill_id: owned_skill_id,
+                cwd,
+            }
+        })
+        .await
+    }
+
+    pub async fn import_managed_skill_async(
+        self: &Arc<Self>,
+        req: ImportManagedSkillRequest,
+    ) -> Result<Vec<ManagedSkillRecord>, String> {
+        let host_id = req.host_id.clone();
+        let cwd = req.cwd.clone();
+        self.request_managed_skills_snapshot(&host_id, cwd, move |request_id, cwd| {
+            WireMessage::ImportManagedSkill {
+                request_id,
+                scope: req.scope,
+                cwd,
+                source_markdown_or_path: req.source_markdown_or_path,
+                slug_override: req.slug_override,
+            }
+        })
+        .await
+    }
+
     pub fn list_provider_subagents(self: &Arc<Self>, host_id: &str, parent_agent_id: &str) {
         self.dispatch_wire_queued(
             host_id,
@@ -6472,14 +9671,21 @@ impl OrbitAppCore {
         parent_agent_id: &str,
         subagent_id: &str,
     ) {
+        let key = (parent_agent_id.to_string(), subagent_id.to_string());
         let since_seq = self
             .hosts
-            .read()
+            .write()
             .ok()
-            .and_then(|g| {
-                g.get(host_id)?
+            .and_then(|mut g| {
+                let host_state = g.get_mut(host_id)?;
+                host_state.active_provider_subagent = Some(key.clone());
+                host_state.subscribed_provider_subagents.insert(key.clone());
+                if host_state.provider_subagent_timelines.contains_key(&key) {
+                    host_state.touch_provider_subagent_lru(&key);
+                }
+                host_state
                     .provider_subagent_timelines
-                    .get(&(parent_agent_id.to_string(), subagent_id.to_string()))
+                    .get(&key)
                     .and_then(|list| list.iter().map(|e| e.seq).max())
             })
             .unwrap_or(0);
@@ -6532,11 +9738,16 @@ impl OrbitAppCore {
             .agents
             .get(parent_agent_id)
             .map(|a| a.cwd.clone());
+        let key = (parent_agent_id.to_string(), subagent_id.to_string());
         let raw_events = host_state
             .provider_subagent_timelines
-            .get(&(parent_agent_id.to_string(), subagent_id.to_string()))
+            .get(&key)
             .cloned()
             .unwrap_or_default();
+        if !raw_events.is_empty() {
+            host_state.touch_provider_subagent_lru(&key);
+            host_state.enforce_provider_subagent_timeline_bounds(Some(&key));
+        }
         let descriptor = host_state
             .provider_subagents
             .get(parent_agent_id)
@@ -6619,6 +9830,20 @@ impl OrbitAppCore {
                 &mut host_state.streaming_markdown_cache,
             ) {
                 items.push(item);
+            }
+        }
+
+        if let Some(d) = descriptor.as_ref() {
+            let terminal_status = match d.status {
+                orbit_protocol::ProviderSubagentStatus::Running => None,
+                orbit_protocol::ProviderSubagentStatus::Completed => {
+                    Some(ToolCallStatus::Completed)
+                }
+                orbit_protocol::ProviderSubagentStatus::Failed
+                | orbit_protocol::ProviderSubagentStatus::Canceled => Some(ToolCallStatus::Failed),
+            };
+            if let Some(status) = terminal_status {
+                stage::settle_timeline_items_for_finished_session(&mut items, status);
             }
         }
 
@@ -7208,6 +10433,95 @@ impl OrbitAppCore {
             .unwrap_or(false)
     }
 
+    /// Verify that `cwd` resolves to (or inside) a registered workspace, agent `cwd`,
+    /// discovered project root, or sidebar project directory on the given local host.
+    /// Rejects unregistered roots, `"~"`, `$HOME`, and filesystem root `"/"`.
+    pub fn is_registered_local_cwd(&self, host_id: &str, cwd: &str) -> bool {
+        let trimmed = cwd.trim();
+        if trimmed.is_empty() || trimmed == "~" {
+            return false;
+        }
+        let resolve_dir = |raw: &str| -> Option<std::path::PathBuf> {
+            let t = raw.trim();
+            if t.is_empty() || t == "~" {
+                return None;
+            }
+            let expanded = if let Some(rest) = t.strip_prefix("~/") {
+                crate::desktop_ops::resolve_user_home()?.join(rest)
+            } else {
+                std::path::PathBuf::from(t)
+            };
+            let canon = std::fs::canonicalize(&expanded).ok()?;
+            if !canon.is_dir() || canon.parent().is_none() {
+                return None;
+            }
+            Some(canon)
+        };
+
+        let Some(canon_cwd) = resolve_dir(trimmed) else {
+            return false;
+        };
+        let canon_home =
+            crate::desktop_ops::resolve_user_home().and_then(|h| std::fs::canonicalize(h).ok());
+        if canon_home.as_ref().is_some_and(|home| canon_cwd == *home) {
+            return false;
+        }
+
+        let matches_registered_root = |raw: &str| -> bool {
+            let Some(canon_root) = resolve_dir(raw) else {
+                return false;
+            };
+            if canon_home.as_ref().is_some_and(|home| canon_root == *home) {
+                return false;
+            }
+            canon_cwd == canon_root || canon_cwd.starts_with(&canon_root)
+        };
+
+        if let Ok(hosts) = self.hosts.read() {
+            let Some(h) = hosts.get(host_id) else {
+                return false;
+            };
+            if !h.is_local {
+                return false;
+            }
+            if h.workspaces.iter().any(|ws| {
+                matches_registered_root(&ws.cwd)
+                    || ws
+                        .source_cwd
+                        .as_deref()
+                        .is_some_and(&matches_registered_root)
+                    || ws
+                        .project_root
+                        .as_deref()
+                        .is_some_and(&matches_registered_root)
+            }) {
+                return true;
+            }
+            if h.agents.values().any(|ag| matches_registered_root(&ag.cwd)) {
+                return true;
+            }
+            if h.discovered_projects
+                .iter()
+                .any(|proj| matches_registered_root(&proj.path))
+            {
+                return true;
+            }
+        } else {
+            return false;
+        }
+
+        if let Ok(projects) = self.projects.read() {
+            return projects.values().any(|proj| {
+                proj.host_id == host_id
+                    && proj
+                        .directories
+                        .iter()
+                        .any(|dir| matches_registered_root(dir))
+            });
+        }
+        false
+    }
+
     /// Rewind an agent conversation (and optionally restore workspace files) to strictly before `to_before_seq`.
     pub async fn rewind_agent_on_host(
         self: &Arc<Self>,
@@ -7301,6 +10615,274 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| "Rewind task terminated unexpectedly".to_string())?
+    }
+
+    /// Fork/branch an existing conversation on `req.host_id` (same directory or fresh git worktree).
+    pub async fn fork_agent_on_host(
+        self: &Arc<Self>,
+        req: ForkAgentRequest,
+    ) -> Result<ForkAgentResultView, String> {
+        if req.source_agent_id.starts_with("opt_") {
+            return Err("Wait for the session to finish initializing before forking".into());
+        }
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to fork this session".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = req.host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_forks.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before forking session".to_string()),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::ForkAgent {
+                    request_id: req_id,
+                    source_agent_id: req.source_agent_id,
+                    up_to_seq: req.up_to_seq,
+                    target: req.target,
+                    title: req.title,
+                    initial_prompt: req.initial_prompt,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_forks.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send fork request: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(60), ack_rx).await {
+                Ok(Ok(Ok(view))) => Ok(view),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while forking session".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_forks.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to fork session (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Fork task terminated unexpectedly".to_string())?
+    }
+
+    /// Non-mutating dry-run preview of a bidirectional Worktree <-> Local handoff on `req.host_id`.
+    pub async fn preview_worktree_handoff_on_host(
+        self: &Arc<Self>,
+        req: PreviewWorktreeHandoffRequest,
+    ) -> Result<WorktreeHandoffPreview, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to preview worktree handoff".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = req.host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_handoff_previews.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before previewing handoff".to_string()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::PreviewWorktreeHandoff {
+                    request_id: req_id,
+                    workspace_id: req.workspace_id,
+                    direction: req.direction,
+                    target_workspace_id: req.target_workspace_id,
+                    include_committed: req.include_committed,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_handoff_previews.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send handoff preview request: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
+                Ok(Ok(Ok(preview))) => Ok(preview),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while previewing handoff".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_handoff_previews.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon handoff preview (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Handoff preview task terminated unexpectedly".to_string())?
+    }
+
+    /// Execute a backup-protected bidirectional Worktree <-> Local handoff on `req.host_id`.
+    pub async fn execute_worktree_handoff_on_host(
+        self: &Arc<Self>,
+        req: ExecuteWorktreeHandoffRequest,
+    ) -> Result<WorktreeHandoffOutcome, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to execute worktree handoff".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = req.host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_handoff_executes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before executing handoff".to_string()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::ExecuteWorktreeHandoff {
+                    request_id: req_id,
+                    workspace_id: req.workspace_id,
+                    direction: req.direction,
+                    mode: req.mode,
+                    target_workspace_id: req.target_workspace_id,
+                    include_committed: req.include_committed,
+                    branch: req.branch,
+                    allow_three_way_conflicts: req.allow_three_way_conflicts,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_handoff_executes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send handoff execute request: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(60), ack_rx).await {
+                Ok(Ok(Ok(result))) => Ok(result),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while executing handoff".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_handoff_executes.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon handoff execution (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Handoff execute task terminated unexpectedly".to_string())?
     }
 
     /// Upgrade a remote Orbit daemon directly over the existing E2EE WebSocket/Relay channel
@@ -7519,6 +11101,10 @@ impl OrbitAppCore {
                             content: raw.content,
                             size_bytes: raw.size_bytes,
                             truncated: raw.truncated,
+                            etag: raw.etag,
+                            mtime_unix_ms: raw.mtime_unix_ms,
+                            writable: raw.writable,
+                            line_ending: raw.line_ending,
                         },
                     ))
                 })
@@ -7576,8 +11162,8 @@ impl OrbitAppCore {
                 return;
             }
 
-            // Shorter wait on local hosts so older local daemons fall back cleanly to local fs read
-            let timeout_secs = if is_local { 3 } else { 15 };
+            // Generous timeout on remote hosts for up to 25 MiB multimodal media previews
+            let timeout_secs = if is_local { 8 } else { 45 };
             let raw_res = match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await
             {
                 Ok(Ok(Ok(raw))) => Ok(raw),
@@ -7597,6 +11183,10 @@ impl OrbitAppCore {
                                 content: local.content,
                                 size_bytes: local.size_bytes,
                                 truncated: local.truncated,
+                                etag: local.etag,
+                                mtime_unix_ms: local.mtime_unix_ms,
+                                writable: local.writable,
+                                line_ending: local.line_ending,
                             }),
                             _ => Err(rpc_err),
                         }
@@ -7626,6 +11216,10 @@ impl OrbitAppCore {
                                 content: local.content,
                                 size_bytes: local.size_bytes,
                                 truncated: local.truncated,
+                                etag: local.etag,
+                                mtime_unix_ms: local.mtime_unix_ms,
+                                writable: local.writable,
+                                line_ending: local.line_ending,
                             }),
                             Ok(Err(e)) => Err(e),
                             Err(_) => Err("local file read task cancelled".to_string()),
@@ -7653,6 +11247,3348 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| "file read task cancelled".to_string())?
+    }
+
+    /// Fuzzy-search workspace code symbols on any connected local or remote Orbit host.
+    pub async fn search_workspace_symbols_on_host(
+        self: &Arc<Self>,
+        req: crate::contract::SearchWorkspaceSymbolsRequest,
+    ) -> Result<crate::contract::WorkspaceSymbolsView, String> {
+        let (session, is_local) = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            (h.session.clone(), h.is_local)
+        };
+
+        let Some(session) = session else {
+            return Ok(crate::contract::WorkspaceSymbolsView {
+                host_id: req.host_id,
+                cwd: req.cwd,
+                symbols: Vec::new(),
+                truncated: false,
+            });
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = req.host_id.clone();
+        let owned_cwd = req.cwd.clone();
+        let owned_query = req.query.clone();
+        let limit = if req.limit == 0 {
+            30
+        } else {
+            req.limit.min(100)
+        };
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_symbol_searches.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before searching symbols".to_string()),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let send_res = session
+                .send_wire(WireMessage::SearchWorkspaceSymbols {
+                    request_id: req_id,
+                    cwd: owned_cwd.clone(),
+                    query: owned_query,
+                    limit,
+                })
+                .await;
+
+            if let Err(e) = send_res {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_symbol_searches.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to request symbol search: {e}")));
+                return;
+            }
+
+            let timeout_secs = if is_local { 6 } else { 15 };
+            let outcome =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
+                    Ok(Ok(Ok((symbols, truncated)))) => Ok(crate::contract::WorkspaceSymbolsView {
+                        host_id: owned_host_id,
+                        cwd: owned_cwd,
+                        symbols,
+                        truncated,
+                    }),
+                    Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                    Ok(Err(_)) => Err("Host disconnected while searching symbols".to_string()),
+                    Err(_) => {
+                        if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&owned_host_id)
+                        {
+                            h.pending_symbol_searches.remove(&req_id);
+                        }
+                        Err("Timed out waiting for workspace symbol search".to_string())
+                    }
+                };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "symbol search task cancelled".to_string())?
+    }
+
+    /// Atomically write UTF-8 content to a workspace file on any connected host with optimistic concurrency.
+    pub async fn write_workspace_file_on_host(
+        self: &Arc<Self>,
+        req: WriteWorkspaceFileRequest,
+    ) -> Result<WorkspaceFileWriteResultView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to save files".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_file_writes.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before saving file".to_string()),
+                        None => Some(format!("host `{}` removed", req.host_id)),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let send_res = session
+                .send_wire(WireMessage::WriteWorkspaceFile {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                    path: req.path,
+                    content: req.content,
+                    expected_etag: req.expected_etag,
+                    force: req.force,
+                })
+                .await;
+
+            if let Err(e) = send_res {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_file_writes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send file write: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while saving file".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_file_writes.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to save file (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "file write task cancelled".to_string())?
+    }
+
+    async fn dispatch_path_rules_snapshot_on_host(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+    ) -> Result<PathRulesSnapshotView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_path_rules.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_path_rules.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_path_rules.remove(&req_id);
+                    }
+                    Err(format!(
+                        "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                    ))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    async fn dispatch_lifecycle_hooks_snapshot_on_host<F>(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: F,
+        op_label: &'static str,
+    ) -> Result<LifecycleHooksSnapshotView, String>
+    where
+        F: FnOnce(Uuid) -> WireMessage + Send + 'static,
+    {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_lifecycle_hooks.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lifecycle_hooks.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lifecycle_hooks.remove(&req_id);
+                    }
+                    Err(format!(
+                        "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                    ))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn list_lifecycle_hooks_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+    ) -> Result<LifecycleHooksSnapshotView, String> {
+        self.dispatch_lifecycle_hooks_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::ListLifecycleHooks { request_id, cwd },
+            "list lifecycle hooks",
+        )
+        .await
+    }
+
+    pub async fn upsert_lifecycle_hook_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+        hook: LifecycleHookRule,
+    ) -> Result<LifecycleHooksSnapshotView, String> {
+        self.dispatch_lifecycle_hooks_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::UpsertLifecycleHook {
+                request_id,
+                cwd,
+                hook,
+            },
+            "save lifecycle hook",
+        )
+        .await
+    }
+
+    pub async fn delete_lifecycle_hook_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+        hook_id: String,
+        scope: HookScope,
+    ) -> Result<LifecycleHooksSnapshotView, String> {
+        self.dispatch_lifecycle_hooks_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::DeleteLifecycleHook {
+                request_id,
+                cwd,
+                hook_id,
+                scope,
+            },
+            "delete lifecycle hook",
+        )
+        .await
+    }
+
+    pub async fn set_project_hooks_trust_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: String,
+        trusted: bool,
+    ) -> Result<LifecycleHooksSnapshotView, String> {
+        self.dispatch_lifecycle_hooks_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::SetProjectHooksTrust {
+                request_id,
+                cwd,
+                trusted,
+            },
+            "update project hooks trust",
+        )
+        .await
+    }
+
+    pub async fn test_lifecycle_hook_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: Option<String>,
+        hook_id: String,
+        sample_payload: serde_json::Value,
+    ) -> Result<HookExecutionRecord, String> {
+        let host_id = host_id.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to test lifecycle hook".to_string());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_lifecycle_hook_tests.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before test lifecycle hook".to_string()),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::TestLifecycleHook {
+                    request_id: req_id,
+                    cwd,
+                    hook_id,
+                    sample_payload,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lifecycle_hook_tests.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to test lifecycle hook: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(35), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => {
+                    Err("Host disconnected while waiting for hook dry-run test".to_string())
+                }
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lifecycle_hook_tests.remove(&req_id);
+                    }
+                    Err("Timed out waiting for lifecycle hook test result".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "test lifecycle hook task cancelled".to_string())?
+    }
+
+    async fn dispatch_event_triggers_snapshot_on_host<F>(
+        self: &Arc<Self>,
+        host_id: String,
+        build_msg: F,
+        op_label: &'static str,
+    ) -> Result<EventTriggersSnapshotView, String>
+    where
+        F: FnOnce(Uuid) -> WireMessage + Send + 'static,
+    {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_event_triggers.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session.send_wire(build_msg(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_event_triggers.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while waiting to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_event_triggers.remove(&req_id);
+                    }
+                    Err(format!(
+                        "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                    ))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn list_event_triggers_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<EventTriggersSnapshotView, String> {
+        self.dispatch_event_triggers_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::ListEventTriggers { request_id },
+            "list event triggers",
+        )
+        .await
+    }
+
+    pub async fn upsert_event_trigger_on_host(
+        self: &Arc<Self>,
+        req: UpsertEventTriggerRequest,
+    ) -> Result<EventTriggersSnapshotView, String> {
+        let host_id = req.host_id;
+        self.dispatch_event_triggers_snapshot_on_host(
+            host_id,
+            move |request_id| WireMessage::UpsertEventTrigger {
+                request_id,
+                trigger_id: req.trigger_id,
+                name: req.name,
+                source: req.source,
+                event_filters: req.event_filters,
+                prompt_template: req.prompt_template,
+                target: req.target,
+                secret: req.secret,
+                keep_existing_secret: req.keep_existing_secret,
+                github_poll: req.github_poll,
+                github_token: req.github_token,
+                keep_existing_token: req.keep_existing_token,
+                enabled: req.enabled,
+            },
+            "save event trigger",
+        )
+        .await
+    }
+
+    pub async fn delete_event_trigger_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        trigger_id: String,
+    ) -> Result<EventTriggersSnapshotView, String> {
+        self.dispatch_event_triggers_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::DeleteEventTrigger {
+                request_id,
+                trigger_id,
+            },
+            "delete event trigger",
+        )
+        .await
+    }
+
+    pub async fn test_event_trigger_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        trigger_id: String,
+        sample_event_type: String,
+        sample_payload: serde_json::Value,
+    ) -> Result<EventTriggerDelivery, String> {
+        let host_id = host_id.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to test event trigger".to_string());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_event_trigger_tests.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before test event trigger".to_string()),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::TestEventTrigger {
+                    request_id: req_id,
+                    trigger_id,
+                    sample_event_type,
+                    sample_payload,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_event_trigger_tests.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to test event trigger: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => {
+                    Err("Host disconnected while waiting for event trigger test".to_string())
+                }
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_event_trigger_tests.remove(&req_id);
+                    }
+                    Err("Timed out waiting for event trigger test result".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "test event trigger task cancelled".to_string())?
+    }
+
+    pub async fn list_path_rules_on_host(
+        self: &Arc<Self>,
+        host_id: String,
+        cwd: String,
+    ) -> Result<PathRulesSnapshotView, String> {
+        self.dispatch_path_rules_snapshot_on_host(
+            host_id,
+            move |request_id| WireMessage::ListPathRules { request_id, cwd },
+            "list path rules",
+        )
+        .await
+    }
+
+    pub async fn upsert_path_rule_on_host(
+        self: &Arc<Self>,
+        req: UpsertPathRuleRequest,
+    ) -> Result<PathRulesSnapshotView, String> {
+        self.dispatch_path_rules_snapshot_on_host(
+            req.host_id,
+            move |request_id| WireMessage::UpsertPathRule {
+                request_id,
+                cwd: req.cwd,
+                scope: req.scope,
+                name: req.name,
+                description: req.description,
+                trigger_mode: req.trigger_mode,
+                globs: req.globs,
+                enabled: req.enabled,
+                body: req.body,
+                expected_etag: req.expected_etag,
+            },
+            "save path rule",
+        )
+        .await
+    }
+
+    pub async fn delete_path_rule_on_host(
+        self: &Arc<Self>,
+        req: DeletePathRuleRequest,
+    ) -> Result<PathRulesSnapshotView, String> {
+        self.dispatch_path_rules_snapshot_on_host(
+            req.host_id,
+            move |request_id| WireMessage::DeletePathRule {
+                request_id,
+                cwd: req.cwd,
+                path: req.path,
+            },
+            "delete path rule",
+        )
+        .await
+    }
+
+    pub async fn match_path_rules_on_host(
+        self: &Arc<Self>,
+        req: MatchPathRulesRequest,
+    ) -> Result<MatchedPathRulesView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to match path rules".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_path_rule_matches.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before matching path rules".to_string()),
+                        None => Some(format!("host `{}` removed", req.host_id)),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let send_res = session
+                .send_wire(WireMessage::MatchPathRules {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                    active_paths: req.active_paths,
+                    manual_rule_names: req.manual_rule_names,
+                })
+                .await;
+
+            if let Err(e) = send_res {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_path_rule_matches.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to match path rules: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while matching path rules".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_path_rule_matches.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to match path rules (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "match path rules task cancelled".to_string())?
+    }
+
+    /// Arm a new one-shot conditional timer on any connected host.
+    pub async fn create_conditional_timer_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        duration_seconds: u64,
+        prompt: String,
+        condition: TimerCondition,
+    ) -> Result<ConditionalTimerRecord, String> {
+        let host_id = host_id.to_string();
+        let agent_id = agent_id.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to create a timer".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_timer_creates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before creating timer".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::CreateConditionalTimer {
+                    request_id: req_id,
+                    agent_id,
+                    duration_seconds,
+                    prompt,
+                    condition,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_timer_creates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to create conditional timer: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while creating timer".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_timer_creates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to create timer".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "create conditional timer task cancelled".to_string())?
+    }
+
+    /// List armed (and optionally resolved) one-shot conditional timers on any connected host.
+    pub async fn list_conditional_timers_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: Option<String>,
+        include_resolved: bool,
+    ) -> Result<Vec<ConditionalTimerRecord>, String> {
+        let host_id = host_id.to_string();
+        let update_host_cache = agent_id.is_none() && include_resolved;
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to list timers".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_timer_lists.insert(req_id, ack_tx);
+                        if update_host_cache {
+                            h.background_timer_list_reqs.insert(req_id);
+                        }
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing timers".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListConditionalTimers {
+                    request_id: req_id,
+                    agent_id,
+                    include_resolved,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_timer_lists.remove(&req_id);
+                    h.background_timer_list_reqs.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to list conditional timers: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while listing timers".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_timer_lists.remove(&req_id);
+                        h.background_timer_list_reqs.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to list timers".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "list conditional timers task cancelled".to_string())?
+    }
+
+    /// Manually cancel an armed conditional timer on any connected host.
+    pub async fn cancel_conditional_timer_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        timer_id: &str,
+    ) -> Result<ConditionalTimerRecord, String> {
+        self.dispatch_conditional_timer_update_rpc(
+            host_id.to_string(),
+            {
+                let timer_id = timer_id.to_string();
+                move |request_id| WireMessage::CancelConditionalTimer {
+                    request_id,
+                    timer_id,
+                }
+            },
+            "cancel conditional timer",
+        )
+        .await
+    }
+
+    /// Immediately fire an armed conditional timer on any connected host.
+    pub async fn fire_conditional_timer_now_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        timer_id: &str,
+    ) -> Result<ConditionalTimerRecord, String> {
+        self.dispatch_conditional_timer_update_rpc(
+            host_id.to_string(),
+            {
+                let timer_id = timer_id.to_string();
+                move |request_id| WireMessage::FireConditionalTimerNow {
+                    request_id,
+                    timer_id,
+                }
+            },
+            "fire conditional timer",
+        )
+        .await
+    }
+
+    async fn dispatch_conditional_timer_update_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+    ) -> Result<ConditionalTimerRecord, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_timer_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_timer_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_timer_updates.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for daemon to {op_label}"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    /// Fetch Guardian auto-approval policy and recent audit entries from any connected host.
+    pub async fn get_guardian_config_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<GuardianConfigSnapshotView, String> {
+        self.dispatch_guardian_config_rpc(
+            host_id.to_string(),
+            |request_id| WireMessage::GetGuardianConfig { request_id },
+            "load Guardian configuration",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Persist updated Guardian auto-approval policy on any connected host.
+    pub async fn update_guardian_config_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        config: GuardianPolicyConfig,
+    ) -> Result<GuardianConfigSnapshotView, String> {
+        self.dispatch_guardian_config_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::UpdateGuardianConfig { request_id, config },
+            "update Guardian configuration",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    async fn dispatch_guardian_config_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+        timeout: Duration,
+    ) -> Result<GuardianConfigSnapshotView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_guardian_configs.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_guardian_configs.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_guardian_configs.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for daemon to {op_label}"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    /// List configured bidirectional IM channels and active thread bindings on any connected host.
+    pub async fn list_im_channels_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<ImChannelsSnapshotView, String> {
+        self.dispatch_im_channels_rpc(
+            host_id.to_string(),
+            |request_id| WireMessage::ListImChannels { request_id },
+            "load IM channels",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Create or update an IM channel on any connected host.
+    pub async fn upsert_im_channel_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        req: UpsertImChannelRequest,
+    ) -> Result<ImChannelsSnapshotView, String> {
+        self.dispatch_im_channels_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::UpsertImChannel {
+                request_id,
+                channel_id: req.channel_id,
+                name: req.name,
+                platform: req.platform,
+                enabled: req.enabled,
+                app_id: req.app_id,
+                primary_secret: req.primary_secret,
+                signing_secret: req.signing_secret,
+                keep_existing_secrets: req.keep_existing_secrets,
+                allowed_chat_ids: req.allowed_chat_ids,
+                allowed_user_ids: req.allowed_user_ids,
+                default_workspace_cwd: req.default_workspace_cwd,
+                default_provider: req.default_provider,
+                default_mode: req.default_mode,
+                forward_approvals: req.forward_approvals,
+            },
+            "save IM channel",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Delete an IM channel and its bindings on any connected host.
+    pub async fn delete_im_channel_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        channel_id: String,
+    ) -> Result<ImChannelsSnapshotView, String> {
+        self.dispatch_im_channels_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::DeleteImChannel {
+                request_id,
+                channel_id,
+            },
+            "delete IM channel",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Send a test message through an IM channel on any connected host.
+    pub async fn test_im_channel_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        channel_id: String,
+        target_chat_id: String,
+        message: String,
+    ) -> Result<ImChannelTestResultView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to test IM channel".to_string());
+        };
+
+        let host_id_owned = host_id.to_string();
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id_owned) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_im_channel_tests.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before test IM channel".to_string()),
+                    None => Some(format!("host `{host_id_owned}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::TestImChannel {
+                    request_id: req_id,
+                    channel_id,
+                    target_chat_id,
+                    message,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id_owned)
+                {
+                    h.pending_im_channel_tests.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to test IM channel: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while testing IM channel".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id_owned)
+                    {
+                        h.pending_im_channel_tests.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to test IM channel".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "test IM channel task cancelled".to_string())?
+    }
+
+    async fn dispatch_im_channels_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+        timeout: Duration,
+    ) -> Result<ImChannelsSnapshotView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_im_channels.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_im_channels.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_im_channels.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for daemon to {op_label}"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    /// List registered mobile push devices and push preferences on any connected host.
+    pub async fn list_push_devices_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        self.dispatch_push_snapshot_rpc(
+            host_id.to_string(),
+            |request_id| WireMessage::ListPushDevices { request_id },
+            "load push notification settings",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Register or update a mobile push device token on any connected host.
+    pub async fn register_push_device_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        req: RegisterPushDeviceRequest,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        self.dispatch_push_snapshot_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::RegisterPushDevice {
+                request_id,
+                device_id: req.device_id,
+                platform: req.platform,
+                device_name: req.device_name,
+                device_token: req.device_token,
+                sandbox: req.sandbox,
+            },
+            "register push device",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Unregister a mobile push device on any connected host.
+    pub async fn unregister_push_device_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        device_id: String,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        self.dispatch_push_snapshot_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::UnregisterPushDevice {
+                request_id,
+                device_id,
+            },
+            "unregister push device",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Update push preferences and optional gateway auth token on any connected host.
+    pub async fn update_push_preferences_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        req: UpdatePushPreferencesRequest,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        self.dispatch_push_snapshot_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::UpdatePushPreferences {
+                request_id,
+                preferences: req.preferences,
+                gateway_auth_token: req.gateway_auth_token,
+                keep_existing_gateway_token: req.keep_existing_gateway_token,
+            },
+            "update push preferences",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Trigger a test push notification on any connected host.
+    pub async fn test_push_notification_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        device_id: Option<String>,
+    ) -> Result<PushTestResultView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to test push notification".to_string());
+        };
+
+        let host_id_owned = host_id.to_string();
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id_owned) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_push_tests.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before test push notification".to_string()),
+                    None => Some(format!("host `{host_id_owned}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::TestPushNotification {
+                    request_id: req_id,
+                    device_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id_owned)
+                {
+                    h.pending_push_tests.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send test push: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while sending test push".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id_owned)
+                    {
+                        h.pending_push_tests.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to send test push".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "test push notification task cancelled".to_string())?
+    }
+
+    pub fn list_push_devices_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        self.runtime
+            .block_on(async move { core.list_push_devices_on_host(&host).await })
+    }
+
+    pub fn register_push_device_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        req: RegisterPushDeviceRequest,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        self.runtime
+            .block_on(async move { core.register_push_device_on_host(&host, req).await })
+    }
+
+    pub fn unregister_push_device_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        device_id: &str,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        let dev = device_id.to_string();
+        self.runtime
+            .block_on(async move { core.unregister_push_device_on_host(&host, dev).await })
+    }
+
+    async fn dispatch_push_snapshot_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+        timeout: Duration,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_push_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_push_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_push_snapshots.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for daemon to {op_label}"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    /// List discovered and active LSP language servers for a workspace on any connected host.
+    pub async fn list_lsp_servers_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+    ) -> Result<Vec<LspServerStatus>, String> {
+        self.dispatch_lsp_servers_rpc(
+            host_id.to_string(),
+            {
+                let cwd = cwd.to_string();
+                move |request_id| WireMessage::ListLspServers { request_id, cwd }
+            },
+            "list LSP servers",
+            Duration::from_secs(20),
+        )
+        .await
+    }
+
+    /// Restart (or start fresh) a language server for a workspace on any connected host.
+    pub async fn restart_lsp_server_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        server_id: &str,
+    ) -> Result<Vec<LspServerStatus>, String> {
+        self.dispatch_lsp_servers_rpc(
+            host_id.to_string(),
+            {
+                let cwd = cwd.to_string();
+                let server_id = server_id.to_string();
+                move |request_id| WireMessage::RestartLspServer {
+                    request_id,
+                    cwd,
+                    server_id,
+                }
+            },
+            "restart LSP server",
+            Duration::from_secs(20),
+        )
+        .await
+    }
+
+    async fn dispatch_lsp_servers_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+        timeout: Duration,
+    ) -> Result<Vec<LspServerStatus>, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_servers.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_servers.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_servers.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for daemon to {op_label}"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    /// Query workspace or document symbols via LSP on any connected host.
+    pub async fn lsp_query_symbols_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        query: &str,
+        path: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<LspSymbolInfo>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let query = query.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to query LSP symbols".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_symbols.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before querying LSP symbols".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspQuerySymbols {
+                    request_id: req_id,
+                    cwd,
+                    query,
+                    path,
+                    limit,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_symbols.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP symbol query: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while querying LSP symbols".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_symbols.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP symbol query".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP symbol query task cancelled".to_string())?
+    }
+
+    /// Fetch LSP diagnostics for a file or workspace on any connected host.
+    pub async fn lsp_get_diagnostics_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: Option<String>,
+    ) -> Result<Vec<LspDiagnostic>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to inspect diagnostics".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_diagnostics.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before fetching diagnostics".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspGetDiagnostics {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_diagnostics.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP diagnostics request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while fetching diagnostics".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_diagnostics.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP diagnostics".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP diagnostics task cancelled".to_string())?
+    }
+
+    /// Resolve Go-to-Definition locations at a 1-based `(line, col)` on any connected host.
+    pub async fn lsp_goto_definition_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<LspLocation>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to resolve definitions".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_locations.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before resolving definition".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspGotoDefinition {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_locations.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!(
+                    "failed to send LSP goto-definition request: {e}"
+                )));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while resolving definition".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_locations.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP definition".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP goto-definition task cancelled".to_string())?
+    }
+
+    /// Fetch host-wide cost/token usage insights and quota depletion forecasts for any connected host.
+    pub async fn get_usage_insights_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        days: u32,
+    ) -> Result<UsageInsightsSnapshot, String> {
+        let host_id = host_id.to_string();
+        let days = days.clamp(1, 90);
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to inspect usage insights".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_usage_insights.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before fetching usage insights".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::GetUsageInsights {
+                    request_id: req_id,
+                    days,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_usage_insights.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send usage insights request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while fetching usage insights".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_usage_insights.remove(&req_id);
+                    }
+                    Err("Timed out waiting for usage insights".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "usage insights task cancelled".to_string())?
+    }
+
+    /// Fetch live context-window occupancy breakdown for an agent on any connected host.
+    pub async fn get_context_occupancy_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<ContextOccupancyBreakdown, String> {
+        let host_id = host_id.to_string();
+        let agent_id = agent_id.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to inspect context occupancy".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_context_occupancy.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => {
+                        Some("Host disconnected before fetching context occupancy".to_string())
+                    }
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::GetContextOccupancy {
+                    request_id: req_id,
+                    agent_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_context_occupancy.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!(
+                    "failed to send context occupancy request: {e}"
+                )));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while fetching context occupancy".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_context_occupancy.remove(&req_id);
+                    }
+                    Err("Timed out waiting for context occupancy".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "context occupancy task cancelled".to_string())?
+    }
+
+    pub async fn start_goal_run_on_host(
+        self: &Arc<Self>,
+        req: StartGoalRunRequest,
+    ) -> Result<GoalRunRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_goal_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before starting goal run".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::StartGoalRun {
+                    request_id: req_id,
+                    agent_id: req.agent_id,
+                    objective: req.objective,
+                    criteria: req.criteria,
+                    verify_command: req.verify_command,
+                    max_iterations: req.max_iterations,
+                    max_duration_secs: req.max_duration_secs,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_goal_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send StartGoalRun: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while starting goal run".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_goal_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for StartGoalRun reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "StartGoalRun task cancelled".to_string())?
+    }
+
+    pub async fn list_goal_runs_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: Option<String>,
+    ) -> Result<Vec<GoalRunRecord>, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let is_unfiltered = agent_id.is_none();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_goal_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing goal runs".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListGoalRuns {
+                    request_id: req_id,
+                    agent_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_goal_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListGoalRuns: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(goals))) => {
+                    if is_unfiltered {
+                        let updated = if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&host_id)
+                        {
+                            h.goal_runs = goals.clone();
+                            true
+                        } else {
+                            false
+                        };
+                        if updated {
+                            core.emit(|revision| CoreNotification::HostChanged {
+                                revision,
+                                host_id: host_id.clone(),
+                            });
+                        }
+                    }
+                    Ok(goals)
+                }
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err("Host disconnected while listing goal runs".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_goal_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ListGoalRuns reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ListGoalRuns task cancelled".to_string())?
+    }
+
+    pub async fn control_goal_run_on_host(
+        self: &Arc<Self>,
+        req: ControlGoalRunRequest,
+    ) -> Result<GoalRunRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_goal_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before controlling goal run".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ControlGoalRun {
+                    request_id: req_id,
+                    goal_id: req.goal_id,
+                    action: req.action,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_goal_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ControlGoalRun: {e}")));
+                return;
+            }
+            // VerifyNow can run up to verify timeout; allow generous wait
+            let out = match tokio::time::timeout(Duration::from_secs(130), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while controlling goal run".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_goal_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ControlGoalRun reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ControlGoalRun task cancelled".to_string())?
+    }
+
+    pub async fn start_monitor_watch_on_host(
+        self: &Arc<Self>,
+        req: StartMonitorWatchRequest,
+    ) -> Result<MonitorWatchRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_monitor_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before starting monitor".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::StartMonitorWatch {
+                    request_id: req_id,
+                    agent_id: req.agent_id,
+                    name: req.name,
+                    kind: req.kind,
+                    expires_in_secs: req.expires_in_secs,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_monitor_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send StartMonitorWatch: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while starting monitor".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_monitor_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for StartMonitorWatch reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "StartMonitorWatch task cancelled".to_string())?
+    }
+
+    pub async fn list_monitor_watches_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: Option<String>,
+    ) -> Result<Vec<MonitorWatchRecord>, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let is_unfiltered = agent_id.is_none();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_monitor_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing monitors".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListMonitorWatches {
+                    request_id: req_id,
+                    agent_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_monitor_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListMonitorWatches: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(monitors))) => {
+                    if is_unfiltered {
+                        let updated = if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&host_id)
+                        {
+                            h.monitor_watches = monitors.clone();
+                            true
+                        } else {
+                            false
+                        };
+                        if updated {
+                            core.emit(|revision| CoreNotification::HostChanged {
+                                revision,
+                                host_id: host_id.clone(),
+                            });
+                        }
+                    }
+                    Ok(monitors)
+                }
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err("Host disconnected while listing monitors".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_monitor_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ListMonitorWatches reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ListMonitorWatches task cancelled".to_string())?
+    }
+
+    pub async fn stop_monitor_watch_on_host(
+        self: &Arc<Self>,
+        req: StopMonitorWatchRequest,
+    ) -> Result<MonitorWatchRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_monitor_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before stopping monitor".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::StopMonitorWatch {
+                    request_id: req_id,
+                    monitor_id: req.monitor_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_monitor_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send StopMonitorWatch: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while stopping monitor".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_monitor_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for StopMonitorWatch reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "StopMonitorWatch task cancelled".to_string())?
+    }
+
+    pub async fn list_browser_sessions_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<BrowserSessionsSnapshotView, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => {
+                        Some("Host disconnected before listing browser sessions".to_string())
+                    }
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListBrowserSessions {
+                    request_id: req_id,
+                    include_screenshots: true,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListBrowserSessions: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while listing browser sessions".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_snapshots.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ListBrowserSessions reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ListBrowserSessions task cancelled".to_string())?
+    }
+
+    pub async fn create_browser_session_on_host(
+        self: &Arc<Self>,
+        req: CreateBrowserSessionRequest,
+    ) -> Result<BrowserSessionSummary, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_sessions.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => {
+                        Some("Host disconnected before creating browser session".to_string())
+                    }
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::CreateBrowserSession {
+                    request_id: req_id,
+                    agent_id: req.agent_id,
+                    initial_url: req.initial_url,
+                    headless: req.headless,
+                    viewport_width: req.viewport_width,
+                    viewport_height: req.viewport_height,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_sessions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send CreateBrowserSession: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while creating browser session".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_sessions.remove(&req_id);
+                    }
+                    Err("Timed out waiting for CreateBrowserSession reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "CreateBrowserSession task cancelled".to_string())?
+    }
+
+    pub async fn execute_browser_action_on_host(
+        self: &Arc<Self>,
+        req: ExecuteBrowserActionRequest,
+    ) -> Result<BrowserActionResponseView, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_actions.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => {
+                        Some("Host disconnected before executing browser action".to_string())
+                    }
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ExecuteBrowserAction {
+                    request_id: req_id,
+                    session_id: req.session_id,
+                    action: req.action,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_actions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ExecuteBrowserAction: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while executing browser action".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_actions.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ExecuteBrowserAction reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ExecuteBrowserAction task cancelled".to_string())?
+    }
+
+    pub async fn close_browser_session_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        session_id: &str,
+    ) -> Result<BrowserSessionsSnapshotView, String> {
+        let host_id = host_id.to_string();
+        let session_id = session_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before closing browser session".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::CloseBrowserSession {
+                    request_id: req_id,
+                    session_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send CloseBrowserSession: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while closing browser session".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_snapshots.remove(&req_id);
+                    }
+                    Err("Timed out waiting for CloseBrowserSession reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "CloseBrowserSession task cancelled".to_string())?
+    }
+
+    pub async fn update_browser_policy_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        policy: BrowserPolicyConfig,
+    ) -> Result<BrowserSessionsSnapshotView, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_browser_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before updating browser policy".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::UpdateBrowserPolicy {
+                    request_id: req_id,
+                    policy,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_browser_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send UpdateBrowserPolicy: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while updating browser policy".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_browser_snapshots.remove(&req_id);
+                    }
+                    Err("Timed out waiting for UpdateBrowserPolicy reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "UpdateBrowserPolicy task cancelled".to_string())?
+    }
+
+    async fn dispatch_workflow_update_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+        timeout_secs: u64,
+    ) -> Result<WorkflowRunRecord, String> {
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_workflow_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_workflow_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected during {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_workflow_updates.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for {op_label} reply"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn start_batch_fanout_on_host(
+        self: &Arc<Self>,
+        req: StartBatchFanoutRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::StartBatchFanout {
+                request_id,
+                name: req.name,
+                cwd: req.cwd,
+                csv_content: req.csv_content,
+                prompt_template: req.prompt_template,
+                provider: req.provider,
+                model: req.model,
+                mode: req.mode,
+                max_concurrency: req.max_concurrency.unwrap_or(3).clamp(1, 8),
+                isolated_worktree: req.isolated_worktree,
+            },
+            "StartBatchFanout",
+            30,
+        )
+        .await
+    }
+
+    pub async fn start_dag_workflow_on_host(
+        self: &Arc<Self>,
+        req: StartDagWorkflowRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::StartDagWorkflow {
+                request_id,
+                name: req.name,
+                cwd: req.cwd,
+                steps: req.steps,
+                default_provider: req.default_provider,
+                default_mode: req.default_mode,
+                max_concurrency: req.max_concurrency.unwrap_or(3).clamp(1, 8),
+            },
+            "StartDagWorkflow",
+            30,
+        )
+        .await
+    }
+
+    pub async fn start_best_of_n_on_host(
+        self: &Arc<Self>,
+        req: StartBestOfNRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::StartBestOfN {
+                request_id,
+                name: req.name,
+                cwd: req.cwd,
+                prompt: req.prompt,
+                candidates: req.candidates,
+                mode: req.mode,
+                verify_command: req.verify_command,
+            },
+            "StartBestOfN",
+            30,
+        )
+        .await
+    }
+
+    pub async fn list_workflow_runs_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        include_completed: bool,
+    ) -> Result<Vec<WorkflowRunRecord>, String> {
+        let host_id = host_id.to_string();
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_workflow_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing workflow runs".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListWorkflowRuns {
+                    request_id: req_id,
+                    include_completed,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_workflow_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ListWorkflowRuns: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(runs))) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        if include_completed {
+                            h.workflow_runs = runs.clone();
+                        } else {
+                            for run in &runs {
+                                upsert_cached_workflow_run(&mut h.workflow_runs, run.clone());
+                            }
+                        }
+                    }
+                    core.emit(|revision| CoreNotification::HostChanged {
+                        revision,
+                        host_id: host_id.clone(),
+                    });
+                    Ok(runs)
+                }
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err("Host disconnected while listing workflow runs".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_workflow_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ListWorkflowRuns reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "ListWorkflowRuns task cancelled".to_string())?
+    }
+
+    pub async fn cancel_workflow_run_on_host(
+        self: &Arc<Self>,
+        req: CancelWorkflowRunRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::CancelWorkflowRun {
+                request_id,
+                run_id: req.run_id,
+            },
+            "CancelWorkflowRun",
+            20,
+        )
+        .await
+    }
+
+    pub async fn select_best_of_n_winner_on_host(
+        self: &Arc<Self>,
+        req: SelectBestOfNWinnerRequest,
+    ) -> Result<WorkflowRunRecord, String> {
+        self.dispatch_workflow_update_rpc(
+            req.host_id,
+            move |request_id| WireMessage::SelectBestOfNWinner {
+                request_id,
+                run_id: req.run_id,
+                winner_step_id: req.winner_step_id,
+                apply_to_workspace: req.apply_to_workspace,
+            },
+            "SelectBestOfNWinner",
+            45,
+        )
+        .await
+    }
+
+    fn require_online_session(&self, host_id: &str) -> Result<HostSessionHandle, String> {
+        let guard = self
+            .hosts
+            .read()
+            .map_err(|_| "host state lock poisoned".to_string())?;
+        let h = guard
+            .get(host_id)
+            .ok_or_else(|| format!("host `{host_id}` not found"))?;
+        h.session
+            .clone()
+            .ok_or_else(|| format!("host `{host_id}` is currently offline"))
+    }
+
+    async fn dispatch_workspace_entry_mutation_on_host(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_file_mutations.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_file_mutations.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_file_mutations.remove(&req_id);
+                    }
+                    Err(format!(
+                        "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                    ))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn create_workspace_entry_on_host(
+        self: &Arc<Self>,
+        req: CreateWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        let host_id = req.host_id;
+        let cwd = req.cwd;
+        let path = req.path;
+        let is_dir = req.is_dir;
+        let initial_content = req.initial_content;
+        self.dispatch_workspace_entry_mutation_on_host(
+            host_id,
+            move |request_id| WireMessage::CreateWorkspaceEntry {
+                request_id,
+                cwd,
+                path,
+                is_dir,
+                initial_content,
+            },
+            "create workspace entry",
+        )
+        .await
+    }
+
+    pub async fn rename_workspace_entry_on_host(
+        self: &Arc<Self>,
+        req: RenameWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        let host_id = req.host_id;
+        let cwd = req.cwd;
+        let old_path = req.old_path;
+        let new_path = req.new_path;
+        self.dispatch_workspace_entry_mutation_on_host(
+            host_id,
+            move |request_id| WireMessage::RenameWorkspaceEntry {
+                request_id,
+                cwd,
+                old_path,
+                new_path,
+            },
+            "rename workspace entry",
+        )
+        .await
+    }
+
+    pub async fn delete_workspace_entry_on_host(
+        self: &Arc<Self>,
+        req: DeleteWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        let host_id = req.host_id;
+        let cwd = req.cwd;
+        let path = req.path;
+        self.dispatch_workspace_entry_mutation_on_host(
+            host_id,
+            move |request_id| WireMessage::DeleteWorkspaceEntry {
+                request_id,
+                cwd,
+                path,
+            },
+            "delete workspace entry",
+        )
+        .await
     }
 
     /// Execute an ephemeral side question (`/btw`) on the target host and stream chunks via `event_tx`.
@@ -7766,6 +14702,29 @@ impl OrbitAppCore {
         ))
     }
 
+    pub fn fork_agent_blocking(
+        self: &Arc<Self>,
+        req: ForkAgentRequest,
+    ) -> Result<ForkAgentResultView, String> {
+        self.runtime.block_on(self.fork_agent_on_host(req))
+    }
+
+    pub fn preview_worktree_handoff_blocking(
+        self: &Arc<Self>,
+        req: PreviewWorktreeHandoffRequest,
+    ) -> Result<WorktreeHandoffPreview, String> {
+        self.runtime
+            .block_on(self.preview_worktree_handoff_on_host(req))
+    }
+
+    pub fn execute_worktree_handoff_blocking(
+        self: &Arc<Self>,
+        req: ExecuteWorktreeHandoffRequest,
+    ) -> Result<WorktreeHandoffOutcome, String> {
+        self.runtime
+            .block_on(self.execute_worktree_handoff_on_host(req))
+    }
+
     pub fn read_workspace_file_blocking(
         self: &Arc<Self>,
         host_id: &str,
@@ -7774,6 +14733,324 @@ impl OrbitAppCore {
     ) -> Result<WorkspaceFileView, String> {
         self.runtime
             .block_on(self.read_workspace_file_on_host(host_id, cwd, path))
+    }
+
+    pub fn search_workspace_symbols_blocking(
+        self: &Arc<Self>,
+        req: crate::contract::SearchWorkspaceSymbolsRequest,
+    ) -> Result<crate::contract::WorkspaceSymbolsView, String> {
+        self.runtime
+            .block_on(self.search_workspace_symbols_on_host(req))
+    }
+
+    pub fn write_workspace_file_blocking(
+        self: &Arc<Self>,
+        req: WriteWorkspaceFileRequest,
+    ) -> Result<WorkspaceFileWriteResultView, String> {
+        self.runtime
+            .block_on(self.write_workspace_file_on_host(req))
+    }
+
+    pub fn create_workspace_entry_blocking(
+        self: &Arc<Self>,
+        req: CreateWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        self.runtime
+            .block_on(self.create_workspace_entry_on_host(req))
+    }
+
+    pub fn rename_workspace_entry_blocking(
+        self: &Arc<Self>,
+        req: RenameWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        self.runtime
+            .block_on(self.rename_workspace_entry_on_host(req))
+    }
+
+    pub fn delete_workspace_entry_blocking(
+        self: &Arc<Self>,
+        req: DeleteWorkspaceEntryRequest,
+    ) -> Result<WorkspaceEntryMutationResultView, String> {
+        self.runtime
+            .block_on(self.delete_workspace_entry_on_host(req))
+    }
+
+    /// Discover the full project instruction hierarchy (`CLAUDE.md` / `AGENTS.md` / `AGENTS.override.md` / etc.)
+    /// for `cwd` on any connected host.
+    pub async fn list_instruction_files_on_host(
+        self: &Arc<Self>,
+        req: ListInstructionFilesRequest,
+    ) -> Result<InstructionFilesSnapshotView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to inspect project instructions".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_instruction_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing instructions".to_string()),
+                    None => Some(format!("host `{}` removed", req.host_id)),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::ListInstructionFiles {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_instruction_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to list instruction files: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while listing instructions".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_instruction_lists.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to list project instructions (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "list instructions task cancelled".to_string())?
+    }
+
+    /// Read an allowlisted instruction file on any connected host.
+    pub async fn read_instruction_file_on_host(
+        self: &Arc<Self>,
+        req: ReadInstructionFileRequest,
+    ) -> Result<InstructionFileContentView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to read instruction file".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_instruction_reads.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before reading instruction file".to_string()),
+                    None => Some(format!("host `{}` removed", req.host_id)),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::ReadInstructionFile {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                    path: req.path,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_instruction_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to read instruction file: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while reading instruction file".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_instruction_reads.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to read instruction file (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "read instruction file task cancelled".to_string())?
+    }
+
+    /// Atomically save an allowlisted instruction file on any connected host with optimistic etag concurrency.
+    pub async fn save_instruction_file_on_host(
+        self: &Arc<Self>,
+        req: SaveInstructionFileRequest,
+    ) -> Result<InstructionFileSavedView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to save instruction file".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_instruction_saves.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before saving instruction file".to_string()),
+                    None => Some(format!("host `{}` removed", req.host_id)),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::SaveInstructionFile {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                    path: req.path,
+                    content: req.content,
+                    expected_etag: req.expected_etag,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_instruction_saves.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to save instruction file: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while saving instruction file".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_instruction_saves.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to save instruction file (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "save instruction file task cancelled".to_string())?
+    }
+
+    pub fn list_instruction_files_blocking(
+        self: &Arc<Self>,
+        req: ListInstructionFilesRequest,
+    ) -> Result<InstructionFilesSnapshotView, String> {
+        self.runtime
+            .block_on(self.list_instruction_files_on_host(req))
+    }
+
+    pub fn read_instruction_file_blocking(
+        self: &Arc<Self>,
+        req: ReadInstructionFileRequest,
+    ) -> Result<InstructionFileContentView, String> {
+        self.runtime
+            .block_on(self.read_instruction_file_on_host(req))
+    }
+
+    pub fn save_instruction_file_blocking(
+        self: &Arc<Self>,
+        req: SaveInstructionFileRequest,
+    ) -> Result<InstructionFileSavedView, String> {
+        self.runtime
+            .block_on(self.save_instruction_file_on_host(req))
     }
 
     pub fn ask_side_question_with_callback<F>(
@@ -8508,6 +15785,10 @@ fn build_workspace_file_view(
         content: raw.content,
         size_bytes: raw.size_bytes,
         truncated: raw.truncated,
+        etag: raw.etag,
+        mtime_unix_ms: raw.mtime_unix_ms,
+        writable: raw.writable,
+        line_ending: raw.line_ending,
         highlighted_lines,
         markdown_blocks,
     }
@@ -8628,6 +15909,109 @@ fn clear_pending_queue_op_by_req(
     changed
 }
 
+fn upsert_cached_artifact(list: &mut Vec<ArtifactSummary>, artifact: ArtifactSummary) {
+    if let Some(slot) = list
+        .iter_mut()
+        .find(|existing| existing.artifact_id == artifact.artifact_id)
+    {
+        *slot = artifact;
+    } else {
+        list.insert(0, artifact);
+    }
+    list.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.artifact_id.cmp(&b.artifact_id))
+    });
+}
+
+fn upsert_cached_goal(list: &mut Vec<GoalRunRecord>, goal: GoalRunRecord) {
+    if let Some(slot) = list
+        .iter_mut()
+        .find(|existing| existing.goal_id == goal.goal_id)
+    {
+        *slot = goal;
+    } else {
+        list.insert(0, goal);
+    }
+    list.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| b.goal_id.cmp(&a.goal_id))
+    });
+}
+
+fn upsert_cached_monitor(list: &mut Vec<MonitorWatchRecord>, monitor: MonitorWatchRecord) {
+    if let Some(slot) = list
+        .iter_mut()
+        .find(|existing| existing.monitor_id == monitor.monitor_id)
+    {
+        *slot = monitor;
+    } else {
+        list.insert(0, monitor);
+    }
+    list.sort_by(|a, b| {
+        b.created_at_ms
+            .cmp(&a.created_at_ms)
+            .then_with(|| b.monitor_id.cmp(&a.monitor_id))
+    });
+}
+
+fn upsert_cached_workflow_run(list: &mut Vec<WorkflowRunRecord>, run: WorkflowRunRecord) {
+    if let Some(slot) = list
+        .iter_mut()
+        .find(|existing| existing.run_id == run.run_id)
+    {
+        *slot = run;
+    } else {
+        list.insert(0, run);
+    }
+    list.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| b.run_id.cmp(&a.run_id))
+    });
+    list.truncate(100);
+}
+
+fn provider_subagent_logical_key(payload: &TimelinePayload) -> Option<(&'static str, String)> {
+    match payload {
+        TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
+            Some(("thinking", item_id.clone()))
+        }
+        TimelinePayload::AssistantMessage { item_id, .. } if !item_id.is_empty() => {
+            Some(("msg", item_id.clone()))
+        }
+        TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
+            Some(("tool", call_id.clone()))
+        }
+        TimelinePayload::UserPrompt { message_id, .. } if !message_id.is_empty() => {
+            Some(("user", message_id.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn collect_provider_subagent_resubscriptions(h: &HostMemoryState) -> Vec<(String, String, u64)> {
+    let mut keys: Vec<(String, String)> = h.subscribed_provider_subagents.iter().cloned().collect();
+    if let Some(ref active) = h.active_provider_subagent
+        && !keys.contains(active)
+    {
+        keys.push(active.clone());
+    }
+    keys.sort();
+    keys.into_iter()
+        .map(|(parent_id, sub_id)| {
+            let since_seq = h
+                .provider_subagent_timelines
+                .get(&(parent_id.clone(), sub_id.clone()))
+                .and_then(|list| list.iter().map(|e| e.seq).max())
+                .unwrap_or(0);
+            (parent_id, sub_id, since_seq)
+        })
+        .collect()
+}
+
 fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_attachment_acks.drain() {
         let _ = tx.send(Err(reason.to_string()));
@@ -8635,10 +16019,158 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_file_reads.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_symbol_searches.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_file_writes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_file_mutations.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_instruction_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_instruction_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_instruction_saves.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (_, tx) in h.pending_rewinds.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_forks.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_handoff_previews.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_handoff_executes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (_, tx) in h.pending_git_repo_inspections.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_acp_probes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_acp_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_mcp_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_mcp_probes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, (_, tx)) in h.pending_artifact_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.unsolicited_unfiltered_artifact_reqs.clear();
+    for (_, tx) in h.pending_artifact_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_artifact_upserts.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_artifact_deletes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, (_, tx)) in h.pending_managed_skills_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.background_managed_skills_reqs.clear();
+    for (_, tx) in h.pending_managed_skill_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_path_rules.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_path_rule_matches.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.path_rules_by_cwd.clear();
+    for (_, tx) in h.pending_lsp_servers.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_symbols.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_diagnostics.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_locations.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_usage_insights.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_context_occupancy.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lifecycle_hooks.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lifecycle_hook_tests.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_timer_creates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_timer_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_timer_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.background_timer_list_reqs.clear();
+    for (_, tx) in h.pending_guardian_configs.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_goal_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_goal_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_monitor_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_event_triggers.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_event_trigger_tests.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_monitor_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_browser_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_browser_sessions.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_browser_actions.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_workflow_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_workflow_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_im_channels.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_im_channel_tests.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_push_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_push_tests.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {
@@ -8654,6 +16186,39 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_upgrade_terminals.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+}
+
+fn upsert_conditional_timer_record(
+    timers: &mut Vec<ConditionalTimerRecord>,
+    timer: ConditionalTimerRecord,
+) {
+    if let Some(slot) = timers.iter_mut().find(|t| t.timer_id == timer.timer_id) {
+        *slot = timer;
+    } else {
+        timers.push(timer);
+    }
+    timers.sort_by(|a, b| match (a.state.is_armed(), b.state.is_armed()) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (true, true) => a
+            .fire_at_ms
+            .cmp(&b.fire_at_ms)
+            .then_with(|| a.created_at_ms.cmp(&b.created_at_ms)),
+        (false, false) => b
+            .resolved_at_ms
+            .unwrap_or(b.created_at_ms)
+            .cmp(&a.resolved_at_ms.unwrap_or(a.created_at_ms)),
+    });
+    // Keep all armed timers plus at most 100 recent resolved timers in memory.
+    let mut resolved_seen = 0usize;
+    timers.retain(|t| {
+        if t.state == ConditionalTimerState::Armed {
+            true
+        } else {
+            resolved_seen += 1;
+            resolved_seen <= 100
+        }
+    });
 }
 
 fn version_supports_remote_attachments(raw: &str) -> bool {
@@ -9137,6 +16702,101 @@ fn is_pending_optimistic_prompt(ev: &TimelineEvent) -> bool {
     ev.seq == 0 && matches!(ev.payload, TimelinePayload::UserPrompt { .. })
 }
 
+pub(crate) fn coalesce_timeline_slice(events: &[TimelineEvent]) -> Vec<TimelineEvent> {
+    let mut coalesced = Vec::with_capacity(events.len());
+    for ev in events {
+        coalesce_or_push_timeline(&mut coalesced, ev.clone());
+    }
+    coalesced
+}
+
+/// Merge persisted replica events with live in-memory events without dropping unpersisted middle
+/// sequence numbers or duplicating optimistic `seq == 0` user prompts already persisted on disk.
+pub(crate) fn merge_persisted_and_memory_timeline(
+    persisted: Vec<TimelineEvent>,
+    mem_events: Vec<TimelineEvent>,
+) -> Vec<TimelineEvent> {
+    if persisted.is_empty() {
+        return mem_events;
+    }
+    if mem_events.is_empty() {
+        return persisted;
+    }
+
+    let max_epoch = persisted
+        .iter()
+        .chain(mem_events.iter())
+        .filter(|e| e.seq > 0)
+        .map(|e| e.epoch)
+        .max()
+        .unwrap_or(0);
+
+    let mut positive: Vec<TimelineEvent> = Vec::with_capacity(persisted.len() + mem_events.len());
+    let mut persisted_seqs: HashSet<u64> = HashSet::with_capacity(persisted.len());
+    let mut persisted_prompt_ids: HashSet<String> = HashSet::new();
+    let mut persisted_prompt_texts: HashSet<String> = HashSet::new();
+
+    for ev in persisted {
+        if ev.seq > 0 {
+            if max_epoch > 0 && ev.epoch < max_epoch {
+                continue;
+            }
+            persisted_seqs.insert(ev.seq);
+            if let TimelinePayload::UserPrompt {
+                message_id, text, ..
+            } = &ev.payload
+            {
+                if !message_id.is_empty() {
+                    persisted_prompt_ids.insert(message_id.clone());
+                }
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    persisted_prompt_texts.insert(trimmed.to_string());
+                }
+            }
+            positive.push(ev);
+        }
+    }
+
+    let mut optimistic: Vec<TimelineEvent> = Vec::new();
+    for ev in mem_events {
+        if ev.seq > 0 {
+            if max_epoch > 0 && ev.epoch < max_epoch {
+                continue;
+            }
+            if persisted_seqs.insert(ev.seq) {
+                if let TimelinePayload::UserPrompt {
+                    message_id, text, ..
+                } = &ev.payload
+                {
+                    if !message_id.is_empty() {
+                        persisted_prompt_ids.insert(message_id.clone());
+                    }
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        persisted_prompt_texts.insert(trimmed.to_string());
+                    }
+                }
+                positive.push(ev);
+            }
+        } else {
+            let is_dup_prompt = matches!(
+                &ev.payload,
+                TimelinePayload::UserPrompt { message_id, text, .. }
+                    if (!message_id.is_empty() && persisted_prompt_ids.contains(message_id))
+                        || (!text.trim().is_empty() && persisted_prompt_texts.contains(text.trim()))
+            );
+            if !is_dup_prompt {
+                optimistic.push(ev);
+            }
+        }
+    }
+
+    positive.sort_by_key(|e| e.seq);
+    positive.extend(optimistic);
+    positive
+}
+
 fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: TimelineEvent) -> usize {
     let active_end = list
         .iter()
@@ -9526,6 +17186,7 @@ fn render_timeline_event_view(
             title,
             detail,
             allowed_decisions,
+            guardian_assessment,
         } => Some(TimelineItemView::PermissionRequest {
             seq: ev.seq,
             request_id: request_id.clone(),
@@ -9533,6 +17194,7 @@ fn render_timeline_event_view(
             detail: detail.clone(),
             allowed_decisions: allowed_decisions.clone(),
             resolved_decision: all_resolved_perms.get(request_id).cloned(),
+            guardian_assessment: guardian_assessment.clone(),
             timestamp_ms: ts_ms,
         }),
         TimelinePayload::QuestionRequest {
@@ -9685,6 +17347,7 @@ fn agent_stage_meta_unchanged(prev: &AgentSummary, next: &AgentSummary) -> bool 
         && prev.provider == next.provider
         && prev.model == next.model
         && prev.effort == next.effort
+        && prev.fast_mode == next.fast_mode
         && prev.mode == next.mode
         && prev.status == next.status
         && prev.parent_agent_id == next.parent_agent_id
@@ -9701,6 +17364,8 @@ fn agent_stage_meta_unchanged(prev: &AgentSummary, next: &AgentSummary) -> bool 
         && prev.pinned_order == next.pinned_order
         && prev.handle == next.handle
         && prev.task_summary == next.task_summary
+        && prev.forked_from_agent_id == next.forked_from_agent_id
+        && prev.forked_at_seq == next.forked_at_seq
         && prev.queued_prompts.len() == next.queued_prompts.len()
         && prev
             .queued_prompts
@@ -9745,15 +17410,23 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         && (a.attention != AttentionState::None
             || (a.latest_seq > 0 && a.latest_seq > effective_seen_seq));
     let worktree_branch = a.labels.get("orbit.worktree_branch").cloned();
+    let provider_label = if a.provider == ProviderKind::Acp {
+        a.acp_agent_id
+            .clone()
+            .unwrap_or_else(|| a.provider.display_name().to_string())
+    } else {
+        a.provider.display_name().to_string()
+    };
     AgentCardView {
         agent_id: a.agent_id.clone(),
         workspace_id: a.workspace_id.clone(),
         cwd: a.cwd.clone(),
         title: a.title.clone(),
         provider: a.provider,
-        provider_label: a.provider.display_name().to_string(),
+        provider_label,
         model: a.model.clone(),
         effort: a.effort,
+        fast_mode: a.fast_mode,
         mode: a.mode.clone(),
         status: a.status.clone(),
         status_label,
@@ -9779,6 +17452,9 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         cluster_suggestion: a.cluster_suggestion.clone(),
         worktree_branch,
         task_summary: a.task_summary.clone(),
+        forked_from_agent_id: a.forked_from_agent_id.clone(),
+        forked_at_seq: a.forked_at_seq,
+        acp_agent_id: a.acp_agent_id.clone(),
     }
 }
 
@@ -9906,6 +17582,20 @@ fn default_client_models_map() -> HashMap<ProviderKind, Vec<ModelOption>> {
             },
         ],
     );
+    for &kind in ProviderKind::all() {
+        m.entry(kind).or_insert_with(|| {
+            crate::catalog::fallback_provider_catalog(kind)
+                .models
+                .into_iter()
+                .map(|spec| ModelOption {
+                    id: spec.id,
+                    label: spec.label,
+                    description: (!spec.description.is_empty()).then_some(spec.description),
+                    is_default: spec.is_default,
+                })
+                .collect()
+        });
+    }
     m
 }
 
@@ -10213,15 +17903,17 @@ mod tests {
         core.pair_host(&uri).expect("pair");
 
         let detail = core.host_detail("host_mobile").expect("detail");
-        assert_eq!(detail.provider_catalogs.len(), 3);
+        assert_eq!(detail.provider_catalogs.len(), ProviderKind::all().len());
 
         let opt_id = core.create_agent_with_config(CreateAgentRequest {
             host_id: "host_mobile",
             cwd: "/Users/jess/Code/orbit",
             extra_dirs: Vec::new(),
             provider: ProviderKind::ClaudeCode,
+            acp_agent_id: None,
             model: Some("claude-opus-5-5".into()),
             effort: Some(ReasoningEffort::High),
+            fast_mode: None,
             mode: SessionMode::AcceptEdits,
             initial_prompt: "Run clippy",
             initial_display_prompt: None,
@@ -10492,6 +18184,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -10503,6 +18196,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -10606,6 +18302,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -10617,6 +18314,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -10748,6 +18448,7 @@ mod tests {
                     provider: ProviderKind::Codex,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Running {
                         turn_id: "t2".into(),
@@ -10761,6 +18462,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -10812,6 +18516,7 @@ mod tests {
                                 output_preview: None,
                             },
                             allowed_decisions: vec!["allow_once".into()],
+                            guardian_assessment: None,
                         },
                     },
                     TimelineEvent {
@@ -10925,6 +18630,7 @@ mod tests {
                     provider: ProviderKind::Codex,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -10936,6 +18642,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 2,
                     created_at: now,
                     updated_at: now,
@@ -11027,6 +18736,7 @@ mod tests {
                     provider: ProviderKind::ClaudeCode,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -11038,6 +18748,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -11072,6 +18785,7 @@ mod tests {
                     provider: ProviderKind::Codex,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Initializing,
                     parent_agent_id: None,
@@ -11083,6 +18797,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -11110,6 +18827,7 @@ mod tests {
                     provider: ProviderKind::Codex,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -11121,6 +18839,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -11291,6 +19012,7 @@ mod tests {
                 provider: ProviderKind::Codex,
                 model: None,
                 effort: None,
+                fast_mode: false,
                 mode: SessionMode::Default,
                 status: AgentStatus::Running {
                     turn_id: "t1".into(),
@@ -11304,6 +19026,9 @@ mod tests {
                 handle: None,
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: None,
                 timeline_epoch: 1,
                 created_at: now,
                 updated_at: now,
@@ -11465,6 +19190,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     created_at: now,
@@ -11476,6 +19202,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: None,
@@ -11514,6 +19243,7 @@ mod tests {
                     provider: ProviderKind::ClaudeCode,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Running {
                         turn_id: "t1".into(),
@@ -11527,6 +19257,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: Some("ag_parent".into()),
@@ -11599,6 +19332,7 @@ mod tests {
             provider: ProviderKind::Antigravity,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status,
             parent_agent_id: None,
@@ -11621,6 +19355,9 @@ mod tests {
             handle: None,
             cluster_suggestion: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
         };
 
         let pref = ClientThreadPref {
@@ -11740,6 +19477,346 @@ mod tests {
     }
 
     #[test]
+    fn provider_subagent_turns_settles_active_items_when_subagent_completed() {
+        let now = Utc::now();
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_sub_settled".into(),
+                hostname: "sub-box".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.provider_subagents.insert(
+                "ag_parent".into(),
+                vec![orbit_protocol::ProviderSubagentDescriptor {
+                    subagent_id: "ps_done".into(),
+                    parent_agent_id: "ag_parent".into(),
+                    parent_subagent_id: None,
+                    title: "Finished Worker".into(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Completed,
+                    created_at: now,
+                    updated_at: now,
+                }],
+            );
+            mem.provider_subagent_timelines.insert(
+                ("ag_parent".into(), "ps_done".into()),
+                vec![
+                    ProviderSubagentEvent {
+                        seq: 1,
+                        parent_agent_id: "ag_parent".into(),
+                        subagent_id: "ps_done".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::ToolCall {
+                            call_id: "tc_open".into(),
+                            status: ToolCallStatus::Running,
+                            detail: ToolCallDetail::FileRead {
+                                path: "/repo/src/lib.rs".into(),
+                                start_line: None,
+                                end_line: None,
+                            },
+                            background_task: None,
+                        },
+                    },
+                    ProviderSubagentEvent {
+                        seq: 2,
+                        parent_agent_id: "ag_parent".into(),
+                        subagent_id: "ps_done".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "msg_streaming".into(),
+                            text: "Final summary text.".into(),
+                            streaming: true,
+                        },
+                    },
+                ],
+            );
+            core.hosts
+                .write()
+                .expect("hosts write lock")
+                .insert("h_sub_settled".into(), mem);
+        }
+
+        let turns = core.provider_subagent_turns(
+            "h_sub_settled",
+            "ag_parent",
+            "ps_done",
+            Some("Check lib.rs"),
+        );
+        assert_eq!(turns.len(), 1);
+        assert!(
+            !turns[0].has_active_item,
+            "completed provider subagent must settle leftover active items"
+        );
+        assert!(turns[0].terminal_reply.is_some());
+        for seg in &turns[0].live_segments {
+            if let stage::TurnLiveSegmentView::StepGroup {
+                has_running_step, ..
+            } = seg
+            {
+                assert!(!has_running_step);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_subagent_timelines_evicts_oldest_finished_while_pinning_running() {
+        let now = Utc::now();
+        let mut mem = HostMemoryState::new(SavedHostProfile {
+            host_id: "h_sub_lru".into(),
+            hostname: "lru-box".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 7474,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            state: HostConnectionState::OnlineDirect,
+        });
+
+        let mut descriptors = Vec::new();
+        for idx in 0..12 {
+            let sub_id = format!("ps_{idx}");
+            let status = if idx == 0 || idx == 1 {
+                orbit_protocol::ProviderSubagentStatus::Running
+            } else {
+                orbit_protocol::ProviderSubagentStatus::Completed
+            };
+            descriptors.push(orbit_protocol::ProviderSubagentDescriptor {
+                subagent_id: sub_id.clone(),
+                parent_agent_id: "ag_parent".into(),
+                parent_subagent_id: None,
+                title: format!("Worker {idx}"),
+                subtitle: None,
+                status,
+                created_at: now,
+                updated_at: now,
+            });
+            let key = ("ag_parent".to_string(), sub_id.clone());
+            mem.provider_subagent_timelines.insert(
+                key.clone(),
+                vec![ProviderSubagentEvent {
+                    seq: 1,
+                    parent_agent_id: "ag_parent".into(),
+                    subagent_id: sub_id,
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: format!("msg_{idx}"),
+                        text: format!("Output {idx}"),
+                        streaming: false,
+                    },
+                }],
+            );
+            mem.touch_provider_subagent_lru(&key);
+        }
+        mem.provider_subagents
+            .insert("ag_parent".into(), descriptors);
+
+        // Touch finished `ps_2` so it becomes most recently accessed and must survive eviction.
+        let touched = ("ag_parent".to_string(), "ps_2".to_string());
+        mem.touch_provider_subagent_lru(&touched);
+        mem.enforce_provider_subagent_timeline_bounds(Some(&touched));
+
+        assert_eq!(mem.provider_subagent_timelines.len(), 8);
+        // Running subagents `ps_0` and `ps_1` stay pinned despite being oldest.
+        assert!(
+            mem.provider_subagent_timelines
+                .contains_key(&("ag_parent".into(), "ps_0".into()))
+        );
+        assert!(
+            mem.provider_subagent_timelines
+                .contains_key(&("ag_parent".into(), "ps_1".into()))
+        );
+        // Recently touched finished `ps_2` stays cached.
+        assert!(mem.provider_subagent_timelines.contains_key(&touched));
+        // Oldest untouched finished entries (`ps_3`..=`ps_6`) were evicted.
+        for evicted_idx in 3..=6 {
+            assert!(
+                !mem.provider_subagent_timelines
+                    .contains_key(&("ag_parent".into(), format!("ps_{evicted_idx}"))),
+                "expected ps_{evicted_idx} to be evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_subagent_active_open_tab_is_pinned_against_lru_eviction() {
+        let now = Utc::now();
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let open_key = ("ag_parent".to_string(), "ps_open".to_string());
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_sub_pin".into(),
+                hostname: "pin-box".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.provider_subagents.insert(
+                "ag_parent".into(),
+                vec![orbit_protocol::ProviderSubagentDescriptor {
+                    subagent_id: "ps_open".into(),
+                    parent_agent_id: "ag_parent".into(),
+                    parent_subagent_id: None,
+                    title: "Inspected Finished Subagent".into(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Completed,
+                    created_at: now,
+                    updated_at: now,
+                }],
+            );
+            mem.provider_subagent_timelines.insert(
+                open_key.clone(),
+                vec![ProviderSubagentEvent {
+                    seq: 1,
+                    parent_agent_id: "ag_parent".into(),
+                    subagent_id: "ps_open".into(),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "msg_open".into(),
+                        text: "Pinned transcript".into(),
+                        streaming: false,
+                    },
+                }],
+            );
+            mem.touch_provider_subagent_lru(&open_key);
+            core.hosts
+                .write()
+                .expect("hosts write lock")
+                .insert("h_sub_pin".into(), mem);
+        }
+
+        // Mark `ps_open` as the actively open subagent tab via `open_provider_subagent_timeline`.
+        core.open_provider_subagent_timeline("h_sub_pin", "ag_parent", "ps_open");
+
+        // Stream 10 other finished subagents while `ps_open` stays open in the side panel.
+        {
+            let mut hosts = core.hosts.write().expect("hosts write lock");
+            let mem = hosts.get_mut("h_sub_pin").expect("host exists");
+            for idx in 0..10 {
+                let sub_id = format!("ps_other_{idx}");
+                mem.provider_subagents
+                    .entry("ag_parent".into())
+                    .or_default()
+                    .push(orbit_protocol::ProviderSubagentDescriptor {
+                        subagent_id: sub_id.clone(),
+                        parent_agent_id: "ag_parent".into(),
+                        parent_subagent_id: None,
+                        title: format!("Other {idx}"),
+                        subtitle: None,
+                        status: orbit_protocol::ProviderSubagentStatus::Completed,
+                        created_at: now,
+                        updated_at: now,
+                    });
+                let key = ("ag_parent".to_string(), sub_id.clone());
+                mem.provider_subagent_timelines.insert(
+                    key.clone(),
+                    vec![ProviderSubagentEvent {
+                        seq: 1,
+                        parent_agent_id: "ag_parent".into(),
+                        subagent_id: sub_id,
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: format!("msg_other_{idx}"),
+                            text: format!("Other output {idx}"),
+                            streaming: false,
+                        },
+                    }],
+                );
+                mem.touch_provider_subagent_lru(&key);
+                mem.enforce_provider_subagent_timeline_bounds(Some(&key));
+            }
+
+            assert_eq!(mem.provider_subagent_timelines.len(), 8);
+            assert!(
+                mem.provider_subagent_timelines.contains_key(&open_key),
+                "actively open finished subagent must remain pinned against LRU eviction"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_subagent_turns_settles_failed_subagent_running_tool_as_failed() {
+        let now = Utc::now();
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_sub_failed".into(),
+                hostname: "fail-box".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.provider_subagents.insert(
+                "ag_parent".into(),
+                vec![orbit_protocol::ProviderSubagentDescriptor {
+                    subagent_id: "ps_fail".into(),
+                    parent_agent_id: "ag_parent".into(),
+                    parent_subagent_id: None,
+                    title: "Failing Worker".into(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Failed,
+                    created_at: now,
+                    updated_at: now,
+                }],
+            );
+            mem.provider_subagent_timelines.insert(
+                ("ag_parent".into(), "ps_fail".into()),
+                vec![ProviderSubagentEvent {
+                    seq: 1,
+                    parent_agent_id: "ag_parent".into(),
+                    subagent_id: "ps_fail".into(),
+                    timestamp: now,
+                    payload: TimelinePayload::ToolCall {
+                        call_id: "tc_stuck".into(),
+                        status: ToolCallStatus::Running,
+                        detail: ToolCallDetail::Shell {
+                            command: "cargo test".into(),
+                            cwd: None,
+                            exit_code: None,
+                            output_preview: None,
+                        },
+                        background_task: None,
+                    },
+                }],
+            );
+            core.hosts
+                .write()
+                .expect("hosts write lock")
+                .insert("h_sub_failed".into(), mem);
+        }
+
+        let turns =
+            core.provider_subagent_turns("h_sub_failed", "ag_parent", "ps_fail", Some("Run tests"));
+        assert_eq!(turns.len(), 1);
+        assert!(!turns[0].has_active_item);
+        assert!(turns[0].has_error);
+        assert_eq!(turns[0].work_counts.failed_count, 1);
+    }
+
+    #[test]
     fn coalescing_subscriber_collapses_fleet_and_host_bursts() {
         let core = OrbitAppCore::open_in_memory().expect("open");
         let received: Arc<Mutex<Vec<CoreNotification>>> = Arc::new(Mutex::new(Vec::new()));
@@ -11822,6 +19899,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::FullAccess,
                     status: AgentStatus::Running {
                         turn_id: "t1".into(),
@@ -11846,6 +19924,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                 },
             );
             hosts.insert("h_seen".into(), mem);
@@ -11903,6 +19984,7 @@ mod tests {
             provider: ProviderKind::Antigravity,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status: AgentStatus::Running {
                 turn_id: "t1".into(),
@@ -11927,6 +20009,9 @@ mod tests {
             handle: None,
             cluster_suggestion: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
         };
         {
             let mut hosts = core.hosts.write().expect("hosts");
@@ -12005,6 +20090,7 @@ mod tests {
                         provider: ProviderKind::Antigravity,
                         model: None,
                         effort: None,
+                        fast_mode: false,
                         mode: SessionMode::FullAccess,
                         status: if idx == 0 {
                             AgentStatus::Running {
@@ -12033,6 +20119,9 @@ mod tests {
                         handle: None,
                         cluster_suggestion: None,
                         task_summary: None,
+                        forked_from_agent_id: None,
+                        forked_at_seq: None,
+                        acp_agent_id: None,
                     },
                 );
             }
@@ -12397,6 +20486,7 @@ mod tests {
                 provider: ProviderKind::Antigravity,
                 model: None,
                 effort: None,
+                fast_mode: false,
                 mode: SessionMode::Default,
                 status: AgentStatus::Running {
                     turn_id: "t2".into(),
@@ -12420,6 +20510,9 @@ mod tests {
                 handle: None,
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: None,
                 queued_prompts: Vec::new(),
             },
         );
@@ -12572,5 +20665,988 @@ mod tests {
                 .expect("cursor reset"),
             0
         );
+    }
+
+    #[test]
+    fn search_messages_cross_host_enrichment_cjk_punctuation_and_cleanup() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+
+        // Set up two hosts across a multi-host fleet
+        let mut mem_a = HostMemoryState::new(SavedHostProfile {
+            host_id: "host_devbox".into(),
+            hostname: "devbox.internal".into(),
+            custom_name: Some("Devbox".into()),
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk_a".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            state: HostConnectionState::OnlineDirect,
+        });
+        mem_a.initial_agents_hydrated = true;
+        mem_a.agents.insert(
+            "ag_db".into(),
+            AgentSummary {
+                agent_id: "ag_db".into(),
+                workspace_id: "ws_orbit".into(),
+                cwd: "/Users/dev/code/orbit".into(),
+                title: "SQLite FTS5 Search".into(),
+                provider: ProviderKind::Antigravity,
+                model: None,
+                effort: None,
+                fast_mode: false,
+                mode: SessionMode::Default,
+                status: AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 2,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: Some(now),
+                read_seq: 2,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: None,
+                queued_prompts: Vec::new(),
+            },
+        );
+        let mut mem_b = HostMemoryState::new(SavedHostProfile {
+            host_id: "host_mac".into(),
+            hostname: "mac-mini".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk_b".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            state: HostConnectionState::OnlineDirect,
+        });
+        mem_b.initial_agents_hydrated = true;
+        mem_b.agents.insert(
+            "ag_web".into(),
+            AgentSummary {
+                agent_id: "ag_web".into(),
+                workspace_id: "ws_web".into(),
+                cwd: "/srv/projects/orbit-web".into(),
+                title: "Cmd+K UI".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: None,
+                effort: None,
+                fast_mode: false,
+                mode: SessionMode::Default,
+                status: AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 1,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: Some(now),
+                read_seq: 1,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: None,
+                queued_prompts: Vec::new(),
+            },
+        );
+
+        {
+            let mut hosts = core.hosts.write().expect("hosts write");
+            hosts.insert("host_devbox".into(), mem_a);
+            hosts.insert("host_mac".into(), mem_b);
+        }
+        core.upsert_project(
+            Some("proj_orbit"),
+            "host_devbox",
+            "Orbit Core",
+            vec!["/Users/dev/code/orbit".into()],
+        )
+        .expect("upsert project");
+
+        // Index replica messages across both hosts
+        core.store
+            .upsert_replica_timeline_events_batch_for_host(
+                "host_devbox",
+                &[
+                    TimelineEvent {
+                        seq: 1,
+                        epoch: 0,
+                        agent_id: "ag_db".into(),
+                        turn_id: Some("t1".into()),
+                        timestamp: now,
+                        payload: TimelinePayload::UserPrompt {
+                            message_id: "m1".into(),
+                            text: "请实现全文检索以及 foo-bar 路由解析与 a/b 测试".into(),
+                            badges: Vec::new(),
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 2,
+                        epoch: 0,
+                        agent_id: "ag_db".into(),
+                        turn_id: Some("t1".into()),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "a1".into(),
+                            text: "Added nebula_fts_engine with BM25 scoring and \"unclosed quote safety.".into(),
+                            streaming: false,
+                        },
+                    },
+                ],
+            )
+            .expect("seed host_devbox");
+
+        core.store
+            .upsert_replica_timeline_event_for_host(
+                "host_mac",
+                &TimelineEvent {
+                    seq: 1,
+                    epoch: 0,
+                    agent_id: "ag_web".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "a2".into(),
+                        text: "Wired nebula_fts_engine into CommandPalette with 80ms debounce."
+                            .into(),
+                        streaming: false,
+                    },
+                },
+            )
+            .expect("seed host_mac");
+
+        // Cross-host query returns enriched hits from both hosts
+        let hits = core.search_messages("nebula_fts_engine", 10);
+        assert_eq!(hits.len(), 2);
+        let devbox_hit = hits
+            .iter()
+            .find(|h| h.host_id == "host_devbox")
+            .expect("devbox hit");
+        assert_eq!(devbox_hit.host_name, "Devbox");
+        assert_eq!(devbox_hit.agent_id, "ag_db");
+        assert_eq!(devbox_hit.title, "SQLite FTS5 Search");
+        assert_eq!(devbox_hit.project_name, "Orbit Core");
+        assert_eq!(devbox_hit.role, "assistant");
+        assert!(
+            devbox_hit
+                .snippet
+                .contains("<mark>nebula_fts_engine</mark>")
+        );
+        assert!(!devbox_hit.updated_at_rfc3339.is_empty());
+
+        let mac_hit = hits
+            .iter()
+            .find(|h| h.host_id == "host_mac")
+            .expect("mac hit");
+        assert_eq!(mac_hit.host_name, "mac-mini");
+        assert_eq!(mac_hit.project_name, "orbit-web");
+
+        // CJK + punctuation queries through OrbitAppCore
+        let cjk_hits = core.search_messages("全文检索", 10);
+        assert_eq!(cjk_hits.len(), 1);
+        assert_eq!(cjk_hits[0].agent_id, "ag_db");
+        assert!(cjk_hits[0].snippet.contains("<mark>全文检索</mark>"));
+
+        assert_eq!(core.search_messages("foo-bar", 10).len(), 1);
+        assert_eq!(core.search_messages("a/b", 10).len(), 1);
+        assert_eq!(core.search_messages("\"unclosed", 10).len(), 1);
+        assert!(core.search_messages("   ", 10).is_empty());
+
+        // Rewinding replica timeline removes rewound events from search results
+        core.store
+            .replace_replica_timeline_for_host("host_devbox", "ag_db", &[])
+            .expect("rewind empty");
+        assert!(core.search_messages("全文检索", 10).is_empty());
+        assert_eq!(core.search_messages("nebula_fts_engine", 10).len(), 1);
+
+        // Deleting agent removes remaining hit
+        core.delete_agent("host_mac", "ag_web");
+        assert!(core.search_messages("nebula_fts_engine", 10).is_empty());
+
+        // Orphaned / unknown-host FTS entries never resurface with empty host_id or placeholder title
+        core.store
+            .upsert_replica_timeline_event_for_host(
+                "host_removed",
+                &TimelineEvent {
+                    seq: 1,
+                    epoch: 0,
+                    agent_id: "ag_ghost".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: "g1".into(),
+                        text: "ghost_orphan_sentinel_token".into(),
+                        badges: Vec::new(),
+                    },
+                },
+            )
+            .expect("seed ghost host");
+        core.store
+            .upsert_replica_timeline_event_for_host(
+                "host_devbox",
+                &TimelineEvent {
+                    seq: 1,
+                    epoch: 0,
+                    agent_id: "ag_missing_from_mem".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: "g2".into(),
+                        text: "ghost_orphan_sentinel_token".into(),
+                        badges: Vec::new(),
+                    },
+                },
+            )
+            .expect("seed missing agent");
+        assert!(
+            core.search_messages("ghost_orphan_sentinel_token", 10)
+                .is_empty(),
+            "orphaned host/agent FTS rows must never surface in search_messages"
+        );
+    }
+
+    #[test]
+    fn agent_forked_updates_host_state_and_projects_provenance_card() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        let host_id = "host_fork";
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            hosts.insert(
+                host_id.into(),
+                HostMemoryState::new(SavedHostProfile {
+                    host_id: host_id.into(),
+                    hostname: "devbox".into(),
+                    custom_name: None,
+                    ssh_alias: None,
+                    route_mode: HostRouteMode::Auto,
+                    remote_daemon_port: 7474,
+                    custom_direct_endpoint: None,
+                    daemon_pubkey_b64: String::new(),
+                    direct_endpoints: vec![],
+                    relay_url: None,
+                    state: HostConnectionState::OnlineDirect,
+                }),
+            );
+        }
+
+        let req_id = Uuid::new_v4();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            hosts
+                .get_mut(host_id)
+                .expect("host")
+                .pending_forks
+                .insert(req_id, tx);
+        }
+
+        let forked_ws = WorkspaceSummary {
+            workspace_id: "ws_wt_fork".into(),
+            title: "Auth (fork)".into(),
+            cwd: "/tmp/wt/auth-fork".into(),
+            git_branch: Some("orbit/fork-auth".into()),
+            is_worktree: true,
+            updated_at: now,
+            source_cwd: Some("/repo/auth".into()),
+            base_ref: Some("main".into()),
+            parent_workspace_id: Some("ws_main".into()),
+            archived_at: None,
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+            mission_goal: None,
+            project_root: Some("/repo/auth".into()),
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
+            is_curated: false,
+        };
+        let forked_agent = AgentSummary {
+            agent_id: "ag_fork_child".into(),
+            workspace_id: "ws_wt_fork".into(),
+            cwd: "/tmp/wt/auth-fork".into(),
+            title: "Auth (fork)".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("sonnet".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 12,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::from([("orbit.worktree_branch".into(), "orbit/fork-auth".into())]),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 12,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: Some("fork".into()),
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: Some("ag_parent_origin".into()),
+            forked_at_seq: Some(8),
+            acp_agent_id: None,
+        };
+
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::AgentForked {
+                request_id: req_id,
+                agent: forked_agent,
+                workspace: Some(forked_ws),
+            },
+        );
+
+        let res = rx
+            .blocking_recv()
+            .expect("oneshot")
+            .expect("fork succeeded");
+        assert_eq!(res.agent.agent_id, "ag_fork_child");
+        assert_eq!(
+            res.agent.forked_from_agent_id.as_deref(),
+            Some("ag_parent_origin")
+        );
+        assert_eq!(res.agent.forked_at_seq, Some(8));
+        assert_eq!(
+            res.workspace.as_ref().map(|w| w.workspace_id.as_str()),
+            Some("ws_wt_fork")
+        );
+
+        let detail = core.host_detail(host_id).expect("detail");
+        assert_eq!(
+            detail.last_created_agent_id.as_deref(),
+            Some("ag_fork_child")
+        );
+        let card = detail
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "ag_fork_child")
+            .expect("projected card");
+        assert_eq!(
+            card.forked_from_agent_id.as_deref(),
+            Some("ag_parent_origin")
+        );
+        assert_eq!(card.forked_at_seq, Some(8));
+        assert!(
+            detail
+                .workspaces
+                .iter()
+                .any(|w| w.workspace_id == "ws_wt_fork")
+        );
+    }
+
+    #[test]
+    fn update_agent_full_guards_optimistic_id_and_uses_narrow_invalidation() {
+        use std::sync::atomic::AtomicU64;
+
+        struct EventCounter {
+            fleet: AtomicU64,
+            host: AtomicU64,
+            timeline: AtomicU64,
+        }
+        impl CoreEventSubscriber for EventCounter {
+            fn on_notification(&self, notification: CoreNotification) {
+                match notification {
+                    CoreNotification::FleetChanged { .. } => {
+                        self.fleet.fetch_add(1, Ordering::Relaxed);
+                    }
+                    CoreNotification::HostChanged { .. } => {
+                        self.host.fetch_add(1, Ordering::Relaxed);
+                    }
+                    CoreNotification::TimelineChanged { .. } => {
+                        self.timeline.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let core = OrbitAppCore::open_in_memory().expect("core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
+        let offer = PairingOffer {
+            host_id: "host_opt".into(),
+            hostname: "devbox".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let opt_id = core.create_agent_with_config(CreateAgentRequest {
+            host_id: "host_opt",
+            cwd: "/repo",
+            extra_dirs: Vec::new(),
+            provider: ProviderKind::ClaudeCode,
+            acp_agent_id: None,
+            model: Some("claude-opus-4-6".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: Some(false),
+            mode: SessionMode::AcceptEdits,
+            initial_prompt: "hello",
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree_branch: None,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
+        });
+        assert!(opt_id.starts_with("opt_"));
+
+        // Clear any pending queued wire messages from `create_agent`
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            if let Some(h) = hosts.get_mut("host_opt") {
+                h.pending_outbox.clear();
+            }
+        }
+
+        let counter = Arc::new(EventCounter {
+            fleet: AtomicU64::new(0),
+            host: AtomicU64::new(0),
+            timeline: AtomicU64::new(0),
+        });
+        core.subscribe(counter.clone());
+
+        // Toggle fast mode on an optimistic `opt_*` agent:
+        // 1. Updates local optimistic agent state
+        // 2. Does NOT dispatch a wire UpdateAgent for `opt_*`
+        // 3. Emits FleetChanged + HostChanged WITHOUT forcing TimelineChanged
+        core.set_agent_fast_mode("host_opt", &opt_id, true);
+
+        {
+            let hosts = core.hosts.read().expect("hosts");
+            let h = hosts.get("host_opt").expect("host");
+            assert!(h.agents.get(&opt_id).expect("opt agent").fast_mode);
+            assert!(
+                h.pending_outbox.is_empty(),
+                "update_agent_full must not dispatch wire messages for opt_* agents"
+            );
+        }
+        assert!(counter.fleet.load(Ordering::Relaxed) >= 1);
+        assert!(counter.host.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            counter.timeline.load(Ordering::Relaxed),
+            0,
+            "metadata-only update_agent_full must not force TimelineChanged"
+        );
+    }
+
+    #[test]
+    fn historical_artifact_read_never_downgrades_cache_and_unknown_snapshot_merges() {
+        use orbit_protocol::{ArtifactDetail, ArtifactKind, ArtifactRevisionMeta, ArtifactSummary};
+
+        let core = OrbitAppCore::open_in_memory().expect("open");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = orbit_crypto::PairingOffer {
+            host_id: "host_art".into(),
+            hostname: "art-box".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "secret".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let now = Utc::now();
+        let art_a_v5 = ArtifactSummary {
+            artifact_id: "art_a".into(),
+            workspace_id: "ws_1".into(),
+            agent_id: Some("ag_1".into()),
+            title: "Dashboard".into(),
+            kind: ArtifactKind::Html,
+            language: Some("html".into()),
+            mime_type: Some("text/html".into()),
+            resource_uri: None,
+            version: 5,
+            byte_len: 100,
+            created_at: now,
+            updated_at: now,
+        };
+        let art_b_v1 = ArtifactSummary {
+            artifact_id: "art_b".into(),
+            workspace_id: "ws_2".into(),
+            agent_id: Some("ag_2".into()),
+            title: "Spec".into(),
+            kind: ArtifactKind::Markdown,
+            language: None,
+            mime_type: Some("text/markdown".into()),
+            resource_uri: None,
+            version: 1,
+            byte_len: 50,
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Seed host cache via registered unsolicited unfiltered ListArtifacts request
+        let init_req_id = Uuid::new_v4();
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            hosts
+                .get_mut("host_art")
+                .expect("host")
+                .unsolicited_unfiltered_artifact_reqs
+                .insert(init_req_id);
+        }
+        core.handle_inbound_wire(
+            "host_art",
+            WireMessage::ArtifactsSnapshot {
+                request_id: init_req_id,
+                artifacts: vec![art_a_v5.clone(), art_b_v1.clone()],
+            },
+        );
+        assert_eq!(core.cached_artifacts("host_art", None, None).len(), 2);
+
+        // 1. Reading historical v1 of art_a (latest is v5) must NOT downgrade cache to v1
+        let mut art_a_v1_summary = art_a_v5.clone();
+        art_a_v1_summary.version = 1;
+        core.handle_inbound_wire(
+            "host_art",
+            WireMessage::ArtifactContent {
+                request_id: Uuid::new_v4(),
+                artifact: ArtifactDetail {
+                    summary: art_a_v1_summary,
+                    content: "<div>old v1</div>".into(),
+                    revisions: vec![
+                        ArtifactRevisionMeta {
+                            version: 5,
+                            created_at: now,
+                            summary_note: None,
+                            byte_len: 100,
+                        },
+                        ArtifactRevisionMeta {
+                            version: 1,
+                            created_at: now,
+                            summary_note: None,
+                            byte_len: 17,
+                        },
+                    ],
+                },
+            },
+        );
+        let after_hist = core.cached_artifacts("host_art", Some("ws_1"), None);
+        assert_eq!(after_hist.len(), 1);
+        assert_eq!(after_hist[0].version, 5);
+
+        // 2. Late/unknown timed-out filtered snapshot for ws_1 must merge, NOT wipe ws_2!
+        core.handle_inbound_wire(
+            "host_art",
+            WireMessage::ArtifactsSnapshot {
+                request_id: Uuid::new_v4(),
+                artifacts: vec![art_a_v5],
+            },
+        );
+        let after_late = core.cached_artifacts("host_art", None, None);
+        assert_eq!(
+            after_late.len(),
+            2,
+            "unknown/late filtered snapshot must not wipe other workspaces' cached artifacts"
+        );
+    }
+
+    #[test]
+    fn is_registered_local_cwd_enforces_local_registered_roots() {
+        let core = OrbitAppCore::open_in_memory().expect("core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
+        let offer = PairingOffer {
+            host_id: "host_local_cwd_test".into(),
+            hostname: "macbook".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let registered_dir =
+            std::env::temp_dir().join(format!("orbit_reg_cwd_{}", uuid::Uuid::new_v4()));
+        let nested_dir = registered_dir.join("packages").join("web");
+        let unregistered_dir =
+            std::env::temp_dir().join(format!("orbit_unreg_cwd_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&nested_dir).expect("mkdir nested");
+        std::fs::create_dir_all(&unregistered_dir).expect("mkdir unreg");
+
+        let reg_str = registered_dir.to_string_lossy().to_string();
+        let nested_str = nested_dir.to_string_lossy().to_string();
+        let unreg_str = unregistered_dir.to_string_lossy().to_string();
+
+        // Remote host (`is_local == false`) must always be rejected even when registered.
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut("host_local_cwd_test").expect("host");
+            h.is_local = false;
+            h.discovered_projects.push(DiscoveredProject {
+                path: reg_str.clone(),
+                name: "reg".into(),
+                git_branch: None,
+                is_git_repo: true,
+                last_modified_unix: 0,
+                nested_git_repos: Vec::new(),
+            });
+        }
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", &reg_str));
+
+        // Flip to local host: registered root + nested subdir pass; `/`, `~`, `$HOME`, and unregistered fail.
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut("host_local_cwd_test").expect("host");
+            h.is_local = true;
+        }
+        assert!(core.is_registered_local_cwd("host_local_cwd_test", &reg_str));
+        assert!(core.is_registered_local_cwd("host_local_cwd_test", &nested_str));
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", "/"));
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", "~"));
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", ""));
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", &unreg_str));
+        if let Some(home) = crate::desktop_ops::resolve_user_home() {
+            assert!(!core.is_registered_local_cwd("host_local_cwd_test", &home.to_string_lossy()));
+        }
+
+        let _ = std::fs::remove_dir_all(&registered_dir);
+        let _ = std::fs::remove_dir_all(&unregistered_dir);
+    }
+
+    #[test]
+    fn provider_subagent_catchup_paginates_resubscribes_and_cleans_on_agent_deleted() {
+        let core = OrbitAppCore::open_in_memory().expect("core");
+        let now = Utc::now();
+        let host_id = "h_sub_page";
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: host_id.into(),
+                hostname: "local".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag_p1".into(),
+                AgentSummary {
+                    agent_id: "ag_p1".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/tmp".into(),
+                    title: "Parent".into(),
+                    provider: ProviderKind::Antigravity,
+                    acp_agent_id: None,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    latest_seq: 1,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    parent_host_id: None,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    queued_prompts: Vec::new(),
+                },
+            );
+            mem.caught_up_agents.insert("ag_p1".into());
+            mem.rewound_agents.insert("ag_p1".into());
+            hosts.insert(host_id.into(), mem);
+        }
+
+        // 1. Open provider subagent timeline -> tracks subscription and queues SubscribeProviderSubagent
+        core.open_provider_subagent_timeline(host_id, "ag_p1", "sub_a");
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            assert!(
+                h.subscribed_provider_subagents
+                    .contains(&("ag_p1".to_string(), "sub_a".to_string()))
+            );
+            // Clear initial outbox so we can observe follow-up pagination messages cleanly
+            h.pending_outbox.clear();
+        }
+
+        // 2. Catchup page 1 with `has_more = true` must enqueue follow-up `since_seq = 2`
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineCatchup {
+                request_id: Uuid::new_v4(),
+                parent_agent_id: "ag_p1".into(),
+                subagent_id: "sub_a".into(),
+                events: vec![
+                    ProviderSubagentEvent {
+                        seq: 1,
+                        parent_agent_id: "ag_p1".into(),
+                        subagent_id: "sub_a".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m1".into(),
+                            text: "page1-a".into(),
+                            streaming: false,
+                        },
+                    },
+                    ProviderSubagentEvent {
+                        seq: 2,
+                        parent_agent_id: "ag_p1".into(),
+                        subagent_id: "sub_a".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m2".into(),
+                            text: "page1-b".into(),
+                            streaming: false,
+                        },
+                    },
+                ],
+                has_more: true,
+            },
+        );
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            assert!(
+                h.pending_outbox.iter().any(|m| matches!(
+                    m,
+                    WireMessage::SubscribeProviderSubagent {
+                        parent_agent_id,
+                        subagent_id,
+                        since_seq: 2,
+                        ..
+                    } if parent_agent_id == "ag_p1" && subagent_id == "sub_a"
+                )),
+                "has_more=true must trigger follow-up SubscribeProviderSubagent with since_seq=2"
+            );
+            h.pending_outbox.clear();
+
+            // 3. Reconnect helper must resubscribe active provider subagent at latest seq = 2
+            let resubs = collect_provider_subagent_resubscriptions(h);
+            assert_eq!(resubs, vec![("ag_p1".into(), "sub_a".into(), 2)]);
+        }
+
+        // 4. Empty catchup with `has_more = true` must NOT infinite-loop
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineCatchup {
+                request_id: Uuid::new_v4(),
+                parent_agent_id: "ag_p1".into(),
+                subagent_id: "sub_a".into(),
+                events: Vec::new(),
+                has_more: true,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts");
+            let h = hosts.get(host_id).expect("host");
+            assert!(
+                h.pending_outbox.is_empty(),
+                "empty catchup must not loop even if has_more=true"
+            );
+        }
+
+        // 5. Logical item replacement on live/catchup (mutated seq replaces older superseded seq)
+        //    and page-boundary live event ahead of catchup still triggers follow-up pagination!
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineLive {
+                event: ProviderSubagentEvent {
+                    seq: 10,
+                    parent_agent_id: "ag_p1".into(),
+                    subagent_id: "sub_a".into(),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantThinking {
+                        item_id: "wake_th_1".into(),
+                        text: "v1".into(),
+                    },
+                },
+            },
+        );
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineLive {
+                event: ProviderSubagentEvent {
+                    seq: 12,
+                    parent_agent_id: "ag_p1".into(),
+                    subagent_id: "sub_a".into(),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantThinking {
+                        item_id: "wake_th_1".into(),
+                        text: "v2-expanded".into(),
+                    },
+                },
+            },
+        );
+        {
+            let timeline = core.provider_subagent_timeline(host_id, "ag_p1", "sub_a");
+            let th_events: Vec<_> = timeline
+                .iter()
+                .filter(|e| matches!(&e.payload, TimelinePayload::AssistantThinking { item_id, .. } if item_id == "wake_th_1"))
+                .collect();
+            assert_eq!(
+                th_events.len(),
+                1,
+                "superseded seq 10 must be replaced in memory by seq 12"
+            );
+            assert_eq!(th_events[0].seq, 12);
+        }
+
+        // Now catchup delivers older page [seq 3, seq 4] with has_more=true while live seq 12 is already cached!
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            hosts.get_mut(host_id).expect("host").pending_outbox.clear();
+        }
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::ProviderSubagentTimelineCatchup {
+                request_id: Uuid::new_v4(),
+                parent_agent_id: "ag_p1".into(),
+                subagent_id: "sub_a".into(),
+                events: vec![
+                    ProviderSubagentEvent {
+                        seq: 3,
+                        parent_agent_id: "ag_p1".into(),
+                        subagent_id: "sub_a".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m3".into(),
+                            text: "page2-a".into(),
+                            streaming: false,
+                        },
+                    },
+                    ProviderSubagentEvent {
+                        seq: 4,
+                        parent_agent_id: "ag_p1".into(),
+                        subagent_id: "sub_a".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m4".into(),
+                            text: "page2-b".into(),
+                            streaming: false,
+                        },
+                    },
+                ],
+                has_more: true,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts");
+            let h = hosts.get(host_id).expect("host");
+            assert!(
+                h.pending_outbox.iter().any(|m| matches!(
+                    m,
+                    WireMessage::SubscribeProviderSubagent {
+                        parent_agent_id,
+                        subagent_id,
+                        since_seq: 4,
+                        ..
+                    } if parent_agent_id == "ag_p1" && subagent_id == "sub_a"
+                )),
+                "catchup inserting new seqs below live seq 12 must still paginate with since_seq=4"
+            );
+        }
+
+        // 6. Evicting finished timelines removes them from `subscribed_provider_subagents` (prevents reconnect thrash)
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            let mut descs = Vec::new();
+            for i in 0..10 {
+                let sid = format!("sub_evict_{i}");
+                descs.push(ProviderSubagentDescriptor {
+                    subagent_id: sid.clone(),
+                    parent_agent_id: "ag_p1".into(),
+                    parent_subagent_id: None,
+                    title: sid.clone(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Completed,
+                    created_at: now,
+                    updated_at: now,
+                });
+                let k = ("ag_p1".to_string(), sid);
+                h.subscribed_provider_subagents.insert(k.clone());
+                h.provider_subagent_timelines.insert(k.clone(), Vec::new());
+                h.touch_provider_subagent_lru(&k);
+            }
+            h.provider_subagents.insert("ag_p1".into(), descs);
+            h.enforce_provider_subagent_timeline_bounds(None);
+            assert!(
+                !h.subscribed_provider_subagents
+                    .contains(&("ag_p1".to_string(), "sub_evict_0".to_string())),
+                "evicted finished subagent must also be removed from subscribed_provider_subagents"
+            );
+        }
+
+        // 7. AgentDeleted must prune subagent timelines, active subagent, subscriptions, caches, and sets
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::AgentDeleted {
+                agent_id: "ag_p1".into(),
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts");
+            let h = hosts.get(host_id).expect("host");
+            assert!(h.provider_subagent_timelines.is_empty());
+            assert!(h.provider_subagent_access_order.is_empty());
+            assert!(h.active_provider_subagent.is_none());
+            assert!(h.subscribed_provider_subagents.is_empty());
+            assert!(!h.stage_cache.contains_key("ag_p1"));
+            assert!(!h.caught_up_agents.contains("ag_p1"));
+            assert!(!h.rewound_agents.contains("ag_p1"));
+        }
     }
 }

@@ -23,6 +23,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{info, warn};
 
+/// Max WebSocket frame & message size across all relay endpoints (48 MiB, safely carrying up to
+/// 25 MiB base64/E2EE multimodal payloads without tearing down sessions).
+pub const MAX_RELAY_WS_FRAME_BYTES: usize = 48 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayPersistedConfig {
     pub listen_addr: SocketAddr,
@@ -125,7 +129,9 @@ async fn ws_daemon_control(
         warn!(pubkey = %q.pubkey, "Rejected unauthorized daemon registration");
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| handle_daemon_control(socket, q.pubkey, state))
+    ws.max_frame_size(MAX_RELAY_WS_FRAME_BYTES)
+        .max_message_size(MAX_RELAY_WS_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_daemon_control(socket, q.pubkey, state))
 }
 
 async fn handle_daemon_control(mut socket: WebSocket, pubkey: String, state: RelayState) {
@@ -194,9 +200,11 @@ async fn ws_daemon_tunnel(
     let Some(tun_tx) = state.waiting_tunnels.write().await.remove(&q.tunnel_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    ws.on_upgrade(move |socket| async move {
-        let _ = tun_tx.send(socket);
-    })
+    ws.max_frame_size(MAX_RELAY_WS_FRAME_BYTES)
+        .max_message_size(MAX_RELAY_WS_FRAME_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _ = tun_tx.send(socket);
+        })
 }
 
 async fn ws_client_connect(
@@ -217,37 +225,39 @@ async fn ws_client_connect(
         return StatusCode::BAD_GATEWAY.into_response();
     };
 
-    ws.on_upgrade(move |client_ws| async move {
-        let (c2d_tx, c2d_rx) = mpsc::channel::<Message>(128);
-        let (d2c_tx, mut d2c_rx) = mpsc::channel::<Message>(128);
+    ws.max_frame_size(MAX_RELAY_WS_FRAME_BYTES)
+        .max_message_size(MAX_RELAY_WS_FRAME_BYTES)
+        .on_upgrade(move |client_ws| async move {
+            let (c2d_tx, c2d_rx) = mpsc::channel::<Message>(128);
+            let (d2c_tx, mut d2c_rx) = mpsc::channel::<Message>(128);
 
-        if accept_tx
-            .send(PendingClient {
-                client_to_daemon_rx: c2d_rx,
-                daemon_to_client_tx: d2c_tx,
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
+            if accept_tx
+                .send(PendingClient {
+                    client_to_daemon_rx: c2d_rx,
+                    daemon_to_client_tx: d2c_tx,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
 
-        let (mut c_sink, mut c_stream) = client_ws.split();
-        let writer = tokio::spawn(async move {
-            while let Some(msg) = d2c_rx.recv().await {
-                if c_sink.send(msg).await.is_err() {
+            let (mut c_sink, mut c_stream) = client_ws.split();
+            let writer = tokio::spawn(async move {
+                while let Some(msg) = d2c_rx.recv().await {
+                    if c_sink.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            while let Some(Ok(msg)) = c_stream.next().await {
+                if c2d_tx.send(msg).await.is_err() {
                     break;
                 }
             }
-        });
-
-        while let Some(Ok(msg)) = c_stream.next().await {
-            if c2d_tx.send(msg).await.is_err() {
-                break;
-            }
-        }
-        writer.abort();
-    })
+            writer.abort();
+        })
 }
 
 async fn bridge_ciphertext_streams(daemon_ws: WebSocket, mut pending: PendingClient) {
@@ -276,4 +286,14 @@ fn rand_hex() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{nanos:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_ws_frame_limit_covers_25mib_base64_media_payloads() {
+        assert_eq!(MAX_RELAY_WS_FRAME_BYTES, 48 * 1024 * 1024);
+    }
 }

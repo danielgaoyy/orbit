@@ -291,6 +291,27 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   font-variant-numeric: tabular-nums;
 }
 
+/* Native MathML Core Typography (Pure-Rust LaTeX compiler, zero JS/font bundle) */
+.orbit-math-inline math,
+.orbit-math-block math {
+  font-family: "STIX Two Math", "Cambria Math", "Apple Symbols", "Latin Modern Math", math;
+  font-feature-settings: normal;
+  color: inherit;
+}
+
+.orbit-math-inline {
+  margin-inline: 0.08em;
+}
+
+.orbit-math-inline math {
+  font-size: 1.03em;
+}
+
+.orbit-math-block math {
+  font-size: 1.12em;
+  line-height: 1.45;
+}
+
 /* Subtle GPU opacity pulse for active running step labels */
 @keyframes orbit-status-pulse {
   0%,

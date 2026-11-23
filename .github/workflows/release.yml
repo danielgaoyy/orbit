@@ -45,6 +45,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: orbit-cli-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: orbit-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -58,10 +61,15 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build release static-linked single binary
+        shell: bash
         run: |
           cargo build --release -p orbit-cli --target ${{ matrix.target }}
-          cp target/${{ matrix.target }}/release/orbit ${{ matrix.artifact }}
-          chmod +x ${{ matrix.artifact }}
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/orbit.exe ${{ matrix.artifact }}
+          else
+            cp target/${{ matrix.target }}/release/orbit ${{ matrix.artifact }}
+            chmod +x ${{ matrix.artifact }}
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -270,6 +278,50 @@ jobs:
           name: ${{ matrix.artifact }}
           path: apps/${{ matrix.artifact }}
 
+  build-windows-desktop:
+    name: Build Windows Tauri v2 Desktop App (.msi & NSIS .exe)
+    needs: rust-quality-and-e2e
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/desktop/src-tauri -> target"
+      - name: Build Tauri v2 Windows .msi & NSIS .exe Packages
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p orbit-cli --target x86_64-pc-windows-msvc --manifest-path ../../Cargo.toml
+          mkdir -p src-tauri/binaries
+          cp ../../target/x86_64-pc-windows-msvc/release/orbit.exe src-tauri/binaries/orbit-x86_64-pc-windows-msvc.exe
+          npm ci
+          npx tauri build --target x86_64-pc-windows-msvc --bundles msi,nsis --config '{"bundle":{"externalBin":["binaries/orbit"]}}'
+          MSI_FILE="$(find src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi -maxdepth 2 -type f -name '*.msi' | head -n 1)"
+          NSIS_FILE="$(find src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -maxdepth 2 -type f -name '*.exe' | head -n 1)"
+          if [ -z "$MSI_FILE" ] || [ -z "$NSIS_FILE" ]; then
+            echo "::error::Failed to locate built Windows MSI/NSIS installers"
+            exit 1
+          fi
+          cp "$MSI_FILE" Orbit-Windows-x64.msi
+          cp "$NSIS_FILE" Orbit-Windows-x64-setup.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Orbit-Windows-x64.msi
+          path: apps/desktop/Orbit-Windows-x64.msi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Orbit-Windows-x64-setup.exe
+          path: apps/desktop/Orbit-Windows-x64-setup.exe
+
   build-android-apk:
     name: Build Native Android APK (Jetpack Compose + UniFFI, minSdk 29)
     needs: rust-quality-and-e2e
@@ -458,6 +510,7 @@ jobs:
       - build-host-binaries
       - build-macos-desktop
       - build-linux-desktop
+      - build-windows-desktop
       - build-android-apk
       - build-ios-ipa
       - build-harmony-hap
@@ -509,9 +562,12 @@ jobs:
             release-dist/Orbit-macOS-AppleSilicon.dmg
             release-dist/Orbit-Linux-arm64.deb
             release-dist/Orbit-Linux-x64.deb
+            release-dist/Orbit-Windows-x64.msi
+            release-dist/Orbit-Windows-x64-setup.exe
             release-dist/orbit-cli-macos-arm64
             release-dist/orbit-cli-linux-arm64
             release-dist/orbit-cli-linux-x64
+            release-dist/orbit-windows-x86_64.exe
             release-dist/Orbit-Android-arm64.apk
             release-dist/Orbit-iOS-sideload.ipa
             release-dist/Orbit-HarmonyOS.hap

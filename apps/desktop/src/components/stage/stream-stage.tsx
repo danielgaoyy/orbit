@@ -21,6 +21,9 @@ import {
 import {
   AlertTriangle,
   ArrowDown,
+  ArrowRight,
+  ArrowUpRight,
+  Blocks,
   Check,
   ChevronRight,
   Copy,
@@ -31,13 +34,17 @@ import {
   FileSearch,
   FileSymlink,
   FileText,
+  Film,
   FoldVertical,
+  GitBranch,
   GitCompareArrows,
+  GitFork,
   Globe,
   Layers,
   ListTodo,
   Loader2,
   MessageSquareText,
+  Music,
   Quote,
   RotateCcw,
   RotateCw,
@@ -51,6 +58,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  type AgentCardView,
+  type ArtifactSummary,
   type DiffFileView,
   type DiffLineView,
   type InlineSpanView,
@@ -64,6 +73,7 @@ import {
   isAgentForegroundRunning,
 } from "@/lib/orbit-ipc";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
+import { detectRichMediaKind } from "@/lib/media-utils";
 import {
   classifySearchTool,
   describeToolStep,
@@ -73,6 +83,7 @@ import {
   stripWorkspacePrefix,
 } from "@/lib/timeline-coalesce";
 import { OmniComposer } from "@/components/composer/omni-composer";
+import { extractInlineArtifactDirectives } from "@/components/artifacts/mcp-app-bridge";
 import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { openOrbitLink } from "@/lib/file-links";
 import {
@@ -83,6 +94,7 @@ import {
 } from "@/lib/prompt-image-cache";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { StickyApprovalDock } from "@/components/stage/stage-approval-dock";
+import { GoalBanner } from "@/components/stage/goal-banner";
 import { ChatOutlineRail } from "@/components/stage/stage-outline-rail";
 import {
   AgentMessageCard,
@@ -99,8 +111,23 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { isImeKeyEvent } from "@/lib/ime";
+import { isAgentInGitRepo } from "@/lib/projects";
+import {
+  type ResolvedSubagentItem,
+  type SubagentNameMatcher,
+  areResolvedSubagentsEqual,
+  buildSubagentNameMatcher,
+  resolveSessionSubagents,
+  resolveToolCallSubagent,
+} from "@/lib/subagents";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -436,20 +463,30 @@ function stableStepItemKey(item: TimelineItemView, idx: number): string {
  * - Pure-CSS `group-hover` swap between semantic icon and `ChevronRight` (0 React hover re-renders during scroll).
  * - Active thinking/tool step sweeps a calm linear-gradient text shimmer.
  */
+const EMPTY_SUBAGENTS: readonly ResolvedSubagentItem[] = [];
+
 const StepItemRow = memo(function StepItemRow({
   item,
+  hostId,
+  agentId,
   cwd,
   holdViewport,
   isActivelyThinking = false,
   thoughtDurationMs = null,
   autoExpandError = false,
+  sessionSubagents,
+  onOpenSubagent,
 }: {
   item: TimelineItemView;
+  hostId?: string;
+  agentId?: string;
   cwd: string;
   holdViewport: ViewportAnchorHoldFn;
   isActivelyThinking?: boolean;
   thoughtDurationMs?: number | null;
   autoExpandError?: boolean;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
   const defaultOpen =
     autoExpandError &&
@@ -641,7 +678,31 @@ const StepItemRow = memo(function StepItemRow({
   const canOpenFileInDiff =
     Boolean(openFilePath) && (desc.kind === "file_edit" || desc.kind === "file_create");
   const canOpenFileDirect = Boolean(openFilePath) && desc.kind === "file_read";
-  const isSubagentStep = item.detail.kind === "subagent";
+  const resolvedSubagentMatch = resolveToolCallSubagent(
+    item,
+    sessionSubagents ?? EMPTY_SUBAGENTS,
+    hostId,
+  );
+  const isSubagentStep = item.detail.kind === "subagent" || resolvedSubagentMatch !== null;
+  const handleOpenResolvedSubagent = () => {
+    if (!resolvedSubagentMatch) return;
+    if (onOpenSubagent) {
+      onOpenSubagent(resolvedSubagentMatch.subagent);
+      return;
+    }
+    const sa = resolvedSubagentMatch.subagent;
+    orbitActions.openSubagentTab({
+      callId: sa.callId,
+      role: sa.title,
+      promptPreview: sa.promptPreview,
+      childAgentId: sa.childAgentId,
+      childHostId: sa.childHostId || undefined,
+      providerSubagentId: sa.providerSubagentId,
+      parentAgentId: agentId || undefined,
+    });
+  };
+  const displayTarget =
+    desc.target || (resolvedSubagentMatch ? resolvedSubagentMatch.subagent.title : "");
   const readStartLine = item.detail.kind === "file_read" ? item.detail.start_line : null;
   const readEndLine = item.detail.kind === "file_read" ? item.detail.end_line : null;
   const canOpenTargetDirectly = Boolean(
@@ -724,14 +785,31 @@ const StepItemRow = memo(function StepItemRow({
             {desc.verb}
           </span>
 
-          {desc.target &&
-            (canOpenTargetDirectly ? (
+          {displayTarget &&
+            (resolvedSubagentMatch ? (
+              <button
+                type="button"
+                title="Open subagent details"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleOpenResolvedSubagent();
+                }}
+                className={cn(
+                  "min-w-0 cursor-pointer truncate text-left text-[12.5px] font-medium hover:underline underline-offset-2",
+                  desc.isRunning
+                    ? "agent-text-shimmer"
+                    : "text-foreground/82 group-hover/tool:text-foreground",
+                )}
+              >
+                {displayTarget}
+              </button>
+            ) : canOpenTargetDirectly ? (
               <button
                 type="button"
                 title={
                   canOpenFileInDiff
-                    ? `Open ${desc.target} diff`
-                    : `Open ${desc.target} in Side Panel`
+                    ? `Open ${displayTarget} diff`
+                    : `Open ${displayTarget} in Side Panel`
                 }
                 onClick={(e) => {
                   e.stopPropagation();
@@ -744,7 +822,7 @@ const StepItemRow = memo(function StepItemRow({
                     : "text-muted-foreground group-hover/tool:text-foreground/70 hover:text-foreground",
                 )}
               >
-                {desc.target}
+                {displayTarget}
               </button>
             ) : (
               <span
@@ -755,7 +833,7 @@ const StepItemRow = memo(function StepItemRow({
                     : "text-muted-foreground group-hover/tool:text-foreground/70",
                 )}
               >
-                {desc.target}
+                {displayTarget}
               </span>
             ))}
 
@@ -832,23 +910,17 @@ const StepItemRow = memo(function StepItemRow({
             </button>
           )}
 
-          {item.detail.kind === "subagent" && (
+          {resolvedSubagentMatch && (
             <button
               type="button"
-              title="Inspect Subagent in Side Panel"
+              title="Open subagent details"
               onClick={(e) => {
                 e.stopPropagation();
-                if (item.detail.kind !== "subagent") return;
-                orbitActions.openSubagentTab({
-                  callId: item.call_id,
-                  role: item.detail.role || "Subagent",
-                  promptPreview: item.detail.prompt_preview || "",
-                  childAgentId: item.detail.child_agent_id,
-                });
+                handleOpenResolvedSubagent();
               }}
               className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
             >
-              <FileSymlink className="size-3.5" />
+              <ArrowUpRight className="size-3.5" />
             </button>
           )}
         </div>
@@ -919,6 +991,7 @@ const StepItemRow = memo(function StepItemRow({
 /** Vertical step connector rail for expanded turn activity steps. */
 const StepTimelineRail = memo(function StepTimelineRail({
   items,
+  hostId,
   cwd,
   holdViewport,
   indented = false,
@@ -927,8 +1000,11 @@ const StepTimelineRail = memo(function StepTimelineRail({
   agentId,
   thinkingSignature: _thinkingSignature,
   getThinkingDurationMs,
+  sessionSubagents,
+  onOpenSubagent,
 }: {
   items: TimelineItemView[];
+  hostId?: string;
   cwd: string;
   holdViewport: ViewportAnchorHoldFn;
   indented?: boolean;
@@ -937,6 +1013,8 @@ const StepTimelineRail = memo(function StepTimelineRail({
   agentId: string;
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
   if (items.length === 0) return null;
 
@@ -961,6 +1039,8 @@ const StepTimelineRail = memo(function StepTimelineRail({
           <StepItemRow
             key={stableStepItemKey(sub, i)}
             item={sub}
+            hostId={hostId}
+            agentId={agentId}
             cwd={cwd}
             holdViewport={holdViewport}
             isActivelyThinking={
@@ -968,9 +1048,91 @@ const StepTimelineRail = memo(function StepTimelineRail({
             }
             thoughtDurationMs={thoughtDurationMs}
             autoExpandError={autoExpandErrors}
+            sessionSubagents={sessionSubagents}
+            onOpenSubagent={onOpenSubagent}
           />
         );
       })}
+    </div>
+  );
+});
+
+/**
+ * Quiet single-line flex-wrap row of clickable subagent pills rendered directly beneath
+ * a `TurnActivityDisclosure` summary whenever a step group dispatches or messages subagents.
+ */
+const SubagentCallChips = memo(function SubagentCallChips({
+  items,
+  hostId,
+  agentId,
+  sessionSubagents,
+  onOpenSubagent,
+}: {
+  items: TimelineItemView[];
+  hostId?: string;
+  agentId?: string;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
+}) {
+  const chips = useMemo(() => {
+    const byKey = new Map<string, { subagent: ResolvedSubagentItem; action: "dispatch" | "message" }>();
+    for (const it of items) {
+      if (it.item_type !== "tool_call") continue;
+      const resolved = resolveToolCallSubagent(it, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
+      if (!resolved) continue;
+      const existing = byKey.get(resolved.subagent.key);
+      if (!existing || (existing.action === "message" && resolved.action === "dispatch")) {
+        byKey.set(resolved.subagent.key, resolved);
+      }
+    }
+    return Array.from(byKey.values());
+  }, [items, sessionSubagents, hostId]);
+
+  if (chips.length === 0) return null;
+
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+      {chips.map(({ subagent, action }) => (
+        <button
+          key={subagent.key}
+          type="button"
+          title={subagent.promptPreview || `Open ${subagent.title}`}
+          onClick={() => {
+            if (onOpenSubagent) {
+              onOpenSubagent(subagent);
+            } else {
+              orbitActions.openSubagentTab({
+                callId: subagent.callId,
+                role: subagent.title,
+                promptPreview: subagent.promptPreview,
+                childAgentId: subagent.childAgentId,
+                childHostId: subagent.childHostId || undefined,
+                providerSubagentId: subagent.providerSubagentId,
+                parentAgentId: agentId || undefined,
+              });
+            }
+          }}
+          className="group/sachip text-foreground/82 hover:text-foreground inline-flex h-[24px] max-w-[260px] cursor-pointer items-center gap-1.5 rounded-full border border-black/[0.07] bg-black/[0.02] px-2.5 text-[12px] leading-none transition-colors hover:border-black/[0.14] hover:bg-black/[0.045] dark:border-white/[0.09] dark:bg-white/[0.03] dark:hover:border-white/[0.16] dark:hover:bg-white/[0.06]"
+        >
+          <span className="flex size-3 shrink-0 items-center justify-center">
+            {action === "message" ? (
+              <ArrowRight className="text-muted-foreground/85 size-3 stroke-[1.9]" />
+            ) : subagent.status === "awaiting_permission" ? (
+              <span className="size-[6px] rounded-full bg-amber-500 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]" />
+            ) : subagent.status === "running" ? (
+              <OrbitSpinner size={11} className="text-foreground/70" />
+            ) : subagent.status === "failed" ? (
+              <AlertTriangle className="size-3 text-rose-500" />
+            ) : subagent.status === "canceled" ? (
+              <span className="bg-muted-foreground/45 size-[6px] rounded-full" />
+            ) : (
+              <Check className="size-3 stroke-[2.2] text-emerald-600/85 dark:text-emerald-400/85" />
+            )}
+          </span>
+          <span className="min-w-0 truncate font-medium">{subagent.title}</span>
+          <ArrowUpRight className="text-muted-foreground/55 group-hover/sachip:text-foreground/85 size-3 shrink-0 opacity-45 transition-opacity group-hover/sachip:opacity-100" />
+        </button>
+      ))}
     </div>
   );
 });
@@ -997,11 +1159,14 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   isNetworkOffline = false,
   isBackgroundWait = false,
   settledDurationMs,
+  hostId,
   cwd,
   agentId,
   thinkingSignature,
   getThinkingDurationMs,
   holdViewport,
+  sessionSubagents,
+  onOpenSubagent,
 }: {
   items: TimelineItemView[];
   isWorkActive: boolean;
@@ -1017,11 +1182,14 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   isNetworkOffline?: boolean;
   isBackgroundWait?: boolean;
   settledDurationMs: number | null;
+  hostId?: string;
   cwd: string;
   agentId: string;
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
   const foldBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -1135,10 +1303,19 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
         />
       </button>
 
+      <SubagentCallChips
+        items={items}
+        hostId={hostId}
+        agentId={agentId}
+        sessionSubagents={sessionSubagents}
+        onOpenSubagent={onOpenSubagent}
+      />
+
       {isExpanded && (
         <div className="orbit-stage-enter">
           <StepTimelineRail
             items={items}
+            hostId={hostId}
             cwd={cwd}
             holdViewport={holdViewport}
             indented
@@ -1149,6 +1326,8 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
             agentId={agentId}
             thinkingSignature={thinkingSignature}
             getThinkingDurationMs={getThinkingDurationMs}
+            sessionSubagents={sessionSubagents}
+            onOpenSubagent={onOpenSubagent}
           />
         </div>
       )}
@@ -1176,6 +1355,12 @@ function resolvePromptBadgeIcon(badge: PromptBadge): LucideIcon {
       return SquareTerminal;
     case "image":
       return FileImage;
+    case "pdf":
+      return FileText;
+    case "video":
+      return Film;
+    case "audio":
+      return Music;
     case "quote":
       return Quote;
     case "paste": {
@@ -1227,6 +1412,27 @@ function extractUserPromptPresentation(
     sanitized = true;
     const name = rawPath.split("/").pop() || rawPath;
     inferredBadges.push({ kind: "image", label: name, path: rawPath });
+    return "";
+  });
+
+  working = working.replace(/^Attached PDF file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
+    sanitized = true;
+    const name = rawPath.split("/").pop() || rawPath;
+    inferredBadges.push({ kind: "pdf", label: name, path: rawPath });
+    return "";
+  });
+
+  working = working.replace(/^Attached audio file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
+    sanitized = true;
+    const name = rawPath.split("/").pop() || rawPath;
+    inferredBadges.push({ kind: "audio", label: name, path: rawPath });
+    return "";
+  });
+
+  working = working.replace(/^Attached video file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
+    sanitized = true;
+    const name = rawPath.split("/").pop() || rawPath;
+    inferredBadges.push({ kind: "video", label: name, path: rawPath });
     return "";
   });
 
@@ -1306,7 +1512,7 @@ function extractUserPromptPresentation(
   return res;
 }
 
-interface PromptImagePreviewTarget {
+export interface PromptImagePreviewTarget {
   url: string;
   label: string;
   path: string | null;
@@ -1440,7 +1646,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
   );
 });
 
-const PromptImageLightbox = memo(function PromptImageLightbox({
+export const PromptImageLightbox = memo(function PromptImageLightbox({
   target,
   onClose,
 }: {
@@ -1682,9 +1888,42 @@ const UserPromptBubble = memo(function UserPromptBubble({
               <div className="flex flex-wrap items-center gap-1.5 select-none">
                 {attachmentBadges.map((badge, idx) => {
                   const BadgeIcon = resolvePromptBadgeIcon(badge);
-                  const isMono = badge.kind === "file" || badge.kind === "quote";
+                  const mediaKind =
+                    badge.kind === "pdf" || badge.kind === "audio" || badge.kind === "video"
+                      ? badge.kind
+                      : badge.kind === "file"
+                        ? detectRichMediaKind(badge.path || badge.label)
+                        : null;
+                  const isMono =
+                    badge.kind === "file" || badge.kind === "quote" || mediaKind !== null;
                   const fileTarget = badge.path?.trim() || badge.label;
+                  const isClickableMediaBadge = mediaKind !== null && fileTarget.trim().length > 0;
                   const isClickableFileBadge = isMono && fileTarget.trim().length > 0;
+                  if (isClickableMediaBadge && mediaKind) {
+                    return (
+                      <button
+                        key={`${badge.kind}-${badge.label}-${idx}`}
+                        type="button"
+                        title={`Preview ${badge.label}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          orbitActions.openMediaPreview({
+                            kind: mediaKind,
+                            filename: badge.label,
+                            path: fileTarget,
+                            hostId,
+                            cwd: cwd || "~",
+                          });
+                        }}
+                        className="text-foreground/85 hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] transition-colors hover:border-black/[0.14] hover:bg-black/[0.055] dark:border-white/[0.10] dark:bg-white/[0.055] dark:hover:border-white/[0.18] dark:hover:bg-white/[0.095]"
+                      >
+                        <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
+                        <span className="font-mono leading-normal font-medium hover:underline">
+                          {badge.label}
+                        </span>
+                      </button>
+                    );
+                  }
                   if (isClickableFileBadge) {
                     return (
                       <button
@@ -1998,6 +2237,150 @@ function UndoActionButton({
   );
 }
 
+/**
+ * Restrained Fork icon button matching `CopyActionButton` / `UndoActionButton` (`13px` icon in `22×22px` hit target).
+ * Directly forks in place for non-git directories; opens a tiny 2-option popover when worktree branching is available.
+ */
+function ForkActionButton({
+  canUseWorktree,
+  onFork,
+  align = "start",
+  className,
+}: {
+  canUseWorktree: boolean;
+  onFork: (worktree: boolean) => void;
+  align?: "start" | "end";
+  className?: string;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  if (!canUseWorktree) {
+    return (
+      <HoverPillTooltip
+        label="Fork from here"
+        delay={240}
+        renderTrigger={(handlers) => (
+          <button
+            type="button"
+            aria-label="Fork from here"
+            onClick={() => onFork(false)}
+            {...handlers}
+            className={cn(
+              "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
+              className,
+            )}
+          >
+            <GitFork className="size-[13px] stroke-[1.8]" />
+          </button>
+        )}
+      />
+    );
+  }
+
+  return (
+    <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+      <HoverPillTooltip
+        label={menuOpen ? "" : "Fork from here"}
+        delay={240}
+        renderTrigger={(handlers) => (
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label="Fork from here"
+              {...handlers}
+              className={cn(
+                "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
+                menuOpen && "bg-accent/65 text-foreground",
+                className,
+              )}
+            >
+              <GitFork className="size-[13px] stroke-[1.8]" />
+            </button>
+          </DropdownMenuTrigger>
+        )}
+      />
+      <DropdownMenuContent
+        align={align}
+        sideOffset={6}
+        className="w-max min-w-[168px] rounded-[11px] p-1"
+      >
+        <DropdownMenuItem
+          onSelect={() => onFork(false)}
+          className="cursor-pointer rounded-[8px] px-2.5 py-1.5 text-[12.5px]"
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <GitFork className="text-muted-foreground size-[13px] shrink-0 stroke-[1.8]" />
+            <span>Fork here</span>
+          </span>
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={() => onFork(true)}
+          className="cursor-pointer rounded-[8px] px-2.5 py-1.5 text-[12.5px]"
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <GitBranch className="text-muted-foreground size-[13px] shrink-0 stroke-[1.8]" />
+            <span>Fork in new worktree</span>
+          </span>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** Super subtle, restrained 1-line provenance chip at the top of a forked thread. */
+const ForkedFromBanner = memo(function ForkedFromBanner({
+  hostId,
+  agent,
+}: {
+  hostId: string;
+  agent: AgentCardView | null;
+}) {
+  const sourceId = agent?.forked_from_agent_id ?? null;
+  const parentAgent = useOrbitSelector((s) =>
+    sourceId
+      ? (s.hostDetails[hostId]?.agents.find((a) => a.agent_id === sourceId) ?? null)
+      : null,
+  );
+  const customTitle = useOrbitSelector((s) =>
+    sourceId ? s.threadCustomTitles[`${hostId}::${sourceId}`] : undefined,
+  );
+  const isLocallyArchived = useOrbitSelector((s) =>
+    sourceId ? Boolean(s.archivedThreads[`${hostId}::${sourceId}`]) : false,
+  );
+
+  if (!sourceId) return null;
+
+  const parentTitle =
+    customTitle?.trim() ||
+    parentAgent?.title?.trim() ||
+    (sourceId.length > 14 ? `${sourceId.slice(0, 12)}…` : sourceId);
+  const canJump = Boolean(
+    parentAgent && !parentAgent.archived_at_rfc3339 && !isLocallyArchived,
+  );
+
+  return (
+    <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,768px)] items-center pt-2 pb-0.5">
+      {canJump ? (
+        <button
+          type="button"
+          onClick={() => orbitActions.selectAgent(hostId, sourceId)}
+          className="text-muted-foreground/85 hover:text-foreground border-border/65 bg-muted/35 hover:bg-muted/65 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11.5px] leading-tight transition-colors"
+        >
+          <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-75" />
+          <span className="truncate">
+            Forked from <span className="text-foreground/85 font-medium">{parentTitle}</span>
+          </span>
+        </button>
+      ) : (
+        <span className="text-muted-foreground/75 border-border/55 bg-muted/25 inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11.5px] leading-tight">
+          <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-65" />
+          <span className="truncate">Forked from {parentTitle}</span>
+        </span>
+      )}
+    </div>
+  );
+});
+
 interface RewindFileEntry {
   displayPath: string;
   basename: string;
@@ -2269,8 +2652,31 @@ const InlineLiveElapsed = memo(function InlineLiveElapsed({
   );
 });
 
+function resolveTurnForkSeq(turn: StageTurnView): number | null {
+  let maxSeq = 0;
+  const record = (seq: number | undefined | null) => {
+    if (typeof seq === "number" && seq > maxSeq) maxSeq = seq;
+  };
+  record(turn.anchor_seq);
+  record(turn.user_prompt?.seq);
+  record(turn.agent_message?.seq);
+  record(turn.terminal_reply?.seq);
+  record(turn.last_assistant_reply?.seq);
+  for (const item of turn.folded_steps) record(item.seq);
+  for (const item of turn.notices) record(item.seq);
+  for (const item of turn.compactions) record(item.seq);
+  for (const seg of turn.live_segments) {
+    if (seg.kind === "step_group") {
+      for (const item of seg.items) record(item.seq);
+    } else if (seg.kind === "assistant_message" || seg.kind === "notice") {
+      record(seg.item.seq);
+    }
+  }
+  return maxSeq > 0 ? maxSeq : null;
+}
+
 /**
- * Completed Turn Footer (`[Copy · 2m ago]`):
+ * Completed Turn Footer (`[Copy · Fork · 2m ago]`):
  * Hidden while a turn is active since live elapsed duration lives inline in `TurnActivityDisclosure`.
  */
 const TurnFooter = memo(function TurnFooter({
@@ -2278,17 +2684,26 @@ const TurnFooter = memo(function TurnFooter({
   timing,
   completedAtMs,
   replyText,
+  forkUpToSeq,
+  isLastTurn = false,
+  canForkWorktree = false,
+  onRequestFork,
 }: {
   isTurnActive: boolean;
   timing?: TurnTimingRecord;
   completedAtMs: number | null;
   replyText: string | null;
+  forkUpToSeq?: number | null;
+  isLastTurn?: boolean;
+  canForkWorktree?: boolean;
+  onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
 }) {
   const [copied, setCopied] = useState(false);
 
   const resolvedCompletedAtMs = timing?.completedAtMs ?? completedAtMs;
+  const showFork = Boolean(onRequestFork && (isLastTurn || (forkUpToSeq !== null && forkUpToSeq !== undefined && forkUpToSeq > 0)));
 
-  if (isTurnActive || (!replyText && resolvedCompletedAtMs === null)) {
+  if (isTurnActive || (!replyText && resolvedCompletedAtMs === null && !showFork)) {
     return null;
   }
 
@@ -2300,13 +2715,22 @@ const TurnFooter = memo(function TurnFooter({
   };
 
   return (
-    <div className="mt-0.5 flex h-[22px] items-center gap-1.5">
+    <div className="mt-0.5 flex h-[22px] items-center gap-1">
       {replyText && (
         <CopyActionButton
           copied={copied}
           label="Copy"
           onClick={() => void handleCopy()}
           className="-ml-1"
+        />
+      )}
+
+      {showFork && onRequestFork && (
+        <ForkActionButton
+          canUseWorktree={canForkWorktree}
+          align="start"
+          onFork={(worktree) => onRequestFork(isLastTurn ? null : (forkUpToSeq ?? null), worktree)}
+          className={replyText ? undefined : "-ml-1"}
         />
       )}
 
@@ -2441,9 +2865,143 @@ const EMPTY_WORK_COUNTS: WorkSummaryResultView["counts"] = {
  *   post-turn autonomous wakeups.
  * - Notices (API warnings, stream interruptions, errors) and wakeup boundaries render in place.
  */
+interface InlineArtifactRef {
+  key: string;
+  artifactId?: string;
+  title: string;
+  version?: number;
+  kindLabel?: string;
+}
+
+function parseArtifactRefsFromMessage(
+  text: string,
+  knownArtifacts: readonly ArtifactSummary[],
+): InlineArtifactRef[] {
+  const directives = extractInlineArtifactDirectives(text);
+  if (directives.length === 0) {
+    return [];
+  }
+  const refs: InlineArtifactRef[] = [];
+  const seen = new Set<string>();
+  for (const dir of directives) {
+    const explicitId = dir.id;
+    const rawTitle = dir.title;
+    const rawUri = dir.resourceUri;
+
+    const matched =
+      (explicitId ? knownArtifacts.find((a) => a.artifact_id === explicitId) : undefined) ??
+      (rawUri ? knownArtifacts.find((a) => a.resource_uri === rawUri) : undefined) ??
+      (rawTitle
+        ? knownArtifacts.find((a) => a.title.toLowerCase() === rawTitle.toLowerCase())
+        : undefined);
+
+    const key = matched?.artifact_id || explicitId || rawTitle || rawUri || `idx_${dir.index}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    refs.push({
+      key,
+      artifactId: matched?.artifact_id ?? explicitId,
+      title: matched?.title ?? rawTitle ?? "Artifact",
+      version: matched?.version,
+      kindLabel: matched?.kind,
+    });
+  }
+  return refs;
+}
+
+function parseArtifactRefsFromTurnTools(
+  turn: StageTurnView,
+  knownArtifacts: readonly ArtifactSummary[],
+): InlineArtifactRef[] {
+  const refs: InlineArtifactRef[] = [];
+  const seen = new Set<string>();
+  const inspectItems = (items: readonly TimelineItemView[]) => {
+    for (const item of items) {
+      if (item.item_type !== "tool_call") continue;
+      if (item.detail.kind !== "generic") continue;
+      const toolName = item.detail.tool_name.toLowerCase();
+      if (!toolName.endsWith("publish_artifact")) continue;
+      try {
+        const parsed = JSON.parse(item.detail.arguments_json) as Record<string, unknown>;
+        const explicitId =
+          typeof parsed.artifact_id === "string" && parsed.artifact_id.trim()
+            ? parsed.artifact_id.trim()
+            : undefined;
+        const rawTitle =
+          typeof parsed.title === "string" && parsed.title.trim()
+            ? parsed.title.trim()
+            : undefined;
+        const matched =
+          (explicitId ? knownArtifacts.find((a) => a.artifact_id === explicitId) : undefined) ??
+          (rawTitle
+            ? knownArtifacts.find((a) => a.title.toLowerCase() === rawTitle.toLowerCase())
+            : undefined);
+        const key = matched?.artifact_id || explicitId || rawTitle || item.call_id;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        refs.push({
+          key,
+          artifactId: matched?.artifact_id ?? explicitId,
+          title: matched?.title ?? rawTitle ?? "Artifact",
+          version: matched?.version,
+          kindLabel: matched?.kind ?? (typeof parsed.kind === "string" ? parsed.kind : undefined),
+        });
+      } catch {
+        // Ignore unparseable partial tool arguments while streaming
+      }
+    }
+  };
+  inspectItems(turn.folded_steps);
+  for (const seg of turn.live_segments) {
+    if (seg.kind === "step_group") {
+      inspectItems(seg.items);
+    }
+  }
+  return refs;
+}
+
+const InlineArtifactCard = memo(function InlineArtifactCard({
+  hostId,
+  artifact,
+}: {
+  hostId: string;
+  artifact: InlineArtifactRef;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() =>
+        orbitActions.openArtifactsTab({
+          hostId,
+          artifactId: artifact.artifactId,
+        })
+      }
+      className="border-border/80 bg-elevated/45 hover:bg-elevated/85 group inline-flex max-w-full cursor-pointer items-center gap-2 rounded-xl border px-3 py-1.5 text-left text-[12.5px] transition-colors"
+    >
+      <Blocks className="text-muted-foreground group-hover:text-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+      <span className="text-muted-foreground shrink-0 text-[11.5px]">Artifact</span>
+      <span className="text-muted-foreground/55 shrink-0">·</span>
+      <span className="text-foreground truncate font-medium">{artifact.title}</span>
+      {artifact.version != null && (
+        <>
+          <span className="text-muted-foreground/55 shrink-0">·</span>
+          <span className="text-muted-foreground shrink-0 font-mono text-[11.5px]">
+            v{artifact.version}
+          </span>
+        </>
+      )}
+      <ChevronRight className="text-muted-foreground/55 group-hover:text-foreground h-[13px] w-[13px] shrink-0 transition-transform group-hover:translate-x-0.5" />
+    </button>
+  );
+});
+
+const EMPTY_ARTIFACTS: readonly ArtifactSummary[] = [];
+
 export const TurnStageSection = memo(function TurnStageSection({
   turn,
   isTurnActive,
+  isLastTurn = false,
   agentStatusLabel = null,
   hasLiveBackgroundTasks = false,
   isNetworkOffline,
@@ -2457,10 +3015,16 @@ export const TurnStageSection = memo(function TurnStageSection({
   getThinkingDurationMs,
   holdViewport,
   onRequestRewind,
+  onRequestFork,
+  canForkWorktree = false,
   onPreviewImage,
+  sessionSubagents,
+  sessionSubagentMatcher,
+  onOpenSubagent,
 }: {
   turn: StageTurnView;
   isTurnActive: boolean;
+  isLastTurn?: boolean;
   agentStatusLabel?: string | null;
   hasLiveBackgroundTasks?: boolean;
   isNetworkOffline: boolean;
@@ -2474,9 +3038,21 @@ export const TurnStageSection = memo(function TurnStageSection({
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
   onRequestRewind: (seq: number, promptText: string) => void;
+  onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
+  canForkWorktree?: boolean;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  sessionSubagentMatcher?: SubagentNameMatcher | null;
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
   const rawSegments = turn.live_segments;
+  const hostArtifacts = useOrbitSelector(
+    (s) => s.hostDetails[hostId]?.artifacts ?? EMPTY_ARTIFACTS,
+  );
+  const turnToolArtifactRefs = useMemo(
+    () => parseArtifactRefsFromTurnTools(turn, hostArtifacts),
+    [turn, hostArtifacts],
+  );
   const lastRawSeg = rawSegments[rawSegments.length - 1] ?? null;
 
   // Exclude transient `Waiting for ...` and internal `Resumed from background task` wakeup rows
@@ -2537,6 +3113,7 @@ export const TurnStageSection = memo(function TurnStageSection({
     !isTurnActive && turn.last_assistant_reply?.item_type === "assistant_message"
       ? turn.last_assistant_reply.text
       : null;
+  const turnForkSeq = useMemo(() => resolveTurnForkSeq(turn), [turn]);
 
   return (
     <div
@@ -2610,13 +3187,31 @@ export const TurnStageSection = memo(function TurnStageSection({
 
               if (seg.kind === "assistant_message") {
                 if (seg.item.item_type !== "assistant_message") return null;
+                const msgArtifacts = !seg.item.streaming
+                  ? parseArtifactRefsFromMessage(seg.item.text, hostArtifacts)
+                  : [];
                 return (
-                  <MarkdownLinkProvider key={seg.key} cwd={cwd}>
-                    <MarkdownBlocksView
-                      blocks={seg.item.blocks}
-                      streaming={seg.item.streaming}
-                    />
-                  </MarkdownLinkProvider>
+                  <div key={seg.key} className="space-y-2">
+                    <MarkdownLinkProvider
+                      hostId={hostId}
+                      cwd={cwd}
+                      subagents={sessionSubagents}
+                      subagentMatcher={sessionSubagentMatcher}
+                      onOpenSubagent={onOpenSubagent}
+                    >
+                      <MarkdownBlocksView
+                        blocks={seg.item.blocks}
+                        streaming={seg.item.streaming}
+                      />
+                    </MarkdownLinkProvider>
+                    {msgArtifacts.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                        {msgArtifacts.map((ref) => (
+                          <InlineArtifactCard key={ref.key} hostId={hostId} artifact={ref} />
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 );
               }
 
@@ -2684,14 +3279,25 @@ export const TurnStageSection = memo(function TurnStageSection({
                   isNetworkOffline={isNetworkOffline}
                   isBackgroundWait={isBackgroundWait}
                   settledDurationMs={groupSettledDurationMs}
+                  hostId={hostId}
                   cwd={cwd}
                   agentId={agentId}
                   thinkingSignature={_thinkingSignature}
                   getThinkingDurationMs={getThinkingDurationMs}
                   holdViewport={holdViewport}
+                  sessionSubagents={sessionSubagents}
+                  onOpenSubagent={onOpenSubagent}
                 />
               );
             })}
+
+            {turnToolArtifactRefs.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                {turnToolArtifactRefs.map((ref) => (
+                  <InlineArtifactCard key={ref.key} hostId={hostId} artifact={ref} />
+                ))}
+              </div>
+            )}
 
             {needsTrailingActivity && (() => {
               const trailingLabel =
@@ -2743,6 +3349,10 @@ export const TurnStageSection = memo(function TurnStageSection({
               timing={timing}
               completedAtMs={turn.completed_at_ms}
               replyText={lastReplyText}
+              forkUpToSeq={turnForkSeq}
+              isLastTurn={isLastTurn}
+              canForkWorktree={canForkWorktree}
+              onRequestFork={onRequestFork}
             />
           </div>
         </div>
@@ -2752,11 +3362,13 @@ export const TurnStageSection = memo(function TurnStageSection({
 }, (prev, next) =>
   prev.turn === next.turn &&
   prev.isTurnActive === next.isTurnActive &&
+  prev.isLastTurn === next.isLastTurn &&
   prev.agentStatusLabel === next.agentStatusLabel &&
   prev.hasLiveBackgroundTasks === next.hasLiveBackgroundTasks &&
   prev.isNetworkOffline === next.isNetworkOffline &&
   prev.animatePromptEntrance === next.animatePromptEntrance &&
   prev.autoFoldCompleted === next.autoFoldCompleted &&
+  prev.hostId === next.hostId &&
   prev.cwd === next.cwd &&
   prev.agentId === next.agentId &&
   prev.thinkingSignature === next.thinkingSignature &&
@@ -2764,7 +3376,12 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.timing?.durationMs === next.timing?.durationMs &&
   prev.timing?.workDurationMs === next.timing?.workDurationMs &&
   prev.timing?.completedAtMs === next.timing?.completedAtMs &&
-  prev.onRequestRewind === next.onRequestRewind,
+  prev.onRequestRewind === next.onRequestRewind &&
+  prev.onRequestFork === next.onRequestFork &&
+  prev.canForkWorktree === next.canForkWorktree &&
+  prev.sessionSubagents === next.sessionSubagents &&
+  prev.sessionSubagentMatcher === next.sessionSubagentMatcher &&
+  prev.onOpenSubagent === next.onOpenSubagent,
 );
 
 function NewSessionLaunchpad() {
@@ -2994,6 +3611,8 @@ function estimateRichBlockHeight(block: RichBlockView): number {
       return Math.max(34, Math.ceil(spanCharLen(block.spans) / 72) * 25 + 14);
     case "block_quote":
       return Math.max(44, Math.ceil(spanCharLen(block.spans) / 66) * 24 + 16);
+    case "math_block":
+      return Math.max(68, block.tex.split("\n").length * 28 + 40);
     case "horizontal_rule":
       return 28;
   }
@@ -3051,10 +3670,55 @@ interface ScrollVelocityState {
   wasScrolling: boolean;
 }
 
+function findTurnIndexForSeq(
+  turns: StageTurnView[],
+  targetSeq: number,
+): { index: number; exact: boolean } {
+  if (turns.length === 0) return { index: -1, exact: false };
+  for (let i = 0; i < turns.length; i += 1) {
+    const t = turns[i];
+    if (
+      t.anchor_seq === targetSeq ||
+      t.user_prompt?.seq === targetSeq ||
+      t.agent_message?.seq === targetSeq ||
+      t.terminal_reply?.seq === targetSeq ||
+      t.last_assistant_reply?.seq === targetSeq ||
+      t.folded_steps.some((item) => item.seq === targetSeq) ||
+      t.notices.some((item) => item.seq === targetSeq) ||
+      t.compactions.some((item) => item.seq === targetSeq)
+    ) {
+      return { index: i, exact: true };
+    }
+    for (const seg of t.live_segments) {
+      if (seg.kind === "step_group" && seg.items.some((item) => item.seq === targetSeq)) {
+        return { index: i, exact: true };
+      }
+      if (
+        (seg.kind === "assistant_message" || seg.kind === "notice") &&
+        seg.item.seq === targetSeq
+      ) {
+        return { index: i, exact: true };
+      }
+    }
+  }
+  // Fallback: last chronological turn whose anchor_seq <= targetSeq
+  let best = 0;
+  for (let i = 0; i < turns.length; i += 1) {
+    if (turns[i].anchor_seq <= targetSeq) {
+      best = i;
+    } else {
+      break;
+    }
+  }
+  return { index: best, exact: false };
+}
+
 const VirtualizedTurnList = memo(function VirtualizedTurnList({
   selectedHostId,
   selectedAgentId,
   stageTurns,
+  highlightedTurnKey,
+  hasPendingJump,
   isLatestTurnActive,
   agentStatusLabel,
   hasLiveBackgroundTasks,
@@ -3072,11 +3736,18 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   getThinkingDurationMs,
   holdViewport,
   onRequestRewind,
+  onRequestFork,
+  canForkWorktree,
   onPreviewImage,
+  sessionSubagents,
+  sessionSubagentMatcher,
+  onOpenSubagent,
 }: {
   selectedHostId: string;
   selectedAgentId: string;
   stageTurns: StageTurnView[];
+  highlightedTurnKey: string | null;
+  hasPendingJump: boolean;
   isLatestTurnActive: boolean;
   agentStatusLabel: string | null;
   hasLiveBackgroundTasks: boolean;
@@ -3094,7 +3765,12 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
   onRequestRewind: (seq: number, promptText: string) => void;
+  onRequestFork: (upToSeq: number | null, worktree: boolean) => void;
+  canForkWorktree: boolean;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
+  sessionSubagents: readonly ResolvedSubagentItem[];
+  sessionSubagentMatcher: SubagentNameMatcher | null;
+  onOpenSubagent: (subagent: ResolvedSubagentItem) => void;
 }) {
   const widthBucket = stageMaxContentWidthPx ? Math.round(stageMaxContentWidthPx / 32) : 24;
   const selectionTurnsRef = useRef<number[]>([]);
@@ -3342,8 +4018,11 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedAgentId]);
 
+  const hasPendingJumpRef = useRef(hasPendingJump);
+  hasPendingJumpRef.current = hasPendingJump;
+
   const initialBottomOffset = useMemo(() => {
-    if (stageTurns.length === 0) return 0;
+    if (hasPendingJump || stageTurns.length === 0) return 0;
     let total = 0;
     for (let i = 0; i < stageTurns.length; i += 1) {
       const turn = stageTurns[i];
@@ -3353,7 +4032,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     return Math.max(0, total - initialRect.height);
     // Compute initial bottom anchor only when mounting a fresh session list
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedAgentId, initialRect.height]);
+  }, [selectedAgentId, initialRect.height, hasPendingJump]);
 
   const observeOffsetWithBottomSeed = useCallback(
     (
@@ -3361,7 +4040,13 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
       cb: (offset: number, isScrolling: boolean) => void,
     ) => {
       const el = instance.scrollElement;
-      if (el && stickToBottomRef.current && initialBottomOffset > 0 && el.scrollTop === 0) {
+      if (
+        el &&
+        stickToBottomRef.current &&
+        !hasPendingJumpRef.current &&
+        initialBottomOffset > 0 &&
+        el.scrollTop === 0
+      ) {
         const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
         if (maxTop > 0) {
           el.scrollTop = maxTop;
@@ -3524,17 +4209,24 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
           thinkingTimingsRef.current,
         );
 
+        const isHighlighted = highlightedTurnKey === turn.key;
+
         return (
           <div
             key={vItem.key}
             data-index={vItem.index}
             data-orbit-turn-index={vItem.index}
             ref={measureTurnNode}
-            className="absolute top-0 left-0 w-full min-w-0"
+            className={cn(
+              "absolute top-0 left-0 w-full min-w-0 rounded-2xl transition-colors duration-700",
+              isHighlighted &&
+                "bg-foreground/[0.035] ring-1 ring-inset ring-foreground/[0.12] dark:bg-foreground/[0.055] dark:ring-foreground/[0.18]",
+            )}
           >
             <TurnStageSection
               turn={turn}
               isTurnActive={turnActive}
+              isLastTurn={isLast}
               agentStatusLabel={turnActive ? agentStatusLabel : null}
               hasLiveBackgroundTasks={turnActive && hasLiveBackgroundTasks}
               isNetworkOffline={isNetworkOffline}
@@ -3548,7 +4240,12 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
               getThinkingDurationMs={getThinkingDurationMs}
               holdViewport={holdViewport}
               onRequestRewind={onRequestRewind}
+              onRequestFork={onRequestFork}
+              canForkWorktree={canForkWorktree}
               onPreviewImage={onPreviewImage}
+              sessionSubagents={sessionSubagents}
+              sessionSubagentMatcher={sessionSubagentMatcher}
+              onOpenSubagent={onOpenSubagent}
             />
           </div>
         );
@@ -3563,7 +4260,16 @@ export function StreamStage() {
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const sessionScrollNonce = useOrbitSelector((s) => s.sessionScrollNonce);
+  const pendingJumpTarget = useOrbitSelector((s) => s.pendingJumpTarget);
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
+  const [highlightedTurnKey, setHighlightedTurnKey] = useState<string | null>(null);
+  const [jumpFallbackNonce, setJumpFallbackNonce] = useState<number | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
+  const jumpFallbackTimerRef = useRef<number | null>(null);
+  const jumpRafRef = useRef<{ raf1: number | null; raf2: number | null }>({
+    raf1: null,
+    raf2: null,
+  });
   const isNetworkOffline = useOrbitSelector((s) => s.isBrowserOffline);
   const {
     canDockOverview,
@@ -3580,9 +4286,9 @@ export function StreamStage() {
     isResizing,
     onStageTransitionEnd,
   } = useWorkspaceMotion();
-  const hostDetail = useOrbitSelector((s) =>
-    s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
-  );
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
   const stageView = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
@@ -3668,6 +4374,47 @@ export function StreamStage() {
   );
   const sessionTurnDiffs = stageView?.session_turn_diffs ?? EMPTY_DIFF_FILES;
   const stageInsights = stageView?.insights ?? EMPTY_INSIGHTS;
+
+  const sessionSubagentsRef = useRef<readonly ResolvedSubagentItem[]>(EMPTY_SUBAGENTS);
+  const sessionSubagents = useMemo(() => {
+    const resolved = resolveSessionSubagents({
+      hostId: selectedHostId,
+      agentId: selectedAgentId,
+      insightsSubagents: stageInsights.subagents,
+      hostDetails,
+      fleetHosts,
+    });
+    const next = resolved.length === 0 ? EMPTY_SUBAGENTS : resolved;
+    if (areResolvedSubagentsEqual(sessionSubagentsRef.current, next)) {
+      return sessionSubagentsRef.current;
+    }
+    sessionSubagentsRef.current = next;
+    return next;
+  }, [selectedHostId, selectedAgentId, stageInsights.subagents, hostDetails, fleetHosts]);
+
+  const sessionSubagentMatcher = useMemo(
+    () => buildSubagentNameMatcher(sessionSubagents),
+    [sessionSubagents],
+  );
+
+  const handleOpenSubagent = useCallback(
+    (sa: ResolvedSubagentItem) => {
+      if (sa.status === "awaiting_permission" && sa.isManaged && sa.childAgentId) {
+        orbitActions.selectAgent(sa.childHostId, sa.childAgentId);
+        return;
+      }
+      orbitActions.openSubagentTab({
+        callId: sa.callId,
+        role: sa.title,
+        promptPreview: sa.promptPreview,
+        childAgentId: sa.childAgentId,
+        childHostId: sa.childHostId || undefined,
+        providerSubagentId: sa.providerSubagentId,
+        parentAgentId: selectedAgentId,
+      });
+    },
+    [selectedAgentId],
+  );
 
   const latestTurn = stageTurns[stageTurns.length - 1] ?? null;
   // Single source of truth: trust authoritative backend `currentAgent.is_running` (which covers
@@ -3853,6 +4600,25 @@ export function StreamStage() {
       editedFiles: Array.from(byPath.values()),
     });
   }, []);
+
+  const handleRequestFork = useCallback(
+    (upToSeq: number | null, worktree: boolean) => {
+      if (!selectedHostId || !selectedAgentId) return;
+      void orbitActions.forkAgent({
+        hostId: selectedHostId,
+        sourceAgentId: selectedAgentId,
+        upToSeq,
+        worktree,
+      });
+    },
+    [selectedHostId, selectedAgentId],
+  );
+
+  const sidebarView = useOrbitSelector((s) => s.sidebarView);
+  const canForkWorktree = useMemo(
+    () => isAgentInGitRepo(selectedHostId, currentAgent, hostDetail, sidebarView),
+    [selectedHostId, currentAgent, hostDetail, sidebarView],
+  );
 
   const handleConfirmRewind = useCallback(
     async (restoreFiles: boolean) => {
@@ -4197,6 +4963,16 @@ export function StreamStage() {
       ? `${selectedHostId}::${selectedAgentId}`
       : null;
 
+  const hasPendingJumpForActive = Boolean(
+    pendingJumpTarget &&
+      selectedHostId &&
+      selectedAgentId &&
+      pendingJumpTarget.hostId === selectedHostId &&
+      pendingJumpTarget.agentId === selectedAgentId,
+  );
+  const hasPendingJumpForActiveRef = useRef(hasPendingJumpForActive);
+  hasPendingJumpForActiveRef.current = hasPendingJumpForActive;
+
   // Always reset bottom-pinning cleanly before paint whenever switching into a session
   useLayoutEffect(() => {
     if (!activeSessionScope) {
@@ -4207,10 +4983,31 @@ export function StreamStage() {
       window.clearTimeout(programmaticScrollTimerRef.current);
       programmaticScrollTimerRef.current = null;
     }
+    if (jumpRafRef.current.raf1 !== null) {
+      window.cancelAnimationFrame(jumpRafRef.current.raf1);
+      jumpRafRef.current.raf1 = null;
+    }
+    if (jumpRafRef.current.raf2 !== null) {
+      window.cancelAnimationFrame(jumpRafRef.current.raf2);
+      jumpRafRef.current.raf2 = null;
+    }
+    if (jumpFallbackTimerRef.current !== null) {
+      window.clearTimeout(jumpFallbackTimerRef.current);
+      jumpFallbackTimerRef.current = null;
+    }
+    setJumpFallbackNonce(null);
     programmaticScrollRef.current = false;
     holdActiveRef.current = false;
-    stickToBottomRef.current = true;
-    sessionEntryLockUntilRef.current = performance.now() + 600;
+    const isTargetedJump = hasPendingJumpForActiveRef.current;
+    if (!isTargetedJump) {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = null;
+      }
+      setHighlightedTurnKey(null);
+    }
+    stickToBottomRef.current = !isTargetedJump;
+    sessionEntryLockUntilRef.current = isTargetedJump ? 0 : performance.now() + 600;
     lastObservedScrollTopRef.current = 0;
     prevTurnsCountRef.current = turnsCountRef.current;
     scrollUiStore.update({
@@ -4219,6 +5016,10 @@ export function StreamStage() {
       activePromptSeq: null,
     });
     setRewindTarget(null);
+
+    if (isTargetedJump) {
+      return;
+    }
 
     const anchorToBottom = () => {
       if (!stickToBottomRef.current || programmaticScrollRef.current) return;
@@ -4252,6 +5053,121 @@ export function StreamStage() {
     scheduleBottomSync,
     syncScrollMetrics,
   ]);
+
+  // Execute search-result jump-to-seq scroll + subtle pulse highlight once turns are hydrated
+  useEffect(() => {
+    if (!activeSessionScope || !pendingJumpTarget) return;
+    if (
+      pendingJumpTarget.hostId !== selectedHostId ||
+      pendingJumpTarget.agentId !== selectedAgentId
+    ) {
+      return;
+    }
+    if (stageTurns.length === 0) return;
+
+    const match = findTurnIndexForSeq(stageTurns, pendingJumpTarget.seq);
+    if (match.index < 0) return;
+    const jumpNonce = pendingJumpTarget.nonce;
+    const stageLatestSeq = stageView?.latest_seq ?? 0;
+
+    // If cached turns haven't caught up to the searched seq yet, wait for pullStageDelta
+    // hydration before consuming the jump target (with a 1500ms fallback if rewound/pruned).
+    if (!match.exact && stageLatestSeq < pendingJumpTarget.seq && jumpFallbackNonce !== jumpNonce) {
+      stickToBottomRef.current = false;
+      sessionEntryLockUntilRef.current = 0;
+      if (jumpFallbackTimerRef.current === null) {
+        jumpFallbackTimerRef.current = window.setTimeout(() => {
+          jumpFallbackTimerRef.current = null;
+          setJumpFallbackNonce(jumpNonce);
+        }, 1500);
+      }
+      return;
+    }
+
+    if (jumpFallbackTimerRef.current !== null) {
+      window.clearTimeout(jumpFallbackTimerRef.current);
+      jumpFallbackTimerRef.current = null;
+    }
+
+    const turnIdx = match.index;
+    const targetTurn = stageTurns[turnIdx];
+
+    stickToBottomRef.current = false;
+    sessionEntryLockUntilRef.current = 0;
+    programmaticScrollRef.current = true;
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+    }
+    programmaticScrollTimerRef.current = window.setTimeout(() => {
+      programmaticScrollRef.current = false;
+      programmaticScrollTimerRef.current = null;
+      syncScrollMetrics();
+    }, 250);
+
+    const performJump = () => {
+      virtualizerRef.current?.scrollToIndex(turnIdx, {
+        align: "center",
+        behavior: "auto",
+      });
+    };
+
+    if (jumpRafRef.current.raf1 !== null) {
+      window.cancelAnimationFrame(jumpRafRef.current.raf1);
+      jumpRafRef.current.raf1 = null;
+    }
+    if (jumpRafRef.current.raf2 !== null) {
+      window.cancelAnimationFrame(jumpRafRef.current.raf2);
+      jumpRafRef.current.raf2 = null;
+    }
+
+    performJump();
+    jumpRafRef.current.raf1 = window.requestAnimationFrame(() => {
+      jumpRafRef.current.raf1 = null;
+      performJump();
+      jumpRafRef.current.raf2 = window.requestAnimationFrame(() => {
+        jumpRafRef.current.raf2 = null;
+        performJump();
+        syncScrollMetrics();
+      });
+    });
+
+    setHighlightedTurnKey(targetTurn.key);
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedTurnKey((cur) => (cur === targetTurn.key ? null : cur));
+      highlightTimerRef.current = null;
+    }, 1800);
+
+    orbitActions.clearPendingJumpTarget(jumpNonce);
+  }, [
+    activeSessionScope,
+    selectedHostId,
+    selectedAgentId,
+    pendingJumpTarget,
+    stageTurns,
+    stageView?.latest_seq,
+    jumpFallbackNonce,
+    syncScrollMetrics,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+      if (jumpFallbackTimerRef.current !== null) {
+        window.clearTimeout(jumpFallbackTimerRef.current);
+      }
+      if (jumpRafRef.current.raf1 !== null) {
+        window.cancelAnimationFrame(jumpRafRef.current.raf1);
+      }
+      if (jumpRafRef.current.raf2 !== null) {
+        window.cancelAnimationFrame(jumpRafRef.current.raf2);
+      }
+    };
+  }, []);
 
   // Synchronously keep pinned to bottom before paint as timeline items arrive, turns append,
   // or sidebar layout motion starts/settles.
@@ -4379,6 +5295,21 @@ export function StreamStage() {
         </div>
       )}
 
+      {/* Subtle 1-line provenance chip when viewing a forked conversation */}
+      {selectedHostId && currentAgent?.forked_from_agent_id && (
+        <div
+          style={{
+            paddingRight: `${24 + overviewReservePx}px`,
+            transition: overviewReserveTransition,
+          }}
+          className="shrink-0 pl-[24px]"
+        >
+          <div style={stagePushStyle}>
+            <ForkedFromBanner hostId={selectedHostId} agent={currentAgent} />
+          </div>
+        </div>
+      )}
+
       {/* 1. Unified Scrollable Conversation Viewport — scrollbar stays on far right edge */}
       <ScrollArea
         className="min-h-0 flex-1"
@@ -4417,6 +5348,8 @@ export function StreamStage() {
               selectedHostId={selectedHostId}
               selectedAgentId={selectedAgentId}
               stageTurns={stageTurns}
+              highlightedTurnKey={highlightedTurnKey}
+              hasPendingJump={hasPendingJumpForActive}
               isLatestTurnActive={isLatestTurnActive}
               agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
               hasLiveBackgroundTasks={stageInsights.background_tasks.length > 0}
@@ -4434,7 +5367,12 @@ export function StreamStage() {
               getThinkingDurationMs={getThinkingDurationMs}
               holdViewport={holdViewport}
               onRequestRewind={handleRequestRewind}
+              onRequestFork={handleRequestFork}
+              canForkWorktree={canForkWorktree}
               onPreviewImage={setImagePreviewTarget}
+              sessionSubagents={sessionSubagents}
+              sessionSubagentMatcher={sessionSubagentMatcher}
+              onOpenSubagent={handleOpenSubagent}
             />
           )}
         </div>
@@ -4457,6 +5395,7 @@ export function StreamStage() {
           }}
         >
           <div style={stagePushStyle}>
+            <GoalBanner hostId={selectedHostId} agentId={selectedAgentId} />
             <SubagentApprovalBanner hostId={selectedHostId} agentId={selectedAgentId} />
             <StickyApprovalDock
               hostId={selectedHostId}

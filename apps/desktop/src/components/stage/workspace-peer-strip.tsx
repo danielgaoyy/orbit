@@ -15,6 +15,8 @@ import {
   X,
 } from "lucide-react";
 import {
+  formatProviderShortLabel,
+  isMacDesktop,
   type ProviderKind,
   type SessionMode,
   semanticAgentTabLabel,
@@ -32,22 +34,18 @@ import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-st
 import { cn } from "@/lib/utils";
 
 function providerShortName(provider: ProviderKind): string {
-  switch (provider) {
-    case "claude_code":
-      return "Claude";
-    case "codex":
-      return "Codex";
-    case "antigravity":
-      return "AGY";
-  }
+  return formatProviderShortLabel(provider);
 }
 
 function pickAlternateProvider(
   current: ProviderKind,
   available: ProviderKind[],
 ): ProviderKind {
-  const alt = available.find((p) => p !== current);
-  return alt ?? current;
+  const direct = available.filter((p) => p !== "acp");
+  const alt = direct.find((p) => p !== current);
+  if (alt) return alt;
+  if (current !== "acp") return current;
+  return direct[0] ?? "claude_code";
 }
 
 /**
@@ -760,7 +758,9 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
             const tooltipParts = [
               `${label} (${providerShortName(peer.provider)}${peer.model ? ` · ${peer.model}` : ""})`,
               peer.task_summary || peer.title,
-              isActive ? "Double-click to rename" : "Click to switch · ⌘/Ctrl+click to split",
+              isActive
+                ? "Double-click to rename"
+                : `Click to switch · ${isMacDesktop() ? "⌘" : "Ctrl"}+click to split`,
             ];
 
             return (
@@ -973,6 +973,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       onChange={(e) => setCustomMode(e.target.value as SessionMode)}
                       className="border-border bg-canvas text-foreground rounded-md border px-1.5 py-0.5 text-[11.5px]"
                     >
+                      <option value="auto">Auto (Guardian)</option>
                       <option value="accept_edits">Accept Edits</option>
                       <option value="plan">Plan</option>
                       <option value="full_access">Full Access</option>

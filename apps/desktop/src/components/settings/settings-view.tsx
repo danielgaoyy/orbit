@@ -3,14 +3,23 @@ import {
   Activity,
   Archive,
   Bell,
+  BookOpen,
   Check,
   ChevronsUpDown,
   Cloud,
+  Code2,
   Cpu,
+  FileCode2,
   Keyboard,
+  MessageSquare,
   Palette,
+  Plug,
   Plus,
+  Server,
   Settings2,
+  ShieldCheck,
+  Sparkles,
+  Webhook,
   Wifi,
   X,
 } from "lucide-react";
@@ -19,8 +28,17 @@ import { AppearanceSection } from "@/components/settings/appearance-section";
 import { ArchivedSection } from "@/components/settings/archived-section";
 import { CloudSyncSection } from "@/components/settings/cloud-sync-section";
 import { GeneralSection } from "@/components/settings/general-section";
+import { InstructionsSection } from "@/components/settings/instructions-section";
+import { HostAcpSection } from "@/components/settings/host-acp-section";
 import { HostAgentsSection } from "@/components/settings/host-agents-section";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
+import { HostGuardianSection } from "@/components/settings/host-guardian-section";
+import { HostHooksSection } from "@/components/settings/host-hooks-section";
+import { HostImChannelsSection } from "@/components/settings/host-im-channels-section";
+import { HostLspSection } from "@/components/settings/host-lsp-section";
+import { HostMcpSection } from "@/components/settings/host-mcp-section";
+import { HostRulesSection } from "@/components/settings/host-rules-section";
+import { HostSkillsSection } from "@/components/settings/host-skills-section";
 import { HostUsageSection } from "@/components/settings/host-usage-section";
 import { NotificationsSection } from "@/components/settings/notifications-section";
 import {
@@ -51,12 +69,13 @@ import { cn } from "@/lib/utils";
 const APP_SECTIONS: {
   id: Extract<
     SettingsSection,
-    "general" | "cloud_sync" | "appearance" | "shortcuts" | "notifications" | "archived"
+    "general" | "instructions" | "cloud_sync" | "appearance" | "shortcuts" | "notifications" | "archived"
   >;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   { id: "general", label: "General", icon: Settings2 },
+  { id: "instructions", label: "Instructions", icon: FileCode2 },
   { id: "cloud_sync", label: "Cloud Sync", icon: Cloud },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
@@ -70,6 +89,14 @@ const HOST_TABS: {
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   { id: "agents", label: "Agents", icon: Cpu },
+  { id: "guardian", label: "Guardian", icon: ShieldCheck },
+  { id: "im_channels", label: "IM Channels", icon: MessageSquare },
+  { id: "skills", label: "Skills", icon: Sparkles },
+  { id: "acp", label: "ACP Agents", icon: Plug },
+  { id: "mcp", label: "MCP Servers", icon: Server },
+  { id: "rules", label: "Rules", icon: BookOpen },
+  { id: "hooks", label: "Hooks", icon: Webhook },
+  { id: "lsp", label: "Language Servers", icon: Code2 },
   { id: "usage", label: "Usage", icon: Activity },
   { id: "connection", label: "Connection", icon: Wifi },
 ];
@@ -82,7 +109,21 @@ function parseHostSection(
   if (lastColon <= 5) return null;
   const hostId = section.slice(5, lastColon);
   const tab = section.slice(lastColon + 1) as HostSettingsTab;
-  if (tab !== "agents" && tab !== "usage" && tab !== "connection") return null;
+  if (
+    tab !== "agents" &&
+    tab !== "guardian" &&
+    tab !== "im_channels" &&
+    tab !== "skills" &&
+    tab !== "acp" &&
+    tab !== "mcp" &&
+    tab !== "rules" &&
+    tab !== "hooks" &&
+    tab !== "lsp" &&
+    tab !== "usage" &&
+    tab !== "connection"
+  ) {
+    return null;
+  }
   return { hostId, tab };
 }
 
@@ -468,27 +509,59 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
         </aside>
 
         {/* Right Scrollable Settings Content */}
-        <ScrollArea className="min-h-0 flex-1" viewportClassName="px-10 py-8">
-          <div key={section} className="orbit-stage-enter mx-auto w-full max-w-[640px] pb-8">
-            {section === "general" && <GeneralSection />}
-            {section === "cloud_sync" && <CloudSyncSection />}
-            {section === "appearance" && <AppearanceSection />}
-            {section === "shortcuts" && <ShortcutsSection />}
-            {section === "notifications" && <NotificationsSection />}
-            {section === "archived" && <ArchivedSection />}
-            {section === "add_host" && <AddHostSection />}
-            {parsedHost && !resolvedHost && <AddHostSection />}
-            {resolvedHost?.tab === "agents" && (
-              <HostAgentsSection hostId={resolvedHost.hostId} />
-            )}
-            {resolvedHost?.tab === "usage" && (
-              <HostUsageSection hostId={resolvedHost.hostId} />
-            )}
-            {resolvedHost?.tab === "connection" && (
-              <HostConnectionSection hostId={resolvedHost.hostId} />
-            )}
+        {section === "instructions" ? (
+          <div className="min-h-0 flex-1 overflow-hidden px-7 py-6">
+            <div key={section} className="orbit-stage-enter h-full w-full">
+              <InstructionsSection />
+            </div>
           </div>
-        </ScrollArea>
+        ) : (
+          <ScrollArea className="min-h-0 flex-1" viewportClassName="px-10 py-8">
+            <div key={section} className="orbit-stage-enter mx-auto w-full max-w-[640px] pb-8">
+              {section === "general" && <GeneralSection />}
+              {section === "cloud_sync" && <CloudSyncSection />}
+              {section === "appearance" && <AppearanceSection />}
+              {section === "shortcuts" && <ShortcutsSection />}
+              {section === "notifications" && <NotificationsSection />}
+              {section === "archived" && <ArchivedSection />}
+              {section === "add_host" && <AddHostSection />}
+              {parsedHost && !resolvedHost && <AddHostSection />}
+              {resolvedHost?.tab === "agents" && (
+                <HostAgentsSection hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "guardian" && (
+                <HostGuardianSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "im_channels" && (
+                <HostImChannelsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "skills" && (
+                <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "acp" && (
+                <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "mcp" && (
+                <HostMcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "rules" && (
+                <HostRulesSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "hooks" && (
+                <HostHooksSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "lsp" && (
+                <HostLspSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "usage" && (
+                <HostUsageSection hostId={resolvedHost.hostId} />
+              )}
+              {resolvedHost?.tab === "connection" && (
+                <HostConnectionSection hostId={resolvedHost.hostId} />
+              )}
+            </div>
+          </ScrollArea>
+        )}
       </div>
     </div>
   );

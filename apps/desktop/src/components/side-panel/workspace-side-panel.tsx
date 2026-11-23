@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef } from "react";
 import {
+  Blocks,
   Columns2,
   File,
   FileCode2,
@@ -12,6 +13,7 @@ import {
   SquareTerminal,
   X,
 } from "lucide-react";
+import { ArtifactsTab } from "@/components/artifacts/artifacts-tab";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { BrowserTab } from "@/components/side-panel/browser-tab";
 import { FileViewerTab } from "@/components/side-panel/file-viewer-tab";
@@ -28,6 +30,7 @@ import { SimpleTooltip } from "@/components/ui/overlays";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type SidePanelTab,
+  fileCacheKey,
   orbitActions,
   sideQuestionScopeKey,
   useOrbitSelector,
@@ -56,6 +59,8 @@ function SidePanelTabIcon({ tab }: { tab: SidePanelTab }) {
       return <FileText className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
     case "peer":
       return <Columns2 className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
+    case "artifacts":
+      return <Blocks className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
   }
 }
 
@@ -97,8 +102,11 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   } = useWorkspaceMotion();
 
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
+  const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const tabs = useOrbitSelector((s) => s.sidePanelTabs);
+  const fileEditorDrafts = useOrbitSelector((s) => s.fileEditorDrafts);
   const panelElRef = useRef<HTMLElement | null>(null);
+  const tabStripRef = useRef<HTMLDivElement | null>(null);
   const activeTabId = useOrbitSelector((s) => s.activeSidePanelTabId);
   const hasStreamingSideQuestion = useOrbitSelector((s) => {
     const scope = sideQuestionScopeKey(s);
@@ -109,6 +117,20 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
     (s) => s.terminalTabs.filter((t) => t.hostId === selectedHostId).length,
   );
   const totalTerminalCount = useOrbitSelector((s) => s.terminalTabs.length);
+  const artifactCount = useOrbitSelector((s) => {
+    const detail = s.hostDetails[selectedHostId];
+    const all = detail?.artifacts ?? [];
+    if (all.length === 0) return 0;
+    const activeAg =
+      !s.isDraftNewSession && s.selectedAgentId
+        ? detail?.agents.find((a) => a.agent_id === s.selectedAgentId)
+        : null;
+    if (activeAg?.workspace_id) {
+      const wsCount = all.filter((a) => a.workspace_id === activeAg.workspace_id).length;
+      if (wsCount > 0) return wsCount;
+    }
+    return all.length;
+  });
 
   const resizeCleanupRef = useRef<(() => void) | null>(null);
   const mod = modSymbol();
@@ -118,6 +140,13 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
       resizeCleanupRef.current?.();
     };
   }, []);
+
+  // Keep the active side-panel tab scrolled into view when multiple tabs (e.g., subagents) overflow horizontally
+  useEffect(() => {
+    if (!activeTabId || !tabStripRef.current) return;
+    const activeEl = tabStripRef.current.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+    activeEl?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeTabId, tabs.length]);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const hasTerminalTabInBar = tabs.some((t) => t.kind === "terminal");
@@ -229,10 +258,23 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
       >
         {tabs.length > 0 ? (
           <div
+            ref={tabStripRef}
             className="flex h-full min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             {tabs.map((tab) => {
               const isActive = tab.id === activeTab?.id;
+              const isDirtyFile =
+                tab.kind === "file" &&
+                Boolean(tab.filePath) &&
+                Boolean(
+                  fileEditorDrafts[
+                    fileCacheKey(
+                      tab.hostId ?? selectedHostId,
+                      tab.cwd ?? selectedWorkspaceCwd ?? "~",
+                      tab.filePath ?? "",
+                    )
+                  ]?.dirty,
+                );
               const showPulseDot =
                 (tab.kind === "side_question" && hasStreamingSideQuestion) ||
                 (tab.kind === "terminal" && activeTerminalCount > 0 && !isActive);
@@ -259,6 +301,17 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                 >
                   <SidePanelTabIcon tab={tab} />
                   <span className="truncate">{tab.title}</span>
+                  {isDirtyFile && (
+                    <span
+                      title="Unsaved changes"
+                      className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
+                    />
+                  )}
+                  {tab.kind === "artifacts" && artifactCount > 0 && (
+                    <span className="text-muted-foreground/80 shrink-0 rounded-full bg-black/[0.05] px-1.5 text-[10px] tabular-nums dark:bg-white/[0.08]">
+                      {artifactCount}
+                    </span>
+                  )}
                   {showPulseDot && (
                     <span
                       className={cn(
@@ -340,6 +393,9 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
           <WorkspaceBoardTab key={activeTab.id} tab={activeTab} />
         )}
         {activeTab?.kind === "peer" && <PeerSplitTab key={activeTab.id} tab={activeTab} />}
+        {activeTab?.kind === "artifacts" && (
+          <ArtifactsTab key={activeTab.id} tab={activeTab} />
+        )}
 
         {!activeTab && (
           <SidePanelLaunchpad

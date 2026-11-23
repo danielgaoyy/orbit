@@ -185,6 +185,28 @@ public struct OrbitPalette: Equatable, Sendable {
             return Color(hex: "#6B8CFF")
         case .claudeCode:
             return Color(hex: "#D97757")
+        case .openCode:
+            return Color(hex: "#10B981")
+        case .geminiCli:
+            return Color(hex: "#4285F4")
+        case .cursorAgent:
+            return Color(hex: "#8B5CF6")
+        case .copilot:
+            return Color(hex: "#6366F1")
+        case .goose:
+            return Color(hex: "#F59E0B")
+        case .pi:
+            return Color(hex: "#EC4899")
+        case .kimi:
+            return Color(hex: "#06B6D4")
+        case .cline:
+            return Color(hex: "#14B8A6")
+        case .mistralVibe:
+            return Color(hex: "#F97316")
+        case .augment:
+            return Color(hex: "#3B82F6")
+        case .acp:
+            return Color(hex: "#64748B")
         }
     }
 }
@@ -493,6 +515,28 @@ public enum OrbitFormatters {
             return "Codex"
         case .claudeCode:
             return "Claude Code"
+        case .openCode:
+            return "OpenCode"
+        case .geminiCli:
+            return "Gemini CLI"
+        case .cursorAgent:
+            return "Cursor Agent"
+        case .copilot:
+            return "GitHub Copilot"
+        case .goose:
+            return "Goose"
+        case .pi:
+            return "Pi"
+        case .kimi:
+            return "Kimi"
+        case .cline:
+            return "Cline"
+        case .mistralVibe:
+            return "Mistral Vibe"
+        case .augment:
+            return "Augment"
+        case .acp:
+            return "ACP Agent"
         }
     }
 
@@ -504,6 +548,28 @@ public enum OrbitFormatters {
             return "Codex"
         case .claudeCode:
             return "Claude"
+        case .openCode:
+            return "OpenCode"
+        case .geminiCli:
+            return "Gemini"
+        case .cursorAgent:
+            return "Cursor"
+        case .copilot:
+            return "Copilot"
+        case .goose:
+            return "Goose"
+        case .pi:
+            return "Pi"
+        case .kimi:
+            return "Kimi"
+        case .cline:
+            return "Cline"
+        case .mistralVibe:
+            return "Mistral"
+        case .augment:
+            return "Augment"
+        case .acp:
+            return "ACP"
         }
     }
 
@@ -539,6 +605,8 @@ public enum OrbitFormatters {
             return "Always Ask"
         case .acceptEdits:
             return "Accept Edits"
+        case .auto:
+            return "Auto (Guardian)"
         case .fullAccess:
             return "Full Access"
         case let .custom(name):
@@ -552,6 +620,8 @@ public enum OrbitFormatters {
             return "shield"
         case .acceptEdits:
             return "checkmark.shield"
+        case .auto:
+            return "sparkles"
         case .fullAccess:
             return "shield.slash"
         }

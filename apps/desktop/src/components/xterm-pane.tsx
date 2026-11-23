@@ -52,6 +52,7 @@ export function XtermPane({
   const fitRef = useRef<FitAddon | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 });
   const resizeTimerRef = useRef<number | null>(null);
+  const isFocusedRef = useRef<boolean>(false);
 
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState("");
@@ -243,6 +244,10 @@ export function XtermPane({
     resizeObserver.observe(el);
 
     return () => {
+      if (isFocusedRef.current) {
+        isFocusedRef.current = false;
+        orbitActions.setTerminalFocused(false);
+      }
       if (resizeTimerRef.current !== null) {
         window.clearTimeout(resizeTimerRef.current);
         resizeTimerRef.current = null;
@@ -276,9 +281,16 @@ export function XtermPane({
     }
   }, [resolvedTheme, terminalFontSize, terminalCursorStyle, terminalScrollback, active, visible, syncRemoteSize]);
 
-  // Re-fit, sync remote PTY size, and focus when this persistent tab becomes visible/active
+  // Re-fit, sync remote PTY size, and focus when this persistent tab becomes visible/active;
+  // also release terminal focus whenever hidden or deactivated (React does not fire blur on hide).
   useEffect(() => {
-    if (!active || !visible) return;
+    if (!active || !visible) {
+      if (isFocusedRef.current) {
+        isFocusedRef.current = false;
+        orbitActions.setTerminalFocused(false);
+      }
+      return;
+    }
     const id = requestAnimationFrame(() => {
       fitRef.current?.fit();
       if (termRef.current) {
@@ -291,8 +303,14 @@ export function XtermPane({
 
   return (
     <div
-      onFocusCapture={() => orbitActions.setTerminalFocused(true)}
-      onBlurCapture={() => orbitActions.setTerminalFocused(false)}
+      onFocusCapture={() => {
+        isFocusedRef.current = true;
+        orbitActions.setTerminalFocused(true);
+      }}
+      onBlurCapture={() => {
+        isFocusedRef.current = false;
+        orbitActions.setTerminalFocused(false);
+      }}
       className={cn(
         "bg-canvas relative h-full w-full overflow-hidden px-3.5 py-2.5 dark:bg-[#0B0E14]",
         !active && "hidden",

@@ -16,6 +16,22 @@ struct Index {
       this.store.showModelPickerSheet = false;
       return true;
     }
+    if (this.store.showSideQuestionSheet) {
+      this.store.showSideQuestionSheet = false;
+      return true;
+    }
+    if (this.store.showWorkspaceBoardSheet) {
+      this.store.showWorkspaceBoardSheet = false;
+      return true;
+    }
+    if (this.store.showAutomationsSheet) {
+      this.store.showAutomationsSheet = false;
+      return true;
+    }
+    if (this.store.showArchivedSessionsSheet) {
+      this.store.showArchivedSessionsSheet = false;
+      return true;
+    }
     return false;
   }
 

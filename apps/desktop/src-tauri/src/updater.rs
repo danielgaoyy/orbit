@@ -1,9 +1,10 @@
-//! Built-in 1-click Desktop Self-Updater for macOS (`.dmg`) and Linux (`.deb`).
+//! Built-in 1-click Desktop Self-Updater for macOS (`.dmg`), Windows (`.exe`/`.msi`), and Linux (`.deb`).
 //!
 //! - Queries GitHub Releases (`danielgaoyy/orbit/releases/latest`)
 //! - Streams release artifact with live MB/MB progress to the UI
 //! - On macOS: mounts `.dmg` silently, replaces `/Applications/Orbit.app` (or current `.app` bundle)
 //!   via `ditto`, runs `xattr -cr` automatically so Gatekeeper never blocks launch, unmounts, and relaunches!
+//! - On Windows: downloads the NSIS `.exe` installer and launches it cleanly!
 //! - On Linux: extracts/installs `.deb` binary in place (or via `sudo -n dpkg -i`) and relaunches!
 
 use std::cmp::Ordering;
@@ -30,6 +31,10 @@ pub struct ReleaseUpdateInfo {
     pub macos_dmg_url: Option<String>,
     pub linux_arm64_deb_url: Option<String>,
     pub linux_x64_deb_url: Option<String>,
+    #[serde(default)]
+    pub windows_nsis_url: Option<String>,
+    #[serde(default)]
+    pub windows_msi_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +108,12 @@ fn build_release_info_from_tag(tag_name: &str, current_version: &str) -> Release
         )),
         linux_x64_deb_url: Some(format!(
             "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-Linux-x64.deb"
+        )),
+        windows_nsis_url: Some(format!(
+            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-Windows-x64-setup.exe"
+        )),
+        windows_msi_url: Some(format!(
+            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-Windows-x64.msi"
         )),
         html_url: format!("https://github.com/{GITHUB_REPO}/releases/tag/{clean_tag}"),
         tag_name: clean_tag,
@@ -215,6 +226,12 @@ pub async fn check_latest_release() -> Result<ReleaseUpdateInfo, String> {
                     if enriched.linux_x64_deb_url.is_some() {
                         info.linux_x64_deb_url = enriched.linux_x64_deb_url;
                     }
+                    if enriched.windows_nsis_url.is_some() {
+                        info.windows_nsis_url = enriched.windows_nsis_url;
+                    }
+                    if enriched.windows_msi_url.is_some() {
+                        info.windows_msi_url = enriched.windows_msi_url;
+                    }
                 }
             }
             Ok(info)
@@ -258,6 +275,8 @@ fn parse_github_release_json(json: &serde_json::Value, current_version: &str) ->
     let mut dmg_url = None;
     let mut linux_arm_deb = None;
     let mut linux_x64_deb = None;
+    let mut windows_nsis = None;
+    let mut windows_msi = None;
 
     if let Some(assets) = json.get("assets").and_then(|v| v.as_array()) {
         for item in assets {
@@ -275,6 +294,14 @@ fn parse_github_release_json(json: &serde_json::Value, current_version: &str) ->
                 linux_arm_deb = Some(dl.to_string());
             } else if name == "Orbit-Linux-x64.deb" {
                 linux_x64_deb = Some(dl.to_string());
+            } else if name == "Orbit-Windows-x64-setup.exe"
+                || (name.ends_with("-setup.exe") && name.contains("Orbit"))
+            {
+                windows_nsis = Some(dl.to_string());
+            } else if name == "Orbit-Windows-x64.msi"
+                || (name.ends_with(".msi") && name.contains("Orbit"))
+            {
+                windows_msi = Some(dl.to_string());
             }
         }
     }
@@ -298,6 +325,16 @@ fn parse_github_release_json(json: &serde_json::Value, current_version: &str) ->
                 "https://github.com/{GITHUB_REPO}/releases/download/{tag_name}/Orbit-Linux-x64.deb"
             ))
         }),
+        windows_nsis_url: windows_nsis.or_else(|| {
+            Some(format!(
+                "https://github.com/{GITHUB_REPO}/releases/download/{tag_name}/Orbit-Windows-x64-setup.exe"
+            ))
+        }),
+        windows_msi_url: windows_msi.or_else(|| {
+            Some(format!(
+                "https://github.com/{GITHUB_REPO}/releases/download/{tag_name}/Orbit-Windows-x64.msi"
+            ))
+        }),
         tag_name,
         html_url,
         notes,
@@ -313,6 +350,9 @@ pub async fn perform_one_click_update(
     }
     if cfg!(target_os = "linux") {
         return update_linux_deb_and_relaunch(&release, &on_progress).await;
+    }
+    if cfg!(target_os = "windows") {
+        return update_windows_installer_and_relaunch(&release, &on_progress).await;
     }
     Err(format!("当前平台请前往 {} 下载安装", release.html_url))
 }
@@ -423,21 +463,79 @@ fn resolve_target_macos_app_bundle() -> PathBuf {
 }
 
 fn spawn_detached_shell(script: &str) -> Result<(), String> {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.args(["-c", script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
 
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("无法拉起后台更新进程: {e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = script;
+        Err("POSIX shell updater is not used on this platform".to_string())
+    }
+}
+
+async fn update_windows_installer_and_relaunch(
+    release: &ReleaseUpdateInfo,
+    on_progress: &Channel<AppUpdateProgress>,
+) -> Result<(), String> {
+    let installer_url = release
+        .windows_nsis_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| release.windows_msi_url.as_deref().filter(|s| !s.is_empty()))
+        .ok_or_else(|| "未找到 Windows 安装包下载链接".to_string())?;
+
+    let ext = if installer_url.to_ascii_lowercase().ends_with(".msi") {
+        "msi"
+    } else {
+        "exe"
+    };
+    let tmp_dir = std::env::temp_dir();
+    let my_pid = std::process::id();
+    let installer_path = tmp_dir.join(format!(
+        "Orbit-{}-{my_pid}-setup.{ext}",
+        release.latest_version
+    ));
+
+    download_with_progress(
+        installer_url,
+        &release.tag_name,
+        &installer_path,
+        on_progress,
+    )
+    .await?;
+    emit_progress(on_progress, 0.96, "正在启动 Windows 安装程序…", true);
+
+    let mut cmd = if ext == "msi" {
+        let mut c = Command::new("msiexec");
+        c.args(["/i", &installer_path.to_string_lossy()]);
+        c
+    } else {
+        Command::new(&installer_path)
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0200);
+    }
     cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("无法拉起后台更新进程: {e}"))
+        .map_err(|e| format!("无法启动 Windows 安装程序: {e}"))?;
+
+    tokio::time::sleep(Duration::from_millis(280)).await;
+    std::process::exit(0);
 }
 
 async fn update_macos_dmg_and_relaunch(
@@ -690,8 +788,15 @@ async fn probe_orbit_binary_version(bin: &Path) -> Option<String> {
     parse_orbit_cli_version(&String::from_utf8_lossy(&out.stdout))
 }
 
+fn resolve_user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
 fn is_dev_daemon_configured() -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = resolve_user_home_dir() else {
         return false;
     };
     let supervisor_files = [
@@ -711,7 +816,8 @@ fn is_dev_daemon_configured() -> bool {
 fn bundled_orbit_sidecar_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let candidate = dir.join("orbit");
+    let exe_name = if cfg!(windows) { "orbit.exe" } else { "orbit" };
+    let candidate = dir.join(exe_name);
     if candidate.is_file() {
         return Some(candidate);
     }
@@ -723,6 +829,7 @@ fn orbit_cli_release_asset_name() -> Result<&'static str, String> {
         ("macos", "aarch64") => Ok("orbit-cli-macos-arm64"),
         ("linux", "x86_64") => Ok("orbit-cli-linux-x64"),
         ("linux", "aarch64") => Ok("orbit-cli-linux-arm64"),
+        ("windows", "x86_64") => Ok("orbit-windows-x86_64.exe"),
         (os, arch) => Err(format!(
             "Unsupported platform for local daemon sync: {os}/{arch}"
         )),
@@ -736,6 +843,44 @@ static LOCAL_DAEMON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 fn next_unique_temp_suffix() -> String {
     let seq = LOCAL_DAEMON_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{}.{seq}", std::process::id())
+}
+
+fn replace_executable_safely(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if let Some(parent) = dst.parent()
+            && let Some(stem) = dst.file_stem().and_then(|s| s.to_str())
+        {
+            let stale_prefix = format!("{stem}.exe.old.");
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().starts_with(&stale_prefix) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+        let backup = if dst.exists() {
+            let b = dst.with_extension(format!("exe.old.{}", std::process::id()));
+            let _ = std::fs::remove_file(&b);
+            std::fs::rename(dst, &b)?;
+            Some(b)
+        } else {
+            None
+        };
+        if let Err(err) = std::fs::rename(tmp, dst) {
+            if let Some(ref b) = backup {
+                let _ = std::fs::rename(b, dst);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, dst)
+    }
 }
 
 fn atomic_install_executable(src: &Path, dst: &Path) -> Result<(), String> {
@@ -756,7 +901,7 @@ fn atomic_install_executable(src: &Path, dst: &Path) -> Result<(), String> {
             return Err(format!("Failed to chmod {}: {e}", tmp.display()));
         }
     }
-    if let Err(e) = std::fs::rename(&tmp, dst) {
+    if let Err(e) = replace_executable_safely(&tmp, dst) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("Failed to replace {}: {e}", dst.display()));
     }
@@ -854,11 +999,11 @@ pub async fn sync_local_daemon(force: bool) -> Result<LocalDaemonSyncResult, Str
         .lock()
         .await;
 
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "Unable to resolve HOME directory".to_string())?;
-    let install_dir = home.join(".local/bin");
-    let install_path = install_dir.join("orbit");
+    let home = resolve_user_home_dir()
+        .ok_or_else(|| "Unable to resolve user home directory".to_string())?;
+    let install_dir = home.join(".local").join("bin");
+    let exe_name = if cfg!(windows) { "orbit.exe" } else { "orbit" };
+    let install_path = install_dir.join(exe_name);
 
     let mut source = "existing";
     let mut installed_version = probe_orbit_binary_version(&install_path).await;
@@ -890,7 +1035,12 @@ pub async fn sync_local_daemon(force: bool) -> Result<LocalDaemonSyncResult, Str
     if still_outdated {
         std::fs::create_dir_all(&install_dir)
             .map_err(|e| format!("Failed to create {}: {e}", install_dir.display()))?;
-        let tmp_dl = install_dir.join(format!("orbit.dl.{}", next_unique_temp_suffix()));
+        let tmp_name = if cfg!(windows) {
+            format!("orbit.dl.{}.exe", next_unique_temp_suffix())
+        } else {
+            format!("orbit.dl.{}", next_unique_temp_suffix())
+        };
+        let tmp_dl = install_dir.join(tmp_name);
         let dl_res = download_orbit_cli_binary(&tmp_dl).await;
         if let Err(err) = dl_res {
             let _ = std::fs::remove_file(&tmp_dl);
@@ -906,7 +1056,7 @@ pub async fn sync_local_daemon(force: bool) -> Result<LocalDaemonSyncResult, Str
                 let _ = std::fs::remove_file(&tmp_dl);
                 return Err("Downloaded orbit binary failed self-check (--version)".to_string());
             }
-            if let Err(e) = std::fs::rename(&tmp_dl, &install_path) {
+            if let Err(e) = replace_executable_safely(&tmp_dl, &install_path) {
                 let _ = std::fs::remove_file(&tmp_dl);
                 return Err(format!("Failed to install {}: {e}", install_path.display()));
             }

@@ -4,20 +4,32 @@ import {
   AgentCardDto,
   AgentStageDeltaDto,
   AskSideQuestionRequestDto,
+  CancelWorkflowRunRequestDto,
   ClientProjectDto,
+  CloudSyncResultDto,
+  CloudSyncStatusDto,
   ComposePromptRequestDto,
   ComposedPromptDto,
   ComposerAttachmentItem,
   ComposerContextInputDto,
   ComposerQuoteInputDto,
+  ConditionalTimerRecordDto,
+  ControlGoalRunRequestDto,
   CoreNotificationDto,
+  CreateSchedulePayloadDto,
+  CreateSessionRequestDto,
   DiffFileDto,
   DiffLineDto,
+  ExportOptionsDto,
+  ExportedTranscriptDto,
   FleetOverviewDto,
   FleetSidebarDto,
   FleetSidebarRequestDto,
+  ForkAgentRequestDto,
+  ForkAgentResultDto,
   GitReviewDto,
   GitStatusSnapshotDto,
+  GoalRunRecordDto,
   HostCardDto,
   HostDetailDto,
   InlineMentionRegistration,
@@ -26,6 +38,7 @@ import {
   MentionRankRequestDto,
   ModelOptionDto,
   ModelSelectionRequestDto,
+  MonitorWatchRecordDto,
   PromptBadgeDto,
   ProviderModelCatalogDto,
   ProviderModelSpecDto,
@@ -36,14 +49,21 @@ import {
   RenderDiagramViewDto,
   ResolvedModelSelectionDto,
   RewindAgentResultDto,
+  ScheduleSpecDto,
   SlashCommandDto,
+  SpawnWorkspacePeerRequestDto,
   StageTurnDto,
   StagedAttachmentDto,
+  StopMonitorWatchRequestDto,
   TerminalRowDto,
   TerminalScreenDto,
   ThreadPrefSeedDto,
   TimelineItemDto,
   ToolStepDescriptorDto,
+  WorkflowRunRecordDto,
+  WorkspaceBoardSnapshotDto,
+  WorkspaceDto,
+  WorkspaceEventRecordDto,
   WorkspaceFileViewDto,
   basenameOfPath,
   cwdPathsEquivalent,
@@ -60,8 +80,12 @@ import {
 import { orbitLogWarn } from './OrbitLogger';
 import { OrbitPreferencesStore } from './OrbitPreferences';
 import {
+  checkHarmonyNotificationEnabled,
+  publishOrbitDeepLinkNotification,
   readAuthorizedClipboardText,
   readUriBytesAsync,
+  registerHarmonyPushToken,
+  requestHarmonyNotificationPermission,
   scanPairingQrCode,
   triggerNativeHaptic,
   writeClipboardText
@@ -84,6 +108,8 @@ interface SideQuestionDoneBody {
 }
 
 interface SideQuestionEnvelopeDto {
+  kind?: string;
+  request_id?: string;
   Delta?: SideQuestionDeltaBody;
   Done?: SideQuestionDoneBody;
   text_delta?: string;
@@ -98,6 +124,10 @@ export class OrbitHarmonyStore {
   private appContext: common.ApplicationContext | null = null;
   private prefsStore: OrbitPreferencesStore = new OrbitPreferencesStore();
   private pendingDeepLink: string = '';
+  private pendingOpenHostId: string = '';
+  private pendingOpenAgentId: string = '';
+  private automationsRefreshSeq: number = 0;
+  private sideQuestionGen: number = 0;
   @Trace public isNewSessionDraft: boolean = false;
   private draftSelectionByProvider: Map<string, DraftModelSelection> = new Map<string, DraftModelSelection>();
   private hasUserCustomizedDraftModel: boolean = false;
@@ -124,6 +154,10 @@ export class OrbitHarmonyStore {
   @Trace public showContextPickerSheet: boolean = false;
   @Trace public showHostSettingsSheet: boolean = false;
   @Trace public showDirBrowser: boolean = false;
+  @Trace public showAutomationsSheet: boolean = false;
+  @Trace public showWorkspaceBoardSheet: boolean = false;
+  @Trace public showSideQuestionSheet: boolean = false;
+  @Trace public showArchivedSessionsSheet: boolean = false;
   @Trace public sidebarProjectSort: string = 'recent';
   @Trace public sidebarThreadFilter: string = 'all';
   @Trace public sidebarSearchQuery: string = '';
@@ -139,9 +173,29 @@ export class OrbitHarmonyStore {
   private stageAgentId: string = '';
   @Trace public draftUseWorktree: boolean = false;
   @Trace public sideQuestionActive: boolean = false;
+  @Trace public sideQuestionStreaming: boolean = false;
   @Trace public sideQuestionPrompt: string = '';
   @Trace public sideQuestionAnswer: string = '';
   @Trace public sideQuestionError: string = '';
+
+  // Wave 7 Parity State: Automations, Shared Board, Cloud Sync, Push & Fast Mode
+  @Trace public composerFastMode: boolean = false;
+  @Trace public schedules: ScheduleSpecDto[] = [];
+  @Trace public conditionalTimers: ConditionalTimerRecordDto[] = [];
+  @Trace public goalRuns: GoalRunRecordDto[] = [];
+  @Trace public monitorWatches: MonitorWatchRecordDto[] = [];
+  @Trace public workflowRuns: WorkflowRunRecordDto[] = [];
+  @Trace public automationsLoading: boolean = false;
+  @Trace public workspaceBoardContent: string = '';
+  @Trace public workspaceBoardRevision: number = 0;
+  @Trace public workspaceBoardUpdatedBy: string = '';
+  @Trace public workspaceBoardPath: string = '';
+  @Trace public workspaceEvents: WorkspaceEventRecordDto[] = [];
+  @Trace public cloudSyncStatus: CloudSyncStatusDto | null = null;
+  @Trace public cloudSyncBusy: boolean = false;
+  @Trace public pushToken: string = '';
+  @Trace public pushStatusMessage: string = '';
+  @Trace public notificationsEnabled: boolean = false;
 
   // Multi-Host Fleet & Workspace State
   @Trace public nativeAvailable: boolean = false;
@@ -221,7 +275,7 @@ export class OrbitHarmonyStore {
       if (this.pendingDeepLink.length > 0) {
         const uri = this.pendingDeepLink;
         this.pendingDeepLink = '';
-        this.pairHost(uri);
+        this.handleDeepLinkUri(uri);
       }
       return;
     }
@@ -278,11 +332,12 @@ export class OrbitHarmonyStore {
       });
       this.reloadFleet();
       this.refreshSidebar();
+      this.refreshCloudSyncStatus();
       this.core.connectAllHosts();
       if (this.pendingDeepLink.length > 0) {
         const uri = this.pendingDeepLink;
         this.pendingDeepLink = '';
-        this.pairHost(uri);
+        this.handleDeepLinkUri(uri);
       }
     } catch (e) {
       this.nativeAvailable = false;
@@ -692,15 +747,114 @@ export class OrbitHarmonyStore {
   }
 
   public handleDeepLinkUri(uri: string): void {
-    const clean = uri.trim();
-    if (!clean.startsWith('orbit://')) {
+    const trimmed = uri.trim();
+    const hashIdx = trimmed.indexOf('#');
+    const clean = hashIdx >= 0 ? trimmed.substring(0, hashIdx).trim() : trimmed;
+    const lower = clean.toLowerCase();
+    if (!lower.startsWith('orbit://')) {
       return;
     }
     if (this.core === null) {
       this.pendingDeepLink = clean;
       return;
     }
-    this.pairHost(clean);
+    const isOpenRoute =
+      lower === 'orbit://open' ||
+      lower.startsWith('orbit://open?') ||
+      lower.startsWith('orbit://open/');
+    const isPairRoute =
+      lower === 'orbit://pair' ||
+      lower.startsWith('orbit://pair?') ||
+      lower.startsWith('orbit://pair/');
+
+    if (isOpenRoute) {
+      const qIdx = clean.indexOf('?');
+      let hostId = '';
+      let agentId = '';
+      if (qIdx >= 0 && qIdx + 1 < clean.length) {
+        const queryStr = clean.substring(qIdx + 1);
+        const parts = queryStr.split('&');
+        for (let i = 0; i < parts.length; i++) {
+          const seg = parts[i];
+          const eq = seg.indexOf('=');
+          if (eq <= 0) {
+            continue;
+          }
+          const k = seg.substring(0, eq).trim().toLowerCase();
+          const rawVal = seg.substring(eq + 1).trim();
+          let val = rawVal;
+          try {
+            val = decodeURIComponent(rawVal);
+          } catch (_e) {
+            val = rawVal;
+          }
+          if (k === 'host' || k === 'host_id') {
+            hostId = val;
+          } else if (k === 'agent' || k === 'agent_id') {
+            agentId = val;
+          }
+        }
+      }
+      if (hostId.length > 0) {
+        this.openSessionFromDeepLink(hostId, agentId);
+      } else {
+        this.showToast('Missing host in Orbit link', true);
+      }
+      return;
+    }
+    if (isPairRoute) {
+      this.pairHost(clean);
+      return;
+    }
+    this.showToast('Unsupported Orbit link', true);
+  }
+
+  private selectValidatedDeepLinkAgent(hostId: string, agentId: string): void {
+    const cleanAgent = agentId.trim();
+    if (cleanAgent.length === 0) {
+      return;
+    }
+    const detail = this.currentHostDetail;
+    const isOnline = detail !== null &&
+      detail.host.host_id === hostId &&
+      (detail.host.connection_state === 'online_direct' ||
+        detail.host.connection_state === 'online_relay');
+    if (isOnline && detail !== null) {
+      const found = detail.agents.some((ag: AgentCardDto): boolean => ag.agent_id === cleanAgent);
+      if (!found) {
+        this.showToast('Session not found', true);
+        return;
+      }
+    }
+    this.selectAgent(cleanAgent);
+  }
+
+  public openSessionFromDeepLink(hostId: string, agentId: string): void {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId.trim();
+    if (cleanHost.length === 0) {
+      return;
+    }
+    if (this.core === null) {
+      this.pendingOpenHostId = cleanHost;
+      this.pendingOpenAgentId = cleanAgent;
+      return;
+    }
+    const hostExists = this.hosts.some((h: HostCardDto): boolean => h.host_id === cleanHost);
+    if (!hostExists) {
+      this.pendingOpenHostId = cleanHost;
+      this.pendingOpenAgentId = cleanAgent;
+      this.reloadFleet();
+      return;
+    }
+    this.pendingOpenHostId = '';
+    this.pendingOpenAgentId = '';
+    if (this.selectedHostId !== cleanHost) {
+      this.selectHost(cleanHost);
+    }
+    if (cleanAgent.length > 0) {
+      this.selectValidatedDeepLinkAgent(cleanHost, cleanAgent);
+    }
   }
 
   // Haptics, Clipboard & Native ScanKit QR Pairing
@@ -819,7 +973,25 @@ export class OrbitHarmonyStore {
       this.hosts = snap.hosts;
       this.projects = snap.projects;
       this.totalPendingApprovals = snap.total_pending_approvals;
-      if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
+      if (this.pendingOpenHostId.length > 0) {
+        const targetHost = this.pendingOpenHostId;
+        const targetAgent = this.pendingOpenAgentId;
+        this.pendingOpenHostId = '';
+        this.pendingOpenAgentId = '';
+        if (snap.hosts.some((h: HostCardDto): boolean => h.host_id === targetHost)) {
+          this.selectHost(targetHost);
+          if (targetAgent.length > 0) {
+            this.selectValidatedDeepLinkAgent(targetHost, targetAgent);
+          }
+        } else {
+          this.showToast('Host not found', true);
+          if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
+            this.selectHost(snap.hosts[0].host_id);
+          } else {
+            this.refreshSidebar();
+          }
+        }
+      } else if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
         this.selectHost(snap.hosts[0].host_id);
       } else {
         this.refreshSidebar();
@@ -1027,6 +1199,9 @@ export class OrbitHarmonyStore {
     const changed = this.selectedHostId !== hostId;
     this.selectedHostId = hostId;
     if (changed) {
+      this.automationsRefreshSeq += 1;
+      this.sideQuestionGen += 1;
+      this.sideQuestionStreaming = false;
       this.selectedAgentId = '';
       this.currentAgent = null;
       this.stageRevision = 0;
@@ -1036,6 +1211,13 @@ export class OrbitHarmonyStore {
       this.pendingPermissions = [];
       this.pendingQuestions = [];
       this.sessionDiffs = [];
+      this.schedules = [];
+      this.conditionalTimers = [];
+      this.goalRuns = [];
+      this.monitorWatches = [];
+      this.workflowRuns = [];
+      this.automationsLoading = false;
+      this.resetWorkspaceBoardState();
       this.syncActiveQueuedPrompts();
     }
     this.reloadHost(hostId);
@@ -1058,6 +1240,12 @@ export class OrbitHarmonyStore {
       if (detail === null) {
         return;
       }
+      this.schedules = detail.schedules ?? [];
+      this.conditionalTimers = detail.conditional_timers ?? [];
+      this.goalRuns = detail.goal_runs ?? [];
+      this.monitorWatches = detail.monitor_watches ?? [];
+      this.workflowRuns = detail.workflow_runs ?? [];
+      this.syncActiveWorkspaceBoardFromDetail(detail);
 
       // Seamlessly upgrade optimistic session ID when daemon confirms AgentCreated
       const replacedId = this.selectedAgentId.startsWith('opt_')
@@ -1147,6 +1335,11 @@ export class OrbitHarmonyStore {
     this.activeCwd = cwd;
     if (changed) {
       this.refreshSidebar();
+      if (this.currentHostDetail !== null) {
+        this.syncActiveWorkspaceBoardFromDetail(this.currentHostDetail);
+      } else {
+        this.resetWorkspaceBoardState();
+      }
     }
     if (this.core !== null && this.selectedHostId.length > 0) {
       try {
@@ -1178,6 +1371,10 @@ export class OrbitHarmonyStore {
     this.syncActiveQueuedPrompts();
     if (cwd !== undefined && cwd.length > 0) {
       this.setActiveCwd(cwd);
+    } else if (this.currentHostDetail !== null) {
+      this.syncActiveWorkspaceBoardFromDetail(this.currentHostDetail);
+    } else {
+      this.resetWorkspaceBoardState();
     }
     this.refreshSidebar();
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
@@ -1212,6 +1409,11 @@ export class OrbitHarmonyStore {
     if (this.core !== null && this.selectedHostId.length > 0) {
       this.core.openAgentTimeline(this.selectedHostId, agentId);
       this.reloadStage();
+      if (this.currentHostDetail !== null) {
+        this.syncActiveWorkspaceBoardFromDetail(this.currentHostDetail);
+      } else {
+        this.resetWorkspaceBoardState();
+      }
       this.refreshSidebar();
     }
     this.triggerHaptic(8);
@@ -1292,6 +1494,10 @@ export class OrbitHarmonyStore {
         const nextMode = normalizeModeSlug(delta.agent.mode);
         if (this.composerMode !== nextMode) {
           this.composerMode = nextMode;
+        }
+        const nextFast = delta.agent.fast_mode === true;
+        if (this.composerFastMode !== nextFast) {
+          this.composerFastMode = nextFast;
         }
         if (!this.isNewSessionDraft && this.selectedAgentId === delta.agent.agent_id) {
           this.core.markAgentSeen(
@@ -1751,8 +1957,7 @@ export class OrbitHarmonyStore {
       return;
     }
     if (cmd.id === 'btw') {
-      this.composerText = '/btw ';
-      this.triggerHaptic(6);
+      this.openSideQuestionSheet();
       return;
     }
     if (cmd.id === 'ask' || cmd.id === 'supervised') {
@@ -1760,7 +1965,12 @@ export class OrbitHarmonyStore {
       this.showToast('Permissions: Always Ask', false);
       return;
     }
-    if (cmd.id === 'edits' || cmd.id === 'auto') {
+    if (cmd.id === 'auto') {
+      this.setSessionMode('auto');
+      this.showToast('Permissions: Auto (Guardian)', false);
+      return;
+    }
+    if (cmd.id === 'edits') {
       this.setSessionMode('accept_edits');
       this.showToast('Permissions: Accept Edits', false);
       return;
@@ -1937,7 +2147,7 @@ export class OrbitHarmonyStore {
   }
 
   public cycleSessionMode(): void {
-    const order: string[] = ['default', 'accept_edits', 'full_access'];
+    const order: string[] = ['default', 'auto', 'accept_edits', 'full_access'];
     const normalized = normalizeModeSlug(this.composerMode);
     const curIdx = order.indexOf(normalized);
     const nextMode = curIdx >= 0 ? order[(curIdx + 1) % order.length] : 'accept_edits';
@@ -2134,7 +2344,8 @@ export class OrbitHarmonyStore {
           this.selectedAgentId,
           provider,
           modelOpt,
-          effortOpt
+          effortOpt,
+          null
         );
       } else {
         this.core.setAgentConfig(this.selectedHostId, this.selectedAgentId, modelOpt, effortOpt);
@@ -2812,19 +3023,25 @@ export class OrbitHarmonyStore {
         const wtOpt = this.worktreeBranch.trim().length > 0
           ? this.worktreeBranch.trim()
           : (this.draftUseWorktree ? 'auto' : null);
-        const optId = this.core.createAgentFull(
-          this.selectedHostId,
-          this.activeCwd,
-          null,
-          this.composerProvider,
-          modelOpt,
-          effortOpt,
-          normalizeModeSlug(this.composerMode),
-          composed.wire_prompt,
-          composed.display_prompt,
-          badgesJson,
-          wtOpt
-        );
+        const createReq: CreateSessionRequestDto = {
+          host_id: this.selectedHostId,
+          cwd: this.activeCwd,
+          extra_dirs: [],
+          provider: this.composerProvider,
+          acp_agent_id: null,
+          model: modelOpt,
+          effort: effortOpt,
+          fast_mode: this.composerFastMode,
+          mode: normalizeModeSlug(this.composerMode),
+          initial_prompt: composed.wire_prompt,
+          initial_display_prompt: composed.display_prompt,
+          initial_badges: composed.badges,
+          worktree_branch: wtOpt,
+          workspace_id: null,
+          handle: null,
+          auto_cluster: null
+        };
+        const optId = this.core.createSessionJson(JSON.stringify(createReq));
         this.selectedAgentId = optId;
         this.isNewSessionDraft = false;
         this.syncActiveQueuedPrompts();
@@ -3317,7 +3534,11 @@ export class OrbitHarmonyStore {
     if (this.core === null || this.selectedHostId.length === 0 || cleanQ.length === 0) {
       return '';
     }
+    this.sideQuestionGen += 1;
+    const gen = this.sideQuestionGen;
+    this.showSideQuestionSheet = true;
     this.sideQuestionActive = true;
+    this.sideQuestionStreaming = true;
     this.sideQuestionPrompt = cleanQ;
     this.sideQuestionAnswer = '';
     this.sideQuestionError = '';
@@ -3336,8 +3557,12 @@ export class OrbitHarmonyStore {
     };
     try {
       return this.core.askSideQuestion(JSON.stringify(req), (err: Error | null, eventJson: string) => {
+        if (gen !== this.sideQuestionGen) {
+          return;
+        }
         if (err !== null && err !== undefined) {
           this.sideQuestionError = err.message;
+          this.sideQuestionStreaming = false;
           return;
         }
         if (eventJson === undefined || eventJson === null || eventJson.length === 0) {
@@ -3356,15 +3581,21 @@ export class OrbitHarmonyStore {
             if (errMsg.length > 0) {
               this.sideQuestionError = errMsg;
             }
+            this.sideQuestionStreaming = false;
           } else {
             if (ev.text_delta !== undefined && ev.text_delta.length > 0) {
               this.sideQuestionAnswer += ev.text_delta;
             }
             if (ev.full_text !== undefined && ev.full_text.length > 0) {
               this.sideQuestionAnswer = ev.full_text;
+              this.sideQuestionStreaming = false;
             }
             if (ev.error !== undefined && ev.error !== null && ev.error.length > 0) {
               this.sideQuestionError = ev.error;
+              this.sideQuestionStreaming = false;
+            }
+            if (ev.kind === 'done') {
+              this.sideQuestionStreaming = false;
             }
           }
         } catch (parseErr) {
@@ -3373,7 +3604,10 @@ export class OrbitHarmonyStore {
       });
     } catch (err) {
       orbitLogWarn('OrbitStore', 'askSideQuestion failed', err as Object);
-      this.sideQuestionError = (err as Error).message;
+      if (gen === this.sideQuestionGen) {
+        this.sideQuestionError = (err as Error).message;
+        this.sideQuestionStreaming = false;
+      }
       return '';
     }
   }
@@ -3424,6 +3658,929 @@ export class OrbitHarmonyStore {
     } catch (err) {
       orbitLogWarn('OrbitStore', 'renderDiagramJson failed', err as Object);
       return null;
+    }
+  }
+
+  // --- Wave 7 Parity Actions ---
+
+  // 1. Session Controls: Fast Mode, Fork / Branch, Export Markdown
+
+  public toggleFastMode(): void {
+    const next = !this.composerFastMode;
+    this.composerFastMode = next;
+    if (
+      this.core !== null &&
+      this.selectedHostId.length > 0 &&
+      this.selectedAgentId.length > 0 &&
+      !this.isNewSessionDraft
+    ) {
+      try {
+        this.core.setAgentFastMode(this.selectedHostId, this.selectedAgentId, next);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'setAgentFastMode failed', err as Object);
+      }
+    }
+    this.showToast(next ? 'Fast Mode enabled' : 'Fast Mode disabled', false);
+    this.triggerHaptic(8);
+  }
+
+  public async forkCurrentSession(useWorktree: boolean): Promise<void> {
+    if (
+      this.core === null ||
+      this.selectedHostId.length === 0 ||
+      this.selectedAgentId.length === 0 ||
+      this.isNewSessionDraft
+    ) {
+      this.showToast('Open a conversation to fork', true);
+      return;
+    }
+    const hostId = this.selectedHostId;
+    const req: ForkAgentRequestDto = {
+      host_id: hostId,
+      source_agent_id: this.selectedAgentId,
+      up_to_seq: null,
+      target: useWorktree
+        ? { kind: 'new_worktree', branch: null, base_ref: null }
+        : { kind: 'same_directory' },
+      title: null,
+      initial_prompt: null
+    };
+    try {
+      const json = await this.core.forkAgentJson(JSON.stringify(req));
+      const res = JSON.parse(json) as ForkAgentResultDto;
+      if (this.selectedHostId !== hostId) {
+        return;
+      }
+      this.reloadHost(hostId);
+      if (res.agent !== undefined && res.agent.agent_id.length > 0) {
+        this.selectAgent(res.agent.agent_id);
+      }
+      this.showToast(
+        useWorktree ? 'Forked into new worktree' : 'Forked conversation',
+        false
+      );
+      this.triggerHaptic(14);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'forkAgentJson failed', err as Object);
+      if (this.selectedHostId === hostId) {
+        this.showToast((err as Error).message || 'Fork failed', true);
+      }
+    }
+  }
+
+  public exportCurrentSessionMarkdown(): void {
+    if (
+      this.core === null ||
+      this.selectedHostId.length === 0 ||
+      this.selectedAgentId.length === 0 ||
+      this.isNewSessionDraft
+    ) {
+      this.showToast('Open a conversation to export', true);
+      return;
+    }
+    const opts: ExportOptionsDto = {
+      format: 'markdown',
+      include_thinking: false,
+      include_tool_calls: true,
+      include_timestamps: true
+    };
+    try {
+      const json = this.core.exportAgentTranscriptJson(
+        this.selectedHostId,
+        this.selectedAgentId,
+        JSON.stringify(opts)
+      );
+      const exported = JSON.parse(json) as ExportedTranscriptDto;
+      if (exported.content.length === 0) {
+        this.showToast('Nothing to export yet', false);
+        return;
+      }
+      this.copyToClipboard(
+        exported.content,
+        `Copied Markdown (${exported.turn_count} turns)`
+      );
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'exportAgentTranscriptJson failed', err as Object);
+      this.showToast((err as Error).message || 'Export failed', true);
+    }
+  }
+
+  // 2. Side Question (`/btw`) Sheet
+
+  public openSideQuestionSheet(): void {
+    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+      this.sidebarOpen = false;
+    }
+    this.showSideQuestionSheet = true;
+    this.triggerHaptic(8);
+  }
+
+  public clearSideQuestion(): void {
+    this.sideQuestionGen += 1;
+    this.sideQuestionActive = false;
+    this.sideQuestionStreaming = false;
+    this.sideQuestionPrompt = '';
+    this.sideQuestionAnswer = '';
+    this.sideQuestionError = '';
+  }
+
+  // 3. Archived Sessions
+
+  public openArchivedSessions(): void {
+    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+      this.sidebarOpen = false;
+    }
+    if (this.core !== null && this.selectedHostId.length > 0) {
+      this.reloadHost(this.selectedHostId);
+    }
+    this.showArchivedSessionsSheet = true;
+    this.triggerHaptic(8);
+  }
+
+  public archivedAgents(): AgentCardDto[] {
+    const detail = this.currentHostDetail;
+    if (detail === null) {
+      return [];
+    }
+    const result: AgentCardDto[] = [];
+    for (let i = 0; i < detail.agents.length; i++) {
+      const ag = detail.agents[i];
+      const hasArchivedTs = ag.archived_at_rfc3339 !== undefined &&
+        ag.archived_at_rfc3339 !== null &&
+        ag.archived_at_rfc3339.length > 0;
+      if (hasArchivedTs || ag.status.state === 'closed') {
+        result.push(ag);
+      }
+    }
+    return result;
+  }
+
+  public unarchiveSession(agentId: string): void {
+    if (this.core === null || this.selectedHostId.length === 0 || agentId.length === 0) {
+      return;
+    }
+    try {
+      this.core.unarchiveAgent(this.selectedHostId, agentId);
+      this.reloadHost(this.selectedHostId);
+      this.showToast('Session restored', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'unarchiveSession failed', err as Object);
+      this.showToast('Failed to restore session', true);
+    }
+  }
+
+  public deleteSessionPermanently(agentId: string): void {
+    if (this.core === null || this.selectedHostId.length === 0 || agentId.length === 0) {
+      return;
+    }
+    try {
+      this.core.deleteAgent(this.selectedHostId, agentId);
+      if (this.selectedAgentId === agentId) {
+        this.startNewSessionDraft();
+      }
+      this.reloadHost(this.selectedHostId);
+      this.showToast('Session deleted', false);
+      this.triggerHaptic(12);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'deleteSessionPermanently failed', err as Object);
+      this.showToast('Failed to delete session', true);
+    }
+  }
+
+  // 4. Mission Workspace Shared Board (`BOARD.md`) & Peers
+
+  public activeWorkspaceId(): string {
+    if (this.currentAgent !== null && this.currentAgent.workspace_id.length > 0) {
+      return this.currentAgent.workspace_id;
+    }
+    const detail = this.currentHostDetail;
+    if (detail !== null) {
+      for (let i = 0; i < detail.workspaces.length; i++) {
+        if (cwdPathsEquivalent(detail.workspaces[i].cwd, this.activeCwd)) {
+          return detail.workspaces[i].workspace_id;
+        }
+      }
+      if (detail.workspaces.length > 0) {
+        return detail.workspaces[0].workspace_id;
+      }
+    }
+    return '';
+  }
+
+  public activeWorkspaceInfo(): WorkspaceDto | null {
+    const wsId = this.activeWorkspaceId();
+    const detail = this.currentHostDetail;
+    if (detail === null || wsId.length === 0) {
+      return null;
+    }
+    for (let i = 0; i < detail.workspaces.length; i++) {
+      if (detail.workspaces[i].workspace_id === wsId) {
+        return detail.workspaces[i];
+      }
+    }
+    return null;
+  }
+
+  public activeWorkspacePeers(): AgentCardDto[] {
+    const wsId = this.activeWorkspaceId();
+    const detail = this.currentHostDetail;
+    if (detail === null || wsId.length === 0) {
+      return [];
+    }
+    const peers: AgentCardDto[] = [];
+    for (let i = 0; i < detail.agents.length; i++) {
+      const ag = detail.agents[i];
+      const archived = ag.archived_at_rfc3339 !== undefined &&
+        ag.archived_at_rfc3339 !== null &&
+        ag.archived_at_rfc3339.length > 0;
+      if (ag.workspace_id === wsId && !archived && ag.status.state !== 'closed') {
+        peers.push(ag);
+      }
+    }
+    return peers;
+  }
+
+  private resetWorkspaceBoardState(): void {
+    this.workspaceBoardContent = '';
+    this.workspaceBoardRevision = 0;
+    this.workspaceBoardUpdatedBy = '';
+    this.workspaceBoardPath = '';
+    this.workspaceEvents = [];
+  }
+
+  private syncActiveWorkspaceBoardFromDetail(detail: HostDetailDto): void {
+    const wsId = this.activeWorkspaceId();
+    if (wsId.length === 0) {
+      this.resetWorkspaceBoardState();
+      return;
+    }
+    if (detail.workspace_boards !== undefined && detail.workspace_boards[wsId] !== undefined) {
+      const snap = detail.workspace_boards[wsId];
+      this.workspaceBoardContent = snap.content;
+      this.workspaceBoardRevision = snap.revision;
+      this.workspaceBoardUpdatedBy = snap.updated_by ?? '';
+      this.workspaceBoardPath = snap.board_path ?? '';
+    } else {
+      this.workspaceBoardContent = '';
+      this.workspaceBoardRevision = 0;
+      this.workspaceBoardUpdatedBy = '';
+      this.workspaceBoardPath = '';
+    }
+    if (detail.workspace_events !== undefined && detail.workspace_events[wsId] !== undefined) {
+      this.workspaceEvents = detail.workspace_events[wsId];
+    } else {
+      this.workspaceEvents = [];
+    }
+  }
+
+  public openWorkspaceBoard(): void {
+    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+      this.sidebarOpen = false;
+    }
+    this.showWorkspaceBoardSheet = true;
+    this.triggerHaptic(8);
+  }
+
+  public refreshWorkspaceBoard(): void {
+    const wsId = this.activeWorkspaceId();
+    if (this.core === null || this.selectedHostId.length === 0 || wsId.length === 0) {
+      this.resetWorkspaceBoardState();
+      return;
+    }
+    try {
+      this.core.fetchWorkspaceBoard(this.selectedHostId, wsId);
+      this.core.fetchWorkspaceEvents(this.selectedHostId, wsId, 30);
+      const snapJson = this.core.workspaceBoardJson(this.selectedHostId, wsId);
+      const snap = JSON.parse(snapJson) as WorkspaceBoardSnapshotDto | null;
+      if (snap !== null) {
+        this.workspaceBoardContent = snap.content;
+        this.workspaceBoardRevision = snap.revision;
+        this.workspaceBoardUpdatedBy = snap.updated_by ?? '';
+        this.workspaceBoardPath = snap.board_path ?? '';
+      } else {
+        this.workspaceBoardContent = '';
+        this.workspaceBoardRevision = 0;
+        this.workspaceBoardUpdatedBy = '';
+        this.workspaceBoardPath = '';
+      }
+      const eventsJson = this.core.workspaceEventsJson(this.selectedHostId, wsId);
+      this.workspaceEvents = JSON.parse(eventsJson) as WorkspaceEventRecordDto[];
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'refreshWorkspaceBoard failed', err as Object);
+    }
+  }
+
+  public saveWorkspaceBoard(content: string): void {
+    const wsId = this.activeWorkspaceId();
+    if (this.core === null || this.selectedHostId.length === 0 || wsId.length === 0) {
+      this.showToast('No active workspace selected', true);
+      return;
+    }
+    try {
+      this.core.updateWorkspaceBoard(
+        this.selectedHostId,
+        wsId,
+        content,
+        null,
+        'harmony-user'
+      );
+      this.workspaceBoardContent = content;
+      this.workspaceBoardRevision += 1;
+      this.showToast('Saved BOARD.md', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'saveWorkspaceBoard failed', err as Object);
+      this.showToast('Failed to save BOARD.md', true);
+    }
+  }
+
+  public spawnWorkspacePeer(handle: string, prompt: string, provider: string): boolean {
+    const wsId = this.activeWorkspaceId();
+    const cleanPrompt = prompt.trim();
+    if (
+      this.core === null ||
+      this.selectedHostId.length === 0 ||
+      wsId.length === 0 ||
+      cleanPrompt.length === 0
+    ) {
+      this.showToast(wsId.length === 0 ? 'No active workspace selected' : 'Enter a prompt to spawn a peer', true);
+      return false;
+    }
+    const cleanHandle = handle.trim();
+    const req: SpawnWorkspacePeerRequestDto = {
+      host_id: this.selectedHostId,
+      workspace_id: wsId,
+      cwd: this.activeCwd,
+      provider: provider.length > 0 ? provider : this.composerProvider,
+      model: null,
+      effort: null,
+      mode: normalizeModeSlug(this.composerMode),
+      initial_prompt: cleanPrompt,
+      handle: cleanHandle.length > 0 ? cleanHandle : null
+    };
+    try {
+      const optId = this.core.spawnWorkspacePeerJson(JSON.stringify(req));
+      this.reloadHost(this.selectedHostId);
+      if (optId.length > 0) {
+        this.showToast(
+          cleanHandle.length > 0 ? `Spawned @${cleanHandle}` : 'Spawned workspace peer',
+          false
+        );
+      }
+      this.triggerHaptic(12);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'spawnWorkspacePeer failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to spawn peer', true);
+      return false;
+    }
+  }
+
+  // 5. Automations: Schedules, Conditional Timers, Goals, Monitors & Workflows
+
+  public openAutomationsSheet(): void {
+    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+      this.sidebarOpen = false;
+    }
+    this.showAutomationsSheet = true;
+    this.triggerHaptic(8);
+  }
+
+  private async settleAutomationJson(promise: Promise<string>, label: string): Promise<string | null> {
+    try {
+      return await promise;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', `${label} failed`, err as Object);
+      return null;
+    }
+  }
+
+  public async refreshAutomations(): Promise<void> {
+    if (this.core === null || this.selectedHostId.length === 0) {
+      return;
+    }
+    const hostId = this.selectedHostId;
+    const seq = ++this.automationsRefreshSeq;
+    this.automationsLoading = true;
+    try {
+      this.core.refreshHost(hostId);
+      this.reloadHost(hostId);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'refreshAutomations host refresh failed', err as Object);
+    }
+
+    const coreRef = this.core;
+    const settled: (string | null)[] = await Promise.all<string | null>([
+      this.settleAutomationJson(
+        coreRef.listConditionalTimersJson(hostId, null, true),
+        'listConditionalTimersJson'
+      ),
+      this.settleAutomationJson(
+        coreRef.listGoalRunsJson(hostId, null),
+        'listGoalRunsJson'
+      ),
+      this.settleAutomationJson(
+        coreRef.listMonitorWatchesJson(hostId, null),
+        'listMonitorWatchesJson'
+      ),
+      this.settleAutomationJson(
+        coreRef.listWorkflowRunsJson(hostId, true),
+        'listWorkflowRunsJson'
+      )
+    ]);
+
+    if (this.selectedHostId !== hostId || seq !== this.automationsRefreshSeq) {
+      return;
+    }
+
+    if (settled[0] !== null) {
+      try {
+        this.conditionalTimers = JSON.parse(settled[0]) as ConditionalTimerRecordDto[];
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'parse conditionalTimers failed', err as Object);
+      }
+    }
+    if (settled[1] !== null) {
+      try {
+        this.goalRuns = JSON.parse(settled[1]) as GoalRunRecordDto[];
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'parse goalRuns failed', err as Object);
+      }
+    }
+    if (settled[2] !== null) {
+      try {
+        this.monitorWatches = JSON.parse(settled[2]) as MonitorWatchRecordDto[];
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'parse monitorWatches failed', err as Object);
+      }
+    }
+    if (settled[3] !== null) {
+      try {
+        this.workflowRuns = JSON.parse(settled[3]) as WorkflowRunRecordDto[];
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'parse workflowRuns failed', err as Object);
+      }
+    }
+
+    this.automationsLoading = false;
+  }
+
+  public createSchedule(
+    name: string,
+    cronExpr: string,
+    prompt: string,
+    provider: string,
+    useWorktree: boolean
+  ): boolean {
+    if (this.core === null || this.selectedHostId.length === 0) {
+      this.showToast('Select a host first', true);
+      return false;
+    }
+    const cleanName = name.trim();
+    const cleanCron = cronExpr.trim();
+    const cleanPrompt = prompt.trim();
+    if (cleanName.length === 0 || cleanCron.length === 0 || cleanPrompt.length === 0) {
+      this.showToast('Name, cron expression, and prompt are required', true);
+      return false;
+    }
+    const payload: CreateSchedulePayloadDto = {
+      host_id: this.selectedHostId,
+      name: cleanName,
+      cron_expr: cleanCron,
+      prompt: cleanPrompt,
+      cwd: this.activeCwd,
+      provider: provider.length > 0 ? provider : this.composerProvider,
+      model: this.composerModel.trim().length > 0 ? this.composerModel.trim() : null,
+      effort: this.composerEffort.trim().length > 0 ? this.composerEffort.trim() : null,
+      mode: normalizeModeSlug(this.composerMode),
+      worktree: useWorktree,
+      archive_on_finish: true,
+      max_runs: null
+    };
+    try {
+      this.core.createScheduleJson(JSON.stringify(payload));
+      this.showToast(`Created schedule "${cleanName}"`, false);
+      this.core.refreshHost(this.selectedHostId);
+      this.triggerHaptic(12);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'createScheduleJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to create schedule', true);
+      return false;
+    }
+  }
+
+  public pauseSchedule(scheduleId: string): void {
+    if (this.core === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
+      return;
+    }
+    try {
+      this.core.pauseSchedule(this.selectedHostId, scheduleId);
+      this.showToast('Schedule paused', false);
+      this.triggerHaptic(8);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'pauseSchedule failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to pause schedule', true);
+    }
+  }
+
+  public resumeSchedule(scheduleId: string): void {
+    if (this.core === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
+      return;
+    }
+    try {
+      this.core.resumeSchedule(this.selectedHostId, scheduleId);
+      this.showToast('Schedule resumed', false);
+      this.triggerHaptic(8);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'resumeSchedule failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to resume schedule', true);
+    }
+  }
+
+  public runScheduleOnce(scheduleId: string): void {
+    if (this.core === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
+      return;
+    }
+    try {
+      this.core.runScheduleOnce(this.selectedHostId, scheduleId);
+      this.showToast('Triggered schedule run', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'runScheduleOnce failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to trigger schedule', true);
+    }
+  }
+
+  public deleteSchedule(scheduleId: string): void {
+    if (this.core === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
+      return;
+    }
+    try {
+      this.core.deleteSchedule(this.selectedHostId, scheduleId);
+      this.reloadHost(this.selectedHostId);
+      this.showToast('Schedule deleted', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'deleteSchedule failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to delete schedule', true);
+    }
+  }
+
+  public async cancelConditionalTimer(timerId: string): Promise<void> {
+    if (this.core === null || this.selectedHostId.length === 0 || timerId.length === 0) {
+      return;
+    }
+    const hostId = this.selectedHostId;
+    try {
+      const json = await this.core.cancelConditionalTimerJson(hostId, timerId);
+      if (this.selectedHostId !== hostId) {
+        return;
+      }
+      const updated = JSON.parse(json) as ConditionalTimerRecordDto;
+      const next: ConditionalTimerRecordDto[] = [];
+      for (let i = 0; i < this.conditionalTimers.length; i++) {
+        if (this.conditionalTimers[i].timer_id === updated.timer_id) {
+          next.push(updated);
+        } else {
+          next.push(this.conditionalTimers[i]);
+        }
+      }
+      this.conditionalTimers = next;
+      this.showToast('Timer canceled', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cancelConditionalTimer failed', err as Object);
+      if (this.selectedHostId === hostId) {
+        this.showToast((err as Error).message || 'Failed to cancel timer', true);
+      }
+    }
+  }
+
+  public async fireConditionalTimerNow(timerId: string): Promise<void> {
+    if (this.core === null || this.selectedHostId.length === 0 || timerId.length === 0) {
+      return;
+    }
+    const hostId = this.selectedHostId;
+    try {
+      await this.core.fireConditionalTimerNowJson(hostId, timerId);
+      if (this.selectedHostId !== hostId) {
+        return;
+      }
+      this.showToast('Timer fired', false);
+      this.triggerHaptic(10);
+      await this.refreshAutomations();
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'fireConditionalTimerNow failed', err as Object);
+      if (this.selectedHostId === hostId) {
+        this.showToast((err as Error).message || 'Failed to fire timer', true);
+      }
+    }
+  }
+
+  public async controlGoalRun(goalId: string, action: string): Promise<void> {
+    if (this.core === null || this.selectedHostId.length === 0 || goalId.length === 0) {
+      return;
+    }
+    const hostId = this.selectedHostId;
+    const req: ControlGoalRunRequestDto = {
+      host_id: hostId,
+      goal_id: goalId,
+      action: action
+    };
+    try {
+      const json = await this.core.controlGoalRunJson(JSON.stringify(req));
+      if (this.selectedHostId !== hostId) {
+        return;
+      }
+      const updated = JSON.parse(json) as GoalRunRecordDto;
+      const next: GoalRunRecordDto[] = [];
+      let replaced = false;
+      for (let i = 0; i < this.goalRuns.length; i++) {
+        if (this.goalRuns[i].goal_id === updated.goal_id) {
+          next.push(updated);
+          replaced = true;
+        } else {
+          next.push(this.goalRuns[i]);
+        }
+      }
+      if (!replaced) {
+        next.push(updated);
+      }
+      this.goalRuns = next;
+      const label = action === 'pause'
+        ? 'Goal paused'
+        : (action === 'resume' ? 'Goal resumed' : (action === 'cancel' ? 'Goal stopped' : 'Goal verifying'));
+      this.showToast(label, false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'controlGoalRun failed', err as Object);
+      if (this.selectedHostId === hostId) {
+        this.showToast((err as Error).message || 'Failed to update goal', true);
+      }
+    }
+  }
+
+  public async stopMonitorWatch(monitorId: string): Promise<void> {
+    if (this.core === null || this.selectedHostId.length === 0 || monitorId.length === 0) {
+      return;
+    }
+    const hostId = this.selectedHostId;
+    const req: StopMonitorWatchRequestDto = {
+      host_id: hostId,
+      monitor_id: monitorId
+    };
+    try {
+      const json = await this.core.stopMonitorWatchJson(JSON.stringify(req));
+      if (this.selectedHostId !== hostId) {
+        return;
+      }
+      const updated = JSON.parse(json) as MonitorWatchRecordDto;
+      const next: MonitorWatchRecordDto[] = [];
+      for (let i = 0; i < this.monitorWatches.length; i++) {
+        if (this.monitorWatches[i].monitor_id === updated.monitor_id) {
+          next.push(updated);
+        } else {
+          next.push(this.monitorWatches[i]);
+        }
+      }
+      this.monitorWatches = next;
+      this.showToast('Monitor stopped', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'stopMonitorWatch failed', err as Object);
+      if (this.selectedHostId === hostId) {
+        this.showToast((err as Error).message || 'Failed to stop monitor', true);
+      }
+    }
+  }
+
+  public async cancelWorkflowRun(runId: string): Promise<void> {
+    if (this.core === null || this.selectedHostId.length === 0 || runId.length === 0) {
+      return;
+    }
+    const hostId = this.selectedHostId;
+    const req: CancelWorkflowRunRequestDto = {
+      host_id: hostId,
+      run_id: runId
+    };
+    try {
+      const json = await this.core.cancelWorkflowRunJson(JSON.stringify(req));
+      if (this.selectedHostId !== hostId) {
+        return;
+      }
+      const updated = JSON.parse(json) as WorkflowRunRecordDto;
+      const next: WorkflowRunRecordDto[] = [];
+      for (let i = 0; i < this.workflowRuns.length; i++) {
+        if (this.workflowRuns[i].run_id === updated.run_id) {
+          next.push(updated);
+        } else {
+          next.push(this.workflowRuns[i]);
+        }
+      }
+      this.workflowRuns = next;
+      this.showToast('Workflow canceled', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cancelWorkflowRun failed', err as Object);
+      if (this.selectedHostId === hostId) {
+        this.showToast((err as Error).message || 'Failed to cancel workflow', true);
+      }
+    }
+  }
+
+  // 6. Cloud Sync (GitHub Gist E2EE)
+
+  public refreshCloudSyncStatus(): void {
+    if (this.core === null) {
+      return;
+    }
+    try {
+      this.cloudSyncStatus = JSON.parse(this.core.cloudSyncStatusJson()) as CloudSyncStatusDto;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncStatusJson failed', err as Object);
+    }
+  }
+
+  public generateCloudSyncPassphrase(): string {
+    if (this.core === null) {
+      return '';
+    }
+    try {
+      return this.core.cloudSyncGeneratePassphrase();
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncGeneratePassphrase failed', err as Object);
+      return '';
+    }
+  }
+
+  public async cloudSyncLoginWithToken(token: string): Promise<boolean> {
+    const clean = token.trim();
+    if (this.core === null || clean.length === 0) {
+      return false;
+    }
+    this.cloudSyncBusy = true;
+    try {
+      const json = await this.core.cloudSyncLoginWithTokenJson(clean);
+      this.cloudSyncStatus = JSON.parse(json) as CloudSyncStatusDto;
+      this.showToast('Connected GitHub account', false);
+      this.triggerHaptic(12);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncLoginWithTokenJson failed', err as Object);
+      this.showToast((err as Error).message || 'GitHub sign-in failed', true);
+      return false;
+    } finally {
+      this.cloudSyncBusy = false;
+    }
+  }
+
+  public async cloudSyncUnlockWithPassphrase(passphrase: string): Promise<boolean> {
+    const clean = passphrase.trim();
+    if (this.core === null || clean.length === 0) {
+      return false;
+    }
+    this.cloudSyncBusy = true;
+    try {
+      const json = await this.core.cloudSyncUnlockWithPassphraseJson(clean);
+      const res = JSON.parse(json) as CloudSyncResultDto;
+      this.refreshCloudSyncStatus();
+      this.reloadFleet();
+      this.showToast(
+        `Vault unlocked (rev ${res.vault_revision})`,
+        false
+      );
+      this.triggerHaptic(12);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncUnlockWithPassphraseJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to unlock vault', true);
+      return false;
+    } finally {
+      this.cloudSyncBusy = false;
+    }
+  }
+
+  public async cloudSyncNow(): Promise<void> {
+    if (this.core === null) {
+      return;
+    }
+    this.cloudSyncBusy = true;
+    try {
+      const json = await this.core.cloudSyncNowJson();
+      const res = JSON.parse(json) as CloudSyncResultDto;
+      this.refreshCloudSyncStatus();
+      this.reloadFleet();
+      this.showToast(`Synced vault rev ${res.vault_revision}`, false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncNowJson failed', err as Object);
+      this.showToast((err as Error).message || 'Cloud sync failed', true);
+    } finally {
+      this.cloudSyncBusy = false;
+    }
+  }
+
+  public cloudSyncSetAutoSync(enabled: boolean): void {
+    if (this.core === null) {
+      return;
+    }
+    try {
+      this.cloudSyncStatus = JSON.parse(
+        this.core.cloudSyncSetAutoSyncJson(enabled)
+      ) as CloudSyncStatusDto;
+      this.triggerHaptic(6);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncSetAutoSyncJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to update auto-sync', true);
+    }
+  }
+
+  public cloudSyncDisconnect(clearLocalHosts: boolean): void {
+    if (this.core === null) {
+      return;
+    }
+    this.cloudSyncBusy = true;
+    try {
+      this.cloudSyncStatus = JSON.parse(
+        this.core.cloudSyncLogoutJson(clearLocalHosts)
+      ) as CloudSyncStatusDto;
+      this.reloadFleet();
+      this.showToast('Disconnected Cloud Sync', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncLogoutJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to disconnect', true);
+    } finally {
+      this.cloudSyncBusy = false;
+    }
+  }
+
+  // 7. HarmonyOS Push Kit & Local Notification Deep-Link Hooks
+
+  public registerPushTokenSilently(): void {
+    registerHarmonyPushToken().then((outcome) => {
+      if (outcome.token.length > 0) {
+        this.pushToken = outcome.token;
+        this.pushStatusMessage = 'Push Kit token ready';
+      } else {
+        this.pushStatusMessage = outcome.errorMessage;
+      }
+    }).catch((err: Object) => {
+      orbitLogWarn('OrbitStore', 'registerPushTokenSilently failed', err);
+    });
+  }
+
+  public async probeNotificationPermission(): Promise<void> {
+    this.notificationsEnabled = await checkHarmonyNotificationEnabled();
+  }
+
+  public async configurePushAndNotifications(context: common.Context | undefined): Promise<void> {
+    const notifOk = await requestHarmonyNotificationPermission(context);
+    this.notificationsEnabled = notifOk;
+    const outcome = await registerHarmonyPushToken();
+    if (outcome.token.length > 0) {
+      this.pushToken = outcome.token;
+      this.pushStatusMessage = 'Push Kit token registered';
+    } else {
+      this.pushStatusMessage = outcome.errorMessage;
+    }
+    if (notifOk && outcome.token.length > 0) {
+      this.showToast('Push Kit & notifications ready', false);
+    } else if (notifOk) {
+      this.showToast(
+        outcome.errorMessage.length > 0
+          ? `Notifications enabled · ${outcome.errorMessage}`
+          : 'Notifications enabled',
+        false
+      );
+    } else if (outcome.token.length > 0) {
+      this.showToast('Push Kit registered · enable notifications in Settings', false);
+    } else {
+      this.showToast(outcome.errorMessage || 'Notifications unavailable', true);
+    }
+    this.triggerHaptic(10);
+  }
+
+  public async notifyDeepLinkForActiveSession(
+    context: common.Context | undefined,
+    title: string,
+    body: string
+  ): Promise<void> {
+    if (this.selectedHostId.length === 0) {
+      return;
+    }
+    const ok = await publishOrbitDeepLinkNotification(
+      context,
+      Math.floor(Date.now() % 1000000),
+      title,
+      body,
+      this.selectedHostId,
+      this.selectedAgentId
+    );
+    if (ok) {
+      this.showToast('Notification dispatched', false);
     }
   }
 }

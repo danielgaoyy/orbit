@@ -183,15 +183,28 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
             parent_agent_id TEXT NOT NULL,
             subagent_id     TEXT NOT NULL,
             timestamp       TEXT NOT NULL,
-            payload_json    TEXT NOT NULL
+            payload_json    TEXT NOT NULL,
+            dedupe_key      TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_psub_events
             ON provider_subagent_events(parent_agent_id, subagent_id, seq);
-
-        PRAGMA user_version = 3;
         ",
     )?;
+    crate::ensure_table_column(conn, "provider_subagent_events", "dedupe_key", "TEXT")?;
+    conn.execute_batch(
+        "
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_psub_events_dedupe_uniq
+            ON provider_subagent_events(parent_agent_id, subagent_id, dedupe_key)
+            WHERE dedupe_key IS NOT NULL;
+        ",
+    )?;
+    let cur_ver: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if cur_ver < 3 {
+        conn.execute_batch("PRAGMA user_version = 3;")?;
+    }
     Ok(())
 }
 
@@ -506,50 +519,110 @@ impl OrbitStore {
         labels: Option<&HashMap<String, String>>,
         handle: Option<&str>,
         task_summary: Option<&str>,
+        fast_mode: Option<bool>,
     ) -> Result<(), StoreError> {
-        let mut current = match self.get_agent(agent_id)? {
-            Some(a) => a,
-            None => return Ok(()),
+        use rusqlite::types::Value as SqlValue;
+
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+
+        let mut set_clauses: Vec<String> = Vec::new();
+        let mut bind_vals: Vec<SqlValue> = Vec::new();
+        let mut push_field = |col: &'static str, val: SqlValue| {
+            bind_vals.push(val);
+            set_clauses.push(format!("{col} = ?{}", bind_vals.len()));
         };
+
         if let Some(t) = title {
-            current.title = t.to_string();
+            push_field("title", SqlValue::Text(t.to_string()));
         }
         if let Some(m) = model {
-            current.model = m.map(ToOwned::to_owned);
+            push_field(
+                "model",
+                match m {
+                    Some(s) => SqlValue::Text(s.to_string()),
+                    None => SqlValue::Null,
+                },
+            );
         }
         if let Some(e) = effort {
-            current.effort = e;
+            let eff_val = match e {
+                Some(eff) => SqlValue::Text(serde_json::to_string(&eff)?),
+                None => SqlValue::Null,
+            };
+            push_field("effort_json", eff_val);
         }
         if let Some(md) = mode {
-            current.mode = md.clone();
+            push_field("mode_json", SqlValue::Text(serde_json::to_string(md)?));
         }
         if let Some(lbls) = labels {
+            let existing_raw: Option<String> = tx
+                .query_row(
+                    "SELECT labels_json FROM agents WHERE agent_id = ?1",
+                    params![agent_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(raw_json) = existing_raw else {
+                tx.commit()?;
+                return Ok(());
+            };
+            let mut merged: HashMap<String, String> =
+                serde_json::from_str(&raw_json).unwrap_or_default();
             for (k, v) in lbls {
                 if v.is_empty() {
-                    current.labels.remove(k);
+                    merged.remove(k);
                 } else {
-                    current.labels.insert(k.clone(), v.clone());
+                    merged.insert(k.clone(), v.clone());
                 }
             }
+            push_field(
+                "labels_json",
+                SqlValue::Text(serde_json::to_string(&merged)?),
+            );
         }
         if let Some(h) = handle {
             let trimmed = h.trim();
-            current.handle = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
+            push_field(
+                "handle",
+                if trimmed.is_empty() {
+                    SqlValue::Null
+                } else {
+                    SqlValue::Text(trimmed.to_string())
+                },
+            );
         }
         if let Some(ts) = task_summary {
             let trimmed = ts.trim();
-            current.task_summary = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
+            push_field(
+                "task_summary",
+                if trimmed.is_empty() {
+                    SqlValue::Null
+                } else {
+                    SqlValue::Text(trimmed.to_string())
+                },
+            );
         }
-        current.updated_at = Utc::now();
-        self.upsert_agent(&current, None)
+        if let Some(fm) = fast_mode {
+            push_field("fast_mode", SqlValue::Integer(i64::from(fm)));
+        }
+
+        if set_clauses.is_empty() {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        bind_vals.push(SqlValue::Text(Utc::now().to_rfc3339()));
+        set_clauses.push(format!("updated_at = ?{}", bind_vals.len()));
+        bind_vals.push(SqlValue::Text(agent_id.to_string()));
+        let sql = format!(
+            "UPDATE agents SET {} WHERE agent_id = ?{}",
+            set_clauses.join(", "),
+            bind_vals.len()
+        );
+        tx.execute(&sql, rusqlite::params_from_iter(bind_vals))?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Return the most recent assistant message text for finish-notification summaries without loading a provider.
@@ -701,8 +774,9 @@ impl OrbitStore {
         conn.execute(
             "INSERT INTO agent_profiles (
                 profile_id, name, provider_json, model, effort_json, mode_json,
-                when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at,
+                fast_mode, acp_agent_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(profile_id) DO UPDATE SET
                 name = excluded.name,
                 provider_json = excluded.provider_json,
@@ -712,7 +786,9 @@ impl OrbitStore {
                 when_to_use = excluded.when_to_use,
                 system_prompt_append = excluded.system_prompt_append,
                 mcp_policy_json = excluded.mcp_policy_json,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                fast_mode = excluded.fast_mode,
+                acp_agent_id = excluded.acp_agent_id",
             params![
                 profile.profile_id,
                 profile.name,
@@ -725,6 +801,8 @@ impl OrbitStore {
                 mcp_policy_json,
                 profile.created_at.to_rfc3339(),
                 profile.updated_at.to_rfc3339(),
+                i32::from(profile.fast_mode),
+                profile.acp_agent_id,
             ],
         )?;
         Ok(())
@@ -734,7 +812,8 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
             "SELECT profile_id, name, provider_json, model, effort_json, mode_json,
-                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at
+                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at,
+                    fast_mode, acp_agent_id
              FROM agent_profiles ORDER BY name COLLATE NOCASE ASC",
         )?;
         let rows = stmt.query_map([], map_profile_row)?;
@@ -745,7 +824,8 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT profile_id, name, provider_json, model, effort_json, mode_json,
-                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at
+                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at,
+                    fast_mode, acp_agent_id
              FROM agent_profiles WHERE profile_id = ?1",
             params![profile_id],
             map_profile_row,
@@ -758,7 +838,8 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT profile_id, name, provider_json, model, effort_json, mode_json,
-                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at
+                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at,
+                    fast_mode, acp_agent_id
              FROM agent_profiles WHERE LOWER(name) = LOWER(?1)",
             params![name],
             map_profile_row,
@@ -1160,7 +1241,12 @@ impl OrbitStore {
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(parent_agent_id, subagent_id) DO UPDATE SET
                 parent_subagent_id = COALESCE(excluded.parent_subagent_id, provider_subagents.parent_subagent_id),
-                title = excluded.title,
+                title = CASE
+                    WHEN excluded.title = excluded.subagent_id
+                         AND length(trim(provider_subagents.title)) > 0
+                    THEN provider_subagents.title
+                    ELSE excluded.title
+                END,
                 subtitle = COALESCE(excluded.subtitle, provider_subagents.subtitle),
                 status_json = excluded.status_json,
                 updated_at = excluded.updated_at",
@@ -1209,28 +1295,145 @@ impl OrbitStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn has_provider_subagent_events(
+        &self,
+        parent_agent_id: &str,
+        subagent_id: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.provider_subagent_event_count(parent_agent_id, subagent_id)? > 0)
+    }
+
+    pub fn provider_subagent_event_count(
+        &self,
+        parent_agent_id: &str,
+        subagent_id: &str,
+    ) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM provider_subagent_events
+             WHERE parent_agent_id = ?1 AND subagent_id = ?2",
+            params![parent_agent_id, subagent_id],
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
     pub fn append_provider_subagent_event(
         &self,
         parent_agent_id: &str,
         subagent_id: &str,
         payload: TimelinePayload,
     ) -> Result<ProviderSubagentEvent, StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        self.append_provider_subagent_event_upsert(parent_agent_id, subagent_id, payload)
+            .map(|(ev, _)| ev)
+    }
+
+    /// Idempotently append or coalesce a provider-subagent timeline event.
+    /// - Identical replays (`existing_json == payload_json`) return `(existing, false)` with zero write.
+    /// - Mutated updates (`existing_json != payload_json`, e.g. growing thinking or `Running -> Completed`
+    ///   tool call) atomically `DELETE` the superseded row and `INSERT` a fresh row inside an `IMMEDIATE`
+    ///   transaction so SQLite stays O(1) per logical item while `seq` strictly advances (`seq > since_seq`).
+    pub fn append_provider_subagent_event_upsert(
+        &self,
+        parent_agent_id: &str,
+        subagent_id: &str,
+        payload: TimelinePayload,
+    ) -> Result<(ProviderSubagentEvent, bool), StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = Utc::now();
+        let now_str = now.to_rfc3339();
         let payload_json = serde_json::to_string(&payload)?;
-        conn.execute(
-            "INSERT INTO provider_subagent_events (parent_agent_id, subagent_id, timestamp, payload_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![parent_agent_id, subagent_id, now.to_rfc3339(), payload_json],
+        let dedupe_key = provider_subagent_dedupe_key(&payload);
+
+        if let Some(ref dkey) = dedupe_key {
+            let existing: Option<(i64, String, String)> = tx
+                .query_row(
+                    "SELECT seq, payload_json, timestamp
+                     FROM provider_subagent_events
+                     WHERE parent_agent_id = ?1 AND subagent_id = ?2 AND dedupe_key = ?3
+                     LIMIT 1",
+                    params![parent_agent_id, subagent_id, dkey],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((existing_seq, existing_json, existing_ts)) = existing {
+                if existing_json == payload_json {
+                    tx.commit()?;
+                    return Ok((
+                        ProviderSubagentEvent {
+                            seq: existing_seq as u64,
+                            parent_agent_id: parent_agent_id.to_string(),
+                            subagent_id: subagent_id.to_string(),
+                            timestamp: parse_ts(&existing_ts),
+                            payload,
+                        },
+                        false,
+                    ));
+                }
+                tx.execute(
+                    "DELETE FROM provider_subagent_events WHERE seq = ?1",
+                    params![existing_seq],
+                )?;
+            } else {
+                // Self-heal legacy pre-dedupe_key rows when an identical payload is replayed on restart.
+                let legacy_match: Option<(i64, String)> = tx
+                    .query_row(
+                        "SELECT seq, timestamp
+                         FROM provider_subagent_events
+                         WHERE parent_agent_id = ?1
+                           AND subagent_id = ?2
+                           AND dedupe_key IS NULL
+                           AND payload_json = ?3
+                         ORDER BY seq DESC
+                         LIMIT 1",
+                        params![parent_agent_id, subagent_id, payload_json],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((legacy_seq, legacy_ts)) = legacy_match {
+                    let _ = tx.execute(
+                        "UPDATE provider_subagent_events SET dedupe_key = ?1 WHERE seq = ?2",
+                        params![dkey, legacy_seq],
+                    );
+                    tx.commit()?;
+                    return Ok((
+                        ProviderSubagentEvent {
+                            seq: legacy_seq as u64,
+                            parent_agent_id: parent_agent_id.to_string(),
+                            subagent_id: subagent_id.to_string(),
+                            timestamp: parse_ts(&legacy_ts),
+                            payload,
+                        },
+                        false,
+                    ));
+                }
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO provider_subagent_events (parent_agent_id, subagent_id, timestamp, payload_json, dedupe_key)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                parent_agent_id,
+                subagent_id,
+                now_str,
+                payload_json,
+                dedupe_key.as_deref()
+            ],
         )?;
-        let seq = conn.last_insert_rowid() as u64;
-        Ok(ProviderSubagentEvent {
-            seq,
-            parent_agent_id: parent_agent_id.to_string(),
-            subagent_id: subagent_id.to_string(),
-            timestamp: now,
-            payload,
-        })
+        let seq = tx.last_insert_rowid() as u64;
+        tx.commit()?;
+        Ok((
+            ProviderSubagentEvent {
+                seq,
+                parent_agent_id: parent_agent_id.to_string(),
+                subagent_id: subagent_id.to_string(),
+                timestamp: now,
+                payload,
+            },
+            true,
+        ))
     }
 
     pub fn fetch_provider_subagent_events_since(
@@ -1289,15 +1492,19 @@ fn map_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentProfile> {
     let mcp_s: String = row.get(8)?;
     let created_s: String = row.get(9)?;
     let updated_s: String = row.get(10)?;
+    let fast_mode: bool = row.get::<_, i32>(11).unwrap_or(0) != 0;
+    let acp_agent_id: Option<String> = row.get(12).unwrap_or(None);
     Ok(AgentProfile {
         profile_id: row.get(0)?,
         name: row.get(1)?,
         provider: serde_json::from_str(&provider_s)
             .unwrap_or(orbit_protocol::ProviderKind::Antigravity),
+        acp_agent_id,
         model: row.get(3)?,
         effort: effort_opt
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok()),
+        fast_mode,
         mode: serde_json::from_str(&mode_s).unwrap_or(SessionMode::AcceptEdits),
         when_to_use: row.get(6)?,
         system_prompt_append: row.get(7)?,
@@ -1365,6 +1572,27 @@ fn map_connected_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCon
         created_at: parse_ts(&created_s),
         updated_at: parse_ts(&updated_s),
     })
+}
+
+fn provider_subagent_dedupe_key(payload: &TimelinePayload) -> Option<String> {
+    match payload {
+        TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
+            Some(format!("thinking:{item_id}"))
+        }
+        TimelinePayload::AssistantMessage { item_id, .. } if !item_id.is_empty() => {
+            Some(format!("msg:{item_id}"))
+        }
+        TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
+            Some(format!("tool:{call_id}"))
+        }
+        TimelinePayload::UserPrompt { message_id, .. } if !message_id.is_empty() => {
+            Some(format!("user:{message_id}"))
+        }
+        TimelinePayload::Notice { level, message } if !message.is_empty() => {
+            Some(format!("notice:{level}:{message}"))
+        }
+        _ => None,
+    }
 }
 
 fn schedule_run_status_str(status: ScheduleRunStatus) -> &'static str {

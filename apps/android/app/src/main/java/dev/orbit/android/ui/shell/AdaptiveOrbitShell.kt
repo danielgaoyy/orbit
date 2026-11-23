@@ -30,15 +30,22 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.CallSplit
 import androidx.compose.material.icons.automirrored.outlined.CompareArrows
 import androidx.compose.material.icons.outlined.Archive
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Forum
+import androidx.compose.material.icons.outlined.IosShare
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.Layers
 import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material.icons.outlined.OpenInFull
+import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -46,7 +53,10 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -60,6 +70,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -70,12 +81,17 @@ import dev.orbit.android.store.OrbitFormatters
 import dev.orbit.android.store.OrbitUiState
 import dev.orbit.android.ui.composer.ContextMentionSheet
 import dev.orbit.android.ui.composer.ModelSelectorSheet
+import dev.orbit.android.ui.sheets.ArchivedSessionsSheet
+import dev.orbit.android.ui.sheets.AutomationsSheet
+import dev.orbit.android.ui.sheets.CloudSyncSheet
 import dev.orbit.android.ui.sheets.DirectoryBrowserSheet
 import dev.orbit.android.ui.sheets.GitDiffBottomSheet
 import dev.orbit.android.ui.sheets.GitDiffInspectorPane
 import dev.orbit.android.ui.sheets.PairQrSheet
 import dev.orbit.android.ui.sheets.PtyTerminalSheet
 import dev.orbit.android.ui.sheets.SettingsSheet
+import dev.orbit.android.ui.sheets.SideQuestionSheet
+import dev.orbit.android.ui.sheets.WorkspaceBoardSheet
 import dev.orbit.android.ui.stage.LocalDiagramRenderer
 import dev.orbit.android.ui.stage.StreamStageScreen
 import dev.orbit.android.ui.theme.OrbitComposeIcon
@@ -102,6 +118,11 @@ private enum class ActiveModalSheet {
     PAIR_QR,
     DIRECTORY_BROWSER,
     SETTINGS,
+    AUTOMATIONS,
+    WORKSPACE_BOARD,
+    SIDE_QUESTION,
+    ARCHIVED_SESSIONS,
+    CLOUD_SYNC,
 }
 
 @Composable
@@ -117,6 +138,7 @@ fun AdaptiveOrbitShell(
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
 
     var activeSheet by rememberSaveable { mutableStateOf(ActiveModalSheet.NONE) }
+    var showForkDialog by rememberSaveable { mutableStateOf(false) }
     var lastToastText by remember { mutableStateOf("") }
     if (ui.toastMessage != null) {
         lastToastText = ui.toastMessage
@@ -127,6 +149,18 @@ fun AdaptiveOrbitShell(
             delay(2400)
             store.clearToast()
         }
+    }
+
+    LaunchedEffect(ui.pendingSheetTriggerId, ui.pendingSheetTrigger) {
+        when (ui.pendingSheetTrigger) {
+            "btw" -> activeSheet = ActiveModalSheet.SIDE_QUESTION
+            "automations" -> activeSheet = ActiveModalSheet.AUTOMATIONS
+            "board" -> activeSheet = ActiveModalSheet.WORKSPACE_BOARD
+            "archived" -> activeSheet = ActiveModalSheet.ARCHIVED_SESSIONS
+            "cloud_sync" -> activeSheet = ActiveModalSheet.CLOUD_SYNC
+            else -> return@LaunchedEffect
+        }
+        store.consumePendingSheetTrigger()
     }
 
     val diagramRenderer = remember(store) { store::renderDiagram }
@@ -199,6 +233,31 @@ fun AdaptiveOrbitShell(
                     store.closeDiffInspector()
                     if (!hasPermanentDrawer && drawerState.isOpen) drawerState.close()
                     activeSheet = ActiveModalSheet.SETTINGS
+                }
+                "automations", "schedules" -> {
+                    store.closeDiffInspector()
+                    if (!hasPermanentDrawer && drawerState.isOpen) drawerState.close()
+                    activeSheet = ActiveModalSheet.AUTOMATIONS
+                }
+                "board", "peers" -> {
+                    store.closeDiffInspector()
+                    if (!hasPermanentDrawer && drawerState.isOpen) drawerState.close()
+                    activeSheet = ActiveModalSheet.WORKSPACE_BOARD
+                }
+                "btw", "side_question" -> {
+                    store.closeDiffInspector()
+                    if (!hasPermanentDrawer && drawerState.isOpen) drawerState.close()
+                    activeSheet = ActiveModalSheet.SIDE_QUESTION
+                }
+                "archived" -> {
+                    store.closeDiffInspector()
+                    if (!hasPermanentDrawer && drawerState.isOpen) drawerState.close()
+                    activeSheet = ActiveModalSheet.ARCHIVED_SESSIONS
+                }
+                "cloud_sync", "sync" -> {
+                    store.closeDiffInspector()
+                    if (!hasPermanentDrawer && drawerState.isOpen) drawerState.close()
+                    activeSheet = ActiveModalSheet.CLOUD_SYNC
                 }
                 "none", "stage" -> {
                     activeSheet = ActiveModalSheet.NONE
@@ -293,6 +352,18 @@ fun AdaptiveOrbitShell(
                     if (!hasPermanentDrawer) scope.launch { drawerState.close() }
                     activeSheet = ActiveModalSheet.SETTINGS
                 },
+                onOpenAutomations = {
+                    if (!hasPermanentDrawer) scope.launch { drawerState.close() }
+                    activeSheet = ActiveModalSheet.AUTOMATIONS
+                },
+                onOpenWorkspaceBoard = {
+                    if (!hasPermanentDrawer) scope.launch { drawerState.close() }
+                    activeSheet = ActiveModalSheet.WORKSPACE_BOARD
+                },
+                onOpenArchived = {
+                    if (!hasPermanentDrawer) scope.launch { drawerState.close() }
+                    activeSheet = ActiveModalSheet.ARCHIVED_SESSIONS
+                },
             )
         }
 
@@ -317,6 +388,12 @@ fun AdaptiveOrbitShell(
                         activeSheet = ActiveModalSheet.FULL_DIFF
                     },
                     onOpenTerminal = { activeSheet = ActiveModalSheet.TERMINAL },
+                    onOpenSideQuestion = { activeSheet = ActiveModalSheet.SIDE_QUESTION },
+                    onOpenWorkspaceBoard = { activeSheet = ActiveModalSheet.WORKSPACE_BOARD },
+                    onOpenAutomations = { activeSheet = ActiveModalSheet.AUTOMATIONS },
+                    onOpenArchived = { activeSheet = ActiveModalSheet.ARCHIVED_SESSIONS },
+                    onOpenForkDialog = { showForkDialog = true },
+                    onExportTranscript = { store.exportActiveTranscriptMarkdown() },
                     onNewSession = { store.startNewSession() },
                     onArchiveSession = { agentId -> store.archiveAgent(agentId) },
                     onOpenSettings = { activeSheet = ActiveModalSheet.SETTINGS },
@@ -334,6 +411,12 @@ fun AdaptiveOrbitShell(
                     onOpenPairSheet = { activeSheet = ActiveModalSheet.PAIR_QR },
                     onOpenTerminal = { activeSheet = ActiveModalSheet.TERMINAL },
                     onOpenSettings = { activeSheet = ActiveModalSheet.SETTINGS },
+                    onOpenSideQuestion = { activeSheet = ActiveModalSheet.SIDE_QUESTION },
+                    onOpenAutomations = { activeSheet = ActiveModalSheet.AUTOMATIONS },
+                    onOpenWorkspaceBoard = { activeSheet = ActiveModalSheet.WORKSPACE_BOARD },
+                    onOpenArchived = { activeSheet = ActiveModalSheet.ARCHIVED_SESSIONS },
+                    onOpenForkDialog = { showForkDialog = true },
+                    onExportTranscript = { store.exportActiveTranscriptMarkdown() },
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -587,9 +670,12 @@ fun AdaptiveOrbitShell(
                     hosts = ui.hosts,
                     selectedHostId = ui.selectedHostId,
                     quotas = ui.hostDetail?.quotas.orEmpty(),
+                    cloudSyncStatus = ui.cloudSyncStatus,
+                    pushRegistrationStatus = ui.pushRegistrationStatus,
                     onSelectAppearance = { store.setAppearanceMode(it) },
                     onSelectHost = { store.selectHost(it) },
                     onOpenPairHost = { activeSheet = ActiveModalSheet.PAIR_QR },
+                    onOpenCloudSync = { activeSheet = ActiveModalSheet.CLOUD_SYNC },
                     onReconnectHost = { hostId -> store.reconnectHost(hostId) },
                     onSaveHostConfig = { hostId, customName, routeMode, directEp, relay ->
                         val target = ui.hosts.firstOrNull { it.hostId == hostId }
@@ -610,9 +696,223 @@ fun AdaptiveOrbitShell(
                     onDismiss = { activeSheet = ActiveModalSheet.NONE },
                 )
             }
+
+            ActiveModalSheet.AUTOMATIONS -> {
+                AutomationsSheet(
+                    schedules = ui.hostDetail?.schedules.orEmpty(),
+                    scheduleRunsById = ui.scheduleRunsById,
+                    conditionalTimers = ui.hostDetail?.conditionalTimers.orEmpty(),
+                    goalRuns = ui.hostDetail?.goalRuns.orEmpty(),
+                    monitorWatches = ui.hostDetail?.monitorWatches.orEmpty(),
+                    workflowRuns = ui.hostDetail?.workflowRuns.orEmpty(),
+                    activeCwd = ui.activeCwd,
+                    defaultProvider = ui.composer.provider,
+                    onRefreshAll = { store.refreshAutomations() },
+                    onCreateSchedule = { name, cron, prompt, cwd, prov, mode, worktree, archive ->
+                        store.createSchedule(name, cron, prompt, cwd, prov, mode, worktree, archive)
+                    },
+                    onPauseSchedule = { store.pauseSchedule(it) },
+                    onResumeSchedule = { store.resumeSchedule(it) },
+                    onRunScheduleOnce = { store.runScheduleOnce(it) },
+                    onDeleteSchedule = { store.deleteSchedule(it) },
+                    onFetchScheduleRuns = { store.fetchScheduleRuns(it) },
+                    onCancelTimer = { store.cancelConditionalTimer(it) },
+                    onFireTimerNow = { store.fireConditionalTimerNow(it) },
+                    onControlGoal = { goalId, action -> store.controlGoalRun(goalId, action) },
+                    onStopMonitor = { store.stopMonitorWatch(it) },
+                    onCancelWorkflow = { store.cancelWorkflowRun(it) },
+                    onDismiss = { activeSheet = ActiveModalSheet.NONE },
+                )
+            }
+
+            ActiveModalSheet.WORKSPACE_BOARD -> {
+                WorkspaceBoardSheet(
+                    workspaces = ui.hostDetail?.workspaces.orEmpty(),
+                    initialWorkspaceId = ui.activeWorkspaceId,
+                    allAgents = ui.hostDetail?.agents.orEmpty(),
+                    selectedAgentId = ui.selectedAgentId?.takeIf { !ui.isNewSessionMode },
+                    boardsByWorkspaceId = ui.hostDetail?.workspaceBoards.orEmpty(),
+                    eventsByWorkspaceId = ui.hostDetail?.workspaceEvents.orEmpty(),
+                    onFetchBoardAndEvents = { store.fetchWorkspaceBoardAndEvents(it) },
+                    onUpdateGoal = { wsId, goal -> store.updateWorkspaceGoal(wsId, goal) },
+                    onUpdateBoard = { wsId, content -> store.updateWorkspaceBoard(wsId, content) },
+                    onSelectPeer = { store.selectAgent(it) },
+                    onSpawnPeer = { wsId, handle, prompt, worktree ->
+                        store.spawnWorkspacePeer(wsId, handle, prompt, worktree)
+                    },
+                    onDismiss = { activeSheet = ActiveModalSheet.NONE },
+                )
+            }
+
+            ActiveModalSheet.SIDE_QUESTION -> {
+                SideQuestionSheet(
+                    entries = ui.activeSideQuestions,
+                    draft = ui.activeSideQuestionDraft,
+                    onDraftChange = { store.setSideQuestionDraft(it) },
+                    onAsk = { store.submitSideQuestion(it) },
+                    onClear = { store.clearSideQuestions() },
+                    onPromoteToComposer = { store.promoteSideQuestionToComposer(it) },
+                    onCopiedAnswer = { store.showToast("Copied answer") },
+                    onDismiss = { activeSheet = ActiveModalSheet.NONE },
+                )
+            }
+
+            ActiveModalSheet.ARCHIVED_SESSIONS -> {
+                ArchivedSessionsSheet(
+                    archivedAgents = ui.hostDetail?.archivedAgents.orEmpty(),
+                    onUnarchive = { store.unarchiveAgent(it) },
+                    onDeletePermanently = { store.deleteAgentPermanently(it) },
+                    onDismiss = { activeSheet = ActiveModalSheet.NONE },
+                )
+            }
+
+            ActiveModalSheet.CLOUD_SYNC -> {
+                CloudSyncSheet(
+                    status = ui.cloudSyncStatus,
+                    deviceFlow = ui.cloudSyncDeviceFlow,
+                    isBusy = ui.cloudSyncBusy,
+                    errorMessage = ui.cloudSyncError,
+                    onRefreshStatus = { store.refreshCloudSyncStatus() },
+                    onStartDeviceFlow = { store.startGithubCloudLogin(it) },
+                    onCancelDeviceFlow = { store.cancelGithubCloudLogin() },
+                    onLoginWithToken = { store.loginCloudSyncWithToken(it) },
+                    onGeneratePassphrase = { store.generateCloudSyncPassphrase() },
+                    onUnlockWithPassphrase = { store.unlockCloudSyncWithPassphrase(it) },
+                    onSyncNow = { store.syncCloudNow() },
+                    onSetAutoSync = { store.setCloudAutoSync(it) },
+                    onDisconnect = { store.logoutCloudSync(it) },
+                    onShowToast = { store.showToast(it) },
+                    onDismiss = { activeSheet = ActiveModalSheet.NONE },
+                )
+            }
+        }
+
+        if (showForkDialog && ui.activeAgent != null) {
+            ForkConversationDialog(
+                sourceTitle = ui.activeAgent?.title.orEmpty(),
+                onConfirm = { worktree, branch, title ->
+                    showForkDialog = false
+                    store.forkActiveAgent(
+                        worktree = worktree,
+                        branch = branch,
+                        title = title,
+                        initialPrompt = null,
+                    )
+                },
+                onDismiss = { showForkDialog = false },
+            )
         }
     }
     }
+}
+
+@Composable
+private fun ForkConversationDialog(
+    sourceTitle: String,
+    onConfirm: (worktree: Boolean, branch: String?, title: String?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    var useWorktree by remember { mutableStateOf(false) }
+    var branchDraft by remember { mutableStateOf("") }
+    var titleDraft by remember {
+        mutableStateOf(if (sourceTitle.isNotBlank()) "$sourceTitle (Fork)" else "")
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.elevated,
+        titleContentColor = colors.fgPrimary,
+        textContentColor = colors.fgSecondary,
+        title = { Text("Fork Conversation", style = typography.title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md)) {
+                Text(
+                    text = "Branch this session to explore an alternative direction without losing current history.",
+                    style = typography.subhead,
+                    color = colors.fgSecondary,
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(text = "Title (optional)", style = typography.metaMedium, color = colors.fgMuted)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colors.subtleFill)
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                    ) {
+                        BasicTextField(
+                            value = titleDraft,
+                            onValueChange = { titleDraft = it },
+                            singleLine = true,
+                            textStyle = typography.subhead.copy(color = colors.fgPrimary),
+                            cursorBrush = SolidColor(colors.primary),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Isolate in Git Worktree",
+                        style = typography.subhead,
+                        color = colors.fgPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = useWorktree,
+                        onCheckedChange = { useWorktree = it },
+                        colors = SwitchDefaults.colors(checkedTrackColor = colors.directAdded),
+                    )
+                }
+                if (useWorktree) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(text = "Branch name (optional)", style = typography.metaMedium, color = colors.fgMuted)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(colors.subtleFill)
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                        ) {
+                            if (branchDraft.isEmpty()) {
+                                Text("Auto-generated branch", style = typography.code, color = colors.fgMuted)
+                            }
+                            BasicTextField(
+                                value = branchDraft,
+                                onValueChange = { branchDraft = it },
+                                singleLine = true,
+                                textStyle = typography.code.copy(color = colors.fgPrimary),
+                                cursorBrush = SolidColor(colors.primary),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onConfirm(
+                        useWorktree,
+                        branchDraft.trim().ifEmpty { null },
+                        titleDraft.trim().ifEmpty { null },
+                    )
+                },
+            ) {
+                Text("Fork", color = colors.primary, style = typography.subheadSemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = colors.fgSecondary, style = typography.subheadMedium)
+            }
+        },
+    )
 }
 
 private fun resolveHeaderGitBranch(ui: OrbitUiState): String? {
@@ -642,6 +942,12 @@ private fun OrbitStageTopBar(
     onToggleDiff: () -> Unit,
     onOpenFullDiff: () -> Unit,
     onOpenTerminal: () -> Unit,
+    onOpenSideQuestion: () -> Unit,
+    onOpenWorkspaceBoard: () -> Unit,
+    onOpenAutomations: () -> Unit,
+    onOpenArchived: () -> Unit,
+    onOpenForkDialog: () -> Unit,
+    onExportTranscript: () -> Unit,
     onNewSession: () -> Unit,
     onArchiveSession: (String) -> Unit,
     onOpenSettings: () -> Unit,
@@ -1008,10 +1314,146 @@ private fun OrbitStageTopBar(
                             },
                         )
 
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = "Side Question (/btw)",
+                                    style = typography.subheadMedium,
+                                    color = colors.fgPrimary,
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Outlined.Forum,
+                                    contentDescription = null,
+                                    tint = colors.fgPrimary,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                            },
+                            onClick = {
+                                moreMenuExpanded = false
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onOpenSideQuestion()
+                            },
+                        )
+
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = "Mission Board & Peers",
+                                    style = typography.subheadMedium,
+                                    color = colors.fgPrimary,
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Outlined.Layers,
+                                    contentDescription = null,
+                                    tint = colors.fgPrimary,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                            },
+                            onClick = {
+                                moreMenuExpanded = false
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onOpenWorkspaceBoard()
+                            },
+                        )
+
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = "Automations",
+                                    style = typography.subheadMedium,
+                                    color = colors.fgPrimary,
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Outlined.Schedule,
+                                    contentDescription = null,
+                                    tint = colors.fgPrimary,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                            },
+                            onClick = {
+                                moreMenuExpanded = false
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onOpenAutomations()
+                            },
+                        )
+
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = "Archived Sessions",
+                                    style = typography.subheadMedium,
+                                    color = colors.fgPrimary,
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Outlined.Archive,
+                                    contentDescription = null,
+                                    tint = colors.fgPrimary,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                            },
+                            onClick = {
+                                moreMenuExpanded = false
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onOpenArchived()
+                            },
+                        )
+
                         if (activeAgent != null) {
                             HorizontalDivider(
                                 thickness = OrbitSpacing.hairline,
                                 color = colors.hairline,
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "Fork Conversation",
+                                        style = typography.subheadMedium,
+                                        color = colors.fgPrimary,
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Outlined.CallSplit,
+                                        contentDescription = null,
+                                        tint = colors.fgPrimary,
+                                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                                    )
+                                },
+                                onClick = {
+                                    moreMenuExpanded = false
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onOpenForkDialog()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "Export Markdown",
+                                        style = typography.subheadMedium,
+                                        color = colors.fgPrimary,
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Outlined.IosShare,
+                                        contentDescription = null,
+                                        tint = colors.fgPrimary,
+                                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                                    )
+                                },
+                                onClick = {
+                                    moreMenuExpanded = false
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onExportTranscript()
+                                },
                             )
                             DropdownMenuItem(
                                 text = {

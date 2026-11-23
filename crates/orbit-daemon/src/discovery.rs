@@ -47,20 +47,18 @@ const IGNORED_DIR_NAMES: &[&str] = &[
 pub fn list_directory_entries(
     requested_path: Option<&str>,
 ) -> (String, Option<String>, Vec<DirectoryEntry>) {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+    let home = crate::platform::resolve_user_home_dir().unwrap_or_else(|| PathBuf::from("/"));
 
     let target = match requested_path.map(str::trim) {
         None | Some("") | Some("~") => home.clone(),
-        Some(rel) if rel.starts_with("~/") => home.join(&rel[2..]),
+        Some(rel) if rel.starts_with("~/") || rel.starts_with(r"~\") => home.join(&rel[2..]),
         Some(abs) => PathBuf::from(abs),
     };
 
     let canonical = if target.is_dir() {
-        std::fs::canonicalize(&target).unwrap_or(target)
+        crate::platform::canonicalize_clean(&target).unwrap_or(target)
     } else {
-        std::fs::canonicalize(&home).unwrap_or(home)
+        crate::platform::canonicalize_clean(&home).unwrap_or(home)
     };
 
     let current_path = canonical.to_string_lossy().to_string();
@@ -127,7 +125,7 @@ pub fn discover_host_projects(store: &OrbitStore) -> Vec<DiscoveredProject> {
         }
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::resolve_user_home_dir() {
         // 2. Also import any projects configured in Paseo (`~/.paseo/projects/projects.json`) or Claude (`~/.claude.json`)
         import_paseo_projects(&home, &mut by_path);
         import_claude_projects(&home, &mut by_path);
@@ -255,7 +253,8 @@ fn insert_candidate(
     boosted_ts: Option<i64>,
     known_branch: Option<String>,
 ) {
-    let canonical = std::fs::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
+    let canonical =
+        crate::platform::canonicalize_clean(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
     let key = canonical.to_string_lossy().to_string();
     let name = canonical
         .file_name()
@@ -321,7 +320,7 @@ pub fn inspect_project_git_repos(
     cwd: &Path,
     extra_dirs: &[PathBuf],
 ) -> (bool, Option<String>, Vec<NestedGitRepo>) {
-    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let canonical = crate::platform::canonicalize_clean(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let (is_git, branch) = find_enclosing_git_head(&canonical);
     let repos = if is_git && extra_dirs.is_empty() {
         Vec::new()
@@ -338,7 +337,7 @@ pub fn discover_nested_git_repos(
     max_depth: usize,
     limit: usize,
 ) -> Vec<NestedGitRepo> {
-    let Ok(canon_root) = std::fs::canonicalize(root) else {
+    let Ok(canon_root) = crate::platform::canonicalize_clean(root) else {
         return Vec::new();
     };
     if !canon_root.is_dir() {
@@ -352,7 +351,7 @@ pub fn discover_nested_git_repos(
         if out.len() >= limit {
             break;
         }
-        let Ok(canon_extra) = std::fs::canonicalize(extra) else {
+        let Ok(canon_extra) = crate::platform::canonicalize_clean(extra) else {
             continue;
         };
         if !canon_extra.is_dir() || canon_extra == canon_root {
@@ -433,7 +432,8 @@ fn walk_nested_git_repos(
         }
         let (is_git, branch) = read_fast_git_head(&path);
         if is_git {
-            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let canonical =
+                crate::platform::canonicalize_clean(&path).unwrap_or_else(|_| path.clone());
             let path_s = canonical.to_string_lossy().to_string();
             if seen.insert(path_s.clone()) {
                 let relative_path = path
@@ -457,9 +457,8 @@ fn walk_nested_git_repos(
 }
 
 fn find_enclosing_git_head(dir: &Path) -> (bool, Option<String>) {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|p| std::fs::canonicalize(p).ok());
+    let home = crate::platform::resolve_user_home_dir()
+        .and_then(|p| crate::platform::canonicalize_clean(&p).ok());
     let mut cur = Some(dir);
     for _ in 0..12 {
         let Some(p) = cur else {

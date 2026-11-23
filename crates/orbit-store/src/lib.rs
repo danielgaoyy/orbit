@@ -2,10 +2,32 @@
 //!
 //! Replaces Paseo's scattered JSON files with ACID event-sourced timelines and `< 1ms` cursor catch-up.
 
+pub mod artifacts;
+pub mod goals;
+pub mod guardian;
+pub mod im_channels;
 pub mod orchestration;
+pub mod push;
+pub mod search;
+pub mod timers;
+pub mod triggers;
+pub mod usage;
+pub mod workflows;
 pub mod workspace_sync;
+pub use artifacts::{
+    MAX_ARTIFACT_CONTENT_BYTES, MAX_ARTIFACT_ID_LEN, MAX_ARTIFACT_REVISIONS, UpsertArtifactInput,
+    validate_artifact_id,
+};
+pub use im_channels::StoredImChannel;
 pub use orchestration::*;
-pub use workspace_sync::AgentContextSnippet;
+pub use push::{StoredPushDevice, StoredPushPreferences};
+pub use search::{FtsBackfillProgress, MessageSearchHit, build_fts5_match_query};
+pub use triggers::{
+    DEFAULT_RECENT_DELIVERIES_LIMIT, StoredEventTrigger, UpsertEventTriggerParams,
+    mask_trigger_secret,
+};
+pub use usage::{QUOTA_SAMPLES_RETENTION_MS, QuotaSampleRecord, USAGE_LEDGER_RETENTION_MS};
+pub use workspace_sync::{AgentContextSnippet, SemanticIdentityOptions};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -17,7 +39,7 @@ use orbit_protocol::{
     ReasoningEffort, SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
     ToolCallStatus, WorkspaceClusterSuggestion, WorkspaceSetupStatus, WorkspaceSummary,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const WORKSPACE_SELECT_COLS: &str =
@@ -30,7 +52,17 @@ pub(crate) const AGENT_SELECT_COLS: &str =
     status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
     parent_host_id, archived_at, background, auto_archive, profile_id, labels_json,
     attention_state, last_activity_at, timeline_epoch, read_seq, is_pinned, pinned_order,
-    handle, cluster_suggestion_json, task_summary";
+    handle, cluster_suggestion_json, task_summary, forked_from_agent_id, forked_at_seq, fast_mode, acp_agent_id";
+
+/// Atomic result of [`OrbitStore::clone_timeline_events_up_to`], computed inside the same
+/// `IMMEDIATE` transaction as the copy so callers avoid TOCTOU races.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClonedTimelineOutcome {
+    pub new_latest_seq: u64,
+    pub copied_count: usize,
+    pub cloned_full_tail: bool,
+    pub effective_source_seq: Option<u64>,
+}
 
 /// Extra host configuration metadata persisted alongside `StoredHostProfile`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -110,6 +142,23 @@ pub enum StoreError {
     LockPoisoned,
 }
 
+impl StoreError {
+    /// Returns `true` when this error is a transient SQLite lock/busy contention error.
+    pub fn is_busy(&self) -> bool {
+        match self {
+            Self::Sqlite(rusqlite::Error::SqliteFailure(err, _)) => matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            Self::Sqlite(err) => {
+                let msg = err.to_string().to_ascii_lowercase();
+                msg.contains("database is locked") || msg.contains("database table is locked")
+            }
+            _ => false,
+        }
+    }
+}
+
 pub struct OrbitStore {
     conn: Mutex<Connection>,
 }
@@ -125,13 +174,13 @@ impl OrbitStore {
         Self::init_connection(conn)
     }
 
-    fn init_connection(conn: Connection) -> Result<Self, StoreError> {
+    fn init_connection(mut conn: Connection) -> Result<Self, StoreError> {
+        conn.busy_timeout(std::time::Duration::from_millis(4000))?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 5000;
             PRAGMA wal_autocheckpoint = 1000;
             PRAGMA journal_size_limit = 16777216;
             PRAGMA cache_size = -16000;
@@ -383,6 +432,35 @@ impl OrbitStore {
                 ON schedules(status, next_run_at);
             ",
         )?;
+        search::migrate_fts5_schema(&mut conn)?;
+        // Idempotent Wave 2 column migrations checked via `PRAGMA table_info` (NO `PRAGMA user_version` bump)
+        for (table, col, col_type) in [
+            ("agents", "forked_from_agent_id", "TEXT"),
+            ("agents", "forked_at_seq", "INTEGER"),
+            ("agents", "fast_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("agents", "acp_agent_id", "TEXT"),
+            ("client_replica_agents", "forked_from_agent_id", "TEXT"),
+            ("client_replica_agents", "forked_at_seq", "INTEGER"),
+            (
+                "client_replica_agents",
+                "fast_mode",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("client_replica_agents", "acp_agent_id", "TEXT"),
+            ("agent_profiles", "fast_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("agent_profiles", "acp_agent_id", "TEXT"),
+        ] {
+            ensure_table_column(&conn, table, col, col_type)?;
+        }
+        artifacts::migrate_artifacts_schema(&conn)?;
+        usage::migrate_usage_schema(&conn)?;
+        timers::migrate_conditional_timers_schema(&conn)?;
+        guardian::migrate_guardian_schema(&conn)?;
+        goals::migrate_goals_schema(&conn)?;
+        triggers::migrate_event_triggers_schema(&conn)?;
+        workflows::migrate_workflows_schema(&conn)?;
+        im_channels::migrate_im_channels_schema(&conn)?;
+        push::migrate_push_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -482,6 +560,12 @@ impl OrbitStore {
             .map(serde_json::to_string)
             .transpose()?;
 
+        let forked_at_seq_i64 = agent
+            .forked_at_seq
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::InvalidArgument("forked_at_seq exceeds i64".into()))?;
+
         conn.execute(
             "
             INSERT INTO agents (
@@ -489,9 +573,10 @@ impl OrbitStore {
                 mode_json, status_json, parent_agent_id, parent_host_id, persistence_ref,
                 latest_seq, timeline_epoch, created_at, updated_at, archived_at, background, auto_archive,
                 profile_id, labels_json, attention_state, last_activity_at,
-                read_seq, is_pinned, pinned_order, handle, cluster_suggestion_json, task_summary
+                read_seq, is_pinned, pinned_order, handle, cluster_suggestion_json, task_summary,
+                forked_from_agent_id, forked_at_seq, fast_mode, acp_agent_id
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
             ON CONFLICT(agent_id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 title = excluded.title,
@@ -517,7 +602,11 @@ impl OrbitStore {
                 pinned_order = excluded.pinned_order,
                 handle = COALESCE(excluded.handle, agents.handle),
                 cluster_suggestion_json = excluded.cluster_suggestion_json,
-                task_summary = COALESCE(excluded.task_summary, agents.task_summary)
+                task_summary = COALESCE(excluded.task_summary, agents.task_summary),
+                forked_from_agent_id = COALESCE(excluded.forked_from_agent_id, agents.forked_from_agent_id),
+                forked_at_seq = COALESCE(excluded.forked_at_seq, agents.forked_at_seq),
+                fast_mode = excluded.fast_mode,
+                acp_agent_id = COALESCE(excluded.acp_agent_id, agents.acp_agent_id)
             ",
             params![
                 agent.agent_id,
@@ -549,6 +638,10 @@ impl OrbitStore {
                 agent.handle,
                 cluster_suggestion_json,
                 agent.task_summary,
+                agent.forked_from_agent_id,
+                forked_at_seq_i64,
+                i32::from(agent.fast_mode),
+                agent.acp_agent_id,
             ],
         )?;
         Ok(())
@@ -760,13 +853,22 @@ impl OrbitStore {
         agent_id: &str,
         model: Option<&str>,
         effort: Option<ReasoningEffort>,
+        fast_mode: Option<bool>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let effort_json = effort.as_ref().map(serde_json::to_string).transpose()?;
-        conn.execute(
-            "UPDATE agents SET model = ?1, effort_json = ?2, updated_at = ?3 WHERE agent_id = ?4",
-            params![model, effort_json, Utc::now().to_rfc3339(), agent_id],
-        )?;
+        let now = Utc::now().to_rfc3339();
+        if let Some(fm) = fast_mode {
+            conn.execute(
+                "UPDATE agents SET model = ?1, effort_json = ?2, fast_mode = ?3, updated_at = ?4 WHERE agent_id = ?5",
+                params![model, effort_json, i64::from(fm), now, agent_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE agents SET model = ?1, effort_json = ?2, updated_at = ?3 WHERE agent_id = ?4",
+                params![model, effort_json, now, agent_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -774,12 +876,21 @@ impl OrbitStore {
         &self,
         agent_id: &str,
         model: Option<&str>,
+        fast_mode: Option<bool>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.execute(
-            "UPDATE agents SET model = ?1, updated_at = ?2 WHERE agent_id = ?3",
-            params![model, Utc::now().to_rfc3339(), agent_id],
-        )?;
+        let now = Utc::now().to_rfc3339();
+        if let Some(fm) = fast_mode {
+            conn.execute(
+                "UPDATE agents SET model = ?1, fast_mode = ?2, updated_at = ?3 WHERE agent_id = ?4",
+                params![model, i64::from(fm), now, agent_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE agents SET model = ?1, updated_at = ?2 WHERE agent_id = ?3",
+                params![model, now, agent_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -789,22 +900,34 @@ impl OrbitStore {
         provider: ProviderKind,
         model: Option<&str>,
         effort: Option<ReasoningEffort>,
+        fast_mode: bool,
+        acp_agent_id: Option<&str>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let provider_json = serde_json::to_string(&provider)?;
         let effort_json = effort.as_ref().map(serde_json::to_string).transpose()?;
         let status_json = serde_json::to_string(&AgentStatus::Idle)?;
+        let clean_acp_id = if provider == ProviderKind::Acp {
+            acp_agent_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        };
         conn.execute(
             "UPDATE agents
-             SET provider_json = ?1, model = ?2, effort_json = ?3, persistence_ref = NULL,
-                 status_json = ?4, updated_at = ?5
-             WHERE agent_id = ?6",
+             SET provider_json = ?1, model = ?2, effort_json = ?3, fast_mode = ?4,
+                 persistence_ref = NULL, status_json = ?5, updated_at = ?6, acp_agent_id = ?7
+             WHERE agent_id = ?8",
             params![
                 provider_json,
                 model,
                 effort_json,
+                i64::from(fast_mode),
                 status_json,
                 Utc::now().to_rfc3339(),
+                clean_acp_id,
                 agent_id
             ],
         )?;
@@ -858,14 +981,17 @@ impl OrbitStore {
         Ok(())
     }
 
-    /// Find the highest numeric segment suffix (`_N`) already persisted for an active Antigravity
-    /// turn so a reattached driver continues segment numbering cleanly without ID collisions.
+    /// Find the highest numeric segment suffix (`_N`) already persisted for an active turn across
+    /// all shim-backed providers (`agy_msg_`, `pi_msg_`, `acp_msg_`, `{slug}_msg_`, and `_th_`) so a
+    /// reattached driver continues segment numbering cleanly without ID collisions.
     pub fn max_turn_segment_step(&self, agent_id: &str, turn_id: &str) -> u64 {
         let Ok(conn) = self.conn.lock() else {
             return 0;
         };
-        let pattern_msg = format!("item_id:agy_msg_{turn_id}_%");
-        let pattern_th = format!("item_id:agy_th_{turn_id}_%");
+        let pattern_msg = format!("item_id:%_msg_{turn_id}_%");
+        let pattern_th = format!("item_id:%_th_{turn_id}_%");
+        let msg_marker = format!("_msg_{turn_id}_");
+        let th_marker = format!("_th_{turn_id}_");
         let Ok(mut stmt) = conn.prepare(
             "SELECT coalesce_key FROM timeline_events
              WHERE agent_id = ?1 AND (coalesce_key LIKE ?2 OR coalesce_key LIKE ?3)",
@@ -877,8 +1003,20 @@ impl OrbitStore {
             r.get::<_, String>(0)
         }) {
             for key in rows.flatten() {
-                if let Some(suffix) = key.rsplit('_').next()
-                    && let Ok(n) = suffix.parse::<u64>()
+                let Some(rest) = key.strip_prefix("item_id:") else {
+                    continue;
+                };
+                let suffix = rest
+                    .find(&msg_marker)
+                    .filter(|&i| i > 0)
+                    .map(|i| &rest[i + msg_marker.len()..])
+                    .or_else(|| {
+                        rest.find(&th_marker)
+                            .filter(|&i| i > 0)
+                            .map(|i| &rest[i + th_marker.len()..])
+                    });
+                if let Some(s) = suffix
+                    && let Ok(n) = s.parse::<u64>()
                 {
                     max_step = max_step.max(n);
                 }
@@ -930,6 +1068,7 @@ impl OrbitStore {
     pub fn delete_agent(&self, agent_id: &str) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
+        search::delete_daemon_fts_for_agent(&tx, agent_id)?;
         tx.execute(
             "DELETE FROM agent_queued_prompts WHERE agent_id = ?1",
             params![agent_id],
@@ -952,6 +1091,21 @@ impl OrbitStore {
         turn_id: Option<&str>,
         payload: TimelinePayload,
     ) -> Result<TimelineEvent, StoreError> {
+        self.append_timeline_event_deduped(agent_id, epoch, turn_id, payload)
+            .map(|(ev, _)| ev)
+    }
+
+    /// Same as [`Self::append_timeline_event`], additionally returning `mutated == false` when an
+    /// identical `AssistantThinking` heartbeat matches the latest persisted row so callers can
+    /// avoid redundant SQLite writes and duplicate `TimelineLive` broadcasts. Any mutated payload
+    /// still executes `DELETE + INSERT` to strictly preserve monotonic `seq > since_seq`.
+    pub fn append_timeline_event_deduped(
+        &self,
+        agent_id: &str,
+        epoch: u32,
+        turn_id: Option<&str>,
+        payload: TimelinePayload,
+    ) -> Result<(TimelineEvent, bool), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
         let now = Utc::now();
@@ -960,8 +1114,57 @@ impl OrbitStore {
         let event_type = payload_event_type(&payload);
         let ckey = coalesce_key(&payload);
 
+        if matches!(payload, TimelinePayload::AssistantThinking { .. })
+            && let Some(ref key_val) = ckey
+        {
+            let latest_row: Option<(i64, Option<String>, String, String)> = tx
+                .query_row(
+                    "SELECT seq, coalesce_key, payload_json, timestamp
+                     FROM timeline_events
+                     WHERE agent_id = ?1
+                     ORDER BY seq DESC
+                     LIMIT 1",
+                    params![agent_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            if let Some((latest_seq, latest_ckey, latest_json, latest_ts)) = latest_row
+                && latest_ckey.as_deref() == Some(key_val.as_str())
+                && latest_json == payload_json
+            {
+                tx.commit()?;
+                return Ok((
+                    TimelineEvent {
+                        seq: latest_seq as u64,
+                        epoch,
+                        agent_id: agent_id.to_string(),
+                        turn_id: turn_id.map(ToOwned::to_owned),
+                        timestamp: parse_ts(&latest_ts),
+                        payload,
+                    },
+                    false,
+                ));
+            }
+        }
+
         if let Some(ref key_val) = ckey {
             let boundary_seq = query_coalesce_boundary_seq(&tx, true, agent_id, &payload, None);
+            let superseded_seqs: Vec<i64> = {
+                if let Ok(mut sel_stmt) = tx.prepare_cached(
+                    "SELECT seq FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
+                ) {
+                    sel_stmt
+                        .query_map(params![agent_id, boundary_seq, key_val], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .ok()
+                        .map(|rows| rows.flatten().collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            };
+            search::delete_daemon_fts_by_seqs(&tx, &superseded_seqs)?;
             if let Ok(mut del_stmt) = tx.prepare_cached(
                 "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
             ) {
@@ -985,6 +1188,7 @@ impl OrbitStore {
             ])?;
         }
         let seq = tx.last_insert_rowid() as u64;
+        search::sync_daemon_fts_upsert(&tx, seq as i64, agent_id, &payload)?;
 
         if let TimelinePayload::StatusChanged { ref status } = payload {
             let status_json = serde_json::to_string(status)?;
@@ -1001,14 +1205,17 @@ impl OrbitStore {
 
         tx.commit()?;
 
-        Ok(TimelineEvent {
-            seq,
-            epoch,
-            agent_id: agent_id.to_string(),
-            turn_id: turn_id.map(ToOwned::to_owned),
-            timestamp: now,
-            payload,
-        })
+        Ok((
+            TimelineEvent {
+                seq,
+                epoch,
+                agent_id: agent_id.to_string(),
+                turn_id: turn_id.map(ToOwned::to_owned),
+                timestamp: now,
+                payload,
+            },
+            true,
+        ))
     }
 
     /// Returns all persisted background-task `ToolCall` entries for `agent_id` whose latest
@@ -1156,8 +1363,20 @@ impl OrbitStore {
 
     /// Upsert a server-sequenced timeline event into a client's local SQLite replica cache (`0ms` instant load).
     pub fn upsert_replica_timeline_event(&self, ev: &TimelineEvent) -> Result<(), StoreError> {
+        self.upsert_replica_timeline_event_for_host("", ev)
+    }
+
+    /// Host-aware variant of `upsert_replica_timeline_event` that tags the FTS5 index with `host_id`.
+    pub fn upsert_replica_timeline_event_for_host(
+        &self,
+        host_id: &str,
+        ev: &TimelineEvent,
+    ) -> Result<(), StoreError> {
+        let seq_i64 = i64::try_from(ev.seq)
+            .map_err(|_| StoreError::InvalidArgument("sequence number exceeds i64".into()))?;
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let resolved_host = search::resolve_replica_host_id(&tx, host_id, &ev.agent_id);
         let payload_json = serde_json::to_string(&ev.payload)?;
         let ts_str = ev.timestamp.to_rfc3339();
         let event_type = payload_event_type(&ev.payload);
@@ -1166,12 +1385,28 @@ impl OrbitStore {
         if let Some(ref key_val) = ckey {
             let boundary_seq =
                 query_coalesce_boundary_seq(&tx, false, &ev.agent_id, &ev.payload, Some(ev.seq));
+            let superseded_rowids: Vec<i64> = {
+                if let Ok(mut sel_stmt) = tx.prepare_cached(
+                    "SELECT rowid FROM client_replica_events
+                     WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
+                ) {
+                    sel_stmt
+                        .query_map(params![ev.agent_id, boundary_seq, seq_i64, key_val], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .ok()
+                        .map(|rows| rows.flatten().collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            };
+            search::delete_replica_fts_by_rowids(&tx, &superseded_rowids)?;
             if let Ok(mut del_stmt) = tx.prepare_cached(
                 "DELETE FROM client_replica_events
                  WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
             ) {
-                let _ =
-                    del_stmt.execute(params![ev.agent_id, boundary_seq, ev.seq as i64, key_val]);
+                let _ = del_stmt.execute(params![ev.agent_id, boundary_seq, seq_i64, key_val]);
             }
         }
 
@@ -1186,7 +1421,7 @@ impl OrbitStore {
             )?;
             ins_stmt.execute(params![
                 ev.agent_id,
-                ev.seq as i64,
+                seq_i64,
                 ev.epoch,
                 ev.turn_id,
                 ts_str,
@@ -1195,6 +1430,20 @@ impl OrbitStore {
                 ckey.as_deref()
             ])?;
         }
+        let rowid: i64 = {
+            let mut rid_stmt = tx.prepare_cached(
+                "SELECT rowid FROM client_replica_events WHERE agent_id = ?1 AND seq = ?2",
+            )?;
+            rid_stmt.query_row(params![ev.agent_id, seq_i64], |r| r.get(0))?
+        };
+        search::sync_replica_fts_upsert(
+            &tx,
+            rowid,
+            &resolved_host,
+            &ev.agent_id,
+            ev.seq,
+            &ev.payload,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1204,12 +1453,33 @@ impl OrbitStore {
         &self,
         events: &[TimelineEvent],
     ) -> Result<(), StoreError> {
+        self.upsert_replica_timeline_events_batch_for_host("", events)
+    }
+
+    /// Host-aware batch-upsert of replica timeline events in a single SQLite transaction.
+    pub fn upsert_replica_timeline_events_batch_for_host(
+        &self,
+        host_id: &str,
+        events: &[TimelineEvent],
+    ) -> Result<(), StoreError> {
         if events.is_empty() {
             return Ok(());
         }
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut host_cache: HashMap<String, String> = HashMap::new();
         for ev in events {
+            let seq_i64 = i64::try_from(ev.seq)
+                .map_err(|_| StoreError::InvalidArgument("sequence number exceeds i64".into()))?;
+            let resolved_host = if !host_id.is_empty() {
+                host_id.to_string()
+            } else if let Some(cached) = host_cache.get(&ev.agent_id) {
+                cached.clone()
+            } else {
+                let resolved = search::resolve_replica_host_id(&tx, "", &ev.agent_id);
+                host_cache.insert(ev.agent_id.clone(), resolved.clone());
+                resolved
+            };
             let payload_json = serde_json::to_string(&ev.payload)?;
             let ts_str = ev.timestamp.to_rfc3339();
             let event_type = payload_event_type(&ev.payload);
@@ -1222,16 +1492,28 @@ impl OrbitStore {
                     &ev.payload,
                     Some(ev.seq),
                 );
+                let superseded_rowids: Vec<i64> = {
+                    if let Ok(mut sel_stmt) = tx.prepare_cached(
+                        "SELECT rowid FROM client_replica_events
+                         WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
+                    ) {
+                        sel_stmt
+                            .query_map(params![ev.agent_id, boundary_seq, seq_i64, key_val], |r| {
+                                r.get::<_, i64>(0)
+                            })
+                            .ok()
+                            .map(|rows| rows.flatten().collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                search::delete_replica_fts_by_rowids(&tx, &superseded_rowids)?;
                 if let Ok(mut del_stmt) = tx.prepare_cached(
                     "DELETE FROM client_replica_events
                      WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
                 ) {
-                    let _ = del_stmt.execute(params![
-                        ev.agent_id,
-                        boundary_seq,
-                        ev.seq as i64,
-                        key_val
-                    ]);
+                    let _ = del_stmt.execute(params![ev.agent_id, boundary_seq, seq_i64, key_val]);
                 }
             }
             {
@@ -1245,7 +1527,7 @@ impl OrbitStore {
                 )?;
                 ins_stmt.execute(params![
                     ev.agent_id,
-                    ev.seq as i64,
+                    seq_i64,
                     ev.epoch,
                     ev.turn_id,
                     ts_str,
@@ -1254,6 +1536,20 @@ impl OrbitStore {
                     ckey.as_deref()
                 ])?;
             }
+            let rowid: i64 = {
+                let mut rid_stmt = tx.prepare_cached(
+                    "SELECT rowid FROM client_replica_events WHERE agent_id = ?1 AND seq = ?2",
+                )?;
+                rid_stmt.query_row(params![ev.agent_id, seq_i64], |r| r.get(0))?
+            };
+            search::sync_replica_fts_upsert(
+                &tx,
+                rowid,
+                &resolved_host,
+                &ev.agent_id,
+                ev.seq,
+                &ev.payload,
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -1341,8 +1637,20 @@ impl OrbitStore {
         agent_id: &str,
         events: &[TimelineEvent],
     ) -> Result<(), StoreError> {
+        self.replace_replica_timeline_for_host("", agent_id, events)
+    }
+
+    /// Host-aware variant of `replace_replica_timeline` that keeps `client_timeline_fts` in sync.
+    pub fn replace_replica_timeline_for_host(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        events: &[TimelineEvent],
+    ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let resolved_host = search::resolve_replica_host_id(&tx, host_id, agent_id);
+        search::delete_replica_fts_for_agent(&tx, agent_id)?;
         tx.execute(
             "DELETE FROM client_replica_events WHERE agent_id = ?1",
             params![agent_id],
@@ -1356,10 +1664,30 @@ impl OrbitStore {
                 .map_err(|_| StoreError::InvalidArgument("sequence number exceeds i64".into()))?;
             let payload_json = serde_json::to_string(&ev.payload)?;
             let ts_str = ev.timestamp.to_rfc3339();
+            let event_type = payload_event_type(&ev.payload);
+            let ckey = coalesce_key(&ev.payload);
             tx.execute(
-                "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![agent_id, seq_i64, ev.epoch, ev.turn_id, ts_str, payload_json],
+                "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json, event_type, coalesce_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    agent_id,
+                    seq_i64,
+                    ev.epoch,
+                    ev.turn_id,
+                    ts_str,
+                    payload_json,
+                    event_type,
+                    ckey.as_deref()
+                ],
+            )?;
+            let rowid = tx.last_insert_rowid();
+            search::sync_replica_fts_upsert(
+                &tx,
+                rowid,
+                &resolved_host,
+                agent_id,
+                ev.seq,
+                &ev.payload,
             )?;
         }
         tx.commit()?;
@@ -1405,13 +1733,52 @@ impl OrbitStore {
         Ok(out)
     }
 
+    /// Fetch the entire locally replicated timeline for an agent without an artificial row cap
+    /// (used for full-fidelity conversation export and code-block extraction).
+    pub fn fetch_replica_timeline_all(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<TimelineEvent>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+             FROM client_replica_events
+             WHERE agent_id = ?1
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![agent_id], |row| {
+            let seq = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
+            let epoch = row.get::<_, u32>(1)?;
+            let ag_id: String = row.get(2)?;
+            let turn_id: Option<String> = row.get(3)?;
+            let ts_str: String = row.get(4)?;
+            let payload_str: String = row.get(5)?;
+            Ok((seq, epoch, ag_id, turn_id, ts_str, payload_str))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = r?;
+            if let Ok(payload) = serde_json::from_str::<TimelinePayload>(&payload_str) {
+                out.push(TimelineEvent {
+                    seq,
+                    epoch,
+                    agent_id: ag_id,
+                    turn_id,
+                    timestamp: parse_ts(&ts_str),
+                    payload,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     pub fn upsert_replica_workspaces(
         &self,
         host_id: &str,
         workspaces: &[WorkspaceSummary],
     ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
             params![host_id],
@@ -1467,17 +1834,47 @@ impl OrbitStore {
         agents: &[AgentSummary],
     ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_ids: Vec<String> = {
+            let mut stmt =
+                tx.prepare_cached("SELECT agent_id FROM client_replica_agents WHERE host_id = ?1")?;
+            let rows = stmt.query_map(params![host_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let incoming_ids: HashSet<&str> = agents.iter().map(|a| a.agent_id.as_str()).collect();
+        for old_id in &existing_ids {
+            if !incoming_ids.contains(old_id.as_str()) {
+                search::delete_replica_fts_for_agent(&tx, old_id)?;
+                tx.execute(
+                    "DELETE FROM client_replica_events WHERE agent_id = ?1",
+                    params![old_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM client_replica_cursors WHERE agent_id = ?1",
+                    params![old_id],
+                )?;
+            }
+        }
         tx.execute(
             "DELETE FROM client_replica_agents WHERE host_id = ?1",
             params![host_id],
         )?;
         for ag in agents {
             let json = serde_json::to_string(ag)?;
+            let forked_at_i64 = ag.forked_at_seq.and_then(|s| i64::try_from(s).ok());
             tx.execute(
-                "INSERT INTO client_replica_agents (host_id, agent_id, payload_json)
-                 VALUES (?1, ?2, ?3)",
-                params![host_id, ag.agent_id, json],
+                "INSERT INTO client_replica_agents (
+                    host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq, fast_mode, acp_agent_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    host_id,
+                    ag.agent_id,
+                    json,
+                    ag.forked_from_agent_id,
+                    forked_at_i64,
+                    i32::from(ag.fast_mode),
+                    ag.acp_agent_id,
+                ],
             )?;
         }
         tx.commit()?;
@@ -1491,32 +1888,72 @@ impl OrbitStore {
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let json = serde_json::to_string(ag)?;
+        let forked_at_i64 = ag.forked_at_seq.and_then(|s| i64::try_from(s).ok());
         conn.execute(
-            "INSERT INTO client_replica_agents (host_id, agent_id, payload_json)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(host_id, agent_id) DO UPDATE SET payload_json = excluded.payload_json",
-            params![host_id, ag.agent_id, json],
+            "INSERT INTO client_replica_agents (
+                host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq, fast_mode, acp_agent_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(host_id, agent_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                forked_from_agent_id = excluded.forked_from_agent_id,
+                forked_at_seq = excluded.forked_at_seq,
+                fast_mode = excluded.fast_mode,
+                acp_agent_id = excluded.acp_agent_id",
+            params![
+                host_id,
+                ag.agent_id,
+                json,
+                ag.forked_from_agent_id,
+                forked_at_i64,
+                i32::from(ag.fast_mode),
+                ag.acp_agent_id,
+            ],
         )?;
         Ok(())
     }
 
     pub fn delete_replica_agent(&self, host_id: &str, agent_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.execute(
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        search::delete_replica_fts_for_agent(&tx, agent_id)?;
+        tx.execute(
+            "DELETE FROM client_replica_events WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        tx.execute(
+            "DELETE FROM client_replica_cursors WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        tx.execute(
             "DELETE FROM client_replica_agents WHERE host_id = ?1 AND agent_id = ?2",
             params![host_id, agent_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn list_replica_agents(&self, host_id: &str) -> Result<Vec<AgentSummary>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let mut stmt =
-            conn.prepare("SELECT payload_json FROM client_replica_agents WHERE host_id = ?1")?;
-        let rows = stmt.query_map(params![host_id], |r| r.get::<_, String>(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT payload_json, fast_mode, acp_agent_id FROM client_replica_agents WHERE host_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![host_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i32>(1).unwrap_or(0) != 0,
+                r.get::<_, Option<String>>(2).unwrap_or(None),
+            ))
+        })?;
         let mut out = Vec::new();
         for r in rows {
-            if let Ok(ag) = serde_json::from_str::<AgentSummary>(&r?) {
+            let (raw_json, fast_col, col_acp_id) = r?;
+            if let Ok(mut ag) = serde_json::from_str::<AgentSummary>(&raw_json) {
+                if fast_col {
+                    ag.fast_mode = true;
+                }
+                if ag.acp_agent_id.is_none() {
+                    ag.acp_agent_id = col_acp_id;
+                }
                 out.push(ag);
             }
         }
@@ -1531,6 +1968,33 @@ impl OrbitStore {
         limit: usize,
     ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
         self.fetch_timeline_since_budgeted(agent_id, since_seq, limit, usize::MAX)
+    }
+
+    /// Return the latest non-empty `AssistantMessage` text for `agent_id` by scanning from the
+    /// newest timeline sequence downward (works even when timelines exceed 500+ events).
+    pub fn latest_assistant_message(&self, agent_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT payload_json
+             FROM timeline_events
+             WHERE agent_id = ?1
+               AND (event_type = 'assistant_message' OR event_type IS NULL)
+             ORDER BY seq DESC
+             LIMIT 200",
+        )?;
+        let mut rows = stmt.query(params![agent_id])?;
+        while let Some(row) = rows.next()? {
+            let payload_json: String = row.get(0)?;
+            if let Ok(TimelinePayload::AssistantMessage { text, .. }) =
+                serde_json::from_str::<TimelinePayload>(&payload_json)
+            {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Ok(Some(trimmed.to_string()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Fetch timeline events strictly after `since_seq` bounded by both event count and an
@@ -1707,6 +2171,7 @@ impl OrbitStore {
                 })
         });
 
+        search::delete_daemon_fts_from_seq(&tx, agent_id, to_before_i64)?;
         tx.execute(
             "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq >= ?2",
             params![agent_id, to_before_i64],
@@ -1798,6 +2263,215 @@ impl OrbitStore {
             events: remaining,
             restored_prompt,
         }))
+    }
+
+    /// Result returned by [`OrbitStore::clone_timeline_events_up_to`].
+    ///
+    /// Computed atomically inside the same `IMMEDIATE` transaction as the copy so callers
+    /// never suffer a TOCTOU race deciding whether the full tail was cloned.
+    pub fn clone_timeline_events_up_to(
+        &self,
+        source_agent_id: &str,
+        target_agent_id: &str,
+        up_to_seq: Option<u64>,
+    ) -> Result<ClonedTimelineOutcome, StoreError> {
+        if source_agent_id == target_agent_id {
+            return Err(StoreError::InvalidArgument(
+                "source_agent_id and target_agent_id must be distinct".into(),
+            ));
+        }
+        let upper_i64 = up_to_seq
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::InvalidArgument("up_to_seq exceeds i64".into()))?;
+
+        struct RawClonedRow {
+            seq: u64,
+            epoch: u32,
+            turn_id: Option<String>,
+            timestamp: String,
+            payload: TimelinePayload,
+        }
+
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let source_max_seq_i64: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM timeline_events WHERE agent_id = ?1",
+            params![source_agent_id],
+            |r| r.get(0),
+        )?;
+        let source_max_seq = u64::try_from(source_max_seq_i64).unwrap_or(0);
+        let cloned_full_tail = up_to_seq.is_none_or(|u| u >= source_max_seq);
+
+        let raw_rows: Vec<RawClonedRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT seq, epoch, turn_id, timestamp, payload_json
+                 FROM timeline_events
+                 WHERE agent_id = ?1 AND (?2 IS NULL OR seq <= ?2)
+                 ORDER BY seq ASC",
+            )?;
+            let mapped = stmt.query_map(params![source_agent_id, upper_i64], |row| {
+                let seq_i64: i64 = row.get(0)?;
+                let epoch: u32 = row.get(1)?;
+                let turn_id: Option<String> = row.get(2)?;
+                let timestamp: String = row.get(3)?;
+                let payload_json: String = row.get(4)?;
+                Ok((seq_i64, epoch, turn_id, timestamp, payload_json))
+            })?;
+            let mut out = Vec::new();
+            for item in mapped {
+                let (seq_i64, epoch, turn_id, timestamp, payload_json) = item?;
+                let payload: TimelinePayload = serde_json::from_str(&payload_json)?;
+                out.push(RawClonedRow {
+                    seq: u64::try_from(seq_i64).unwrap_or(0),
+                    epoch,
+                    turn_id,
+                    timestamp,
+                    payload,
+                });
+            }
+            out
+        };
+
+        let effective_source_seq = raw_rows.last().map(|r| r.seq).filter(|&s| s > 0);
+
+        // Scan the selected prefix to normalize unfinished in-flight states cleanly:
+        // - Unresolved PermissionRequest / QuestionRequest rows are stripped.
+        // - ToolCall rows still Running at the end of the prefix are settled as Failed with
+        //   `background_task: None` so forked agents never hijack parent background tasks.
+        // - Streaming AssistantMessage rows are finalized (`streaming: false`) so they render
+        //   cleanly and are indexed in FTS5.
+        // - Trailing transient StatusChanged rows (Running/Initializing/AwaitingPermission/
+        //   AutonomousWakeup) are dropped.
+        let mut resolved_perm_ids = std::collections::HashSet::<String>::new();
+        let mut resolved_question_ids = std::collections::HashSet::<String>::new();
+        let mut final_tool_status = std::collections::HashMap::<String, ToolCallStatus>::new();
+        for r in &raw_rows {
+            match &r.payload {
+                TimelinePayload::PermissionResolved { request_id, .. } => {
+                    resolved_perm_ids.insert(request_id.clone());
+                }
+                TimelinePayload::QuestionResolved { request_id, .. } => {
+                    resolved_question_ids.insert(request_id.clone());
+                }
+                TimelinePayload::ToolCall {
+                    call_id, status, ..
+                } => {
+                    final_tool_status.insert(call_id.clone(), *status);
+                }
+                _ => {}
+            }
+        }
+
+        let mut normalized: Vec<RawClonedRow> = Vec::with_capacity(raw_rows.len());
+        for mut r in raw_rows {
+            match &mut r.payload {
+                TimelinePayload::PermissionRequest { request_id, .. }
+                    if !resolved_perm_ids.contains(request_id) =>
+                {
+                    continue;
+                }
+                TimelinePayload::QuestionRequest { request_id, .. }
+                    if !resolved_question_ids.contains(request_id) =>
+                {
+                    continue;
+                }
+                TimelinePayload::ToolCall {
+                    call_id,
+                    status,
+                    background_task,
+                    ..
+                } => {
+                    if *status == ToolCallStatus::Running
+                        && final_tool_status.get(call_id) == Some(&ToolCallStatus::Running)
+                    {
+                        *status = ToolCallStatus::Failed;
+                        *background_task = None;
+                    }
+                }
+                TimelinePayload::AssistantMessage { streaming, .. } if *streaming => {
+                    *streaming = false;
+                }
+                _ => {}
+            }
+            normalized.push(r);
+        }
+
+        while let Some(last) = normalized.last() {
+            let is_transient_status = matches!(
+                &last.payload,
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::Running { .. }
+                        | AgentStatus::Initializing
+                        | AgentStatus::AwaitingPermission { .. }
+                        | AgentStatus::AutonomousWakeup { .. }
+                }
+            );
+            if is_transient_status {
+                normalized.pop();
+            } else {
+                break;
+            }
+        }
+
+        let mut new_latest_seq_i64: i64 = 0;
+        let mut copied_count: usize = 0;
+
+        for row in normalized {
+            let payload_json = serde_json::to_string(&row.payload)?;
+            let eff_type = payload_event_type(&row.payload);
+            let eff_ckey = crate::coalesce_key(&row.payload);
+
+            {
+                let mut ins_stmt = tx.prepare_cached(
+                    "INSERT INTO timeline_events (
+                        epoch, agent_id, turn_id, timestamp, payload_json, event_type, coalesce_key
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?;
+                ins_stmt.execute(params![
+                    row.epoch,
+                    target_agent_id,
+                    row.turn_id,
+                    row.timestamp,
+                    payload_json,
+                    eff_type,
+                    eff_ckey.as_deref(),
+                ])?;
+            }
+            let new_seq_i64 = tx.last_insert_rowid();
+            search::sync_daemon_fts_upsert(&tx, new_seq_i64, target_agent_id, &row.payload)?;
+            new_latest_seq_i64 = new_seq_i64;
+            copied_count += 1;
+        }
+
+        let effective_source_seq_i64 = effective_source_seq
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::InvalidArgument("effective_source_seq exceeds i64".into()))?;
+        let now_str = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE agents
+             SET latest_seq = MAX(latest_seq, ?1),
+                 read_seq = MAX(read_seq, ?1),
+                 forked_at_seq = ?2,
+                 updated_at = ?3
+             WHERE agent_id = ?4",
+            params![
+                new_latest_seq_i64,
+                effective_source_seq_i64,
+                now_str,
+                target_agent_id
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(ClonedTimelineOutcome {
+            new_latest_seq: u64::try_from(new_latest_seq_i64).unwrap_or(0),
+            copied_count,
+            cloned_full_tail,
+            effective_source_seq,
+        })
     }
 
     pub fn get_persistence_ref(&self, agent_id: &str) -> Result<Option<String>, StoreError> {
@@ -1918,44 +2592,50 @@ impl OrbitStore {
     }
 
     pub fn delete_client_host(&self, host_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.execute(
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        search::delete_replica_fts_and_events_for_host(&tx, host_id)?;
+        tx.execute(
             "DELETE FROM client_hosts WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_projects WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_replica_agents WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_thread_prefs WHERE host_id = ?1",
             params![host_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn clear_host_replica(&self, host_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.execute(
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        search::delete_replica_fts_and_events_for_host(&tx, host_id)?;
+        tx.execute(
             "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_replica_agents WHERE host_id = ?1",
             params![host_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM client_thread_prefs WHERE host_id = ?1",
             params![host_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2238,6 +2918,7 @@ impl OrbitStore {
         if legacy_count <= 0 {
             return Ok(0);
         }
+        search::clear_daemon_fts(&conn)?;
         conn.execute("DELETE FROM turn_checkpoints", [])?;
         conn.execute("DELETE FROM timeline_events", [])?;
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -2380,6 +3061,19 @@ pub(crate) fn map_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wor
     })
 }
 
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
     let provider_str: String = row.get(4)?;
     let mode_str: String = row.get(6)?;
@@ -2402,6 +3096,14 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
     let handle: Option<String> = row.get(25).unwrap_or(None);
     let cluster_suggestion_opt: Option<String> = row.get(26).unwrap_or(None);
     let task_summary: Option<String> = row.get(27).unwrap_or(None);
+    let forked_from_agent_id: Option<String> = row.get(28).unwrap_or(None);
+    let forked_at_seq: Option<u64> = row
+        .get::<_, Option<i64>>(29)
+        .unwrap_or(None)
+        .filter(|&v| v >= 0)
+        .map(|v| v as u64);
+    let fast_mode: bool = row.get::<_, i32>(30).unwrap_or(0) != 0;
+    let acp_agent_id: Option<String> = row.get(31).unwrap_or(None);
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
@@ -2424,6 +3126,7 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         provider,
         model: row.get(5)?,
         effort,
+        fast_mode,
         mode,
         status,
         parent_agent_id: row.get(8)?,
@@ -2446,7 +3149,25 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         handle,
         cluster_suggestion,
         task_summary,
+        forked_from_agent_id,
+        forked_at_seq,
+        acp_agent_id,
     })
+}
+
+/// Idempotently add a nullable/defaulted column by inspecting `PRAGMA table_info(<table>)` first.
+/// Never bumps `PRAGMA user_version` so parallel feature branches merge cleanly in any order.
+pub(crate) fn ensure_table_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_def: &str,
+) -> Result<(), StoreError> {
+    if !table_has_column(conn, table, column)? {
+        let alter_sql = format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}");
+        conn.execute(&alter_sql, [])?;
+    }
+    Ok(())
 }
 
 fn map_stored_queued_prompt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredQueuedPrompt> {
@@ -2567,6 +3288,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: Some(ReasoningEffort::High),
+                    fast_mode: false,
                     mode: SessionMode::AcceptEdits,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -2589,6 +3311,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 Some("session_abc"),
             )
@@ -2673,6 +3398,7 @@ mod tests {
             provider: ProviderKind::ClaudeCode,
             model: Some("claude-opus".into()),
             effort: Some(ReasoningEffort::High),
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::Running {
                 turn_id: "t1".into(),
@@ -2697,6 +3423,9 @@ mod tests {
             handle: None,
             cluster_suggestion: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
         };
         store.upsert_agent(&parent, Some("ref_p")).expect("parent");
 
@@ -2759,8 +3488,10 @@ mod tests {
             profile_id: "prof_rev".into(),
             name: "Independent Reviewer".into(),
             provider: ProviderKind::Codex,
+            acp_agent_id: None,
             model: Some("gpt-5.4".into()),
             effort: Some(ReasoningEffort::Xhigh),
+            fast_mode: true,
             mode: SessionMode::Plan,
             when_to_use: "Review diffs independently without editing files".into(),
             system_prompt_append: Some("Never edit files.".into()),
@@ -2882,6 +3613,7 @@ mod tests {
                     provider: ProviderKind::ClaudeCode,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -2904,6 +3636,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 Some("prov_sess_1"),
             )
@@ -3044,6 +3779,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -3066,6 +3802,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 None,
             )
@@ -3138,6 +3877,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -3160,6 +3900,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 None,
             )
@@ -3360,6 +4103,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::FullAccess,
                     status: AgentStatus::Running {
                         turn_id: "t1".into(),
@@ -3384,6 +4128,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 None,
             )
@@ -3509,6 +4256,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::FullAccess,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -3531,6 +4279,9 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 Some("sess_bg"),
             )
@@ -3675,6 +4426,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::FullAccess,
                     status: AgentStatus::Running {
                         turn_id: "turn_abc".into(),
@@ -3693,6 +4445,9 @@ mod tests {
                     handle: None,
                     task_summary: None,
                     cluster_suggestion: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
                     labels: Default::default(),
                     latest_seq: 0,
                     timeline_epoch: 0,
@@ -3741,15 +4496,1475 @@ mod tests {
         assert_eq!(store.max_turn_segment_step("ag_cur", "turn_abc"), 12);
         assert_eq!(store.max_turn_segment_step("ag_cur", "turn_other"), 0);
 
+        // Multi-provider segment tracking: `pi_msg_`, `opencode_msg_`, `gemini_cli_th_`,
+        // `acp_th_`, `acp_msg_`, while ignoring unrelated turns that share a prefix.
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_pi"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "pi_msg_turn_pi_7".into(),
+                    text: "pi chunk".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append pi msg");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "opencode_msg_turn_acp_9".into(),
+                    text: "opencode chunk".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append opencode msg");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp"),
+                TimelinePayload::AssistantThinking {
+                    item_id: "gemini_cli_th_turn_acp_15".into(),
+                    text: "gemini thought".into(),
+                },
+            )
+            .expect("append gemini th");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp_extra"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "opencode_msg_turn_acp_extra_99".into(),
+                    text: "different turn".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append extra turn");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp_1"),
+                TimelinePayload::AssistantThinking {
+                    item_id: "acp_th_turn_acp_1_7".into(),
+                    text: "acp thought".into(),
+                },
+            )
+            .expect("append acp th");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp_1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "acp_msg_turn_acp_1_19".into(),
+                    text: "acp reply".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append acp msg");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp_10"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "acp_msg_turn_acp_10_99".into(),
+                    text: "other turn".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append other acp turn");
+
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_pi"), 7);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp"), 15);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp_extra"), 99);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp_1"), 19);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp_10"), 99);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_abc"), 12);
+
         let recent = store.fetch_recent_timeline("ag_cur", 2).expect("recent");
         assert_eq!(recent.len(), 2);
         assert!(matches!(
             &recent[0].payload,
-            TimelinePayload::AssistantThinking { item_id, .. } if item_id == "agy_th_turn_abc_5"
+            TimelinePayload::AssistantMessage { item_id, .. } if item_id == "acp_msg_turn_acp_1_19"
         ));
         assert!(matches!(
             &recent[1].payload,
-            TimelinePayload::AssistantMessage { item_id, .. } if item_id == "agy_msg_turn_abc_12"
+            TimelinePayload::AssistantMessage { item_id, .. } if item_id == "acp_msg_turn_acp_10_99"
         ));
+    }
+
+    #[test]
+    fn clone_timeline_events_up_to_truncates_strictly_and_syncs_fts5() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_fk".into(),
+                title: "fork".into(),
+                cwd: "/tmp/fork".into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let mk_ag = |id: &str, from: Option<&str>, at_seq: Option<u64>| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_fk".into(),
+            cwd: "/tmp/fork".into(),
+            title: format!("Title {id}"),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("sonnet".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: from.map(ToOwned::to_owned),
+            forked_at_seq: at_seq,
+            acp_agent_id: None,
+        };
+
+        store
+            .upsert_agent(&mk_ag("ag_src", None, None), Some("sess_src"))
+            .expect("src");
+
+        let e1 = store
+            .append_timeline_event(
+                "ag_src",
+                1,
+                Some("t1"),
+                TimelinePayload::UserPrompt {
+                    message_id: "m1".into(),
+                    text: "AlphaTurnOneToken design question".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("e1");
+        let e2 = store
+            .append_timeline_event(
+                "ag_src",
+                1,
+                Some("t1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
+                    text: "AlphaReplyOneToken detailed answer".into(),
+                    streaming: false,
+                },
+            )
+            .expect("e2");
+        let _e3 = store
+            .append_timeline_event(
+                "ag_src",
+                1,
+                Some("t2"),
+                TimelinePayload::UserPrompt {
+                    message_id: "m2".into(),
+                    text: "SecretPostForkTurnTwoToken should never appear in prefix fork".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("e3");
+        let _e4 = store
+            .append_timeline_event(
+                "ag_src",
+                1,
+                Some("t2"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a2".into(),
+                    text: "SecretPostForkReplyTwoToken also excluded".into(),
+                    streaming: false,
+                },
+            )
+            .expect("e4");
+
+        // 1. Mid-thread prefix fork strictly up to e2.seq
+        store
+            .upsert_agent(&mk_ag("ag_mid", Some("ag_src"), Some(e2.seq)), None)
+            .expect("mid");
+        let mid_res = store
+            .clone_timeline_events_up_to("ag_src", "ag_mid", Some(e2.seq))
+            .expect("clone mid");
+        assert_eq!(mid_res.copied_count, 2);
+        assert!(!mid_res.cloned_full_tail);
+        assert_eq!(mid_res.effective_source_seq, Some(e2.seq));
+        assert!(mid_res.new_latest_seq > e2.seq);
+        let mid_latest = mid_res.new_latest_seq;
+
+        let mid_agent = store.get_agent("ag_mid").expect("get").expect("exists");
+        assert_eq!(mid_agent.forked_from_agent_id.as_deref(), Some("ag_src"));
+        assert_eq!(mid_agent.forked_at_seq, Some(e2.seq));
+        assert_eq!(mid_agent.latest_seq, mid_latest);
+        assert_eq!(mid_agent.read_seq, mid_latest);
+
+        let (mid_events, has_more) = store.fetch_timeline_since("ag_mid", 0, 50).expect("fetch");
+        assert!(!has_more);
+        assert_eq!(mid_events.len(), 2);
+        assert!(mid_events[0].seq < mid_events[1].seq);
+        assert_eq!(mid_events[1].seq, mid_latest);
+        assert!(matches!(
+            &mid_events[0].payload,
+            TimelinePayload::UserPrompt { text, .. } if text.contains("AlphaTurnOneToken")
+        ));
+        assert!(matches!(
+            &mid_events[1].payload,
+            TimelinePayload::AssistantMessage { text, .. } if text.contains("AlphaReplyOneToken")
+        ));
+
+        // FTS5 sync: prefix tokens searchable on ag_mid, post-fork tokens strictly NOT in ag_mid
+        let alpha_hits = store
+            .search_daemon_messages("AlphaReplyOneToken", 20)
+            .expect("fts alpha");
+        assert!(alpha_hits.iter().any(|h| h.agent_id == "ag_src"));
+        assert!(alpha_hits.iter().any(|h| h.agent_id == "ag_mid"));
+
+        let post_hits = store
+            .search_daemon_messages("SecretPostForkTurnTwoToken", 20)
+            .expect("fts post");
+        assert!(post_hits.iter().any(|h| h.agent_id == "ag_src"));
+        assert!(!post_hits.iter().any(|h| h.agent_id == "ag_mid"));
+
+        // 2. Full fork (up_to_seq = None) copies all 4 events in exact order
+        store
+            .upsert_agent(&mk_ag("ag_full", Some("ag_src"), None), None)
+            .expect("full");
+        let full_res = store
+            .clone_timeline_events_up_to("ag_src", "ag_full", None)
+            .expect("clone full");
+        assert_eq!(full_res.copied_count, 4);
+        assert!(full_res.cloned_full_tail);
+        assert_eq!(full_res.effective_source_seq, Some(_e4.seq));
+        assert!(full_res.new_latest_seq > mid_latest);
+        let (full_events, _) = store.fetch_timeline_since("ag_full", 0, 50).expect("fetch");
+        assert_eq!(full_events.len(), 4);
+        for w in full_events.windows(2) {
+            assert!(w[0].seq < w[1].seq);
+        }
+
+        // Self-clone rejected cleanly
+        assert!(
+            store
+                .clone_timeline_events_up_to("ag_src", "ag_src", Some(e1.seq))
+                .is_err()
+        );
+
+        // Replica provenance roundtrip & column persistence
+        store
+            .upsert_single_replica_agent("host_1", &mid_agent)
+            .expect("replica upsert");
+        let rep = store.list_replica_agents("host_1").expect("replica list");
+        assert_eq!(rep.len(), 1);
+        assert_eq!(rep[0].forked_from_agent_id.as_deref(), Some("ag_src"));
+        assert_eq!(rep[0].forked_at_seq, Some(e2.seq));
+    }
+
+    #[test]
+    fn clone_timeline_events_up_to_normalizes_inflight_events_and_tracks_full_tail() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_norm".into(),
+                title: "norm".into(),
+                cwd: "/tmp/norm".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let mk_ag = |id: &str| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_norm".into(),
+            cwd: "/tmp/norm".into(),
+            title: id.into(),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Default,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+        store
+            .upsert_agent(&mk_ag("ag_live_src"), None)
+            .expect("src");
+        store
+            .upsert_agent(&mk_ag("ag_live_fork"), None)
+            .expect("fork");
+
+        // 1. UserPrompt
+        store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "Run dev server and edit".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("prompt");
+        // 2. Open Running background ToolCall
+        store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::ToolCall {
+                    call_id: "call_bg_1".into(),
+                    status: ToolCallStatus::Running,
+                    detail: orbit_protocol::ToolCallDetail::Shell {
+                        command: "npm run dev".into(),
+                        cwd: None,
+                        exit_code: None,
+                        output_preview: None,
+                    },
+                    background_task: Some(orbit_protocol::BackgroundTaskInfo {
+                        task_id: Some("bg_99".into()),
+                        label: Some("dev server".into()),
+                        log_path: None,
+                    }),
+                },
+            )
+            .expect("bg tool");
+        // 3. Unresolved PermissionRequest
+        store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::PermissionRequest {
+                    request_id: "perm_open_1".into(),
+                    title: "Run rm -rf".into(),
+                    detail: orbit_protocol::ToolCallDetail::Generic {
+                        tool_name: "Bash".into(),
+                        arguments_json: "{\"command\":\"rm -rf\"}".into(),
+                    },
+                    allowed_decisions: vec!["allow".into(), "deny".into()],
+                    guardian_assessment: None,
+                },
+            )
+            .expect("perm req");
+        // 4. Streaming AssistantMessage (not yet finalized!)
+        store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "msg_stream_1".into(),
+                    text: "StreamingPartialTokenUnique42 in progress reply".into(),
+                    streaming: true,
+                },
+            )
+            .expect("streaming reply");
+        // 5. Trailing transient StatusChanged::Running
+        let last_ev = store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                },
+            )
+            .expect("running status");
+
+        // Oversized up_to_seq still reports cloned_full_tail = true and clamps effective_source_seq
+        let outcome = store
+            .clone_timeline_events_up_to("ag_live_src", "ag_live_fork", Some(last_ev.seq + 500))
+            .expect("clone inflight");
+        assert!(outcome.cloned_full_tail);
+        assert_eq!(outcome.effective_source_seq, Some(last_ev.seq));
+        // Unresolved PermissionRequest + trailing StatusChanged::Running were stripped -> 3 rows remain
+        assert_eq!(outcome.copied_count, 3);
+
+        let (events, _) = store
+            .fetch_timeline_since("ag_live_fork", 0, 50)
+            .expect("fetch normalized");
+        assert_eq!(events.len(), 3);
+
+        // Running background ToolCall was rewritten to Failed with background_task cleared
+        assert!(matches!(
+            &events[1].payload,
+            TimelinePayload::ToolCall {
+                call_id,
+                status: ToolCallStatus::Failed,
+                background_task: None,
+                ..
+            } if call_id == "call_bg_1"
+        ));
+        assert!(
+            store
+                .list_running_background_tool_calls("ag_live_fork")
+                .expect("bg list")
+                .is_empty(),
+            "forked agent must not inherit running background tool calls"
+        );
+
+        // Streaming reply was finalized (`streaming: false`) and indexed in FTS5!
+        assert!(matches!(
+            &events[2].payload,
+            TimelinePayload::AssistantMessage {
+                item_id,
+                streaming: false,
+                ..
+            } if item_id == "msg_stream_1"
+        ));
+        let fts_hits = store
+            .search_daemon_messages("StreamingPartialTokenUnique42", 10)
+            .expect("fts search finalized stream");
+        assert!(
+            fts_hits.iter().any(|h| h.agent_id == "ag_live_fork"),
+            "finalized streaming reply must be indexed in FTS5 for forked agent"
+        );
+
+        // Target agent's forked_at_seq was clamped to actual source max seq inside the transaction
+        let forked_ag = store
+            .get_agent("ag_live_fork")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(forked_ag.forked_at_seq, Some(last_ev.seq));
+    }
+
+    #[test]
+    fn idempotent_fork_column_migration_preserves_user_version() {
+        let dir = std::env::temp_dir().join(format!(
+            "orbit_store_fork_mig_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db_path = dir.join("orbit.db");
+
+        // Open once (applies all migrations), verify user_version is unchanged (6)
+        let store1 = OrbitStore::open(&db_path).expect("open 1");
+        let ver1: i64 = {
+            let conn = store1.conn.lock().expect("lock");
+            assert!(table_has_column(&conn, "agents", "forked_from_agent_id").expect("col"));
+            assert!(table_has_column(&conn, "agents", "forked_at_seq").expect("col"));
+            assert!(
+                table_has_column(&conn, "client_replica_agents", "forked_from_agent_id")
+                    .expect("col")
+            );
+            assert!(
+                table_has_column(&conn, "client_replica_agents", "forked_at_seq").expect("col")
+            );
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .expect("ver")
+        };
+        drop(store1);
+
+        // Re-open existing DB -> idempotent migration succeeds cleanly without bumping user_version
+        let store2 = OrbitStore::open(&db_path).expect("open 2");
+        let ver2: i64 = store2
+            .conn
+            .lock()
+            .expect("lock")
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("ver");
+        assert_eq!(ver1, ver2);
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fast_mode_migration_idempotency_and_crud_persistence() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "orbit_fast_mode_test_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("orbit.sqlite");
+
+        // 1. Seed a pre-existing database WITHOUT fast_mode columns and with user_version = 6
+        {
+            let raw = Connection::open(&db_path).expect("open raw");
+            raw.execute_batch(
+                "
+                CREATE TABLE workspaces (
+                    workspace_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    git_branch TEXT,
+                    is_worktree INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE agents (
+                    agent_id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    provider_json TEXT NOT NULL,
+                    model TEXT,
+                    effort_json TEXT,
+                    mode_json TEXT NOT NULL,
+                    status_json TEXT NOT NULL,
+                    parent_agent_id TEXT,
+                    persistence_ref TEXT,
+                    latest_seq INTEGER NOT NULL DEFAULT 0,
+                    timeline_epoch INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE client_replica_agents (
+                    host_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (host_id, agent_id)
+                );
+                CREATE TABLE agent_profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    provider_json TEXT NOT NULL,
+                    model TEXT,
+                    effort_json TEXT,
+                    mode_json TEXT NOT NULL,
+                    when_to_use TEXT NOT NULL DEFAULT '',
+                    system_prompt_append TEXT,
+                    mcp_policy_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                PRAGMA user_version = 6;
+                ",
+            )
+            .expect("seed legacy schema");
+        }
+
+        // 2. Open with OrbitStore twice to confirm idempotent PRAGMA table_info migration
+        //    and confirm PRAGMA user_version stays 6 (not bumped in parallel with other Wave 2 work).
+        let store = OrbitStore::open(&db_path).expect("first open");
+        drop(store);
+        let store = OrbitStore::open(&db_path).expect("second idempotent open");
+        {
+            let conn = store.conn.lock().expect("lock");
+            let ver: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .expect("user_version");
+            assert_eq!(ver, 6);
+            for tbl in ["agents", "client_replica_agents", "agent_profiles"] {
+                let mut stmt = conn
+                    .prepare(&format!("PRAGMA table_info({tbl})"))
+                    .expect("pragma");
+                let has_col = stmt
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .expect("query")
+                    .filter_map(Result::ok)
+                    .any(|c| c == "fast_mode");
+                assert!(has_col, "missing fast_mode column on {tbl}");
+            }
+        }
+
+        // 3. Verify CRUD persistence on agents, client_replica_agents, and agent_profiles
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_fast".into(),
+                title: "Fast".into(),
+                cwd: "/repo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let ag = AgentSummary {
+            agent_id: "ag_fast".into(),
+            workspace_id: "ws_fast".into(),
+            cwd: "/repo".into(),
+            title: "Fast Session".into(),
+            provider: ProviderKind::Codex,
+            model: Some("gpt-5.4".into()),
+            effort: Some(ReasoningEffort::Medium),
+            fast_mode: true,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+        store.upsert_agent(&ag, None).expect("upsert agent");
+        let loaded = store.get_agent("ag_fast").expect("get").expect("some");
+        assert!(loaded.fast_mode);
+
+        store
+            .update_agent_fields(
+                "ag_fast",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+            )
+            .expect("disable fast");
+        let disabled = store.get_agent("ag_fast").expect("get").expect("some");
+        assert!(!disabled.fast_mode);
+
+        // Replica persistence
+        store
+            .upsert_replica_agents("h_fast", std::slice::from_ref(&ag))
+            .expect("upsert replica batch");
+        let rep1 = store.list_replica_agents("h_fast").expect("list replica");
+        assert_eq!(rep1.len(), 1);
+        assert!(rep1[0].fast_mode);
+
+        let mut ag_off = ag.clone();
+        ag_off.fast_mode = false;
+        store
+            .upsert_single_replica_agent("h_fast", &ag_off)
+            .expect("upsert single replica");
+        let rep2 = store.list_replica_agents("h_fast").expect("list replica 2");
+        assert_eq!(rep2.len(), 1);
+        assert!(!rep2[0].fast_mode);
+
+        // Profile persistence
+        let prof = orbit_protocol::AgentProfile {
+            profile_id: "prof_fast".into(),
+            name: "Fast Coder".into(),
+            provider: ProviderKind::ClaudeCode,
+            acp_agent_id: None,
+            model: Some("claude-opus-4-6".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: true,
+            mode: SessionMode::AcceptEdits,
+            when_to_use: "Rapid iteration".into(),
+            system_prompt_append: None,
+            mcp_policy: orbit_protocol::McpToolPolicy::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_profile(&prof).expect("upsert prof");
+        let loaded_prof = store
+            .get_profile("prof_fast")
+            .expect("get prof")
+            .expect("some prof");
+        assert!(loaded_prof.fast_mode);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_agent_fields_preserves_unrelated_runtime_columns() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "orbit_atomic_update_test_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("orbit.sqlite");
+        let store = OrbitStore::open(&db_path).expect("open store");
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_atomic".into(),
+                title: "Atomic".into(),
+                cwd: "/repo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let mut labels = HashMap::new();
+        labels.insert("env".into(), "prod".into());
+        let ag = AgentSummary {
+            agent_id: "ag_atomic".into(),
+            workspace_id: "ws_atomic".into(),
+            cwd: "/repo".into(),
+            title: "Original Title".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("claude-opus-4-6".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Running {
+                turn_id: "turn_active".into(),
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 9,
+            timeline_epoch: 2,
+            created_at: now,
+            updated_at: now,
+            archived_at: Some(now),
+            background: false,
+            auto_archive: false,
+            profile_id: Some("prof_1".into()),
+            labels,
+            attention: AttentionState::Permission,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 5,
+            is_pinned: true,
+            pinned_order: 7,
+            handle: Some("lead".into()),
+            cluster_suggestion: None,
+            task_summary: Some("Working".into()),
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+        store
+            .upsert_agent(&ag, Some("native_sess_atomic"))
+            .expect("upsert agent");
+
+        // Targeted update changing ONLY fast_mode must leave all other runtime columns intact
+        store
+            .update_agent_fields(
+                "ag_atomic",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .expect("targeted fast_mode update");
+
+        let updated = store
+            .get_agent("ag_atomic")
+            .expect("get")
+            .expect("agent exists");
+        assert!(updated.fast_mode);
+        assert_eq!(updated.title, "Original Title");
+        assert_eq!(
+            updated.status,
+            AgentStatus::Running {
+                turn_id: "turn_active".into()
+            }
+        );
+        assert_eq!(updated.attention, AttentionState::Permission);
+        assert!(updated.is_pinned);
+        assert_eq!(updated.pinned_order, 7);
+        assert!(updated.archived_at.is_some());
+        assert_eq!(updated.labels.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(updated.handle.as_deref(), Some("lead"));
+        assert_eq!(updated.task_summary.as_deref(), Some("Working"));
+        assert_eq!(
+            store.get_persistence_ref("ag_atomic").expect("pref"),
+            Some("native_sess_atomic".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acp_agent_id_roundtrip_agents_replica_and_profiles() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_acp".into(),
+                title: "ACP Workspace".into(),
+                cwd: "/tmp/acp".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let acp_agent = AgentSummary {
+            agent_id: "ag_acp_1".into(),
+            workspace_id: "ws_acp".into(),
+            cwd: "/tmp/acp".into(),
+            title: "OpenCode ACP Session".into(),
+            provider: ProviderKind::Acp,
+            model: Some("default".into()),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: Some("opencode".into()),
+        };
+
+        store
+            .upsert_agent(&acp_agent, Some("acp_sess_1"))
+            .expect("upsert acp agent");
+        let loaded = store
+            .get_agent("ag_acp_1")
+            .expect("get acp agent")
+            .expect("exists");
+        assert_eq!(loaded.provider, ProviderKind::Acp);
+        assert_eq!(loaded.acp_agent_id.as_deref(), Some("opencode"));
+
+        // Verify client_replica_agents roundtrip (both batch and single upsert)
+        store
+            .upsert_replica_agents("host_1", std::slice::from_ref(&acp_agent))
+            .expect("upsert replica batch");
+        let replica_list = store.list_replica_agents("host_1").expect("list replica");
+        assert_eq!(replica_list.len(), 1);
+        assert_eq!(replica_list[0].provider, ProviderKind::Acp);
+        assert_eq!(replica_list[0].acp_agent_id.as_deref(), Some("opencode"));
+
+        let mut updated_replica = acp_agent.clone();
+        updated_replica.acp_agent_id = Some("gemini-cli".into());
+        store
+            .upsert_single_replica_agent("host_1", &updated_replica)
+            .expect("upsert single replica");
+        let replica_list2 = store.list_replica_agents("host_1").expect("list replica 2");
+        assert_eq!(replica_list2[0].acp_agent_id.as_deref(), Some("gemini-cli"));
+
+        // Verify switch_agent_provider updates acp_agent_id cleanly
+        store
+            .switch_agent_provider(
+                "ag_acp_1",
+                ProviderKind::Acp,
+                None,
+                None,
+                false,
+                Some("goose"),
+            )
+            .expect("switch to goose");
+        let switched = store
+            .get_agent("ag_acp_1")
+            .expect("get switched")
+            .expect("exists");
+        assert_eq!(switched.acp_agent_id.as_deref(), Some("goose"));
+
+        // Verify AgentProfile acp_agent_id roundtrip
+        let profile = orbit_protocol::AgentProfile {
+            profile_id: "prof_acp".into(),
+            name: "OpenCode Worker".into(),
+            provider: ProviderKind::Acp,
+            acp_agent_id: Some("opencode".into()),
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            when_to_use: "Use for OpenCode ACP tasks".into(),
+            system_prompt_append: None,
+            mcp_policy: orbit_protocol::McpToolPolicy::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_profile(&profile).expect("upsert acp profile");
+        let loaded_prof = store
+            .get_profile("prof_acp")
+            .expect("get profile")
+            .expect("exists");
+        assert_eq!(loaded_prof.provider, ProviderKind::Acp);
+        assert_eq!(loaded_prof.acp_agent_id.as_deref(), Some("opencode"));
+
+        // Ensure PRAGMA user_version remains untouched (v6 from FTS5) and ensure_table_column is idempotent
+        let conn = store.conn.lock().expect("lock");
+        let ver_before: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(ver_before, 6);
+        ensure_table_column(&conn, "agents", "acp_agent_id", "TEXT").expect("idempotent 1");
+        ensure_table_column(&conn, "client_replica_agents", "acp_agent_id", "TEXT")
+            .expect("idempotent 2");
+        let ver_after: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(ver_after, ver_before);
+    }
+
+    #[test]
+    fn provider_subagent_events_dedupe_historical_replay_and_coalesce_thinking_heartbeats() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_sub_dedupe".into(),
+                title: "Dedupe".into(),
+                cwd: "/tmp".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_parent_dedupe".into(),
+                    workspace_id: "ws_sub_dedupe".into(),
+                    cwd: "/tmp".into(),
+                    title: "Parent".into(),
+                    provider: ProviderKind::Antigravity,
+                    acp_agent_id: None,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    parent_host_id: None,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: orbit_protocol::AttentionState::None,
+                    last_activity_at: None,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    queued_prompts: Vec::new(),
+                },
+                None,
+            )
+            .expect("agent");
+
+        assert!(
+            !store
+                .has_provider_subagent_events("ag_parent_dedupe", "sub_1")
+                .expect("empty check")
+        );
+
+        // 1. Streaming thinking heartbeats for the same `wake_th_5` keep row count O(1) while
+        //    strictly advancing `seq > since_seq` on mutation so reconnecting clients never miss updates!
+        let (ev1, m1) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_5".into(),
+                    text: "Analyzing step 1...".into(),
+                },
+            )
+            .expect("hb1");
+        assert!(m1);
+        let (ev2, m2) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_5".into(),
+                    text: "Analyzing step 1... and step 2".into(),
+                },
+            )
+            .expect("hb2");
+        assert!(m2);
+        assert!(
+            ev2.seq > ev1.seq,
+            "mutated thinking heartbeat must advance seq past since_seq"
+        );
+        assert_eq!(
+            store
+                .provider_subagent_event_count("ag_parent_dedupe", "sub_1")
+                .expect("count after mutated thinking"),
+            1
+        );
+        // Client catching up with `since_seq = ev1.seq` MUST observe the mutated thinking event!
+        let (caught_up, _) = store
+            .fetch_provider_subagent_events_since("ag_parent_dedupe", "sub_1", ev1.seq, 50)
+            .expect("catchup after mutation");
+        assert_eq!(caught_up.len(), 1);
+        assert_eq!(caught_up[0].seq, ev2.seq);
+
+        let (ev3, m3) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_5".into(),
+                    text: "Analyzing step 1... and step 2".into(),
+                },
+            )
+            .expect("hb3 identical");
+        assert!(!m3, "identical heartbeat must be a zero-write no-op");
+        assert_eq!(ev3.seq, ev2.seq);
+
+        // 2. Tool call transition (Running -> Completed) keeps O(1) row while advancing seq
+        let (tool_run, m_tr) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                TimelinePayload::ToolCall {
+                    call_id: "wake_tool_5_0".into(),
+                    status: ToolCallStatus::Running,
+                    detail: ToolCallDetail::FileRead {
+                        path: "src/lib.rs".into(),
+                        start_line: None,
+                        end_line: None,
+                    },
+                    background_task: None,
+                },
+            )
+            .expect("tool run");
+        assert!(m_tr);
+        let msg_payload = TimelinePayload::AssistantMessage {
+            item_id: "wake_msg_5".into(),
+            text: "Done!".into(),
+            streaming: false,
+        };
+        let tool_payload = TimelinePayload::ToolCall {
+            call_id: "wake_tool_5_0".into(),
+            status: ToolCallStatus::Completed,
+            detail: ToolCallDetail::FileRead {
+                path: "src/lib.rs".into(),
+                start_line: None,
+                end_line: None,
+            },
+            background_task: None,
+        };
+        let (_, m_msg) = store
+            .append_provider_subagent_event_upsert("ag_parent_dedupe", "sub_1", msg_payload.clone())
+            .expect("msg");
+        let (tool_done, m_tool) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                tool_payload.clone(),
+            )
+            .expect("tool");
+        assert!(m_msg && m_tool);
+        assert!(tool_done.seq > tool_run.seq);
+        assert_eq!(
+            store
+                .provider_subagent_event_count("ag_parent_dedupe", "sub_1")
+                .expect("count"),
+            3
+        );
+
+        // Replay the entire historical sequence twice (simulating 2 daemon restarts)
+        for _ in 0..2 {
+            let (_, rm1) = store
+                .append_provider_subagent_event_upsert(
+                    "ag_parent_dedupe",
+                    "sub_1",
+                    TimelinePayload::AssistantThinking {
+                        item_id: "wake_th_5".into(),
+                        text: "Analyzing step 1... and step 2".into(),
+                    },
+                )
+                .expect("replay th");
+            let (_, rm2) = store
+                .append_provider_subagent_event_upsert(
+                    "ag_parent_dedupe",
+                    "sub_1",
+                    msg_payload.clone(),
+                )
+                .expect("replay msg");
+            let (_, rm3) = store
+                .append_provider_subagent_event_upsert(
+                    "ag_parent_dedupe",
+                    "sub_1",
+                    tool_payload.clone(),
+                )
+                .expect("replay tool");
+            assert!(
+                !rm1 && !rm2 && !rm3,
+                "historical replay must not mutate or duplicate"
+            );
+        }
+        assert_eq!(
+            store
+                .provider_subagent_event_count("ag_parent_dedupe", "sub_1")
+                .expect("count after replay"),
+            3
+        );
+        assert!(
+            store
+                .has_provider_subagent_events("ag_parent_dedupe", "sub_1")
+                .expect("has events")
+        );
+
+        // 3. Main timeline `AssistantThinking` heartbeats advance seq on mutation (1 row) and no-op on identical
+        let (t1, tm1) = store
+            .append_timeline_event_deduped(
+                "ag_parent_dedupe",
+                1,
+                None,
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_main_9".into(),
+                    text: "Thinking part A".into(),
+                },
+            )
+            .expect("main th1");
+        assert!(tm1);
+        let (t1_dup, tm1_dup) = store
+            .append_timeline_event_deduped(
+                "ag_parent_dedupe",
+                1,
+                None,
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_main_9".into(),
+                    text: "Thinking part A".into(),
+                },
+            )
+            .expect("main th1 dup");
+        assert!(!tm1_dup);
+        assert_eq!(t1_dup.seq, t1.seq);
+        let (t2, tm2) = store
+            .append_timeline_event_deduped(
+                "ag_parent_dedupe",
+                1,
+                None,
+                TimelinePayload::AssistantThinking {
+                    item_id: "wake_th_main_9".into(),
+                    text: "Thinking part A + B".into(),
+                },
+            )
+            .expect("main th2");
+        assert!(tm2);
+        assert!(
+            t2.seq > t1.seq,
+            "mutated main timeline thinking must advance seq past since_seq"
+        );
+        let (rows, _) = store
+            .fetch_timeline_since("ag_parent_dedupe", 0, 50)
+            .expect("fetch main");
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0].payload,
+            TimelinePayload::AssistantThinking { item_id, text }
+                if item_id == "wake_th_main_9" && text == "Thinking part A + B"
+        ));
+
+        // 4. `upsert_provider_subagent` preserves existing real title when post-restart fallback passes title == subagent_id
+        store
+            .upsert_provider_subagent(&orbit_protocol::ProviderSubagentDescriptor {
+                subagent_id: "sub_title_keep".into(),
+                parent_agent_id: "ag_parent_dedupe".into(),
+                parent_subagent_id: None,
+                title: "Database Migration Engineer".into(),
+                subtitle: None,
+                status: orbit_protocol::ProviderSubagentStatus::Running,
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("upsert real title");
+        store
+            .upsert_provider_subagent(&orbit_protocol::ProviderSubagentDescriptor {
+                subagent_id: "sub_title_keep".into(),
+                parent_agent_id: "ag_parent_dedupe".into(),
+                parent_subagent_id: None,
+                title: "sub_title_keep".into(),
+                subtitle: None,
+                status: orbit_protocol::ProviderSubagentStatus::Completed,
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("upsert synthetic id title");
+        let listed = store
+            .list_provider_subagents("ag_parent_dedupe")
+            .expect("list subagents");
+        let kept = listed
+            .iter()
+            .find(|s| s.subagent_id == "sub_title_keep")
+            .expect("found");
+        assert_eq!(kept.title, "Database Migration Engineer");
+        assert_eq!(
+            kept.status,
+            orbit_protocol::ProviderSubagentStatus::Completed
+        );
+
+        // Ensure PRAGMA user_version remains 6
+        let conn = store.conn.lock().expect("lock");
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(ver, 6);
+    }
+
+    #[test]
+    fn latest_assistant_message_reads_newest_past_500_events() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_long".into(),
+                title: "Long".into(),
+                cwd: "/tmp/long".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_long".into(),
+                    workspace_id: "ws_long".into(),
+                    cwd: "/tmp/long".into(),
+                    title: "Long Turn".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: orbit_protocol::AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        // Append an early assistant message, then 550 tool calls, then the final assistant message.
+        store
+            .append_timeline_event(
+                "ag_long",
+                1,
+                None,
+                TimelinePayload::AssistantMessage {
+                    item_id: "m_early".into(),
+                    text: "Early message".into(),
+                    streaming: false,
+                },
+            )
+            .expect("early msg");
+        for i in 0..550 {
+            store
+                .append_timeline_event(
+                    "ag_long",
+                    1,
+                    None,
+                    TimelinePayload::ToolCall {
+                        call_id: format!("c_{i}"),
+                        status: ToolCallStatus::Completed,
+                        detail: ToolCallDetail::FileRead {
+                            path: format!("src/f{i}.rs"),
+                            start_line: Some(1),
+                            end_line: Some(10),
+                        },
+                        background_task: None,
+                    },
+                )
+                .expect("tool event");
+        }
+        store
+            .append_timeline_event(
+                "ag_long",
+                1,
+                None,
+                TimelinePayload::AssistantMessage {
+                    item_id: "m_final".into(),
+                    text: "Final summary past 500 events".into(),
+                    streaming: false,
+                },
+            )
+            .expect("final msg");
+
+        let latest = store
+            .latest_assistant_message("ag_long")
+            .expect("query latest assistant message");
+        assert_eq!(latest.as_deref(), Some("Final summary past 500 events"));
     }
 }

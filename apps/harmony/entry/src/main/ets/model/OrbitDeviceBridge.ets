@@ -1,12 +1,20 @@
-import { common, Want } from '@kit.AbilityKit';
+import { common, Want, wantAgent } from '@kit.AbilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { fileIo } from '@kit.CoreFileKit';
+import { notificationManager } from '@kit.NotificationKit';
+import { pushService } from '@kit.PushKit';
 import { scanBarcode, scanCore } from '@kit.ScanKit';
 import { vibrator } from '@kit.SensorServiceKit';
 import { orbitLogWarn } from './OrbitLogger';
 
 export const MAX_ATTACHMENT_BYTES: number = 20 * 1024 * 1024;
 const SCAN_USER_CANCEL_CODE: number = 1000500002;
+
+export interface PushTokenOutcome {
+  available: boolean;
+  token: string;
+  errorMessage: string;
+}
 
 export interface LoadedUriBytes {
   filename: string;
@@ -216,6 +224,124 @@ export function openExternalWebUrl(context: common.Context | undefined, rawUrl: 
     return true;
   } catch (err) {
     orbitLogWarn('OrbitLink', 'External URL launch unavailable', err as Object);
+    return false;
+  }
+}
+
+export async function registerHarmonyPushToken(): Promise<PushTokenOutcome> {
+  if (!canIUse('SystemCapability.Push.PushService')) {
+    return {
+      available: false,
+      token: '',
+      errorMessage: 'Push Kit is unavailable on this device.'
+    };
+  }
+  try {
+    const token = await pushService.getToken();
+    const clean = token !== undefined && token !== null ? token.trim() : '';
+    return {
+      available: true,
+      token: clean,
+      errorMessage: clean.length > 0 ? '' : 'Push Kit returned an empty token.'
+    };
+  } catch (err) {
+    orbitLogWarn('OrbitPush', 'Push Kit getToken failed', err as Object);
+    const msg = (err as Error).message;
+    return {
+      available: true,
+      token: '',
+      errorMessage: msg !== undefined && msg.length > 0 ? msg : 'Push Kit registration requires a signed HMS profile.'
+    };
+  }
+}
+
+export async function checkHarmonyNotificationEnabled(): Promise<boolean> {
+  if (!canIUse('SystemCapability.Notification.Notification')) {
+    return false;
+  }
+  try {
+    return await notificationManager.isNotificationEnabled();
+  } catch (err) {
+    orbitLogWarn('OrbitNotify', 'Notification status probe failed', err as Object);
+    return false;
+  }
+}
+
+export async function requestHarmonyNotificationPermission(
+  context: common.Context | undefined
+): Promise<boolean> {
+  if (!canIUse('SystemCapability.Notification.Notification')) {
+    return false;
+  }
+  try {
+    const enabled = await notificationManager.isNotificationEnabled();
+    if (enabled) {
+      return true;
+    }
+    if (context !== undefined) {
+      const uiCtx = context as common.UIAbilityContext;
+      await notificationManager.requestEnableNotification(uiCtx);
+      return await notificationManager.isNotificationEnabled();
+    }
+    return false;
+  } catch (err) {
+    orbitLogWarn('OrbitNotify', 'Notification permission request failed', err as Object);
+    return false;
+  }
+}
+
+export async function publishOrbitDeepLinkNotification(
+  context: common.Context | undefined,
+  notificationId: number,
+  title: string,
+  body: string,
+  hostId: string,
+  agentId: string
+): Promise<boolean> {
+  if (
+    !canIUse('SystemCapability.Notification.Notification') ||
+    !canIUse('SystemCapability.Ability.AbilityRuntime.Core') ||
+    context === undefined
+  ) {
+    return false;
+  }
+  try {
+    const uiCtx = context as common.UIAbilityContext;
+    const bundleName = uiCtx.abilityInfo?.bundleName ?? 'dev.orbit.harmony';
+    const abilityName = uiCtx.abilityInfo?.name ?? 'EntryAbility';
+    const deepLinkUri = `orbit://open?host=${encodeURIComponent(hostId)}&agent=${encodeURIComponent(agentId)}`;
+    const targetWant: Want = {
+      bundleName: bundleName,
+      abilityName: abilityName,
+      uri: deepLinkUri,
+      parameters: {
+        'orbit_open_uri': deepLinkUri,
+        'orbit_host_id': hostId,
+        'orbit_agent_id': agentId
+      }
+    };
+    const agentInfo: wantAgent.WantAgentInfo = {
+      wants: [targetWant],
+      actionType: wantAgent.OperationType.START_ABILITY,
+      requestCode: notificationId,
+      actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+    };
+    const agentObj = await wantAgent.getWantAgent(agentInfo);
+    const req: notificationManager.NotificationRequest = {
+      id: notificationId,
+      content: {
+        notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
+        normal: {
+          title: title,
+          text: body
+        }
+      },
+      wantAgent: agentObj
+    };
+    await notificationManager.publish(req);
+    return true;
+  } catch (err) {
+    orbitLogWarn('OrbitNotify', 'Failed to publish local notification', err as Object);
     return false;
   }
 }

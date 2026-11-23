@@ -106,6 +106,7 @@ export interface AgentCardDto {
   provider_label: string;
   model: string | null;
   effort: string | null;
+  fast_mode?: boolean;
   mode: string | CustomSessionModeDto;
   status: AgentStatusDto;
   status_label: string;
@@ -113,6 +114,8 @@ export interface AgentCardDto {
   has_background_tasks?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
+  archived_at_rfc3339?: string | null;
+  handle?: string | null;
   latest_seq: number;
   updated_at_rfc3339: string;
   is_pinned?: boolean;
@@ -164,6 +167,9 @@ export interface WorkspaceDto {
   git_branch: string | null;
   is_worktree: boolean;
   updated_at?: string;
+  archived_at?: string | null;
+  mission_goal?: string | null;
+  board_revision?: number;
 }
 
 export interface QuotaWindowDto {
@@ -190,6 +196,302 @@ export interface TerminalSummaryDto {
   created_at: string;
 }
 
+export interface ScheduleNewAgentConfigDto {
+  cwd: string;
+  workspace_id?: string | null;
+  provider: string;
+  model?: string | null;
+  effort?: string | null;
+  fast_mode?: boolean;
+  mode: string | CustomSessionModeDto;
+  worktree?: boolean;
+  archive_on_finish?: boolean;
+  background?: boolean;
+}
+
+export interface ScheduleTargetDto {
+  type: string; // 'new_agent' | 'existing_agent'
+  cwd?: string;
+  provider?: string;
+  agent_id?: string;
+}
+
+export interface ScheduleSpecDto {
+  schedule_id: string;
+  kind: string; // 'cron' | 'heartbeat'
+  name: string;
+  cron_expr: string;
+  timezone?: string | null;
+  prompt: string;
+  status: string; // 'active' | 'paused' | 'completed'
+  target: ScheduleTargetDto;
+  max_runs?: number | null;
+  run_count: number;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScheduleRunRecordDto {
+  run_id: string;
+  schedule_id: string;
+  agent_id?: string | null;
+  workspace_id?: string | null;
+  status: string; // 'running' | 'succeeded' | 'failed' | 'skipped'
+  summary?: string | null;
+  error?: string | null;
+  started_at: string;
+  finished_at?: string | null;
+}
+
+export interface CreateSchedulePayloadDto {
+  host_id: string;
+  name: string;
+  cron_expr: string;
+  prompt: string;
+  cwd: string;
+  provider: string;
+  model: string | null;
+  effort: string | null;
+  mode: string;
+  worktree: boolean;
+  archive_on_finish: boolean;
+  max_runs: number | null;
+}
+
+export interface TimerConditionDto {
+  kind: string; // 'never' | 'any_message' | 'sender' | 'all_subagents_settled' | 'file_changed'
+  sender_id?: string;
+  path?: string;
+}
+
+export interface ConditionalTimerRecordDto {
+  timer_id: string;
+  agent_id: string;
+  workspace_id: string;
+  prompt: string;
+  duration_seconds: number;
+  condition: TimerConditionDto;
+  state: string; // 'armed' | 'fired' | 'canceled_early' | 'canceled_manual'
+  created_at_ms: number;
+  fire_at_ms: number;
+  resolved_at_ms?: number | null;
+  resolved_reason?: string | null;
+}
+
+export interface GoalCriterionDto {
+  id: string;
+  label: string;
+  passed: boolean;
+}
+
+export interface GoalRunRecordDto {
+  goal_id: string;
+  agent_id: string;
+  workspace_id: string;
+  objective: string;
+  criteria: GoalCriterionDto[];
+  verify_command?: string | null;
+  max_iterations: number;
+  current_iteration: number;
+  max_duration_secs: number;
+  status: string; // 'running' | 'verifying' | 'paused' | 'succeeded' | 'failed' | 'canceled'
+  last_verify_exit_code?: number | null;
+  last_verify_output?: string | null;
+  started_at_ms: number;
+  updated_at_ms: number;
+  finished_at_ms?: number | null;
+}
+
+export interface ControlGoalRunRequestDto {
+  host_id: string;
+  goal_id: string;
+  action: string; // 'pause' | 'resume' | 'cancel' | 'verify_now'
+}
+
+export interface MonitorKindDto {
+  kind: string; // 'command_stream' | 'log_file_tail' | 'http_health'
+  command?: string;
+  path?: string;
+  pattern?: string | null;
+  url?: string;
+}
+
+export interface MonitorWatchRecordDto {
+  monitor_id: string;
+  agent_id: string;
+  name: string;
+  kind: MonitorKindDto;
+  status: string; // 'active' | 'paused' | 'triggered' | 'stopped' | 'error'
+  match_count: number;
+  last_event_preview?: string | null;
+  last_triggered_at_ms?: number | null;
+  created_at_ms: number;
+}
+
+export interface StopMonitorWatchRequestDto {
+  host_id: string;
+  monitor_id: string;
+}
+
+export interface WorkflowStepRecordDto {
+  run_id: string;
+  step_id: string;
+  name: string;
+  status: string;
+  agent_id?: string | null;
+  provider: string;
+  model?: string | null;
+  output_preview?: string | null;
+  diff_additions: number;
+  diff_deletions: number;
+  diff_files: number;
+  verify_passed?: boolean | null;
+  error?: string | null;
+  is_winner: boolean;
+}
+
+export interface WorkflowRunRecordDto {
+  run_id: string;
+  name: string;
+  kind: string; // 'batch_csv' | 'dag' | 'best_of_n'
+  workspace_cwd: string;
+  owner_agent_id?: string | null;
+  status: string; // 'pending' | 'running' | 'succeeded' | 'partial_failure' | 'failed' | 'canceled'
+  max_concurrency: number;
+  verify_command?: string | null;
+  winner_step_id?: string | null;
+  steps: WorkflowStepRecordDto[];
+  created_at_ms: number;
+  updated_at_ms: number;
+  finished_at_ms?: number | null;
+}
+
+export interface CancelWorkflowRunRequestDto {
+  host_id: string;
+  run_id: string;
+}
+
+export interface WorkspaceBoardSnapshotDto {
+  workspace_id: string;
+  content: string;
+  revision: number;
+  updated_by?: string | null;
+  updated_at: string;
+  board_path?: string | null;
+}
+
+export interface WorkspaceEventRecordDto {
+  seq: number;
+  workspace_id: string;
+  agent_id?: string | null;
+  agent_handle?: string | null;
+  kind: string;
+  summary: string;
+  file_path?: string | null;
+  created_at: string;
+}
+
+export interface SpawnWorkspacePeerRequestDto {
+  host_id: string;
+  workspace_id: string;
+  cwd: string;
+  provider: string;
+  model: string | null;
+  effort: string | null;
+  mode: string;
+  initial_prompt: string;
+  handle: string | null;
+}
+
+export interface CreateSessionRequestDto {
+  host_id: string;
+  cwd: string;
+  extra_dirs: string[];
+  provider: string;
+  acp_agent_id: string | null;
+  model: string | null;
+  effort: string | null;
+  fast_mode: boolean;
+  mode: string;
+  initial_prompt: string;
+  initial_display_prompt: string | null;
+  initial_badges: PromptBadgeDto[];
+  worktree_branch: string | null;
+  workspace_id: string | null;
+  handle: string | null;
+  auto_cluster: boolean | null;
+}
+
+export interface ForkTargetDto {
+  kind: string; // 'same_directory' | 'new_worktree'
+  branch?: string | null;
+  base_ref?: string | null;
+}
+
+export interface ForkAgentRequestDto {
+  host_id: string;
+  source_agent_id: string;
+  up_to_seq: number | null;
+  target: ForkTargetDto;
+  title: string | null;
+  initial_prompt: string | null;
+}
+
+export interface ForkAgentResultDto {
+  agent: AgentCardDto;
+  workspace?: WorkspaceDto | null;
+}
+
+export interface ExportOptionsDto {
+  format: string; // 'markdown' | 'json' | 'html'
+  include_thinking: boolean;
+  include_tool_calls: boolean;
+  include_timestamps: boolean;
+}
+
+export interface ExportedTranscriptDto {
+  suggested_filename: string;
+  mime_type: string;
+  content: string;
+  turn_count: number;
+  byte_len: number;
+}
+
+export interface CloudSyncStatusDto {
+  state: string; // 'signed_out' | 'locked' | 'ready' | 'syncing' | 'error'
+  provider: string;
+  github_oauth_configured: boolean;
+  github_client_id_override: string | null;
+  account_login: string | null;
+  account_name: string | null;
+  account_avatar_url: string | null;
+  gist_id: string | null;
+  gist_html_url: string | null;
+  remote_vault_exists: boolean;
+  auto_sync_enabled: boolean;
+  last_synced_at_ms: number | null;
+  last_vault_revision: number;
+  synced_host_count: number;
+  synced_project_count: number;
+  last_error: string | null;
+}
+
+export interface CloudSyncResultDto {
+  hosts_added: number;
+  hosts_updated: number;
+  hosts_removed: number;
+  projects_added: number;
+  projects_updated: number;
+  projects_removed: number;
+  preferences_updated: number;
+  pushed_remote: boolean;
+  vault_revision: number;
+  synced_at_ms: number;
+  gist_html_url: string | null;
+}
+
 export interface HostDetailDto {
   revision: number;
   host: HostCardDto;
@@ -205,6 +507,13 @@ export interface HostDetailDto {
   terminals: TerminalSummaryDto[];
   active_terminal_id: string | null;
   active_terminal_slot: number;
+  schedules?: ScheduleSpecDto[];
+  conditional_timers?: ConditionalTimerRecordDto[];
+  goal_runs?: GoalRunRecordDto[];
+  monitor_watches?: MonitorWatchRecordDto[];
+  workflow_runs?: WorkflowRunRecordDto[];
+  workspace_boards?: Record<string, WorkspaceBoardSnapshotDto>;
+  workspace_events?: Record<string, WorkspaceEventRecordDto[]>;
 }
 
 export interface PromptBadgeDto {
@@ -864,6 +1173,9 @@ export function formatModeLabel(modeSlug: string): string {
   if (modeSlug === 'default' || modeSlug === 'plan') {
     return 'Always Ask';
   }
+  if (modeSlug === 'auto') {
+    return 'Auto';
+  }
   if (modeSlug === 'accept_edits') {
     return 'Accept Edits';
   }
@@ -871,6 +1183,32 @@ export function formatModeLabel(modeSlug: string): string {
     return 'Full Access';
   }
   return modeSlug;
+}
+
+export function formatTimerConditionLabel(cond: TimerConditionDto): string {
+  if (cond.kind === 'any_message') {
+    return 'until any message';
+  }
+  if (cond.kind === 'all_subagents_settled') {
+    return 'until subagents settle';
+  }
+  if (cond.kind === 'sender' && cond.sender_id !== undefined && cond.sender_id.length > 0) {
+    return `until ${cond.sender_id}`;
+  }
+  if (cond.kind === 'file_changed' && cond.path !== undefined && cond.path.length > 0) {
+    return `until ${basenameOfPath(cond.path)} changes`;
+  }
+  return 'fixed timer';
+}
+
+export function formatWorkflowKindLabel(kind: string): string {
+  if (kind === 'batch_csv') {
+    return 'Batch CSV';
+  }
+  if (kind === 'best_of_n') {
+    return 'Best-of-N';
+  }
+  return 'DAG';
 }
 
 export function formatAgentStatusLabel(agent: AgentCardDto): string {

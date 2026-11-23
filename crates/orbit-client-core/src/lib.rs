@@ -14,7 +14,9 @@ pub mod composer;
 pub mod contract;
 pub mod desktop_ops;
 pub mod diagram;
+pub mod export;
 pub mod logging;
+pub mod math;
 pub mod render;
 pub mod sidebar;
 pub mod stage;
@@ -31,7 +33,10 @@ use orbit_relay_transport::connect_relay_ws;
 use orbit_store::{OrbitStore, StoreError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 use uuid::Uuid;
 
 use crate::desktop_ops::{SshTunnelGuard, spawn_ssh_local_tunnel};
@@ -256,7 +261,10 @@ async fn connect_direct_with_host_id(
     replica: Option<Arc<OrbitStore>>,
     ssh_tunnel: Option<Arc<SshTunnelGuard>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
-    let (ws_stream, _) = connect_async(ws_url).await?;
+    let mut ws_cfg = WebSocketConfig::default();
+    ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+    ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+    let (ws_stream, _) = connect_async_with_config(ws_url, Some(ws_cfg), false).await?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let hello = WireMessage::Hello {
@@ -373,7 +381,7 @@ async fn connect_direct_with_host_id(
             match msg {
                 Message::Text(txt) => match serde_json::from_str::<WireMessage>(&txt) {
                     Ok(wire) => {
-                        sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
+                        sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
                         let _ = events_in.send(ClientInboundEvent::Wire(wire));
                     }
                     Err(err) => {
@@ -384,7 +392,7 @@ async fn connect_direct_with_host_id(
                     if bin[0] == DIRECT_BIN_ZSTD_WIRE {
                         match WireMessage::decode_zstd(&bin[1..]) {
                             Ok(wire) => {
-                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
+                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
                                 let _ = events_in.send(ClientInboundEvent::Wire(wire));
                             }
                             Err(err) => {
@@ -538,7 +546,7 @@ async fn connect_via_relay_with_host_id(
                     match plain[0] {
                         E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
                             Ok(wire) => {
-                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
+                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
                                 let _ = events_in.send(ClientInboundEvent::Wire(wire));
                             }
                             Err(err) => {
@@ -807,7 +815,26 @@ pub async fn connect_smart(
     }
 }
 
-fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage) {
+async fn retry_replica_write<F>(mut op: F) -> Result<(), orbit_store::StoreError>
+where
+    F: FnMut() -> Result<(), orbit_store::StoreError>,
+{
+    const BACKOFF_MS: [u64; 2] = [25, 75];
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.is_busy() && attempt < BACKOFF_MS.len() => {
+                let delay = Duration::from_millis(BACKOFF_MS[attempt]);
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage) {
     let Some(store) = store else { return };
     match msg {
         WireMessage::WorkspacesSnapshot { workspaces, .. } => {
@@ -841,6 +868,21 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
                 let _ = store.upsert_agent(agent, None);
             }
         }
+        WireMessage::AgentForked {
+            agent, workspace, ..
+        } => {
+            if let Some(ws) = workspace {
+                let _ = store.upsert_workspace(ws);
+                if !host_id.is_empty() {
+                    let _ = store.upsert_single_replica_workspace(host_id, ws);
+                }
+            }
+            if !host_id.is_empty() {
+                let _ = store.upsert_single_replica_agent(host_id, agent);
+            } else {
+                let _ = store.upsert_agent(agent, None);
+            }
+        }
         WireMessage::AgentDeleted { agent_id } => {
             if !host_id.is_empty() {
                 let _ = store.delete_replica_agent(host_id, agent_id);
@@ -849,7 +891,11 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
         WireMessage::TimelineCatchup {
             agent_id, events, ..
         } => {
-            if let Err(err) = store.upsert_replica_timeline_events_batch(events) {
+            if let Err(err) = retry_replica_write(|| {
+                store.upsert_replica_timeline_events_batch_for_host(host_id, events)
+            })
+            .await
+            {
                 tracing::warn!(
                     host_id = %host_id,
                     agent_id = %agent_id,
@@ -860,7 +906,10 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
             }
         }
         WireMessage::TimelineLive { event } => {
-            if let Err(err) = store.upsert_replica_timeline_event(event) {
+            if let Err(err) =
+                retry_replica_write(|| store.upsert_replica_timeline_event_for_host(host_id, event))
+                    .await
+            {
                 tracing::warn!(
                     host_id = %host_id,
                     agent_id = %event.agent_id,

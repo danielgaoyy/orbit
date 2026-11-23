@@ -1292,6 +1292,7 @@ mod tests {
             provider_label: "Claude Code".to_string(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::Idle,
             status_label: if is_running {
@@ -1323,6 +1324,9 @@ mod tests {
             cluster_suggestion: None,
             worktree_branch: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
         }
     }
 

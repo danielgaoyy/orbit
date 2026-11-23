@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
   AlertCircle,
+  Blocks,
   CheckCircle2,
   ChevronRight,
   Clock,
@@ -145,7 +146,7 @@ function formatCompactHostLabel(rawUrl: string): string {
 }
 
 interface LaunchpadPrimaryAction {
-  id: "review" | "files" | "terminal" | "browser" | "side_question";
+  id: "review" | "files" | "artifacts" | "terminal" | "browser" | "side_question";
   label: string;
   keywords: string[];
   icon: ReactNode;
@@ -268,6 +269,16 @@ export function SidePanelLaunchpad({
     return (sideQuestionsByScope[scope] ?? []).length;
   }, [isDraftNewSession, selectedAgentId, selectedHostId, sideQuestionsByScope]);
 
+  const artifactCount = useMemo(() => {
+    const all = hostDetail?.artifacts ?? [];
+    if (all.length === 0) return 0;
+    if (currentAgent?.workspace_id) {
+      const wsCount = all.filter((a) => a.workspace_id === currentAgent.workspace_id).length;
+      if (wsCount > 0) return wsCount;
+    }
+    return all.length;
+  }, [hostDetail?.artifacts, currentAgent?.workspace_id]);
+
   const primaryLocalUrl = insights.detected_local_urls[0] ?? null;
 
   const primaryActions = useMemo<LaunchpadPrimaryAction[]>(
@@ -302,6 +313,26 @@ export function SidePanelLaunchpad({
         keywords: ["open file", "files", "explorer", "tree", "folder"],
         icon: <File className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />,
         onSelect: () => orbitActions.openFilesExplorerTab(),
+      },
+      {
+        id: "artifacts",
+        label: "Artifacts",
+        keywords: ["artifacts", "html", "mcp", "app", "preview", "diagram", "svg", "mermaid"],
+        icon: <Blocks className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />,
+        trailing:
+          artifactCount > 0 ? (
+            <Badge
+              variant="secondary"
+              className="text-muted-foreground h-4 min-w-[18px] justify-center rounded-full px-1.5 text-[10.5px] font-medium tabular-nums"
+            >
+              {artifactCount}
+            </Badge>
+          ) : null,
+        onSelect: () =>
+          orbitActions.openArtifactsTab({
+            hostId: selectedHostId ?? undefined,
+            workspaceId: currentAgent?.workspace_id,
+          }),
       },
       {
         id: "terminal",
@@ -360,7 +391,15 @@ export function SidePanelLaunchpad({
         onSelect: () => orbitActions.openSideQuestionTab(),
       },
     ],
-    [primaryLocalUrl, reviewSummary, sideQuestionCount, totalTerminalCount],
+    [
+      artifactCount,
+      currentAgent?.workspace_id,
+      primaryLocalUrl,
+      reviewSummary,
+      selectedHostId,
+      sideQuestionCount,
+      totalTerminalCount,
+    ],
   );
 
   const trimmedQuery = query.trim();
@@ -706,6 +745,7 @@ export function SidePanelLaunchpad({
                         const isAwaiting = subagent.status === "awaiting_permission";
                         const isRunning = subagent.status === "running";
                         const isFailed = subagent.status === "failed";
+                        const isCanceled = subagent.status === "canceled";
                         return (
                           <button
                             key={subagent.key}
@@ -734,6 +774,8 @@ export function SidePanelLaunchpad({
                                 <Loader2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 animate-spin" />
                               ) : isFailed ? (
                                 <AlertCircle className="h-[14px] w-[14px] shrink-0 text-red-500" />
+                              ) : isCanceled ? (
+                                <span className="bg-muted-foreground/45 size-[6.5px] shrink-0 rounded-full" />
                               ) : (
                                 <CheckCircle2 className="h-[14px] w-[14px] shrink-0 text-emerald-600 dark:text-emerald-400" />
                               )}

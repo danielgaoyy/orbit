@@ -298,11 +298,18 @@ pub async fn wait_until_healthy_for_host(
     }
 }
 
+fn resolve_user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
 fn is_default_orbit_home(home_dir: &Path) -> bool {
-    let Some(h) = std::env::var_os("HOME") else {
+    let Some(h) = resolve_user_home() else {
         return false;
     };
-    let default_dir = PathBuf::from(h).join(".orbit");
+    let default_dir = h.join(".orbit");
     fs::canonicalize(home_dir).unwrap_or_else(|_| home_dir.to_path_buf())
         == fs::canonicalize(&default_dir).unwrap_or(default_dir)
 }
@@ -368,8 +375,9 @@ pub fn stop_service(role: ServiceRole, home_dir: &Path) -> anyhow::Result<()> {
 
 fn resolve_self_exe() -> anyhow::Result<PathBuf> {
     let cur = std::env::current_exe()?;
-    if let Some(user_home) = std::env::var_os("HOME") {
-        let stable_symlink = PathBuf::from(user_home).join(".local/bin/orbit");
+    if let Some(user_home) = resolve_user_home() {
+        let exe_name = if cfg!(windows) { "orbit.exe" } else { "orbit" };
+        let stable_symlink = user_home.join(".local").join("bin").join(exe_name);
         if stable_symlink.exists()
             && fs::canonicalize(&stable_symlink).ok() == fs::canonicalize(&cur).ok()
         {
@@ -380,13 +388,20 @@ fn resolve_self_exe() -> anyhow::Result<PathBuf> {
 }
 
 fn build_service_path_env() -> String {
-    let mut entries: Vec<String> = Vec::new();
-    if let Some(h) = std::env::var_os("HOME") {
-        let home = PathBuf::from(h);
-        for rel in [".local/bin", ".cargo/bin", ".npm-global/bin"] {
-            entries.push(home.join(rel).to_string_lossy().to_string());
+    let mut entries: Vec<PathBuf> = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && !entries.contains(&p) {
+            entries.push(p);
         }
+    };
+    if let Some(home) = resolve_user_home() {
+        for rel in [".local/bin", ".cargo/bin", ".npm-global/bin"] {
+            push_unique(home.join(rel));
+        }
+        #[cfg(windows)]
+        push_unique(home.join("AppData").join("Roaming").join("npm"));
     }
+    #[cfg(unix)]
     for fixed in [
         "/opt/homebrew/bin",
         "/usr/local/bin",
@@ -395,18 +410,16 @@ fn build_service_path_env() -> String {
         "/usr/sbin",
         "/sbin",
     ] {
-        if !entries.iter().any(|e| e == fixed) {
-            entries.push(fixed.to_string());
+        push_unique(PathBuf::from(fixed));
+    }
+    if let Some(current) = std::env::var_os("PATH") {
+        for part in std::env::split_paths(&current) {
+            push_unique(part);
         }
     }
-    if let Ok(current) = std::env::var("PATH") {
-        for part in current.split(':') {
-            if !part.is_empty() && !entries.iter().any(|e| e == part) {
-                entries.push(part.to_string());
-            }
-        }
-    }
-    entries.join(":")
+    std::env::join_paths(&entries)
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|_| std::env::var("PATH").unwrap_or_default())
 }
 
 fn has_user_systemd() -> bool {
@@ -627,6 +640,11 @@ fn start_detached_pid_service(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0200 | 0x0800_0000);
+    }
 
     let child = cmd.spawn()?;
     fs::write(&pid_file, child.id().to_string())?;
@@ -637,13 +655,67 @@ fn stop_pid_file_process(pid_file: &Path) {
     if let Ok(raw) = fs::read_to_string(pid_file) {
         let pid = raw.trim();
         if !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()) {
-            let _ = Command::new("kill")
-                .arg(pid)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill")
+                    .arg(pid)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // Terminate ONLY the daemon/relay PID (NEVER `/T`) so detached `orbit shim`
+                // agent and PTY child sessions survive daemon restarts and hot-upgrades!
+                let _ = Command::new("taskkill")
+                    .args(["/PID", pid, "/F"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .creation_flags(0x0800_0000)
+                    .status();
+            }
         }
         let _ = fs::remove_file(pid_file);
+    }
+}
+
+fn replace_executable_safely(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if let Some(parent) = dst.parent()
+            && let Some(stem) = dst.file_stem().and_then(|s| s.to_str())
+        {
+            let stale_prefix = format!("{stem}.exe.old.");
+            if let Ok(entries) = fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().starts_with(&stale_prefix) {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+        let backup = if dst.exists() {
+            let b = dst.with_extension(format!("exe.old.{}", std::process::id()));
+            let _ = fs::remove_file(&b);
+            fs::rename(dst, &b)?;
+            Some(b)
+        } else {
+            None
+        };
+        if let Err(err) = fs::rename(tmp, dst) {
+            if let Some(ref b) = backup {
+                let _ = fs::rename(b, dst);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp, dst)
     }
 }
 
@@ -823,6 +895,7 @@ pub async fn self_upgrade_cli(
         ("linux", "x86_64") => "orbit-cli-linux-x64",
         ("linux", "aarch64") => "orbit-cli-linux-arm64",
         ("macos", "aarch64") => "orbit-cli-macos-arm64",
+        ("windows", "x86_64") => "orbit-windows-x86_64.exe",
         (os, arch) => anyhow::bail!("unsupported auto-upgrade platform: {os}/{arch}"),
     };
 
@@ -850,7 +923,10 @@ pub async fn self_upgrade_cli(
         fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
     }
 
-    fs::rename(&tmp_path, &target_exe)?;
+    if let Err(err) = replace_executable_safely(&tmp_path, &target_exe) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
     println!(
         "[✓] Upgraded Orbit v{current_ver} -> {tag} at {}",
         target_exe.display()

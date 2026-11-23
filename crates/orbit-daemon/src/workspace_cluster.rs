@@ -234,11 +234,7 @@ pub fn allocate_unique_handle(
             if taken.is_empty() {
                 "lead".to_string()
             } else {
-                match provider {
-                    ProviderKind::Antigravity => "agy".to_string(),
-                    ProviderKind::Codex => "codex".to_string(),
-                    ProviderKind::ClaudeCode => "claude".to_string(),
-                }
+                provider.short_label().to_ascii_lowercase()
             }
         });
 
@@ -609,6 +605,7 @@ mod tests {
             provider: ProviderKind::ClaudeCode,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::Idle,
             parent_agent_id: None,
@@ -631,6 +628,9 @@ mod tests {
             handle: Some(handle.into()),
             cluster_suggestion: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
         }
     }
 

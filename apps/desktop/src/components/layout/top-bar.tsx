@@ -1,10 +1,26 @@
 import { memo } from "react";
-import { FileText } from "lucide-react";
+import {
+  ArrowLeftRight,
+  Blocks,
+  Code2,
+  Copy,
+  Download,
+  FileText,
+  MoreHorizontal,
+  Sparkles,
+} from "lucide-react";
 import { isAgentBackgroundWaiting, isMacDesktop } from "@/lib/orbit-ipc";
 import { modSymbol } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { StandaloneGroupButton } from "@/components/stage/workspace-peer-strip";
-import { SimpleTooltip } from "@/components/ui/overlays";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  SimpleTooltip,
+} from "@/components/ui/overlays";
 import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -13,9 +29,30 @@ export const TopBar = memo(function TopBar() {
   const overviewVisible = useOrbitSelector((s) =>
     s.stageCanDockOverview ? s.overviewDesktopOpenPref : s.overviewPopoverOpen,
   );
+  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
-  const hasActiveSession = workspacePanel === "conversation" && !isDraft && Boolean(selectedAgentId);
+  const hasActiveSession =
+    workspacePanel === "conversation" &&
+    !isDraft &&
+    Boolean(selectedHostId) &&
+    Boolean(selectedAgentId);
+
+  const activeWorktreeWorkspace = useOrbitSelector((s) => {
+    if (
+      s.workspacePanel !== "conversation" ||
+      s.isDraftNewSession ||
+      !s.selectedHostId ||
+      !s.selectedAgentId
+    ) {
+      return null;
+    }
+    const detail = s.hostDetails[s.selectedHostId];
+    const ag = detail?.agents.find((a) => a.agent_id === s.selectedAgentId);
+    if (!ag || !detail) return null;
+    const ws = detail.workspaces.find((w) => w.workspace_id === ag.workspace_id);
+    return ws?.is_worktree ? ws : null;
+  });
   // Primitive return keeps TopBar free from re-renders on unrelated store updates
   const overviewBadgeTone = useOrbitSelector<
     "none" | "approval" | "subagent_running" | "bg_running"
@@ -90,6 +127,21 @@ export const TopBar = memo(function TopBar() {
     return ag?.title || "New Conversation";
   });
 
+  const workspaceArtifactCount = useOrbitSelector((s) => {
+    if (!s.selectedHostId) return 0;
+    const detail = s.hostDetails[s.selectedHostId];
+    const all = detail?.artifacts ?? [];
+    if (all.length === 0) return 0;
+    const ag =
+      !s.isDraftNewSession && s.selectedAgentId
+        ? detail?.agents.find((a) => a.agent_id === s.selectedAgentId)
+        : null;
+    if (ag?.workspace_id) {
+      return all.filter((a) => a.workspace_id === ag.workspace_id).length;
+    }
+    return all.length;
+  });
+
   const mod = modSymbol();
   const isMac = isMacDesktop();
 
@@ -150,9 +202,96 @@ export const TopBar = memo(function TopBar() {
         }}
         className="flex shrink-0 items-center gap-1"
       >
-        {hasActiveSession && (
+        {hasActiveSession && selectedHostId && selectedAgentId && (
           <>
+            {activeWorktreeWorkspace && (
+              <SimpleTooltip label="Apply or move worktree changes to local checkout">
+                <button
+                  type="button"
+                  onClick={() =>
+                    orbitActions.openWorktreeHandoffDialog({
+                      hostId: selectedHostId,
+                      workspaceId: activeWorktreeWorkspace.workspace_id,
+                      direction: "worktree_to_local",
+                      defaultMode: "apply",
+                      sourceCwd: activeWorktreeWorkspace.cwd,
+                    })
+                  }
+                  className="border-border text-foreground/78 hover:text-foreground inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] border px-2 text-[11.5px] font-medium transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+                >
+                  <ArrowLeftRight className="h-[12px] w-[12px] shrink-0 stroke-[1.75] opacity-75" />
+                  <span>Apply to Local</span>
+                </button>
+              </SimpleTooltip>
+            )}
+            {workspaceArtifactCount > 0 && (
+              <SimpleTooltip label="Artifacts">
+                <button
+                  type="button"
+                  aria-label={`Artifacts (${workspaceArtifactCount})`}
+                  onClick={() => orbitActions.openArtifactsTab({ hostId: selectedHostId })}
+                  className="text-foreground/70 hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-[7px] px-2 text-[12px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+                >
+                  <Blocks className="h-[14px] w-[14px] stroke-[1.75]" />
+                  <span className="tabular-nums text-[11px] opacity-80">
+                    {workspaceArtifactCount}
+                  </span>
+                </button>
+              </SimpleTooltip>
+            )}
             <StandaloneGroupButton />
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Conversation actions"
+                  className="text-foreground/65 hover:text-foreground inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+                >
+                  <MoreHorizontal className="h-[15.5px] w-[15.5px] stroke-[1.75]" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" sideOffset={6} className="min-w-[184px]">
+                <DropdownMenuItem
+                  onSelect={() => orbitActions.openExportDialog(selectedHostId, selectedAgentId)}
+                >
+                  <span className="flex items-center gap-2">
+                    <Download className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                    <span>Export…</span>
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void orbitActions.openCopyCodeBlocksModal(selectedHostId, selectedAgentId);
+                  }}
+                >
+                  <span className="flex items-center gap-2">
+                    <Code2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                    <span>Copy code block…</span>
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void orbitActions.copyThread(selectedHostId, selectedAgentId);
+                  }}
+                >
+                  <span className="flex items-center gap-2">
+                    <Copy className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                    <span>Copy transcript</span>
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void orbitActions.summarizeAgent(selectedHostId, selectedAgentId);
+                  }}
+                >
+                  <span className="flex items-center gap-2">
+                    <Sparkles className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                    <span>Summarize</span>
+                  </span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <SimpleTooltip
             label={
               overviewVisible

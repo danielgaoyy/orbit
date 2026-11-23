@@ -3156,6 +3156,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "similar",
  "syntect",
  "thiserror 2.0.21",
@@ -3227,6 +3228,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "similar",
  "thiserror 2.0.21",
  "tokio",
@@ -3253,6 +3255,7 @@ version = "0.8.4"
 dependencies = [
  "base64 0.22.1",
  "portable-pty",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -3269,6 +3272,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

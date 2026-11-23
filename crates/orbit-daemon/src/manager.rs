@@ -9,17 +9,19 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, HostProjectEntry, HostSyncState,
-    OrchestrationConfig, PendingPermissionSummary, PromptBadge, ProviderKind,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec,
-    SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
-    WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
-    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus,
-    WorkspaceSetupProgress, WorkspaceSetupStatus, WorkspaceSummary, WorktreeCreateMode,
+    ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, ForkTarget, HostProjectEntry,
+    HostSyncState, KeepAwakeStatus, OrchestrationConfig, PendingPermissionSummary, PromptBadge,
+    ProviderKind, ProviderModelCatalog, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    QuestionItem, ReasoningEffort, ScheduleSpec, SessionMode, TerminalSummary, TimelineEvent,
+    TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceEventKind,
+    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
+    WorkspaceScriptKind, WorkspaceScriptStatus, WorkspaceSetupProgress, WorkspaceSetupStatus,
+    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffDirection, WorktreeHandoffMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, SessionLaunchConfig,
-    find_provider_executable, spawn_provider_session,
+    find_provider_executable, provider_model_supports_fast_mode, spawn_provider_session,
 };
 use orbit_shim::{
     ShimClient, ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, kill_existing_shim,
@@ -30,10 +32,12 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::fast_copy::{DirShareMode, link_or_clone_dir};
 use crate::git::{
     capture_git_tree_snapshot, inspect_git_status, resolve_git_scope, restore_git_tree_snapshot,
     reverse_apply_file_edit_diffs,
 };
+use crate::keep_awake::KeepAwakeManager;
 use crate::messaging::{CoalescedDispatchBatch, sanitize_human_prompt_for_wire};
 use crate::workspace_board::{
     board_file_path, build_workspace_roster_context, default_board_template,
@@ -42,9 +46,16 @@ use crate::workspace_board::{
 use crate::workspace_cluster::{allocate_unique_handle, evaluate_auto_cluster, sanitize_handle};
 use crate::workspace_runtime::{
     WorkspaceScriptRegistry, allocate_ephemeral_port, build_service_proxy_host,
-    create_worktree_with_mode, load_workspace_manifest_with_fallback, run_worktree_setup_hooks,
-    teardown_and_remove_worktree,
+    create_worktree_with_mode_pooled, load_workspace_manifest_with_fallback,
+    run_worktree_setup_hooks, teardown_and_remove_worktree, validate_git_base_ref,
+    validate_git_branch_name,
 };
+use crate::worktree_handoff::{
+    HandoffExecutePathsSpec, HandoffPreviewPathsSpec, execute_worktree_handoff_paths,
+    force_delete_git_branch, preflight_validate_source_safety, preview_worktree_handoff_paths,
+    resolve_git_checkout_info, validate_handoff_branch_name,
+};
+use crate::worktree_pool::WorktreePool;
 
 #[derive(Debug, Clone)]
 pub struct RewindAgentOutcome {
@@ -54,6 +65,38 @@ pub struct RewindAgentOutcome {
     pub restored_files: u32,
     pub restored_prompt: Option<String>,
     pub notice: Option<String>,
+}
+
+pub struct ForkAgentSpec {
+    pub source_agent_id: String,
+    pub up_to_seq: Option<u64>,
+    pub target: ForkTarget,
+    pub title: Option<String>,
+    pub initial_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForkAgentOutcome {
+    pub agent: AgentSummary,
+    pub workspace: Option<WorkspaceSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecuteWorktreeHandoffSpec {
+    pub workspace_id: String,
+    pub direction: WorktreeHandoffDirection,
+    pub mode: WorktreeHandoffMode,
+    pub target_workspace_id: Option<String>,
+    pub include_committed: bool,
+    pub branch: Option<String>,
+    pub allow_three_way_conflicts: bool,
+}
+
+struct DeferredWorktreeSetup {
+    workspace_id: String,
+    source_cwd: PathBuf,
+    worktree_cwd: PathBuf,
+    branch_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +121,14 @@ pub enum DaemonBroadcast {
     WorkspaceBoardUpdated(WorkspaceBoardSnapshot),
     WorkspaceEventRecorded(WorkspaceEventRecord),
     WorkspaceOrganizeProgress(WorkspaceOrganizeEvent),
+    KeepAwakeStatusUpdated(KeepAwakeStatus),
+    AcpAgentsUpdated(Vec<orbit_protocol::AcpAgentAvailability>),
+    ArtifactUpdated(orbit_protocol::ArtifactSummary),
+    ArtifactDeleted(String),
+    ConditionalTimerEvent(orbit_protocol::ConditionalTimerRecord),
+    GoalRunEvent(orbit_protocol::GoalRunRecord),
+    MonitorWatchEvent(orbit_protocol::MonitorWatchRecord),
+    WorkflowRunEvent(orbit_protocol::WorkflowRunRecord),
 }
 
 struct LiveAgentEntry {
@@ -131,6 +182,7 @@ pub struct CreateAgentSpec {
     pub provider: ProviderKind,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
+    pub fast_mode: Option<bool>,
     pub mode: SessionMode,
     pub initial_prompt: String,
     pub initial_display_prompt: Option<String>,
@@ -148,6 +200,7 @@ pub struct CreateAgentSpec {
     pub pr_number: Option<u32>,
     pub handle: Option<String>,
     pub auto_cluster: Option<bool>,
+    pub acp_agent_id: Option<String>,
 }
 
 pub struct AgentOrchestrator {
@@ -159,12 +212,23 @@ pub struct AgentOrchestrator {
     orch_config: Arc<RwLock<OrchestrationConfig>>,
     store: Arc<OrbitStore>,
     pub scripts: Arc<WorkspaceScriptRegistry>,
+    pub guardian: Arc<crate::guardian::GuardianManager>,
+    keep_awake: Arc<KeepAwakeManager>,
+    provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
+    hooks: Arc<crate::hooks::HooksEngine>,
+    pub worktree_pool: Arc<WorktreePool>,
     live_agents: RwLock<HashMap<String, LiveAgentEntry>>,
+    /// Per-agent mutex serializing driver startup (e.g. concurrent eager fork startup and
+    /// immediate `send_prompt`) so two shims never collide on `a_<agent_id>.sock`.
+    driver_start_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     agent_generations: RwLock<HashMap<String, u64>>,
     pending_questions: RwLock<HashMap<String, Vec<String>>>,
     live_terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
     /// Pending permissions keyed by `(agent_id, request_id)`
     pending_permissions: RwLock<HashMap<(String, String), PendingPermissionSummary>>,
+    /// Recently Guardian-auto-resolved `(agent_id, request_id)` pairs so trailing
+    /// `StatusChanged::AwaitingPermission` events do not flash stale `AttentionState::Permission`.
+    guardian_auto_resolved_requests: RwLock<std::collections::HashSet<(String, String)>>,
     /// Last `<orbit-workspace>` roster fingerprint injected per `agent_id` to avoid redundant XML bloat.
     roster_fingerprints: RwLock<HashMap<String, String>>,
     /// Conflict radar cooldown keyed by `(workspace_id, canonical_file_path)`.
@@ -172,12 +236,46 @@ pub struct AgentOrchestrator {
     /// Agents whose next idle transition was caused by explicit interrupt or flush-now,
     /// suppressing automatic queue drain for that transition.
     suppress_auto_drain: RwLock<std::collections::HashSet<String>>,
+    /// Agents that already persisted provider-reported `DriverEvent::TurnUsage` for the active turn,
+    /// avoiding double-counting when the turn settles to `Idle`.
+    turn_usage_recorded: RwLock<std::collections::HashSet<String>>,
+    /// Most recent provider-reported instantaneous single-call prompt token count `(tokens, recorded_at_ms)`
+    /// per `agent_id` for accurate context occupancy without multi-step turn-sum inflation.
+    last_call_prompt_occupancy: RwLock<HashMap<String, (u64, i64)>>,
     /// In-flight AI organizer / summarizer locks keyed by `sum:<agent_id>` or `org:<project_root>`.
-    organizing_locks: RwLock<std::collections::HashSet<String>>,
+    /// Uses a synchronous `std::sync::Mutex` (never held across `.await`) so RAII `OrganizerLockGuard`
+    /// always releases the lock and marks `keep_awake` idle on cancellation or panic.
+    organizing_locks: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Bounded concurrency limiter for background Turn-1 AI auto-naming & summary tasks
+    /// so bursts of completing sessions never saturate local CPU or provider API rate limits.
+    auto_name_semaphore: Arc<tokio::sync::Semaphore>,
+    conditional_timers: RwLock<Option<Arc<crate::timers::ConditionalTimerEngine>>>,
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
 }
 
+/// RAII guard for an organizer/summarizer lock key that guarantees lock release and
+/// `keep_awake.mark_idle` even if the owning async task is cancelled or panics.
+pub(crate) struct OrganizerLockGuard {
+    locks: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    keep_awake: Arc<KeepAwakeManager>,
+    key: String,
+}
+
+impl Drop for OrganizerLockGuard {
+    fn drop(&mut self) {
+        let removed = self
+            .locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+        if removed {
+            self.keep_awake.mark_idle(&format!("workflow:{}", self.key));
+        }
+    }
+}
+
 impl AgentOrchestrator {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         home_dir: PathBuf,
         host_id: String,
@@ -186,9 +284,15 @@ impl AgentOrchestrator {
         orch_config: Arc<RwLock<OrchestrationConfig>>,
         store: Arc<OrbitStore>,
         scripts: Arc<WorkspaceScriptRegistry>,
+        keep_awake: Arc<KeepAwakeManager>,
+        provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
+        hooks: Arc<crate::hooks::HooksEngine>,
     ) -> Arc<Self> {
         let orbit_exe = resolve_orbit_exe();
         let (broadcast_tx, _) = broadcast::channel(2048);
+        let worktree_pool = WorktreePool::with_default_config(home_dir.clone());
+        let guardian =
+            crate::guardian::GuardianManager::new(home_dir.clone(), Some(Arc::clone(&store)));
         Arc::new(Self {
             home_dir,
             orbit_exe,
@@ -198,29 +302,142 @@ impl AgentOrchestrator {
             orch_config,
             store,
             scripts,
+            guardian,
+            keep_awake,
+            provider_catalogs,
+            hooks,
+            worktree_pool,
             live_agents: RwLock::new(HashMap::new()),
+            driver_start_locks: RwLock::new(HashMap::new()),
             agent_generations: RwLock::new(HashMap::new()),
             pending_questions: RwLock::new(HashMap::new()),
             live_terminals: RwLock::new(HashMap::new()),
             pending_permissions: RwLock::new(HashMap::new()),
+            guardian_auto_resolved_requests: RwLock::new(std::collections::HashSet::new()),
             roster_fingerprints: RwLock::new(HashMap::new()),
             conflict_cooldowns: RwLock::new(HashMap::new()),
             suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
-            organizing_locks: RwLock::new(std::collections::HashSet::new()),
+            turn_usage_recorded: RwLock::new(std::collections::HashSet::new()),
+            last_call_prompt_occupancy: RwLock::new(HashMap::new()),
+            organizing_locks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            auto_name_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            conditional_timers: RwLock::new(None),
             broadcast_tx,
         })
+    }
+
+    pub async fn set_conditional_timers(&self, timers: Arc<crate::timers::ConditionalTimerEngine>) {
+        *self.conditional_timers.write().await = Some(timers);
+    }
+
+    async fn conditional_timers(&self) -> Option<Arc<crate::timers::ConditionalTimerEngine>> {
+        self.conditional_timers.read().await.clone()
+    }
+
+    fn are_all_subagents_settled(&self, parent_agent_id: &str) -> bool {
+        let managed_busy = self
+            .store
+            .list_agents_filtered(None, false, true, Some(parent_agent_id))
+            .map(|children| {
+                children.into_iter().any(|child| {
+                    child.status.is_foreground_busy()
+                        || matches!(child.status, AgentStatus::AwaitingPermission { .. })
+                })
+            })
+            .unwrap_or(false);
+        if managed_busy {
+            return false;
+        }
+        let native_running = self
+            .store
+            .list_provider_subagents(parent_agent_id)
+            .map(|subs| {
+                subs.into_iter()
+                    .any(|s| s.status == orbit_protocol::ProviderSubagentStatus::Running)
+            })
+            .unwrap_or(false);
+        !native_running
+    }
+
+    pub fn keep_awake(&self) -> &Arc<KeepAwakeManager> {
+        &self.keep_awake
+    }
+
+    pub(crate) fn auto_name_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.auto_name_semaphore
     }
 
     pub(crate) fn store(&self) -> &OrbitStore {
         &self.store
     }
 
-    pub(crate) async fn try_acquire_organizer_lock(&self, key: &str) -> bool {
-        self.organizing_locks.write().await.insert(key.to_string())
+    pub(crate) fn try_acquire_organizer_lock(&self, key: &str) -> Option<OrganizerLockGuard> {
+        let acquired = self
+            .organizing_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string());
+        if acquired {
+            self.keep_awake.mark_busy(format!("workflow:{key}"));
+            Some(OrganizerLockGuard {
+                locks: Arc::clone(&self.organizing_locks),
+                keep_awake: Arc::clone(&self.keep_awake),
+                key: key.to_string(),
+            })
+        } else {
+            None
+        }
     }
 
-    pub(crate) async fn release_organizer_lock(&self, key: &str) {
-        self.organizing_locks.write().await.remove(key);
+    pub(crate) async fn resolve_launch_executable(
+        &self,
+        provider: ProviderKind,
+        acp_agent_id: Option<&str>,
+    ) -> anyhow::Result<(PathBuf, Option<orbit_protocol::AcpAgentSpec>)> {
+        let home_dir = self.home_dir.clone();
+        let acp_id = acp_agent_id.map(ToOwned::to_owned);
+        tokio::task::spawn_blocking(move || {
+            if provider == ProviderKind::Acp {
+                let id = acp_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("`acp_agent_id` is required when provider is `acp`")
+                    })?;
+                let spec = orbit_providers::get_acp_agent_spec(&home_dir, id).ok_or_else(|| {
+                    anyhow::anyhow!("ACP agent `{id}` not found in registry on this host")
+                })?;
+                if !spec.enabled {
+                    anyhow::bail!("ACP agent `{id}` is disabled on this host");
+                }
+                let exe =
+                    orbit_providers::resolve_acp_agent_command(&spec.command).ok_or_else(|| {
+                        let hint = spec
+                            .install_hint
+                            .as_deref()
+                            .map(|h| format!(" (install: `{h}`)"))
+                            .unwrap_or_default();
+                        anyhow::anyhow!(
+                            "ACP agent `{}` executable (`{}`) not found on host PATH{hint}",
+                            spec.name,
+                            spec.command
+                        )
+                    })?;
+                return Ok((exe, Some(spec)));
+            }
+
+            let exe = find_provider_executable(provider).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} binary (`{}`) not found on host PATH",
+                    provider.display_name(),
+                    provider.default_binary()
+                )
+            })?;
+            Ok((exe, None))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("executable resolution task failed: {e}"))?
     }
 
     pub(crate) async fn invalidate_roster_fingerprint(&self, agent_id: &str) {
@@ -252,8 +469,10 @@ impl AgentOrchestrator {
     }
 
     /// Increment generation to fence off stale startup/ingestion tasks, shut down any live driver,
-    /// and wait (bounded) for the old driver ingestion loop to drain before mutating files or store.
+    /// wait (bounded) for the old driver ingestion loop to drain, and guarantee zero surviving shims.
     async fn stop_and_wait_driver(&self, agent_id: &str) -> u64 {
+        let start_lock = self.agent_start_lock(agent_id).await;
+        let _start_guard = start_lock.lock().await;
         let next_gen = self.bump_generation(agent_id).await;
         let removed = self.live_agents.write().await.remove(agent_id);
         if let Some(entry) = removed {
@@ -266,7 +485,10 @@ impl AgentOrchestrator {
                 entry.ingest_abort.abort();
             }
         }
+        kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
+        kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
         self.clear_pending_requests(agent_id).await;
+        self.keep_awake.mark_agent_idle(agent_id);
         next_gen
     }
 
@@ -275,6 +497,24 @@ impl AgentOrchestrator {
     pub async fn activate_runtime(self: &Arc<Self>) {
         self.reattach_surviving_terminals().await;
         self.reattach_or_recover_agents().await;
+        let pool = Arc::clone(&self.worktree_pool);
+        tokio::spawn(async move {
+            let pruned = pool.prune_stale_standbys().await;
+            if pruned > 0 {
+                info!(pruned, "Pruned stale worktree pool standbys on startup");
+            }
+        });
+    }
+
+    /// Clean up all warm worktree pool standbys on graceful daemon shutdown.
+    pub async fn shutdown_worktree_pool(&self) {
+        let removed = self.worktree_pool.shutdown_cleanup().await;
+        if removed > 0 {
+            info!(
+                removed,
+                "Cleaned up warm worktree pool standbys on shutdown"
+            );
+        }
     }
 
     /// Resolve a Unix Domain Socket path guaranteed to fit comfortably under Linux's 108-byte
@@ -370,18 +610,25 @@ impl AgentOrchestrator {
             let was_running = ag.status.is_foreground_busy();
 
             if surviving_sock.is_some()
-                && let Some(executable) = find_provider_executable(ag.provider)
+                && let Ok((executable, _)) = self
+                    .resolve_launch_executable(ag.provider, ag.acp_agent_id.as_deref())
+                    .await
             {
                 let resume_ref = self.store.get_persistence_ref(&ag.agent_id).ok().flatten();
                 let launch_gen = self.bump_generation(&ag.agent_id).await;
+                self.keep_awake
+                    .notify_agent_status(&ag.agent_id, &ag.status);
                 if self
-                    .spawn_and_wire_driver(&ag, executable, resume_ref, true, launch_gen)
+                    .spawn_and_wire_driver(
+                        &ag, executable, resume_ref, None, false, None, true, launch_gen,
+                    )
                     .await
                     .is_ok()
                 {
                     info!(agent_id = %ag.agent_id, "Reattached surviving agent shim across daemon restart");
                     continue;
                 }
+                self.keep_awake.mark_agent_idle(&ag.agent_id);
             }
 
             // No surviving live shim -> normalize stale transient statuses to `Closed` and settle
@@ -407,6 +654,7 @@ impl AgentOrchestrator {
                 let _ = self
                     .store
                     .update_agent_status(&ag.agent_id, &AgentStatus::Closed);
+                self.keep_awake.mark_agent_idle(&ag.agent_id);
                 if was_running && cfg.resume_on_startup && !ag.background {
                     let mgr = Arc::clone(self);
                     let ag_id = ag.agent_id.clone();
@@ -457,6 +705,15 @@ impl AgentOrchestrator {
         &self,
         spec: CreateWorkspaceSpec,
     ) -> anyhow::Result<WorkspaceSummary> {
+        let (ws, _) = self.create_workspace_v2_inner(spec, false).await?;
+        Ok(ws)
+    }
+
+    async fn create_workspace_v2_inner(
+        &self,
+        spec: CreateWorkspaceSpec,
+        defer_setup: bool,
+    ) -> anyhow::Result<(WorkspaceSummary, Option<DeferredWorktreeSetup>)> {
         let src_path = crate::expand_host_path(&spec.source_cwd);
         let use_worktree =
             spec.isolation == WorkspaceIsolation::Worktree || spec.worktree_branch.is_some();
@@ -468,13 +725,14 @@ impl AgentOrchestrator {
                     src_path.display()
                 );
             }
-            let (wt_path, br) = create_worktree_with_mode(
+            let (wt_path, br) = create_worktree_with_mode_pooled(
                 &self.home_dir,
                 &src_path,
                 spec.worktree_mode,
                 spec.worktree_branch.as_deref(),
                 spec.base_ref.as_deref(),
                 spec.pr_number,
+                Some(&self.worktree_pool),
             )
             .await?;
             (wt_path, true, br)
@@ -488,7 +746,7 @@ impl AgentOrchestrator {
             && spec.allow_reuse_existing
             && let Ok(Some(existing)) = self.store.find_workspace_by_cwd(&cwd_str)
         {
-            return Ok(existing);
+            return Ok((existing, None));
         }
 
         let git_stat = inspect_git_status(&final_path).await;
@@ -538,7 +796,7 @@ impl AgentOrchestrator {
             parent_workspace_id: spec.parent_workspace_id,
             archived_at: None,
             background: spec.background,
-            setup_status: if has_setup {
+            setup_status: if has_setup && !defer_setup {
                 WorkspaceSetupStatus::Running
             } else {
                 WorkspaceSetupStatus::Idle
@@ -551,42 +809,88 @@ impl AgentOrchestrator {
             is_curated: spec.is_curated,
         };
         self.store.upsert_workspace(&ws)?;
+        // Share existing parent workspace scratch/artifacts directories in O(1) via reference link
+        if let Some(ref parent_ws_id) = ws.parent_workspace_id {
+            let parent_dir = board_file_path(&self.home_dir, parent_ws_id)
+                .parent()
+                .map(Path::to_path_buf);
+            let child_dir = board_file_path(&self.home_dir, &ws.workspace_id)
+                .parent()
+                .map(Path::to_path_buf);
+            if let (Some(p_dir), Some(c_dir)) = (parent_dir, child_dir) {
+                let _ = tokio::task::spawn_blocking(move || {
+                    for folder in ["scratch", "artifacts"] {
+                        let src_folder = p_dir.join(folder);
+                        if src_folder.is_dir() {
+                            let _ = link_or_clone_dir(
+                                &src_folder,
+                                &c_dir.join(folder),
+                                DirShareMode::ReferenceLink,
+                            );
+                        }
+                    }
+                })
+                .await;
+            }
+        }
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::WorkspaceUpdated(ws.clone()));
 
-        // Execute `worktree.setup` asynchronously so workspace readiness publishes immediately
-        if has_setup {
-            let store_bg = Arc::clone(&self.store);
-            let bcast_bg = self.broadcast_tx.clone();
-            let ws_id = ws.workspace_id.clone();
-            let src_bg = src_path;
-            let wt_bg = final_path;
-            let br_bg = branch_final;
-            tokio::spawn(async move {
-                let res = run_worktree_setup_hooks(
-                    &ws_id,
-                    &src_bg,
-                    &wt_bg,
-                    br_bg.as_deref(),
-                    |progress| {
-                        let _ = bcast_bg.send(DaemonBroadcast::WorkspaceSetupProgress(progress));
-                    },
-                )
-                .await;
-                let final_status = if res.is_ok() {
-                    WorkspaceSetupStatus::Succeeded
-                } else {
-                    WorkspaceSetupStatus::Failed
-                };
-                let _ = store_bg.set_workspace_setup_status(&ws_id, final_status);
-                if let Ok(Some(updated_ws)) = store_bg.get_workspace(&ws_id) {
-                    let _ = bcast_bg.send(DaemonBroadcast::WorkspaceUpdated(updated_ws));
-                }
-            });
-        }
+        let deferred = if has_setup {
+            let hook = DeferredWorktreeSetup {
+                workspace_id: ws.workspace_id.clone(),
+                source_cwd: src_path,
+                worktree_cwd: final_path,
+                branch_name: branch_final,
+            };
+            if defer_setup {
+                Some(hook)
+            } else {
+                self.spawn_deferred_worktree_setup(hook, false);
+                None
+            }
+        } else {
+            None
+        };
 
-        Ok(ws)
+        Ok((ws, deferred))
+    }
+
+    fn spawn_deferred_worktree_setup(&self, hook: DeferredWorktreeSetup, mark_running: bool) {
+        if mark_running {
+            let _ = self
+                .store
+                .set_workspace_setup_status(&hook.workspace_id, WorkspaceSetupStatus::Running);
+            if let Ok(Some(updated_ws)) = self.store.get_workspace(&hook.workspace_id) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceUpdated(updated_ws));
+            }
+        }
+        let store_bg = Arc::clone(&self.store);
+        let bcast_bg = self.broadcast_tx.clone();
+        tokio::spawn(async move {
+            let res = run_worktree_setup_hooks(
+                &hook.workspace_id,
+                &hook.source_cwd,
+                &hook.worktree_cwd,
+                hook.branch_name.as_deref(),
+                |progress| {
+                    let _ = bcast_bg.send(DaemonBroadcast::WorkspaceSetupProgress(progress));
+                },
+            )
+            .await;
+            let final_status = if res.is_ok() {
+                WorkspaceSetupStatus::Succeeded
+            } else {
+                WorkspaceSetupStatus::Failed
+            };
+            let _ = store_bg.set_workspace_setup_status(&hook.workspace_id, final_status);
+            if let Ok(Some(updated_ws)) = store_bg.get_workspace(&hook.workspace_id) {
+                let _ = bcast_bg.send(DaemonBroadcast::WorkspaceUpdated(updated_ws));
+            }
+        });
     }
 
     pub async fn rename_workspace(
@@ -603,6 +907,210 @@ impl AgentOrchestrator {
             .broadcast_tx
             .send(DaemonBroadcast::WorkspaceUpdated(ws.clone()));
         Ok(ws)
+    }
+
+    /// Preview a bidirectional Git Worktree <-> Local checkout handoff without mutating disk.
+    pub async fn preview_worktree_handoff(
+        &self,
+        workspace_id: &str,
+        direction: WorktreeHandoffDirection,
+        target_workspace_id: Option<&str>,
+        include_committed: bool,
+    ) -> anyhow::Result<WorktreeHandoffPreview> {
+        let source_ws = self
+            .store
+            .get_workspace(workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace `{workspace_id}` not found"))?;
+        let source_cwd = crate::expand_host_path(&source_ws.cwd);
+
+        let target_cwd =
+            if let Some(tid) = target_workspace_id.map(str::trim).filter(|s| !s.is_empty()) {
+                let target_ws = self
+                    .store
+                    .get_workspace(tid)?
+                    .ok_or_else(|| anyhow::anyhow!("target workspace `{tid}` not found"))?;
+                Some(crate::expand_host_path(&target_ws.cwd))
+            } else if direction == WorktreeHandoffDirection::WorktreeToLocal {
+                if let Some(candidate) = source_ws
+                    .source_cwd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(crate::expand_host_path)
+                    .filter(|p| *p != source_cwd)
+                    && tokio::fs::try_exists(&candidate).await.unwrap_or(false)
+                {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        preview_worktree_handoff_paths(HandoffPreviewPathsSpec {
+            source_cwd,
+            target_cwd,
+            direction,
+            include_committed,
+            base_ref: source_ws.base_ref.clone(),
+        })
+        .await
+    }
+
+    /// Execute a backup-protected bidirectional Git Worktree <-> Local checkout handoff.
+    pub async fn execute_worktree_handoff(
+        self: &Arc<Self>,
+        spec: ExecuteWorktreeHandoffSpec,
+    ) -> anyhow::Result<WorktreeHandoffOutcome> {
+        let source_ws = self
+            .store
+            .get_workspace(&spec.workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace `{}` not found", spec.workspace_id))?;
+        let source_cwd = crate::expand_host_path(&source_ws.cwd);
+
+        match spec.direction {
+            WorktreeHandoffDirection::WorktreeToLocal => {
+                let target_cwd = if let Some(tid) = spec
+                    .target_workspace_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let target_ws = self
+                        .store
+                        .get_workspace(tid)?
+                        .ok_or_else(|| anyhow::anyhow!("target workspace `{tid}` not found"))?;
+                    crate::expand_host_path(&target_ws.cwd)
+                } else if let Some(src_dir) = source_ws
+                    .source_cwd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(crate::expand_host_path)
+                    .filter(|p| *p != source_cwd)
+                    && tokio::fs::try_exists(&src_dir).await.unwrap_or(false)
+                {
+                    src_dir
+                } else {
+                    crate::worktree_handoff::resolve_primary_local_checkout(&source_cwd).await?
+                };
+
+                execute_worktree_handoff_paths(HandoffExecutePathsSpec {
+                    source_cwd,
+                    target_cwd,
+                    direction: WorktreeHandoffDirection::WorktreeToLocal,
+                    mode: spec.mode,
+                    include_committed: spec.include_committed,
+                    base_ref: source_ws.base_ref.clone(),
+                    allow_three_way_conflicts: spec.allow_three_way_conflicts,
+                    target_workspace: None,
+                    backup_source_as_primary: false,
+                })
+                .await
+            }
+            WorktreeHandoffDirection::LocalToWorktree => {
+                if let Some(tid) = spec
+                    .target_workspace_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let target_ws = self
+                        .store
+                        .get_workspace(tid)?
+                        .ok_or_else(|| anyhow::anyhow!("target workspace `{tid}` not found"))?;
+                    let target_cwd = crate::expand_host_path(&target_ws.cwd);
+                    return execute_worktree_handoff_paths(HandoffExecutePathsSpec {
+                        source_cwd,
+                        target_cwd,
+                        direction: WorktreeHandoffDirection::LocalToWorktree,
+                        mode: spec.mode,
+                        include_committed: false,
+                        base_ref: None,
+                        allow_three_way_conflicts: spec.allow_three_way_conflicts,
+                        target_workspace: Some(target_ws),
+                        backup_source_as_primary: false,
+                    })
+                    .await;
+                }
+
+                // Provision a fresh isolated worktree off current local HEAD.
+                // Validate branch & tracked/untracked symlinks BEFORE provisioning the worktree!
+                let source_info = resolve_git_checkout_info(&source_cwd).await?;
+                let validated_branch = match spec
+                    .branch
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(b) => Some(validate_handoff_branch_name(&source_info.toplevel, b).await?),
+                    None => None,
+                };
+                preflight_validate_source_safety(&source_info.toplevel).await?;
+
+                let project_root = source_ws
+                    .project_root
+                    .clone()
+                    .or_else(|| Some(source_info.toplevel.to_string_lossy().to_string()));
+                let (new_ws, deferred_setup) = self
+                    .create_workspace_v2_inner(
+                        CreateWorkspaceSpec {
+                            source_cwd: source_info.toplevel.to_string_lossy().to_string(),
+                            title: validated_branch.clone(),
+                            worktree_branch: validated_branch,
+                            base_ref: source_info.head_oid.clone(),
+                            isolation: WorkspaceIsolation::Worktree,
+                            worktree_mode: WorktreeCreateMode::BranchOff,
+                            pr_number: None,
+                            parent_workspace_id: Some(source_ws.workspace_id.clone()),
+                            background: source_ws.background,
+                            project_root,
+                            mission_goal: None,
+                            allow_reuse_existing: false,
+                            is_curated: false,
+                        },
+                        true,
+                    )
+                    .await?;
+                let new_ws_id = new_ws.workspace_id.clone();
+                let new_ws_branch = new_ws.git_branch.clone();
+                let target_cwd = crate::expand_host_path(&new_ws.cwd);
+
+                let exec_res = execute_worktree_handoff_paths(HandoffExecutePathsSpec {
+                    source_cwd: source_info.toplevel.clone(),
+                    target_cwd,
+                    direction: WorktreeHandoffDirection::LocalToWorktree,
+                    mode: spec.mode,
+                    include_committed: false,
+                    base_ref: None,
+                    allow_three_way_conflicts: spec.allow_three_way_conflicts,
+                    target_workspace: Some(new_ws),
+                    backup_source_as_primary: true,
+                })
+                .await;
+
+                match exec_res {
+                    Ok(mut outcome) => {
+                        if let Some(hook) = deferred_setup {
+                            self.spawn_deferred_worktree_setup(hook, true);
+                            if let Some(ref mut ws_out) = outcome.target_workspace {
+                                ws_out.setup_status = WorkspaceSetupStatus::Running;
+                            }
+                        }
+                        Ok(outcome)
+                    }
+                    Err(err) => {
+                        // Roll back the orphaned workspace, worktree directory, and newly generated branch
+                        let _ = self.archive_workspace(&new_ws_id).await;
+                        if let Some(ref br) = new_ws_branch {
+                            force_delete_git_branch(&source_info.toplevel, br).await;
+                        }
+                        Err(err)
+                    }
+                }
+            }
+        }
     }
 
     pub async fn archive_workspace(self: &Arc<Self>, workspace_id: &str) -> anyhow::Result<()> {
@@ -677,9 +1185,71 @@ impl AgentOrchestrator {
             let wt_path = PathBuf::from(&ws.cwd);
             let br_opt = ws.git_branch.clone();
             teardown_and_remove_worktree(src_opt.as_deref(), &wt_path, br_opt.as_deref()).await;
+            if let Some(ref src) = src_opt {
+                self.reconcile_worktree_pool_after_archive(src).await;
+            }
         }
 
         Ok(())
+    }
+
+    async fn resolve_canonical_repo_key(&self, path: &Path) -> String {
+        if let Ok((repo_hash, _)) = self.worktree_pool.repo_pool_dir(path).await {
+            return format!("git:{repo_hash}");
+        }
+        tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    async fn reconcile_worktree_pool_after_archive(&self, source_cwd: &Path) {
+        let target_key = self.resolve_canonical_repo_key(source_cwd).await;
+
+        let mut ws_candidates = std::collections::HashSet::new();
+        for w in self
+            .store
+            .list_workspaces_filtered(false, true)
+            .unwrap_or_default()
+        {
+            ws_candidates.insert(w.cwd);
+            if let Some(src) = w.source_cwd {
+                ws_candidates.insert(src);
+            }
+        }
+        let mut has_active_ref = false;
+        for candidate in ws_candidates {
+            if self.resolve_canonical_repo_key(Path::new(&candidate)).await == target_key {
+                has_active_ref = true;
+                break;
+            }
+        }
+
+        if !has_active_ref {
+            let mut agent_candidates = std::collections::HashSet::new();
+            for a in self
+                .store
+                .list_agents_filtered(None, false, true, None)
+                .unwrap_or_default()
+            {
+                if let Some(src) = a.labels.get("orbit.worktree_source_cwd") {
+                    agent_candidates.insert(src.clone());
+                }
+            }
+            for candidate in agent_candidates {
+                if self.resolve_canonical_repo_key(Path::new(&candidate)).await == target_key {
+                    has_active_ref = true;
+                    break;
+                }
+            }
+        }
+
+        if !has_active_ref {
+            let _ = self.worktree_pool.cleanup_repo_pool(source_cwd).await;
+        } else {
+            let _ = self.worktree_pool.prune_repo_pool(source_cwd).await;
+        }
     }
 
     pub async fn unarchive_workspace(
@@ -899,12 +1469,37 @@ impl AgentOrchestrator {
             .as_ref()
             .map(|p| p.provider)
             .unwrap_or(spec.provider);
+        let acp_agent_id = if provider == ProviderKind::Acp {
+            spec.acp_agent_id
+                .or_else(|| profile.as_ref().and_then(|p| p.acp_agent_id.clone()))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         let model = spec
             .model
             .or_else(|| profile.as_ref().and_then(|p| p.model.clone()));
         let effort = spec
             .effort
             .or_else(|| profile.as_ref().and_then(|p| p.effort));
+        let supports_fast = self
+            .model_supports_fast_mode(provider, model.as_deref())
+            .await;
+        let fast_mode = match spec.fast_mode {
+            Some(true) => {
+                if !supports_fast {
+                    anyhow::bail!(
+                        "Fast mode is not supported by {} model `{}`",
+                        provider.display_name(),
+                        model.as_deref().unwrap_or("default")
+                    );
+                }
+                true
+            }
+            Some(false) => false,
+            None => profile.as_ref().is_some_and(|p| p.fast_mode) && supports_fast,
+        };
         let mode = if profile.is_some() && matches!(spec.mode, SessionMode::Default) {
             profile
                 .as_ref()
@@ -914,13 +1509,9 @@ impl AgentOrchestrator {
             spec.mode
         };
 
-        let executable = find_provider_executable(provider).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} binary (`{}`) not found on host PATH",
-                provider.display_name(),
-                provider.default_binary()
-            )
-        })?;
+        let (executable, _acp_spec) = self
+            .resolve_launch_executable(provider, acp_agent_id.as_deref())
+            .await?;
 
         let human_seed = derive_human_seed(
             spec.initial_display_prompt.as_deref(),
@@ -985,13 +1576,14 @@ impl AgentOrchestrator {
                     .branch
                     .clone()
                     .unwrap_or_else(|| auto_worktree_branch(&human_seed));
-                let (wt_path, created_br) = create_worktree_with_mode(
+                let (wt_path, created_br) = create_worktree_with_mode_pooled(
                     &self.home_dir,
                     &src_for_wt,
                     spec.worktree_mode,
                     Some(&auto_branch),
                     spec.base_ref.as_deref(),
                     spec.pr_number,
+                    Some(&self.worktree_pool),
                 )
                 .await?;
                 let wt_str = wt_path.to_string_lossy().to_string();
@@ -1108,6 +1700,45 @@ impl AgentOrchestrator {
         let agent_id = format!("ag_{}", Uuid::new_v4().simple());
         let final_cwd = agent_cwd_override.unwrap_or_else(|| ws.cwd.clone());
 
+        // Evaluate PrePromptSubmit lifecycle hooks BEFORE persisting the agent, acquiring
+        // keep-awake, emitting PeerJoined, or broadcasting AgentUpdated so a blocked initial
+        // prompt leaves zero DB rows or ghost UI state behind.
+        let mut initial_prompt = spec.initial_prompt;
+        if !initial_prompt.trim().is_empty() {
+            let hook_outcome = self
+                .hooks
+                .dispatch_event(
+                    orbit_protocol::HookEventKind::PrePromptSubmit,
+                    Some(Path::new(&final_cwd)),
+                    Some(provider.slug()),
+                    serde_json::json!({
+                        "event": "pre_prompt_submit",
+                        "agent_id": &agent_id,
+                        "workspace_id": &ws.workspace_id,
+                        "cwd": &final_cwd,
+                        "provider": provider.slug(),
+                        "prompt": &initial_prompt,
+                    }),
+                )
+                .await;
+            if hook_outcome.decision == orbit_protocol::HookDecision::Block {
+                let hook_name = hook_outcome
+                    .blocking_hook_name
+                    .as_deref()
+                    .unwrap_or("lifecycle hook");
+                let reason = hook_outcome
+                    .reason
+                    .as_deref()
+                    .unwrap_or("blocked by policy");
+                anyhow::bail!("Prompt blocked by hook `{hook_name}`: {reason}");
+            }
+            if hook_outcome.decision == orbit_protocol::HookDecision::Modify
+                && let Some(updated) = hook_outcome.updated_text
+            {
+                initial_prompt = updated;
+            }
+        }
+
         let existing_peers = self
             .store
             .list_agents_filtered(Some(&ws.workspace_id), false, false, None)
@@ -1140,6 +1771,7 @@ impl AgentOrchestrator {
             provider,
             model,
             effort,
+            fast_mode,
             mode,
             status: AgentStatus::Initializing,
             parent_agent_id: spec.parent_agent_id,
@@ -1165,8 +1797,13 @@ impl AgentOrchestrator {
             handle: Some(allocated_handle.clone()),
             cluster_suggestion,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id,
         };
         self.store.upsert_agent(&summary, None)?;
+        self.keep_awake
+            .notify_agent_status(&agent_id, &summary.status);
         if !extra_strs.is_empty() {
             let _ = self.store.set_agent_extra_dirs(&agent_id, &extra_strs);
         }
@@ -1198,7 +1835,33 @@ impl AgentOrchestrator {
             .send(DaemonBroadcast::AgentUpdated(summary.clone()));
         let launch_gen = self.bump_generation(&agent_id).await;
 
-        let initial_prompt = spec.initial_prompt;
+        // Fire SessionStart lifecycle hooks asynchronously (non-blocking).
+        {
+            let hooks = Arc::clone(&self.hooks);
+            let cwd_hook = PathBuf::from(&summary.cwd);
+            let prov_slug = summary.provider.slug().to_string();
+            let payload = serde_json::json!({
+                "event": "session_start",
+                "agent_id": &summary.agent_id,
+                "workspace_id": &summary.workspace_id,
+                "cwd": &summary.cwd,
+                "provider": &prov_slug,
+                "model": &summary.model,
+                "title": &summary.title,
+            });
+            tokio::spawn(async move {
+                let _ = hooks
+                    .dispatch_event(
+                        orbit_protocol::HookEventKind::SessionStart,
+                        Some(&cwd_hook),
+                        Some(&prov_slug),
+                        payload,
+                    )
+                    .await;
+            });
+        }
+
+        let initial_rule_badges = spec.initial_badges.clone();
         // Persist the initial user prompt IMMEDIATELY (`< 1ms`) so `AgentCreated` returns right away
         // and the user sees their clean message + badges at 0ms without blocking the socket!
         let initial_turn = if !initial_prompt.trim().is_empty() {
@@ -1244,7 +1907,16 @@ impl AgentOrchestrator {
                 return;
             }
             match mgr
-                .spawn_and_wire_driver(&summary_bg, executable, None, false, launch_gen)
+                .spawn_and_wire_driver(
+                    &summary_bg,
+                    executable,
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    launch_gen,
+                )
                 .await
             {
                 Ok(cmd_tx) => {
@@ -1254,8 +1926,16 @@ impl AgentOrchestrator {
                     }
                     if let Some((turn_id, _)) = initial_turn {
                         let sanitized = sanitize_human_prompt_for_wire(&initial_prompt, &turn_id);
+                        let with_rules = mgr
+                            .augment_prompt_with_path_rules(
+                                &ag_id_bg,
+                                &initial_rule_badges,
+                                &sanitized,
+                                sanitized.clone(),
+                            )
+                            .await;
                         let wire = mgr
-                            .augment_prompt_with_workspace_context(&ag_id_bg, sanitized)
+                            .augment_prompt_with_workspace_context(&ag_id_bg, with_rules)
                             .await;
                         let _ = cmd_tx
                             .send(DriverCommand::SendPrompt {
@@ -1270,6 +1950,7 @@ impl AgentOrchestrator {
                     if mgr.current_generation(&ag_id_bg).await != launch_gen {
                         return;
                     }
+                    mgr.keep_awake.mark_agent_idle(&ag_id_bg);
                     if let Ok(ev) = mgr.store.append_timeline_event(
                         &ag_id_bg,
                         1,
@@ -1294,6 +1975,539 @@ impl AgentOrchestrator {
         });
 
         Ok(self.store.get_agent(&agent_id)?.unwrap_or(summary))
+    }
+
+    /// Fork/branch an existing conversation into a new session (either in the same directory
+    /// or inside a freshly provisioned git worktree), atomically cloning timeline history up to
+    /// `spec.up_to_seq` (inclusive, or the full timeline when `None`).
+    ///
+    /// - Full-tail forks (`up_to_seq` is `None` or `>= source.latest_seq`) attempt native upstream
+    ///   session forking (`--resume <sid> --fork-session` on Claude, `thread/fork` on Codex,
+    ///   `session/fork` when advertised on Antigravity) with graceful fallback to a fresh session
+    ///   seeded with compact handoff context built from the cloned events.
+    /// - Mid-thread forks (`up_to_seq < source.latest_seq`) ALWAYS start a fresh upstream session
+    ///   seeded strictly with handoff context built from the cloned prefix (`<= up_to_seq`) so
+    ///   post-fork turns from the parent never leak into the branch.
+    pub async fn fork_agent(
+        self: &Arc<Self>,
+        spec: ForkAgentSpec,
+    ) -> anyhow::Result<ForkAgentOutcome> {
+        // Preflight validations BEFORE creating any workspace/worktree or mutating SQLite
+        if let Some(seq) = spec.up_to_seq {
+            i64::try_from(seq).map_err(|_| anyhow::anyhow!("up_to_seq exceeds supported range"))?;
+        }
+
+        let source = self
+            .store
+            .get_agent(&spec.source_agent_id)?
+            .ok_or_else(|| anyhow::anyhow!("source agent `{}` not found", spec.source_agent_id))?;
+
+        let initial_prompt_text = spec
+            .initial_prompt
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+
+        let preflight_executable = if initial_prompt_text.is_some() {
+            let (exe, _) = self
+                .resolve_launch_executable(source.provider, source.acp_agent_id.as_deref())
+                .await?;
+            Some(exe)
+        } else {
+            None
+        };
+
+        let source_ws = self.store.get_workspace(&source.workspace_id)?;
+
+        let explicit_title = spec
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let derived_title = explicit_title.clone().unwrap_or_else(|| {
+            let trimmed = source.title.trim();
+            let base = trimmed
+                .strip_suffix(" (fork)")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(if trimmed.is_empty() {
+                    "Session"
+                } else {
+                    trimmed
+                });
+            format!("{base} (fork)")
+        });
+
+        let (target_workspace_id, target_cwd, created_workspace, shared_curated_workspace) =
+            match spec.target {
+                ForkTarget::SameDirectory => {
+                    let reuse_source_ws = source_ws
+                        .as_ref()
+                        .is_some_and(|w| w.is_curated || w.is_worktree);
+                    if reuse_source_ws {
+                        let is_curated = source_ws.as_ref().is_some_and(|w| w.is_curated);
+                        (
+                            source.workspace_id.clone(),
+                            source.cwd.clone(),
+                            None,
+                            is_curated,
+                        )
+                    } else {
+                        // Standalone non-curated local thread: provision a dedicated non-curated
+                        // local workspace (matching `create_and_start_agent`) so archiving one
+                        // thread never archives the other.
+                        let project_root = source_ws
+                            .as_ref()
+                            .and_then(|w| w.project_root.clone())
+                            .or_else(|| Some(source.cwd.clone()));
+                        let new_ws = self
+                            .create_workspace_v2(CreateWorkspaceSpec {
+                                source_cwd: source.cwd.clone(),
+                                title: Some(derived_title.clone()),
+                                worktree_branch: None,
+                                base_ref: None,
+                                isolation: WorkspaceIsolation::Local,
+                                worktree_mode: WorktreeCreateMode::BranchOff,
+                                pr_number: None,
+                                parent_workspace_id: Some(source.workspace_id.clone()),
+                                background: source.background,
+                                project_root,
+                                mission_goal: None,
+                                allow_reuse_existing: false,
+                                is_curated: false,
+                            })
+                            .await?;
+                        (
+                            new_ws.workspace_id.clone(),
+                            new_ws.cwd.clone(),
+                            Some(new_ws),
+                            false,
+                        )
+                    }
+                }
+                ForkTarget::NewWorktree { branch, base_ref } => {
+                    let src_for_wt = source_ws
+                        .as_ref()
+                        .and_then(|w| w.source_cwd.as_deref())
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(&source.cwd);
+                    let expanded_src = crate::expand_host_path(src_for_wt);
+                    if resolve_git_scope(&expanded_src).await.is_none() {
+                        anyhow::bail!(
+                            "not_a_git_repo: `{}` is not a Git repository. Fork in the same directory instead.",
+                            expanded_src.display()
+                        );
+                    }
+                    let branch_name =
+                        match branch.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            Some(b) => validate_git_branch_name(&expanded_src, b).await?,
+                            None => {
+                                format!("orbit/fork-{}", &Uuid::new_v4().simple().to_string()[..6])
+                            }
+                        };
+                    let effective_base_ref =
+                        match base_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            Some(b) => Some(validate_git_base_ref(&expanded_src, b).await?),
+                            None => {
+                                // If forking an agent already running inside a worktree, default
+                                // `base_ref` to that worktree's branch so we branch from its commits
+                                // instead of the main checkout's HEAD.
+                                if let Some(ref ws) = source_ws
+                                    && ws.is_worktree
+                                    && let Some(ref wt_branch) = ws.git_branch
+                                    && !wt_branch.trim().is_empty()
+                                {
+                                    validate_git_base_ref(&expanded_src, wt_branch).await.ok()
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                    let project_root = source_ws
+                        .as_ref()
+                        .and_then(|w| w.project_root.clone())
+                        .or_else(|| Some(expanded_src.to_string_lossy().to_string()));
+                    let new_ws = self
+                        .create_workspace_v2(CreateWorkspaceSpec {
+                            source_cwd: expanded_src.to_string_lossy().to_string(),
+                            title: Some(derived_title.clone()),
+                            worktree_branch: Some(branch_name),
+                            base_ref: effective_base_ref,
+                            isolation: WorkspaceIsolation::Worktree,
+                            worktree_mode: WorktreeCreateMode::BranchOff,
+                            pr_number: None,
+                            parent_workspace_id: Some(source.workspace_id.clone()),
+                            background: source.background,
+                            project_root,
+                            mission_goal: None,
+                            allow_reuse_existing: false,
+                            is_curated: false,
+                        })
+                        .await?;
+                    (
+                        new_ws.workspace_id.clone(),
+                        new_ws.cwd.clone(),
+                        Some(new_ws),
+                        false,
+                    )
+                }
+            };
+
+        let now = Utc::now();
+        let new_agent_id = format!("ag_{}", Uuid::new_v4().simple());
+        let existing_peers = self
+            .store
+            .list_agents_filtered(Some(&target_workspace_id), false, false, None)
+            .unwrap_or_default();
+        let allocated_handle = allocate_unique_handle(
+            None,
+            source.provider,
+            None,
+            Some(&derived_title),
+            &existing_peers,
+        );
+
+        let mut labels = HashMap::new();
+        if explicit_title.is_some() {
+            labels.insert("orbit.title_locked".into(), "1".into());
+        }
+        if let Some(ref ws) = created_workspace
+            && ws.is_worktree
+        {
+            if let Some(ref br) = ws.git_branch {
+                labels.insert("orbit.worktree_branch".into(), br.clone());
+            }
+            if let Some(ref src) = ws.source_cwd {
+                labels.insert("orbit.worktree_source_cwd".into(), src.clone());
+            }
+        }
+
+        let has_initial_prompt = initial_prompt_text.is_some();
+
+        let initial_summary = AgentSummary {
+            agent_id: new_agent_id.clone(),
+            workspace_id: target_workspace_id.clone(),
+            cwd: target_cwd.clone(),
+            title: derived_title,
+            provider: source.provider,
+            model: source.model.clone(),
+            effort: source.effort,
+            fast_mode: source.fast_mode,
+            mode: source.mode.clone(),
+            status: if has_initial_prompt {
+                AgentStatus::Initializing
+            } else {
+                AgentStatus::Idle
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: source.background,
+            auto_archive: source.auto_archive,
+            profile_id: source.profile_id.clone(),
+            labels,
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: Some(allocated_handle.clone()),
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: Some(source.agent_id.clone()),
+            forked_at_seq: None,
+            acp_agent_id: source.acp_agent_id.clone(),
+        };
+
+        struct ForkInitialPromptEvent {
+            turn_id: String,
+            msg_id: String,
+            prompt_seq: u64,
+            event: TimelineEvent,
+        }
+        struct ForkDbSetup {
+            final_summary: AgentSummary,
+            handoff_context: Option<String>,
+            fork_from_session_id: Option<String>,
+            prompt_event: Option<ForkInitialPromptEvent>,
+        }
+
+        // Run all fallible DB writes inside a closure so any failure cleanly rolls back both
+        // the inserted agent row AND any newly provisioned workspace/worktree!
+        let setup_res: anyhow::Result<ForkDbSetup> = (|| {
+            self.store.upsert_agent(&initial_summary, None)?;
+
+            let source_extra_dirs = self
+                .store
+                .get_agent_extra_dirs(&source.agent_id)
+                .unwrap_or_default();
+            if !source_extra_dirs.is_empty() {
+                let _ = self
+                    .store
+                    .set_agent_extra_dirs(&new_agent_id, &source_extra_dirs);
+            }
+
+            let cloned = self.store.clone_timeline_events_up_to(
+                &source.agent_id,
+                &new_agent_id,
+                spec.up_to_seq,
+            )?;
+
+            // Build handoff context STRICTLY from the newly cloned timeline (never the source's tail!).
+            let handoff_context = self.build_handoff_context(&new_agent_id);
+
+            // Eliminate TOCTOU leak: native upstream session fork is ONLY eligible when the
+            // atomic transaction cloned the true full tail AND the re-fetched source agent is
+            // not currently foreground-busy.
+            let source_now = self.store.get_agent(&source.agent_id)?;
+            let can_native_fork = cloned.cloned_full_tail
+                && source_now
+                    .as_ref()
+                    .is_some_and(|s| !s.status.is_foreground_busy());
+            let fork_from_session_id = if can_native_fork {
+                self.store
+                    .get_persistence_ref(&source.agent_id)?
+                    .filter(|s| !s.trim().is_empty())
+            } else {
+                None
+            };
+
+            let prompt_event = if let Some(ref prompt_text) = initial_prompt_text {
+                let turn_id = format!("turn_{}", Uuid::new_v4().simple());
+                let msg_id = format!("u_{}", Uuid::new_v4().simple());
+                let ev = self.store.append_timeline_event(
+                    &new_agent_id,
+                    1,
+                    Some(&turn_id),
+                    TimelinePayload::UserPrompt {
+                        message_id: msg_id.clone(),
+                        text: prompt_text.clone(),
+                        badges: Vec::new(),
+                    },
+                )?;
+                let prompt_seq = ev.seq;
+                let _ = self
+                    .store
+                    .mark_agent_read_seq(&new_agent_id, Some(prompt_seq));
+                Some(ForkInitialPromptEvent {
+                    turn_id,
+                    msg_id,
+                    prompt_seq,
+                    event: ev,
+                })
+            } else {
+                None
+            };
+
+            let final_summary = self
+                .store
+                .get_agent(&new_agent_id)?
+                .unwrap_or_else(|| initial_summary.clone());
+
+            Ok(ForkDbSetup {
+                final_summary,
+                handoff_context,
+                fork_from_session_id,
+                prompt_event,
+            })
+        })();
+
+        let ForkDbSetup {
+            final_summary,
+            handoff_context,
+            fork_from_session_id,
+            prompt_event,
+        } = match setup_res {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = self.store.delete_agent(&new_agent_id);
+                if let Some(ref ws) = created_workspace {
+                    let _ = self.archive_workspace(&ws.workspace_id).await;
+                }
+                return Err(err);
+            }
+        };
+
+        // Emit PeerJoined when joining a curated multi-agent Mission Workspace
+        if shared_curated_workspace && !final_summary.background {
+            if let Ok(ws_ev) = self.store.append_workspace_event(
+                &target_workspace_id,
+                Some(&new_agent_id),
+                Some(&allocated_handle),
+                WorkspaceEventKind::PeerJoined,
+                &format!(
+                    "@{} ({}) forked into workspace",
+                    allocated_handle,
+                    final_summary.provider.display_name()
+                ),
+                None,
+            ) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceEventRecorded(ws_ev));
+            }
+            if let Ok(Some(refreshed_ws)) = self.store.get_workspace(&target_workspace_id) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceUpdated(refreshed_ws));
+            }
+        }
+
+        // Defer AgentUpdated broadcast until all fallible creation/cloning/prompt steps succeed
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::AgentUpdated(final_summary.clone()));
+
+        if let (
+            Some(prompt_text),
+            Some(executable),
+            Some(ForkInitialPromptEvent {
+                turn_id,
+                msg_id,
+                prompt_seq,
+                event: ev,
+            }),
+        ) = (initial_prompt_text, preflight_executable, prompt_event)
+        {
+            let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            self.keep_awake
+                .notify_agent_status(&new_agent_id, &AgentStatus::Initializing);
+            let launch_gen = self.bump_generation(&new_agent_id).await;
+            let mgr = Arc::clone(self);
+            let summary_bg = final_summary.clone();
+            let ag_id_bg = new_agent_id.clone();
+            tokio::spawn(async move {
+                if mgr.current_generation(&ag_id_bg).await == launch_gen
+                    && let Some(tree_oid) =
+                        capture_git_tree_snapshot(Path::new(&summary_bg.cwd)).await
+                    && mgr.current_generation(&ag_id_bg).await == launch_gen
+                {
+                    let _ = mgr.store.save_turn_checkpoint(
+                        &ag_id_bg,
+                        prompt_seq,
+                        Some(&turn_id),
+                        &tree_oid,
+                    );
+                }
+                if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                    return;
+                }
+                match mgr
+                    .spawn_and_wire_driver(
+                        &summary_bg,
+                        executable,
+                        None,
+                        fork_from_session_id,
+                        false,
+                        handoff_context,
+                        false,
+                        launch_gen,
+                    )
+                    .await
+                {
+                    Ok(cmd_tx) => {
+                        if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                            let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+                            return;
+                        }
+                        let sanitized = sanitize_human_prompt_for_wire(&prompt_text, &msg_id);
+                        let with_rules = mgr
+                            .augment_prompt_with_path_rules(
+                                &ag_id_bg,
+                                &[],
+                                &sanitized,
+                                sanitized.clone(),
+                            )
+                            .await;
+                        let wire = mgr
+                            .augment_prompt_with_workspace_context(&ag_id_bg, with_rules)
+                            .await;
+                        let _ = cmd_tx
+                            .send(DriverCommand::SendPrompt {
+                                turn_id,
+                                prompt: wire,
+                                behavior: ActiveTurnBehavior::Steer,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                            return;
+                        }
+                        mgr.keep_awake.mark_agent_idle(&ag_id_bg);
+                        if let Ok(ev) = mgr.store.append_timeline_event(
+                            &ag_id_bg,
+                            1,
+                            None,
+                            TimelinePayload::StatusChanged {
+                                status: AgentStatus::Error {
+                                    message: e.to_string(),
+                                    recoverable: true,
+                                },
+                            },
+                        ) {
+                            let _ = mgr.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                        }
+                        let _ = mgr
+                            .store
+                            .set_agent_attention(&ag_id_bg, AttentionState::Error);
+                        if let Ok(Some(ag)) = mgr.store.get_agent(&ag_id_bg) {
+                            let _ = mgr.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
+                        }
+                    }
+                }
+            });
+        } else if fork_from_session_id.is_some()
+            && let Ok((executable, _)) = self
+                .resolve_launch_executable(
+                    final_summary.provider,
+                    final_summary.acp_agent_id.as_deref(),
+                )
+                .await
+        {
+            // Eagerly snapshot the parent's upstream session for full-tail forks before the
+            // parent thread diverges with new turns. `native_fork_only = true` ensures that if
+            // upstream native fork fails or is unsupported, we NEVER persist a blank fallback
+            // session ID — letting the user's first prompt spawn fresh with `handoff_context`.
+            let launch_gen = self.bump_generation(&new_agent_id).await;
+            let mgr = Arc::clone(self);
+            let summary_bg = final_summary.clone();
+            let ag_id_bg = new_agent_id.clone();
+            tokio::spawn(async move {
+                if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                    return;
+                }
+                if let Err(e) = mgr
+                    .spawn_and_wire_driver(
+                        &summary_bg,
+                        executable,
+                        None,
+                        fork_from_session_id,
+                        true,
+                        handoff_context,
+                        false,
+                        launch_gen,
+                    )
+                    .await
+                {
+                    warn!(
+                        agent_id = %ag_id_bg,
+                        error = %e,
+                        "eager native fork driver startup deferred; next user prompt will launch with handoff context"
+                    );
+                }
+            });
+        }
+
+        Ok(ForkAgentOutcome {
+            agent: final_summary,
+            workspace: created_workspace,
+        })
     }
 
     pub async fn send_prompt(
@@ -1333,14 +2547,50 @@ impl AgentOrchestrator {
     pub async fn send_prompt_with_options(
         self: &Arc<Self>,
         agent_id: &str,
-        prompt: String,
+        mut prompt: String,
         display_prompt: Option<String>,
         badges: Vec<PromptBadge>,
         behavior: ActiveTurnBehavior,
         message_id: Option<String>,
     ) -> anyhow::Result<()> {
+        let existing_agent = self.store.get_agent(agent_id).ok().flatten();
+        if let Some(ref ag) = existing_agent {
+            let hook_outcome = self
+                .hooks
+                .dispatch_event(
+                    orbit_protocol::HookEventKind::PrePromptSubmit,
+                    Some(Path::new(&ag.cwd)),
+                    Some(ag.provider.slug()),
+                    serde_json::json!({
+                        "event": "pre_prompt_submit",
+                        "agent_id": agent_id,
+                        "workspace_id": &ag.workspace_id,
+                        "cwd": &ag.cwd,
+                        "provider": ag.provider.slug(),
+                        "prompt": &prompt,
+                    }),
+                )
+                .await;
+            if hook_outcome.decision == orbit_protocol::HookDecision::Block {
+                let hook_name = hook_outcome
+                    .blocking_hook_name
+                    .as_deref()
+                    .unwrap_or("lifecycle hook");
+                let reason = hook_outcome
+                    .reason
+                    .as_deref()
+                    .unwrap_or("blocked by policy");
+                anyhow::bail!("Prompt blocked by hook `{hook_name}`: {reason}");
+            }
+            if hook_outcome.decision == orbit_protocol::HookDecision::Modify
+                && let Some(updated) = hook_outcome.updated_text
+            {
+                prompt = updated;
+            }
+        }
+
         // Sending a human prompt acknowledges unread attention and unarchives if needed
-        if let Ok(Some(ag)) = self.store.get_agent(agent_id)
+        if let Some(ref ag) = existing_agent
             && ag.archived_at.is_some()
         {
             let _ = self.unarchive_agent(agent_id).await;
@@ -1534,6 +2784,22 @@ impl AgentOrchestrator {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
 
         // Persist structured `TimelinePayload::AgentMessage` cards for each entry in the coalesced batch
+        if let Some(timers) = self.conditional_timers().await {
+            for entry in &batch.entries {
+                if matches!(
+                    entry.source.kind,
+                    orbit_protocol::AgentMessageKind::DirectMessage
+                        | orbit_protocol::AgentMessageKind::FinishNotification
+                ) {
+                    timers
+                        .notify_agent_message(
+                            &batch.recipient_id,
+                            entry.source.source_agent_id.as_deref(),
+                        )
+                        .await;
+                }
+            }
+        }
         for entry in &batch.entries {
             let ev = self.store.append_timeline_event(
                 &batch.recipient_id,
@@ -1583,9 +2849,13 @@ impl AgentOrchestrator {
             .live_agent_tx(agent_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("agent session not active"))?;
+        if let Some(timers) = self.conditional_timers().await {
+            timers.notify_agent_message(agent_id, Some("user")).await;
+        }
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let msg_id = message_id.unwrap_or_else(|| format!("u_{}", Uuid::new_v4().simple()));
         let visible_text = display_prompt.unwrap_or_else(|| prompt.clone());
+        let rule_badges = badges.clone();
         let ev = self.store.append_timeline_event(
             agent_id,
             1,
@@ -1616,10 +2886,13 @@ impl AgentOrchestrator {
         }
         let with_handoff = match handoff_context {
             Some(ctx) => format!("{ctx}\n\n[Latest User Request]\n{sanitized}"),
-            None => sanitized,
+            None => sanitized.clone(),
         };
+        let with_rules = self
+            .augment_prompt_with_path_rules(agent_id, &rule_badges, &sanitized, with_handoff)
+            .await;
         let wire_prompt = self
-            .augment_prompt_with_workspace_context(agent_id, with_handoff)
+            .augment_prompt_with_workspace_context(agent_id, with_rules)
             .await;
 
         cmd_tx
@@ -1733,16 +3006,39 @@ impl AgentOrchestrator {
         Ok(())
     }
 
+    async fn model_supports_fast_mode(&self, provider: ProviderKind, model: Option<&str>) -> bool {
+        let cached = self.provider_catalogs.read().await;
+        provider_model_supports_fast_mode(provider, model, cached.as_deref())
+    }
+
     pub async fn set_agent_config(
         &self,
         agent_id: &str,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     ) -> anyhow::Result<()> {
+        let clear_fast = if let Some(existing) = self.store.get_agent(agent_id)? {
+            let supports_fast = self
+                .model_supports_fast_mode(existing.provider, model.as_deref())
+                .await;
+            if existing.fast_mode && !supports_fast {
+                Some(false)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         self.store
-            .update_agent_config(agent_id, model.as_deref(), effort)?;
+            .update_agent_config(agent_id, model.as_deref(), effort, clear_fast)?;
         if let Some(tx) = self.live_agent_tx(agent_id).await {
-            let _ = tx.send(DriverCommand::SetConfig { model, effort }).await;
+            let _ = tx
+                .send(DriverCommand::SetConfig {
+                    model,
+                    effort,
+                    fast_mode: clear_fast,
+                })
+                .await;
         }
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
             let _ = self
@@ -1757,12 +3053,26 @@ impl AgentOrchestrator {
         agent_id: &str,
         model: Option<String>,
     ) -> anyhow::Result<()> {
-        self.store.update_agent_model(agent_id, model.as_deref())?;
+        let clear_fast = if let Some(existing) = self.store.get_agent(agent_id)? {
+            let supports_fast = self
+                .model_supports_fast_mode(existing.provider, model.as_deref())
+                .await;
+            if existing.fast_mode && !supports_fast {
+                Some(false)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.store
+            .update_agent_model(agent_id, model.as_deref(), clear_fast)?;
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             let _ = tx
                 .send(DriverCommand::SetConfig {
                     model,
                     effort: None,
+                    fast_mode: clear_fast,
                 })
                 .await;
         }
@@ -1781,28 +3091,73 @@ impl AgentOrchestrator {
         title: Option<String>,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        fast_mode: Option<bool>,
         mode: Option<SessionMode>,
         labels: Option<HashMap<String, String>>,
         handle: Option<String>,
         task_summary: Option<String>,
     ) -> anyhow::Result<AgentSummary> {
+        let existing = self
+            .store
+            .get_agent(agent_id)?
+            .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
+        let effective_model = model.as_deref().or(existing.model.as_deref());
+        let supports_fast = self
+            .model_supports_fast_mode(existing.provider, effective_model)
+            .await;
+        let effective_fast_mode = match fast_mode {
+            Some(true) => {
+                if !supports_fast {
+                    anyhow::bail!(
+                        "Fast mode is not supported by {} model `{}`",
+                        existing.provider.display_name(),
+                        effective_model.unwrap_or("default")
+                    );
+                }
+                Some(true)
+            }
+            Some(false) => Some(false),
+            None => {
+                if model.is_some() && existing.fast_mode && !supports_fast {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        };
+
         let clean_handle = handle.map(|h| sanitize_handle(&h));
+        let mut effective_labels = labels;
+        // Explicit user/API title edits automatically lock the title against future AI auto-naming
+        // unless the caller explicitly sets `orbit.title_locked` (e.g. `""` to unlock).
+        if title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+            let map = effective_labels.get_or_insert_with(HashMap::new);
+            map.entry("orbit.title_locked".into())
+                .or_insert_with(|| "1".into());
+        }
         self.store.update_agent_fields(
             agent_id,
             title.as_deref(),
             model.as_deref().map(Some),
             effort.map(Some),
             mode.as_ref(),
-            labels.as_ref(),
+            effective_labels.as_ref(),
             clean_handle.as_deref(),
             task_summary.as_deref(),
+            effective_fast_mode,
         )?;
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             if let Some(md) = mode {
                 let _ = tx.send(DriverCommand::SetMode { mode: md }).await;
             }
-            if model.is_some() || effort.is_some() {
-                let _ = tx.send(DriverCommand::SetConfig { model, effort }).await;
+            if model.is_some() || effort.is_some() || effective_fast_mode.is_some() {
+                let _ = tx
+                    .send(DriverCommand::SetConfig {
+                        model,
+                        effort,
+                        fast_mode: effective_fast_mode,
+                    })
+                    .await;
             }
         }
         let updated = self
@@ -1821,28 +3176,55 @@ impl AgentOrchestrator {
         provider: ProviderKind,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        acp_agent_id: Option<String>,
     ) -> anyhow::Result<()> {
-        let _ = find_provider_executable(provider).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} CLI (`{}`) is not installed on this host",
-                provider.display_name(),
-                provider.default_binary()
-            )
-        })?;
+        let (_, acp_spec) = self
+            .resolve_launch_executable(provider, acp_agent_id.as_deref())
+            .await?;
+
+        let prev_fast_mode = self
+            .store
+            .get_agent(agent_id)?
+            .map(|a| a.fast_mode)
+            .unwrap_or(false);
+        let supports_fast = self
+            .model_supports_fast_mode(provider, model.as_deref())
+            .await;
+        let next_fast_mode = prev_fast_mode && supports_fast;
+        if prev_fast_mode
+            && !next_fast_mode
+            && let Some(tx) = self.live_agent_tx(agent_id).await
+        {
+            let _ = tx
+                .send(DriverCommand::SetConfig {
+                    model: None,
+                    effort: None,
+                    fast_mode: Some(false),
+                })
+                .await;
+        }
 
         let _ = self.stop_and_wait_driver(agent_id).await;
-        kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
-        kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
-        self.store
-            .switch_agent_provider(agent_id, provider, model.as_deref(), effort)?;
+        self.store.switch_agent_provider(
+            agent_id,
+            provider,
+            model.as_deref(),
+            effort,
+            next_fast_mode,
+            acp_agent_id.as_deref(),
+        )?;
 
+        let switched_label = acp_spec
+            .as_ref()
+            .map(|s| s.name.as_str())
+            .unwrap_or_else(|| provider.display_name());
         if let Ok(ev) = self.store.append_timeline_event(
             agent_id,
             1,
             None,
             TimelinePayload::Notice {
                 level: "info".into(),
-                message: format!("已切换至 {} 接力当前对话", provider.display_name()),
+                message: format!("已切换至 {switched_label} 接力当前对话"),
             },
         ) {
             let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
@@ -1886,6 +3268,10 @@ impl AgentOrchestrator {
             .write()
             .await
             .retain(|(aid, _), _| aid != agent_id);
+        self.guardian_auto_resolved_requests
+            .write()
+            .await
+            .retain(|(aid, _)| aid != agent_id);
         self.pending_questions.write().await.remove(agent_id);
     }
 
@@ -1974,7 +3360,12 @@ impl AgentOrchestrator {
             // 1. Stop live runtime & clear pending permissions
             let _ = self.stop_and_wait_driver(agent_id).await;
 
-            // 2. Retire any heartbeats bound to this agent
+            // 2. Retire any heartbeats & armed conditional timers bound to this agent
+            if let Some(timers) = self.conditional_timers().await {
+                timers
+                    .cancel_all_for_agent(agent_id, "Agent archived")
+                    .await;
+            }
             if let Ok(removed_hbs) = self.store.delete_heartbeats_for_agent(agent_id) {
                 for hb_id in removed_hbs {
                     let _ = self
@@ -1985,6 +3376,35 @@ impl AgentOrchestrator {
 
             // 3. Soft-archive record in SQLite & broadcast
             self.store.archive_agent_soft(agent_id)?;
+            if let Some(ref ag) = existing {
+                let hooks = Arc::clone(&self.hooks);
+                let cwd_hook = PathBuf::from(&ag.cwd);
+                let prov_slug = ag.provider.slug().to_string();
+                let payload = serde_json::json!({
+                    "event": "session_end",
+                    "agent_id": agent_id,
+                    "workspace_id": &ag.workspace_id,
+                    "cwd": &ag.cwd,
+                    "provider": &prov_slug,
+                    "reason": "archived",
+                });
+                tokio::spawn(async move {
+                    let _ = hooks
+                        .dispatch_event(
+                            orbit_protocol::HookEventKind::SessionEnd,
+                            Some(&cwd_hook),
+                            Some(&prov_slug),
+                            payload,
+                        )
+                        .await;
+                });
+            }
+            if let Some(ref parent_id) = existing.as_ref().and_then(|a| a.parent_agent_id.clone())
+                && let Some(timers) = self.conditional_timers().await
+            {
+                let all_settled = self.are_all_subagents_settled(parent_id);
+                timers.notify_subagent_settled(parent_id, all_settled).await;
+            }
             if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
                 let wt_src = updated.labels.get("orbit.worktree_source_cwd").cloned();
                 let wt_branch = updated.labels.get("orbit.worktree_branch").cloned();
@@ -2007,6 +3427,8 @@ impl AgentOrchestrator {
                             wt_branch.as_deref(),
                         )
                         .await;
+                        self.reconcile_worktree_pool_after_archive(Path::new(&src))
+                            .await;
                     }
                 }
             }
@@ -2044,6 +3466,10 @@ impl AgentOrchestrator {
     }
 
     pub async fn detach_agent(&self, agent_id: &str) -> anyhow::Result<AgentSummary> {
+        let prev_parent_id = self
+            .store
+            .get_agent(agent_id)?
+            .and_then(|a| a.parent_agent_id);
         self.store.detach_agent(agent_id)?;
         let updated = self
             .store
@@ -2052,25 +3478,46 @@ impl AgentOrchestrator {
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::AgentUpdated(updated.clone()));
+        if let Some(ref parent_id) = prev_parent_id
+            && let Some(timers) = self.conditional_timers().await
+        {
+            let all_settled = self.are_all_subagents_settled(parent_id);
+            timers.notify_subagent_settled(parent_id, all_settled).await;
+        }
         Ok(updated)
     }
 
     pub async fn kill_agent(&self, agent_id: &str) -> anyhow::Result<()> {
         let _ = self.stop_and_wait_driver(agent_id).await;
-        kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
-        kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
         self.store
             .update_agent_status(agent_id, &AgentStatus::Closed)?;
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+            let parent_id = updated.parent_agent_id.clone();
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::AgentUpdated(updated));
+            if let Some(ref pid) = parent_id
+                && let Some(timers) = self.conditional_timers().await
+            {
+                let all_settled = self.are_all_subagents_settled(pid);
+                timers.notify_subagent_settled(pid, all_settled).await;
+            }
         }
         Ok(())
     }
 
     pub async fn delete_agent(self: &Arc<Self>, agent_id: &str) -> anyhow::Result<()> {
+        let prev_parent_id = self
+            .store
+            .get_agent(agent_id)
+            .ok()
+            .flatten()
+            .and_then(|a| a.parent_agent_id);
         let _ = self.kill_agent(agent_id).await;
+        if let Some(timers) = self.conditional_timers().await {
+            timers.cancel_all_for_agent(agent_id, "Agent deleted").await;
+        }
+        let _ = self.store.delete_conditional_timers_for_agent(agent_id);
         if let Ok(removed_hbs) = self.store.delete_heartbeats_for_agent(agent_id) {
             for hb_id in removed_hbs {
                 let _ = self
@@ -2079,6 +3526,16 @@ impl AgentOrchestrator {
             }
         }
         self.store.delete_agent(agent_id)?;
+        if let Some(ref parent_id) = prev_parent_id
+            && let Some(timers) = self.conditional_timers().await
+        {
+            let all_settled = self.are_all_subagents_settled(parent_id);
+            timers.notify_subagent_settled(parent_id, all_settled).await;
+        }
+        self.driver_start_locks.write().await.remove(agent_id);
+        self.agent_generations.write().await.remove(agent_id);
+        self.roster_fingerprints.write().await.remove(agent_id);
+        self.suppress_auto_drain.write().await.remove(agent_id);
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::AgentDeleted(agent_id.to_string()));
@@ -2553,6 +4010,60 @@ impl AgentOrchestrator {
             .find(|a| a.title.to_ascii_lowercase().contains(&lower)))
     }
 
+    /// Match workspace/user path-scoped glob rules against mentioned/edited paths and `@rule:` tokens,
+    /// prepending `<WORKSPACE_RULES>` cleanly when non-empty and leaving the prompt untouched otherwise.
+    /// `signal_source` is strictly the current turn's user prompt (never historical handoff turns).
+    async fn augment_prompt_with_path_rules(
+        &self,
+        agent_id: &str,
+        badges: &[PromptBadge],
+        signal_source: &str,
+        prompt: String,
+    ) -> String {
+        if prompt.trim_start().starts_with("<WORKSPACE_RULES>") {
+            return prompt;
+        }
+        let Ok(Some(agent)) = self.store.get_agent(agent_id) else {
+            return prompt;
+        };
+        if agent.background {
+            return prompt;
+        }
+        let edited_paths: Vec<String> = self
+            .store
+            .list_workspace_events(&agent.workspace_id, 24)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|ev| ev.kind == WorkspaceEventKind::FileEdited)
+            .filter_map(|ev| ev.file_path)
+            .collect();
+        let (active_paths, manual_rules) = crate::rules::extract_prompt_rule_signals(
+            signal_source,
+            badges,
+            &agent.cwd,
+            &edited_paths,
+        );
+
+        let home_dir = self.home_dir.clone();
+        let cwd = PathBuf::from(&agent.cwd);
+        let matched = tokio::task::spawn_blocking(move || {
+            crate::rules::match_rules_for_workspace(
+                &home_dir,
+                Some(&cwd),
+                &active_paths,
+                &manual_rules,
+            )
+        })
+        .await
+        .unwrap_or_default();
+
+        if matched.injected_markdown.is_empty() {
+            prompt
+        } else {
+            format!("{}\n\n{prompt}", matched.injected_markdown)
+        }
+    }
+
     /// Prepend a deduplicated `<orbit-workspace>` live awareness block (peers + shared board +
     /// recent events) whenever the workspace has 2+ peers or board content that changed since the
     /// last turn sent to `agent_id`.
@@ -2681,9 +4192,10 @@ impl AgentOrchestrator {
         let should_alert = {
             let mut guard = self.conflict_cooldowns.write().await;
             let now = std::time::Instant::now();
+            guard.retain(|_, prev| now.duration_since(*prev) < Duration::from_secs(60));
             match guard.get(&key) {
-                Some(prev) if now.duration_since(*prev) < Duration::from_secs(60) => false,
-                _ => {
+                Some(_) => false,
+                None => {
                     guard.insert(key, now);
                     true
                 }
@@ -2783,6 +4295,17 @@ impl AgentOrchestrator {
             .await
             .keys()
             .any(|(aid, _)| aid == agent_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_pending_permission_for_test(
+        &self,
+        summary: PendingPermissionSummary,
+    ) {
+        self.pending_permissions.write().await.insert(
+            (summary.agent_id.clone(), summary.request_id.clone()),
+            summary,
+        );
     }
 
     /// Rewind an agent to strictly before `to_before_seq`:
@@ -2899,10 +4422,31 @@ impl AgentOrchestrator {
         Ok(outcome)
     }
 
+    async fn agent_start_lock(&self, agent_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(lock) = self.driver_start_locks.read().await.get(agent_id) {
+            return Arc::clone(lock);
+        }
+        let mut guard = self.driver_start_locks.write().await;
+        Arc::clone(
+            guard
+                .entry(agent_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
     async fn get_or_resume_driver(
         self: &Arc<Self>,
         agent_id: &str,
     ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
+            return Ok(tx);
+        }
+
+        let start_lock = self.agent_start_lock(agent_id).await;
+        let _start_guard = start_lock.lock().await;
+
+        // Re-check after acquiring the per-agent startup lock so concurrent eager-fork startup
+        // and user `send_prompt` share the same live shim without socket collision.
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             return Ok(tx);
         }
@@ -2912,20 +4456,56 @@ impl AgentOrchestrator {
             .get_agent(agent_id)?
             .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
         let resume_ref = self.store.get_persistence_ref(agent_id)?;
-        let executable = find_provider_executable(summary.provider).ok_or_else(|| {
-            anyhow::anyhow!("{} CLI not installed", summary.provider.display_name())
-        })?;
+        let (executable, _) = self
+            .resolve_launch_executable(summary.provider, summary.acp_agent_id.as_deref())
+            .await?;
         let launch_gen = self.bump_generation(agent_id).await;
 
-        self.spawn_and_wire_driver(&summary, executable, resume_ref, false, launch_gen)
-            .await
+        self.spawn_and_wire_driver_locked(
+            &summary, executable, resume_ref, None, false, None, false, launch_gen,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_and_wire_driver(
         self: &Arc<Self>,
         summary: &AgentSummary,
         executable: PathBuf,
         resume_session_id: Option<String>,
+        fork_from_session_id: Option<String>,
+        native_fork_only: bool,
+        explicit_handoff_context: Option<String>,
+        reattach_existing_shim: bool,
+        expected_gen: u64,
+    ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
+        let start_lock = self.agent_start_lock(&summary.agent_id).await;
+        let _start_guard = start_lock.lock().await;
+        if self.current_generation(&summary.agent_id).await != expected_gen {
+            anyhow::bail!("agent session was reset before startup");
+        }
+        self.spawn_and_wire_driver_locked(
+            summary,
+            executable,
+            resume_session_id,
+            fork_from_session_id,
+            native_fork_only,
+            explicit_handoff_context,
+            reattach_existing_shim,
+            expected_gen,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_and_wire_driver_locked(
+        self: &Arc<Self>,
+        summary: &AgentSummary,
+        executable: PathBuf,
+        resume_session_id: Option<String>,
+        fork_from_session_id: Option<String>,
+        native_fork_only: bool,
+        explicit_handoff_context: Option<String>,
         reattach_existing_shim: bool,
         expected_gen: u64,
     ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
@@ -3044,8 +4624,23 @@ impl AgentOrchestrator {
             .as_deref()
             .map(|tid| self.store.max_turn_segment_step(&summary.agent_id, tid))
             .unwrap_or(0);
-        let fallback_handoff_context = if !reattach_existing_shim && resume_session_id.is_some() {
-            self.build_handoff_context(&summary.agent_id)
+        let fallback_handoff_context = explicit_handoff_context.or_else(|| {
+            if !reattach_existing_shim
+                && (resume_session_id.is_some()
+                    || fork_from_session_id.is_some()
+                    || summary.latest_seq > 0)
+            {
+                self.build_handoff_context(&summary.agent_id)
+            } else {
+                None
+            }
+        });
+
+        let acp_spec = if summary.provider == ProviderKind::Acp {
+            summary
+                .acp_agent_id
+                .as_deref()
+                .and_then(|id| orbit_providers::get_acp_agent_spec(&self.home_dir, id))
         } else {
             None
         };
@@ -3061,8 +4656,11 @@ impl AgentOrchestrator {
             attachments_dir: Some(attachments_dir),
             model: summary.model.clone(),
             effort: summary.effort,
+            fast_mode: summary.fast_mode,
             mode: summary.mode.clone(),
             resume_session_id,
+            fork_from_session_id,
+            native_fork_only,
             mcp_spec,
             system_prompt_append: profile.and_then(|p| p.system_prompt_append),
             extra_env,
@@ -3074,6 +4672,8 @@ impl AgentOrchestrator {
             fallback_handoff_context,
             persisted_running_bg_tasks,
             persisted_bg_wait,
+            acp_agent_id: summary.acp_agent_id.clone(),
+            acp_spec,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -3177,6 +4777,7 @@ impl AgentOrchestrator {
             drop(live_guard);
             if mgr.current_generation(&ag_id).await == expected_gen {
                 mgr.clear_pending_requests(&ag_id).await;
+                mgr.keep_awake.mark_agent_idle(&ag_id);
             }
             done_notify_bg.notify_waiters();
         });
@@ -3219,19 +4820,30 @@ impl AgentOrchestrator {
                 return;
             }
             DriverEvent::ProviderSubagentUpsert(desc) => {
+                let parent_id = desc.parent_agent_id.clone();
+                let is_settled = desc.status != orbit_protocol::ProviderSubagentStatus::Running;
                 let _ = self.store.upsert_provider_subagent(&desc);
                 let _ = self
                     .broadcast_tx
                     .send(DaemonBroadcast::ProviderSubagentUpdated(desc));
+                if is_settled && let Some(timers) = self.conditional_timers().await {
+                    let all_settled = self.are_all_subagents_settled(&parent_id);
+                    timers
+                        .notify_subagent_settled(&parent_id, all_settled)
+                        .await;
+                }
                 return;
             }
             DriverEvent::ProviderSubagentTimeline {
                 subagent_id,
-                payload,
+                mut payload,
             } => {
-                if let Ok(saved) =
-                    self.store
-                        .append_provider_subagent_event(agent_id, &subagent_id, payload)
+                sanitize_timeline_payload(&mut payload);
+                if let Ok((saved, mutated)) = self.store.append_provider_subagent_event_upsert(
+                    agent_id,
+                    &subagent_id,
+                    payload,
+                ) && mutated
                 {
                     let _ = self
                         .broadcast_tx
@@ -3250,15 +4862,81 @@ impl AgentOrchestrator {
                 }
                 return;
             }
+            DriverEvent::TurnUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                last_call_prompt_tokens,
+                model,
+            } => {
+                let recorded_at_ms = Utc::now().timestamp_millis();
+                self.turn_usage_recorded
+                    .write()
+                    .await
+                    .insert(agent_id.to_string());
+                if let Some(prompt_toks) = last_call_prompt_tokens
+                    && prompt_toks > 0
+                {
+                    self.last_call_prompt_occupancy
+                        .write()
+                        .await
+                        .insert(agent_id.to_string(), (prompt_toks, recorded_at_ms));
+                }
+                let store_bg = Arc::clone(&self.store);
+                let aid_bg = agent_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(Some(ag)) = store_bg.get_agent(&aid_bg) {
+                        let provider_slug = ag.provider.slug().to_string();
+                        let effective_model = model
+                            .as_deref()
+                            .filter(|m| !m.trim().is_empty())
+                            .or(ag.model.as_deref())
+                            .filter(|m| !m.trim().is_empty())
+                            .unwrap_or(&provider_slug)
+                            .to_string();
+                        let (estimated_cost_usd, cache_savings_usd) =
+                            crate::usage::estimate_turn_cost_usd(
+                                &provider_slug,
+                                &effective_model,
+                                input_tokens,
+                                output_tokens,
+                                cache_read_tokens,
+                                cache_write_tokens,
+                            );
+                        let entry = orbit_protocol::UsageLedgerEntry {
+                            id: format!("ul_{}", Uuid::new_v4().simple()),
+                            agent_id: aid_bg,
+                            workspace_cwd: ag.cwd,
+                            provider: provider_slug,
+                            model: effective_model,
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            cache_write_tokens,
+                            estimated_cost_usd,
+                            cache_savings_usd,
+                            recorded_at_ms,
+                        };
+                        let _ = store_bg.record_usage_entry(&entry);
+                    }
+                });
+                return;
+            }
             _ => {}
         }
 
         let mut should_check_auto_archive = false;
         let mut should_drain_queued_prompt = false;
         let mut should_mark_finished = false;
+        let mut completed_running_turn = false;
         let payload = match evt {
             DriverEvent::StatusChanged(status) => {
+                self.keep_awake.notify_agent_status(agent_id, &status);
                 let prev = self.store.get_agent(agent_id).ok().flatten();
+                let was_running_turn = prev
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.status, AgentStatus::Running { .. }));
                 let was_foreground_busy =
                     prev.as_ref().is_some_and(|a| a.status.is_foreground_busy());
                 let was_awaiting_permission = prev
@@ -3273,6 +4951,9 @@ impl AgentOrchestrator {
                         let suppressed = self.suppress_auto_drain.write().await.remove(agent_id);
                         if (was_foreground_busy || was_awaiting_permission) && !suppressed {
                             should_drain_queued_prompt = true;
+                        }
+                        if was_running_turn {
+                            completed_running_turn = true;
                         }
                         if was_foreground_busy {
                             let _ = self.store.touch_agent_activity(agent_id, Utc::now());
@@ -3306,6 +4987,7 @@ impl AgentOrchestrator {
                         recoverable,
                     } => {
                         self.suppress_auto_drain.write().await.remove(agent_id);
+                        self.turn_usage_recorded.write().await.remove(agent_id);
                         tracing::warn!(
                             agent_id = %agent_id,
                             recoverable,
@@ -3320,7 +5002,18 @@ impl AgentOrchestrator {
                         }
                         should_check_auto_archive = true;
                     }
-                    AgentStatus::AwaitingPermission { .. } => {
+                    AgentStatus::AwaitingPermission { request_id, .. } => {
+                        let key = (agent_id.to_string(), request_id.clone());
+                        let was_auto_resolved = self
+                            .guardian_auto_resolved_requests
+                            .write()
+                            .await
+                            .remove(&key);
+                        if was_auto_resolved
+                            && !self.pending_permissions.read().await.contains_key(&key)
+                        {
+                            return;
+                        }
                         if prev.as_ref().is_some_and(|a| !a.background) {
                             let _ = self
                                 .store
@@ -3329,6 +5022,7 @@ impl AgentOrchestrator {
                     }
                     AgentStatus::Running { .. } => {
                         self.suppress_auto_drain.write().await.remove(agent_id);
+                        self.turn_usage_recorded.write().await.remove(agent_id);
                         let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                     }
                     _ => {}
@@ -3342,22 +5036,89 @@ impl AgentOrchestrator {
                 item_id,
                 text,
                 streaming,
-            } => TimelinePayload::AssistantMessage {
-                item_id,
-                text,
-                streaming,
-            },
+            } => {
+                if !streaming {
+                    let mgr = Arc::clone(self);
+                    let aid = agent_id.to_string();
+                    let text_clone = text.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = mgr.auto_extract_artifacts_from_message(&aid, &text_clone);
+                    });
+                }
+                TimelinePayload::AssistantMessage {
+                    item_id,
+                    text,
+                    streaming,
+                }
+            }
             DriverEvent::ToolCall {
                 call_id,
                 status,
                 detail,
                 background_task,
             } => {
-                if status == ToolCallStatus::Completed
-                    && let ToolCallDetail::FileEdit { ref path, .. } = detail
-                {
-                    self.record_file_edit_and_check_conflict(agent_id, path)
-                        .await;
+                if status == ToolCallStatus::Completed {
+                    match &detail {
+                        ToolCallDetail::FileEdit { path, .. } => {
+                            self.record_file_edit_and_check_conflict(agent_id, path)
+                                .await;
+                            if let Ok(Some(ag)) = self.store.get_agent(agent_id) {
+                                let hooks = Arc::clone(&self.hooks);
+                                let cwd_hook = PathBuf::from(&ag.cwd);
+                                let target_path = path.clone();
+                                let payload = serde_json::json!({
+                                    "event": "post_file_edit",
+                                    "agent_id": agent_id,
+                                    "workspace_id": &ag.workspace_id,
+                                    "cwd": &ag.cwd,
+                                    "path": &target_path,
+                                    "source": "agent_tool",
+                                });
+                                tokio::spawn(async move {
+                                    let _ = hooks
+                                        .dispatch_event(
+                                            orbit_protocol::HookEventKind::PostFileEdit,
+                                            Some(&cwd_hook),
+                                            Some(&target_path),
+                                            payload,
+                                        )
+                                        .await;
+                                });
+                            }
+                        }
+                        ToolCallDetail::Generic {
+                            tool_name,
+                            arguments_json,
+                        } if !crate::artifacts::is_orbit_artifact_mcp_tool(tool_name)
+                            && arguments_json.contains("ui://") =>
+                        {
+                            let mgr = Arc::clone(self);
+                            let aid = agent_id.to_string();
+                            let tname = tool_name.clone();
+                            let payload_json = arguments_json.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = mgr.auto_extract_artifacts_from_tool_call(
+                                    &aid,
+                                    &tname,
+                                    &payload_json,
+                                );
+                            });
+                        }
+                        ToolCallDetail::Shell {
+                            output_preview: Some(out),
+                            ..
+                        } if out.contains("ui://") => {
+                            let mgr = Arc::clone(self);
+                            let aid = agent_id.to_string();
+                            let out_clone = out.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = mgr.auto_extract_artifacts_from_tool_call(
+                                    &aid, "shell", &out_clone,
+                                );
+                            });
+                        }
+                        _ => {}
+                    }
                 }
                 TimelinePayload::ToolCall {
                     call_id,
@@ -3372,7 +5133,166 @@ impl AgentOrchestrator {
                 detail,
                 allowed_decisions,
             } => {
-                if let Ok(Some(ag)) = self.store.get_agent(agent_id) {
+                let agent_opt = self.store.get_agent(agent_id).ok().flatten();
+                let mut guardian_assessment = None;
+
+                if let Some(ref ag) = agent_opt
+                    && matches!(ag.mode, SessionMode::Auto)
+                {
+                    let eval_req = crate::guardian::GuardianEvalRequest {
+                        agent_id,
+                        request_id: &request_id,
+                        title: &title,
+                        detail: &detail,
+                        workspace_cwd: &ag.cwd,
+                    };
+                    let assessment = self.guardian.assess_and_record(&eval_req).await;
+                    // Re-verify generation and current mode after async classification (TOCTOU guard).
+                    if self.current_generation(agent_id).await != expected_gen {
+                        return;
+                    }
+                    let still_auto = self
+                        .store
+                        .get_agent(agent_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|fresh| matches!(fresh.mode, SessionMode::Auto));
+                    let (_, target_summary) =
+                        crate::guardian::summarize_tool_request(&detail, &title);
+
+                    if !still_auto {
+                        let mut escalated = assessment;
+                        escalated.decision = orbit_protocol::GuardianDecision::RequireHuman;
+                        escalated.classifier_tier = "fail_closed".into();
+                        escalated.reason =
+                            "Session mode changed during Guardian evaluation; requires approval"
+                                .into();
+                        guardian_assessment = Some(escalated);
+                    } else {
+                        match assessment.decision {
+                            orbit_protocol::GuardianDecision::AutoAllow => {
+                                let allow_decision =
+                                    crate::guardian::pick_auto_allow_decision(&allowed_decisions);
+                                let resolved_key = (agent_id.to_string(), request_id.clone());
+                                {
+                                    let mut set =
+                                        self.guardian_auto_resolved_requests.write().await;
+                                    if set.len() > 512 {
+                                        set.clear();
+                                    }
+                                    set.insert(resolved_key.clone());
+                                }
+                                if let Some(tx) = self.live_agent_tx(agent_id).await
+                                    && tx
+                                        .send(DriverCommand::ResolvePermission {
+                                            request_id: request_id.clone(),
+                                            decision: allow_decision,
+                                        })
+                                        .await
+                                        .is_ok()
+                                {
+                                    if !self.has_pending_permissions(agent_id).await {
+                                        let _ = self
+                                            .store
+                                            .set_agent_attention(agent_id, AttentionState::None);
+                                    }
+                                    let notice = TimelinePayload::Notice {
+                                        level: "info".into(),
+                                        message: format!(
+                                            "Guardian auto-approved ({}): {target_summary}",
+                                            assessment.risk_level.as_str()
+                                        ),
+                                    };
+                                    if let Ok((saved_ev, mutated)) = self
+                                        .store
+                                        .append_timeline_event_deduped(agent_id, 1, None, notice)
+                                        && mutated
+                                    {
+                                        let _ = self
+                                            .broadcast_tx
+                                            .send(DaemonBroadcast::TimelineLive(saved_ev));
+                                    }
+                                    return;
+                                }
+                                self.guardian_auto_resolved_requests
+                                    .write()
+                                    .await
+                                    .remove(&resolved_key);
+                                // Fail-closed: if auto-resolve dispatch failed, escalate to human.
+                                let mut escalated = assessment;
+                                escalated.decision = orbit_protocol::GuardianDecision::RequireHuman;
+                                escalated.classifier_tier = "fail_closed".into();
+                                escalated.reason =
+                                    "Auto-approval dispatch unavailable; requires human approval"
+                                        .into();
+                                guardian_assessment = Some(escalated);
+                            }
+                            orbit_protocol::GuardianDecision::AutoDeny => {
+                                let deny_decision =
+                                    crate::guardian::pick_auto_deny_decision(&allowed_decisions);
+                                let resolved_key = (agent_id.to_string(), request_id.clone());
+                                {
+                                    let mut set =
+                                        self.guardian_auto_resolved_requests.write().await;
+                                    if set.len() > 512 {
+                                        set.clear();
+                                    }
+                                    set.insert(resolved_key.clone());
+                                }
+                                if let Some(tx) = self.live_agent_tx(agent_id).await
+                                    && tx
+                                        .send(DriverCommand::ResolvePermission {
+                                            request_id: request_id.clone(),
+                                            decision: deny_decision,
+                                        })
+                                        .await
+                                        .is_ok()
+                                {
+                                    if !self.has_pending_permissions(agent_id).await {
+                                        let _ = self
+                                            .store
+                                            .set_agent_attention(agent_id, AttentionState::None);
+                                    }
+                                    let notice = TimelinePayload::Notice {
+                                        level: "warning".into(),
+                                        message: format!(
+                                            "Guardian denied ({}): {}",
+                                            assessment.risk_level.as_str(),
+                                            assessment.reason
+                                        ),
+                                    };
+                                    if let Ok((saved_ev, mutated)) = self
+                                        .store
+                                        .append_timeline_event_deduped(agent_id, 1, None, notice)
+                                        && mutated
+                                    {
+                                        let _ = self
+                                            .broadcast_tx
+                                            .send(DaemonBroadcast::TimelineLive(saved_ev));
+                                    }
+                                    return;
+                                }
+                                self.guardian_auto_resolved_requests
+                                    .write()
+                                    .await
+                                    .remove(&resolved_key);
+                                // Fail-closed: mirror AutoAllow dispatch fallback for AutoDeny.
+                                let mut escalated = assessment;
+                                escalated.decision = orbit_protocol::GuardianDecision::RequireHuman;
+                                escalated.classifier_tier = "fail_closed".into();
+                                escalated.reason =
+                                    "Auto-deny dispatch unavailable; requires human approval"
+                                        .into();
+                                guardian_assessment = Some(escalated);
+                            }
+                            orbit_protocol::GuardianDecision::RequireHuman => {
+                                guardian_assessment = Some(assessment);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ag) = agent_opt {
                     self.pending_permissions.write().await.insert(
                         (agent_id.to_string(), request_id.clone()),
                         PendingPermissionSummary {
@@ -3383,6 +5303,7 @@ impl AgentOrchestrator {
                             title: title.clone(),
                             detail: detail.clone(),
                             allowed_decisions: allowed_decisions.clone(),
+                            guardian_assessment: guardian_assessment.clone(),
                             created_at: Utc::now(),
                         },
                     );
@@ -3392,6 +5313,7 @@ impl AgentOrchestrator {
                     title,
                     detail,
                     allowed_decisions,
+                    guardian_assessment,
                 }
             }
             DriverEvent::QuestionRequest {
@@ -3424,6 +5346,33 @@ impl AgentOrchestrator {
                     );
                 }
                 self.clear_pending_requests(agent_id).await;
+                self.turn_usage_recorded.write().await.remove(agent_id);
+                self.keep_awake
+                    .notify_agent_status(agent_id, &AgentStatus::Closed);
+                if let Ok(Some(ag)) = self.store.get_agent(agent_id) {
+                    let hooks = Arc::clone(&self.hooks);
+                    let cwd_hook = PathBuf::from(&ag.cwd);
+                    let prov_slug = ag.provider.slug().to_string();
+                    let payload = serde_json::json!({
+                        "event": "session_end",
+                        "agent_id": agent_id,
+                        "workspace_id": &ag.workspace_id,
+                        "cwd": &ag.cwd,
+                        "provider": &prov_slug,
+                        "reason": "exited",
+                        "exit_code": code,
+                    });
+                    tokio::spawn(async move {
+                        let _ = hooks
+                            .dispatch_event(
+                                orbit_protocol::HookEventKind::SessionEnd,
+                                Some(&cwd_hook),
+                                Some(&prov_slug),
+                                payload,
+                            )
+                            .await;
+                    });
+                }
                 should_check_auto_archive = true;
                 TimelinePayload::StatusChanged {
                     status: AgentStatus::Closed,
@@ -3432,11 +5381,18 @@ impl AgentOrchestrator {
             DriverEvent::SessionInitialized { .. }
             | DriverEvent::ProviderSubagentUpsert(_)
             | DriverEvent::ProviderSubagentTimeline { .. }
-            | DriverEvent::ReconcileBackgroundTasks(_) => unreachable!(),
+            | DriverEvent::ReconcileBackgroundTasks(_)
+            | DriverEvent::TurnUsage { .. } => unreachable!(),
         };
 
         let is_status_change = matches!(payload, TimelinePayload::StatusChanged { .. });
-        if let Ok(saved_ev) = self.store.append_timeline_event(agent_id, 1, None, payload) {
+        let mut payload = payload;
+        sanitize_timeline_payload(&mut payload);
+        if let Ok((saved_ev, mutated)) = self
+            .store
+            .append_timeline_event_deduped(agent_id, 1, None, payload)
+            && mutated
+        {
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::TimelineLive(saved_ev));
@@ -3467,9 +5423,93 @@ impl AgentOrchestrator {
             let finished_idle = should_check_auto_archive && matches!(ag.status, AgentStatus::Idle);
             let ag_handle = ag.handle.clone();
             let ag_bg = ag.background;
-            let ag_is_subagent = ag.parent_agent_id.is_some();
-            let ag_needs_summary = ag.task_summary.is_none() && !ag_is_subagent;
+            let ag_parent_id = ag.parent_agent_id.clone();
+            let ag_settled = ag.archived_at.is_some()
+                || matches!(
+                    ag.status,
+                    AgentStatus::Idle | AgentStatus::Error { .. } | AgentStatus::Closed
+                );
+            let ag_is_subagent = ag_parent_id.is_some();
+            let ag_needs_auto_naming = completed_running_turn
+                && !ag_is_subagent
+                && !crate::workspace_organizer::is_auto_named(&ag.labels);
+            if completed_running_turn {
+                let already_recorded = self.turn_usage_recorded.write().await.remove(agent_id);
+                if !already_recorded {
+                    let store_bg = Arc::clone(&self.store);
+                    let aid_bg = agent_id.to_string();
+                    let cwd_bg = ag.cwd.clone();
+                    let provider_slug = ag.provider.slug().to_string();
+                    let effective_model = ag
+                        .model
+                        .as_deref()
+                        .filter(|m| !m.trim().is_empty())
+                        .unwrap_or(&provider_slug)
+                        .to_string();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(events) = store_bg.fetch_recent_timeline(&aid_bg, 400) {
+                            let (input_tokens, output_tokens) =
+                                crate::usage::estimate_fallback_turn_tokens(&events);
+                            if input_tokens > 0 || output_tokens > 0 {
+                                let (estimated_cost_usd, cache_savings_usd) =
+                                    crate::usage::estimate_turn_cost_usd(
+                                        &provider_slug,
+                                        &effective_model,
+                                        input_tokens,
+                                        output_tokens,
+                                        0,
+                                        0,
+                                    );
+                                let entry = orbit_protocol::UsageLedgerEntry {
+                                    id: format!("ul_{}", Uuid::new_v4().simple()),
+                                    agent_id: aid_bg,
+                                    workspace_cwd: cwd_bg,
+                                    provider: provider_slug,
+                                    model: effective_model,
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_read_tokens: 0,
+                                    cache_write_tokens: 0,
+                                    estimated_cost_usd,
+                                    cache_savings_usd,
+                                    recorded_at_ms: Utc::now().timestamp_millis(),
+                                };
+                                let _ = store_bg.record_usage_entry(&entry);
+                            }
+                        }
+                    });
+                }
+                let hooks = Arc::clone(&self.hooks);
+                let cwd_hook = PathBuf::from(&ag.cwd);
+                let prov_slug = ag.provider.slug().to_string();
+                let payload = serde_json::json!({
+                    "event": "turn_stop",
+                    "agent_id": agent_id,
+                    "workspace_id": &ag.workspace_id,
+                    "cwd": &ag.cwd,
+                    "provider": &prov_slug,
+                    "title": &ag.title,
+                });
+                tokio::spawn(async move {
+                    let _ = hooks
+                        .dispatch_event(
+                            orbit_protocol::HookEventKind::TurnStop,
+                            Some(&cwd_hook),
+                            Some(&prov_slug),
+                            payload,
+                        )
+                        .await;
+                });
+            }
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
+
+            if ag_settled
+                && let Some(ref parent_id) = ag_parent_id
+                && let Some(timers) = self.conditional_timers().await
+            {
+                let all_settled = self.are_all_subagents_settled(parent_id);
+                timers.notify_subagent_settled(parent_id, all_settled).await;
+            }
 
             if finished_idle && !ag_bg {
                 let ws_opt = self.store.get_workspace(&ws_id).ok().flatten();
@@ -3510,13 +5550,16 @@ impl AgentOrchestrator {
                     }
                 }
 
-                // Non-blocking Turn-1 AI semantic summary (title/handle/1-line summary only).
-                // Workspace classification is strictly user-triggered (`待归类` until user clicks AI 归类 or assigns manually).
-                if ag_needs_summary && drained_prompt.is_none() && !auto_arch {
+                // Bounded non-blocking Turn-1 AI auto-naming & semantic summary
+                // (respects `orbit.title_locked = "1"` and `orbit.auto_named = "1"`).
+                if ag_needs_auto_naming && drained_prompt.is_none() && !auto_arch {
                     let mgr_bg = Arc::clone(self);
                     let aid_bg = agent_id.to_string();
                     tokio::spawn(async move {
-                        let _ = mgr_bg.summarize_agent(&aid_bg).await;
+                        let _ = crate::workspace_organizer::auto_name_agent_after_first_turn(
+                            &mgr_bg, &aid_bg,
+                        )
+                        .await;
                     });
                 }
             }
@@ -3570,6 +5613,16 @@ impl AgentOrchestrator {
 
     // --- Detached PTY Terminals ---
 
+    /// Return the latest provider-reported single-call prompt token count `(tokens, recorded_at_ms)`
+    /// observed in-memory for `agent_id`, if available.
+    pub async fn latest_single_call_prompt_tokens(&self, agent_id: &str) -> Option<(u64, i64)> {
+        self.last_call_prompt_occupancy
+            .read()
+            .await
+            .get(agent_id)
+            .copied()
+    }
+
     pub async fn list_live_terminals(&self) -> Vec<TerminalSummary> {
         let mut live: Vec<TerminalSummary> = self
             .live_terminals
@@ -3603,7 +5656,7 @@ impl AgentOrchestrator {
         env: HashMap<String, String>,
     ) -> anyhow::Result<TerminalSummary> {
         let term_id = format!("term_{}", Uuid::new_v4().simple());
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let shell = crate::platform::default_shell_program();
         let sock_path = self.shim_socket_path("p", &term_id);
         let candidate_cwd = crate::expand_host_path(&cwd);
         let resolved_cwd = if candidate_cwd.is_dir() {
@@ -3613,8 +5666,10 @@ impl AgentOrchestrator {
         };
         let resolved_cwd_str = resolved_cwd.to_string_lossy().to_string();
 
+        let mut env = env;
         let (program, args) = if let Some(cmd_line) = initial_command {
-            ("/bin/sh".to_string(), vec!["-lc".to_string(), cmd_line])
+            let has_cached_env = orbit_providers::merge_cached_shell_env_into_map(&mut env);
+            crate::platform::shell_command_for_platform(&cmd_line, !has_cached_env)
         } else {
             (shell.clone(), Vec::new())
         };
@@ -3851,11 +5906,32 @@ fn decode_terminal_key_token(token: &str) -> &'static [u8] {
     }
 }
 
+static ORBIT_EXE_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Override the resolved `orbit` executable path used when spawning detached `orbit shim`
+/// supervisors (primarily for integration tests via `env!("CARGO_BIN_EXE_orbit")`).
+pub fn set_orbit_exe_override(path: PathBuf) {
+    let _ = ORBIT_EXE_OVERRIDE.set(path);
+}
+
 fn resolve_orbit_exe() -> PathBuf {
+    if let Some(overridden) = ORBIT_EXE_OVERRIDE.get()
+        && overridden.is_file()
+    {
+        return overridden.clone();
+    }
     if let Ok(explicit) = std::env::var("ORBIT_BIN")
         && !explicit.trim().is_empty()
     {
         return PathBuf::from(explicit);
+    }
+    if let Ok(cargo_bin) = std::env::var("CARGO_BIN_EXE_orbit")
+        && !cargo_bin.trim().is_empty()
+    {
+        let p = PathBuf::from(cargo_bin);
+        if p.is_file() {
+            return p;
+        }
     }
     if let Ok(cur) = std::env::current_exe() {
         let is_orbit_bin = cur
@@ -3865,9 +5941,10 @@ fn resolve_orbit_exe() -> PathBuf {
         if is_orbit_bin {
             return cur;
         }
+        let orbit_bin_name = format!("orbit{}", std::env::consts::EXE_SUFFIX);
         let mut anc = cur.parent();
         while let Some(dir) = anc {
-            let candidate = dir.join("orbit");
+            let candidate = dir.join(&orbit_bin_name);
             if candidate.is_file() {
                 return candidate;
             }
@@ -3875,7 +5952,7 @@ fn resolve_orbit_exe() -> PathBuf {
         }
         return cur;
     }
-    PathBuf::from("orbit")
+    PathBuf::from(format!("orbit{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn derive_human_seed(
@@ -4048,6 +6125,21 @@ impl StreamingEventBuffer {
     }
 }
 
+fn sanitize_timeline_payload(payload: &mut TimelinePayload) {
+    if let TimelinePayload::ToolCall {
+        detail:
+            ToolCallDetail::FileEdit {
+                unified_diff: Some(diff),
+                ..
+            },
+        ..
+    } = payload
+    {
+        *diff =
+            orbit_providers::compact_unified_diff(diff, orbit_providers::MAX_UNIFIED_DIFF_BYTES);
+    }
+}
+
 #[cfg(test)]
 mod streaming_buffer_tests {
     use super::*;
@@ -4143,5 +6235,1345 @@ mod streaming_buffer_tests {
             StreamPushOutcome::Buffered => panic!("non-streaming event must flush immediately"),
         }
         assert!(buf.is_empty());
+    }
+
+    async fn setup_test_orchestrator(home_dir: &Path) -> (Arc<AgentOrchestrator>, Arc<OrbitStore>) {
+        std::fs::create_dir_all(home_dir).expect("mkdir home");
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open mem store"));
+        let scripts = Arc::new(WorkspaceScriptRegistry::default());
+        let keep_awake = Arc::new(KeepAwakeManager::new(false));
+        let hooks = crate::hooks::HooksEngine::new(home_dir.to_path_buf());
+        let orch = AgentOrchestrator::new(
+            home_dir.to_path_buf(),
+            "host_test".into(),
+            "tok_test".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            scripts,
+            keep_awake,
+            Arc::new(RwLock::new(None)),
+            hooks,
+        )
+        .await;
+        (orch, store)
+    }
+
+    fn seed_source_conversation(
+        store: &OrbitStore,
+        ws_id: &str,
+        cwd: &str,
+        agent_id: &str,
+        persistence_ref: Option<&str>,
+    ) -> (u64, u64, u64, u64) {
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: ws_id.into(),
+                title: "demo".into(),
+                cwd: cwd.into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: Some(cwd.into()),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: agent_id.into(),
+                    workspace_id: ws_id.into(),
+                    cwd: cwd.into(),
+                    title: "Refactor Auth".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: Some("sonnet".into()),
+                    effort: Some(ReasoningEffort::High),
+                    fast_mode: false,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: Some("prof_1".into()),
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("lead".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                persistence_ref,
+            )
+            .expect("upsert agent");
+
+        let s1 = store
+            .append_timeline_event(
+                agent_id,
+                1,
+                Some("t1"),
+                TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "Design token rotation for AuthService".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("e1")
+            .seq;
+        let s2 = store
+            .append_timeline_event(
+                agent_id,
+                1,
+                Some("t1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
+                    text: "Use rotating refresh tokens stored hashed in SQLite.".into(),
+                    streaming: false,
+                },
+            )
+            .expect("e2")
+            .seq;
+        let s3 = store
+            .append_timeline_event(
+                agent_id,
+                1,
+                Some("t2"),
+                TimelinePayload::UserPrompt {
+                    message_id: "u2".into(),
+                    text: "POST_FORK_SECRET_PROMPT_XYZ switch to OAuth2 PKCE".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("e3")
+            .seq;
+        let s4 = store
+            .append_timeline_event(
+                agent_id,
+                1,
+                Some("t2"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a2".into(),
+                    text: "POST_FORK_SECRET_REPLY_XYZ PKCE flow implemented.".into(),
+                    streaming: false,
+                },
+            )
+            .expect("e4")
+            .seq;
+        (s1, s2, s3, s4)
+    }
+
+    #[tokio::test]
+    async fn fork_agent_same_dir_mid_thread_and_new_worktree_e2e() {
+        let tmp_root =
+            std::env::temp_dir().join(format!("orbit_fork_e2e_{}", Uuid::new_v4().simple()));
+        let home_dir = tmp_root.join("orbit_home");
+        let repo_dir = tmp_root.join("repo");
+        let non_git_dir = tmp_root.join("plain_dir");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        std::fs::create_dir_all(&non_git_dir).expect("mkdir plain");
+
+        // Initialize a real git repository for the NewWorktree fork test
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.name", "Orbit Test"]);
+        run_git(&["config", "user.email", "test@orbit.local"]);
+        std::fs::write(repo_dir.join("README.md"), "# Orbit Fork Test\n").expect("write readme");
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-m", "initial commit"]);
+
+        let (orch, store) = setup_test_orchestrator(&home_dir).await;
+        let repo_str = repo_dir.to_string_lossy().to_string();
+        let (_s1, s2, _s3, s4) =
+            seed_source_conversation(&store, "ws_repo", &repo_str, "ag_src", None);
+
+        // (a) Same-directory full fork from standalone non-curated workspace creates a dedicated
+        // isolated local workspace so archiving one thread never archives the other.
+        let full_out = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src".into(),
+                up_to_seq: None,
+                target: ForkTarget::SameDirectory,
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect("same-dir full fork");
+        let full_ws = full_out
+            .workspace
+            .as_ref()
+            .expect("standalone same-dir fork must provision dedicated local workspace");
+        assert!(!full_ws.is_worktree);
+        assert!(!full_ws.is_curated);
+        assert_ne!(full_out.agent.workspace_id, "ws_repo");
+        assert_eq!(full_out.agent.workspace_id, full_ws.workspace_id);
+        assert_eq!(full_out.agent.cwd, repo_str);
+        assert_eq!(full_out.agent.title, "Refactor Auth (fork)");
+        assert!(
+            !full_out.agent.labels.contains_key("orbit.title_locked"),
+            "default derived fork title must remain unlocked"
+        );
+        assert_eq!(
+            full_out.agent.forked_from_agent_id.as_deref(),
+            Some("ag_src")
+        );
+        assert_eq!(full_out.agent.forked_at_seq, Some(s4));
+        assert_eq!(full_out.agent.provider, ProviderKind::ClaudeCode);
+        assert_eq!(full_out.agent.model.as_deref(), Some("sonnet"));
+        assert_eq!(full_out.agent.effort, Some(ReasoningEffort::High));
+        assert_eq!(full_out.agent.profile_id.as_deref(), Some("prof_1"));
+
+        let (full_events, _) = store
+            .fetch_timeline_since(&full_out.agent.agent_id, 0, 50)
+            .expect("fetch full");
+        assert_eq!(full_events.len(), 4);
+
+        // (a2) Same-directory fork inside a curated Mission Workspace reuses the workspace and
+        // emits a WorkspaceEventKind::PeerJoined event.
+        let mut curated_ws = store
+            .get_workspace("ws_repo")
+            .expect("get ws")
+            .expect("exists");
+        curated_ws.workspace_id = "ws_curated".into();
+        curated_ws.is_curated = true;
+        store.upsert_workspace(&curated_ws).expect("upsert curated");
+        let mut curated_ag = store.get_agent("ag_src").expect("get ag").expect("exists");
+        curated_ag.agent_id = "ag_curated_src".into();
+        curated_ag.workspace_id = "ws_curated".into();
+        store
+            .upsert_agent(&curated_ag, None)
+            .expect("upsert curated ag");
+        let curated_fork = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_curated_src".into(),
+                up_to_seq: None,
+                target: ForkTarget::SameDirectory,
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect("curated same-dir fork");
+        assert!(curated_fork.workspace.is_none());
+        assert_eq!(curated_fork.agent.workspace_id, "ws_curated");
+        let ws_events = store
+            .list_workspace_events("ws_curated", 20)
+            .expect("ws events");
+        assert!(
+            ws_events
+                .iter()
+                .any(|e| e.kind == WorkspaceEventKind::PeerJoined
+                    && e.agent_id.as_deref() == Some(curated_fork.agent.agent_id.as_str())),
+            "curated workspace fork must record PeerJoined event"
+        );
+
+        // (b) Mid-thread fork at `s2` (with source holding a persistence_ref!) must strictly
+        // truncate timeline AND handoff context and NEVER inherit parent persistence_ref.
+        store
+            .set_persistence_ref("ag_src", "parent_claude_sess_999")
+            .expect("set parent pref");
+        let mid_out = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src".into(),
+                up_to_seq: Some(s2),
+                target: ForkTarget::SameDirectory,
+                title: Some("Alt Auth Branch".into()),
+                initial_prompt: None,
+            })
+            .await
+            .expect("mid-thread fork");
+        assert_eq!(mid_out.agent.title, "Alt Auth Branch");
+        assert_eq!(
+            mid_out
+                .agent
+                .labels
+                .get("orbit.title_locked")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            mid_out.agent.forked_from_agent_id.as_deref(),
+            Some("ag_src")
+        );
+        assert_eq!(mid_out.agent.forked_at_seq, Some(s2));
+        assert_eq!(
+            store
+                .get_persistence_ref(&mid_out.agent.agent_id)
+                .expect("mid pref"),
+            None,
+            "mid-thread fork must not inherit parent persistence_ref"
+        );
+
+        let (mid_events, _) = store
+            .fetch_timeline_since(&mid_out.agent.agent_id, 0, 50)
+            .expect("fetch mid");
+        assert_eq!(mid_events.len(), 2);
+        let mid_handoff = orch
+            .build_handoff_context(&mid_out.agent.agent_id)
+            .expect("mid handoff");
+        assert!(mid_handoff.contains("Design token rotation for AuthService"));
+        assert!(mid_handoff.contains("rotating refresh tokens"));
+        assert!(
+            !mid_handoff.contains("POST_FORK_SECRET_PROMPT_XYZ"),
+            "post-fork prompt must never leak into handoff context"
+        );
+        assert!(
+            !mid_handoff.contains("POST_FORK_SECRET_REPLY_XYZ"),
+            "post-fork reply must never leak into handoff context"
+        );
+
+        // (c) Git flag / ref injection MUST be rejected upfront with zero leaked workspaces!
+        let ws_count_before = store.list_workspaces().expect("ws list").len();
+        let bad_branch_err = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src".into(),
+                up_to_seq: None,
+                target: ForkTarget::NewWorktree {
+                    branch: Some("-f".into()),
+                    base_ref: None,
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect_err("leading-dash branch must be rejected");
+        assert!(
+            bad_branch_err.to_string().contains("invalid_git_ref"),
+            "unexpected branch error: {bad_branch_err}"
+        );
+
+        let bad_base_err = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src".into(),
+                up_to_seq: None,
+                target: ForkTarget::NewWorktree {
+                    branch: Some("orbit/fork-safe-name".into()),
+                    base_ref: Some("--detach".into()),
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect_err("leading-dash base_ref must be rejected");
+        assert!(
+            bad_base_err.to_string().contains("invalid_git_ref"),
+            "unexpected base_ref error: {bad_base_err}"
+        );
+        assert_eq!(
+            store.list_workspaces().expect("ws list").len(),
+            ws_count_before,
+            "rejected git ref forks must not leave leaked workspace rows"
+        );
+
+        // (d) NewWorktree fork creates a real git worktree via the accelerated path
+        let wt_src = seed_source_conversation(&store, "ws_repo", &repo_str, "ag_src_wt", None);
+        let wt_out = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src_wt".into(),
+                up_to_seq: Some(wt_src.1),
+                target: ForkTarget::NewWorktree {
+                    branch: Some("orbit/fork-alt-auth".into()),
+                    base_ref: Some("main".into()),
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect("new worktree fork");
+        let wt_ws = wt_out
+            .workspace
+            .as_ref()
+            .expect("worktree fork must return created workspace");
+        assert!(wt_ws.is_worktree);
+        assert_eq!(wt_ws.git_branch.as_deref(), Some("orbit/fork-alt-auth"));
+        assert_eq!(wt_out.agent.workspace_id, wt_ws.workspace_id);
+        assert_eq!(wt_out.agent.cwd, wt_ws.cwd);
+        assert_ne!(wt_out.agent.cwd, repo_str);
+        assert!(Path::new(&wt_ws.cwd).join("README.md").is_file());
+        assert_eq!(
+            wt_out.agent.forked_from_agent_id.as_deref(),
+            Some("ag_src_wt")
+        );
+        assert_eq!(wt_out.agent.forked_at_seq, Some(wt_src.1));
+
+        // (e) Forking an agent INSIDE a worktree into a second NewWorktree with `base_ref: None`
+        // must branch from the source worktree's branch (carrying its unique commit!), NOT main!
+        let wt_dir = PathBuf::from(&wt_ws.cwd);
+        std::fs::write(wt_dir.join("WT_ONLY.txt"), "from worktree branch\n")
+            .expect("write wt file");
+        let run_git_wt = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&wt_dir)
+                .output()
+                .expect("run git wt");
+            assert!(
+                out.status.success(),
+                "git {args:?} in wt failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git_wt(&["add", "WT_ONLY.txt"]);
+        run_git_wt(&["commit", "-m", "worktree branch commit"]);
+
+        let wt_child = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: wt_out.agent.agent_id.clone(),
+                up_to_seq: None,
+                target: ForkTarget::NewWorktree {
+                    branch: Some("orbit/fork-from-wt".into()),
+                    base_ref: None,
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect("nested worktree fork");
+        let wt_child_ws = wt_child
+            .workspace
+            .as_ref()
+            .expect("nested worktree fork workspace");
+        assert!(
+            Path::new(&wt_child_ws.cwd).join("WT_ONLY.txt").is_file(),
+            "forking a worktree agent with base_ref=None must branch from the worktree's branch"
+        );
+
+        // Non-git directory returns clean not_a_git_repo error for NewWorktree
+        let plain_str = non_git_dir.to_string_lossy().to_string();
+        seed_source_conversation(&store, "ws_plain", &plain_str, "ag_plain", None);
+        let err = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_plain".into(),
+                up_to_seq: None,
+                target: ForkTarget::NewWorktree {
+                    branch: None,
+                    base_ref: None,
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect_err("non-git worktree fork must fail cleanly");
+        assert!(
+            err.to_string().contains("not_a_git_repo"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+}
+
+#[cfg(test)]
+mod fast_mode_orchestrator_tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    fn ensure_mock_provider_binaries() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let exe = if cfg!(windows) {
+                std::env::current_exe().expect("current test exe")
+            } else if Path::new("/usr/bin/true").exists() {
+                PathBuf::from("/usr/bin/true")
+            } else {
+                PathBuf::from("/bin/true")
+            };
+            orbit_providers::set_provider_executable_override(
+                ProviderKind::ClaudeCode,
+                exe.clone(),
+            );
+            orbit_providers::set_provider_executable_override(ProviderKind::Codex, exe.clone());
+            orbit_providers::set_provider_executable_override(ProviderKind::Antigravity, exe);
+        });
+    }
+
+    async fn test_orchestrator(tag: &str) -> (PathBuf, Arc<OrbitStore>, Arc<AgentOrchestrator>) {
+        ensure_mock_provider_binaries();
+        let dir =
+            std::env::temp_dir().join(format!("orbit_mgr_fast_{tag}_{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("shims")).expect("create shims dir");
+        let store = Arc::new(OrbitStore::open(dir.join("orbit.db")).expect("open store"));
+        let listen_port = Arc::new(RwLock::new(0u16));
+        let orch_config = Arc::new(RwLock::new(OrchestrationConfig::default()));
+        let scripts = WorkspaceScriptRegistry::new();
+        let keep_awake = Arc::new(KeepAwakeManager::new(false));
+        let provider_catalogs = Arc::new(RwLock::new(None));
+        let hooks = crate::hooks::HooksEngine::new(dir.clone());
+        let orch = AgentOrchestrator::new(
+            dir.clone(),
+            "host_test".into(),
+            "tok_test".into(),
+            listen_port,
+            orch_config,
+            store.clone(),
+            scripts,
+            keep_awake,
+            provider_catalogs,
+            hooks,
+        )
+        .await;
+        (dir, store, orch)
+    }
+
+    fn mk_spec(
+        cwd: &Path,
+        provider: ProviderKind,
+        model: Option<&str>,
+        profile_id: Option<&str>,
+        fast_mode: Option<bool>,
+    ) -> CreateAgentSpec {
+        CreateAgentSpec {
+            cwd: cwd.to_string_lossy().to_string(),
+            extra_dirs: Vec::new(),
+            title: Some("Test Agent".into()),
+            provider,
+            model: model.map(ToOwned::to_owned),
+            effort: None,
+            fast_mode,
+            mode: SessionMode::AcceptEdits,
+            initial_prompt: String::new(),
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree: false,
+            workspace_id: None,
+            parent_agent_id: None,
+            parent_host_id: None,
+            profile_id: profile_id.map(ToOwned::to_owned),
+            background: false,
+            auto_archive: false,
+            base_ref: None,
+            worktree_mode: WorktreeCreateMode::BranchOff,
+            branch: None,
+            pr_number: None,
+            handle: None,
+            auto_cluster: Some(false),
+            acp_agent_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_agent_explicit_false_overrides_fast_profile_and_gates_capability() {
+        let (dir, store, orch) = test_orchestrator("create_override").await;
+        let now = Utc::now();
+        store
+            .upsert_profile(&orbit_protocol::AgentProfile {
+                profile_id: "prof_fast".into(),
+                name: "Fast Opus".into(),
+                provider: ProviderKind::ClaudeCode,
+                acp_agent_id: None,
+                model: Some("claude-opus-4-6".into()),
+                effort: Some(ReasoningEffort::High),
+                fast_mode: true,
+                mode: SessionMode::AcceptEdits,
+                when_to_use: "Fast coding".into(),
+                system_prompt_append: None,
+                mcp_policy: orbit_protocol::McpToolPolicy::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("save profile");
+
+        // 1. Explicit `Some(false)` overrides `profile.fast_mode == true`
+        let ag_override = orch
+            .create_and_start_agent(mk_spec(
+                &dir,
+                ProviderKind::ClaudeCode,
+                None,
+                Some("prof_fast"),
+                Some(false),
+            ))
+            .await
+            .expect("create with explicit false");
+        assert!(
+            !ag_override.fast_mode,
+            "explicit fast_mode=Some(false) must override profile.fast_mode=true"
+        );
+        let persisted = store
+            .get_agent(&ag_override.agent_id)
+            .expect("get")
+            .expect("exists");
+        assert!(!persisted.fast_mode);
+
+        // 2. `None` inherits `profile.fast_mode == true` on a fast-capable model
+        let ag_inherit = orch
+            .create_and_start_agent(mk_spec(
+                &dir,
+                ProviderKind::ClaudeCode,
+                None,
+                Some("prof_fast"),
+                None,
+            ))
+            .await
+            .expect("create inheriting profile fast_mode");
+        assert!(
+            ag_inherit.fast_mode,
+            "fast_mode=None must inherit profile.fast_mode=true"
+        );
+
+        // 3. `None` inheriting fast profile while overridden to unsupported model clamps to `false`
+        let ag_clamped = orch
+            .create_and_start_agent(mk_spec(
+                &dir,
+                ProviderKind::ClaudeCode,
+                Some("claude-sonnet-4-6"),
+                Some("prof_fast"),
+                None,
+            ))
+            .await
+            .expect("create clamped to false on unsupported model");
+        assert!(
+            !ag_clamped.fast_mode,
+            "inherited profile fast_mode must clamp to false on unsupported model"
+        );
+
+        // 4. Explicit `Some(true)` on an unsupported model returns an actionable error
+        let err = orch
+            .create_and_start_agent(mk_spec(
+                &dir,
+                ProviderKind::ClaudeCode,
+                Some("claude-haiku-4-5"),
+                None,
+                Some(true),
+            ))
+            .await
+            .expect_err("explicit fast_mode=true on haiku must be rejected");
+        assert!(
+            err.to_string().contains("Fast mode is not supported"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn model_and_provider_switches_enforce_fast_mode_capability() {
+        let (dir, store, orch) = test_orchestrator("capability_switch").await;
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_cap".into(),
+                title: "Cap".into(),
+                cwd: dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let ag = AgentSummary {
+            agent_id: "ag_cap".into(),
+            workspace_id: "ws_cap".into(),
+            cwd: dir.to_string_lossy().to_string(),
+            title: "Cap Agent".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("claude-opus-4-6".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: true,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: Some("lead".into()),
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+        store.upsert_agent(&ag, None).expect("seed agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<DriverCommand>(16);
+        let done_notify = Arc::new(tokio::sync::Notify::new());
+        done_notify.notify_one();
+        let dummy_task = tokio::spawn(std::future::pending::<()>());
+        orch.live_agents.write().await.insert(
+            "ag_cap".into(),
+            LiveAgentEntry {
+                generation: 1,
+                cmd_tx,
+                done_notify,
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        // 1. `update_agent` switching to non-fast model auto-clears fast_mode in DB + live driver
+        let updated = orch
+            .update_agent(
+                "ag_cap",
+                None,
+                Some("claude-sonnet-4-6".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("update_agent to sonnet");
+        assert!(!updated.fast_mode);
+        let cmd = cmd_rx.try_recv().expect("driver SetConfig on update_agent");
+        assert!(matches!(
+            cmd,
+            DriverCommand::SetConfig {
+                model: Some(ref m),
+                fast_mode: Some(false),
+                ..
+            } if m == "claude-sonnet-4-6"
+        ));
+
+        // 2. `update_agent` rejects explicit `fast_mode: Some(true)` on non-fast model
+        let err = orch
+            .update_agent(
+                "ag_cap",
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("explicit fast_mode=true on sonnet must fail");
+        assert!(err.to_string().contains("Fast mode is not supported"));
+
+        // 3. Re-enable fast_mode on opus, then `set_agent_config` to haiku clears DB + sends Some(false)
+        let re_enabled = orch
+            .update_agent(
+                "ag_cap",
+                None,
+                Some("claude-opus-4-6".into()),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("re-enable fast_mode on opus");
+        assert!(re_enabled.fast_mode);
+        let _ = cmd_rx.try_recv();
+
+        orch.set_agent_config(
+            "ag_cap",
+            Some("claude-haiku-4-5".into()),
+            Some(ReasoningEffort::Low),
+        )
+        .await
+        .expect("set_agent_config");
+        assert!(
+            !store
+                .get_agent("ag_cap")
+                .expect("get")
+                .expect("some")
+                .fast_mode
+        );
+        let cmd2 = cmd_rx
+            .try_recv()
+            .expect("driver SetConfig on set_agent_config");
+        assert!(matches!(
+            cmd2,
+            DriverCommand::SetConfig {
+                model: Some(ref m),
+                fast_mode: Some(false),
+                ..
+            } if m == "claude-haiku-4-5"
+        ));
+
+        // 4. Re-enable fast_mode on opus, then `set_agent_model` to sonnet clears DB + sends Some(false)
+        orch.update_agent(
+            "ag_cap",
+            None,
+            Some("claude-opus-4-6".into()),
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("re-enable on opus");
+        let _ = cmd_rx.try_recv();
+
+        orch.set_agent_model("ag_cap", Some("claude-sonnet-4-6".into()))
+            .await
+            .expect("set_agent_model");
+        assert!(
+            !store
+                .get_agent("ag_cap")
+                .expect("get")
+                .expect("some")
+                .fast_mode
+        );
+        let cmd3 = cmd_rx
+            .try_recv()
+            .expect("driver SetConfig on set_agent_model");
+        assert!(matches!(
+            cmd3,
+            DriverCommand::SetConfig {
+                model: Some(ref m),
+                fast_mode: Some(false),
+                ..
+            } if m == "claude-sonnet-4-6"
+        ));
+
+        // 5. Re-enable fast_mode on opus, then `switch_agent_provider` to Codex `gpt-oss-120b` clears fast_mode
+        orch.update_agent(
+            "ag_cap",
+            None,
+            Some("claude-opus-4-6".into()),
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("re-enable on opus");
+        let _ = cmd_rx.try_recv();
+
+        orch.switch_agent_provider(
+            "ag_cap",
+            ProviderKind::Codex,
+            Some("gpt-oss-120b".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("switch_agent_provider");
+        let switched = store.get_agent("ag_cap").expect("get").expect("some");
+        assert_eq!(switched.provider, ProviderKind::Codex);
+        assert!(!switched.fast_mode);
+        let cmd4 = cmd_rx
+            .try_recv()
+            .expect("driver SetConfig on switch_agent_provider");
+        assert!(matches!(
+            cmd4,
+            DriverCommand::SetConfig {
+                fast_mode: Some(false),
+                ..
+            }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_local_to_worktree_handoff_creates_worktree_moves_changes_and_cleans_local()
+     {
+        let root = std::env::temp_dir().join(format!("orbit_mgr_handoff_{}", Uuid::new_v4()));
+        let repo_dir = root.join("demo-repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "core.autocrlf", "false"],
+            vec!["config", "user.email", "test@orbit.local"],
+            vec!["config", "user.name", "Orbit Test"],
+        ] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git init/config");
+            assert!(st.success());
+        }
+        std::fs::write(repo_dir.join("main.rs"), "fn main() {}\n").expect("write main.rs");
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "init"]] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git commit");
+            assert!(st.success());
+        }
+
+        let (home_dir, _store, orch) = test_orchestrator("handoff").await;
+        let local_ws = orch
+            .ensure_workspace(repo_dir.to_str().expect("utf8"), None, None, None)
+            .await
+            .expect("ensure local workspace");
+
+        // Create staged + unstaged + untracked edits in local checkout
+        std::fs::write(
+            repo_dir.join("main.rs"),
+            "fn main() { println!(\"moved\"); }\n",
+        )
+        .expect("edit main");
+        let st_add = tokio::process::Command::new("git")
+            .args(["add", "main.rs"])
+            .current_dir(&repo_dir)
+            .status()
+            .await
+            .expect("git add");
+        assert!(st_add.success());
+        std::fs::write(repo_dir.join("extra.txt"), "untracked-note\n").expect("write extra");
+
+        // Preview Local -> New worktree
+        let preview = orch
+            .preview_worktree_handoff(
+                &local_ws.workspace_id,
+                WorktreeHandoffDirection::LocalToWorktree,
+                None,
+                false,
+            )
+            .await
+            .expect("preview");
+        assert!(preview.can_apply_cleanly);
+        assert_eq!(preview.files.len(), 2);
+
+        // Reject flag-injection branch name upfront
+        let bad = orch
+            .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                workspace_id: local_ws.workspace_id.clone(),
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                target_workspace_id: None,
+                include_committed: false,
+                branch: Some("--bad-branch".into()),
+                allow_three_way_conflicts: false,
+            })
+            .await;
+        assert!(bad.is_err());
+
+        // Execute Local -> New worktree Move
+        let outcome = orch
+            .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                workspace_id: local_ws.workspace_id.clone(),
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                target_workspace_id: None,
+                include_committed: false,
+                branch: Some("feat/from-local".into()),
+                allow_three_way_conflicts: false,
+            })
+            .await
+            .expect("execute move to new worktree");
+
+        assert_eq!(outcome.applied_files, 2);
+        assert!(outcome.backup_ref.is_some());
+        let new_ws = outcome.target_workspace.expect("created target workspace");
+        assert!(new_ws.is_worktree);
+        assert_eq!(new_ws.git_branch.as_deref(), Some("feat/from-local"));
+
+        // Verify new worktree has both files
+        let wt_path = PathBuf::from(&new_ws.cwd);
+        assert_eq!(
+            std::fs::read_to_string(wt_path.join("main.rs")).expect("wt main"),
+            "fn main() { println!(\"moved\"); }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt_path.join("extra.txt")).expect("wt extra"),
+            "untracked-note\n"
+        );
+
+        // Verify local checkout is clean
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.join("main.rs")).expect("local main"),
+            "fn main() {}\n"
+        );
+        assert!(!repo_dir.join("extra.txt").exists());
+        let status = inspect_git_status(&repo_dir).await;
+        assert!(status.files.is_empty(), "local checkout must be clean");
+
+        orch.shutdown_worktree_pool().await;
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_local_to_worktree_failure_rolls_back_worktree_and_branch() {
+        let root = std::env::temp_dir().join(format!("orbit_mgr_handoff_rb_{}", Uuid::new_v4()));
+        let repo_dir = root.join("demo-repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "core.autocrlf", "false"],
+            vec!["config", "user.email", "test@orbit.local"],
+            vec!["config", "user.name", "Orbit Test"],
+        ] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git init/config");
+            assert!(st.success());
+        }
+        std::fs::write(repo_dir.join("main.rs"), "fn main() { /* v1 */ }\n")
+            .expect("write main.rs");
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "init"]] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git commit");
+            assert!(st.success());
+        }
+
+        // Trigger a genuine post-provision conflict: `.worktreeinclude` copies modified `main.rs`
+        // into the freshly created worktree, causing `git apply` of the `HEAD -> modified` diff
+        // to fail cleanly inside `execute_worktree_handoff_paths`.
+        std::fs::write(repo_dir.join(".worktreeinclude"), "main.rs\n")
+            .expect("write .worktreeinclude");
+        std::fs::write(
+            repo_dir.join("main.rs"),
+            "fn main() { println!(\"v2-dirty\"); }\n",
+        )
+        .expect("modify main.rs");
+
+        let (home_dir, store, orch) = test_orchestrator("handoff_rollback").await;
+        let local_ws = orch
+            .ensure_workspace(repo_dir.to_str().expect("utf8"), None, None, None)
+            .await
+            .expect("ensure local workspace");
+
+        let err = orch
+            .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                workspace_id: local_ws.workspace_id.clone(),
+                direction: WorktreeHandoffDirection::LocalToWorktree,
+                mode: WorktreeHandoffMode::Move,
+                target_workspace_id: None,
+                include_committed: false,
+                branch: Some("feat/rollback-branch".into()),
+                allow_three_way_conflicts: false,
+            })
+            .await
+            .expect_err("must fail due to post-provision patch conflict");
+        assert!(err.to_string().contains("handoff_conflict"));
+
+        // 1. No active worktree workspace left in store
+        let active_ws = store
+            .list_workspaces_filtered(false, true)
+            .expect("list active ws");
+        assert!(
+            active_ws.iter().all(|w| !w.is_worktree),
+            "orphaned worktree workspace must be archived on rollback"
+        );
+
+        // 2. Newly created branch MUST be deleted on rollback
+        let branch_check = tokio::process::Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feat/rollback-branch",
+            ])
+            .current_dir(&repo_dir)
+            .status()
+            .await
+            .expect("show-ref");
+        assert!(
+            !branch_check.success(),
+            "newly created branch `feat/rollback-branch` must be deleted on rollback"
+        );
+
+        // 3. No linked worktree directory remains in `git worktree list`
+        let wt_list = tokio::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&repo_dir)
+            .output()
+            .await
+            .expect("worktree list");
+        let wt_text = String::from_utf8_lossy(&wt_list.stdout);
+        assert!(
+            !wt_text.contains("feat/rollback-branch"),
+            "orphaned worktree must be removed: {wt_text}"
+        );
+
+        // 4. Local dirty changes were NEVER reset
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.join("main.rs")).expect("local main intact"),
+            "fn main() { println!(\"v2-dirty\"); }\n"
+        );
+
+        orch.shutdown_worktree_pool().await;
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sanitize_timeline_payload_caps_oversized_file_edit_diff() {
+        let mut giant = String::from("--- a/huge.rs\n+++ b/huge.rs\n@@ -1,1 +1,1500 @@\n");
+        for i in 0..1500 {
+            giant.push_str(&format!(
+                "+let line_{i} = \"payload_padding_0123456789\";\n"
+            ));
+        }
+        assert!(giant.len() > orbit_providers::MAX_UNIFIED_DIFF_BYTES);
+        let mut payload = TimelinePayload::ToolCall {
+            call_id: "c_big".into(),
+            status: ToolCallStatus::Completed,
+            detail: ToolCallDetail::FileEdit {
+                path: "huge.rs".into(),
+                unified_diff: Some(giant),
+            },
+            background_task: None,
+        };
+        sanitize_timeline_payload(&mut payload);
+        match payload {
+            TimelinePayload::ToolCall {
+                detail: ToolCallDetail::FileEdit { unified_diff, .. },
+                ..
+            } => {
+                let d = unified_diff.expect("diff preserved");
+                assert!(d.len() <= orbit_providers::MAX_UNIFIED_DIFF_BYTES);
+                assert!(d.contains("diff truncated at 24 KB"));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn guardian_auto_resolve_suppresses_stale_awaiting_permission_and_mirrors_deny_fallback()
+    {
+        let home_dir = std::env::temp_dir().join(format!(
+            "orbit-guardian-mgr-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("create ws");
+        let store = Arc::new(OrbitStore::open_in_memory().expect("store"));
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_test".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            crate::hooks::HooksEngine::new(home_dir.clone()),
+        )
+        .await;
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_g1".into(),
+                title: "Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_g1".into(),
+                    workspace_id: "ws_g1".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Guardian Agent".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Auto,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        // 1. Live driver receives AutoAllow resolve, and trailing AwaitingPermission does NOT set Permission attention
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let agent_gen = orch.bump_generation("ag_g1").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_g1".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        orch.ingest_driver_event(
+            "ag_g1",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_low_1".into(),
+                title: "Run tests".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+            },
+        )
+        .await;
+        match cmd_rx.try_recv().expect("auto allow dispatched") {
+            DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "perm_low_1");
+                assert_eq!(decision, "allow");
+            }
+            other => panic!("unexpected driver command: {other:?}"),
+        }
+        // Trailing StatusChanged(AwaitingPermission) for the auto-resolved request must be suppressed
+        orch.ingest_driver_event(
+            "ag_g1",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::AwaitingPermission {
+                turn_id: "t1".into(),
+                request_id: "perm_low_1".into(),
+            }),
+        )
+        .await;
+        let ag_after = store.get_agent("ag_g1").expect("get").expect("exists");
+        assert_eq!(ag_after.attention, AttentionState::None);
+
+        // 2. AutoDeny dispatch failure (no live driver) falls back to fail_closed RequireHuman
+        let _ = orch
+            .guardian
+            .update_config(orbit_protocol::GuardianPolicyConfig {
+                blocked_command_patterns: vec!["deny:cargo test".into()],
+                ..orbit_protocol::GuardianPolicyConfig::default()
+            })
+            .await
+            .expect("update cfg");
+        orch.live_agents.write().await.remove("ag_g1");
+        orch.ingest_driver_event(
+            "ag_g1",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_deny_fail".into(),
+                title: "Run tests".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+            },
+        )
+        .await;
+        let pending = orch.list_pending_permissions(Some("ag_g1")).await;
+        assert_eq!(pending.len(), 1);
+        let assess = pending[0]
+            .guardian_assessment
+            .as_ref()
+            .expect("guardian assessment attached");
+        assert_eq!(
+            assess.decision,
+            orbit_protocol::GuardianDecision::RequireHuman
+        );
+        assert_eq!(assess.classifier_tier, "fail_closed");
+
+        let _ = std::fs::remove_dir_all(&home_dir);
     }
 }

@@ -940,9 +940,16 @@ export function StreamStage() {
     prevScrollHeight: number;
     prevScrollTop: number;
   } | null>(null);
-  const prevWindowStartRef = useRef<{ scope: string | null; windowStart: number }>({
+  const prevWindowStartRef = useRef<{
+    scope: string | null;
+    windowStart: number;
+    firstTurnKey: string | null;
+    turnCount: number;
+  }>({
     scope: null,
     windowStart: 0,
+    firstTurnKey: null,
+    turnCount: 0,
   });
   const jumpEarlierAttemptedNonceRef = useRef<number | null>(null);
   const [imagePreviewTarget, setImagePreviewTarget] =
@@ -968,9 +975,17 @@ export function StreamStage() {
   const bootstrapError = useOrbitSelector((s) => s.bootstrapError);
 
   const stageTurns = stageView?.turns ?? EMPTY_TURNS;
+  const firstTurnKey = stageTurns[0]?.key ?? null;
+  const firstTurnKeyRef = useRef(firstTurnKey);
+  firstTurnKeyRef.current = firstTurnKey;
+  const turnsLengthRef = useRef(stageTurns.length);
+  turnsLengthRef.current = stageTurns.length;
   const windowStartTurnIndex = Math.max(0, stageView?.window_start_turn_index ?? 0);
   const windowStartTurnIndexRef = useRef(windowStartTurnIndex);
   windowStartTurnIndexRef.current = windowStartTurnIndex;
+  const hasOlderHistory = Boolean(stageView?.has_older_history);
+  const hasOlderHistoryRef = useRef(hasOlderHistory);
+  hasOlderHistoryRef.current = hasOlderHistory;
   const stageRevisionRef = useRef(stageView?.revision ?? 0);
   stageRevisionRef.current = stageView?.revision ?? 0;
   const activeHostIdRef = useRef(selectedHostId);
@@ -1299,12 +1314,14 @@ export function StreamStage() {
       const agentId = activeAgentIdRef.current;
       const scope = activeSessionScopeRef.current;
       const curWindowStart = windowStartTurnIndexRef.current;
-      if (!hostId || !agentId || !scope || curWindowStart <= 0 || loadingEarlierTurnsRef.current) {
+      const canLoadOlder = curWindowStart > 0 || hasOlderHistoryRef.current;
+      if (!hostId || !agentId || !scope || !canLoadOlder || loadingEarlierTurnsRef.current) {
         return;
       }
       const curRev = stageRevisionRef.current;
       const exhausted = exhaustedEarlierWindowRef.current;
       if (
+        curWindowStart > 0 &&
         targetTurnIndex === undefined &&
         exhausted &&
         exhausted.scope === scope &&
@@ -1332,7 +1349,7 @@ export function StreamStage() {
           if (earlierLoadReqIdRef.current !== reqId) return;
           if (loadedCount === 0) {
             pendingTurnPrependRef.current = null;
-            if (targetTurnIndex === undefined) {
+            if (targetTurnIndex === undefined && curWindowStart > 0) {
               exhaustedEarlierWindowRef.current = {
                 scope,
                 windowStart: curWindowStart,
@@ -1344,7 +1361,7 @@ export function StreamStage() {
         .catch(() => {
           if (earlierLoadReqIdRef.current !== reqId) return;
           pendingTurnPrependRef.current = null;
-          if (targetTurnIndex === undefined) {
+          if (targetTurnIndex === undefined && curWindowStart > 0) {
             exhaustedEarlierWindowRef.current = {
               scope,
               windowStart: curWindowStart,
@@ -1417,7 +1434,7 @@ export function StreamStage() {
       !stickToBottomRef.current &&
       !programmaticScrollRef.current &&
       currentTop < STAGE_TOP_PAGINATE_THRESHOLD_PX &&
-      windowStartTurnIndexRef.current > 0
+      (windowStartTurnIndexRef.current > 0 || hasOlderHistoryRef.current)
     ) {
       triggerLoadEarlierTurns(undefined, true);
     }
@@ -1467,7 +1484,11 @@ export function StreamStage() {
     if (bottomSyncRafRef.current !== null) return;
     bottomSyncRafRef.current = window.requestAnimationFrame(() => {
       bottomSyncRafRef.current = null;
-      if (stickToBottomRef.current && !programmaticScrollRef.current) {
+      if (
+        stickToBottomRef.current &&
+        !programmaticScrollRef.current &&
+        !loadingEarlierTurnsRef.current
+      ) {
         snapScrollerToBottom();
       }
       syncScrollMetrics();
@@ -1498,11 +1519,14 @@ export function StreamStage() {
         }
         if (
           el.scrollTop < STAGE_TOP_PAGINATE_THRESHOLD_PX &&
-          windowStartTurnIndexRef.current > 0
+          (windowStartTurnIndexRef.current > 0 || hasOlderHistoryRef.current)
         ) {
           triggerLoadEarlierTurns(undefined, true);
         }
       }
+    };
+    const onTouchStart = () => {
+      sessionEntryLockUntilRef.current = 0;
     };
     const onPointerDown = (e: PointerEvent) => {
       const rect = el.getBoundingClientRect();
@@ -1510,11 +1534,21 @@ export function StreamStage() {
         sessionEntryLockUntilRef.current = 0;
       }
     };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") {
+        sessionEntryLockUntilRef.current = 0;
+        stickToBottomRef.current = false;
+      }
+    };
     el.addEventListener("wheel", onPassiveWheel, { passive: true });
+    el.addEventListener("touchstart", onTouchStart, { passive: true });
     el.addEventListener("pointerdown", onPointerDown, { passive: true });
+    el.addEventListener("keydown", onKeyDown);
     return () => {
       el.removeEventListener("wheel", onPassiveWheel);
+      el.removeEventListener("touchstart", onTouchStart);
       el.removeEventListener("pointerdown", onPointerDown);
+      el.removeEventListener("keydown", onKeyDown);
     };
   }, [isDraft, selectedHostId, selectedAgentId, triggerLoadEarlierTurns]);
 
@@ -1534,7 +1568,11 @@ export function StreamStage() {
       lastClientHeight = ch;
 
       if (heightChanged) {
-        if (stickToBottomRef.current && !programmaticScrollRef.current) {
+        const distanceFromBottom = Math.max(0, sh - scrollerEl.scrollTop - ch);
+        const allowSnap =
+          !loadingEarlierTurnsRef.current &&
+          (performance.now() < sessionEntryLockUntilRef.current || distanceFromBottom <= 120);
+        if (stickToBottomRef.current && !programmaticScrollRef.current && allowSnap) {
           snapScrollerToBottom();
         }
         scheduleBottomSync();
@@ -1690,6 +1728,8 @@ export function StreamStage() {
     prevWindowStartRef.current = {
       scope: activeSessionScope,
       windowStart: windowStartTurnIndexRef.current,
+      firstTurnKey: firstTurnKeyRef.current,
+      turnCount: turnsLengthRef.current,
     };
 
     if (!activeSessionScope) {
@@ -1724,7 +1764,7 @@ export function StreamStage() {
       setHighlightedTurnKey(null);
     }
     stickToBottomRef.current = !isTargetedJump;
-    sessionEntryLockUntilRef.current = isTargetedJump ? 0 : performance.now() + 600;
+    sessionEntryLockUntilRef.current = isTargetedJump ? 0 : performance.now() + 200;
     lastObservedScrollTopRef.current = 0;
     prevTurnsCountRef.current = turnsCountRef.current;
     scrollUiStore.update({
@@ -1776,11 +1816,18 @@ export function StreamStage() {
     prevWindowStartRef.current = {
       scope: activeSessionScope,
       windowStart: windowStartTurnIndex,
+      firstTurnKey,
+      turnCount: stageTurns.length,
     };
+    const wirePrepended =
+      firstTurnKey !== null &&
+      prev.firstTurnKey !== null &&
+      firstTurnKey !== prev.firstTurnKey &&
+      stageTurns.length > prev.turnCount;
     if (
       !activeSessionScope ||
       prev.scope !== activeSessionScope ||
-      windowStartTurnIndex >= prev.windowStart
+      (windowStartTurnIndex >= prev.windowStart && !wirePrepended)
     ) {
       return;
     }
@@ -1808,7 +1855,7 @@ export function StreamStage() {
         holdActiveRef.current = false;
       };
     }
-  }, [activeSessionScope, windowStartTurnIndex, stageTurns.length, syncScrollMetrics]);
+  }, [activeSessionScope, windowStartTurnIndex, firstTurnKey, stageTurns.length, syncScrollMetrics]);
 
   useEffect(() => {
     if (!activeSessionScope || !pendingJumpTarget) return;
@@ -1821,7 +1868,7 @@ export function StreamStage() {
     if (stageTurns.length === 0) return;
 
     const firstLoadedAnchorSeq = stageTurns[0]?.anchor_seq ?? 0;
-    if (windowStartTurnIndex > 0 && pendingJumpTarget.seq < firstLoadedAnchorSeq) {
+    if ((windowStartTurnIndex > 0 || hasOlderHistory) && pendingJumpTarget.seq < firstLoadedAnchorSeq) {
       if (loadingEarlierTurns) {
         return;
       }
@@ -1915,6 +1962,7 @@ export function StreamStage() {
     pendingJumpTarget,
     stageTurns,
     windowStartTurnIndex,
+    hasOlderHistory,
     loadingEarlierTurns,
     stageView?.latest_seq,
     jumpFallbackNonce,

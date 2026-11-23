@@ -127,6 +127,7 @@ struct DiagramBlockView: View {
     @State private var showCode: Bool = false
     @State private var showFullscreen: Bool = false
     @State private var copied: Bool = false
+    @State private var isDiagramVisible: Bool = false
 
     private var kindTitle: String {
         switch kind {
@@ -238,14 +239,32 @@ struct DiagramBlockView: View {
             } else if !showCode, let rendered, rendered.error == nil, let svg = rendered.svg {
                 let ratio = max(0.35, min(3.0, CGFloat(rendered.width) / max(1.0, CGFloat(rendered.height))))
                 let maxInlineHeight = min(max(CGFloat(rendered.height) * 1.15, 140), 420)
-                OrbitSvgWebCanvas(svg: svg, isDark: palette.isDark, allowZoomScroll: false)
-                    .aspectRatio(ratio, contentMode: .fit)
-                    .frame(maxWidth: .infinity, maxHeight: maxInlineHeight)
-                    .padding(OrbitSpacing.xs)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        showFullscreen = true
+                Group {
+                    if isDiagramVisible {
+                        OrbitSvgWebCanvas(svg: svg, isDark: palette.isDark, allowZoomScroll: false)
+                    } else {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(palette.subtleFill.opacity(0.4))
+                            .overlay {
+                                Text("\(kindTitle) diagram")
+                                    .font(OrbitTypography.meta(.regular))
+                                    .foregroundStyle(palette.fgMuted)
+                            }
                     }
+                }
+                .aspectRatio(ratio, contentMode: .fit)
+                .frame(maxWidth: .infinity, maxHeight: maxInlineHeight)
+                .padding(OrbitSpacing.xs)
+                .contentShape(Rectangle())
+                .onAppear {
+                    isDiagramVisible = true
+                }
+                .onDisappear {
+                    isDiagramVisible = false
+                }
+                .onTapGesture {
+                    showFullscreen = true
+                }
             } else if isLoading && !showCode {
                 HStack(spacing: OrbitSpacing.sm) {
                     ProgressView()

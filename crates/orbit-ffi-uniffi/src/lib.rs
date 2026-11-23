@@ -3461,6 +3461,11 @@ pub struct FfiAgentStageDelta {
     pub insights: FfiSessionInsights,
     pub latest_seq: u64,
     pub reset: bool,
+    pub aux_revision: u64,
+    pub aux_unchanged: bool,
+    pub window_start_turn_index: u32,
+    pub has_older_turns: bool,
+    pub oldest_loaded_seq: u64,
 }
 
 impl From<AgentStageDeltaView> for FfiAgentStageDelta {
@@ -3478,6 +3483,11 @@ impl From<AgentStageDeltaView> for FfiAgentStageDelta {
             insights: v.insights.into(),
             latest_seq: v.latest_seq,
             reset: v.reset,
+            aux_revision: v.aux_revision,
+            aux_unchanged: v.aux_unchanged,
+            window_start_turn_index: v.window_start_turn_index,
+            has_older_turns: v.has_older_turns,
+            oldest_loaded_seq: v.oldest_loaded_seq,
         }
     }
 }
@@ -4611,6 +4621,9 @@ pub struct FfiAgentStageDeltaRequest {
     pub host_id: String,
     pub agent_id: String,
     pub since_revision: u64,
+    pub since_aux_revision: Option<u64>,
+    pub turn_limit: Option<u32>,
+    pub since_window_start_turn_index: Option<u32>,
 }
 
 impl From<FfiAgentStageDeltaRequest> for AgentStageDeltaRequest {
@@ -4619,7 +4632,9 @@ impl From<FfiAgentStageDeltaRequest> for AgentStageDeltaRequest {
             host_id: v.host_id,
             agent_id: v.agent_id,
             since_revision: v.since_revision,
-            since_aux_revision: None,
+            since_aux_revision: v.since_aux_revision,
+            turn_limit: v.turn_limit,
+            since_window_start_turn_index: v.since_window_start_turn_index,
         }
     }
 }
@@ -5504,6 +5519,14 @@ impl OrbitMobileCore {
             })
     }
 
+    pub fn apply_relay_to_fleet(&self, raw_relay_url: String) -> Result<u32, FfiOrbitError> {
+        self.inner
+            .apply_relay_to_fleet(&raw_relay_url)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_host_config(
         &self,
@@ -5637,6 +5660,29 @@ impl OrbitMobileCore {
 
     pub fn open_agent_timeline(&self, host_id: String, agent_id: String) {
         self.inner.open_agent_timeline(&host_id, &agent_id);
+    }
+
+    pub fn load_older_agent_timeline(
+        &self,
+        host_id: String,
+        agent_id: String,
+        limit_events: u32,
+    ) -> bool {
+        self.inner
+            .load_older_agent_timeline(&host_id, &agent_id, limit_events)
+    }
+
+    pub fn get_tool_call_diff(
+        &self,
+        host_id: String,
+        agent_id: String,
+        seq: u64,
+    ) -> Vec<FfiDiffFile> {
+        self.inner
+            .get_tool_call_diff(&host_id, &agent_id, seq)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     pub fn send_prompt(&self, host_id: String, agent_id: String, prompt: String) {
@@ -7133,6 +7179,9 @@ mod tests {
             host_id: "host_1".into(),
             agent_id: opt_id.clone(),
             since_revision: 0,
+            since_aux_revision: None,
+            turn_limit: None,
+            since_window_start_turn_index: None,
         });
         assert_eq!(delta0.host_id, "host_1");
         assert_eq!(delta0.total_turn_count, 1);

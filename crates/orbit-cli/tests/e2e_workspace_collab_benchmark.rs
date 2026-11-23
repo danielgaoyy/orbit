@@ -1348,3 +1348,342 @@ if __name__ == "__main__":
     let _ = tokio::task::spawn_blocking(move || drop(core)).await;
     drop(rt);
 }
+
+fn list_git_worktree_paths(repo: &Path) -> Vec<PathBuf> {
+    let out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .expect("git worktree list");
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "Live benchmark test invoking real claude, codex, agy CLIs"]
+async fn live_04_negotiate_non_blocking_worktree_isolation_and_alias_resilience() {
+    ensure_all_three_clis_installed();
+    orbit_shim::set_test_parent_pid_watchdog(Some(std::process::id()));
+
+    let started = Instant::now();
+    let since_ms = chrono::Utc::now().timestamp_millis();
+    let home = temp_dir("home_p4");
+    let repo = temp_dir("repo_p4");
+
+    let init_router = r#"def route(task: str) -> str:
+    return f"route:{task}"
+"#;
+    let init_perf = r#"def page_size() -> int:
+    return 0
+"#;
+    let init_app_test = r#"import unittest
+import router
+import perf
+
+
+class TestBaseline(unittest.TestCase):
+    def test_baseline(self) -> None:
+        self.assertEqual(router.route("ping"), "route:ping")
+        self.assertIsInstance(perf.page_size(), int)
+
+
+if __name__ == "__main__":
+    unittest.main()
+"#;
+    init_git_repo(
+        &repo,
+        &[
+            ("router.py", init_router),
+            ("perf.py", init_perf),
+            ("test_app.py", init_app_test),
+        ],
+        "initial repo",
+    );
+
+    // Pre-seed uncommitted Track 1 edits on `main` (reproducing dirty main checkout before Track 2 arrives).
+    std::fs::write(
+        repo.join("router.py"),
+        r#"def route(task: str) -> str:
+    return f"route:{task}"
+
+
+def discover_hosts() -> list[str]:
+    return ["local"]
+"#,
+    )
+    .expect("write dirty track 1 router.py");
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("spawn daemon");
+    let uri = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("pairing offer")
+        .to_qr_uri()
+        .expect("pair uri");
+    let (core, host_id) = open_and_connect(home.join("client.db"), uri).await;
+
+    let repo_str = repo.to_string_lossy().to_string();
+    let ws_id = create_curated_workspace_and_wait(
+        &rt,
+        &core,
+        &host_id,
+        &repo,
+        "Parallel Release Order & Worktree Isolation",
+        "Negotiate v0.9.5 before v0.10.0, self-isolate onto a worktree without stalling, and preserve handle aliases",
+    )
+    .await;
+
+    // Spawn BOTH peers in the SAME local `main` directory (zero initial worktree isolation).
+    core.spawn_workspace_peer(SpawnWorkspacePeerRequest {
+        host_id: host_id.clone(),
+        workspace_id: ws_id.clone(),
+        cwd: repo_str.clone(),
+        extra_dirs: Vec::new(),
+        provider: ProviderKind::Antigravity,
+        acp_agent_id: None,
+        model: None,
+        effort: None,
+        fast_mode: None,
+        mode: SessionMode::FullAccess,
+        initial_prompt: "You are `@router` (Track 1, targeting `v0.10.0`). You already have uncommitted `v0.10.0` edits (`discover_hosts`) in `router.py` on `main` in this checkout. Your task for this turn is to finish `router.py` by adding `ROUTER_VERSION = \"0.10.0\"` (preserving `route` and `discover_hosts`) and add `test_router.py` (`unittest`) testing `discover_hosts()` and `ROUTER_VERSION`, then run `python3 -m unittest discover -v`. A sibling peer (`@initial-perf`, Track 2) just joined for an urgent `v0.9.5` task (`perf.py`). Coordinate release order via `message_peer` / `workspace_board` (confirming `v0.9.5` ships first and `v0.10.0` rebases after), do NOT block or stall if not hard-blocked, and keep your `router.py` changes clean on Track 1.".into(),
+        worktree_branch: None,
+        handle: Some("router".into()),
+        profile_id: None,
+    });
+
+    core.spawn_workspace_peer(SpawnWorkspacePeerRequest {
+        host_id: host_id.clone(),
+        workspace_id: ws_id.clone(),
+        cwd: repo_str.clone(),
+        extra_dirs: Vec::new(),
+        provider: ProviderKind::Antigravity,
+        acp_agent_id: None,
+        model: None,
+        effort: None,
+        fast_mode: None,
+        mode: SessionMode::FullAccess,
+        initial_prompt: "You are the Track 2 (`v0.9.5`) performance engineer. The user needs you to implement an urgent `v0.9.5` fix FIRST: update `perf.py` so `page_size()` returns `50` and create `test_perf.py` (`unittest`) asserting `page_size() == 50`. Notice `@router` currently has uncommitted `v0.10.0` edits on `main` in this shared checkout. Align release order (`v0.9.5` before `v0.10.0`) with `@router` via `message_peer` and `workspace_board`, decide whether you are hard-blocked or can work in parallel, and self-isolate onto a dedicated git worktree (e.g. `orbit_agent(action=\"fork\", worktree=true, branch=\"feat/v095-perf\", initial_prompt=...)` or `spawn_workspace_peer(worktree=true, branch=\"feat/v095-perf\", ...)`) rather than editing or freezing on `main`, so your Track 2 work finishes and passes `python3 -m unittest discover -v` inside that isolated worktree without touching `@router`'s dirty `router.py` on `main`.".into(),
+        worktree_branch: None,
+        handle: Some("initial-perf".into()),
+        profile_id: None,
+    });
+
+    wait_for_agents_registered(
+        &rt,
+        &ws_id,
+        &["router", "initial-perf"],
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // Simulate mid-flight background rename (`@initial-perf` -> `@perf-opt`) while `@router` may still address `@initial-perf`.
+    let perf_peer = rt
+        .store
+        .list_agents_filtered(Some(&ws_id), false, false, None)
+        .expect("list peers")
+        .into_iter()
+        .find(|a| a.handle.as_deref() == Some("initial-perf"))
+        .expect("initial-perf registered");
+    let renamed = rt
+        .store
+        .set_agent_handle(&perf_peer.agent_id, Some("perf-opt"))
+        .expect("rename perf peer")
+        .expect("perf peer exists");
+    assert_eq!(renamed.handle.as_deref(), Some("perf-opt"));
+    assert_eq!(
+        renamed
+            .labels
+            .get(orbit_store::LABEL_HANDLE_ALIASES)
+            .map(String::as_str),
+        Some("initial-perf")
+    );
+    let alias_resolved = rt
+        .orchestrator
+        .resolve_peer_in_workspace(&ws_id, "@initial-perf")
+        .expect("resolve historical alias")
+        .expect("peer found via alias");
+    assert_eq!(alias_resolved.agent_id, perf_peer.agent_id);
+
+    // Wait until ALL active peers in the Mission Workspace (including any newly forked/spawned worktree peer)
+    // settle cleanly and stay settled across the 2.5s coalescing delivery window.
+    let quiet_streak = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let all_settled = wait_until(Duration::from_secs(420), || {
+        let store = rt.store.clone();
+        let wid = ws_id.clone();
+        let streak = Arc::clone(&quiet_streak);
+        async move {
+            let Ok(list) = store.list_agents_filtered(Some(&wid), false, false, None) else {
+                streak.store(0, std::sync::atomic::Ordering::SeqCst);
+                return false;
+            };
+            if list.len() < 2 {
+                streak.store(0, std::sync::atomic::Ordering::SeqCst);
+                return false;
+            }
+            let ready = list.iter().all(|a| {
+                a.latest_seq > 0
+                    && matches!(
+                        a.status,
+                        AgentStatus::Idle | AgentStatus::Error { .. } | AgentStatus::Closed
+                    )
+            });
+            if !ready {
+                streak.store(0, std::sync::atomic::Ordering::SeqCst);
+                return false;
+            }
+            streak.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= 5
+        }
+    })
+    .await;
+    assert!(
+        all_settled,
+        "Timed out waiting for all peers in `{ws_id}` to settle: [{}]",
+        format_workspace_agents_diag(&rt, Some(&ws_id))
+    );
+
+    let all_peers = rt
+        .store
+        .list_agents_filtered(Some(&ws_id), false, false, None)
+        .expect("final peers");
+    for p in &all_peers {
+        if let AgentStatus::Error { ref message, .. } = p.status {
+            panic!(
+                "Peer @{} ({}) ended in Error: {message}",
+                p.handle.as_deref().unwrap_or("peer"),
+                p.agent_id
+            );
+        }
+    }
+
+    let worktree_paths = list_git_worktree_paths(&repo);
+    let canonical_repo = std::fs::canonicalize(&*repo).unwrap_or_else(|_| repo.to_path_buf());
+    let isolated_worktrees: Vec<PathBuf> = worktree_paths
+        .iter()
+        .filter(|p| std::fs::canonicalize(p).unwrap_or_else(|_| (*p).clone()) != canonical_repo)
+        .cloned()
+        .collect();
+    let wt_peers: Vec<&AgentSummary> = all_peers
+        .iter()
+        .filter(|a| {
+            std::fs::canonicalize(&a.cwd).unwrap_or_else(|_| PathBuf::from(&a.cwd))
+                != canonical_repo
+                || a.labels.contains_key("orbit.worktree_branch")
+        })
+        .collect();
+
+    println!(
+        "[LIVE P4] peers_in_ws={} wt_peers={} git_worktrees={:?}",
+        all_peers.len(),
+        wt_peers.len(),
+        isolated_worktrees
+    );
+    for p in &all_peers {
+        println!(
+            "  - @{} ({}) cwd={} branch={:?} reply={}",
+            p.handle.as_deref().unwrap_or("peer"),
+            p.agent_id,
+            p.cwd,
+            p.labels.get("orbit.worktree_branch"),
+            rt.store
+                .last_assistant_message_text(&p.agent_id)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .chars()
+                .take(180)
+                .collect::<String>()
+                .replace('\n', " ")
+        );
+    }
+
+    assert!(
+        !isolated_worktrees.is_empty() && !wt_peers.is_empty(),
+        "Expected Track 2 (or Track 1) to autonomously isolate onto a git worktree inside the SAME Mission Workspace `{ws_id}`! peers=[{}], worktrees={worktree_paths:?}",
+        format_workspace_agents_diag(&rt, Some(&ws_id))
+    );
+    assert!(
+        wt_peers.iter().all(|p| p.workspace_id == ws_id),
+        "Worktree-isolated peer must remain in Mission Workspace `{ws_id}`"
+    );
+
+    // Verify Track 1 (`router.py` + `test_router.py`) progressed without stalling or losing dirty edits.
+    let main_router_py =
+        std::fs::read_to_string(repo.join("router.py")).expect("read main router.py");
+    assert!(
+        main_router_py.contains("def discover_hosts") && main_router_py.contains("ROUTER_VERSION"),
+        "Track 1 router.py on main must preserve `discover_hosts` and add `ROUTER_VERSION`:\n{main_router_py}"
+    );
+    assert!(
+        repo.join("test_router.py").is_file(),
+        "Track 1 test_router.py must be created without stalling"
+    );
+    let (t1_ok, t1_out) = run_python_unittest(&repo);
+    assert!(t1_ok, "Track 1 main unit tests must pass:\n{t1_out}");
+
+    // Verify Track 2 (`perf.py` + `test_perf.py`) progressed cleanly in its isolated worktree checkout.
+    let wt_dir = wt_peers
+        .first()
+        .map(|p| PathBuf::from(&p.cwd))
+        .unwrap_or_else(|| isolated_worktrees[0].clone());
+    let wt_perf_py = std::fs::read_to_string(wt_dir.join("perf.py")).expect("read wt perf.py");
+    assert!(
+        wt_perf_py.contains("50"),
+        "Track 2 perf.py in isolated worktree `{}` must return 50:\n{wt_perf_py}",
+        wt_dir.display()
+    );
+    assert!(
+        wt_dir.join("test_perf.py").is_file(),
+        "Track 2 test_perf.py must exist in isolated worktree `{}`",
+        wt_dir.display()
+    );
+    let (t2_ok, t2_out) = run_python_unittest(&wt_dir);
+    assert!(
+        t2_ok,
+        "Track 2 isolated worktree unit tests must pass:\n{t2_out}"
+    );
+
+    // Verify negotiation events & zero handle-alias resolution failures.
+    let ws_events = rt
+        .store
+        .list_workspace_events(&ws_id, 200)
+        .expect("ws events");
+    let peer_msgs = ws_events
+        .iter()
+        .filter(|e| e.kind == WorkspaceEventKind::PeerMessage)
+        .count();
+    let board_updates = ws_events
+        .iter()
+        .filter(|e| e.kind == WorkspaceEventKind::BoardUpdated)
+        .count();
+    assert!(
+        peer_msgs >= 1 && board_updates >= 1,
+        "Expected peer negotiation via message_peer ({peer_msgs}) and workspace_board ({board_updates})"
+    );
+
+    // Re-verify historical alias lookup still resolves after full multi-agent turns.
+    let post_alias = rt
+        .orchestrator
+        .resolve_peer_in_workspace(&ws_id, "@initial-perf")
+        .expect("post alias lookup")
+        .expect("peer still resolvable via historical alias");
+    assert_eq!(post_alias.agent_id, perf_peer.agent_id);
+
+    print_collab_and_cache_scorecard(
+        "live_04_negotiate_non_blocking_worktree_isolation_and_alias_resilience",
+        &rt,
+        &ws_id,
+        since_ms,
+        started.elapsed(),
+    )
+    .await;
+
+    let _ = tokio::task::spawn_blocking(move || drop(core)).await;
+    drop(rt);
+}

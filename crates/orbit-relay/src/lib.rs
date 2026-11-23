@@ -50,6 +50,8 @@ const MAX_CONCURRENT_TUNNEL_ATTACHES: usize = 128;
 const TUNNEL_ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Body returned by `GET /v1/daemon/probe` on HTTP 200 so clients can confirm an Orbit Relay endpoint.
 pub const RELAY_PROBE_OK_BODY: &str = "orbit-relay-ok";
+const RELAY_CONTROL_PING_INTERVAL: Duration = Duration::from_secs(20);
+const RELAY_CONTROL_DEADLINE: Duration = Duration::from_secs(65);
 const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,8 +345,26 @@ async fn handle_daemon_control(
     };
 
     if ack_sent {
+        let mut ping_interval = tokio::time::interval(RELAY_CONTROL_PING_INTERVAL);
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_interval.tick().await;
+        let mut last_seen = tokio::time::Instant::now();
+
         loop {
             tokio::select! {
+                _ = ping_interval.tick() => {
+                    if last_seen.elapsed() > RELAY_CONTROL_DEADLINE {
+                        warn!(
+                            pubkey = %pubkey,
+                            conn_id = my_conn_id,
+                            "Daemon relay control heartbeat timed out"
+                        );
+                        break;
+                    }
+                    if socket.send(Message::Ping(b"hb".to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
                 maybe_client = accept_rx.recv() => {
                     let Some(pending) = maybe_client else { break; };
                     let tunnel_id = generate_tunnel_id();
@@ -400,11 +420,15 @@ async fn handle_daemon_control(
                 msg = socket.recv() => {
                     match msg {
                         Some(Ok(Message::Ping(p))) => {
-                            let _ = socket.send(Message::Pong(p)).await;
+                            last_seen = tokio::time::Instant::now();
+                            if socket.send(Message::Pong(p)).await.is_err() {
+                                break;
+                            }
                         }
-                        Some(Ok(Message::Close(_))) => break,
-                        Some(Ok(_)) => {}
-                        _ => break,
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {
+                            last_seen = tokio::time::Instant::now();
+                        }
                     }
                 }
             }

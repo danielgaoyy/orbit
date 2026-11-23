@@ -653,6 +653,12 @@ impl OhosCoreFacade {
             .map_err(|e| e.to_string())
     }
 
+    pub fn apply_relay_to_fleet(&self, raw_relay_url: &str) -> Result<u32, String> {
+        self.inner
+            .apply_relay_to_fleet(raw_relay_url)
+            .map_err(|e| e.to_string())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_host_config_json(
         &self,
@@ -789,6 +795,16 @@ impl OhosCoreFacade {
 
     pub fn open_agent_timeline(&self, host_id: &str, agent_id: &str) {
         self.inner.open_agent_timeline(host_id, agent_id);
+    }
+
+    pub fn load_older_agent_timeline(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        limit_events: u32,
+    ) -> bool {
+        self.inner
+            .load_older_agent_timeline(host_id, agent_id, limit_events)
     }
 
     pub fn send_prompt(&self, host_id: &str, agent_id: &str, prompt: &str) {
@@ -2651,6 +2667,13 @@ mod ohos_napi {
         }
 
         #[napi]
+        pub fn apply_relay_to_fleet(&self, raw_relay_url: String) -> Result<u32> {
+            self.facade
+                .apply_relay_to_fleet(&raw_relay_url)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
         #[allow(clippy::too_many_arguments)]
         pub fn update_host_config_json(
             &self,
@@ -2785,6 +2808,17 @@ mod ohos_napi {
         #[napi]
         pub fn open_agent_timeline(&self, host_id: String, agent_id: String) {
             self.facade.open_agent_timeline(&host_id, &agent_id);
+        }
+
+        #[napi]
+        pub fn load_older_agent_timeline(
+            &self,
+            host_id: String,
+            agent_id: String,
+            limit_events: u32,
+        ) -> bool {
+            self.facade
+                .load_older_agent_timeline(&host_id, &agent_id, limit_events)
         }
 
         #[napi]

@@ -13,7 +13,7 @@ orbit relay up --port 7878 --allow-pubkey <YOUR_HOST_PUBKEY>
 ```
 
 - **Persistent Background Service**: Automatically configures `systemd --user` (with `loginctl enable-linger` so it survives SSH logout), `launchd` on macOS, or detached PID supervisor.
-- **Zero-Knowledge**: All traffic is encrypted end-to-end with `Noise_NK_25519_ChaChaPoly_SHA256` (`orbit-relay-e2ee/1`). The relay only forwards opaque ciphertext records.
+- **Zero-Knowledge**: All traffic is encrypted end-to-end with `Noise_NKpsk0_25519_ChaChaPoly_SHA256` (`orbit-relay-e2ee/2`). The relay only forwards opaque ciphertext records.
 - **Zero Abuse**: Any connection targeting a public key outside `--allow-pubkey` is rejected immediately with `HTTP 403 Forbidden` before upgrading WebSocket frames.
 - **Add More Machines Anytime**: Run `orbit relay allow <NEW_HOST_PUBKEY>` on the relay server.
 

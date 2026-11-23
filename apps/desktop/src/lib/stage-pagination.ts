@@ -14,11 +14,17 @@ export const LOG_TOP_PAGINATE_THRESHOLD_PX = 260;
 export type WindowedAgentStageView = AgentStageView & {
   window_start_turn_index?: number;
   total_turn_count?: number;
+  has_older_turns?: boolean;
+  has_older_history?: boolean;
+  oldest_loaded_seq?: number;
 };
 
 export type StageDeltaWithWindow = AgentStageDeltaView & {
   window_start_turn_index?: number;
   total_turn_count?: number;
+  has_older_turns?: boolean;
+  has_older_history?: boolean;
+  oldest_loaded_seq?: number;
 };
 
 export interface StageTurnPaginationIpc {

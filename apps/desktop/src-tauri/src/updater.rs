@@ -1261,6 +1261,26 @@ fn atomic_install_executable(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Install the bundled `orbit` CLI sidecar into `~/.local/bin/orbit` ONLY if no local `orbit`
+/// binary exists yet. Called strictly on explicit user opt-in ("Connect This Machine").
+pub fn ensure_bundled_sidecar_installed() -> Result<(), String> {
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    else {
+        return Ok(());
+    };
+    let exe_name = if cfg!(windows) { "orbit.exe" } else { "orbit" };
+    let install_path = home.join(".local/bin").join(exe_name);
+    if install_path.is_file() {
+        return Ok(());
+    }
+    if let Some(sidecar) = bundled_orbit_sidecar_path() {
+        atomic_install_executable(&sidecar, &install_path)?;
+    }
+    Ok(())
+}
+
 async fn download_orbit_cli_binary(dst_tmp: &Path) -> Result<(), String> {
     let asset = orbit_cli_release_asset_name()?;
     let client = build_github_release_download_client(

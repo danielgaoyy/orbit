@@ -421,6 +421,7 @@ impl FinishSubscriptionManager {
                                                 request_id: tl_req,
                                                 agent_id: child.agent_id.clone(),
                                                 since_seq: 0,
+                                                tail_limit: None,
                                             },
                                             Duration::from_secs(10),
                                         )
@@ -712,6 +713,7 @@ impl FinishSubscriptionManager {
                     request_id: req_id,
                     agent_id: child.agent_id.clone(),
                     since_seq: 0,
+                    tail_limit: None,
                 },
                 Duration::from_secs(10),
             )

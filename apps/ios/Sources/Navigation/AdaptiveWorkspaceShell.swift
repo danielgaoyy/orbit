@@ -220,11 +220,13 @@ struct AdaptiveWorkspaceShell: View {
             }
             .offset(x: stageOffset)
 
-            // Full-Height Edge-to-Edge Push-Over Drawer (kept mounted so search & scroll state persists)
-            compactDrawerPanel(drawerWidth: drawerWidth)
-                .offset(x: drawerOffset)
-                .opacity(progress > 0.001 ? 1 : 0)
-                .allowsHitTesting(store.isDrawerOpen || progress > 0.05)
+            // Full-Height Edge-to-Edge Push-Over Drawer (lazily mounted only when open or being dragged)
+            if store.isDrawerOpen || drawerDragTranslation > 0 {
+                compactDrawerPanel(drawerWidth: drawerWidth)
+                    .offset(x: drawerOffset)
+                    .opacity(progress > 0.001 ? 1 : 0)
+                    .allowsHitTesting(store.isDrawerOpen || progress > 0.05)
+            }
         }
     }
 

@@ -69,13 +69,13 @@ use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
-    extract_ws_port, normalize_relay_input, read_local_workspace_file,
+    extract_ws_port, normalize_relay_input, read_local_daemon_identity, read_local_workspace_file,
     read_local_workspace_file_with_writable, stage_local_attachment,
 };
 use crate::render::{
     DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator, TerminalScreenView,
     detect_language_for_path, highlight_code_lines_capped, parse_markdown_blocks,
-    parse_unified_diff,
+    parse_unified_diff, parse_unified_diff_capped,
 };
 use crate::stage::{self, SessionInsightsView, StageTurnView};
 use crate::{
@@ -1123,6 +1123,9 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PushTestResultView, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
+    timeline_has_older: HashMap<String, bool>,
+    timeline_loading_older: HashSet<String>,
+    pending_tail_catchups: HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
     agent_req_by_req_id: HashMap<Uuid, String>,
     replaced_optimistic_agents: HashMap<String, String>,
@@ -1276,6 +1279,9 @@ impl HostMemoryState {
             pending_push_tests: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
+            timeline_has_older: HashMap::new(),
+            timeline_loading_older: HashSet::new(),
+            pending_tail_catchups: HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
             agent_req_by_req_id: HashMap::new(),
             replaced_optimistic_agents: HashMap::new(),
@@ -1512,6 +1518,8 @@ impl HostMemoryState {
                     break;
                 }
                 self.timelines.remove(&id);
+                self.timeline_has_older.remove(&id);
+                self.timeline_loading_older.remove(&id);
                 to_remove -= 1;
             }
         }
@@ -1666,9 +1674,14 @@ impl OrbitAppCore {
             }
         }
 
+        let local_identity = read_local_daemon_identity();
+
         let mut initial_hosts = HashMap::new();
         if let Ok(saved) = store.list_client_hosts() {
             for h in saved {
+                let is_saved_local = local_identity
+                    .as_ref()
+                    .is_some_and(|(id, pubkey)| *id == h.host_id && *pubkey == h.daemon_pubkey_b64);
                 let profile = SavedHostProfile {
                     host_id: h.host_id.clone(),
                     hostname: h.display_name,
@@ -1685,6 +1698,7 @@ impl OrbitAppCore {
                     state: HostConnectionState::Disconnected,
                 };
                 let mut mem = HostMemoryState::new(profile);
+                mem.is_local = is_saved_local;
                 if let Ok(ws_list) = store.list_replica_workspaces(&h.host_id) {
                     mem.workspaces = ws_list;
                 }
@@ -2036,14 +2050,19 @@ impl OrbitAppCore {
     ) -> bool {
         if !host_state.timelines.contains_key(agent_id)
             && !agent_id.starts_with("opt_")
-            && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 50_000)
+            && let Ok((cached, local_has_older)) =
+                self.store.fetch_replica_timeline_tail(agent_id, 300)
             && !cached.is_empty()
         {
+            let remote_has_older = self.store.get_replica_has_older(agent_id).unwrap_or(false);
             let mut coalesced = Vec::with_capacity(cached.len());
             for ev in cached {
                 coalesce_or_push_timeline(&mut coalesced, ev);
             }
             host_state.timelines.insert(agent_id.to_string(), coalesced);
+            host_state
+                .timeline_has_older
+                .insert(agent_id.to_string(), local_has_older || remote_has_older);
             host_state.mark_stage_dirty(agent_id, 0, true);
             return true;
         }
@@ -2148,7 +2167,8 @@ impl OrbitAppCore {
                 let mut rendered_by_event = Vec::with_capacity(raw_events.len());
                 let mut items = Vec::with_capacity(raw_events.len());
                 let mut event_to_item_idx = Vec::with_capacity(raw_events.len());
-                for ev in raw_events {
+                let highlight_floor = raw_events.len().saturating_sub(48);
+                for (ev_idx, ev) in raw_events.iter().enumerate() {
                     event_to_item_idx.push(items.len());
                     let rendered = render_timeline_event_view(
                         agent_id,
@@ -2156,6 +2176,7 @@ impl OrbitAppCore {
                         ev,
                         &all_resolved_perms,
                         &all_resolved_questions,
+                        ev_idx >= highlight_floor,
                         &mut host_state.markdown_cache,
                         &mut host_state.streaming_markdown_cache,
                     );
@@ -2221,6 +2242,7 @@ impl OrbitAppCore {
                             ev,
                             &all_resolved_perms,
                             &all_resolved_questions,
+                            true,
                             &mut host_state.markdown_cache,
                             &mut host_state.streaming_markdown_cache,
                         );
@@ -2374,7 +2396,7 @@ impl OrbitAppCore {
         since_aux_revision: Option<u64>,
         tail_turn_limit: Option<usize>,
     ) -> crate::stage::AgentStageDeltaView {
-        self.ensure_stage_fresh_and_read(host_id, agent_id, |agent, cached| {
+        let mut delta = self.ensure_stage_fresh_and_read(host_id, agent_id, |agent, cached| {
             let Some(c) = cached else {
                 return crate::stage::AgentStageDeltaView {
                     revision: 0,
@@ -2392,6 +2414,9 @@ impl OrbitAppCore {
                     reset: since_revision > 0,
                     aux_revision: 0,
                     aux_unchanged: false,
+                    has_older_turns: false,
+                    has_older_history: false,
+                    oldest_loaded_seq: 0,
                 };
             };
 
@@ -2431,6 +2456,9 @@ impl OrbitAppCore {
                     reset: false,
                     aux_revision: c.aux_revision,
                     aux_unchanged,
+                    has_older_turns: false,
+                    has_older_history: false,
+                    oldest_loaded_seq: 0,
                 };
             }
 
@@ -2492,8 +2520,214 @@ impl OrbitAppCore {
                 reset: needs_reset,
                 aux_revision: c.aux_revision,
                 aux_unchanged,
+                has_older_turns: window_start > 0,
+                has_older_history: false,
+                oldest_loaded_seq: 0,
             }
-        })
+        });
+        if delta.revision > 0
+            && let Ok(guard) = self.hosts.read()
+            && let Some(h) = guard.get(host_id)
+        {
+            let oldest_seq = h
+                .timelines
+                .get(agent_id)
+                .and_then(|evs| evs.iter().filter(|e| e.seq > 0).map(|e| e.seq).min())
+                .unwrap_or(0);
+            let remote_has_older = h.timeline_has_older.get(agent_id).copied().unwrap_or(false);
+            delta.oldest_loaded_seq = oldest_seq;
+            delta.has_older_history = remote_has_older;
+            delta.has_older_turns = delta.window_start_turn_index > 0 || remote_has_older;
+        }
+        delta
+    }
+
+    pub fn agent_stage_delta_windowed(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        since_revision: u64,
+        since_aux_revision: Option<u64>,
+        turn_limit: Option<u32>,
+        since_window_start_turn_index: Option<u32>,
+    ) -> crate::stage::AgentStageDeltaView {
+        let base = self.ensure_stage_fresh_and_read(host_id, agent_id, |agent, cached| {
+            let Some(c) = cached else {
+                return (
+                    crate::stage::AgentStageDeltaView {
+                        revision: 0,
+                        host_id: host_id.to_string(),
+                        agent: agent.cloned(),
+                        replace_from_turn_index: 0,
+                        changed_turns: Vec::new(),
+                        total_turn_count: 0,
+                        pending_permissions: Vec::new(),
+                        pending_questions: Vec::new(),
+                        session_turn_diffs: Vec::new(),
+                        insights: crate::stage::SessionInsightsView::default(),
+                        latest_seq: agent.map(|a| a.latest_seq).unwrap_or(0),
+                        reset: since_revision > 0,
+                        aux_revision: 0,
+                        aux_unchanged: false,
+                        window_start_turn_index: 0,
+                        has_older_turns: false,
+                        has_older_history: false,
+                        oldest_loaded_seq: 0,
+                    },
+                    None,
+                );
+            };
+
+            let total_turns = c.turns.len();
+            let capped_limit = turn_limit.filter(|&n| n > 0).map(|n| n as usize);
+            let full_reset = since_revision == 0
+                || since_revision > c.stage_revision
+                || since_revision < c.last_reset_revision
+                || since_revision < c.history_floor_revision;
+
+            if since_revision == c.stage_revision && capped_limit.is_none() {
+                let aux_unchanged =
+                    matches!(since_aux_revision, Some(prev_aux) if prev_aux == c.aux_revision);
+                return (
+                    crate::stage::AgentStageDeltaView {
+                        revision: c.stage_revision,
+                        host_id: host_id.to_string(),
+                        agent: agent.cloned(),
+                        replace_from_turn_index: total_turns as u32,
+                        changed_turns: Vec::new(),
+                        total_turn_count: total_turns as u32,
+                        pending_permissions: if aux_unchanged {
+                            Vec::new()
+                        } else {
+                            c.pending_permissions.clone()
+                        },
+                        pending_questions: if aux_unchanged {
+                            Vec::new()
+                        } else {
+                            c.pending_questions.clone()
+                        },
+                        session_turn_diffs: if aux_unchanged {
+                            Vec::new()
+                        } else {
+                            c.session_turn_diffs.clone()
+                        },
+                        insights: if aux_unchanged {
+                            crate::stage::SessionInsightsView::default()
+                        } else {
+                            c.insights.clone()
+                        },
+                        latest_seq: c.latest_seq,
+                        reset: false,
+                        aux_revision: c.aux_revision,
+                        aux_unchanged,
+                        window_start_turn_index: 0,
+                        has_older_turns: false,
+                        has_older_history: false,
+                        oldest_loaded_seq: 0,
+                    },
+                    Some(0),
+                );
+            }
+
+            let raw_replace_from = if full_reset {
+                0
+            } else if since_revision == c.stage_revision {
+                total_turns
+            } else {
+                c.delta_history
+                    .iter()
+                    .filter(|(rev, _)| *rev > since_revision)
+                    .map(|(_, idx)| *idx)
+                    .min()
+                    .unwrap_or(total_turns)
+                    .min(total_turns)
+            };
+
+            let (window_start, replace_from_window, reset_out) = if let Some(limit) = capped_limit {
+                let default_ws = total_turns.saturating_sub(limit);
+                if full_reset {
+                    (default_ws, 0, since_revision > 0)
+                } else if let Some(prev_ws_u32) = since_window_start_turn_index
+                    && (prev_ws_u32 as usize) <= total_turns
+                {
+                    let prev_ws = prev_ws_u32 as usize;
+                    if prev_ws > 0 && default_ws < prev_ws {
+                        (default_ws, 0, true)
+                    } else if raw_replace_from >= prev_ws {
+                        (prev_ws, raw_replace_from - prev_ws, false)
+                    } else {
+                        (default_ws, 0, true)
+                    }
+                } else {
+                    (default_ws, 0, since_revision > 0)
+                }
+            } else {
+                (0, raw_replace_from, full_reset)
+            };
+
+            let slice_start = window_start
+                .saturating_add(replace_from_window)
+                .min(total_turns);
+            let aux_unchanged = !reset_out
+                && matches!(since_aux_revision, Some(prev_aux) if prev_aux == c.aux_revision);
+
+            (
+                crate::stage::AgentStageDeltaView {
+                    revision: c.stage_revision,
+                    host_id: host_id.to_string(),
+                    agent: agent.cloned(),
+                    replace_from_turn_index: replace_from_window as u32,
+                    changed_turns: c.turns[slice_start..].to_vec(),
+                    total_turn_count: total_turns as u32,
+                    pending_permissions: if aux_unchanged {
+                        Vec::new()
+                    } else {
+                        c.pending_permissions.clone()
+                    },
+                    pending_questions: if aux_unchanged {
+                        Vec::new()
+                    } else {
+                        c.pending_questions.clone()
+                    },
+                    session_turn_diffs: if aux_unchanged {
+                        Vec::new()
+                    } else {
+                        c.session_turn_diffs.clone()
+                    },
+                    insights: if aux_unchanged {
+                        crate::stage::SessionInsightsView::default()
+                    } else {
+                        c.insights.clone()
+                    },
+                    latest_seq: c.latest_seq,
+                    reset: reset_out,
+                    aux_revision: c.aux_revision,
+                    aux_unchanged,
+                    window_start_turn_index: window_start as u32,
+                    has_older_turns: window_start > 0,
+                    has_older_history: false,
+                    oldest_loaded_seq: 0,
+                },
+                Some(window_start),
+            )
+        });
+
+        let mut delta = base.0;
+        if let Some(ws) = base.1
+            && let Ok(guard) = self.hosts.read()
+            && let Some(h) = guard.get(host_id)
+        {
+            let oldest_seq = h
+                .timelines
+                .get(agent_id)
+                .and_then(|evs| evs.iter().filter(|e| e.seq > 0).map(|e| e.seq).min())
+                .unwrap_or(0);
+            let remote_has_older = h.timeline_has_older.get(agent_id).copied().unwrap_or(false);
+            delta.oldest_loaded_seq = oldest_seq;
+            delta.has_older_history = remote_has_older;
+            delta.has_older_turns = ws > 0 || remote_has_older;
+        }
+        delta
     }
 
     pub fn agent_stage_turns_slice(
@@ -2623,7 +2857,8 @@ impl OrbitAppCore {
         }
 
         let mut upserted_items = Vec::new();
-        for ev in &events {
+        let highlight_floor = events.len().saturating_sub(48);
+        for (ev_idx, ev) in events.iter().enumerate() {
             let is_local_notice =
                 ev.seq == 0 && matches!(ev.payload, TimelinePayload::Notice { .. });
             if effective_since_seq > 0 && ev.seq <= effective_since_seq && !is_local_notice {
@@ -2635,6 +2870,7 @@ impl OrbitAppCore {
                 ev,
                 &all_resolved_perms,
                 &all_resolved_questions,
+                ev_idx >= highlight_floor,
                 &mut host_state.markdown_cache,
                 &mut host_state.streaming_markdown_cache,
             ) {
@@ -3166,11 +3402,13 @@ impl OrbitAppCore {
         &self,
         req: &crate::contract::AgentStageDeltaRequest,
     ) -> crate::stage::AgentStageDeltaView {
-        self.agent_stage_delta_with_aux(
+        self.agent_stage_delta_windowed(
             &req.host_id,
             &req.agent_id,
             req.since_revision,
             req.since_aux_revision,
+            req.turn_limit,
+            req.since_window_start_turn_index,
         )
     }
 
@@ -3913,6 +4151,17 @@ impl OrbitAppCore {
         self.pair_host_internal(&uri, Some((alias.to_string(), remote_port)))
     }
 
+    /// Explicitly ensure the local Orbit daemon is running and pair this machine into the fleet.
+    /// Never called automatically on startup; invoked only on explicit user opt-in.
+    pub fn pair_local_host_blocking(self: &Arc<Self>) -> Result<HostCardView, ClientCoreError> {
+        let uri = discover_local_daemon_pairing_uri().ok_or_else(|| {
+            ClientCoreError::Handshake(
+                "Local Orbit daemon is not installed or failed to start. Install `orbit` CLI or run `orbit daemon up`.".to_string(),
+            )
+        })?;
+        self.pair_host_internal(&uri, None)
+    }
+
     fn pair_host_internal(
         self: &Arc<Self>,
         pairing_uri: &str,
@@ -3920,6 +4169,10 @@ impl OrbitAppCore {
     ) -> Result<HostCardView, ClientCoreError> {
         let offer = PairingOffer::from_qr_uri(pairing_uri)?;
         let detected_port = extract_ws_port(&offer.direct_endpoints);
+        let is_local_daemon = ssh_info.is_none()
+            && read_local_daemon_identity().is_some_and(|(id, pubkey)| {
+                id == offer.host_id && pubkey == offer.daemon_pubkey_b64
+            });
         let (card, stored) = {
             let mut guard = self
                 .hosts
@@ -3942,6 +4195,13 @@ impl OrbitAppCore {
                 .unwrap_or(HostRouteMode::Auto);
             let custom_direct_endpoint =
                 prev.and_then(|h| h.profile.custom_direct_endpoint.clone());
+            let mut direct_endpoints = offer.direct_endpoints;
+            if is_local_daemon {
+                let loopback = format!("ws://127.0.0.1:{remote_port}/ws");
+                if !direct_endpoints.contains(&loopback) {
+                    direct_endpoints.insert(0, loopback);
+                }
+            }
 
             let pairing_secret_updated_at_ms = match prev {
                 Some(h)
@@ -3962,7 +4222,7 @@ impl OrbitAppCore {
                 remote_daemon_port: remote_port,
                 custom_direct_endpoint,
                 daemon_pubkey_b64: offer.daemon_pubkey_b64,
-                direct_endpoints: offer.direct_endpoints,
+                direct_endpoints,
                 relay_url: offer.relay_url,
                 pairing_secret: offer.pairing_secret,
                 pairing_secret_updated_at_ms,
@@ -3972,6 +4232,9 @@ impl OrbitAppCore {
                 .entry(offer.host_id.clone())
                 .or_insert_with(|| HostMemoryState::new(profile.clone()));
             entry.profile = profile;
+            if is_local_daemon {
+                entry.is_local = true;
+            }
             entry.ssh_heal_attempted = false;
             (entry.to_card(), entry.to_stored_host())
         };
@@ -4051,12 +4314,13 @@ impl OrbitAppCore {
         raw_relay_url: Option<String>,
         reconnect: bool,
     ) -> Result<HostCardView, ClientCoreError> {
-        let (card, stored) = {
+        let (card, stored, relay_changed, new_relay) = {
             let mut guard = self
                 .hosts
                 .write()
                 .map_err(|_| ClientCoreError::LockPoisoned)?;
             let h = guard.get_mut(host_id).ok_or(ClientCoreError::Unreachable)?;
+            let prev_relay = h.profile.relay_url.clone();
 
             if let Some(cn) = custom_name {
                 let t = cn.trim();
@@ -4093,13 +4357,24 @@ impl OrbitAppCore {
             if let Some(ref relay) = raw_relay_url {
                 h.profile.relay_url = normalize_relay_input(Some(relay));
             }
+            let relay_changed = raw_relay_url.is_some() && h.profile.relay_url != prev_relay;
+            let new_relay = h.profile.relay_url.clone();
             h.ssh_heal_attempted = false;
-            (h.to_card(), h.to_stored_host())
+            (h.to_card(), h.to_stored_host(), relay_changed, new_relay)
         };
 
         self.store.upsert_client_host(&stored)?;
         let now_ms = now_unix_ms();
         self.record_cloud_meta_mutation(|meta| meta.record_host_mutated(host_id, now_ms));
+        if relay_changed {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::ConfigureHostRelay {
+                    request_id: Uuid::new_v4(),
+                    relay_url: new_relay,
+                },
+            );
+        }
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
@@ -4117,6 +4392,16 @@ impl OrbitAppCore {
         host_id: &str,
         raw_relay_url: Option<&str>,
     ) -> Result<(), ClientCoreError> {
+        let should_reconnect = self
+            .hosts
+            .read()
+            .ok()
+            .and_then(|g| {
+                g.get(host_id).map(|h| {
+                    h.session.is_none() || h.profile.route_mode == HostRouteMode::RelayOnly
+                })
+            })
+            .unwrap_or(true);
         let _ = self.update_host_config(
             host_id,
             None,
@@ -4125,9 +4410,63 @@ impl OrbitAppCore {
             None,
             None,
             Some(raw_relay_url.unwrap_or("").to_string()),
-            true,
+            should_reconnect,
         )?;
         Ok(())
+    }
+
+    pub fn apply_relay_to_fleet(
+        self: &Arc<Self>,
+        raw_relay_url: &str,
+    ) -> Result<u32, ClientCoreError> {
+        let trimmed = raw_relay_url.trim();
+        let new_relay = if trimmed.is_empty() {
+            None
+        } else {
+            Some(normalize_relay_input(Some(trimmed)).ok_or_else(|| {
+                ClientCoreError::Transport(format!("Invalid relay URL: {trimmed}"))
+            })?)
+        };
+
+        let updates: Vec<(String, StoredHostProfile, bool)> = {
+            let mut guard = self
+                .hosts
+                .write()
+                .map_err(|_| ClientCoreError::LockPoisoned)?;
+            let mut items = Vec::with_capacity(guard.len());
+            for (host_id, h) in guard.iter_mut() {
+                h.profile.relay_url = new_relay.clone();
+                h.ssh_heal_attempted = false;
+                let should_reconnect =
+                    h.session.is_none() || h.profile.route_mode == HostRouteMode::RelayOnly;
+                items.push((host_id.clone(), h.to_stored_host(), should_reconnect));
+            }
+            items
+        };
+
+        let now_ms = now_unix_ms();
+        let count = updates.len() as u32;
+        for (host_id, stored, should_reconnect) in updates {
+            self.store.upsert_client_host(&stored)?;
+            self.record_cloud_meta_mutation(|meta| meta.record_host_mutated(&host_id, now_ms));
+            self.dispatch_wire_queued(
+                &host_id,
+                WireMessage::ConfigureHostRelay {
+                    request_id: Uuid::new_v4(),
+                    relay_url: new_relay.clone(),
+                },
+            );
+            self.emit(|revision| CoreNotification::HostChanged {
+                revision,
+                host_id: host_id.clone(),
+            });
+            if should_reconnect {
+                self.connect_host_async(host_id);
+            }
+        }
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.schedule_cloud_auto_sync(false);
+        Ok(count)
     }
 
     pub fn connect_all_hosts(self: &Arc<Self>) {
@@ -4171,6 +4510,8 @@ impl OrbitAppCore {
             h.last_error = None;
             h.session = None;
             h.caught_up_agents.clear();
+            h.timeline_loading_older.clear();
+            h.pending_tail_catchups.clear();
             h.slot_attach_dispatched_gen.clear();
             h.slot_confirmed_gen.clear();
             h.silent_attach_req_ids.clear();
@@ -4224,6 +4565,11 @@ impl OrbitAppCore {
                             (aid.clone(), self.safe_catchup_since_seq(aid, max_seq))
                         })
                         .collect();
+                    for (aid, since_seq) in &resubs {
+                        if *since_seq == 0 {
+                            h.pending_tail_catchups.insert(aid.clone());
+                        }
+                    }
                     let resub_subagents = collect_provider_subagent_resubscriptions(h);
                     let resub_terms =
                         self.collect_reconnect_terminal_attaches(host_id, h, conn_gen, &outbox);
@@ -4398,11 +4744,13 @@ impl OrbitAppCore {
                     .await;
 
                 for (agent_id, since_seq) in resub_timelines {
+                    let tail_limit = (since_seq == 0).then_some(300);
                     let _ = handle
                         .send_wire(WireMessage::SubscribeTimeline {
                             request_id: Uuid::new_v4(),
                             agent_id,
                             since_seq,
+                            tail_limit,
                         })
                         .await;
                 }
@@ -4476,11 +4824,15 @@ impl OrbitAppCore {
                         h.agents.clear();
                         h.discovered_projects.clear();
                         h.timelines.clear();
+                        h.timeline_has_older.clear();
+                        h.timeline_loading_older.clear();
+                        h.pending_tail_catchups.clear();
                         h.stage_cache.clear();
                         h.stage_dirty.clear();
                     }
 
-                    if !h.ssh_heal_attempted
+                    if cfg!(any(target_os = "macos", target_os = "linux"))
+                        && !h.ssh_heal_attempted
                         && let Some(ref alias) = h.profile.ssh_alias
                         && !alias.trim().is_empty()
                         && (is_identity_mismatch || h.reconnect_attempt == 1)
@@ -4571,6 +4923,8 @@ impl OrbitAppCore {
             h.via_ssh_tunnel = false;
             h.session = None;
             h.caught_up_agents.clear();
+            h.timeline_loading_older.clear();
+            h.pending_tail_catchups.clear();
             h.slot_attach_dispatched_gen.clear();
             h.slot_confirmed_gen.clear();
             h.pending_slot_frames.clear();
@@ -4659,6 +5013,9 @@ impl OrbitAppCore {
             None;
         let mut migrated_opt_pref: Option<(String, String)> = None;
         let mut rewound_seen_reset: Option<(String, u64)> = None;
+        let mut adopted_daemon_relay = false;
+        let mut persist_has_older: Option<(String, bool)> = None;
+        let mut history_page_to_persist: Option<Vec<TimelineEvent>> = None;
 
         if let Ok(mut guard) = self.hosts.write()
             && let Some(state) = guard.get_mut(host_id)
@@ -4671,6 +5028,12 @@ impl OrbitAppCore {
                     state.os_arch = Some(format!("{} / {}", host.os, host.arch));
                     if !host.available_providers.is_empty() {
                         state.available_providers = host.available_providers;
+                    }
+                    if state.profile.relay_url.is_none()
+                        && let Some(daemon_relay) = normalize_relay_input(host.relay_url.as_deref())
+                    {
+                        state.profile.relay_url = Some(daemon_relay);
+                        adopted_daemon_relay = true;
                     }
                     host_to_persist = Some(state.to_stored_host());
                     notify_fleet = true;
@@ -4770,6 +5133,9 @@ impl OrbitAppCore {
                         if epoch_advanced || seq_regressed {
                             let had_mem = state.timelines.remove(&ag_id).is_some();
                             state.caught_up_agents.remove(&ag_id);
+                            state.timeline_has_older.remove(&ag_id);
+                            state.timeline_loading_older.remove(&ag_id);
+                            state.pending_tail_catchups.remove(&ag_id);
                             state.stage_cache.remove(&ag_id);
                             state.mark_stage_dirty(&ag_id, 0, true);
                             state.rewound_agents.insert(ag_id.clone());
@@ -4944,6 +5310,9 @@ impl OrbitAppCore {
                     if epoch_advanced || seq_regressed {
                         let had_mem = state.timelines.remove(&ag_id).is_some();
                         state.caught_up_agents.remove(&ag_id);
+                        state.timeline_has_older.remove(&ag_id);
+                        state.timeline_loading_older.remove(&ag_id);
+                        state.pending_tail_catchups.remove(&ag_id);
                         state.stage_cache.remove(&ag_id);
                         state.mark_stage_dirty(&ag_id, 0, true);
                         state.rewound_agents.insert(ag_id.clone());
@@ -4990,6 +5359,9 @@ impl OrbitAppCore {
                         .and_then(|a| a.parent_agent_id.clone());
                     state.agents.remove(&agent_id);
                     state.timelines.remove(&agent_id);
+                    state.timeline_has_older.remove(&agent_id);
+                    state.timeline_loading_older.remove(&agent_id);
+                    state.pending_tail_catchups.remove(&agent_id);
                     state.conditional_timers.retain(|t| t.agent_id != agent_id);
                     state.provider_subagents.remove(&agent_id);
                     state
@@ -5464,6 +5836,10 @@ impl OrbitAppCore {
                     } else {
                         state.caught_up_agents.remove(&ag_id);
                     }
+                    state.timeline_has_older.remove(&ag_id);
+                    state.timeline_loading_older.remove(&ag_id);
+                    state.pending_tail_catchups.remove(&ag_id);
+                    persist_has_older = Some((ag_id.clone(), false));
                     state.stage_cache.remove(&ag_id);
                     state.mark_stage_dirty(&ag_id, 0, true);
                     state.rewound_agents.insert(ag_id.clone());
@@ -5490,8 +5866,17 @@ impl OrbitAppCore {
                     agent_id,
                     events,
                     has_more,
+                    has_older_history,
                     ..
                 } => {
+                    let was_tail = state.pending_tail_catchups.remove(&agent_id);
+                    if was_tail || has_older_history {
+                        state
+                            .timeline_has_older
+                            .insert(agent_id.clone(), has_older_history);
+                        persist_has_older = Some((agent_id.clone(), has_older_history));
+                    }
+
                     let mut ordered = events;
                     ordered.sort_by_key(|e| e.seq);
                     let min_incoming_seq = ordered.first().map(|e| e.seq);
@@ -5545,6 +5930,33 @@ impl OrbitAppCore {
                     }
                     push_notify_timeline(agent_id);
                 }
+                WireMessage::TimelineHistoryPage {
+                    agent_id,
+                    events,
+                    has_more_older,
+                    ..
+                } => {
+                    state.timeline_loading_older.remove(&agent_id);
+                    state
+                        .timeline_has_older
+                        .insert(agent_id.clone(), has_more_older);
+                    persist_has_older = Some((agent_id.clone(), has_more_older));
+                    if !events.is_empty() {
+                        history_page_to_persist = Some(events.clone());
+                        let list = state.timelines.entry(agent_id.clone()).or_default();
+                        let mut combined = std::mem::take(list);
+                        combined.extend(events);
+                        combined.sort_by_key(|e| (e.seq == 0, e.seq));
+                        let mut rebuilt = Vec::with_capacity(combined.len());
+                        for ev in combined {
+                            coalesce_or_push_timeline(&mut rebuilt, ev);
+                        }
+                        *list = rebuilt;
+                        state.mark_stage_dirty(&agent_id, 0, true);
+                    }
+                    push_notify_timeline(agent_id);
+                }
+                WireMessage::HostRelayConfigured { .. } => {}
                 WireMessage::TimelineLive { event } => {
                     let agent_id = event.agent_id.clone();
                     let live_seq = event.seq;
@@ -6603,6 +7015,19 @@ impl OrbitAppCore {
 
         if let Some(stored) = host_to_persist {
             let _ = self.store.upsert_client_host(&stored);
+            if adopted_daemon_relay {
+                let now_ms = now_unix_ms();
+                self.record_cloud_meta_mutation(|meta| meta.record_host_mutated(host_id, now_ms));
+                self.schedule_cloud_auto_sync(false);
+            }
+        }
+        if let Some((ag_id, has_older)) = persist_has_older {
+            let _ = self.store.set_replica_has_older(&ag_id, has_older);
+        }
+        if let Some(evs) = history_page_to_persist {
+            let _ = self
+                .store
+                .upsert_replica_timeline_events_batch_for_host(host_id, &evs);
         }
         if !initial_seen_seeds.is_empty()
             && let Ok(mut prefs) = self.thread_prefs.write()
@@ -6772,13 +7197,20 @@ impl OrbitAppCore {
             let _ = self
                 .store
                 .replace_replica_timeline_for_host(host_id, &stale_ag_id, &[]);
+            let _ = self.store.set_replica_has_older(&stale_ag_id, false);
             if should_resubscribe {
+                if let Ok(mut guard) = self.hosts.write()
+                    && let Some(h) = guard.get_mut(host_id)
+                {
+                    h.pending_tail_catchups.insert(stale_ag_id.clone());
+                }
                 self.dispatch_wire(
                     host_id,
                     WireMessage::SubscribeTimeline {
                         request_id: Uuid::new_v4(),
                         agent_id: stale_ag_id,
                         since_seq: 0,
+                        tail_limit: Some(300),
                     },
                 );
             }
@@ -6793,6 +7225,7 @@ impl OrbitAppCore {
                     request_id: Uuid::new_v4(),
                     agent_id: catchup_agent_id,
                     since_seq,
+                    tail_limit: None,
                 },
             );
         }
@@ -7577,14 +8010,168 @@ impl OrbitAppCore {
             0
         };
         let since_seq = self.safe_catchup_since_seq(agent_id, mem_max_seq);
+        let tail_limit = (since_seq == 0).then_some(300);
+        if since_seq == 0
+            && let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            h.pending_tail_catchups.insert(agent_id.to_string());
+        }
         self.dispatch_wire_queued(
             host_id,
             WireMessage::SubscribeTimeline {
                 request_id: Uuid::new_v4(),
                 agent_id: agent_id.to_string(),
                 since_seq,
+                tail_limit,
             },
         );
+    }
+
+    pub fn load_older_agent_timeline(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        limit_events: u32,
+    ) -> bool {
+        if agent_id.starts_with("opt_") {
+            return false;
+        }
+        let limit = limit_events.clamp(50, 500);
+        let (oldest_seq, has_older_flag, has_session, already_loading) = {
+            let Ok(guard) = self.hosts.read() else {
+                return false;
+            };
+            let Some(h) = guard.get(host_id) else {
+                return false;
+            };
+            let oldest_seq = h
+                .timelines
+                .get(agent_id)
+                .and_then(|evs| evs.iter().filter(|e| e.seq > 0).map(|e| e.seq).min())
+                .unwrap_or(0);
+            let has_older_flag = h.timeline_has_older.get(agent_id).copied().unwrap_or(false);
+            let has_session = h.session.is_some();
+            let already_loading = h.timeline_loading_older.contains(agent_id);
+            (oldest_seq, has_older_flag, has_session, already_loading)
+        };
+
+        if oldest_seq <= 1 {
+            return false;
+        }
+
+        if let Ok((local_older, local_has_more)) =
+            self.store
+                .fetch_replica_timeline_before(agent_id, oldest_seq, limit as usize)
+            && !local_older.is_empty()
+        {
+            if let Ok(mut guard) = self.hosts.write()
+                && let Some(h) = guard.get_mut(host_id)
+            {
+                let list = h.timelines.entry(agent_id.to_string()).or_default();
+                let mut combined = std::mem::take(list);
+                combined.extend(local_older);
+                combined.sort_by_key(|e| (e.seq == 0, e.seq));
+                let mut rebuilt = Vec::with_capacity(combined.len());
+                for ev in combined {
+                    coalesce_or_push_timeline(&mut rebuilt, ev);
+                }
+                let new_oldest = rebuilt
+                    .iter()
+                    .filter(|e| e.seq > 0)
+                    .map(|e| e.seq)
+                    .min()
+                    .unwrap_or(0);
+                *list = rebuilt;
+                let still_local = local_has_more
+                    || self
+                        .store
+                        .has_replica_timeline_before(agent_id, new_oldest)
+                        .unwrap_or(false);
+                let remote_flag = self.store.get_replica_has_older(agent_id).unwrap_or(false);
+                h.timeline_has_older
+                    .insert(agent_id.to_string(), still_local || remote_flag);
+                h.mark_stage_dirty(agent_id, 0, true);
+            }
+            self.emit(|revision| CoreNotification::TimelineChanged {
+                revision,
+                host_id: host_id.to_string(),
+                agent_id: agent_id.to_string(),
+            });
+            return true;
+        }
+
+        if !has_older_flag || !has_session || already_loading {
+            return false;
+        }
+
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if h.timeline_loading_older.contains(agent_id) {
+                return false;
+            }
+            h.timeline_loading_older.insert(agent_id.to_string());
+        } else {
+            return false;
+        }
+
+        self.dispatch_wire(
+            host_id,
+            WireMessage::FetchTimelineBefore {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+                before_seq: oldest_seq,
+                limit,
+            },
+        );
+        true
+    }
+
+    pub fn get_tool_call_diff(&self, host_id: &str, agent_id: &str, seq: u64) -> Vec<DiffFileView> {
+        let from_mem = self.hosts.read().ok().and_then(|guard| {
+            guard.get(host_id).and_then(|h| {
+                h.timelines.get(agent_id).and_then(|evs| {
+                    evs.iter().find_map(|ev| {
+                        if ev.seq != seq {
+                            return None;
+                        }
+                        if let TimelinePayload::ToolCall {
+                            detail: ToolCallDetail::FileEdit { unified_diff, .. },
+                            ..
+                        } = &ev.payload
+                        {
+                            unified_diff.as_deref().map(parse_unified_diff)
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
+        });
+        if let Some(diffs) = from_mem {
+            return diffs;
+        }
+        if !agent_id.starts_with("opt_")
+            && let Ok(evs) = self.store.fetch_replica_timeline_all(agent_id)
+            && let Some(diffs) = evs.into_iter().find_map(|ev| {
+                if ev.seq != seq {
+                    return None;
+                }
+                if let TimelinePayload::ToolCall {
+                    detail: ToolCallDetail::FileEdit { unified_diff, .. },
+                    ..
+                } = ev.payload
+                {
+                    unified_diff.as_deref().map(parse_unified_diff)
+                } else {
+                    None
+                }
+            })
+        {
+            return diffs;
+        }
+        Vec::new()
     }
 
     fn record_agent_request(&self, host_id: &str, req_id: Uuid, agent_id: &str) {
@@ -8047,6 +8634,9 @@ impl OrbitAppCore {
             if agent_id.starts_with("opt_") {
                 h.agents.remove(agent_id);
                 h.timelines.remove(agent_id);
+                h.timeline_has_older.remove(agent_id);
+                h.timeline_loading_older.remove(agent_id);
+                h.pending_tail_catchups.remove(agent_id);
                 h.stage_cache.remove(agent_id);
                 h.stage_dirty.remove(agent_id);
             } else if let Some(ag) = h.agents.get_mut(agent_id) {
@@ -8098,6 +8688,9 @@ impl OrbitAppCore {
         {
             h.agents.remove(agent_id);
             h.timelines.remove(agent_id);
+            h.timeline_has_older.remove(agent_id);
+            h.timeline_loading_older.remove(agent_id);
+            h.pending_tail_catchups.remove(agent_id);
             h.stage_cache.remove(agent_id);
             h.stage_dirty.remove(agent_id);
         }
@@ -10491,6 +11084,7 @@ impl OrbitAppCore {
                 ev,
                 &all_resolved_perms,
                 &all_resolved_questions,
+                false,
                 &mut host_state.markdown_cache,
                 &mut host_state.streaming_markdown_cache,
             ) {
@@ -11410,8 +12004,16 @@ impl OrbitAppCore {
                             (aid.clone(), self.safe_catchup_since_seq(aid, max_seq))
                         })
                         .collect();
-                    for (aid, _) in &resubs {
+                    for (aid, since_seq) in &resubs {
+                        if *since_seq == 0 {
+                            h.pending_tail_catchups.insert(aid.clone());
+                        }
+                    }
+                    for (aid, since_seq) in &resubs {
                         h.caught_up_agents.remove(aid);
+                        if *since_seq == 0 {
+                            h.pending_tail_catchups.insert(aid.clone());
+                        }
                     }
                     connected.push((host_id.clone(), handle.clone(), resubs));
                 } else {
@@ -11462,11 +12064,13 @@ impl OrbitAppCore {
                     })
                     .await;
                 for (agent_id, since_seq) in resubs {
+                    let tail_limit = (since_seq == 0).then_some(300);
                     let _ = handle
                         .send_wire(WireMessage::SubscribeTimeline {
                             request_id: Uuid::new_v4(),
                             agent_id,
                             since_seq,
+                            tail_limit,
                         })
                         .await;
                 }
@@ -16471,7 +17075,7 @@ impl OrbitAppCore {
     /// Poll GitHub's Device Flow endpoint once. When authorized, immediately verifies the user profile
     /// and checks whether an existing Orbit Encrypted Vault Secret Gist already exists.
     pub fn cloud_sync_poll_github_device_flow(
-        &self,
+        self: &Arc<Self>,
         device_code: &str,
         client_id_override: Option<String>,
     ) -> Result<CloudSyncDevicePollView, ClientCoreError> {
@@ -16525,14 +17129,14 @@ impl OrbitAppCore {
 
     /// Sign in directly using a GitHub Personal Access Token (`gist` scope).
     pub fn cloud_sync_login_with_token(
-        &self,
+        self: &Arc<Self>,
         token: &str,
     ) -> Result<CloudSyncStatusView, ClientCoreError> {
         self.finalize_github_login_blocking(token)
     }
 
     fn finalize_github_login_blocking(
-        &self,
+        self: &Arc<Self>,
         token: &str,
     ) -> Result<CloudSyncStatusView, ClientCoreError> {
         let client = self.cloud_client();
@@ -16572,8 +17176,12 @@ impl OrbitAppCore {
         } else {
             cfg.remote_vault_exists = false;
         }
+        let auto_sync_ready = cfg.derived_key().is_some();
         save_sync_config_to_store(&self.store, &cfg)?;
         self.emit(|revision| CoreNotification::FleetChanged { revision });
+        if auto_sync_ready {
+            self.schedule_cloud_auto_sync(false);
+        }
         Ok(cfg.to_status_view(false))
     }
 
@@ -16756,7 +17364,12 @@ impl OrbitAppCore {
             if matches!(err, CloudSyncError::PassphraseRotationRequired) {
                 cfg.clear_derived_key();
             }
-            cfg.last_error = Some(err.to_string());
+            cfg.last_error = Some(match err {
+                CloudSyncError::GitHubApi { status: 401, .. } => {
+                    "GitHub authorization expired or revoked (401) — sign in again to resume Cloud Sync (your vault and passphrase stay intact).".to_string()
+                }
+                _ => err.to_string(),
+            });
             let _ = save_sync_config_to_store(&self.store, &cfg);
             self.emit(|revision| CoreNotification::FleetChanged { revision });
         }
@@ -17080,6 +17693,17 @@ impl OrbitAppCore {
         cfg.last_error = None;
         save_sync_config_to_store(&self.store, cfg)?;
 
+        if let Ok(mut guard) = self.hosts.write() {
+            for (hid, h) in guard.iter_mut() {
+                if h.session.is_none() && !h.connecting_in_flight {
+                    h.reconnect_attempt = 0;
+                    h.reconnect_scheduled = false;
+                    if !hosts_to_connect.iter().any(|existing| existing == hid) {
+                        hosts_to_connect.push(hid.clone());
+                    }
+                }
+            }
+        }
         for hid in hosts_to_connect {
             self.connect_host_async(hid);
         }
@@ -18011,6 +18635,17 @@ fn truncate_utf8_prefix(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
+fn truncate_utf8_tail(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
+}
+
 fn folder_basename(path: &str) -> String {
     let clean = path.trim_end_matches('/');
     if clean.is_empty() || clean == "~" {
@@ -18481,12 +19116,14 @@ fn collect_resolved_gates(events: &[TimelineEvent]) -> ResolvedGatesMap {
     (all_resolved_perms, all_resolved_questions)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_timeline_event_view(
     agent_id: &str,
     agent_cwd: Option<&str>,
     ev: &TimelineEvent,
     all_resolved_perms: &HashMap<String, String>,
     all_resolved_questions: &HashMap<String, Vec<Vec<String>>>,
+    highlight_diff: bool,
     markdown_cache: &mut HashMap<(String, u64, usize), Vec<RichBlockView>>,
     streaming_markdown_cache: &mut HashMap<(String, String), (usize, Vec<RichBlockView>)>,
 ) -> Option<TimelineItemView> {
@@ -18592,7 +19229,7 @@ fn render_timeline_event_view(
             detail,
             background_task,
         } => {
-            let (summary_title, diff_files) = summarize_tool_detail(detail);
+            let (summary_title, diff_files) = summarize_tool_detail(detail, highlight_diff);
             let step_descriptor = Some(crate::stage::describe_tool_detail(
                 *status,
                 &summary_title,
@@ -18605,7 +19242,7 @@ fn render_timeline_event_view(
                 call_id: call_id.clone(),
                 status: *status,
                 summary_title,
-                detail: detail.clone(),
+                detail: slim_tool_detail_for_stage(detail),
                 background_task: background_task.clone(),
                 step_descriptor,
                 diff_files,
@@ -18987,20 +19624,74 @@ fn agent_to_card_view_with_subagents(
     }
 }
 
-fn summarize_tool_detail(detail: &ToolCallDetail) -> (String, Vec<DiffFileView>) {
+fn summarize_tool_detail(
+    detail: &ToolCallDetail,
+    highlight_diff: bool,
+) -> (String, Vec<DiffFileView>) {
     match detail {
         ToolCallDetail::Shell { command, .. } => (format!("$ {command}"), Vec::new()),
         ToolCallDetail::FileRead { path, .. } => (format!("Read {path}"), Vec::new()),
         ToolCallDetail::FileEdit { path, unified_diff } => {
             let diffs = unified_diff
                 .as_deref()
-                .map(parse_unified_diff)
+                .map(|raw| parse_unified_diff_capped(raw, 80, highlight_diff))
                 .unwrap_or_default();
             (format!("Edit {path}"), diffs)
         }
         ToolCallDetail::Search { query, .. } => (format!("Search \"{query}\""), Vec::new()),
         ToolCallDetail::Subagent { role, .. } => (format!("Subagent · {role}"), Vec::new()),
         ToolCallDetail::Generic { tool_name, .. } => (tool_name.clone(), Vec::new()),
+    }
+}
+
+fn slim_tool_detail_for_stage(detail: &ToolCallDetail) -> ToolCallDetail {
+    const MAX_STAGE_DIFF_BYTES: usize = 8192;
+    const MAX_STAGE_SHELL_PREVIEW_BYTES: usize = 8192;
+    const MAX_STAGE_GENERIC_ARGS_BYTES: usize = 4096;
+
+    match detail {
+        ToolCallDetail::FileEdit { path, unified_diff } => ToolCallDetail::FileEdit {
+            path: path.clone(),
+            unified_diff: unified_diff.as_deref().map(|raw| {
+                if raw.len() <= MAX_STAGE_DIFF_BYTES {
+                    raw.to_string()
+                } else {
+                    let prefix = truncate_utf8_prefix(raw, MAX_STAGE_DIFF_BYTES);
+                    format!("{prefix}\n... (truncated)")
+                }
+            }),
+        },
+        ToolCallDetail::Shell {
+            command,
+            cwd,
+            exit_code,
+            output_preview,
+        } => ToolCallDetail::Shell {
+            command: command.clone(),
+            cwd: cwd.clone(),
+            exit_code: *exit_code,
+            output_preview: output_preview.as_deref().map(|raw| {
+                if raw.len() <= MAX_STAGE_SHELL_PREVIEW_BYTES {
+                    raw.to_string()
+                } else {
+                    let tail = truncate_utf8_tail(raw, MAX_STAGE_SHELL_PREVIEW_BYTES);
+                    format!("... (truncated)\n{tail}")
+                }
+            }),
+        },
+        ToolCallDetail::Generic {
+            tool_name,
+            arguments_json,
+        } => ToolCallDetail::Generic {
+            tool_name: tool_name.clone(),
+            arguments_json: if arguments_json.len() <= MAX_STAGE_GENERIC_ARGS_BYTES {
+                arguments_json.clone()
+            } else {
+                let prefix = truncate_utf8_prefix(arguments_json, MAX_STAGE_GENERIC_ARGS_BYTES);
+                format!("{prefix}\n... (truncated)")
+            },
+        },
+        other => other.clone(),
     }
 }
 
@@ -19626,6 +20317,7 @@ mod tests {
                 request_id: Uuid::new_v4(),
                 agent_id: "ag_1".into(),
                 has_more: false,
+                has_older_history: false,
                 events: vec![TimelineEvent {
                     seq: 1,
                     epoch: 1,
@@ -19748,6 +20440,7 @@ mod tests {
                 request_id: Uuid::new_v4(),
                 agent_id: "ag_existing".into(),
                 has_more: false,
+                has_older_history: false,
                 events: vec![TimelineEvent {
                     seq: 5,
                     epoch: 1,
@@ -19870,6 +20563,7 @@ mod tests {
                 request_id: Uuid::new_v4(),
                 agent_id: "ag_w".into(),
                 has_more: false,
+                has_older_history: false,
                 events: vec![
                     TimelineEvent {
                         seq: 1,
@@ -20020,6 +20714,7 @@ mod tests {
                 request_id: Uuid::new_v4(),
                 agent_id: "ag1".into(),
                 has_more: false,
+                has_older_history: false,
                 events: vec![
                     TimelineEvent {
                         seq: 1,
@@ -20886,6 +21581,7 @@ mod tests {
             &settled_ev,
             &HashMap::new(),
             &HashMap::new(),
+            true,
             &mut mem.markdown_cache,
             &mut mem.streaming_markdown_cache,
         );
@@ -20911,6 +21607,7 @@ mod tests {
                 &stream_ev,
                 &HashMap::new(),
                 &HashMap::new(),
+                true,
                 &mut mem.markdown_cache,
                 &mut mem.streaming_markdown_cache,
             );
@@ -20970,6 +21667,7 @@ mod tests {
                 request_id: Uuid::new_v4(),
                 agent_id: "ag_s".into(),
                 has_more: false,
+                has_older_history: false,
                 events: vec![
                     TimelineEvent {
                         seq: 1,
@@ -22539,6 +23237,7 @@ mod tests {
                 agent_id: "ag_gap".into(),
                 events: catchup_batch,
                 has_more: false,
+                has_older_history: false,
             },
         );
 
@@ -24127,5 +24826,577 @@ mod tests {
         ));
         assert!(stage.turns[1].live_segments.is_empty());
         assert!(stage.turns[1].terminal_reply.is_none());
+    }
+
+    #[test]
+    fn windowed_stage_delta_paginates_and_widens_without_spurious_reset() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("lock");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_win".into(),
+                hostname: "h_win".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag_win".into(),
+                AgentSummary {
+                    agent_id: "ag_win".into(),
+                    workspace_id: "ws1".into(),
+                    cwd: "/repo".into(),
+                    title: "Window".into(),
+                    provider: ProviderKind::Codex,
+                    acp_agent_id: None,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Running {
+                        turn_id: "t12".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 24,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    timeline_epoch: 1,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                    queued_prompts: Vec::new(),
+                },
+            );
+            guard.insert("h_win".into(), mem);
+        }
+
+        let mut events = Vec::new();
+        for i in 1..=12u64 {
+            events.push(TimelineEvent {
+                seq: i * 2 - 1,
+                epoch: 1,
+                agent_id: "ag_win".into(),
+                turn_id: Some(format!("t{i}")),
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: format!("u{i}"),
+                    text: format!("Prompt {i}"),
+                    badges: Vec::new(),
+                },
+            });
+            events.push(TimelineEvent {
+                seq: i * 2,
+                epoch: 1,
+                agent_id: "ag_win".into(),
+                turn_id: Some(format!("t{i}")),
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: format!("a{i}"),
+                    text: format!("Reply {i}"),
+                    streaming: i == 12,
+                },
+            });
+        }
+
+        core.handle_inbound_wire(
+            "h_win",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: "ag_win".into(),
+                has_more: false,
+                has_older_history: false,
+                events,
+            },
+        );
+
+        let d0 = core.agent_stage_delta_windowed("h_win", "ag_win", 0, None, Some(5), None);
+        assert_eq!(d0.total_turn_count, 12);
+        assert_eq!(d0.changed_turns.len(), 5);
+        assert_eq!(d0.window_start_turn_index, 7);
+        assert!(d0.has_older_turns);
+        assert_eq!(d0.replace_from_turn_index, 0);
+
+        // Incremental streaming update on tail turn must NOT reset window
+        core.handle_inbound_wire(
+            "h_win",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 24,
+                    epoch: 1,
+                    agent_id: "ag_win".into(),
+                    turn_id: Some("t12".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "a12".into(),
+                        text: "Reply 12 updated".into(),
+                        streaming: true,
+                    },
+                },
+            },
+        );
+        let d1 = core.agent_stage_delta_windowed(
+            "h_win",
+            "ag_win",
+            d0.revision,
+            Some(d0.aux_revision),
+            Some(5),
+            Some(d0.window_start_turn_index),
+        );
+        assert!(!d1.reset);
+        assert_eq!(d1.window_start_turn_index, 7);
+        assert_eq!(d1.changed_turns.len(), 1);
+        assert_eq!(d1.replace_from_turn_index, 4);
+
+        // Widening window exposes earlier turns with reset=true
+        let d2 = core.agent_stage_delta_windowed(
+            "h_win",
+            "ag_win",
+            d1.revision,
+            Some(d1.aux_revision),
+            Some(10),
+            Some(d1.window_start_turn_index),
+        );
+        assert!(d2.reset);
+        assert_eq!(d2.window_start_turn_index, 2);
+        assert_eq!(d2.changed_turns.len(), 10);
+        assert!(d2.has_older_turns);
+
+        // Short session (3 turns < turn_limit=15) must never reset on streaming deltas
+        core.handle_inbound_wire(
+            "h_win",
+            WireMessage::AgentRewound {
+                request_id: None,
+                to_before_seq: 6,
+                agent: AgentSummary {
+                    agent_id: "ag_win".into(),
+                    workspace_id: "ws1".into(),
+                    cwd: "/repo".into(),
+                    title: "Window".into(),
+                    provider: ProviderKind::Codex,
+                    acp_agent_id: None,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Running {
+                        turn_id: "t3".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 6,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    timeline_epoch: 2,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                    queued_prompts: Vec::new(),
+                },
+                events: (1..=3u64)
+                    .flat_map(|i| {
+                        [
+                            TimelineEvent {
+                                seq: i * 2 - 1,
+                                epoch: 2,
+                                agent_id: "ag_win".into(),
+                                turn_id: None,
+                                timestamp: now,
+                                payload: TimelinePayload::UserPrompt {
+                                    message_id: format!("su{i}"),
+                                    text: format!("Short {i}"),
+                                    badges: Vec::new(),
+                                },
+                            },
+                            TimelineEvent {
+                                seq: i * 2,
+                                epoch: 2,
+                                agent_id: "ag_win".into(),
+                                turn_id: None,
+                                timestamp: now,
+                                payload: TimelinePayload::AssistantMessage {
+                                    item_id: format!("sa{i}"),
+                                    text: format!("Short reply {i}"),
+                                    streaming: i == 3,
+                                },
+                            },
+                        ]
+                    })
+                    .collect(),
+                restored_files: 0,
+                restored_prompt: None,
+                notice: None,
+            },
+        );
+        let s0 = core.agent_stage_delta_windowed("h_win", "ag_win", 0, None, Some(15), None);
+        assert_eq!(s0.total_turn_count, 3);
+        assert_eq!(s0.window_start_turn_index, 0);
+        assert!(!s0.has_older_turns);
+        core.handle_inbound_wire(
+            "h_win",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 6,
+                    epoch: 2,
+                    agent_id: "ag_win".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "sa3".into(),
+                        text: "Short reply 3 longer".into(),
+                        streaming: true,
+                    },
+                },
+            },
+        );
+        let s1 = core.agent_stage_delta_windowed(
+            "h_win",
+            "ag_win",
+            s0.revision,
+            Some(s0.aux_revision),
+            Some(15),
+            Some(s0.window_start_turn_index),
+        );
+        assert!(!s1.reset);
+        assert!(!s1.has_older_turns);
+        assert_eq!(s1.window_start_turn_index, 0);
+    }
+
+    #[test]
+    fn slim_tool_detail_and_session_turn_diffs_dedup() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("lock");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_diff".into(),
+                hostname: "h_diff".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag_diff".into(),
+                AgentSummary {
+                    agent_id: "ag_diff".into(),
+                    workspace_id: "ws1".into(),
+                    cwd: "/repo".into(),
+                    title: "Diff".into(),
+                    provider: ProviderKind::Codex,
+                    acp_agent_id: None,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 2,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    timeline_epoch: 1,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                    queued_prompts: Vec::new(),
+                },
+            );
+            guard.insert("h_diff".into(), mem);
+        }
+
+        let big_body = (0..400)
+            .map(|i| format!("+added line number {i} padding padding padding\n"))
+            .collect::<String>();
+        let big_diff = format!("--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1,400 @@\n{big_body}");
+        core.handle_inbound_wire(
+            "h_diff",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: "ag_diff".into(),
+                has_more: false,
+                has_older_history: false,
+                events: vec![
+                    TimelineEvent {
+                        seq: 1,
+                        epoch: 1,
+                        agent_id: "ag_diff".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::ToolCall {
+                            call_id: "c1".into(),
+                            status: ToolCallStatus::Completed,
+                            detail: ToolCallDetail::FileEdit {
+                                path: "/repo/src/new.rs".into(),
+                                unified_diff: Some(big_diff.clone()),
+                            },
+                            background_task: None,
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 2,
+                        epoch: 1,
+                        agent_id: "ag_diff".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::ToolCall {
+                            call_id: "c2".into(),
+                            status: ToolCallStatus::Completed,
+                            detail: ToolCallDetail::FileEdit {
+                                path: "/repo/src/new.rs".into(),
+                                unified_diff: Some(
+                                    "--- a/src/new.rs\n+++ b/src/new.rs\n@@ -1 +1 @@\n-old\n+new"
+                                        .into(),
+                                ),
+                            },
+                            background_task: None,
+                        },
+                    },
+                ],
+            },
+        );
+
+        let delta = core.agent_stage_delta("h_diff", "ag_diff", 0);
+        assert_eq!(delta.session_turn_diffs.len(), 1);
+        assert_eq!(delta.session_turn_diffs[0].additions, 1);
+
+        let stage_step = delta.changed_turns[0]
+            .folded_steps
+            .first()
+            .expect("first folded step");
+        match stage_step {
+            TimelineItemView::ToolCall {
+                detail: ToolCallDetail::FileEdit { unified_diff, .. },
+                diff_files,
+                ..
+            } => {
+                let d = unified_diff.as_deref().expect("slim diff");
+                assert!(d.starts_with("--- /dev/null"));
+                assert!(d.len() < 9000);
+                assert!(diff_files[0].lines.len() <= 81);
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+        let full_diff = core.get_tool_call_diff("h_diff", "ag_diff", 1);
+        assert_eq!(full_diff.len(), 1);
+        assert!(full_diff[0].lines.len() > 80);
+    }
+
+    #[test]
+    fn load_older_agent_timeline_pages_from_local_replica() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("lock");
+            guard.insert(
+                "h_rep".into(),
+                HostMemoryState::new(SavedHostProfile {
+                    host_id: "h_rep".into(),
+                    hostname: "rep".into(),
+                    custom_name: None,
+                    ssh_alias: None,
+                    route_mode: HostRouteMode::Auto,
+                    remote_daemon_port: 6868,
+                    custom_direct_endpoint: None,
+                    daemon_pubkey_b64: "pk".into(),
+                    direct_endpoints: vec![],
+                    relay_url: None,
+                    pairing_secret: String::new(),
+                    pairing_secret_updated_at_ms: 0,
+                    state: HostConnectionState::Disconnected,
+                }),
+            );
+        }
+
+        let events: Vec<TimelineEvent> = (1..=350u64)
+            .map(|seq| TimelineEvent {
+                seq,
+                epoch: 1,
+                agent_id: "ag_rep".into(),
+                turn_id: Some(format!("t{}", seq.div_ceil(2))),
+                timestamp: now,
+                payload: if seq % 2 == 1 {
+                    TimelinePayload::UserPrompt {
+                        message_id: format!("m{seq}"),
+                        text: format!("Prompt {seq}"),
+                        badges: Vec::new(),
+                    }
+                } else {
+                    TimelinePayload::AssistantMessage {
+                        item_id: format!("a{seq}"),
+                        text: format!("Reply {seq}"),
+                        streaming: false,
+                    }
+                },
+            })
+            .collect();
+        core.store
+            .upsert_replica_timeline_events_batch_for_host("h_rep", &events)
+            .expect("seed replica");
+
+        core.open_agent_timeline("h_rep", "ag_rep");
+        let d0 = core.agent_stage_delta_windowed("h_rep", "ag_rep", 0, None, Some(200), None);
+        assert!(d0.has_older_turns);
+        assert_eq!(d0.oldest_loaded_seq, 51);
+
+        assert!(core.load_older_agent_timeline("h_rep", "ag_rep", 100));
+        let d1 = core.agent_stage_delta_windowed(
+            "h_rep",
+            "ag_rep",
+            d0.revision,
+            None,
+            Some(400),
+            Some(d0.window_start_turn_index),
+        );
+        assert_eq!(d1.oldest_loaded_seq, 1);
+        assert!(!d1.has_older_turns);
+    }
+
+    #[test]
+    fn welcome_adopts_daemon_relay_and_apply_relay_to_fleet_updates_all_hosts() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut guard = core.hosts.write().expect("lock");
+            for (hid, relay) in [
+                ("h1", None),
+                ("h2", Some("ws://old.example:7878".to_string())),
+            ] {
+                guard.insert(
+                    hid.into(),
+                    HostMemoryState::new(SavedHostProfile {
+                        host_id: hid.into(),
+                        hostname: hid.into(),
+                        custom_name: None,
+                        ssh_alias: None,
+                        route_mode: HostRouteMode::Auto,
+                        remote_daemon_port: 6868,
+                        custom_direct_endpoint: None,
+                        daemon_pubkey_b64: format!("pk_{hid}"),
+                        direct_endpoints: vec![],
+                        relay_url: relay,
+                        pairing_secret: String::new(),
+                        pairing_secret_updated_at_ms: 0,
+                        state: HostConnectionState::Disconnected,
+                    }),
+                );
+            }
+        }
+
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::Welcome {
+                host: orbit_protocol::HostInfo {
+                    host_id: "h1".into(),
+                    hostname: "h1".into(),
+                    os: "macos".into(),
+                    arch: "aarch64".into(),
+                    public_key_b64: "pk_h1".into(),
+                    protocol_version: orbit_protocol::PROTOCOL_VERSION,
+                    daemon_version: "0.9.7".into(),
+                    available_providers: vec![],
+                    relay_url: Some("https://relay.example.com".into()),
+                },
+            },
+        );
+        assert_eq!(
+            core.hosts
+                .read()
+                .expect("read")
+                .get("h1")
+                .expect("h1")
+                .profile
+                .relay_url
+                .as_deref(),
+            Some("wss://relay.example.com")
+        );
+
+        let ssh_key = orbit_relay_transport::generate_ssh_tunnel_key().expect("ssh key");
+        let ssh_uri = format!(
+            "ssh+relay://ec2-user@1.2.3.4:22/7878?key={}",
+            ssh_key.seed_b64
+        );
+        let updated = core.apply_relay_to_fleet(&ssh_uri).expect("apply relay");
+        assert_eq!(updated, 2);
+        let hosts = core.hosts.read().expect("read");
+        assert_eq!(
+            hosts.get("h1").expect("h1").profile.relay_url.as_deref(),
+            Some(ssh_uri.as_str())
+        );
+        assert_eq!(
+            hosts.get("h2").expect("h2").profile.relay_url.as_deref(),
+            Some(ssh_uri.as_str())
+        );
+        assert!(
+            hosts
+                .get("h1")
+                .expect("h1")
+                .pending_outbox
+                .iter()
+                .any(|m| matches!(
+                    m,
+                    WireMessage::ConfigureHostRelay {
+                        relay_url: Some(url),
+                        ..
+                    } if url == &ssh_uri
+                ))
+        );
+    }
+
+    #[test]
+    fn open_in_memory_without_local_discovery_starts_empty() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
+        assert!(core.fleet_overview().hosts.is_empty());
     }
 }

@@ -685,6 +685,17 @@ public final class OrbitIosStore: ObservableObject {
     @Published public private(set) var cloudSyncDeviceFlow: FfiGitHubDeviceFlowStart?
     private var cloudDeviceFlowTask: Task<Void, Never>?
 
+    // Windowed tail-first pagination & off-main-thread core read pipeline
+    @Published public private(set) var stageHasOlderTurns: Bool = false
+    @Published public private(set) var isLoadingOlderTurns: Bool = false
+    private let coreReadQueue = DispatchQueue(label: "dev.orbit.ios.core-read", qos: .userInitiated)
+    private var stageFetchEpoch: UInt64 = 0
+    private var stageAuxRevision: UInt64 = 0
+    private var stageTurnLimit: UInt32 = 15
+    private var stageWindowStartTurnIndex: UInt32? = nil
+    private var pendingTimelineRefreshWorkItem: DispatchWorkItem?
+    private var isTimelineRefreshCoalescing = false
+
     private var core: OrbitMobileCore?
     private var listenerBridge: WeakMobileListenerBridge?
     private let pathMonitor = NWPathMonitor()
@@ -741,7 +752,7 @@ public final class OrbitIosStore: ObservableObject {
                 throw OrbitStorageError.applicationSupportUnavailable
             }
             let dbURL = try OrbitStorageProtection.prepareProtectedDatabaseURL(in: appSupportDir)
-            let instance = try OrbitMobileCore.openWithOptions(dbPath: dbURL.path, autoDiscoverLocal: true)
+            let instance = try OrbitMobileCore.openWithOptions(dbPath: dbURL.path, autoDiscoverLocal: false)
             self.core = instance
 
             if !UserDefaults.standard.bool(forKey: Self.migratedThreadPrefsDefaultsKey) {
@@ -1491,6 +1502,7 @@ public final class OrbitIosStore: ObservableObject {
         switch event {
         case .fleetChanged:
             reloadFleet()
+            cloudSyncStatus = core?.cloudSyncStatus()
             if let hid = selectedHostId {
                 reloadHostDetail(hid)
             }
@@ -1503,7 +1515,7 @@ public final class OrbitIosStore: ObservableObject {
 
         case let .timelineChanged(_, hostId, agentId):
             if hostId == selectedHostId, agentId == selectedAgentId {
-                reloadAgentStage(hostId: hostId, agentId: agentId)
+                scheduleCoalescedStageReload(hostId: hostId, agentId: agentId)
             }
 
         case let .gitChanged(_, hostId, _):
@@ -1958,6 +1970,14 @@ public final class OrbitIosStore: ObservableObject {
             reloadHostDetail(hostId)
         }
         if agentChanged {
+            pendingTimelineRefreshWorkItem?.cancel()
+            pendingTimelineRefreshWorkItem = nil
+            stageFetchEpoch &+= 1
+            stageAuxRevision = 0
+            stageTurnLimit = 15
+            stageWindowStartTurnIndex = nil
+            stageHasOlderTurns = false
+            isLoadingOlderTurns = false
             agentStage = nil
             agentStageHostId = nil
             agentStageScopeKey = nil
@@ -2011,9 +2031,64 @@ public final class OrbitIosStore: ObservableObject {
         hapticLight()
     }
 
+    private func scheduleCoalescedStageReload(hostId: String, agentId: String) {
+        pendingTimelineRefreshWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.pendingTimelineRefreshWorkItem = nil
+                self.reloadAgentStage(hostId: hostId, agentId: agentId)
+            }
+        }
+        pendingTimelineRefreshWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(33), execute: work)
+    }
+
+    public func loadOlderStageTurns() {
+        guard !isLoadingOlderTurns,
+              stageHasOlderTurns,
+              let hostId = selectedHostId,
+              let agentId = selectedAgentId,
+              let core = self.core else {
+            return
+        }
+        isLoadingOlderTurns = true
+        stageTurnLimit &+= 20
+
+        if (stageWindowStartTurnIndex ?? 0) > 0 {
+            reloadAgentStage(hostId: hostId, agentId: agentId)
+            return
+        }
+
+        let epoch = stageFetchEpoch
+        coreReadQueue.async { [weak self] in
+            let dispatched = core.loadOlderAgentTimeline(
+                hostId: hostId,
+                agentId: agentId,
+                limitEvents: 200
+            )
+            if !dispatched {
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          self.stageFetchEpoch == epoch,
+                          self.selectedHostId == hostId,
+                          self.selectedAgentId == agentId else {
+                        return
+                    }
+                    self.isLoadingOlderTurns = false
+                }
+            }
+        }
+    }
+
     public func reloadAgentStage(hostId: String, agentId: String) {
         guard hostId == selectedHostId, agentId == selectedAgentId else { return }
         if isDemoChatMode && hostId == "demo-host" {
+            return
+        }
+        guard let core = self.core else {
+            isStageHydrating = false
+            isLoadingOlderTurns = false
             return
         }
         let targetScope = OrbitAgentLogic.stageScopeKey(hostId: hostId, agentId: agentId)
@@ -2023,91 +2098,125 @@ public final class OrbitIosStore: ObservableObject {
             && agentStageHostId == hostId
             && agentStage?.agent?.agentId == agentId
         let sinceRev: UInt64 = sameStage ? (agentStage?.revision ?? 0) : 0
-        guard let delta = core?.agentStageDelta(hostId: hostId, agentId: agentId, sinceRevision: sinceRev) else {
-            if hostId == selectedHostId && agentId == selectedAgentId {
-                isStageHydrating = false
-            }
-            return
-        }
-        guard hostId == selectedHostId && agentId == selectedAgentId else { return }
+        let sinceAuxRev: UInt64? = sameStage ? stageAuxRevision : nil
+        let turnLimit = stageTurnLimit
+        let sinceWindowStart: UInt32? = sameStage ? stageWindowStartTurnIndex : nil
+        let epoch = stageFetchEpoch
 
-        let stage: FfiAgentStage
-        if !delta.reset,
-           sameStage,
-           let current = agentStage,
-           Int(delta.replaceFromTurnIndex) <= current.turns.count {
-            var mergedTurns = Array(current.turns.prefix(Int(delta.replaceFromTurnIndex)))
-            mergedTurns.append(contentsOf: delta.changedTurns)
-            stage = FfiAgentStage(
-                revision: delta.revision,
-                hostId: delta.hostId,
-                agent: delta.agent ?? current.agent,
-                turns: mergedTurns,
-                pendingPermissions: delta.pendingPermissions,
-                pendingQuestions: delta.pendingQuestions,
-                sessionTurnDiffs: delta.sessionTurnDiffs,
-                insights: delta.insights,
-                latestSeq: delta.latestSeq
-            )
-        } else if !delta.reset && sinceRev > 0,
-                  let full = core?.agentStageDelta(hostId: hostId, agentId: agentId, sinceRevision: 0) {
-            stage = FfiAgentStage(
-                revision: full.revision,
-                hostId: full.hostId,
-                agent: full.agent,
-                turns: full.changedTurns,
-                pendingPermissions: full.pendingPermissions,
-                pendingQuestions: full.pendingQuestions,
-                sessionTurnDiffs: full.sessionTurnDiffs,
-                insights: full.insights,
-                latestSeq: full.latestSeq
-            )
-        } else {
-            stage = FfiAgentStage(
-                revision: delta.revision,
-                hostId: delta.hostId,
-                agent: delta.agent,
-                turns: delta.changedTurns,
-                pendingPermissions: delta.pendingPermissions,
-                pendingQuestions: delta.pendingQuestions,
-                sessionTurnDiffs: delta.sessionTurnDiffs,
-                insights: delta.insights,
-                latestSeq: delta.latestSeq
-            )
-        }
-
-        agentStage = stage
-        agentStageHostId = hostId
-        agentStageScopeKey = targetScope
-        isStageHydrating = false
-        activeStageLoadError = nil
-        if let card = stage.agent {
-            if selectedProvider != card.provider { selectedProvider = card.provider }
-            if let m = card.model, selectedModel != m { selectedModel = m }
-            if let e = card.effort, selectedEffort != e { selectedEffort = e }
-            if selectedMode != card.mode { selectedMode = card.mode }
-            if !card.cwd.isEmpty && card.cwd != activeCwd {
-                updateActiveWorkspaceCwd(card.cwd)
-            }
-            if hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
-                markAgentSeen(
+        coreReadQueue.async { [weak self] in
+            let fetchedDelta = core.agentStageDeltaRequest(
+                req: FfiAgentStageDeltaRequest(
                     hostId: hostId,
                     agentId: agentId,
-                    seq: max(card.latestSeq, stage.latestSeq),
-                    force: card.isUnread,
-                    refreshSidebarAfter: !card.isForegroundRunning
+                    sinceRevision: sinceRev,
+                    sinceAuxRevision: sinceAuxRev,
+                    turnLimit: turnLimit,
+                    sinceWindowStartTurnIndex: sinceWindowStart
                 )
-            }
-        } else if hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
-            markAgentSeen(hostId: hostId, agentId: agentId, seq: stage.latestSeq, refreshSidebarAfter: false)
-        }
+            )
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.stageFetchEpoch == epoch,
+                      self.selectedHostId == hostId,
+                      self.selectedAgentId == agentId else {
+                    return
+                }
+                var effectiveDelta = fetchedDelta
+                let currentSameStage = targetScope != nil
+                    && self.agentStageScopeKey == targetScope
+                    && self.agentStage?.hostId == hostId
+                    && self.agentStageHostId == hostId
+                    && self.agentStage?.agent?.agentId == agentId
+                let existingTurnsCount = self.agentStage?.turns.count ?? 0
 
-        if hostId == selectedHostId && agentId == selectedAgentId {
-            let awaitingDecision = !stage.pendingPermissions.isEmpty
-                || !stage.pendingQuestions.isEmpty
-                || (stage.agent?.isAwaitingPermission ?? false)
-            let isBusy = isActiveAgentTurnBusy || awaitingDecision
-            evaluateAgentQueueDrain(hostId: hostId, agentId: agentId, isBusy: isBusy)
+                if !effectiveDelta.reset && sinceRev > 0 && (!currentSameStage || Int(effectiveDelta.replaceFromTurnIndex) > existingTurnsCount) {
+                    let full = core.agentStageDeltaRequest(
+                        req: FfiAgentStageDeltaRequest(
+                            hostId: hostId,
+                            agentId: agentId,
+                            sinceRevision: 0,
+                            sinceAuxRevision: nil,
+                            turnLimit: turnLimit,
+                            sinceWindowStartTurnIndex: nil
+                        )
+                    )
+                    effectiveDelta = full
+                }
+
+                let delta = effectiveDelta
+
+                let stage: FfiAgentStage
+                let canIncremental = !delta.reset
+                    && currentSameStage
+                    && self.agentStage != nil
+                    && Int(delta.replaceFromTurnIndex) <= existingTurnsCount
+                if canIncremental, let current = self.agentStage {
+                    var mergedTurns = Array(current.turns.prefix(Int(delta.replaceFromTurnIndex)))
+                    mergedTurns.append(contentsOf: delta.changedTurns)
+                    let reuseAux = delta.auxUnchanged
+                    stage = FfiAgentStage(
+                        revision: delta.revision,
+                        hostId: delta.hostId,
+                        agent: delta.agent ?? current.agent,
+                        turns: mergedTurns,
+                        pendingPermissions: reuseAux ? current.pendingPermissions : delta.pendingPermissions,
+                        pendingQuestions: reuseAux ? current.pendingQuestions : delta.pendingQuestions,
+                        sessionTurnDiffs: reuseAux ? current.sessionTurnDiffs : delta.sessionTurnDiffs,
+                        insights: reuseAux ? current.insights : delta.insights,
+                        latestSeq: delta.latestSeq
+                    )
+                } else {
+                    stage = FfiAgentStage(
+                        revision: delta.revision,
+                        hostId: delta.hostId,
+                        agent: delta.agent,
+                        turns: delta.changedTurns,
+                        pendingPermissions: delta.pendingPermissions,
+                        pendingQuestions: delta.pendingQuestions,
+                        sessionTurnDiffs: delta.sessionTurnDiffs,
+                        insights: delta.insights,
+                        latestSeq: delta.latestSeq
+                    )
+                }
+
+                self.stageAuxRevision = delta.auxRevision
+                self.stageWindowStartTurnIndex = delta.windowStartTurnIndex
+                self.stageHasOlderTurns = delta.hasOlderTurns
+                self.isLoadingOlderTurns = false
+                self.agentStage = stage
+                self.agentStageHostId = hostId
+                self.agentStageScopeKey = targetScope
+                self.isStageHydrating = false
+                self.activeStageLoadError = nil
+                if let card = stage.agent {
+                    if self.selectedProvider != card.provider { self.selectedProvider = card.provider }
+                    if let m = card.model, self.selectedModel != m { self.selectedModel = m }
+                    if let e = card.effort, self.selectedEffort != e { self.selectedEffort = e }
+                    if self.selectedMode != card.mode { self.selectedMode = card.mode }
+                    if !card.cwd.isEmpty && card.cwd != self.activeCwd {
+                        self.updateActiveWorkspaceCwd(card.cwd)
+                    }
+                    if hostId == self.selectedHostId && agentId == self.selectedAgentId && !self.isDraftNewSession {
+                        self.markAgentSeen(
+                            hostId: hostId,
+                            agentId: agentId,
+                            seq: max(card.latestSeq, stage.latestSeq),
+                            force: card.isUnread,
+                            refreshSidebarAfter: !card.isForegroundRunning
+                        )
+                    }
+                } else if hostId == self.selectedHostId && agentId == self.selectedAgentId && !self.isDraftNewSession {
+                    self.markAgentSeen(hostId: hostId, agentId: agentId, seq: stage.latestSeq, refreshSidebarAfter: false)
+                }
+
+                if hostId == self.selectedHostId && agentId == self.selectedAgentId {
+                    let awaitingDecision = !stage.pendingPermissions.isEmpty
+                        || !stage.pendingQuestions.isEmpty
+                        || (stage.agent?.isAwaitingPermission ?? false)
+                    let isBusy = self.isActiveAgentTurnBusy || awaitingDecision
+                    self.evaluateAgentQueueDrain(hostId: hostId, agentId: agentId, isBusy: isBusy)
+                }
+            }
         }
     }
 
@@ -2506,6 +2615,26 @@ public final class OrbitIosStore: ObservableObject {
         } catch {
             lastError = error.localizedDescription
             hapticWarning()
+        }
+    }
+
+    public func applyRelayToFleet(_ rawRelayUrl: String) {
+        guard let core = self.core else { return }
+        let trimmed = rawRelayUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let count = try await Task.detached(priority: .userInitiated) {
+                    try core.applyRelayToFleet(rawRelayUrl: trimmed)
+                }.value
+                self.lastError = nil
+                self.reloadFleet()
+                self.hapticSuccess()
+                self.showToast("Shared relay across \(count) host\(count == 1 ? "" : "s")")
+            } catch {
+                self.lastError = error.localizedDescription
+                self.hapticWarning()
+            }
         }
     }
 
@@ -4820,7 +4949,7 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Fleet Daemon Version & One-Click Over-the-Wire Update
 
     public var appShortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.9.7"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.9.8"
     }
 
     public func isHostProtocolBehind(_ host: FfiHostCard) -> Bool {
@@ -5080,6 +5209,9 @@ public final class OrbitIosStore: ObservableObject {
                         } else {
                             self.showToast("Signed in to GitHub")
                         }
+                        if nextStatus.state == .ready {
+                            self.syncCloudNow()
+                        }
                         return
                     case .expired, .denied:
                         self.cloudSyncDeviceFlow = nil
@@ -5130,6 +5262,9 @@ public final class OrbitIosStore: ObservableObject {
                 self.hapticSuccess()
                 if let login = status.accountLogin {
                     self.showToast("Signed in to GitHub as @\(login)")
+                }
+                if status.state == .ready {
+                    self.syncCloudNow()
                 }
             } catch {
                 self.cloudSyncBusy = false

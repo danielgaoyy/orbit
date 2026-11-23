@@ -16,8 +16,8 @@ env:
   ORBIT_GITHUB_CLIENT_ID: ${{ vars.ORBIT_GITHUB_CLIENT_ID }}
 
 jobs:
-  rust-quality-and-e2e:
-    name: Rust Clippy & E2E Tests
+  rust-quality-and-unit:
+    name: Rust Format, Clippy & Unit Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +27,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --lib --bins
+
+  e2e-regression-matrix:
+    name: E2E (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: pitfall-regressions
+            label: "Pitfall Regressions"
+            args: "-p orbit-cli --test e2e_pitfall_regressions"
+          - suite: relay-security-isolation
+            label: "Relay E2EE & Isolation"
+            args: "-p orbit-cli --test e2e_relay_and_pty --test e2e_multi_user_isolation"
+          - suite: orchestration
+            label: "Orchestration & Fleet Mesh"
+            args: "-p orbit-cli --test e2e_orchestration"
+          - suite: workspace-sync-worktree
+            label: "Workspace Sync & Worktree"
+            args: "-p orbit-cli --test e2e_workspace_sync_and_worktree"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "orbit-rust-e2e"
+      - name: Run ${{ matrix.label }}
+        shell: bash
+        run: |
+          start_ts=$(date +%s)
+          TMPDIR=/tmp cargo test ${{ matrix.args }} -- --test-threads=4
+          end_ts=$(date +%s)
+          elapsed=$((end_ts - start_ts))
+          echo "E2E shard '${{ matrix.label }}' finished in ${elapsed}s" >> "$GITHUB_STEP_SUMMARY"
 
   desktop-frontend-quality:
     name: Desktop Frontend Tests, Build & Runtime Smoke
@@ -49,7 +83,7 @@ jobs:
 
   build-host-binaries:
     name: Build CLI & Daemon (${{ matrix.artifact }})
-    needs: rust-quality-and-e2e
+    needs: [rust-quality-and-unit, e2e-regression-matrix]
     strategy:
       fail-fast: false
       matrix:
@@ -95,7 +129,7 @@ jobs:
 
   build-macos-desktop:
     name: Build macOS Tauri v2 Desktop App (Orbit.dmg)
-    needs: [rust-quality-and-e2e, desktop-frontend-quality]
+    needs: [rust-quality-and-unit, e2e-regression-matrix, desktop-frontend-quality]
     runs-on: macos-latest
     outputs:
       notarized: ${{ steps.macos-signing.outputs.notarized }}
@@ -252,7 +286,7 @@ jobs:
 
   build-linux-desktop:
     name: Build Linux Tauri v2 Desktop App (${{ matrix.artifact }})
-    needs: [rust-quality-and-e2e, desktop-frontend-quality]
+    needs: [rust-quality-and-unit, e2e-regression-matrix, desktop-frontend-quality]
     strategy:
       fail-fast: false
       matrix:
@@ -298,7 +332,7 @@ jobs:
 
   build-windows-desktop:
     name: Build Windows Tauri v2 Desktop App (.msi & NSIS .exe)
-    needs: [rust-quality-and-e2e, desktop-frontend-quality]
+    needs: [rust-quality-and-unit, e2e-regression-matrix, desktop-frontend-quality]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -342,7 +376,7 @@ jobs:
 
   build-android-apk:
     name: Build Native Android APK (Jetpack Compose + UniFFI, minSdk 29)
-    needs: rust-quality-and-e2e
+    needs: [rust-quality-and-unit, e2e-regression-matrix]
     runs-on: ubuntu-latest
     outputs:
       signed: ${{ steps.android-signing.outputs.signed }}
@@ -416,7 +450,7 @@ jobs:
 
   build-ios-ipa:
     name: Build Native iOS App (SwiftUI iOS 16.4+ + UniFFI XCFramework)
-    needs: rust-quality-and-e2e
+    needs: [rust-quality-and-unit, e2e-regression-matrix]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -450,7 +484,7 @@ jobs:
 
   build-harmony-hap:
     name: Build Native HarmonyOS HAP (ArkUI V2 + N-API, API 26)
-    needs: rust-quality-and-e2e
+    needs: [rust-quality-and-unit, e2e-regression-matrix]
     runs-on: ubuntu-latest
     outputs:
       signed: ${{ steps.harmony-signing.outputs.signed }}

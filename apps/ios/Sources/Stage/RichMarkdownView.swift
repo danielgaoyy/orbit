@@ -1,6 +1,67 @@
 import SwiftUI
 import UIKit
 
+// MARK: - Bounded Caches for Attributed Strings, Text Heights & Syntax Colors
+
+private enum MarkdownRenderCache {
+    static let attributedStrings: NSCache<NSString, NSAttributedString> = {
+        let cache = NSCache<NSString, NSAttributedString>()
+        cache.countLimit = 256
+        return cache
+    }()
+
+    static let textMeasurements: NSCache<NSString, NSValue> = {
+        let cache = NSCache<NSString, NSValue>()
+        cache.countLimit = 512
+        return cache
+    }()
+
+    private static let colorLock = NSLock()
+    private static var hexColorMap: [String: Color] = [:]
+
+    static func attributedString(forKey key: String, build: () -> NSAttributedString) -> NSAttributedString {
+        let nsKey = key as NSString
+        if let hit = attributedStrings.object(forKey: nsKey) {
+            return hit
+        }
+        let built = build()
+        attributedStrings.setObject(built, forKey: nsKey)
+        return built
+    }
+
+    static func cachedColor(hex: String, isDark: Bool, fallback: Color) -> Color {
+        let key = "\(isDark ? "d" : "l"):\(hex)"
+        colorLock.lock()
+        if let hit = hexColorMap[key] {
+            colorLock.unlock()
+            return hit
+        }
+        colorLock.unlock()
+
+        let resolved: Color
+        if !isDark {
+            let clean = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+            var rgb: UInt64 = 0
+            Scanner(string: clean).scanHexInt64(&rgb)
+            let r = Double((rgb >> 16) & 0xFF) / 255.0
+            let g = Double((rgb >> 8) & 0xFF) / 255.0
+            let b = Double(rgb & 0xFF) / 255.0
+            let luminance = 0.299 * r + 0.587 * g + 0.114 * b
+            resolved = luminance > 0.78 ? fallback : Color(red: r * 0.72, green: g * 0.72, blue: b * 0.72)
+        } else {
+            resolved = Color(hex: hex)
+        }
+
+        colorLock.lock()
+        if hexColorMap.count > 256 {
+            hexColorMap.removeAll(keepingCapacity: true)
+        }
+        hexColorMap[key] = resolved
+        colorLock.unlock()
+        return resolved
+    }
+}
+
 // MARK: - Native Auto-Sizing Selectable TextView (Genuine iOS Range Selection)
 
 struct OrbitSelectableTextView: UIViewRepresentable {
@@ -47,6 +108,13 @@ struct OrbitSelectableTextView: UIViewRepresentable {
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
         context.coordinator.parent = self
 
+        let widthBucket = proposal.width.map { Int(max(1, $0).rounded()) } ?? -1
+        let measureKey = "\(attributedText.length):\(attributedText.string.hashValue):\(isDarkAppearance ? 1 : 0):\(maxLines):\(stretchesToProposedWidth ? 1 : 0):\(widthBucket)" as NSString
+        if let cachedVal = MarkdownRenderCache.textMeasurements.object(forKey: measureKey) {
+            return cachedVal.cgSizeValue
+        }
+
+        let result: CGSize
         if let proposedWidth = proposal.width {
             let safeProposed = max(1, proposedWidth)
             if stretchesToProposedWidth {
@@ -55,7 +123,7 @@ struct OrbitSelectableTextView: UIViewRepresentable {
                     options: [.usesLineFragmentOrigin, .usesFontLeading],
                     context: nil
                 )
-                return CGSize(width: safeProposed, height: max(1, ceil(measured.height) + 4))
+                result = CGSize(width: safeProposed, height: max(1, ceil(measured.height) + 4))
             } else {
                 let measured = attributedText.boundingRect(
                     with: CGSize(width: safeProposed, height: .greatestFiniteMagnitude),
@@ -68,7 +136,7 @@ struct OrbitSelectableTextView: UIViewRepresentable {
                     options: [.usesLineFragmentOrigin, .usesFontLeading],
                     context: nil
                 )
-                return CGSize(width: tightWidth, height: max(1, ceil(tightMeasured.height) + 4))
+                result = CGSize(width: tightWidth, height: max(1, ceil(tightMeasured.height) + 4))
             }
         } else {
             let measured = attributedText.boundingRect(
@@ -76,8 +144,10 @@ struct OrbitSelectableTextView: UIViewRepresentable {
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
                 context: nil
             )
-            return CGSize(width: max(1, ceil(measured.width) + 2), height: max(1, ceil(measured.height) + 4))
+            result = CGSize(width: max(1, ceil(measured.width) + 2), height: max(1, ceil(measured.height) + 4))
         }
+        MarkdownRenderCache.textMeasurements.setObject(NSValue(cgSize: result), forKey: measureKey)
+        return result
     }
 
     private func syncContentIfNeeded(on uiView: UITextView, coordinator: Coordinator) {
@@ -97,9 +167,12 @@ struct OrbitSelectableTextView: UIViewRepresentable {
             ]
             coordinator.lastLinkColor = linkColor
         }
-        if coordinator.lastAttributedText == nil || !coordinator.lastAttributedText!.isEqual(to: attributedText) {
+        let unchanged = coordinator.lastAttributedText.map { prev in
+            prev === attributedText || prev.isEqual(to: attributedText)
+        } ?? false
+        if !unchanged {
             uiView.attributedText = attributedText
-            coordinator.lastAttributedText = attributedText.copy() as? NSAttributedString
+            coordinator.lastAttributedText = attributedText
             uiView.invalidateIntrinsicContentSize()
         }
     }
@@ -564,17 +637,33 @@ struct RichMarkdownView: View {
     }
 
     private func buildPlainNSAttributed(_ text: String, color: UIColor) -> NSAttributedString {
-        NSAttributedString(
-            string: text,
-            attributes: [
-                .font: uiFont(size: 15, weight: .regular),
-                .foregroundColor: color,
-                .paragraphStyle: bodyParagraphStyle(spacingAfter: 0)
-            ]
-        )
+        let key = "plain:\(palette.isDark ? 1 : 0):\(text.hashValue):\(text.utf8.count)"
+        return MarkdownRenderCache.attributedString(forKey: key) {
+            NSAttributedString(
+                string: text,
+                attributes: [
+                    .font: uiFont(size: 15, weight: .regular),
+                    .foregroundColor: color,
+                    .paragraphStyle: bodyParagraphStyle(spacingAfter: 0)
+                ]
+            )
+        }
     }
 
     private func buildMergedProseNSAttributed(_ proseBlocks: [FfiRichBlock]) -> NSAttributedString {
+        if isStreaming {
+            return buildMergedProseNSAttributedUncached(proseBlocks)
+        }
+        var hasher = Hasher()
+        hasher.combine(palette.isDark)
+        hasher.combine(proseBlocks)
+        let key = "prose:\(proseBlocks.count):\(hasher.finalize())"
+        return MarkdownRenderCache.attributedString(forKey: key) {
+            buildMergedProseNSAttributedUncached(proseBlocks)
+        }
+    }
+
+    private func buildMergedProseNSAttributedUncached(_ proseBlocks: [FfiRichBlock]) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let uiPrimary = UIColor(palette.fgPrimary)
         let uiSecondary = UIColor(palette.fgSecondary)
@@ -990,38 +1079,47 @@ struct CodeBlockView: View {
     }
 
     private func buildFallbackCodeNSAttributed() -> NSAttributedString {
-        NSAttributedString(
-            string: rawCode.hasSuffix("\n") ? String(rawCode.dropLast()) : rawCode,
-            attributes: [
-                .font: codeUIFont(bold: false, italic: false),
-                .foregroundColor: UIColor(palette.fgPrimary),
-                .paragraphStyle: codeParagraphStyle()
-            ]
-        )
+        let key = "codefb:\(palette.isDark ? 1 : 0):\(rawCode.hashValue):\(rawCode.utf8.count)"
+        return MarkdownRenderCache.attributedString(forKey: key) {
+            NSAttributedString(
+                string: rawCode.hasSuffix("\n") ? String(rawCode.dropLast()) : rawCode,
+                attributes: [
+                    .font: codeUIFont(bold: false, italic: false),
+                    .foregroundColor: UIColor(palette.fgPrimary),
+                    .paragraphStyle: codeParagraphStyle()
+                ]
+            )
+        }
     }
 
     private func buildHighlightedCodeNSAttributed() -> NSAttributedString {
-        let out = NSMutableAttributedString()
-        let p = codeParagraphStyle()
-        let uiPrimary = UIColor(palette.fgPrimary)
+        var hasher = Hasher()
+        hasher.combine(palette.isDark)
+        hasher.combine(lines)
+        let key = "codehl:\(lines.count):\(hasher.finalize())"
+        return MarkdownRenderCache.attributedString(forKey: key) {
+            let out = NSMutableAttributedString()
+            let p = codeParagraphStyle()
+            let uiPrimary = UIColor(palette.fgPrimary)
 
-        for (idx, line) in lines.enumerated() {
-            if idx > 0 {
-                out.append(NSAttributedString(string: "\n", attributes: [.font: codeUIFont(bold: false, italic: false), .paragraphStyle: p]))
+            for (idx, line) in lines.enumerated() {
+                if idx > 0 {
+                    out.append(NSAttributedString(string: "\n", attributes: [.font: codeUIFont(bold: false, italic: false), .paragraphStyle: p]))
+                }
+                for token in line.tokens {
+                    let fg = token.fgHex.isEmpty ? uiPrimary : UIColor(adjustedTokenColor(hex: token.fgHex))
+                    out.append(NSAttributedString(
+                        string: token.text,
+                        attributes: [
+                            .font: codeUIFont(bold: token.bold, italic: token.italic),
+                            .foregroundColor: fg,
+                            .paragraphStyle: p
+                        ]
+                    ))
+                }
             }
-            for token in line.tokens {
-                let fg = token.fgHex.isEmpty ? uiPrimary : UIColor(adjustedTokenColor(hex: token.fgHex))
-                out.append(NSAttributedString(
-                    string: token.text,
-                    attributes: [
-                        .font: codeUIFont(bold: token.bold, italic: token.italic),
-                        .foregroundColor: fg,
-                        .paragraphStyle: p
-                    ]
-                ))
-            }
+            return out
         }
-        return out
     }
 
     private func buildHighlightedLine(_ line: FfiHighlightedLine) -> AttributedString {
@@ -1048,19 +1146,6 @@ struct CodeBlockView: View {
     }
 
     private func adjustedTokenColor(hex: String) -> Color {
-        if !palette.isDark {
-            let clean = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-            var rgb: UInt64 = 0
-            Scanner(string: clean).scanHexInt64(&rgb)
-            let r = Double((rgb >> 16) & 0xFF) / 255.0
-            let g = Double((rgb >> 8) & 0xFF) / 255.0
-            let b = Double(rgb & 0xFF) / 255.0
-            let luminance = 0.299 * r + 0.587 * g + 0.114 * b
-            if luminance > 0.78 {
-                return palette.fgPrimary
-            }
-            return Color(red: r * 0.72, green: g * 0.72, blue: b * 0.72)
-        }
-        return Color(hex: hex)
+        MarkdownRenderCache.cachedColor(hex: hex, isDark: palette.isDark, fallback: palette.fgPrimary)
     }
 }

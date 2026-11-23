@@ -22,7 +22,8 @@ fn next_unique_local_tag(prefix: &str) -> String {
 
 use crate::updater::{
     AppUpdateProgress, CURRENT_APP_VERSION, LocalDaemonSyncResult, ReleaseUpdateInfo,
-    check_latest_release, perform_one_click_update, sync_local_daemon as run_sync_local_daemon,
+    check_latest_release, ensure_bundled_sidecar_installed, perform_one_click_update,
+    sync_local_daemon as run_sync_local_daemon,
 };
 
 use orbit_client_core::HostRouteMode;
@@ -60,11 +61,11 @@ use orbit_client_core::contract::{
     WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
-    ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
-    detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
-    open_external_url, open_in_external_editor, open_local_file_externally as open_local_file_os,
-    pick_local_directory, pick_local_save_file, provision_relay_over_ssh, resolve_user_home,
-    upgrade_remote_daemon_over_ssh,
+    ExternalEditorInfo, ExternalEditorKind, LocalMachineInfo, SshHostItem, StagedAttachmentInfo,
+    detect_installed_editors, discover_user_ssh_hosts, inspect_local_machine_info,
+    list_local_workspace_files, open_external_url, open_in_external_editor,
+    open_local_file_externally as open_local_file_os, pick_local_directory, pick_local_save_file,
+    provision_relay_over_ssh, resolve_user_home, upgrade_remote_daemon_over_ssh,
 };
 use orbit_client_core::export::{
     ExportOptions, ExportedTranscript, ExtractedCodeBlock, write_file_atomically,
@@ -406,6 +407,21 @@ async fn get_agent_stage_turns_slice(
 }
 
 #[tauri::command]
+async fn load_older_agent_timeline(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    limit_events: Option<u32>,
+) -> Result<bool, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.load_older_agent_timeline(&host_id, &agent_id, limit_events.unwrap_or(300))
+    })
+    .await
+    .map_err(|e| format!("load older timeline task error: {e}"))
+}
+
+#[tauri::command]
 fn get_fallback_provider_catalogs(state: State<'_, DesktopAppState>) -> Vec<ProviderModelCatalog> {
     state.core.fallback_provider_catalogs()
 }
@@ -595,6 +611,24 @@ async fn pair_ssh_host(
 }
 
 #[tauri::command]
+async fn get_local_machine_info() -> Result<LocalMachineInfo, String> {
+    tauri::async_runtime::spawn_blocking(inspect_local_machine_info)
+        .await
+        .map_err(|e| format!("inspect local machine task error: {e}"))
+}
+
+#[tauri::command]
+async fn pair_local_host(state: State<'_, DesktopAppState>) -> Result<HostCardView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = ensure_bundled_sidecar_installed();
+        core.pair_local_host_blocking().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("pair local host task error: {e}"))?
+}
+
+#[tauri::command]
 fn remove_host(state: State<'_, DesktopAppState>, host_id: String) -> Result<(), String> {
     state.core.remove_host(&host_id).map_err(|e| e.to_string())
 }
@@ -636,6 +670,17 @@ fn update_host_relay(
     state
         .core
         .update_host_relay(&host_id, relay_url.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn apply_relay_to_all_hosts(
+    state: State<'_, DesktopAppState>,
+    raw_relay_url: String,
+) -> Result<u32, String> {
+    state
+        .core
+        .apply_relay_to_fleet(&raw_relay_url)
         .map_err(|e| e.to_string())
 }
 
@@ -3629,6 +3674,7 @@ async fn provision_ssh_relay(
     ssh_alias: String,
     fallback_hostname: String,
     relay_port: u16,
+    apply_to_all_hosts: Option<bool>,
 ) -> Result<String, String> {
     let overview = state.core.fleet_overview();
     let pubkeys: Vec<String> = overview
@@ -3643,10 +3689,17 @@ async fn provision_ssh_relay(
     .await
     .map_err(|e| format!("task join error: {e}"))??;
 
-    state
-        .core
-        .update_host_relay(&target_host_id, Some(&relay_url))
-        .map_err(|e| e.to_string())?;
+    if apply_to_all_hosts.unwrap_or(true) {
+        let _ = state
+            .core
+            .apply_relay_to_fleet(&relay_url)
+            .map_err(|e| e.to_string())?;
+    } else {
+        state
+            .core
+            .update_host_relay(&target_host_id, Some(&relay_url))
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(relay_url)
 }
@@ -3877,10 +3930,10 @@ pub fn run() {
         db_path = %db_path.display(),
         "Starting Orbit Desktop"
     );
-    let core = OrbitAppCore::open(&db_path, true)
+    let core = OrbitAppCore::open(&db_path, false)
         .or_else(|err| {
             tracing::error!(error = %err, "Failed to open desktop replica SQLite; falling back to in-memory store");
-            OrbitAppCore::open_in_memory_with_discovery(true)
+            OrbitAppCore::open_in_memory_with_discovery(false)
         })
         .expect("failed to initialize OrbitAppCore");
     core.connect_all_hosts();
@@ -3913,6 +3966,7 @@ pub fn run() {
             get_agent_stage,
             get_agent_stage_delta,
             get_agent_stage_turns_slice,
+            load_older_agent_timeline,
             get_fallback_provider_catalogs,
             resolve_model_selection,
             get_slash_commands,
@@ -3932,9 +3986,12 @@ pub fn run() {
             get_git_review,
             pair_host,
             pair_ssh_host,
+            get_local_machine_info,
+            pair_local_host,
             remove_host,
             update_host_config,
             update_host_relay,
+            apply_relay_to_all_hosts,
             upgrade_remote_daemon,
             upsert_project,
             remove_project,

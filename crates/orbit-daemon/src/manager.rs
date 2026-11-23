@@ -2230,91 +2230,133 @@ impl AgentOrchestrator {
             format!("{base} (fork)")
         });
 
-        let (target_workspace_id, target_cwd, created_workspace, shared_curated_workspace) =
-            match spec.target {
-                ForkTarget::SameDirectory => {
-                    let reuse_source_ws = source_ws
+        let (
+            target_workspace_id,
+            target_cwd,
+            created_workspace,
+            shared_curated_workspace,
+            peer_wt_meta,
+        ) = match spec.target {
+            ForkTarget::SameDirectory => {
+                let reuse_source_ws = source_ws
+                    .as_ref()
+                    .is_some_and(|w| w.is_curated || w.is_worktree);
+                if reuse_source_ws {
+                    let is_curated = source_ws.as_ref().is_some_and(|w| w.is_curated);
+                    (
+                        source.workspace_id.clone(),
+                        source.cwd.clone(),
+                        None,
+                        is_curated,
+                        None,
+                    )
+                } else {
+                    // Standalone non-curated local thread: provision a dedicated non-curated
+                    // local workspace (matching `create_and_start_agent`) so archiving one
+                    // thread never archives the other.
+                    let project_root = source_ws
                         .as_ref()
-                        .is_some_and(|w| w.is_curated || w.is_worktree);
-                    if reuse_source_ws {
-                        let is_curated = source_ws.as_ref().is_some_and(|w| w.is_curated);
-                        (
-                            source.workspace_id.clone(),
-                            source.cwd.clone(),
-                            None,
-                            is_curated,
-                        )
-                    } else {
-                        // Standalone non-curated local thread: provision a dedicated non-curated
-                        // local workspace (matching `create_and_start_agent`) so archiving one
-                        // thread never archives the other.
-                        let project_root = source_ws
-                            .as_ref()
-                            .and_then(|w| w.project_root.clone())
-                            .or_else(|| Some(source.cwd.clone()));
-                        let new_ws = self
-                            .create_workspace_v2(CreateWorkspaceSpec {
-                                source_cwd: source.cwd.clone(),
-                                title: Some(derived_title.clone()),
-                                worktree_branch: None,
-                                base_ref: None,
-                                isolation: WorkspaceIsolation::Local,
-                                worktree_mode: WorktreeCreateMode::BranchOff,
-                                pr_number: None,
-                                parent_workspace_id: Some(source.workspace_id.clone()),
-                                background: source.background,
-                                project_root,
-                                mission_goal: None,
-                                allow_reuse_existing: false,
-                                is_curated: false,
-                            })
-                            .await?;
-                        (
-                            new_ws.workspace_id.clone(),
-                            new_ws.cwd.clone(),
-                            Some(new_ws),
-                            false,
-                        )
-                    }
+                        .and_then(|w| w.project_root.clone())
+                        .or_else(|| Some(source.cwd.clone()));
+                    let new_ws = self
+                        .create_workspace_v2(CreateWorkspaceSpec {
+                            source_cwd: source.cwd.clone(),
+                            title: Some(derived_title.clone()),
+                            worktree_branch: None,
+                            base_ref: None,
+                            isolation: WorkspaceIsolation::Local,
+                            worktree_mode: WorktreeCreateMode::BranchOff,
+                            pr_number: None,
+                            parent_workspace_id: Some(source.workspace_id.clone()),
+                            background: source.background,
+                            project_root,
+                            mission_goal: None,
+                            allow_reuse_existing: false,
+                            is_curated: false,
+                        })
+                        .await?;
+                    (
+                        new_ws.workspace_id.clone(),
+                        new_ws.cwd.clone(),
+                        Some(new_ws),
+                        false,
+                        None,
+                    )
                 }
-                ForkTarget::NewWorktree { branch, base_ref } => {
-                    let src_for_wt = source_ws
-                        .as_ref()
-                        .and_then(|w| w.source_cwd.as_deref())
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or(&source.cwd);
-                    let expanded_src = crate::expand_host_path(src_for_wt);
-                    if resolve_git_scope(&expanded_src).await.is_none() {
-                        anyhow::bail!(
-                            "not_a_git_repo: `{}` is not a Git repository. Fork in the same directory instead.",
-                            expanded_src.display()
-                        );
+            }
+            ForkTarget::NewWorktree { branch, base_ref } => {
+                let src_for_wt = source
+                    .labels
+                    .get("orbit.worktree_source_cwd")
+                    .map(String::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        source_ws
+                            .as_ref()
+                            .and_then(|w| w.source_cwd.as_deref())
+                            .filter(|s| !s.trim().is_empty())
+                    })
+                    .unwrap_or(&source.cwd);
+                let expanded_src = crate::expand_host_path(src_for_wt);
+                if resolve_git_scope(&expanded_src).await.is_none() {
+                    anyhow::bail!(
+                        "not_a_git_repo: `{}` is not a Git repository. Fork in the same directory instead.",
+                        expanded_src.display()
+                    );
+                }
+                let branch_name = match branch.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(b) => validate_git_branch_name(&expanded_src, b).await?,
+                    None => {
+                        format!("orbit/fork-{}", &Uuid::new_v4().simple().to_string()[..6])
                     }
-                    let branch_name =
-                        match branch.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            Some(b) => validate_git_branch_name(&expanded_src, b).await?,
-                            None => {
-                                format!("orbit/fork-{}", &Uuid::new_v4().simple().to_string()[..6])
+                };
+                let effective_base_ref =
+                    match base_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(b) => Some(validate_git_base_ref(&expanded_src, b).await?),
+                        None => {
+                            // If forking an agent already running inside a worktree, default
+                            // `base_ref` to that worktree's branch so we branch from its commits
+                            // instead of the main checkout's HEAD.
+                            let peer_wt_branch = source
+                                .labels
+                                .get("orbit.worktree_branch")
+                                .map(String::as_str)
+                                .filter(|s| !s.trim().is_empty());
+                            let ws_wt_branch = source_ws
+                                .as_ref()
+                                .filter(|w| w.is_worktree)
+                                .and_then(|w| w.git_branch.as_deref())
+                                .filter(|s| !s.trim().is_empty());
+                            if let Some(wt_branch) = peer_wt_branch.or(ws_wt_branch) {
+                                validate_git_base_ref(&expanded_src, wt_branch).await.ok()
+                            } else {
+                                None
                             }
-                        };
-                    let effective_base_ref =
-                        match base_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            Some(b) => Some(validate_git_base_ref(&expanded_src, b).await?),
-                            None => {
-                                // If forking an agent already running inside a worktree, default
-                                // `base_ref` to that worktree's branch so we branch from its commits
-                                // instead of the main checkout's HEAD.
-                                if let Some(ref ws) = source_ws
-                                    && ws.is_worktree
-                                    && let Some(ref wt_branch) = ws.git_branch
-                                    && !wt_branch.trim().is_empty()
-                                {
-                                    validate_git_base_ref(&expanded_src, wt_branch).await.ok()
-                                } else {
-                                    None
-                                }
-                            }
-                        };
+                        }
+                    };
+                if source_ws.as_ref().is_some_and(|w| w.is_curated) {
+                    // Inside a curated Mission Workspace, keep the forked peer in the SAME
+                    // workspace while isolating its checkout onto an owned git worktree so
+                    // sibling peers remain visible and can coordinate/merge via `handoff_worktree`.
+                    let (wt_path, created_br) = create_worktree_with_mode_pooled(
+                        &self.home_dir,
+                        &expanded_src,
+                        WorktreeCreateMode::BranchOff,
+                        Some(&branch_name),
+                        effective_base_ref.as_deref(),
+                        None,
+                        Some(&self.worktree_pool),
+                    )
+                    .await?;
+                    let resolved_branch = created_br.or(Some(branch_name));
+                    (
+                        source.workspace_id.clone(),
+                        wt_path.to_string_lossy().to_string(),
+                        None,
+                        true,
+                        Some((expanded_src, resolved_branch)),
+                    )
+                } else {
                     let project_root = source_ws
                         .as_ref()
                         .and_then(|w| w.project_root.clone())
@@ -2341,9 +2383,11 @@ impl AgentOrchestrator {
                         new_ws.cwd.clone(),
                         Some(new_ws),
                         false,
+                        None,
                     )
                 }
-            };
+            }
+        };
 
         let now = Utc::now();
         let new_agent_id = format!("ag_{}", Uuid::new_v4().simple());
@@ -2374,6 +2418,14 @@ impl AgentOrchestrator {
             }
             if let Some(ref src) = ws.source_cwd {
                 labels.insert("orbit.worktree_source_cwd".into(), src.clone());
+            }
+        } else if let Some((ref src, ref br)) = peer_wt_meta {
+            labels.insert(
+                "orbit.worktree_source_cwd".into(),
+                src.to_string_lossy().to_string(),
+            );
+            if let Some(branch) = br {
+                labels.insert("orbit.worktree_branch".into(), branch.clone());
             }
         }
 
@@ -2523,6 +2575,9 @@ impl AgentOrchestrator {
                 let _ = self.store.delete_agent(&new_agent_id);
                 if let Some(ref ws) = created_workspace {
                     let _ = self.archive_workspace(&ws.workspace_id).await;
+                } else if let Some((ref src, ref br)) = peer_wt_meta {
+                    teardown_and_remove_worktree(Some(src), Path::new(&target_cwd), br.as_deref())
+                        .await;
                 }
                 return Err(err);
             }
@@ -2530,16 +2585,25 @@ impl AgentOrchestrator {
 
         // Emit PeerJoined when joining a curated multi-agent Mission Workspace
         if shared_curated_workspace && !final_summary.background {
+            let joined_msg = if let Some((_, Some(ref br))) = peer_wt_meta {
+                format!(
+                    "@{} ({}) forked into isolated worktree (`{br}`) inside workspace",
+                    allocated_handle,
+                    final_summary.provider.display_name()
+                )
+            } else {
+                format!(
+                    "@{} ({}) forked into workspace",
+                    allocated_handle,
+                    final_summary.provider.display_name()
+                )
+            };
             if let Ok(ws_ev) = self.store.append_workspace_event(
                 &target_workspace_id,
                 Some(&new_agent_id),
                 Some(&allocated_handle),
                 WorkspaceEventKind::PeerJoined,
-                &format!(
-                    "@{} ({}) forked into workspace",
-                    allocated_handle,
-                    final_summary.provider.display_name()
-                ),
+                &joined_msg,
                 None,
             ) {
                 let _ = self
@@ -4294,7 +4358,8 @@ impl AgentOrchestrator {
         Ok(())
     }
 
-    /// Resolve a sibling peer inside `workspace_id` by `@handle`, `agent_id`, or case-insensitive title prefix.
+    /// Resolve a sibling peer inside `workspace_id` by `@handle`, `agent_id`, historical handle
+    /// aliases (`orbit.handle_aliases`), or case-insensitive title substring.
     pub fn resolve_peer_in_workspace(
         &self,
         workspace_id: &str,
@@ -4326,6 +4391,24 @@ impl AgentOrchestrator {
             })
         {
             return Ok(Some(norm_handle.clone()));
+        }
+        if let Some(alias_match) = peers.iter().find(|a| {
+            a.labels
+                .get(orbit_store::LABEL_HANDLE_ALIASES)
+                .is_some_and(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .any(|alias| {
+                            alias.eq_ignore_ascii_case(clean)
+                                || (!sanitized.is_empty()
+                                    && (alias.eq_ignore_ascii_case(&sanitized)
+                                        || crate::workspace_cluster::sanitize_handle(alias)
+                                            .eq_ignore_ascii_case(&sanitized)))
+                        })
+                })
+        }) {
+            return Ok(Some(alias_match.clone()));
         }
         let lower = clean.to_ascii_lowercase();
         Ok(peers
@@ -4589,7 +4672,7 @@ impl AgentOrchestrator {
                 .collect::<Vec<_>>()
                 .join(", ");
             let msg = format!(
-                "Conflict Radar: @{handle} and {others_str} both edited `{norm_path}` in the same directory (`{}`). Coordinate via `message_peer` / `workspace_board` or fork one peer into a worktree.",
+                "Conflict Radar: @{handle} and {others_str} both edited `{norm_path}` in the same checkout (`{}`). Unless hard-blocked, isolate one track into its own git worktree via `orbit_agent(action=\"fork\", worktree=true, branch=..., initial_prompt=...)` or `spawn_workspace_peer(worktree=true, ...)` and continue in parallel; rebase/merge via `handoff_worktree` later.",
                 agent.cwd
             );
             if let Ok(ev) = self.store.append_workspace_event(
@@ -7137,6 +7220,147 @@ mod streaming_buffer_tests {
             "unexpected error: {err}"
         );
 
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn resolve_peer_in_workspace_resolves_historical_handle_alias() {
+        let tmp_root =
+            std::env::temp_dir().join(format!("orbit_alias_res_{}", Uuid::new_v4().simple()));
+        let home_dir = tmp_root.join("orbit_home");
+        let repo_dir = tmp_root.join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        let (orch, store) = setup_test_orchestrator(&home_dir).await;
+        let repo_str = repo_dir.to_string_lossy().to_string();
+        seed_source_conversation(&store, "ws_alias_res", &repo_str, "ag_perf", None);
+        store
+            .set_agent_handle("ag_perf", Some("我这边对orbit"))
+            .expect("initial handle");
+        store
+            .set_agent_semantic_identity("ag_perf", Some("大会话性能优化"), None, None)
+            .expect("rename");
+
+        let by_old = orch
+            .resolve_peer_in_workspace("ws_alias_res", "@我这边对orbit")
+            .expect("resolve old handle")
+            .expect("peer found by historical alias");
+        assert_eq!(by_old.agent_id, "ag_perf");
+        assert_eq!(by_old.handle.as_deref(), Some("大会话性能优化"));
+
+        let by_new = orch
+            .resolve_peer_in_workspace("ws_alias_res", "大会话性能优化")
+            .expect("resolve new handle")
+            .expect("peer found by current handle");
+        assert_eq!(by_new.agent_id, "ag_perf");
+
+        orch.shutdown_worktree_pool().await;
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn fork_agent_new_worktree_in_curated_workspace_stays_in_mission_workspace() {
+        let tmp_root =
+            std::env::temp_dir().join(format!("orbit_curated_wt_{}", Uuid::new_v4().simple()));
+        let home_dir = tmp_root.join("orbit_home");
+        let repo_dir = tmp_root.join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.name", "Orbit Test"]);
+        run_git(&["config", "user.email", "test@orbit.local"]);
+        std::fs::write(repo_dir.join("README.md"), "# Curated Fork Test\n").expect("write readme");
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-m", "initial commit"]);
+
+        let (orch, store) = setup_test_orchestrator(&home_dir).await;
+        let repo_str = repo_dir.to_string_lossy().to_string();
+        seed_source_conversation(&store, "ws_curated_wt", &repo_str, "ag_src", None);
+        store
+            .set_workspace_curated("ws_curated_wt", true)
+            .expect("mark curated");
+
+        let out = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src".into(),
+                up_to_seq: None,
+                target: ForkTarget::NewWorktree {
+                    branch: Some("feat/parallel-b".into()),
+                    base_ref: Some("main".into()),
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect("curated worktree fork");
+
+        assert!(
+            out.workspace.is_none(),
+            "curated workspace worktree fork must stay inside the same Mission Workspace"
+        );
+        assert_eq!(out.agent.workspace_id, "ws_curated_wt");
+        assert_ne!(out.agent.cwd, repo_str);
+        assert!(Path::new(&out.agent.cwd).join("README.md").is_file());
+        assert_eq!(
+            out.agent
+                .labels
+                .get("orbit.worktree_branch")
+                .map(String::as_str),
+            Some("feat/parallel-b")
+        );
+        assert_eq!(
+            out.agent
+                .labels
+                .get("orbit.worktree_source_cwd")
+                .map(String::as_str),
+            Some(repo_str.as_str())
+        );
+
+        let ws_events = store
+            .list_workspace_events("ws_curated_wt", 20)
+            .expect("ws events");
+        assert!(
+            ws_events.iter().any(|e| {
+                e.kind == WorkspaceEventKind::PeerJoined
+                    && e.agent_id.as_deref() == Some(out.agent.agent_id.as_str())
+                    && e.summary.contains("feat/parallel-b")
+            }),
+            "PeerJoined event must mention isolated worktree branch: {ws_events:?}"
+        );
+
+        let preview = orch
+            .preview_worktree_handoff_with_agent(
+                "ws_curated_wt",
+                Some(&out.agent.agent_id),
+                WorktreeHandoffDirection::WorktreeToLocal,
+                None,
+                true,
+            )
+            .await
+            .expect("handoff preview for curated worktree peer");
+        assert!(preview.can_apply_cleanly);
+
+        let wt_cwd = PathBuf::from(&out.agent.cwd);
+        orch.archive_agent(&out.agent.agent_id)
+            .await
+            .expect("archive forked worktree peer");
+        assert!(
+            !wt_cwd.exists(),
+            "archiving peer-owned isolated worktree must clean up worktree directory"
+        );
+
+        orch.shutdown_worktree_pool().await;
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

@@ -6,7 +6,6 @@ import {
   Copy,
   ExternalLink,
   KeyRound,
-  Loader2,
   Lock,
   LogOut,
   RefreshCw,
@@ -21,10 +20,12 @@ import {
   SettingSectionHeader,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { orbitIpc } from "@/lib/orbit-ipc";
@@ -52,6 +53,7 @@ export function CloudSyncSection() {
   const storeError = useOrbitSelector((s) => s.cloudSyncError);
   const deviceFlow = useOrbitSelector((s) => s.cloudSyncDeviceFlow);
   const lastResult = useOrbitSelector((s) => s.cloudSyncLastResult);
+  const hosts = useOrbitSelector((s) => s.fleet.hosts);
 
   const [loginTab, setLoginTab] = useState<LoginMethodTab>("device");
   const [clientIdInput, setClientIdInput] = useState("");
@@ -84,6 +86,11 @@ export function CloudSyncSection() {
 
   const effectiveState = status?.state ?? "signed_out";
   const displayError = localError ?? storeError ?? status?.last_error ?? null;
+  const isAuthExpiredError = Boolean(
+    displayError &&
+      /401|bad credentials|expired|revoked|unauthorized/i.test(displayError),
+  );
+  const hostsMissingRelay = hosts.filter((h) => !(h.relay_url ?? "").trim());
 
   const markCopied = (which: "code" | "key" | "cli", text: string) => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
@@ -161,7 +168,7 @@ export function CloudSyncSection() {
 
       {/* Architecture / Zero-Server Trust Summary */}
       <div className="border-border/80 bg-background/55 flex items-start gap-3 rounded-[13px] border px-4 py-3.5">
-        <ShieldCheck className="mt-0.5 h-[17px] w-[17px] shrink-0 text-emerald-500" />
+        <ShieldCheck className="text-signal-success mt-0.5 h-[17px] w-[17px] shrink-0" />
         <div className="text-muted-foreground space-y-1 text-[12.5px] leading-relaxed">
           <div className="text-foreground text-[13px] font-medium">
             Zero-Server · Zero-Knowledge (BYOS)
@@ -177,75 +184,80 @@ export function CloudSyncSection() {
         </div>
       </div>
 
-      {/* 1. SIGNED OUT */}
-      {effectiveState === "signed_out" && (
-        <div className="space-y-3">
-          {deviceFlow ? (
-            <div className="space-y-2">
-              <SettingGroupLabel>GitHub Verification</SettingGroupLabel>
-              <SettingCard>
-                <div className="space-y-4 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-foreground text-[13.5px] font-medium">
-                        Enter this code on GitHub
-                      </div>
-                      <div className="text-muted-foreground text-[12px]">
-                        Authorize Orbit to store your encrypted sync vault in a Secret Gist.
-                      </div>
-                    </div>
-                    <Loader2 className="text-muted-foreground h-4 w-4 shrink-0 animate-spin" />
+      {/* Active GitHub Device Flow Card (shown regardless of signed_out/error state for seamless re-auth) */}
+      {deviceFlow && (
+        <div className="space-y-2">
+          <SettingGroupLabel>GitHub Verification</SettingGroupLabel>
+          <SettingCard>
+            <div className="space-y-4 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-foreground text-[13.5px] font-medium">
+                    Enter this code on GitHub
                   </div>
-
-                  <div className="border-border bg-muted/40 flex items-center justify-between rounded-[11px] border px-4 py-3">
-                    <span className="selectable-text text-foreground font-mono text-[22px] font-semibold tracking-[0.14em]">
-                      {deviceFlow.user_code}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => markCopied("code", deviceFlow.user_code)}
-                      className="border-border bg-background hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
-                    >
-                      {copiedFlag === "code" ? (
-                        <>
-                          <Check className="h-3.5 w-3.5 text-emerald-500" />
-                          <span>{t("common.copied")}</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="h-3.5 w-3.5" />
-                          <span>{t("common.copy")}</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        markCopied("code", deviceFlow.user_code);
-                        void orbitIpc.openExternalBrowserUrl(deviceFlow.verification_uri);
-                      }}
-                      className="bg-foreground text-background inline-flex h-[34px] cursor-pointer items-center gap-2 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90"
-                    >
-                      <ExternalLink className="h-3.5 w-3.5" />
-                      <span>{t("settings.copyCodeOpenGithub")}</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => orbitActions.cancelGithubCloudLogin()}
-                      className="border-border text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[34px] cursor-pointer items-center rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
-                    >
-                      {t("common.cancel")}
-                    </button>
+                  <div className="text-muted-foreground text-[12px]">
+                    Authorize Orbit to store your encrypted sync vault in a Secret Gist.
                   </div>
                 </div>
-              </SettingCard>
+                <OrbitSpinner size={16} className="text-muted-foreground" />
+              </div>
+
+              <div className="border-border bg-muted/40 flex items-center justify-between rounded-[11px] border px-4 py-3">
+                <span className="selectable-text text-foreground font-mono text-[22px] font-semibold tracking-[0.14em]">
+                  {deviceFlow.user_code}
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => markCopied("code", deviceFlow.user_code)}
+                  className="px-2.5"
+                >
+                  {copiedFlag === "code" ? (
+                    <>
+                      <Check className="text-signal-success size-3.5" />
+                      <span>{t("common.copied")}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="size-3.5" />
+                      <span>{t("common.copy")}</span>
+                    </>
+                  )}
+                </Button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  onClick={() => {
+                    markCopied("code", deviceFlow.user_code);
+                    void orbitIpc.openExternalBrowserUrl(deviceFlow.verification_uri);
+                  }}
+                  className="gap-2 text-[12.5px]"
+                >
+                  <ExternalLink className="size-3.5" />
+                  <span>{t("settings.copyCodeOpenGithub")}</span>
+                </Button>
+
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => orbitActions.cancelGithubCloudLogin()}
+                  className="text-muted-foreground hover:text-foreground px-3 text-[12.5px]"
+                >
+                  {t("common.cancel")}
+                </Button>
+              </div>
             </div>
-          ) : (
-            <div className="space-y-2">
+          </SettingCard>
+        </div>
+      )}
+
+      {/* 1. SIGNED OUT */}
+      {effectiveState === "signed_out" && !deviceFlow && (
+        <div className="space-y-3">
+          <div className="space-y-2">
               <SettingGroupLabel>{t("settings.signInGithub")}</SettingGroupLabel>
               <SettingCard>
                 <div className="space-y-4 p-4">
@@ -327,9 +339,9 @@ export function CloudSyncSection() {
                         className="h-[36px] gap-2 px-4 text-[13px]"
                       >
                         {busy ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
+                          <OrbitSpinner size={16} className="size-4" />
                         ) : (
-                          <Cloud className="h-4 w-4" />
+                          <Cloud className="size-4" />
                         )}
                         <span>Sign in with GitHub</span>
                       </Button>
@@ -375,9 +387,9 @@ export function CloudSyncSection() {
                           className="h-[34px] shrink-0 gap-1.5 px-3.5"
                         >
                           {busy ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            <OrbitSpinner size={14} className="size-3.5" />
                           ) : (
-                            <KeyRound className="h-3.5 w-3.5" />
+                            <KeyRound className="size-3.5" />
                           )}
                           <span>Continue</span>
                         </Button>
@@ -387,7 +399,6 @@ export function CloudSyncSection() {
                 </div>
               </SettingCard>
             </div>
-          )}
         </div>
       )}
 
@@ -411,12 +422,12 @@ export function CloudSyncSection() {
                     </div>
                   )}
                   <div className="min-w-0">
-                    <div className="text-foreground flex items-center gap-2 text-[13.5px] font-medium">
-                      <span className="truncate">@{status.account_login}</span>
-                      <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">
-                        {status.remote_vault_exists ? "Vault Locked" : "Setup Required"}
-                      </span>
-                    </div>
+                      <div className="text-foreground flex items-center gap-2 text-[13.5px] font-medium">
+                        <span className="truncate">@{status.account_login}</span>
+                        <Badge variant="warning" className="rounded-full">
+                          {status.remote_vault_exists ? "Vault Locked" : "Setup Required"}
+                        </Badge>
+                      </div>
                     <div className="text-muted-foreground truncate text-[12px]">
                       {status.remote_vault_exists
                         ? "Encrypted Orbit Vault found on GitHub — enter passphrase to unlock."
@@ -424,15 +435,17 @@ export function CloudSyncSection() {
                     </div>
                   </div>
                 </div>
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="sm"
                   disabled={busy}
                   onClick={() => void orbitActions.logoutCloudSync(false)}
-                  className="text-muted-foreground hover:text-foreground inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium transition-colors"
+                  className="shrink-0 px-2.5"
                 >
-                  <LogOut className="h-3.5 w-3.5" />
+                  <LogOut className="size-3.5" />
                   <span>Sign Out</span>
-                </button>
+                </Button>
               </div>
             </SettingCard>
           </div>
@@ -457,28 +470,30 @@ export function CloudSyncSection() {
             <SettingCard>
               <div className="space-y-3 p-4">
                 {generatedKey && (
-                  <div className="border-emerald-500/30 bg-emerald-500/8 space-y-2 rounded-[10px] border p-3">
+                  <div className="border-signal-success-border bg-signal-success-bg space-y-2 rounded-[10px] border p-3">
                     <div className="flex items-center justify-between gap-2">
-                      <span className="text-[12px] font-medium text-emerald-700 dark:text-emerald-300">
+                      <span className="text-signal-success text-[12px] font-medium">
                         Generated Recovery Key — save this in your password manager
                       </span>
-                      <button
+                      <Button
                         type="button"
+                        variant="outline"
+                        size="xs"
                         onClick={() => markCopied("key", generatedKey)}
-                        className="border-border bg-background hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium"
+                        className="gap-1 px-2 text-[11.5px]"
                       >
                         {copiedFlag === "key" ? (
                           <>
-                            <Check className="h-3 w-3 text-emerald-500" />
+                            <Check className="text-signal-success size-3" />
                             <span>Copied</span>
                           </>
                         ) : (
                           <>
-                            <Copy className="h-3 w-3" />
+                            <Copy className="size-3" />
                             <span>Copy</span>
                           </>
                         )}
-                      </button>
+                      </Button>
                     </div>
                     <div className="selectable-text text-foreground font-mono text-[13px] font-semibold">
                       {generatedKey}
@@ -538,9 +553,9 @@ export function CloudSyncSection() {
                     className="h-[34px] shrink-0 gap-1.5 px-4"
                   >
                     {busy ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      <OrbitSpinner size={14} className="size-3.5" />
                     ) : (
-                      <Lock className="h-3.5 w-3.5" />
+                      <Lock className="size-3.5" />
                     )}
                     <span>
                       {status.remote_vault_exists ? "Unlock & Sync" : "Encrypt & Start Sync"}
@@ -578,18 +593,14 @@ export function CloudSyncSection() {
                     <div className="min-w-0">
                       <div className="text-foreground flex flex-wrap items-center gap-2 text-[13.5px] font-medium">
                         <span className="truncate">@{status.account_login}</span>
-                        <span
-                          className={cn(
-                            "rounded-full px-2 py-0.5 text-[11px] font-medium",
-                            effectiveState === "error"
-                              ? "bg-rose-500/15 text-rose-600 dark:text-rose-400"
-                              : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
-                          )}
+                        <Badge
+                          variant={effectiveState === "error" ? "destructive" : "success"}
+                          className="rounded-full"
                         >
                           {effectiveState === "error"
                             ? "Sync Attention"
                             : `E2EE Synced · rev #${status.last_vault_revision}`}
-                        </span>
+                        </Badge>
                       </div>
                       <div className="text-muted-foreground mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[12px]">
                         <span>{status.synced_host_count} hosts</span>
@@ -601,15 +612,16 @@ export function CloudSyncSection() {
                     </div>
                   </div>
 
-                  <button
+                  <Button
                     type="button"
+                    size="sm"
                     disabled={busy}
                     onClick={() => void orbitActions.syncCloudNow()}
-                    className="bg-foreground text-background inline-flex h-[32px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-50"
+                    className="h-[32px] shrink-0 text-[12.5px]"
                   >
-                    <RefreshCw className={cn("h-3.5 w-3.5", busy && "animate-spin")} />
+                    <RefreshCw className={cn("size-3.5", busy && "animate-spin")} />
                     <span>{busy ? "Syncing…" : "Sync Now"}</span>
-                  </button>
+                  </Button>
                 </div>
 
                 {lastResult && (
@@ -654,16 +666,18 @@ export function CloudSyncSection() {
                     title="Remote encrypted vault"
                     description="Stored as a private Secret Gist on your GitHub account."
                   >
-                    <button
+                    <Button
                       type="button"
+                      variant="outline"
+                      size="sm"
                       onClick={() =>
                         void orbitIpc.openExternalBrowserUrl(status.gist_html_url ?? "")
                       }
-                      className="border-border bg-background hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+                      className="px-2.5"
                     >
                       <span>Open on GitHub</span>
-                      <ExternalLink className="h-3 w-3" />
-                    </button>
+                      <ExternalLink className="size-3" />
+                    </Button>
                   </SettingRow>
                 )}
 
@@ -680,15 +694,17 @@ export function CloudSyncSection() {
                       />
                       <span>Clear hosts</span>
                     </label>
-                    <button
+                    <Button
                       type="button"
+                      variant="outline"
+                      size="sm"
                       disabled={busy}
                       onClick={() => setConfirmSignOutOpen(true)}
-                      className="border-border hover:bg-rose-500/10 hover:text-rose-600 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12px] font-medium transition-colors"
+                      className="hover:border-signal-danger-border hover:bg-signal-danger-bg hover:text-signal-danger"
                     >
-                      <LogOut className="h-3.5 w-3.5" />
+                      <LogOut className="size-3.5" />
                       <span>Sign Out</span>
-                    </button>
+                    </Button>
                   </div>
                 </SettingRow>
               </SettingCard>
@@ -711,32 +727,61 @@ export function CloudSyncSection() {
                     on any host — it encrypts &amp; registers itself into this vault automatically.
                   </div>
                 </div>
-                <button
+                <Button
                   type="button"
+                  variant="outline"
+                  size="sm"
                   onClick={() => markCopied("cli", "orbit login")}
-                  className="border-border bg-background hover:bg-accent inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium"
+                  className="shrink-0 px-2.5"
                 >
                   {copiedFlag === "cli" ? (
                     <>
-                      <Check className="h-3.5 w-3.5 text-emerald-500" />
+                      <Check className="text-signal-success size-3.5" />
                       <span>Copied</span>
                     </>
                   ) : (
                     <>
-                      <Copy className="h-3.5 w-3.5" />
+                      <Copy className="size-3.5" />
                       <span>Copy</span>
                     </>
                   )}
-                </button>
+                </Button>
               </div>
             </div>
           </div>
         )}
 
-      {displayError && (
-        <div className="border-rose-500/30 bg-rose-500/8 flex items-start gap-2 rounded-[11px] border px-3.5 py-2.5 text-[12.5px] text-rose-600 dark:text-rose-400">
+      {effectiveState === "ready" && hosts.length > 0 && hostsMissingRelay.length > 0 && (
+        <div className="border-signal-warning-border bg-signal-warning-bg text-signal-warning flex items-start gap-2 rounded-[11px] border px-3.5 py-2.5 text-[12px]">
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span className="selectable-text break-words">{displayError}</span>
+          <span>
+            {hostsMissingRelay.length} host{hostsMissingRelay.length === 1 ? " has" : "s have"} no Private Relay configured yet — mobile off-LAN connections require configuring &amp; sharing a relay in Host Connection settings.
+          </span>
+        </div>
+      )}
+
+      {displayError && (
+        <div className="border-signal-danger-border bg-signal-danger-bg text-signal-danger flex flex-wrap items-center justify-between gap-2.5 rounded-[11px] border px-3.5 py-2.5 text-[12.5px]">
+          <div className="flex min-w-0 flex-1 items-start gap-2">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span className="selectable-text break-words">{displayError}</span>
+          </div>
+          {(effectiveState === "error" || isAuthExpiredError) && (
+            <Button
+              type="button"
+              size="sm"
+              disabled={busy}
+              onClick={() => void handleStartDeviceLogin()}
+              className="shrink-0"
+            >
+              {busy ? (
+                <OrbitSpinner size={14} className="size-3.5" />
+              ) : (
+                <Cloud className="size-3.5" />
+              )}
+              <span>Sign In Again with GitHub</span>
+            </Button>
+          )}
         </div>
       )}
 

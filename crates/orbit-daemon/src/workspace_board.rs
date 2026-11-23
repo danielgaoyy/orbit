@@ -166,24 +166,47 @@ fn build_full_workspace_xml(
     xml.push_str(">\n");
 
     // Current agent identity + sibling peers
-    let self_handle = active_peers
-        .iter()
-        .find(|a| a.agent_id == current_agent_id)
+    let self_agent = active_peers.iter().find(|a| a.agent_id == current_agent_id);
+    let self_handle = self_agent
         .and_then(|a| a.handle.as_deref())
         .unwrap_or("peer");
+    let self_cwd = self_agent.map(|a| a.cwd.as_str()).unwrap_or("");
+    let self_branch = self_agent
+        .and_then(|a| a.labels.get("orbit.worktree_branch"))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     xml.push_str(&format!(
-        "  <self agent-id=\"{}\" handle=\"@{}\" />\n",
+        "  <self agent-id=\"{}\" handle=\"@{}\"",
         escape_xml(current_agent_id),
         escape_xml(self_handle)
     ));
+    if !self_cwd.is_empty() {
+        xml.push_str(&format!(" cwd=\"{}\"", escape_xml(self_cwd)));
+    }
+    if let Some(br) = self_branch {
+        xml.push_str(&format!(" worktree-branch=\"{}\"", escape_xml(br)));
+    }
+    xml.push_str(" />\n");
 
+    let mut shared_checkout_peers: Vec<&str> = Vec::new();
     xml.push_str("  <peers>\n");
     for peer in active_peers {
         if peer.agent_id == current_agent_id {
             continue;
         }
         let handle = peer.handle.as_deref().unwrap_or("peer");
+        if !self_cwd.is_empty() && peer.cwd == self_cwd {
+            shared_checkout_peers.push(handle);
+        }
         let status_slug = status_short_slug(&peer.status);
+        let peer_branch = peer
+            .labels
+            .get("orbit.worktree_branch")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let last_summary = peer
             .task_summary
             .as_deref()
@@ -198,14 +221,17 @@ fn build_full_workspace_xml(
             })
             .unwrap_or_else(|| single_line_excerpt(&peer.title, 100));
         xml.push_str(&format!(
-            "    <peer handle=\"@{}\" agent-id=\"{}\" provider=\"{}\" status=\"{}\" cwd=\"{}\">{}</peer>\n",
+            "    <peer handle=\"@{}\" agent-id=\"{}\" provider=\"{}\" status=\"{}\" cwd=\"{}\"",
             escape_xml(handle),
             escape_xml(&peer.agent_id),
             escape_xml(peer.provider.display_name()),
             escape_xml(status_slug),
             escape_xml(&peer.cwd),
-            escape_xml(&last_summary),
         ));
+        if let Some(br) = peer_branch {
+            xml.push_str(&format!(" worktree-branch=\"{}\"", escape_xml(br)));
+        }
+        xml.push_str(&format!(">{}</peer>\n", escape_xml(&last_summary)));
     }
     xml.push_str("  </peers>\n");
 
@@ -245,7 +271,23 @@ fn build_full_workspace_xml(
         xml.push_str("  </recent-events>\n");
     }
 
-    xml.push_str("  <coordination-hint>You share this Mission Workspace with the peers above. Use Orbit MCP tools (`workspace_peers`, `message_peer`, `workspace_board`, `spawn_workspace_peer`, `handoff_worktree`, `orbit_timer`) to coordinate directly by @handle without polling.</coordination-hint>\n");
+    let mut hint = String::from(
+        "You share this Mission Workspace with the peers above. Use Orbit MCP tools (`workspace_peers`, `message_peer`, `workspace_board`, `spawn_workspace_peer`, `orbit_agent(action=\"fork\", worktree=true)`, `handoff_worktree`, `orbit_timer`) to coordinate directly by @handle without polling. Parallel-first rule: release order != hard block — after aligning contracts/order, ONLY wait if strictly hard-blocked by an unbuilt dependency; otherwise self-isolate onto a dedicated git worktree (`orbit_agent(action=\"fork\", worktree=true, branch=..., initial_prompt=...)` keeps your context inside this same Mission Workspace, or `spawn_workspace_peer(worktree=true, ...)`) and keep developing in parallel, then rebase/merge later via `handoff_worktree`. If you genuinely must wait on a peer, NEVER go idle silently — arm `orbit_timer(action=\"create\", condition=\"all_peers\" | \"sender:@handle\", ...)` or pass `notify_on_finish=true` on `message_peer`.",
+    );
+    if !shared_checkout_peers.is_empty() {
+        let peer_list = shared_checkout_peers
+            .iter()
+            .map(|h| format!("@{h}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        hint.push_str(&format!(
+            " Shared-checkout notice: you currently share `{self_cwd}` with {peer_list}; avoid freezing on main — isolate one track into a worktree (or move dirty local edits off main with `handoff_worktree(direction=\"local_to_worktree\", mode=\"move\", branch=...)`) before conflicting edits."
+        ));
+    }
+    xml.push_str(&format!(
+        "  <coordination-hint>{}</coordination-hint>\n",
+        escape_xml(&hint)
+    ));
     xml.push_str("</orbit-workspace>");
     xml
 }
@@ -322,11 +364,14 @@ pub fn build_workspace_roster_context_incremental(
         return None;
     }
 
-    let self_handle = active_peers
-        .iter()
-        .find(|a| a.agent_id == current_agent_id)
+    let self_agent = active_peers.iter().find(|a| a.agent_id == current_agent_id);
+    let self_handle = self_agent
         .and_then(|a| a.handle.as_deref())
         .unwrap_or("peer");
+    let self_branch = self_agent
+        .and_then(|a| a.labels.get("orbit.worktree_branch"))
+        .map(String::as_str)
+        .unwrap_or("");
 
     // Structural fingerprint intentionally excludes volatile `status` and `last_summary` fields
     // so parallel peer activity does not re-inject the entire roster on every turn.
@@ -338,19 +383,24 @@ pub fn build_workspace_roster_context_incremental(
     sibling_peers.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
 
     let mut struct_seed = format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         workspace.workspace_id,
         workspace.title,
         workspace.mission_goal.as_deref().unwrap_or(""),
-        self_handle
+        self_handle,
+        self_branch
     );
     for p in &sibling_peers {
         struct_seed.push_str(&format!(
-            "|{}:{}:{}:{}",
+            "|{}:{}:{}:{}:{}",
             p.agent_id,
             p.handle.as_deref().unwrap_or("peer"),
             p.provider.slug(),
-            p.cwd
+            p.cwd,
+            p.labels
+                .get("orbit.worktree_branch")
+                .map(String::as_str)
+                .unwrap_or("")
         ));
     }
     let structural_fingerprint = sha256_hex_str(&struct_seed);
@@ -431,12 +481,22 @@ pub fn build_workspace_roster_context_incremental(
         for peer in &sibling_peers {
             let handle = peer.handle.as_deref().unwrap_or("peer");
             delta.push_str(&format!(
-                "    <peer handle=\"@{}\" agent-id=\"{}\" provider=\"{}\" cwd=\"{}\" />\n",
+                "    <peer handle=\"@{}\" agent-id=\"{}\" provider=\"{}\" cwd=\"{}\"",
                 escape_xml(handle),
                 escape_xml(&peer.agent_id),
                 escape_xml(peer.provider.display_name()),
                 escape_xml(&peer.cwd),
             ));
+            if let Some(br) = peer
+                .labels
+                .get("orbit.worktree_branch")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                delta.push_str(&format!(" worktree-branch=\"{}\"", escape_xml(br)));
+            }
+            delta.push_str(" />\n");
         }
         delta.push_str("  </peers-updated>\n");
     }
@@ -677,5 +737,114 @@ mod tests {
         assert!(delta.contains("<orbit-workspace-delta "));
         assert!(delta.contains("<board-updated rev=\"2\""));
         assert!(!delta.contains("<coordination-hint>"));
+    }
+
+    #[test]
+    fn roster_xml_surfaces_parallel_first_contract_worktree_branch_and_shared_checkout_hint() {
+        use orbit_protocol::{AttentionState, ProviderKind, SessionMode, WorkspaceSetupStatus};
+        use std::collections::HashMap;
+
+        let store = OrbitStore::open_in_memory().expect("open");
+        let now = chrono::Utc::now();
+        let ws = WorkspaceSummary {
+            workspace_id: "ws_parallel".into(),
+            title: "Parallel Track Test".into(),
+            cwd: "/repo".into(),
+            git_branch: Some("main".into()),
+            is_worktree: false,
+            updated_at: now,
+            source_cwd: None,
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: None,
+            background: false,
+            setup_status: WorkspaceSetupStatus::Idle,
+            mission_goal: Some("Verify parallel-first coordination".into()),
+            project_root: Some("/repo".into()),
+            board_revision: 1,
+            title_locked: false,
+            auto_clustered: false,
+            is_curated: true,
+        };
+        let mk_peer = |id: &str, handle: &str, cwd: &str, branch: Option<&str>| {
+            let mut labels = HashMap::new();
+            if let Some(br) = branch {
+                labels.insert("orbit.worktree_branch".into(), br.into());
+            }
+            AgentSummary {
+                agent_id: id.into(),
+                workspace_id: "ws_parallel".into(),
+                cwd: cwd.into(),
+                title: handle.into(),
+                provider: ProviderKind::Antigravity,
+                model: None,
+                effort: None,
+                fast_mode: false,
+                mode: SessionMode::FullAccess,
+                status: AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 1,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels,
+                attention: AttentionState::None,
+                last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
+                read_seq: 1,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: Some(handle.into()),
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: None,
+            }
+        };
+
+        // 1. Both peers share `/repo` -> Shared-checkout notice + parallel-first rules appear.
+        let shared_peers = vec![
+            mk_peer("ag_r", "router", "/repo", None),
+            mk_peer("ag_p", "perf", "/repo", None),
+        ];
+        let (shared_xml, _) = build_workspace_roster_context(
+            &store,
+            Path::new("/tmp"),
+            &ws,
+            "ag_r",
+            &shared_peers,
+            &[],
+            None,
+        )
+        .expect("shared xml");
+        assert!(shared_xml.contains("Parallel-first rule: release order != hard block"));
+        assert!(shared_xml.contains("NEVER go idle silently"));
+        assert!(
+            shared_xml.contains("Shared-checkout notice: you currently share `/repo` with @perf")
+        );
+
+        // 2. Sibling moves to isolated worktree `/repo-wt` -> notice disappears and worktree-branch appears.
+        let isolated_peers = vec![
+            mk_peer("ag_r", "router", "/repo", None),
+            mk_peer("ag_p", "perf", "/repo-wt", Some("feat/perf-v095")),
+        ];
+        let (iso_xml, _) = build_workspace_roster_context(
+            &store,
+            Path::new("/tmp"),
+            &ws,
+            "ag_r",
+            &isolated_peers,
+            &[],
+            None,
+        )
+        .expect("isolated xml");
+        assert!(iso_xml.contains("worktree-branch=\"feat/perf-v095\""));
+        assert!(!iso_xml.contains("Shared-checkout notice"));
     }
 }

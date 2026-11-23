@@ -468,7 +468,24 @@ impl ConditionalTimerEngine {
                 if clean.is_empty() {
                     anyhow::bail!("TimerCondition::Sender requires a non-empty sender_id");
                 }
-                (TimerCondition::Sender { sender_id: clean }, None)
+                let orch_resolve = Arc::clone(&self.orchestrator);
+                let ws_owned = agent.workspace_id.clone();
+                let clean_owned = clean.clone();
+                let resolved_id = tokio::task::spawn_blocking(move || {
+                    orch_resolve.resolve_peer_in_workspace(&ws_owned, &clean_owned)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("sender resolution task failed: {e}"))?
+                .ok()
+                .flatten()
+                .map(|peer| peer.agent_id)
+                .unwrap_or(clean);
+                (
+                    TimerCondition::Sender {
+                        sender_id: resolved_id,
+                    },
+                    None,
+                )
             }
             TimerCondition::FileChanged { path } => {
                 let cwd_owned = agent.cwd.clone();
@@ -1784,5 +1801,53 @@ mod tests {
                 .1
                 .contains("All peers settled; proceed to merge.")
         );
+    }
+
+    #[tokio::test]
+    async fn create_timer_resolves_sender_handle_and_historical_alias_to_agent_id() {
+        let tmp = TestTempDir::new();
+        let ws_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir");
+        let (store, _orch, engine, _dispatches, count) =
+            setup_test_engine_with_delay(tmp.path(), &ws_dir, Duration::ZERO).await;
+
+        let mut peer = make_agent(
+            "ag_peer_alias",
+            "ws_timer_test",
+            &ws_dir,
+            None,
+            AgentStatus::Idle,
+        );
+        peer.handle = Some("initial-perf".into());
+        store.upsert_agent(&peer, None).expect("upsert peer");
+        store
+            .set_agent_semantic_identity("ag_peer_alias", Some("perf-opt"), None, None)
+            .expect("rename peer");
+
+        let timer = engine
+            .create_timer(
+                "ag_timer_main",
+                5,
+                "Resume after peer finishes".into(),
+                TimerCondition::Sender {
+                    sender_id: "@initial-perf".into(),
+                },
+            )
+            .await
+            .expect("arm timer with historical @handle");
+        assert_eq!(
+            timer.condition,
+            TimerCondition::Sender {
+                sender_id: "ag_peer_alias".into()
+            }
+        );
+
+        let canceled = engine
+            .notify_agent_message("ag_timer_main", Some("ag_peer_alias"))
+            .await;
+        assert_eq!(canceled.len(), 1);
+        assert_eq!(canceled[0].timer_id, timer.timer_id);
+        assert_eq!(canceled[0].state, ConditionalTimerState::CanceledEarly);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 }

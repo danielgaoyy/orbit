@@ -27,7 +27,7 @@ pub use triggers::{
     mask_trigger_secret,
 };
 pub use usage::{QUOTA_SAMPLES_RETENTION_MS, QuotaSampleRecord, USAGE_LEDGER_RETENTION_MS};
-pub use workspace_sync::{AgentContextSnippet, SemanticIdentityOptions};
+pub use workspace_sync::{AgentContextSnippet, LABEL_HANDLE_ALIASES, SemanticIdentityOptions};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -410,6 +410,10 @@ impl OrbitStore {
         );
         let _ = conn.execute(
             "ALTER TABLE client_replica_events ADD COLUMN coalesce_key TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE client_replica_cursors ADD COLUMN has_older INTEGER NOT NULL DEFAULT 0",
             [],
         );
         // One-time schema v2 migration: self-heal legacy pre-v0.2.4 client replica caches once
@@ -1747,6 +1751,29 @@ impl OrbitStore {
         Ok(seq.unwrap_or(0).max(0) as u64)
     }
 
+    pub fn get_replica_has_older(&self, agent_id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let res: Option<i64> = conn
+            .query_row(
+                "SELECT has_older FROM client_replica_cursors WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(res.is_some_and(|v| v != 0))
+    }
+
+    pub fn set_replica_has_older(&self, agent_id: &str, has_older: bool) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO client_replica_cursors (agent_id, contiguous_seq, has_older)
+             VALUES (?1, 0, ?2)
+             ON CONFLICT(agent_id) DO UPDATE SET has_older = excluded.has_older",
+            params![agent_id, i32::from(has_older)],
+        )?;
+        Ok(())
+    }
+
     pub fn set_replica_contiguous_seq(&self, agent_id: &str, seq: u64) -> Result<(), StoreError> {
         let seq_i64 = i64::try_from(seq)
             .map_err(|_| StoreError::InvalidArgument("contiguous_seq exceeds i64".into()))?;
@@ -1874,6 +1901,53 @@ impl OrbitStore {
         Ok(())
     }
 
+    /// Read a contiguous slice of timeline events matching a prepared query and byte/count limits.
+    fn collect_timeline_rows_budgeted<'a, P>(
+        stmt: &mut rusqlite::Statement<'a>,
+        params: P,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TimelineEvent>, bool), StoreError>
+    where
+        P: rusqlite::Params,
+    {
+        let mut events = Vec::new();
+        let mut approx_bytes: usize = 0;
+        let mut has_more = false;
+        let rows = stmt.query_map(params, |row| {
+            let seq = row.get::<_, i64>(0)? as u64;
+            let epoch = row.get::<_, u32>(1)?;
+            let ag_id: String = row.get(2)?;
+            let turn_id: Option<String> = row.get(3)?;
+            let ts_str: String = row.get(4)?;
+            let payload_str: String = row.get(5)?;
+            Ok((seq, epoch, ag_id, turn_id, ts_str, payload_str))
+        })?;
+
+        for row in rows {
+            let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = row?;
+            let row_bytes = payload_str.len().saturating_add(128);
+            if events.len() >= limit
+                || (!events.is_empty() && approx_bytes.saturating_add(row_bytes) > max_bytes)
+            {
+                has_more = true;
+                break;
+            }
+            if let Ok(payload) = serde_json::from_str::<TimelinePayload>(&payload_str) {
+                approx_bytes = approx_bytes.saturating_add(row_bytes);
+                events.push(TimelineEvent {
+                    seq,
+                    epoch,
+                    agent_id: ag_id,
+                    turn_id,
+                    timestamp: parse_ts(&ts_str),
+                    payload,
+                });
+            }
+        }
+        Ok((events, has_more))
+    }
+
     pub fn fetch_replica_timeline(
         &self,
         agent_id: &str,
@@ -1887,30 +1961,94 @@ impl OrbitStore {
              ORDER BY seq ASC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![agent_id, limit as i64], |row| {
-            let seq = row.get::<_, i64>(0)? as u64;
-            let epoch = row.get::<_, u32>(1)?;
-            let ag_id: String = row.get(2)?;
-            let turn_id: Option<String> = row.get(3)?;
-            let ts_str: String = row.get(4)?;
-            let payload_str: String = row.get(5)?;
-            Ok((seq, epoch, ag_id, turn_id, ts_str, payload_str))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = r?;
-            if let Ok(payload) = serde_json::from_str::<TimelinePayload>(&payload_str) {
-                out.push(TimelineEvent {
-                    seq,
-                    epoch,
-                    agent_id: ag_id,
-                    turn_id,
-                    timestamp: parse_ts(&ts_str),
-                    payload,
-                });
-            }
+        let (events, _) = Self::collect_timeline_rows_budgeted(
+            &mut stmt,
+            params![agent_id, limit as i64],
+            limit,
+            usize::MAX,
+        )?;
+        Ok(events)
+    }
+
+    /// Fetch the newest `limit` events from the local client replica in ascending `seq` order,
+    /// along with `has_older` indicating whether earlier history exists in `client_replica_events`.
+    pub fn fetch_replica_timeline_tail(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
+        let limit = limit.max(1);
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let fetch_limit = (limit.saturating_add(1)) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+             FROM client_replica_events
+             WHERE agent_id = ?1
+             ORDER BY seq DESC
+             LIMIT ?2",
+        )?;
+        let (mut events, has_older) = Self::collect_timeline_rows_budgeted(
+            &mut stmt,
+            params![agent_id, fetch_limit],
+            limit,
+            usize::MAX,
+        )?;
+        events.reverse();
+        Ok((events, has_older))
+    }
+
+    /// Fetch up to `limit` events strictly older than `before_seq` from the local client replica
+    /// in ascending `seq` order, returning `(events, has_more_older)`.
+    pub fn fetch_replica_timeline_before(
+        &self,
+        agent_id: &str,
+        before_seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
+        if before_seq <= 1 {
+            return Ok((Vec::new(), false));
         }
-        Ok(out)
+        let limit = limit.max(1);
+        let before_i64 = i64::try_from(before_seq)
+            .map_err(|_| StoreError::InvalidArgument("before_seq exceeds i64".into()))?;
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let fetch_limit = (limit.saturating_add(1)) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+             FROM client_replica_events
+             WHERE agent_id = ?1 AND seq < ?2
+             ORDER BY seq DESC
+             LIMIT ?3",
+        )?;
+        let (mut events, has_more_older) = Self::collect_timeline_rows_budgeted(
+            &mut stmt,
+            params![agent_id, before_i64, fetch_limit],
+            limit,
+            usize::MAX,
+        )?;
+        events.reverse();
+        Ok((events, has_more_older))
+    }
+
+    pub fn has_replica_timeline_before(
+        &self,
+        agent_id: &str,
+        before_seq: u64,
+    ) -> Result<bool, StoreError> {
+        if before_seq <= 1 {
+            return Ok(false);
+        }
+        let before_i64 = i64::try_from(before_seq)
+            .map_err(|_| StoreError::InvalidArgument("before_seq exceeds i64".into()))?;
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM client_replica_events WHERE agent_id = ?1 AND seq < ?2 LIMIT 1",
+                params![agent_id, before_i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Fetch the entire locally replicated timeline for an agent without an artificial row cap
@@ -2197,41 +2335,74 @@ impl OrbitStore {
              LIMIT ?3",
         )?;
 
-        let mut events = Vec::new();
-        let mut approx_bytes: usize = 0;
-        let mut has_more = false;
-        let rows = stmt.query_map(params![agent_id, since_seq as i64, fetch_limit], |row| {
-            let seq = row.get::<_, i64>(0)? as u64;
-            let epoch = row.get::<_, u32>(1)?;
-            let ag_id: String = row.get(2)?;
-            let turn_id: Option<String> = row.get(3)?;
-            let ts_str: String = row.get(4)?;
-            let payload_str: String = row.get(5)?;
-            Ok((seq, epoch, ag_id, turn_id, ts_str, payload_str))
-        })?;
+        Self::collect_timeline_rows_budgeted(
+            &mut stmt,
+            params![agent_id, since_seq as i64, fetch_limit],
+            limit,
+            max_bytes,
+        )
+    }
 
-        for row in rows {
-            let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = row?;
-            let row_bytes = payload_str.len().saturating_add(128);
-            if events.len() >= limit
-                || (!events.is_empty() && approx_bytes.saturating_add(row_bytes) > max_bytes)
-            {
-                has_more = true;
-                break;
-            }
-            let payload: TimelinePayload = serde_json::from_str(&payload_str)?;
-            approx_bytes = approx_bytes.saturating_add(row_bytes);
-            events.push(TimelineEvent {
-                seq,
-                epoch,
-                agent_id: ag_id,
-                turn_id,
-                timestamp: parse_ts(&ts_str),
-                payload,
-            });
+    /// Fetch the newest timeline events (tail-first) for `agent_id`, bounded by `limit` and
+    /// `max_bytes`, returning `(ascending_events, has_older)`.
+    pub fn fetch_timeline_tail_budgeted(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
+        let limit = limit.max(1);
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let fetch_limit = (limit.saturating_add(1)) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+             FROM timeline_events
+             WHERE agent_id = ?1
+             ORDER BY seq DESC
+             LIMIT ?2",
+        )?;
+        let (mut events, has_older) = Self::collect_timeline_rows_budgeted(
+            &mut stmt,
+            params![agent_id, fetch_limit],
+            limit,
+            max_bytes,
+        )?;
+        events.reverse();
+        Ok((events, has_older))
+    }
+
+    /// Fetch timeline events strictly older than `before_seq` bounded by `limit` and `max_bytes`,
+    /// returning `(ascending_events, has_more_older)`.
+    pub fn fetch_timeline_before_budgeted(
+        &self,
+        agent_id: &str,
+        before_seq: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
+        if before_seq <= 1 {
+            return Ok((Vec::new(), false));
         }
-
-        Ok((events, has_more))
+        let limit = limit.max(1);
+        let before_i64 = i64::try_from(before_seq)
+            .map_err(|_| StoreError::InvalidArgument("before_seq exceeds i64".into()))?;
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let fetch_limit = (limit.saturating_add(1)) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+             FROM timeline_events
+             WHERE agent_id = ?1 AND seq < ?2
+             ORDER BY seq DESC
+             LIMIT ?3",
+        )?;
+        let (mut events, has_more_older) = Self::collect_timeline_rows_budgeted(
+            &mut stmt,
+            params![agent_id, before_i64, fetch_limit],
+            limit,
+            max_bytes,
+        )?;
+        events.reverse();
+        Ok((events, has_more_older))
     }
 
     /// Persist a pre-turn workspace tree snapshot keyed by `(agent_id, prompt_seq)`.
@@ -6562,6 +6733,151 @@ mod tests {
         assert!(
             legacy_2.seq > p3.seq && legacy_2.seq != legacy_1.seq,
             "legacy shared item_id must never overwrite a pre-boundary row"
+        );
+    }
+
+    #[test]
+    fn tail_and_before_timeline_pagination_respect_limits_and_ascending_order() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_1".into(),
+                title: "ws".into(),
+                cwd: "/tmp/tail".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_tail".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/tmp/tail".into(),
+                    title: "Tail".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert");
+
+        let mut seqs = Vec::new();
+        for i in 1..=5 {
+            let ev = store
+                .append_timeline_event(
+                    "ag_tail",
+                    0,
+                    None,
+                    TimelinePayload::AssistantMessage {
+                        item_id: format!("m{i}"),
+                        text: format!("msg-{i}-{}", "x".repeat(400)),
+                        streaming: false,
+                    },
+                )
+                .expect("append");
+            seqs.push(ev.seq);
+        }
+
+        // Tail count cap returns newest 2 events in ascending order + has_older=true
+        let (tail, has_older) = store
+            .fetch_timeline_tail_budgeted("ag_tail", 2, usize::MAX)
+            .expect("tail");
+        assert!(has_older);
+        assert_eq!(
+            tail.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![seqs[3], seqs[4]]
+        );
+
+        // Backward page before tail[0] yields the next 2 older events in ascending order
+        let (older1, more1) = store
+            .fetch_timeline_before_budgeted("ag_tail", tail[0].seq, 2, usize::MAX)
+            .expect("before 1");
+        assert!(more1);
+        assert_eq!(
+            older1.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![seqs[1], seqs[2]]
+        );
+
+        // Final backward page reaches seq[0] with has_more_older=false
+        let (older2, more2) = store
+            .fetch_timeline_before_budgeted("ag_tail", older1[0].seq, 10, usize::MAX)
+            .expect("before 2");
+        assert!(!more2);
+        assert_eq!(
+            older2.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![seqs[0]]
+        );
+
+        // Replica tail & before work symmetrically
+        let mut all_evs = older2;
+        all_evs.extend(older1);
+        all_evs.extend(tail);
+        store
+            .upsert_replica_timeline_events_batch(&all_evs)
+            .expect("seed replica");
+
+        let (rep_tail, rep_has_older) = store
+            .fetch_replica_timeline_tail("ag_tail", 2)
+            .expect("rep tail");
+        assert!(rep_has_older);
+        assert_eq!(
+            rep_tail.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![seqs[3], seqs[4]]
+        );
+        assert!(
+            store
+                .has_replica_timeline_before("ag_tail", rep_tail[0].seq)
+                .expect("has before")
+        );
+        let (rep_before, rep_more) = store
+            .fetch_replica_timeline_before("ag_tail", rep_tail[0].seq, 10)
+            .expect("rep before");
+        assert!(!rep_more);
+        assert_eq!(
+            rep_before.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![seqs[0], seqs[1], seqs[2]]
         );
     }
 }

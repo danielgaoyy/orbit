@@ -12,10 +12,13 @@
 
 ## Architecture & Safety Checklist
 
+- [ ] Pre-read the required authoritative domain documentation / Skill per `AGENTS.md` and `docs/INDEX.md` before editing.
+- [ ] Synced affected docs and `docs/INDEX.md` in this PR if architecture, wire/FFI/store contracts, design rules, or CI jobs changed (and verified `bash scripts/check-docs-index.sh`).
 - [ ] Respects `AGENTS.md` redlines: single static binary, shim process isolation, multi-host fleet compatibility, and zero-knowledge E2EE boundaries.
 - [ ] No `unsafe` code (`unsafe_code = "deny"`) and no new `.unwrap()` calls in production Rust paths.
 - [ ] No secrets or credentials passed via process `argv` or logged in plaintext.
 - [ ] If Desktop UI copy changed, kept `en`, `zh-CN`, and `ja` i18n catalogs in sync.
+- [ ] If this is a release PR (`chore(release): prepare vX.Y.Z`), followed `docs/engineering/git-pr-release-workflow.md` (PR merges to `main` cleanly before any `v*` tag is created).
 
 ## Verification
 

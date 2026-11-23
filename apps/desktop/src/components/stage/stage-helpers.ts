@@ -728,15 +728,15 @@ export function setCachedTurnHeight(key: string, height: number): void {
 }
 
 export const TURN_LIST_GAP_PX = 32;
-export const IDLE_LOOKAHEAD_UP_PX = 2400;
+export const IDLE_LOOKAHEAD_UP_PX = 900;
 export const IDLE_LOOKAHEAD_DOWN_PX = 1400;
 export const SCROLL_LEADING_PX = 3600;
-export const SCROLL_FAST_LEADING_PX = 5200;
+export const SCROLL_FAST_LEADING_PX = 1800;
 export const SCROLL_TRAILING_PX = 1200;
 export const FAST_FLICK_PX_PER_SEC = 2200;
-export const MAX_OVERSCAN_ITEMS_PER_SIDE = 24;
-export const WARM_RESTING_CAP = 36;
-export const WARM_SCROLLING_CAP = 52;
+export const MAX_OVERSCAN_ITEMS_PER_SIDE = 6;
+export const WARM_RESTING_CAP = 10;
+export const WARM_SCROLLING_CAP = 14;
 export const IDLE_PREWARM_BATCH = 2;
 
 function spanCharLen(spans: InlineSpanView[]): number {

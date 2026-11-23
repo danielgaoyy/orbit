@@ -564,42 +564,57 @@ impl OrbitStore {
         if let Some(md) = mode {
             push_field("mode_json", SqlValue::Text(serde_json::to_string(md)?));
         }
-        if let Some(lbls) = labels {
-            let existing_raw: Option<String> = tx
+        if labels.is_some() || handle.is_some() {
+            let existing_row: Option<(Option<String>, String)> = tx
                 .query_row(
-                    "SELECT labels_json FROM agents WHERE agent_id = ?1",
+                    "SELECT handle, labels_json FROM agents WHERE agent_id = ?1",
                     params![agent_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let Some(raw_json) = existing_raw else {
+            let Some((existing_handle, raw_json)) = existing_row else {
                 tx.commit()?;
                 return Ok(());
             };
             let mut merged: HashMap<String, String> =
                 serde_json::from_str(&raw_json).unwrap_or_default();
-            for (k, v) in lbls {
-                if v.is_empty() {
-                    merged.remove(k);
-                } else {
-                    merged.insert(k.clone(), v.clone());
+            let mut labels_dirty = false;
+
+            if let Some(lbls) = labels {
+                for (k, v) in lbls {
+                    if v.is_empty() {
+                        merged.remove(k);
+                    } else {
+                        merged.insert(k.clone(), v.clone());
+                    }
                 }
+                labels_dirty = true;
             }
-            push_field(
-                "labels_json",
-                SqlValue::Text(serde_json::to_string(&merged)?),
-            );
-        }
-        if let Some(h) = handle {
-            let trimmed = h.trim();
-            push_field(
-                "handle",
-                if trimmed.is_empty() {
-                    SqlValue::Null
-                } else {
-                    SqlValue::Text(trimmed.to_string())
-                },
-            );
+            if let Some(h) = handle {
+                let trimmed = h.trim();
+                if !trimmed.is_empty()
+                    && let Some(old) = existing_handle.as_deref()
+                    && !old.trim().is_empty()
+                    && !old.trim().eq_ignore_ascii_case(trimmed)
+                {
+                    crate::workspace_sync::record_previous_handle_alias(&mut merged, old, trimmed);
+                    labels_dirty = true;
+                }
+                push_field(
+                    "handle",
+                    if trimmed.is_empty() {
+                        SqlValue::Null
+                    } else {
+                        SqlValue::Text(trimmed.to_string())
+                    },
+                );
+            }
+            if labels_dirty {
+                push_field(
+                    "labels_json",
+                    SqlValue::Text(serde_json::to_string(&merged)?),
+                );
+            }
         }
         if let Some(ts) = task_summary {
             let trimmed = ts.trim();

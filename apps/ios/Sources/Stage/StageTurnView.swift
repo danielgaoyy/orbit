@@ -8,17 +8,40 @@ private let orbitDisclosureAnimation: Animation = .timingCurve(0.22, 1.0, 0.36, 
 private struct VerticalRevealLayout: Layout {
     var progress: CGFloat
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    struct Cache {
+        var natural: CGSize = .zero
+        var lastWidth: CGFloat? = nil
+    }
+
+    func makeCache(subviews: Subviews) -> Cache {
+        Cache()
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
         guard let content = subviews.first else { return .zero }
         let clamped = min(1, max(0, progress))
-        let natural = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+        let natural: CGSize
+        if let lw = cache.lastWidth, let pw = proposal.width, lw == pw, cache.natural != .zero {
+            natural = cache.natural
+        } else {
+            natural = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+            cache.lastWidth = proposal.width
+            cache.natural = natural
+        }
         let width = proposal.width ?? natural.width
         return CGSize(width: width, height: natural.height * clamped)
     }
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
         guard let content = subviews.first else { return }
-        let natural = content.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
+        let natural: CGSize
+        if let lw = cache.lastWidth, lw == bounds.width, cache.natural != .zero {
+            natural = cache.natural
+        } else {
+            natural = content.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
+            cache.lastWidth = bounds.width
+            cache.natural = natural
+        }
         content.place(
             at: CGPoint(x: bounds.minX, y: bounds.minY),
             anchor: .topLeading,
@@ -55,12 +78,83 @@ private extension AnyTransition {
     }
 }
 
-struct StageTurnView: View {
-    @ObservedObject var store: OrbitIosStore
+@MainActor
+final class StageTurnActions {
+    private weak var store: OrbitIosStore?
+
+    init(store: OrbitIosStore) {
+        self.store = store
+    }
+
+    func hapticLight() { store?.hapticLight() }
+    func copyPromptText(_ text: String) { store?.copyPromptText(text) }
+    func copyAssistantReply(_ text: String) { store?.copyAssistantReply(text) }
+    func quoteAssistantReply(turnKey: String, text: String) {
+        store?.quoteAssistantReply(turnKey: turnKey, text: text)
+    }
+    func rewindAgent(toBeforeSeq seq: UInt64, restoreFiles: Bool) {
+        store?.rewindAgent(toBeforeSeq: seq, restoreFiles: restoreFiles)
+    }
+    func openGitDiff(focusFilePath: String? = nil) {
+        store?.openGitDiff(focusFilePath: focusFilePath)
+    }
+    func openWorkspaceFiles(initialPath: String? = nil, line: Int? = nil) {
+        store?.openWorkspaceFiles(initialPath: initialPath, line: line)
+    }
+    func describeTool(_ item: FfiTimelineItem) -> FfiToolStepDescriptor? {
+        store?.describeTool(item)
+    }
+    func refreshPasteboardAvailability() { store?.refreshPasteboardAvailability() }
+    func showToast(_ message: String) { store?.showToast(message) }
+    func selectAgent(_ agentId: String) { store?.selectAgent(agentId) }
+    func resolveChildPermission(
+        childHostId: String?,
+        childAgentId: String,
+        requestId: String,
+        decision: String
+    ) {
+        store?.resolveChildPermission(
+            childHostId: childHostId,
+            childAgentId: childAgentId,
+            requestId: requestId,
+            decision: decision
+        )
+    }
+}
+
+struct StageTurnView: View, Equatable {
     let turn: FfiStageTurn
     var isTurnActive: Bool = false
     var agentStatusLabel: String? = nil
     var hasLiveBackgroundTasks: Bool = false
+    var isHostOnline: Bool = true
+    var activeCwd: String = ""
+    var selectedHostId: String? = nil
+    var isActiveAgentTurnBusy: Bool = false
+    var coalesceExploration: Bool = true
+    var expandAllWorkGroupsByDefault: Bool = false
+    var expandFirstStepByDefault: Bool = false
+    var expandFirstTurnByDefault: Bool = false
+    var isFirstStepBearingTurn: Bool = false
+    var isFirstTurn: Bool = false
+    let actions: StageTurnActions
+
+    static func == (lhs: StageTurnView, rhs: StageTurnView) -> Bool {
+        lhs.turn == rhs.turn
+            && lhs.isTurnActive == rhs.isTurnActive
+            && lhs.agentStatusLabel == rhs.agentStatusLabel
+            && lhs.hasLiveBackgroundTasks == rhs.hasLiveBackgroundTasks
+            && lhs.isHostOnline == rhs.isHostOnline
+            && lhs.activeCwd == rhs.activeCwd
+            && lhs.selectedHostId == rhs.selectedHostId
+            && lhs.isActiveAgentTurnBusy == rhs.isActiveAgentTurnBusy
+            && lhs.coalesceExploration == rhs.coalesceExploration
+            && lhs.expandAllWorkGroupsByDefault == rhs.expandAllWorkGroupsByDefault
+            && lhs.expandFirstStepByDefault == rhs.expandFirstStepByDefault
+            && lhs.expandFirstTurnByDefault == rhs.expandFirstTurnByDefault
+            && lhs.isFirstStepBearingTurn == rhs.isFirstStepBearingTurn
+            && lhs.isFirstTurn == rhs.isFirstTurn
+    }
 
     @Environment(\.orbitPalette) private var palette
     @State private var isFoldedStepsExpanded = false
@@ -123,18 +217,6 @@ struct StageTurnView: View {
         return "Working…"
     }
 
-    private var isHostOnline: Bool {
-        guard let host = store.activeHost else { return true }
-        return OrbitFormatters.isHostOnline(host.connectionState)
-    }
-
-    private var isFirstStepBearingTurn: Bool {
-        if let firstWithSteps = store.agentStage?.turns.first(where: { !$0.foldedSteps.isEmpty }) {
-            return turn.key == firstWithSteps.key
-        }
-        return turn.turnIndex == 0 || turn.key == store.agentStage?.turns.first?.key
-    }
-
     private var settledSummaryLabel: String {
         let label = turn.workSummaryLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         if !label.isEmpty {
@@ -147,7 +229,7 @@ struct StageTurnView: View {
     }
 
     private var canFoldPreReplyWork: Bool {
-        turn.liveSegments.isEmpty && store.coalesceExploration && turn.terminalReply != nil && !turn.foldedSteps.isEmpty
+        turn.liveSegments.isEmpty && coalesceExploration && turn.terminalReply != nil && !turn.foldedSteps.isEmpty
     }
 
     private var terminalReplyText: String? {
@@ -177,9 +259,9 @@ struct StageTurnView: View {
                             blocks: blocks,
                             timestampMs: timestampMs,
                             onCopy: {
-                                store.copyPromptText(text)
+                                actions.copyPromptText(text)
                             },
-                            onRewind: !store.isActiveAgentTurnBusy ? {
+                            onRewind: !isActiveAgentTurnBusy ? {
                                 rewindTargetSeq = promptSeq
                                 isRewindDialogPresented = true
                             } : nil
@@ -189,7 +271,8 @@ struct StageTurnView: View {
                     if let agentMsg = turn.agentMessage,
                        case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, blocks, timestampMs) = agentMsg {
                         AgentMessageCardView(
-                            store: store,
+                            selectedHostId: selectedHostId,
+                            actions: actions,
                             kind: kind,
                             sourceAgentId: sourceAgentId,
                             sourceHostId: sourceHostId,
@@ -244,10 +327,10 @@ struct StageTurnView: View {
                             if !isTurnActive && !turn.turnDiffs.isEmpty {
                                 TurnChangesBarView(
                                     diffs: turn.turnDiffs,
-                                    cwd: store.activeCwd,
+                                    cwd: activeCwd,
                                     onOpenDiff: { path in
-                                        store.hapticLight()
-                                        store.openGitDiff(focusFilePath: path)
+                                        actions.hapticLight()
+                                        actions.openGitDiff(focusFilePath: path)
                                     }
                                 )
                                 .padding(.top, 2)
@@ -262,10 +345,10 @@ struct StageTurnView: View {
                                 thoughtDurationMs: turn.thoughtDurationMs,
                                 replyText: !isTurnActive ? terminalReplyText : nil,
                                 onCopy: { reply in
-                                    store.copyAssistantReply(reply)
+                                    actions.copyAssistantReply(reply)
                                 },
                                 onQuote: { reply in
-                                    store.quoteAssistantReply(turnKey: turn.key, text: reply)
+                                    actions.quoteAssistantReply(turnKey: turn.key, text: reply)
                                 }
                             )
                         }
@@ -279,11 +362,11 @@ struct StageTurnView: View {
                 ) {
                     if let seq = rewindTargetSeq {
                         Button("Restore Conversation & Files", role: .destructive) {
-                            store.rewindAgent(toBeforeSeq: seq, restoreFiles: true)
+                            actions.rewindAgent(toBeforeSeq: seq, restoreFiles: true)
                             rewindTargetSeq = nil
                         }
                         Button("Rewind Conversation Only") {
-                            store.rewindAgent(toBeforeSeq: seq, restoreFiles: false)
+                            actions.rewindAgent(toBeforeSeq: seq, restoreFiles: false)
                             rewindTargetSeq = nil
                         }
                     }
@@ -296,21 +379,21 @@ struct StageTurnView: View {
             }
         }
         .onAppear {
-            if store.expandAllWorkGroupsByDefault {
+            if expandAllWorkGroupsByDefault {
                 isFoldedStepsExpanded = true
-            } else if store.expandFirstStepByDefault && isFirstStepBearingTurn {
+            } else if expandFirstStepByDefault && isFirstStepBearingTurn {
                 isFoldedStepsExpanded = true
-            } else if store.expandFirstTurnByDefault,
-                      (turn.turnIndex == 0 || turn.key == store.agentStage?.turns.first?.key || isFirstStepBearingTurn) {
+            } else if expandFirstTurnByDefault,
+                      (turn.turnIndex == 0 || isFirstTurn || isFirstStepBearingTurn) {
                 isFoldedStepsExpanded = true
             }
         }
-        .onChange(of: store.expandAllWorkGroupsByDefault) { expandAll in
+        .onChange(of: expandAllWorkGroupsByDefault) { expandAll in
             if expandAll {
                 isFoldedStepsExpanded = true
             }
         }
-        .onChange(of: store.expandFirstStepByDefault) { expandFirstStep in
+        .onChange(of: expandFirstStepByDefault) { expandFirstStep in
             if expandFirstStep && isFirstStepBearingTurn {
                 isFoldedStepsExpanded = true
             }
@@ -327,12 +410,12 @@ struct StageTurnView: View {
             blocks: blocks,
             fallbackText: text,
             isStreaming: streaming,
-            workspaceCwd: store.activeCwd,
+            workspaceCwd: activeCwd,
             onQuoteSelection: { selected in
-                store.quoteAssistantReply(turnKey: turn.key, text: selected)
+                actions.quoteAssistantReply(turnKey: turn.key, text: selected)
             },
             onOpenFileLink: { target in
-                store.openWorkspaceFiles(initialPath: target.path, line: target.line)
+                actions.openWorkspaceFiles(initialPath: target.path, line: target.line)
             }
         )
     }
@@ -351,23 +434,28 @@ struct StageTurnView: View {
                 deletions: turn.workCounts.deletions,
                 isLiveRunning: false
             ) {
-                store.hapticLight()
-                withAnimation(orbitDisclosureAnimation) {
+                actions.hapticLight()
+                if turn.foldedSteps.count > 12 {
                     isFoldedStepsExpanded.toggle()
+                } else {
+                    withAnimation(orbitDisclosureAnimation) {
+                        isFoldedStepsExpanded.toggle()
+                    }
                 }
             }
             .zIndex(1)
 
             if isFoldedStepsExpanded {
                 StepRailListView(
-                    store: store,
+                    selectedHostId: selectedHostId,
+                    actions: actions,
                     items: turn.foldedSteps,
-                    expandFirstToolStep: store.expandFirstStepByDefault && isFirstStepBearingTurn,
+                    expandFirstToolStep: expandFirstStepByDefault && isFirstStepBearingTurn,
                     isLiveActive: false,
                     autoExpandErrors: turn.workCounts.failedCount > 0 || turn.workCounts.deniedCount > 0
                 )
                 .padding(.top, OrbitSpacing.xs)
-                .transition(.orbitVerticalDisclosure)
+                .transition(turn.foldedSteps.count > 12 ? .opacity : .orbitVerticalDisclosure)
             }
         }
     }
@@ -389,7 +477,7 @@ struct StageTurnView: View {
                         unrecoveredFailureCount: summary.counts.unrecoveredFailureCount
                     )
                     let keepOpenForTrailingFailure = !hasFollowingContent && summary.counts.unrecoveredFailureCount > 0
-                    let shouldFold = store.coalesceExploration && !isSegLiveActive && !keepOpenForTrailingFailure
+                    let shouldFold = coalesceExploration && !isSegLiveActive && !keepOpenForTrailingFailure
                     let isThoughtOnly = summary.counts.actionSteps == 0 && items.allSatisfy {
                         if case .assistantThinking = $0 { return true }
                         return false
@@ -411,7 +499,10 @@ struct StageTurnView: View {
                     }()
 
                     LiveStepGroupView(
-                        store: store,
+                        selectedHostId: selectedHostId,
+                        expandAllWorkGroupsByDefault: expandAllWorkGroupsByDefault,
+                        expandFirstStepByDefault: expandFirstStepByDefault,
+                        actions: actions,
                         segmentKey: segKey,
                         items: items,
                         summary: summary,
@@ -446,7 +537,8 @@ struct StageTurnView: View {
                 case let .agentMessage(_, item):
                     if case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, blocks, timestampMs) = item {
                         AgentMessageCardView(
-                            store: store,
+                            selectedHostId: selectedHostId,
+                            actions: actions,
                             kind: kind,
                             sourceAgentId: sourceAgentId,
                             sourceHostId: sourceHostId,
@@ -841,6 +933,34 @@ private let legacyPlanPrefix =
 private let legacyReviewPrompt =
     "Review the uncommitted working tree changes for bugs, edge cases, and architectural consistency."
 
+private enum PromptRegexCache {
+    static let attachedImage = try? NSRegularExpression(
+        pattern: #"^Attached image file:\s*`([^`]+)`\s*$"#,
+        options: [.anchorsMatchLines]
+    )
+    static let referencedFiles = try? NSRegularExpression(
+        pattern: #"^Referenced workspace files:\s*(.+)$"#,
+        options: [.anchorsMatchLines]
+    )
+    static let backtickItem = try? NSRegularExpression(pattern: #"`@?([^`]+)`"#)
+    static let gitDiffBlock = try? NSRegularExpression(
+        pattern: #"^>\s*(Working Tree Diff|Staged Diff):\r?\n```diff\r?\n[\s\S]*?\r?\n```\s*$"#,
+        options: [.anchorsMatchLines]
+    )
+    static let gitDiffContext = try? NSRegularExpression(
+        pattern: #"^>\s*Context:\s*Inspect (staged|working tree) git changes\.\s*$"#,
+        options: [.anchorsMatchLines, .caseInsensitive]
+    )
+    static let terminalBlock = try? NSRegularExpression(
+        pattern: #"^>\s*([^:\r\n]*lines):\r?\n```text\r?\n[\s\S]*?\r?\n```\s*$"#,
+        options: [.anchorsMatchLines]
+    )
+    static let referenceQuote = try? NSRegularExpression(
+        pattern: #"^>\s*Reference\s*`([^`]+)`:\r?\n```[\s\S]*?\r?\n```\s*$"#,
+        options: [.anchorsMatchLines]
+    )
+}
+
 private func extractUserPromptPresentation(
     text: String,
     badges: [FfiPromptBadge]
@@ -857,8 +977,8 @@ private func extractUserPromptPresentation(
     var inferred: [FfiPromptBadge] = []
     var sanitized = false
 
-    func stripRegex(_ pattern: String, options: NSRegularExpression.Options = [.anchorsMatchLines], handler: ([String]) -> Void) {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else { return }
+    func stripRegex(_ regex: NSRegularExpression?, handler: ([String]) -> Void) {
+        guard let regex else { return }
         let full = NSRange(working.startIndex..<working.endIndex, in: working)
         let matches = regex.matches(in: working, options: [], range: full)
         guard !matches.isEmpty else { return }
@@ -879,16 +999,16 @@ private func extractUserPromptPresentation(
         }
     }
 
-    stripRegex(#"^Attached image file:\s*`([^`]+)`\s*$"#) { groups in
+    stripRegex(PromptRegexCache.attachedImage) { groups in
         if let raw = groups.first {
             let name = raw.split(separator: "/").last.map(String.init) ?? raw
             inferred.append(FfiPromptBadge(kind: "image", label: name, path: raw))
         }
     }
 
-    stripRegex(#"^Referenced workspace files:\s*(.+)$"#) { groups in
+    stripRegex(PromptRegexCache.referencedFiles) { groups in
         if let listStr = groups.first,
-           let itemRegex = try? NSRegularExpression(pattern: #"`@?([^`]+)`"#) {
+           let itemRegex = PromptRegexCache.backtickItem {
             let range = NSRange(listStr.startIndex..<listStr.endIndex, in: listStr)
             for match in itemRegex.matches(in: listStr, range: range) {
                 if let r = Range(match.range(at: 1), in: listStr) {
@@ -900,24 +1020,24 @@ private func extractUserPromptPresentation(
         }
     }
 
-    stripRegex(#"^>\s*(Working Tree Diff|Staged Diff):\r?\n```diff\r?\n[\s\S]*?\r?\n```\s*$"#) { groups in
+    stripRegex(PromptRegexCache.gitDiffBlock) { groups in
         if let label = groups.first {
             inferred.append(FfiPromptBadge(kind: "git_diff", label: label, path: nil))
         }
     }
 
-    stripRegex(#"^>\s*Context:\s*Inspect (staged|working tree) git changes\.\s*$"#, options: [.anchorsMatchLines, .caseInsensitive]) { groups in
+    stripRegex(PromptRegexCache.gitDiffContext) { groups in
         let isStaged = groups.first?.lowercased() == "staged"
         inferred.append(FfiPromptBadge(kind: "git_diff", label: isStaged ? "Staged Diff" : "Working Tree Diff", path: nil))
     }
 
-    stripRegex(#"^>\s*([^:\r\n]*lines):\r?\n```text\r?\n[\s\S]*?\r?\n```\s*$"#) { groups in
+    stripRegex(PromptRegexCache.terminalBlock) { groups in
         if let label = groups.first {
             inferred.append(FfiPromptBadge(kind: "terminal", label: label.trimmingCharacters(in: .whitespaces), path: nil))
         }
     }
 
-    stripRegex(#"^>\s*Reference\s*`([^`]+)`:\r?\n```[\s\S]*?\r?\n```\s*$"#) { groups in
+    stripRegex(PromptRegexCache.referenceQuote) { groups in
         if let loc = groups.first {
             let shortLoc = loc.split(separator: "/").last.map(String.init) ?? loc
             inferred.append(FfiPromptBadge(kind: "quote", label: shortLoc, path: loc))
@@ -1316,7 +1436,10 @@ private struct StepSummaryDisclosureButton: View {
 }
 
 private struct LiveStepGroupView: View {
-    @ObservedObject var store: OrbitIosStore
+    let selectedHostId: String?
+    let expandAllWorkGroupsByDefault: Bool
+    let expandFirstStepByDefault: Bool
+    let actions: StageTurnActions
     let segmentKey: String
     let items: [FfiTimelineItem]
     let summary: FfiWorkSummaryResult
@@ -1365,7 +1488,7 @@ private struct LiveStepGroupView: View {
     }
 
     private var forceExpanded: Bool {
-        store.expandAllWorkGroupsByDefault || store.expandFirstStepByDefault
+        expandAllWorkGroupsByDefault || expandFirstStepByDefault
     }
 
     private var isFoldOpen: Bool {
@@ -1378,9 +1501,13 @@ private struct LiveStepGroupView: View {
             // directly above the active step rail (replacing the removed bottom `• MM:SS` turn footer).
             VStack(alignment: .leading, spacing: 0) {
                 Button {
-                    store.hapticLight()
-                    withAnimation(orbitDisclosureAnimation) {
+                    actions.hapticLight()
+                    if items.count > 12 {
                         isLiveCollapsed.toggle()
+                    } else {
+                        withAnimation(orbitDisclosureAnimation) {
+                            isLiveCollapsed.toggle()
+                        }
                     }
                 } label: {
                     HStack(spacing: 6) {
@@ -1441,21 +1568,23 @@ private struct LiveStepGroupView: View {
 
                 if !isLiveCollapsed {
                     StepRailListView(
-                        store: store,
+                        selectedHostId: selectedHostId,
+                        actions: actions,
                         items: items,
-                        expandFirstToolStep: store.expandFirstStepByDefault,
+                        expandFirstToolStep: expandFirstStepByDefault,
                         isLiveActive: true,
                         autoExpandErrors: false
                     )
                     .padding(.top, OrbitSpacing.xs)
-                    .transition(.orbitVerticalDisclosure)
+                    .transition(items.count > 12 ? .opacity : .orbitVerticalDisclosure)
                 }
             }
         } else if !shouldFold || forceExpanded {
             StepRailListView(
-                store: store,
+                selectedHostId: selectedHostId,
+                actions: actions,
                 items: items,
-                expandFirstToolStep: store.expandFirstStepByDefault,
+                expandFirstToolStep: expandFirstStepByDefault,
                 isLiveActive: false,
                 autoExpandErrors: summary.counts.unrecoveredFailureCount > 0
             )
@@ -1472,23 +1601,28 @@ private struct LiveStepGroupView: View {
                     deletions: summary.counts.deletions,
                     isLiveRunning: false
                 ) {
-                    store.hapticLight()
-                    withAnimation(orbitDisclosureAnimation) {
+                    actions.hapticLight()
+                    if items.count > 12 {
                         isManualExpanded.toggle()
+                    } else {
+                        withAnimation(orbitDisclosureAnimation) {
+                            isManualExpanded.toggle()
+                        }
                     }
                 }
                 .zIndex(1)
 
                 if isFoldOpen {
                     StepRailListView(
-                        store: store,
+                        selectedHostId: selectedHostId,
+                        actions: actions,
                         items: items,
-                        expandFirstToolStep: store.expandFirstStepByDefault,
+                        expandFirstToolStep: expandFirstStepByDefault,
                         isLiveActive: false,
                         autoExpandErrors: summary.counts.failedCount > 0 || summary.counts.deniedCount > 0
                     )
                     .padding(.top, OrbitSpacing.xs)
-                    .transition(.orbitVerticalDisclosure)
+                    .transition(items.count > 12 ? .opacity : .orbitVerticalDisclosure)
                 }
             }
         }
@@ -1503,7 +1637,8 @@ private struct IndexedStepRow: Identifiable {
 }
 
 struct StepRailListView: View {
-    @ObservedObject var store: OrbitIosStore
+    let selectedHostId: String?
+    let actions: StageTurnActions
     let items: [FfiTimelineItem]
     var expandFirstToolStep: Bool = false
     var isLiveActive: Bool = false
@@ -1511,6 +1646,9 @@ struct StepRailListView: View {
 
     @Environment(\.orbitPalette) private var palette
     @State private var showAllLiveSteps = false
+    @State private var showAllSettledSteps = false
+
+    private let settledStepVisibleTailCap = 20
 
     private var canRollUpEarlier: Bool {
         isLiveActive && items.count >= liveStepAutoCollapseThreshold
@@ -1518,6 +1656,12 @@ struct StepRailListView: View {
 
     private var hiddenCount: Int {
         canRollUpEarlier ? max(0, items.count - liveStepVisibleTailCount) : 0
+    }
+
+    private var hiddenSettledCount: Int {
+        (!canRollUpEarlier && !isLiveActive && items.count > settledStepVisibleTailCap)
+            ? (items.count - settledStepVisibleTailCap)
+            : 0
     }
 
     private var firstToolCallSeq: UInt64? {
@@ -1540,7 +1684,7 @@ struct StepRailListView: View {
 
                 VStack(alignment: .leading, spacing: 0) {
                     Button {
-                        store.hapticLight()
+                        actions.hapticLight()
                         withAnimation(orbitDisclosureAnimation) {
                             showAllLiveSteps.toggle()
                         }
@@ -1571,11 +1715,36 @@ struct StepRailListView: View {
                             }
                         }
                         .padding(.bottom, 2)
-                        .transition(.orbitVerticalDisclosure)
+                        .transition(earlierRows.count > 12 ? .opacity : .orbitVerticalDisclosure)
                     }
                 }
 
                 ForEach(tailRows) { row in
+                    stepRowView(for: row.item)
+                }
+            } else if hiddenSettledCount > 0 && !showAllSettledSteps {
+                Button {
+                    actions.hapticLight()
+                    showAllSettledSteps = true
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted.opacity(0.8))
+                            .frame(width: 16, alignment: .center)
+
+                        Text("Show \(hiddenSettledCount) earlier steps")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 5)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                ForEach(indexedRows(for: Array(items.suffix(settledStepVisibleTailCap)), indexOffset: hiddenSettledCount)) { row in
                     stepRowView(for: row.item)
                 }
             } else {
@@ -1605,7 +1774,8 @@ struct StepRailListView: View {
         }()
 
         return StepRowView(
-            store: store,
+            selectedHostId: selectedHostId,
+            actions: actions,
             item: item,
             autoExpandOnAppear: expandFirstToolStep && (seq == firstToolCallSeq),
             autoExpandError: autoExpandErrors,
@@ -1658,7 +1828,8 @@ struct StepRailListView: View {
 }
 
 struct StepRowView: View {
-    @ObservedObject var store: OrbitIosStore
+    let selectedHostId: String?
+    let actions: StageTurnActions
     let item: FfiTimelineItem
     var autoExpandOnAppear: Bool = false
     var autoExpandError: Bool = false
@@ -1693,7 +1864,7 @@ struct StepRowView: View {
                 resolvedQuestionRow(count: questions.count)
 
             case let .toolCall(_, _, status, summaryTitle, previewBody, detail, stepDescriptor, diffFiles, _):
-                let descriptor = stepDescriptor ?? store.describeTool(item)
+                let descriptor = stepDescriptor ?? actions.describeTool(item)
                 toolStepRow(
                     status: status,
                     summaryTitle: summaryTitle,
@@ -1708,7 +1879,8 @@ struct StepRowView: View {
 
             case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, blocks, timestampMs):
                 AgentMessageCardView(
-                    store: store,
+                    selectedHostId: selectedHostId,
+                    actions: actions,
                     kind: kind,
                     sourceAgentId: sourceAgentId,
                     sourceHostId: sourceHostId,
@@ -1752,7 +1924,7 @@ struct StepRowView: View {
         return VStack(alignment: .leading, spacing: 0) {
             Button {
                 guard canExpand else { return }
-                store.hapticLight()
+                actions.hapticLight()
                 withAnimation(orbitDisclosureAnimation) {
                     isDetailExpanded.toggle()
                 }
@@ -1849,7 +2021,7 @@ struct StepRowView: View {
             } else {
                 VStack(alignment: .leading, spacing: 0) {
                     Button {
-                        store.hapticLight()
+                        actions.hapticLight()
                         withAnimation(orbitDisclosureAnimation) {
                             isDetailExpanded.toggle()
                         }
@@ -1973,13 +2145,13 @@ struct StepRowView: View {
         return VStack(alignment: .leading, spacing: 0) {
             Button {
                 if canExpand {
-                    store.hapticLight()
+                    actions.hapticLight()
                     withAnimation(orbitDisclosureAnimation) {
                         isDetailExpanded.toggle()
                     }
                 } else if canOpenFileInDiff, let path = openPath {
-                    store.hapticLight()
-                    store.openGitDiff(focusFilePath: path)
+                    actions.hapticLight()
+                    actions.openGitDiff(focusFilePath: path)
                 }
             } label: {
                 HStack(spacing: 8) {
@@ -2161,8 +2333,8 @@ struct StepRowView: View {
                 }
 
                 Button {
-                    store.hapticLight()
-                    store.openGitDiff(focusFilePath: path)
+                    actions.hapticLight()
+                    actions.openGitDiff(focusFilePath: path)
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "arrow.left.arrow.right")
@@ -2346,9 +2518,9 @@ struct StepRowView: View {
         let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         UIPasteboard.general.string = trimmed
-        store.refreshPasteboardAvailability()
-        store.hapticLight()
-        store.showToast("Copied step details")
+        actions.refreshPasteboardAvailability()
+        actions.hapticLight()
+        actions.showToast("Copied step details")
         withAnimation(.easeOut(duration: 0.15)) {
             copiedStepDetail = true
         }
@@ -2525,7 +2697,8 @@ struct TurnNoticeRow: View {
 // MARK: - Inter-Agent Peer Message / Finish Notification / Heartbeat / Child Permission Card
 
 struct AgentMessageCardView: View {
-    @ObservedObject var store: OrbitIosStore
+    let selectedHostId: String?
+    let actions: StageTurnActions
     let kind: FfiAgentMessageKind
     let sourceAgentId: String?
     let sourceHostId: String?
@@ -2575,7 +2748,7 @@ struct AgentMessageCardView: View {
 
     private var canJumpToSource: Bool {
         guard let aid = sourceAgentId, !aid.isEmpty else { return false }
-        if let shid = sourceHostId, !shid.isEmpty, shid != store.selectedHostId {
+        if let shid = sourceHostId, !shid.isEmpty, shid != selectedHostId {
             return false
         }
         return true
@@ -2585,7 +2758,7 @@ struct AgentMessageCardView: View {
         if kind == .heartbeat && permissionContext == nil {
             VStack(alignment: .leading, spacing: 6) {
                 Button {
-                    store.hapticLight()
+                    actions.hapticLight()
                     withAnimation(.easeInOut(duration: 0.18)) {
                         isHeartbeatExpanded.toggle()
                     }
@@ -2638,7 +2811,7 @@ struct AgentMessageCardView: View {
 
                     if canJumpToSource, let aid = sourceAgentId {
                         Button {
-                            store.selectAgent(aid)
+                            actions.selectAgent(aid)
                         } label: {
                             Text("Open")
                                 .font(OrbitTypography.meta(.semibold))
@@ -2680,7 +2853,7 @@ struct AgentMessageCardView: View {
                                 let isPrimary = !isDeny && !lower.contains("always")
                                 Button {
                                     resolvedChildDecision = dec
-                                    store.resolveChildPermission(
+                                    actions.resolveChildPermission(
                                         childHostId: perm.childHostId,
                                         childAgentId: perm.childAgentId,
                                         requestId: perm.permissionRequestId,

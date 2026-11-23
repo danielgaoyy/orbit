@@ -952,6 +952,7 @@ async fn execute_tool_inner(
                             request_id: req_id,
                             agent_id: agent_id.clone(),
                             since_seq,
+                            tail_limit: None,
                         },
                         Duration::from_secs(15),
                     )
@@ -2093,9 +2094,16 @@ async fn execute_tool_inner(
                 .list_agents_filtered(Some(&ws_id), false, false, None)?;
             let board = rt.orchestrator.get_workspace_board(&ws_id).ok();
             let events = rt.orchestrator.list_workspace_events(&ws_id, 20)?;
+            let caller_cwd = caller.as_ref().map(|c| c.cwd.as_str());
+            let mut shared_checkout_peers: Vec<String> = Vec::new();
             let peer_cards: Vec<Value> = peers
                 .iter()
                 .map(|p| {
+                    let is_self = caller_agent_id == Some(p.agent_id.as_str());
+                    let handle = p.handle.as_deref().unwrap_or("peer");
+                    if !is_self && caller_cwd.is_some_and(|cwd| !cwd.is_empty() && cwd == p.cwd) {
+                        shared_checkout_peers.push(format!("@{handle}"));
+                    }
                     let last_reply = rt
                         .store
                         .last_assistant_message_text(&p.agent_id)
@@ -2104,14 +2112,16 @@ async fn execute_tool_inner(
                         .map(|s| truncate_chars(&s, 280));
                     json!({
                         "agent_id": p.agent_id,
-                        "handle": p.handle.as_deref().unwrap_or("peer"),
-                        "is_self": caller_agent_id == Some(p.agent_id.as_str()),
+                        "handle": handle,
+                        "is_self": is_self,
                         "title": p.title,
                         "provider": p.provider,
                         "model": p.model,
                         "mode": p.mode,
                         "status": p.status,
                         "cwd": p.cwd,
+                        "worktree_branch": p.labels.get("orbit.worktree_branch"),
+                        "is_worktree_isolated": p.labels.contains_key("orbit.worktree_source_cwd"),
                         "last_summary": last_reply,
                         "updated_at": p.updated_at,
                     })
@@ -2120,6 +2130,7 @@ async fn execute_tool_inner(
             Ok(json!({
                 "workspace": ws,
                 "peers": peer_cards,
+                "shared_checkout_peers": shared_checkout_peers,
                 "board_revision": board.as_ref().map(|b| b.revision).unwrap_or(0),
                 "board_path": board.as_ref().and_then(|b| b.board_path.clone()),
                 "recent_events": events,
@@ -2210,11 +2221,18 @@ async fn execute_tool_inner(
                         crate::manager::DaemonBroadcast::WorkspaceEventRecorded(ws_ev),
                     );
                 }
-                delivered.push(json!({
+                let mut entry = json!({
                     "agent_id": peer.agent_id,
                     "handle": peer_h,
                     "message_id": mid,
-                }));
+                });
+                if !clean_target.eq_ignore_ascii_case("all")
+                    && !clean_target.eq_ignore_ascii_case(&peer_h)
+                    && clean_target != peer.agent_id
+                {
+                    entry["resolved_via_alias"] = json!(true);
+                }
+                delivered.push(entry);
             }
             Ok(json!({
                 "ok": true,
@@ -2438,6 +2456,10 @@ async fn execute_tool_inner(
             let title = opt_str(args, "title");
             let initial_prompt =
                 opt_str(args, "initial_prompt").or_else(|| opt_str(args, "prompt"));
+            let notify_on_finish = args
+                .get("notify_on_finish")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             let (agent, workspace) = if let Some(ref remote_host_id) = target_host {
                 let req_id = Uuid::new_v4();
@@ -2480,11 +2502,23 @@ async fn execute_tool_inner(
                 (outcome.agent, outcome.workspace)
             };
 
+            if notify_on_finish
+                && target_host.is_none()
+                && let Some(cid) = caller_agent_id
+            {
+                let _ = rt
+                    .finish_subs
+                    .register(cid.to_string(), agent.agent_id.clone(), None, false)
+                    .await;
+            }
+
             Ok(json!({
                 "ok": true,
                 "agent_id": agent.agent_id,
+                "handle": agent.handle,
                 "workspace_id": agent.workspace_id,
                 "cwd": agent.cwd,
+                "worktree_branch": agent.labels.get("orbit.worktree_branch"),
                 "forked_from_agent_id": agent.forked_from_agent_id,
                 "forked_at_seq": agent.forked_at_seq,
                 "agent": agent,
@@ -4350,7 +4384,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "message_peer",
-                description: "Send a collaborative message to a sibling peer by `@handle` or `all` in the same Mission Workspace (with optional finish notification).",
+                description: "Send a collaborative message to a sibling peer by `@handle` (historical handle aliases resolve automatically) or `all` in the same Mission Workspace (with optional finish notification).",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -4488,7 +4522,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "orbit_agent",
-                description: "Manage Orbit agents: list, inspect status/activity, fork (same dir or worktree), update config/mode, move workspace, cancel, archive, or kill.",
+                description: "Manage Orbit agents: list, inspect status/activity, fork (same dir or worktree — inside a Mission Workspace `worktree=true` keeps the forked peer in the same workspace for parallel non-blocking development), update config/mode, move workspace, cancel, archive, or kill.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -4505,6 +4539,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                         "base_ref": { "type": "string" },
                         "title": { "type": "string" },
                         "initial_prompt": { "type": "string" },
+                        "notify_on_finish": { "type": "boolean" },
                         "model": { "type": "string" },
                         "effort": { "type": "string" },
                         "fast_mode": { "type": "boolean" },
@@ -4546,7 +4581,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "orbit_timer",
-                description: "Arm, list, or cancel durable one-shot conditional wakeup timers (`never`, `any`, `all_subagents`, `all_peers`, `sender:<id>`, `file:<path>`).",
+                description: "Arm, list, or cancel durable one-shot conditional wakeup timers (`never`, `any`, `all_subagents`, `all_peers`, `sender:<id|@handle>`, `file:<path>`).",
                 input_schema: json!({
                     "type": "object",
                     "properties": {

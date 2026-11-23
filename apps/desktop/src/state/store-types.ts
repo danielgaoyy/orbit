@@ -366,6 +366,9 @@ export interface ComposerFocusOptions {
 export type WindowedAgentStageView = AgentStageView & {
   window_start_turn_index?: number;
   total_turn_count?: number;
+  has_older_turns?: boolean;
+  has_older_history?: boolean;
+  oldest_loaded_seq?: number;
 };
 
 export interface StageRunningSubagentRef {

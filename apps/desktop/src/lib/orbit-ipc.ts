@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { t } from "@/lib/i18n";
 
 export type ProviderKind =
@@ -411,6 +412,18 @@ export interface ExternalEditorInfo {
   kind: ExternalEditorKind;
   label: string;
   installed: boolean;
+}
+
+export type ProviderAuthStatus = "authenticated" | "unauthenticated" | "unknown";
+
+export interface ProviderReadinessInfo {
+  kind: ProviderKind;
+  display_name: string;
+  installed: boolean;
+  executable_path: string | null;
+  auth_status: ProviderAuthStatus;
+  install_hint: string;
+  login_hint: string;
 }
 
 export type HostRouteMode = "auto" | "ssh_tunnel" | "direct_only" | "relay_only";
@@ -5482,6 +5495,33 @@ export const orbitIpc = {
       return;
     }
     await invoke<void>("focus_main_window");
+  },
+
+  updateTrayStatus: async (runningCount: number, pendingApprovals: number): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_tray_status", {
+      runningCount: Math.max(0, Math.floor(runningCount)),
+      pendingApprovals: Math.max(0, Math.floor(pendingApprovals)),
+    });
+  },
+
+  onTrayNewConversation: async (handler: () => void): Promise<() => void> => {
+    if (!isTauriRuntime()) return () => {};
+    return listen("orbit://tray-new-conversation", () => {
+      handler();
+    });
+  },
+
+  probeLocalProviderReadiness: async (): Promise<ProviderReadinessInfo[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ProviderReadinessInfo[]>("probe_local_provider_readiness");
+  },
+
+  renderQrSvg: async (content: string): Promise<string> => {
+    if (!isTauriRuntime()) {
+      throw new Error("QR rendering requires the Orbit Desktop runtime");
+    }
+    return invoke<string>("render_qr_svg", { content });
   },
 
   listPushDevices: async (hostId: string): Promise<PushDevicesSnapshotView> => {

@@ -31,6 +31,10 @@ import {
   type SentImagePreviewMeta,
 } from "@/lib/prompt-image-cache";
 import {
+  type NotificationSoundTone,
+  playSoftNotificationChime,
+} from "@/lib/notification-sound";
+import {
   getCatalogForProvider,
   modelSupportsFastMode,
   resolveActiveModelSpec,
@@ -634,6 +638,7 @@ export interface OrbitUiState {
   workspacePanel: WorkspacePanelMode;
   settingsSection: SettingsSection;
   commandPaletteOpen: boolean;
+  onboardingOpen: boolean;
   pairDialogOpen: boolean;
   relayDialogOpen: boolean;
   remoteFolderPickerHostId: string | null;
@@ -1147,6 +1152,7 @@ const defaultInitialState: OrbitUiState = {
   workspacePanel: "conversation",
   settingsSection: "general",
   commandPaletteOpen: false,
+  onboardingOpen: false,
   pairDialogOpen: false,
   relayDialogOpen: false,
   remoteFolderPickerHostId: null,
@@ -1872,12 +1878,52 @@ function isAgentErrorState(
   );
 }
 
+const ONBOARDING_COMPLETED_STORAGE_KEY = "orbit:onboarding_completed_v1";
+let onboardingAutoPromptChecked = false;
+
+function hasCompletedOnboarding(): boolean {
+  if (typeof window === "undefined") return true;
+  try {
+    const val = window.localStorage.getItem(ONBOARDING_COMPLETED_STORAGE_KEY);
+    return val === "true" || val === "1";
+  } catch {
+    return true;
+  }
+}
+
+function markOnboardingCompleted(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(ONBOARDING_COMPLETED_STORAGE_KEY, "true");
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+let lastTrayStatusKey: string | null = null;
+let trayStatusSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleTrayStatusSync(runningCount: number, pendingApprovals: number): void {
+  const nextKey = `${runningCount}:${pendingApprovals}`;
+  if (nextKey === lastTrayStatusKey) return;
+  if (trayStatusSyncTimer !== null) {
+    clearTimeout(trayStatusSyncTimer);
+  }
+  trayStatusSyncTimer = setTimeout(() => {
+    trayStatusSyncTimer = null;
+    if (disposed) return;
+    lastTrayStatusKey = nextKey;
+    void orbitIpc.updateTrayStatus(runningCount, pendingApprovals).catch(() => undefined);
+  }, 140);
+}
+
 function dispatchDesktopNotification(opts: {
   title: string;
   body: string;
   hostId: string;
   agentId?: string | null;
   tag?: string;
+  tone?: NotificationSoundTone;
   forceEvenIfVisible?: boolean;
 }): boolean {
   if (typeof window === "undefined" || !("Notification" in window)) return false;
@@ -1887,10 +1933,16 @@ function dispatchDesktopNotification(opts: {
     if (isInDesktopQuietHours()) return false;
   }
 
+  const shouldPlaySound =
+    state.notifySoundEnabled && (opts.forceEvenIfVisible || !isInDesktopQuietHours());
+  const chimePlayed = shouldPlaySound
+    ? playSoftNotificationChime(opts.tone ?? "default")
+    : false;
+
   try {
     const notif = new Notification(opts.title, {
       body: opts.body,
-      silent: !state.notifySoundEnabled,
+      silent: chimePlayed || !state.notifySoundEnabled,
       tag: opts.tag,
     });
     notif.onclick = () => {
@@ -1899,6 +1951,7 @@ function dispatchDesktopNotification(opts: {
         window.focus();
       }
       orbitActions.closeSettings();
+      orbitActions.closeOnboardingGuide(false);
       if (opts.hostId && opts.agentId) {
         orbitActions.selectAgent(opts.hostId, opts.agentId);
       } else if (opts.hostId) {
@@ -1948,6 +2001,16 @@ function syncAttentionIndicators(overview: FleetOverviewView, details: Record<st
         : "Orbit";
   }
 
+  let runningCount = 0;
+  for (const detail of Object.values(details)) {
+    for (const ag of detail.agents) {
+      if (!ag.archived_at_rfc3339 && isAgentForegroundRunning(ag)) {
+        runningCount += 1;
+      }
+    }
+  }
+  scheduleTrayStatusSync(runningCount, overview.total_pending_approvals);
+
   if (!state.notifyOnApproval) return;
 
   for (const detail of Object.values(details)) {
@@ -1962,6 +2025,7 @@ function syncAttentionIndicators(overview: FleetOverviewView, details: Record<st
             hostId: detail.host.host_id,
             agentId: ag.agent_id,
             tag: `orbit-approval-${detail.host.host_id}-${ag.agent_id}`,
+            tone: "approval",
           });
         }
       } else {
@@ -3143,6 +3207,20 @@ export const orbitActions = {
     syncAttentionIndicators(state.fleet, state.hostDetails);
     orbitActions.refreshSidebarView();
 
+    if (initialBootstrap && !onboardingAutoPromptChecked) {
+      onboardingAutoPromptChecked = true;
+      if (!hasCompletedOnboarding() && state.activeView === "workspace") {
+        const hasAnyActiveConversation =
+          state.fleet.hosts.some((h) => h.agent_count > 0) ||
+          Object.values(state.hostDetails).some((detail) =>
+            detail.agents.some((ag) => !ag.archived_at_rfc3339),
+          );
+        if (!hasAnyActiveConversation) {
+          setState((s) => ({ ...s, onboardingOpen: true }));
+        }
+      }
+    }
+
     if (state.selectedHostId) {
       if (initialBootstrap) {
         void orbitIpc.refreshQuotas(state.selectedHostId);
@@ -3264,6 +3342,7 @@ export const orbitActions = {
           hostId,
           agentId: nextAg.agent_id,
           tag: `orbit-error-${hostId}-${nextAg.agent_id}`,
+          tone: "error",
         });
       }
     }
@@ -10632,6 +10711,22 @@ export const orbitActions = {
 
   setCommandPaletteOpen(open: boolean): void {
     setState((s) => ({ ...s, commandPaletteOpen: open }));
+  },
+
+  openOnboardingGuide(): void {
+    setState((s) => ({
+      ...s,
+      activeView: "workspace",
+      commandPaletteOpen: false,
+      onboardingOpen: true,
+    }));
+  },
+
+  closeOnboardingGuide(markCompleted = true): void {
+    if (markCompleted) {
+      markOnboardingCompleted();
+    }
+    setState((s) => (s.onboardingOpen ? { ...s, onboardingOpen: false } : s));
   },
 
   setPairDialogOpen(open: boolean): void {

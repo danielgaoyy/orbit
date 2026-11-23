@@ -6,10 +6,12 @@ import {
   ChevronRight,
   Copy,
   Loader2,
+  QrCode,
   Radio,
   RefreshCw,
   Trash2,
 } from "lucide-react";
+import { PairingQrDialog } from "@/components/modals/pairing-qr-dialog";
 import {
   HostStatusIndicator,
   SettingCard,
@@ -50,12 +52,14 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   const [deployingSsh, setDeployingSsh] = useState<string | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [confirmRemoveOpen, setConfirmRemoveOpen] = useState(false);
+  const [pairingQrOpen, setPairingQrOpen] = useState(false);
   const ime = useImeCompositionGuard();
 
   useEffect(() => {
     setRelayInput(host?.relay_url ?? "");
     setRelayStatusMsg(null);
     setShowSshDeploy(false);
+    setPairingQrOpen(false);
   }, [host?.host_id, host?.relay_url]);
 
   if (!host) return null;
@@ -170,23 +174,33 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             title={t("settings.mobilePairing")}
             description={t("settings.mobilePairingDesc")}
           >
-            <button
-              type="button"
-              onClick={() => {
-                void orbitIpc
-                  .exportHostPairingUri(host.host_id)
-                  .then((uri) => copyValue("uri", uri))
-                  .catch((err) => orbitActions.showToast(String(err)));
-              }}
-              className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
-            >
-              {copiedField === "uri" ? (
-                <Check className="h-[13px] w-[13px] text-emerald-500" />
-              ) : (
-                <Copy className="text-muted-foreground h-[13px] w-[13px]" />
-              )}
-              <span>{copiedField === "uri" ? t("common.copied") : t("settings.copyUri")}</span>
-            </button>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setPairingQrOpen(true)}
+                className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+              >
+                <QrCode className="text-muted-foreground h-[13px] w-[13px]" />
+                <span>{t("settings.showQr")}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void orbitIpc
+                    .exportHostPairingUri(host.host_id)
+                    .then((uri) => copyValue("uri", uri))
+                    .catch((err) => orbitActions.showToast(String(err)));
+                }}
+                className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+              >
+                {copiedField === "uri" ? (
+                  <Check className="h-[13px] w-[13px] text-emerald-500" />
+                ) : (
+                  <Copy className="text-muted-foreground h-[13px] w-[13px]" />
+                )}
+                <span>{copiedField === "uri" ? t("common.copied") : t("settings.copyUri")}</span>
+              </button>
+            </div>
           </SettingRow>
 
           <SettingRow
@@ -422,6 +436,13 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         confirmLabel="Remove host"
         tone="danger"
         onConfirm={handleRemoveHost}
+      />
+
+      <PairingQrDialog
+        open={pairingQrOpen}
+        onOpenChange={setPairingQrOpen}
+        hostId={host.host_id}
+        hostName={host.display_name}
       />
     </div>
   );

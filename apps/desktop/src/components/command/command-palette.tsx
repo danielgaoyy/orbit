@@ -6,6 +6,7 @@ import {
   BookOpen,
   Clock,
   Code2,
+  Compass,
   Download,
   FileCode2,
   FolderOpen,
@@ -501,6 +502,15 @@ function CommandPaletteDialog() {
         shortcut: `${mod},`,
         icon: <Settings2 className="size-3.5" />,
         run: () => orbitActions.openSettings("general"),
+      },
+      {
+        id: "settings-setup-guide",
+        sectionKey: "palette.sectionSettings",
+        section: settingsSection,
+        title: t("palette.setupGuide"),
+        subtitle: t("palette.setupGuideSub"),
+        icon: <Compass className="size-3.5" />,
+        run: () => orbitActions.openOnboardingGuide(),
       },
       {
         id: "settings-archived",

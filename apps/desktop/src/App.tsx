@@ -7,6 +7,7 @@ import { MarkdownThemeProvider } from "@/components/markdown-blocks";
 import { CopyCodeBlocksModal } from "@/components/modals/copy-code-blocks-modal";
 import { ExportTranscriptModal } from "@/components/modals/export-transcript-modal";
 import { WorktreeHandoffModal } from "@/components/modals/worktree-handoff-modal";
+import { OnboardingGuide } from "@/components/onboarding/onboarding-guide";
 import { MediaPreviewModal } from "@/components/viewers/media-preview-modal";
 import { ConnectionStatusBanner } from "@/components/layout/connection-status-banner";
 import { TopBar } from "@/components/layout/top-bar";
@@ -53,6 +54,30 @@ export default function App() {
 
   useEffect(() => {
     void orbitActions.init();
+  }, []);
+
+  // Listen to native menu bar / system tray "New Conversation" action
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    void orbitIpc
+      .onTrayNewConversation(() => {
+        orbitActions.closeSettings();
+        orbitActions.closeOnboardingGuide(false);
+        orbitActions.startNewThreadDraft();
+      })
+      .then((fn) => {
+        if (!active) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, []);
 
   // Track OS/WebView internet connectivity & window foreground/background lifecycle
@@ -204,6 +229,7 @@ export default function App() {
         <ExportTranscriptModal />
         <CopyCodeBlocksModal />
         <WorktreeHandoffModal />
+        <OnboardingGuide />
         <MediaPreviewModal />
 
         {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit & Undo Archive */}

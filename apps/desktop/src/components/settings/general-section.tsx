@@ -3,6 +3,7 @@ import {
   AlertCircle,
   ArrowUpCircle,
   Check,
+  Compass,
   Download,
   Laptop,
   Loader2,
@@ -637,6 +638,26 @@ export function GeneralSection() {
               );
             })}
           </div>
+        </SettingCard>
+      </div>
+
+      {/* Getting Started / Onboarding Guide */}
+      <div className="space-y-2">
+        <SettingGroupLabel>{t("settings.groupGettingStarted")}</SettingGroupLabel>
+        <SettingCard>
+          <SettingRow
+            title={t("settings.setupGuide")}
+            description={t("settings.setupGuideDesc")}
+          >
+            <button
+              type="button"
+              onClick={() => orbitActions.openOnboardingGuide()}
+              className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+            >
+              <Compass className="text-muted-foreground h-[13px] w-[13px]" />
+              <span>{t("settings.openSetupGuide")}</span>
+            </button>
+          </SettingRow>
         </SettingCard>
       </div>
     </div>

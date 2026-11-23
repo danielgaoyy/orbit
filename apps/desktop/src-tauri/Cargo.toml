@@ -17,7 +17,8 @@ orbit-client-core = { path = "../../../crates/orbit-client-core" }
 orbit-crypto = { path = "../../../crates/orbit-crypto" }
 orbit-protocol = { path = "../../../crates/orbit-protocol" }
 orbit-providers = { path = "../../../crates/orbit-providers" }
-tauri = { version = "2.12", features = [] }
+tauri = { version = "2.12", features = ["tray-icon"] }
+qrcode = { version = "0.14", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.44", features = ["fs", "io-util", "process", "rt-multi-thread", "time"] }

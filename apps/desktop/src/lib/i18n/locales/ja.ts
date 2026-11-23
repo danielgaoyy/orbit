@@ -290,6 +290,8 @@ export const ja: MessageDictionary = {
   "palette.openInEditor": "{editor} で開く",
   "palette.openSettings": "設定を開く",
   "palette.openSettingsSub": "一般、外観、通知、モデルとエージェント、コンテキスト、拡張、ホスト",
+  "palette.setupGuide": "セットアップガイド (Onboarding)",
+  "palette.setupGuideSub": "ローカルデーモン、AI コーディング CLI、モバイルペアリング QR を確認",
   "palette.openArchived": "アーカイブ済みの会話を開く",
   "palette.openArchivedSub": "アーカイブ済みスレッドの検索・復元・完全削除",
   "palette.settingsHosts": "設定：ホストとペアリング",
@@ -394,6 +396,10 @@ export const ja: MessageDictionary = {
     "Orbit デスクトップとオンラインの全 {reachable} ホストは最新の v{version} です（{offline} 台オフライン）。",
   "settings.updatesDefaultDesc":
     "Orbit デスクトップと接続済み {count} 台のホストをワンクリックで確認・更新します。",
+  "settings.groupGettingStarted": "スタートガイド",
+  "settings.setupGuide": "セットアップガイド",
+  "settings.setupGuideDesc": "ホスト接続状態、ローカル AI CLI の準備状況、モバイルペアリングを確認します。",
+  "settings.openSetupGuide": "ガイドを開く",
 
   // Settings -> Appearance
   "settings.appearanceTitle": "外観",
@@ -434,6 +440,14 @@ export const ja: MessageDictionary = {
   "settings.mobilePairing": "モバイルペアリング",
   "settings.mobilePairingDesc": "Orbit モバイルアプリ用のペアリング URI をコピーします。",
   "settings.copyUri": "URI をコピー",
+  "settings.showQr": "QR を表示",
+  "settings.pairingQrTitle": "モバイルデバイスをペアリング",
+  "settings.pairingQrDesc":
+    "iOS・Android・HarmonyOS 版 Orbit でスキャンして {host} に接続します。",
+  "settings.pairingQrLoading": "ペアリング用 QR を生成中…",
+  "settings.pairingQrError": "ペアリング用 QR を生成できませんでした",
+  "settings.pairingQrAlt": "{host} の Orbit モバイルペアリング QR コード",
+  "settings.pairingQrHint": "Noise_NK でエンドツーエンド暗号化されます。この QR は共有しないでください。",
   "settings.localService": "ローカルサービス",
   "settings.hostService": "ホストサービス",
   "settings.runningVersionOutdated":
@@ -453,6 +467,10 @@ export const ja: MessageDictionary = {
   // Settings -> Notifications
   "settings.notificationsTitle": "通知",
   "settings.notificationsDesc": "デスクトップ通知、おやすみ時間、承認・完了時のモバイルプッシュ通知。",
+  "settings.notificationSoundTitle": "サウンド",
+  "settings.notificationSoundDesc":
+    "おやすみ時間外にデスクトップ通知とあわせて穏やかなチャイムを鳴らします。",
+  "settings.testSound": "サウンドをテスト",
 
   // Settings -> Cloud Sync
   "settings.cloudSyncTitle": "クラウド同期",
@@ -615,4 +633,44 @@ export const ja: MessageDictionary = {
   "store.summarizingSession": "会話ラベルと要約を生成中…",
   "store.updatedSessionTag": "セッションラベルを「{handle}」に更新しました",
   "store.updatedSessionSummary": "会話の要約を更新しました",
+
+  // First-Run Onboarding Guide
+  "onboarding.title": "Orbit へようこそ",
+  "onboarding.subtitle": "ホスト接続、コーディング CLI、ワークスペースを手早く確認します。",
+  "onboarding.stepHost": "ホスト",
+  "onboarding.stepClis": "CLI",
+  "onboarding.stepStart": "開始",
+  "onboarding.step1Title": "ホストとデーモン",
+  "onboarding.step1Desc":
+    "Orbit はローカルデーモンやリモートマシンにエンドツーエンド暗号化で接続します。",
+  "onboarding.noHostsYet": "ローカルの Orbit デーモンを待機中…",
+  "onboarding.addRemoteHost": "リモートホストを追加",
+  "onboarding.hostsSummary": "{total} 台のうち {online} 台オンライン",
+  "onboarding.step2Title": "AI コーディング CLI",
+  "onboarding.step2Desc":
+    "このマシン上のインストール状況とログイン準備状態をローカルで検出します。",
+  "onboarding.probingClis": "ローカル CLI を確認中…",
+  "onboarding.probeFailed": "ローカル CLI の状態を取得できませんでした。",
+  "onboarding.cliSummary": "{ready} 件準備完了 · {installed} 件インストール済み",
+  "onboarding.statusReady": "準備完了",
+  "onboarding.statusLoginRequired": "ログインが必要",
+  "onboarding.statusNotInstalled": "未インストール",
+  "onboarding.copyInstallCmd": "インストールコマンドをコピー",
+  "onboarding.copyLoginCmd": "ログインコマンドをコピー",
+  "onboarding.step3Title": "コーディングを始める",
+  "onboarding.step3Desc":
+    "リポジトリフォルダを選択するか、すぐに最初の会話を始めましょう。",
+  "onboarding.chooseFolder": "ワークスペースフォルダを選択",
+  "onboarding.chooseFolderDesc":
+    "ローカルまたはリモートの Git リポジトリをサイドバーに追加します。",
+  "onboarding.startConversation": "最初の会話を始める",
+  "onboarding.startConversationDesc":
+    "シンプルな起動画面を開き、準備済みの CLI に指示を送ります。",
+  "onboarding.pairMobileToggle": "モバイルデバイスをペアリング",
+  "onboarding.pairMobileDesc":
+    "任意 — Orbit モバイルから進捗確認やツール承認を行えます。",
+  "onboarding.skip": "スキップ",
+  "onboarding.back": "戻る",
+  "onboarding.next": "次へ",
+  "onboarding.done": "完了",
 };

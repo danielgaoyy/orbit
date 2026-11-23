@@ -290,6 +290,8 @@ export const en = {
   "palette.openSettings": "Open Settings",
   "palette.openSettingsSub":
     "General, Appearance, Notifications, Models & Agents, Context, Extensions, Hosts",
+  "palette.setupGuide": "Setup Guide (Onboarding)",
+  "palette.setupGuideSub": "Check local daemon, AI coding CLIs, and mobile pairing QR",
   "palette.openArchived": "Open Archived Conversations",
   "palette.openArchivedSub": "Search, restore, or permanently delete archived threads",
   "palette.settingsHosts": "Settings: Hosts & Pairing",
@@ -396,6 +398,10 @@ export const en = {
     "Orbit Desktop and all {reachable} online host(s) are up to date on v{version} ({offline} offline).",
   "settings.updatesDefaultDesc":
     "Check and update Orbit Desktop and all {count} connected host(s) in one click.",
+  "settings.groupGettingStarted": "Getting Started",
+  "settings.setupGuide": "Setup guide",
+  "settings.setupGuideDesc": "Review host status, local AI CLI readiness, and mobile pairing.",
+  "settings.openSetupGuide": "Open Setup Guide",
 
   // Settings -> Appearance
   "settings.appearanceTitle": "Appearance",
@@ -436,6 +442,14 @@ export const en = {
   "settings.mobilePairing": "Mobile pairing",
   "settings.mobilePairingDesc": "Copy pairing URI for Orbit mobile apps.",
   "settings.copyUri": "Copy URI",
+  "settings.showQr": "Show QR",
+  "settings.pairingQrTitle": "Pair Mobile Device",
+  "settings.pairingQrDesc":
+    "Scan with Orbit on iOS, Android, or HarmonyOS to connect to {host}.",
+  "settings.pairingQrLoading": "Generating pairing QR…",
+  "settings.pairingQrError": "Couldn't generate pairing QR",
+  "settings.pairingQrAlt": "Orbit mobile pairing QR code for {host}",
+  "settings.pairingQrHint": "End-to-end encrypted via Noise_NK. Keep this QR private.",
   "settings.localService": "Local service",
   "settings.hostService": "Host service",
   "settings.runningVersionOutdated":
@@ -456,6 +470,10 @@ export const en = {
   "settings.notificationsTitle": "Notifications",
   "settings.notificationsDesc":
     "Desktop alerts, quiet hours, and mobile push notifications for approvals and completions.",
+  "settings.notificationSoundTitle": "Sound",
+  "settings.notificationSoundDesc":
+    "Play a soft chime with desktop notifications outside quiet hours.",
+  "settings.testSound": "Test sound",
 
   // Settings -> Cloud Sync
   "settings.cloudSyncTitle": "Cloud Sync",
@@ -619,6 +637,44 @@ export const en = {
   "store.summarizingSession": "Generating conversation label and summary…",
   "store.updatedSessionTag": "Updated session label to \"{handle}\"",
   "store.updatedSessionSummary": "Updated conversation summary",
+
+  // First-Run Onboarding Guide
+  "onboarding.title": "Welcome to Orbit",
+  "onboarding.subtitle": "A quick check of your host, coding CLIs, and workspace.",
+  "onboarding.stepHost": "Host",
+  "onboarding.stepClis": "CLIs",
+  "onboarding.stepStart": "Start",
+  "onboarding.step1Title": "Host & Daemon",
+  "onboarding.step1Desc":
+    "Orbit connects to your local daemon and any remote workstations over end-to-end encrypted channels.",
+  "onboarding.noHostsYet": "Waiting for local Orbit daemon…",
+  "onboarding.addRemoteHost": "Add Remote Host",
+  "onboarding.hostsSummary": "{online} of {total} online",
+  "onboarding.step2Title": "AI Coding CLIs",
+  "onboarding.step2Desc":
+    "Local installation and login readiness detected directly from this machine.",
+  "onboarding.probingClis": "Checking local CLIs…",
+  "onboarding.probeFailed": "Couldn't probe local CLIs.",
+  "onboarding.cliSummary": "{ready} ready · {installed} installed",
+  "onboarding.statusReady": "Ready",
+  "onboarding.statusLoginRequired": "Login Required",
+  "onboarding.statusNotInstalled": "Not Installed",
+  "onboarding.copyInstallCmd": "Copy install command",
+  "onboarding.copyLoginCmd": "Copy login command",
+  "onboarding.step3Title": "Start Coding",
+  "onboarding.step3Desc":
+    "Pick a repository folder or jump straight into your first conversation.",
+  "onboarding.chooseFolder": "Choose Workspace Folder",
+  "onboarding.chooseFolderDesc": "Pin a local or remote Git repository to your sidebar.",
+  "onboarding.startConversation": "Start First Conversation",
+  "onboarding.startConversationDesc": "Open a clean launchpad and prompt any ready CLI.",
+  "onboarding.pairMobileToggle": "Pair mobile device",
+  "onboarding.pairMobileDesc":
+    "Optional — monitor sessions and approve tools from Orbit mobile.",
+  "onboarding.skip": "Skip",
+  "onboarding.back": "Back",
+  "onboarding.next": "Next",
+  "onboarding.done": "Done",
 } as const;
 
 export type MessageKey = keyof typeof en;

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Bell, Check, RefreshCw, Send, Shield, Smartphone, Trash2 } from "lucide-react";
+import { Bell, Check, RefreshCw, Send, Shield, Smartphone, Trash2, Volume2 } from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
@@ -11,6 +11,7 @@ import {
 } from "@/components/settings/settings-primitives";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useI18n } from "@/lib/i18n";
+import { playSoftNotificationChime } from "@/lib/notification-sound";
 import type { PushPlatform, PushPreferences } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -323,11 +324,24 @@ export function NotificationsSection() {
             />
           </SettingRow>
 
-          <SettingRow title="Sound" description="Play the system alert sound with notifications.">
-            <ToggleSwitch
-              checked={notifySoundEnabled}
-              onChange={(v) => orbitActions.setNotificationPrefs({ notifySoundEnabled: v })}
-            />
+          <SettingRow
+            title={t("settings.notificationSoundTitle")}
+            description={t("settings.notificationSoundDesc")}
+          >
+            <div className="flex items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => void playSoftNotificationChime("default")}
+                className="border-border text-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.06] inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+              >
+                <Volume2 className="text-muted-foreground h-[12.5px] w-[12.5px]" />
+                <span>{t("settings.testSound")}</span>
+              </button>
+              <ToggleSwitch
+                checked={notifySoundEnabled}
+                onChange={(v) => orbitActions.setNotificationPrefs({ notifySoundEnabled: v })}
+              />
+            </div>
           </SettingRow>
 
           <SettingRow

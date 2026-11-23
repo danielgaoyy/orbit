@@ -783,6 +783,7 @@ async fn run_agy_actor(
     let mut pending_perms: HashMap<String, PendingPerm> = HashMap::new();
     let mut pending_elicits: HashMap<String, PendingElicitation> = HashMap::new();
     let mut pending_prompts: VecDeque<(String, String)> = VecDeque::new();
+    let mut pending_interrupt_replacement: Option<(String, String)> = None;
     let mut subagent_monitors: HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)> =
         HashMap::new();
 
@@ -950,6 +951,7 @@ async fn run_agy_actor(
     };
     let mut user_interrupted = false;
     let mut cancelling_active_turn = false;
+    let mut cancel_deadline: Option<tokio::time::Instant> = None;
     let mut pending_self_heal: Option<PendingSelfHeal> = None;
     let mut consecutive_self_heals: u32 = 0;
     let mut last_ask_question_raw: Option<Vec<QuestionItem>> = None;
@@ -971,7 +973,10 @@ async fn run_agy_actor(
                         pending_self_heal = None;
                         consecutive_self_heals = 0;
                         if active_prompt_rpc_key.is_some() || active_turn_id.is_some() {
-                            if matches!(behavior, ActiveTurnBehavior::Interrupt) {
+                            if matches!(behavior, ActiveTurnBehavior::Queue) {
+                                // Always enqueue FIFO notifications/prompts even while awaiting permission
+                                pending_prompts.push_back((turn_id, prompt));
+                            } else if matches!(behavior, ActiveTurnBehavior::Interrupt) {
                                 cancel_pending_agy_perms_and_elicits(
                                     &shim,
                                     &mut pending_perms,
@@ -980,16 +985,21 @@ async fn run_agy_actor(
                                 )
                                 .await;
                                 finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
-                                pending_prompts.clear();
                                 cancelling_active_turn = true;
+                                cancel_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_secs(10),
+                                );
                                 let cancel = json!({
                                     "jsonrpc": "2.0",
                                     "method": "session/cancel",
                                     "params": { "sessionId": session_id }
                                 })
                                 .to_string();
-                                let _ = shim.write_stdin_line(cancel).await;
-                                pending_prompts.push_back((turn_id, prompt));
+                                if shim.write_stdin_line(cancel).await.is_err() {
+                                    let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                    break;
+                                }
+                                pending_interrupt_replacement = Some((turn_id, prompt));
                             } else if !pending_perms.is_empty() || !pending_elicits.is_empty() {
                                 let _ = evt_tx
                                     .send(DriverEvent::Notice {
@@ -998,34 +1008,31 @@ async fn run_agy_actor(
                                     })
                                     .await;
                             } else {
-                                match behavior {
-                                    ActiveTurnBehavior::Queue => {
-                                        pending_prompts.push_back((turn_id, prompt));
-                                    }
-                                    ActiveTurnBehavior::Steer => {
-                                        // `agy acp` has no native mid-RPC steer without `session/cancel`.
-                                        // Never stack prompts LIFO without cancelling (which shifts turns
-                                        // off-by-one); cancel cleanly, flush streaming buffers, clear stale
-                                        // queued prompts, and enqueue this replacement prompt.
-                                        finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
-                                        pending_prompts.clear();
-                                        cancelling_active_turn = true;
-                                        let cancel = json!({
-                                            "jsonrpc": "2.0",
-                                            "method": "session/cancel",
-                                            "params": { "sessionId": session_id }
-                                        })
-                                        .to_string();
-                                        let _ = shim.write_stdin_line(cancel).await;
-                                        pending_prompts.push_back((turn_id, prompt));
-                                    }
-                                    ActiveTurnBehavior::Interrupt => unreachable!(),
+                                // `ActiveTurnBehavior::Steer`: `agy acp` has no native mid-RPC steer without
+                                // `session/cancel`. Cancel cleanly, flush streaming buffers, preserve accepted
+                                // FIFO `pending_prompts`, and schedule this replacement as priority next turn.
+                                finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+                                cancelling_active_turn = true;
+                                cancel_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_secs(10),
+                                );
+                                let cancel = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/cancel",
+                                    "params": { "sessionId": session_id }
+                                })
+                                .to_string();
+                                if shim.write_stdin_line(cancel).await.is_err() {
+                                    let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                    break;
                                 }
+                                pending_interrupt_replacement = Some((turn_id, prompt));
                             }
                             continue;
                         }
 
                         cancelling_active_turn = false;
+                        cancel_deadline = None;
                         let effective_prompt = if inject_handoff_on_next_prompt {
                             inject_handoff_on_next_prompt = false;
                             prepend_handoff_context(pending_handoff_context.take(), &prompt)
@@ -1061,9 +1068,15 @@ async fn run_agy_actor(
                         user_interrupted = true;
                         pending_self_heal = None;
                         pending_prompts.clear();
+                        pending_interrupt_replacement = None;
                         finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
-                        cancelling_active_turn =
+                        let had_active =
                             active_prompt_rpc_key.is_some() || active_turn_id.is_some();
+                        cancelling_active_turn = had_active;
+                        if had_active {
+                            cancel_deadline =
+                                Some(tokio::time::Instant::now() + Duration::from_secs(10));
+                        }
                         bg_tracker.clear();
                         cancel_agy_subagent_monitors(None, &mut subagent_monitors, &evt_tx).await;
                         if autonomous_turn_id.take().is_some() {
@@ -1099,7 +1112,10 @@ async fn run_agy_actor(
                             "params": { "sessionId": session_id }
                         })
                         .to_string();
-                        let _ = shim.write_stdin_line(cancel).await;
+                        if shim.write_stdin_line(cancel).await.is_err() {
+                            let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                            break;
+                        }
                     }
                     DriverCommand::SetMode { mode: new_mode } => {
                         mode = new_mode.clone();
@@ -1309,6 +1325,7 @@ async fn run_agy_actor(
                                 {
                                     reattached_turn_in_flight = false;
                                     cancelling_active_turn = false;
+                                    cancel_deadline = None;
                                     active_prompt_rpc_key = None;
                                     pending_perms.clear();
                                     pending_elicits.clear();
@@ -1451,9 +1468,11 @@ async fn run_agy_actor(
                                             })
                                             .await;
                                     }
-                                    // Drain queued / steered / interrupted-replacement prompt
+                                    // Drain interrupted-replacement or accepted FIFO queued prompt
                                     if let Some((next_turn_id, next_prompt)) =
-                                        pending_prompts.pop_front()
+                                        pending_interrupt_replacement
+                                            .take()
+                                            .or_else(|| pending_prompts.pop_front())
                                     {
                                         last_dispatched_prompt =
                                             Some((next_turn_id.clone(), next_prompt.clone()));
@@ -2070,6 +2089,63 @@ async fn run_agy_actor(
                             }
                         }
                     }
+                }
+            }
+
+            _ = async {
+                if let Some(deadline) = cancel_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if cancel_deadline.is_some() => {
+                cancel_deadline = None;
+                cancelling_active_turn = false;
+                reattached_turn_in_flight = false;
+                active_prompt_rpc_key = None;
+                active_turn_id = None;
+                pending_perms.clear();
+                pending_elicits.clear();
+                last_ask_question_raw = None;
+                finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+                let _ = evt_tx
+                    .send(DriverEvent::Notice {
+                        level: "warning".into(),
+                        message: "Antigravity cancel timed out waiting for turn settlement; resetting active turn state.".into(),
+                    })
+                    .await;
+                if let Some((next_turn_id, next_prompt)) = pending_interrupt_replacement
+                    .take()
+                    .or_else(|| pending_prompts.pop_front())
+                {
+                    last_dispatched_prompt =
+                        Some((next_turn_id.clone(), next_prompt.clone()));
+                    wakeup_tools.begin_turn();
+                    if dispatch_agy_prompt(
+                        &shim,
+                        &session_id,
+                        cfg.attachments_dir.as_deref(),
+                        prompt_media_caps,
+                        &mut next_rpc_id,
+                        &mut active_turn_id,
+                        &mut active_prompt_rpc_key,
+                        &mut autonomous_turn_id,
+                        &mut transcript_monitor,
+                        &mut seg_state,
+                        &mut last_ask_question_raw,
+                        &evt_tx,
+                        next_turn_id,
+                        next_prompt,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                } else {
+                    let _ = evt_tx
+                        .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+                        .await;
                 }
             }
         }
@@ -2724,6 +2800,10 @@ fn is_send_message_tool_name(name: &str) -> bool {
         .strip_prefix("Run ")
         .or_else(|| trimmed.strip_prefix("run "))
         .unwrap_or(trimmed);
+    let lower_without_run = without_run.to_ascii_lowercase();
+    if lower_without_run == "send message" || lower_without_run.starts_with("send message ") {
+        return true;
+    }
     let first_tok = without_run.split_whitespace().next().unwrap_or("");
     let leaf = first_tok
         .rsplit([':', '/', '.'])
@@ -10679,8 +10759,9 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             "trailing chunks during cancel teardown must be dropped"
         );
 
-        // Case 2: Start SLOW_2, queue STALE_Q2, then preempt directly with ActiveTurnBehavior::Interrupt ->
-        // STALE_Q2 must be cleared and REPLACEMENT_NOW must execute immediately with ZERO off-by-one!
+        // Case 2: Start SLOW_2, queue FIFO_PRESERVED, then preempt directly with
+        // ActiveTurnBehavior::Interrupt -> REPLACEMENT_NOW must execute immediately ahead of
+        // FIFO_PRESERVED, and FIFO_PRESERVED must NOT be lost (it runs right after)!
         cmd_tx
             .send(DriverCommand::SendPrompt {
                 turn_id: "t_slow_2".into(),
@@ -10707,12 +10788,12 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         }
         cmd_tx
             .send(DriverCommand::SendPrompt {
-                turn_id: "t_stale_q2".into(),
-                prompt: "STALE_Q2_MUST_NOT_RUN".into(),
+                turn_id: "t_fifo_2".into(),
+                prompt: "FIFO_PRESERVED".into(),
                 behavior: ActiveTurnBehavior::Queue,
             })
             .await
-            .expect("queue stale 2");
+            .expect("queue fifo 2");
         cmd_tx
             .send(DriverCommand::SendPrompt {
                 turn_id: "t_replace".into(),
@@ -10724,6 +10805,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
         let mut saw_slow2_final = false;
         let mut saw_replacement_reply = false;
+        let mut saw_fifo_reply = false;
         loop {
             let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
                 .await
@@ -10740,6 +10822,11 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                     streaming: false,
                     ..
                 } if text == "reply:REPLACEMENT_NOW" => saw_replacement_reply = true,
+                DriverEvent::AssistantText {
+                    text,
+                    streaming: false,
+                    ..
+                } if text == "reply:FIFO_PRESERVED" => saw_fifo_reply = true,
                 DriverEvent::AssistantText { text, .. }
                     if text.contains("TRAILING_LEAK_MUST_DROP") =>
                 {
@@ -10751,6 +10838,10 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         }
         assert!(saw_slow2_final);
         assert!(saw_replacement_reply);
+        assert!(
+            saw_fifo_reply,
+            "accepted FIFO queue entry must be preserved after Interrupt replacement"
+        );
 
         let prompts = received_prompts.lock().await;
         assert_eq!(
@@ -10758,11 +10849,15 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             vec![
                 "SLOW_1".to_string(),
                 "SLOW_2".to_string(),
-                "REPLACEMENT_NOW".to_string()
+                "REPLACEMENT_NOW".to_string(),
+                "FIFO_PRESERVED".to_string(),
             ],
-            "stale queued prompts must NEVER hijack turns or cause off-by-one shift"
+            "Stop clears queue; Interrupt replacement runs immediately ahead of preserved FIFO queue"
         );
         assert_eq!(cancel_count.load(Ordering::SeqCst), 2);
+        assert!(is_send_message_tool_name("Send message"));
+        assert!(is_send_message_tool_name("Run send message"));
+        assert!(is_send_message_tool_name("send message to subagent"));
 
         drop(cmd_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;

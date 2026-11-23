@@ -2739,17 +2739,13 @@ impl AgentOrchestrator {
         .await
     }
 
-    pub async fn send_prompt_with_options(
-        self: &Arc<Self>,
+    async fn run_pre_prompt_submit_hook(
+        &self,
         agent_id: &str,
+        existing_agent: Option<&AgentSummary>,
         mut prompt: String,
-        display_prompt: Option<String>,
-        badges: Vec<PromptBadge>,
-        behavior: ActiveTurnBehavior,
-        message_id: Option<String>,
-    ) -> anyhow::Result<()> {
-        let existing_agent = self.store.get_agent(agent_id).ok().flatten();
-        if let Some(ref ag) = existing_agent {
+    ) -> anyhow::Result<String> {
+        if let Some(ag) = existing_agent {
             let hook_outcome = self
                 .hooks
                 .dispatch_event(
@@ -2783,7 +2779,45 @@ impl AgentOrchestrator {
                 prompt = updated;
             }
         }
+        Ok(prompt)
+    }
 
+    pub async fn send_prompt_with_options(
+        self: &Arc<Self>,
+        agent_id: &str,
+        prompt: String,
+        display_prompt: Option<String>,
+        badges: Vec<PromptBadge>,
+        behavior: ActiveTurnBehavior,
+        message_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        let existing_agent = self.store.get_agent(agent_id).ok().flatten();
+        let checked_prompt = self
+            .run_pre_prompt_submit_hook(agent_id, existing_agent.as_ref(), prompt)
+            .await?;
+        self.send_prompt_with_options_after_hook(
+            agent_id,
+            checked_prompt,
+            display_prompt,
+            badges,
+            behavior,
+            message_id,
+            existing_agent,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_prompt_with_options_after_hook(
+        self: &Arc<Self>,
+        agent_id: &str,
+        prompt: String,
+        display_prompt: Option<String>,
+        badges: Vec<PromptBadge>,
+        behavior: ActiveTurnBehavior,
+        message_id: Option<String>,
+        existing_agent: Option<AgentSummary>,
+    ) -> anyhow::Result<()> {
         // Sending a human prompt acknowledges unread attention and unarchives if needed
         if let Some(ref ag) = existing_agent
             && ag.archived_at.is_some()
@@ -2906,6 +2940,16 @@ impl AgentOrchestrator {
         agent_id: &str,
         queue_id: &str,
     ) -> anyhow::Result<()> {
+        // Peek first and preflight `PrePromptSubmit` hooks BEFORE consuming the queue entry or
+        // cancelling pending permissions/questions so a blocked hook leaves state intact.
+        let Some(peeked) = self.store.peek_queued_prompt(agent_id, queue_id)? else {
+            return Ok(());
+        };
+        let existing_agent = self.store.get_agent(agent_id).ok().flatten();
+        let checked_prompt = self
+            .run_pre_prompt_submit_hook(agent_id, existing_agent.as_ref(), peeked.wire_prompt)
+            .await?;
+
         let Some(item) = self.store.take_queued_prompt(agent_id, queue_id)? else {
             return Ok(());
         };
@@ -2943,13 +2987,14 @@ impl AgentOrchestrator {
             ActiveTurnBehavior::Steer
         };
         let res = self
-            .send_prompt_with_options(
+            .send_prompt_with_options_after_hook(
                 agent_id,
-                item.wire_prompt,
+                checked_prompt,
                 Some(item.display_prompt),
                 item.badges,
                 behavior,
                 None,
+                existing_agent,
             )
             .await;
         if res.is_err() && should_interrupt {
@@ -8562,6 +8607,75 @@ mod fast_mode_orchestrator_tests {
             cmd_rx.try_recv().is_err(),
             "must not emit extra DriverCommand::Interrupt before SendPrompt"
         );
+
+        // Preflight guard: if a `PrePromptSubmit` hook blocks `flush_queued_user_prompt_now`,
+        // the queued prompt AND pending permissions MUST remain intact!
+        #[cfg(unix)]
+        {
+            orch.hooks
+                .upsert_hook(
+                    None,
+                    orbit_protocol::LifecycleHookRule {
+                        id: "hk_block_flush".into(),
+                        name: "Block flush".into(),
+                        scope: orbit_protocol::HookScope::UserGlobal,
+                        event: orbit_protocol::HookEventKind::PrePromptSubmit,
+                        matcher: None,
+                        action: orbit_protocol::HookAction::Command {
+                            command: "/bin/sh".into(),
+                            args: vec!["-c".into(), "echo policy-denied >&2; exit 2".into()],
+                            env: std::collections::BTreeMap::new(),
+                        },
+                        timeout_ms: 5_000,
+                        enabled: true,
+                        trusted: true,
+                        description: None,
+                    },
+                )
+                .await
+                .expect("upsert blocking hook");
+
+            orch.pending_permissions.write().await.insert(
+                ("ag_fq".to_string(), "perm_keep_1".to_string()),
+                PendingPermissionSummary {
+                    agent_id: "ag_fq".into(),
+                    agent_title: "Flush Queue Agent".into(),
+                    workspace_id: "ws_fq".into(),
+                    request_id: "perm_keep_1".into(),
+                    title: "Approve".into(),
+                    detail: ToolCallDetail::Generic {
+                        tool_name: "shell".into(),
+                        arguments_json: "{}".into(),
+                    },
+                    allowed_decisions: vec!["allow".into(), "deny".into()],
+                    guardian_assessment: None,
+                    created_at: now,
+                },
+            );
+            let blocked_item = store
+                .enqueue_agent_prompt("ag_fq", "q_blocked_1", "Blocked text", "Blocked text", &[])
+                .expect("enqueue blocked");
+            let err = orch
+                .flush_queued_user_prompt_now("ag_fq", &blocked_item.queue_id)
+                .await
+                .expect_err("blocking hook must reject flush");
+            assert!(err.to_string().contains("blocked by hook"));
+            assert!(
+                store
+                    .peek_queued_prompt("ag_fq", &blocked_item.queue_id)
+                    .expect("peek")
+                    .is_some(),
+                "blocked hook must NOT consume the queued prompt"
+            );
+            assert!(
+                orch.has_pending_permissions("ag_fq").await,
+                "blocked hook must NOT cancel pending permissions"
+            );
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "blocked hook must NOT dispatch any driver command"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&home_dir);
     }

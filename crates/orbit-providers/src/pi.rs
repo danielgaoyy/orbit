@@ -831,6 +831,7 @@ async fn run_pi_actor(
     };
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_prompts: VecDeque<(String, String)> = VecDeque::new();
+    let mut pending_interrupt_replacement: Option<(String, String)> = None;
     let mut inflight_followups: HashMap<String, (String, String)> = HashMap::new();
     let mut pending_ext_reqs: HashMap<String, PendingExtensionRequest> = HashMap::new();
 
@@ -891,7 +892,6 @@ async fn run_pi_actor(
                                 }
                                 ActiveTurnBehavior::Interrupt => {
                                     cancel_pending_ext_reqs(&shim, &mut pending_ext_reqs).await;
-                                    pending_prompts.clear();
                                     inflight_followups.clear();
                                     let cmd_id = format!("pi_cmd_{next_cmd_id}");
                                     next_cmd_id += 1;
@@ -905,7 +905,8 @@ async fn run_pi_actor(
                                             .await;
                                         break;
                                     }
-                                    pending_prompts.push_back((turn_id, effective_prompt));
+                                    pending_interrupt_replacement =
+                                        Some((turn_id, effective_prompt));
                                 }
                             }
                             continue;
@@ -932,6 +933,7 @@ async fn run_pi_actor(
                     }
                     DriverCommand::Interrupt => {
                         pending_prompts.clear();
+                        pending_interrupt_replacement = None;
                         inflight_followups.clear();
                         cancel_pending_ext_reqs(&shim, &mut pending_ext_reqs).await;
                         let cmd_id = format!("pi_cmd_{next_cmd_id}");
@@ -1272,7 +1274,9 @@ async fn run_pi_actor(
                                 pending_ext_reqs.clear();
                                 inflight_followups.clear();
                                 if let Some((next_turn_id, next_prompt)) =
-                                    pending_prompts.pop_front()
+                                    pending_interrupt_replacement
+                                        .take()
+                                        .or_else(|| pending_prompts.pop_front())
                                 {
                                     active_turn_id = Some(next_turn_id.clone());
                                     seg_state.reset_for_turn(&next_turn_id);

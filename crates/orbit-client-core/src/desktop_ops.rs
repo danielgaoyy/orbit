@@ -2016,6 +2016,191 @@ fn extract_deleted_local_worktree_relative_path(
     None
 }
 
+fn resolve_local_git_common_dir(start: &Path, stop_root: Option<&Path>) -> Option<PathBuf> {
+    let mut cur = if start.is_dir() {
+        start
+    } else {
+        start.parent()?
+    };
+    loop {
+        if let Some(bound) = stop_root
+            && (cur == bound || !cur.starts_with(bound))
+        {
+            return None;
+        }
+        let dot_git = cur.join(".git");
+        if let Ok(meta) = fs::symlink_metadata(&dot_git) {
+            if meta.is_dir() {
+                return fs::canonicalize(&dot_git).ok();
+            }
+            if meta.is_file() {
+                let raw = fs::read_to_string(&dot_git).ok()?;
+                let first_line = raw.lines().next()?.trim();
+                let gitdir_raw = first_line
+                    .strip_prefix("gitdir:")
+                    .or_else(|| first_line.strip_prefix("GITDIR:"))?
+                    .trim();
+                if gitdir_raw.is_empty() {
+                    return None;
+                }
+                let gitdir_path = {
+                    let p = Path::new(gitdir_raw);
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        cur.join(p)
+                    }
+                };
+                let canon_gitdir = fs::canonicalize(&gitdir_path).ok()?;
+                let commondir_file = canon_gitdir.join("commondir");
+                if let Ok(common_raw) = fs::read_to_string(&commondir_file) {
+                    let common_trim = common_raw.trim();
+                    if !common_trim.is_empty() {
+                        let common_path = {
+                            let p = Path::new(common_trim);
+                            if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                canon_gitdir.join(p)
+                            }
+                        };
+                        return fs::canonicalize(&common_path).ok();
+                    }
+                }
+                return Some(canon_gitdir);
+            }
+        }
+        cur = cur.parent()?;
+    }
+}
+
+fn is_same_repo_local_worktree_file(
+    canonical_cwd: &Path,
+    canonical_target: &Path,
+    worktree_roots: &ManagedLocalWorktreeRoots,
+) -> bool {
+    let Some(cwd_common) = resolve_local_git_common_dir(canonical_cwd, None) else {
+        return false;
+    };
+    for wt_root in worktree_roots.all_roots() {
+        let Ok(canon_wt_root) = fs::canonicalize(wt_root) else {
+            continue;
+        };
+        if !canonical_target.starts_with(&canon_wt_root) {
+            continue;
+        }
+        if let Some(target_common) =
+            resolve_local_git_common_dir(canonical_target, Some(&canon_wt_root))
+            && target_common == cwd_common
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn local_unix_o_nofollow_flag() -> Option<i32> {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        Some(0x0100)
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "x86", target_arch = "riscv64")
+    ))]
+    {
+        Some(0x20000)
+    }
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+    {
+        Some(0x10000)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "x86_64",
+                target_arch = "x86",
+                target_arch = "riscv64",
+                target_arch = "aarch64",
+                target_arch = "arm"
+            )
+        )
+    )))]
+    {
+        None
+    }
+}
+
+/// Open a canonicalized regular file with `O_NOFOLLOW` (where supported) and verify via `fstat`
+/// on the opened handle + pre/post `symlink_metadata` `(dev, ino)` identity checks that no
+/// symlink swap occurred between containment validation and open.
+fn open_validated_local_regular_file(
+    canonical: &Path,
+    trimmed: &str,
+) -> Result<(fs::File, fs::Metadata), String> {
+    let lmeta_before =
+        fs::symlink_metadata(canonical).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
+    if lmeta_before.file_type().is_symlink() {
+        return Err(format!(
+            "Access denied: `{trimmed}` resolved to a symlink during open"
+        ));
+    }
+    if !lmeta_before.is_file() {
+        return Err(format!("`{trimmed}` is not a regular file"));
+    }
+
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    if let Some(flag) = local_unix_o_nofollow_flag() {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(flag);
+    }
+    let file = opts
+        .open(canonical)
+        .map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
+    let fmeta = file
+        .metadata()
+        .map_err(|e| format!("Cannot inspect `{trimmed}`: {e}"))?;
+    if !fmeta.is_file() {
+        return Err(format!("`{trimmed}` is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let lmeta_after = fs::symlink_metadata(canonical)
+            .map_err(|e| format!("Cannot verify `{trimmed}`: {e}"))?;
+        if lmeta_after.file_type().is_symlink()
+            || fmeta.dev() != lmeta_before.dev()
+            || fmeta.ino() != lmeta_before.ino()
+            || fmeta.dev() != lmeta_after.dev()
+            || fmeta.ino() != lmeta_after.ino()
+        {
+            return Err(format!(
+                "Access denied: `{trimmed}` changed during validation"
+            ));
+        }
+    }
+
+    Ok((file, fmeta))
+}
+
 fn resolve_allowed_local_file_path(
     cwd: Option<&str>,
     raw_path: &str,
@@ -2052,11 +2237,6 @@ fn resolve_allowed_local_file_path_with_roots(
         if let Some(h) = resolve_user_home() {
             managed_artifact_roots.push(h.join(".gemini").join("antigravity-cli").join("brain"));
             managed_artifact_roots.push(h.join(".claude").join("projects"));
-        }
-        for wt_root in worktree_roots.all_roots() {
-            if !managed_artifact_roots.contains(wt_root) {
-                managed_artifact_roots.push(wt_root.clone());
-            }
         }
         managed_artifact_roots.push(std::env::temp_dir().join("claude"));
         let tmp_claude = PathBuf::from("/tmp/claude");
@@ -2147,7 +2327,10 @@ fn resolve_allowed_local_file_path_with_roots(
             return Err(format!("Cannot read `{trimmed}`: {orig_err}"));
         }
     };
-    let allowed = canon.starts_with(&canonical_cwd) || is_in_managed_root(&canon);
+    let allowed = canon.starts_with(&canonical_cwd)
+        || is_in_managed_root(&canon)
+        || (allow_agent_log_roots
+            && is_same_repo_local_worktree_file(&canonical_cwd, &canon, worktree_roots));
     if !allowed {
         return Err(format!(
             "Access denied: `{trimmed}` is outside the workspace directory"
@@ -2234,19 +2417,13 @@ pub fn read_local_workspace_file_with_writable(
 
     let trimmed = raw_path.trim();
     let canonical = resolve_allowed_local_file_path(Some(cwd), trimmed, true)?;
-
-    let meta = fs::metadata(&canonical).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("`{trimmed}` is not a regular file"));
-    }
+    let (mut file, meta) = open_validated_local_regular_file(&canonical, trimmed)?;
 
     let size_bytes = meta.len();
     let mtime_unix_ms = local_metadata_mtime_unix_ms(&meta);
     let writable = allow_writable && compute_local_file_writable(cwd, trimmed, &canonical, &meta);
     let resolved_path = canonical.to_string_lossy().to_string();
 
-    let mut file =
-        fs::File::open(&canonical).map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
     let mut header = Vec::with_capacity((size_bytes as usize).min(4096));
     (&mut file)
         .take(4096)
@@ -2427,14 +2604,10 @@ pub fn validate_external_local_file(cwd: Option<&str>, raw_path: &str) -> Result
     use std::io::Read;
 
     let canonical = resolve_allowed_local_file_path(cwd, raw_path, false)?;
-    let meta = fs::metadata(&canonical).map_err(|e| format!("Cannot inspect file: {e}"))?;
-    if !meta.is_file() {
-        return Err("Target path is not a regular file".into());
-    }
+    let (file, _meta) = open_validated_local_regular_file(&canonical, raw_path.trim())?;
     if !is_safe_external_preview_extension(&canonical) {
         return Err("Only PDF, image, audio, and video files can be opened externally".into());
     }
-    let file = fs::File::open(&canonical).map_err(|e| format!("Cannot open file: {e}"))?;
     let mut header = Vec::with_capacity(4096);
     file.take(4096)
         .read_to_end(&mut header)
@@ -2704,26 +2877,65 @@ mod tests {
     fn local_subagent_worktree_reads_allow_live_and_deleted_fallback_and_block_escapes() {
         let root =
             std::env::temp_dir().join(format!("orbit_local_wt_read_{}", uuid::Uuid::new_v4()));
-        let ws = root.join("primary_repo");
+        let ws = root.join("repo_a");
+        let repo_b = root.join("repo_b");
         let agy_wt_root = root.join("agy_data").join("worktrees");
-        let agy_live_wt = agy_wt_root.join("conv-123").join("subagent-track-1-orbit");
+        let agy_live_wt = agy_wt_root.join("conv-123").join("subagent-track-1-repo-a");
+        let agy_other_repo_wt = agy_wt_root.join("conv-456").join("subagent-other-repo-b");
         let orbit_wt_root = root.join("orbit_home").join("worktrees");
-        let orbit_live_wt = orbit_wt_root.join("orbit-feat-foo");
+        let orbit_live_wt = orbit_wt_root.join("repo-a-feat-foo");
+        let orbit_other_repo_wt = orbit_wt_root.join("repo-b-feat-bar");
         let outside = root.join("outside_secrets");
 
-        fs::create_dir_all(ws.join("src")).expect("mkdir ws");
-        fs::create_dir_all(agy_live_wt.join("src")).expect("mkdir agy wt");
-        fs::create_dir_all(orbit_live_wt.join("src")).expect("mkdir orbit wt");
-        fs::create_dir_all(&outside).expect("mkdir outside");
+        let ws_git = ws.join(".git");
+        let ws_wt_agy_gitdir = ws_git.join("worktrees").join("subagent-track-1-repo-a");
+        let ws_wt_orbit_gitdir = ws_git.join("worktrees").join("repo-a-feat-foo");
+        let repo_b_git = repo_b.join(".git");
+        let repo_b_wt_agy_gitdir = repo_b_git.join("worktrees").join("subagent-other-repo-b");
+        let repo_b_wt_orbit_gitdir = repo_b_git.join("worktrees").join("repo-b-feat-bar");
+
+        for dir in [
+            ws.join("src"),
+            ws_wt_agy_gitdir.clone(),
+            ws_wt_orbit_gitdir.clone(),
+            repo_b.join("src"),
+            repo_b_wt_agy_gitdir.clone(),
+            repo_b_wt_orbit_gitdir.clone(),
+            agy_live_wt.join("src"),
+            agy_other_repo_wt.join("src"),
+            orbit_live_wt.join("src"),
+            orbit_other_repo_wt.join("src"),
+            outside.clone(),
+        ] {
+            fs::create_dir_all(&dir).expect("mkdir");
+        }
+        for (wt_checkout, gitdir) in [
+            (&agy_live_wt, &ws_wt_agy_gitdir),
+            (&orbit_live_wt, &ws_wt_orbit_gitdir),
+            (&agy_other_repo_wt, &repo_b_wt_agy_gitdir),
+            (&orbit_other_repo_wt, &repo_b_wt_orbit_gitdir),
+        ] {
+            fs::write(gitdir.join("commondir"), "../..\n").expect("write commondir");
+            fs::write(
+                wt_checkout.join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .expect("write wt .git");
+        }
 
         let primary_file = ws.join("src").join("lib.rs");
         let agy_live_file = agy_live_wt.join("src").join("lib.rs");
+        let agy_other_repo_file = agy_other_repo_wt.join("src").join("secret_b.rs");
         let orbit_live_file = orbit_live_wt.join("src").join("lib.rs");
+        let orbit_other_repo_file = orbit_other_repo_wt.join("src").join("secret_b.rs");
         let outside_file = outside.join("secret.txt");
 
         fs::write(&primary_file, "pub fn primary() {}\n").expect("write primary");
         fs::write(&agy_live_file, "pub fn agy_live() {}\n").expect("write agy live");
+        fs::write(&agy_other_repo_file, "pub fn repo_b_secret() {}\n").expect("write agy other");
         fs::write(&orbit_live_file, "pub fn orbit_live() {}\n").expect("write orbit live");
+        fs::write(&orbit_other_repo_file, "pub fn repo_b_secret() {}\n")
+            .expect("write orbit other");
         fs::write(&outside_file, "top-secret\n").expect("write outside");
 
         let roots = ManagedLocalWorktreeRoots {
@@ -2735,11 +2947,11 @@ mod tests {
         let canon_agy_live = fs::canonicalize(&agy_live_file).expect("canon agy live");
         let canon_orbit_live = fs::canonicalize(&orbit_live_file).expect("canon orbit live");
 
-        // (a) Live Antigravity and Orbit worktree files allowed read-only
+        // (a) Same-repo live Antigravity and Orbit worktree files allowed read-only
         let agy_raw = agy_live_file.to_string_lossy().to_string();
         let resolved_agy =
             resolve_allowed_local_file_path_with_roots(Some(&cwd_str), &agy_raw, true, &roots)
-                .expect("live agy worktree file must resolve");
+                .expect("same-repo live agy worktree file must resolve");
         assert_eq!(resolved_agy, canon_agy_live);
         let agy_meta = fs::metadata(&resolved_agy).expect("meta");
         assert!(
@@ -2750,8 +2962,30 @@ mod tests {
         let orbit_raw = orbit_live_file.to_string_lossy().to_string();
         let resolved_orbit =
             resolve_allowed_local_file_path_with_roots(Some(&cwd_str), &orbit_raw, true, &roots)
-                .expect("live orbit worktree file must resolve");
+                .expect("same-repo live orbit worktree file must resolve");
         assert_eq!(resolved_orbit, canon_orbit_live);
+
+        // (a2) Cross-repository worktree files MUST BE STRICTLY DENIED
+        assert!(
+            resolve_allowed_local_file_path_with_roots(
+                Some(&cwd_str),
+                &agy_other_repo_file.to_string_lossy(),
+                true,
+                &roots,
+            )
+            .is_err(),
+            "repo A must NEVER read a file from repo B's Antigravity worktree"
+        );
+        assert!(
+            resolve_allowed_local_file_path_with_roots(
+                Some(&cwd_str),
+                &orbit_other_repo_file.to_string_lossy(),
+                true,
+                &roots,
+            )
+            .is_err(),
+            "repo A must NEVER read a file from repo B's Orbit worktree"
+        );
 
         // (b) Deleted worktree files gracefully fall back to primary workspace `cwd`
         let deleted_agy_raw = agy_wt_root
@@ -2792,7 +3026,7 @@ mod tests {
         .expect("deleted orbit worktree must fall back to primary cwd");
         assert_eq!(fallback_orbit, canon_primary);
 
-        // (c) Traversal, outside files, and external-open (`allow_agent_log_roots = false`) stay denied
+        // (c) Traversal, outside files, external-open, and direct symlink opens stay denied
         let traversal = format!(
             "{}/conv-999/deleted-wt/../../outside_secrets/secret.txt",
             agy_wt_root.display()
@@ -2815,6 +3049,16 @@ mod tests {
                 .is_err(),
             "external open must not open arbitrary worktree files"
         );
+
+        #[cfg(unix)]
+        {
+            let sym = ws.join("src").join("swap_link.rs");
+            std::os::unix::fs::symlink(&outside_file, &sym).expect("create symlink");
+            assert!(
+                open_validated_local_regular_file(&sym, "src/swap_link.rs").is_err(),
+                "TOCTOU-hardened local open must reject symlinks directly"
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

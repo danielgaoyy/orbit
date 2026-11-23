@@ -948,6 +948,9 @@ async fn run_acp_actor(
     let mut pending_perms: HashMap<String, PendingAcpPerm> = HashMap::new();
     let mut pending_perm_order: VecDeque<String> = VecDeque::new();
     let mut pending_prompts: VecDeque<(String, String)> = VecDeque::new();
+    let mut pending_interrupt_replacement: Option<(String, String)> = None;
+    let mut cancelling_active_turn = false;
+    let mut cancel_deadline: Option<tokio::time::Instant> = None;
     let mut last_dispatched_prompt: Option<(String, String)> = None;
     let mut recovered_missing_session = false;
 
@@ -962,8 +965,9 @@ async fn run_acp_actor(
                         behavior,
                     } => {
                         if active_prompt_rpc_key.is_some() || active_turn_id.is_some() {
-                            if matches!(behavior, ActiveTurnBehavior::Interrupt) {
-                                pending_prompts.clear();
+                            if matches!(behavior, ActiveTurnBehavior::Queue) {
+                                pending_prompts.push_back((turn_id, prompt));
+                            } else if matches!(behavior, ActiveTurnBehavior::Interrupt) {
                                 pending_perm_order.clear();
                                 finalize_stream_segments(&mut seg_state, &evt_tx).await;
                                 for (_, p) in pending_perms.drain() {
@@ -977,6 +981,10 @@ async fn run_acp_actor(
                                     .to_string();
                                     let _ = shim.write_stdin_line(resp).await;
                                 }
+                                cancelling_active_turn = true;
+                                cancel_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_secs(10),
+                                );
                                 let cancel = json!({
                                     "jsonrpc": "2.0",
                                     "method": "session/cancel",
@@ -988,7 +996,7 @@ async fn run_acp_actor(
                                     let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                                     break;
                                 }
-                                pending_prompts.push_back((turn_id, prompt));
+                                pending_interrupt_replacement = Some((turn_id, prompt));
                             } else if !pending_perms.is_empty() {
                                 let _ = evt_tx
                                     .send(DriverEvent::Notice {
@@ -997,32 +1005,31 @@ async fn run_acp_actor(
                                     })
                                     .await;
                             } else {
-                                match behavior {
-                                    ActiveTurnBehavior::Queue => {
-                                        pending_prompts.push_back((turn_id, prompt));
-                                    }
-                                    ActiveTurnBehavior::Steer => {
-                                        pending_prompts.clear();
-                                        finalize_stream_segments(&mut seg_state, &evt_tx).await;
-                                        let cancel = json!({
-                                            "jsonrpc": "2.0",
-                                            "method": "session/cancel",
-                                            "params": { "sessionId": session_id }
-                                        })
-                                        .to_string();
-                                        if shim.write_stdin_line(cancel).await.is_err() {
-                                            finalize_stream_segments(&mut seg_state, &evt_tx).await;
-                                            let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
-                                            break;
-                                        }
-                                        pending_prompts.push_back((turn_id, prompt));
-                                    }
-                                    ActiveTurnBehavior::Interrupt => unreachable!(),
+                                // `ActiveTurnBehavior::Steer` on generic ACP without native mid-RPC steer:
+                                // cancel active turn cleanly while preserving accepted FIFO `pending_prompts`.
+                                finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                                cancelling_active_turn = true;
+                                cancel_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_secs(10),
+                                );
+                                let cancel = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/cancel",
+                                    "params": { "sessionId": session_id }
+                                })
+                                .to_string();
+                                if shim.write_stdin_line(cancel).await.is_err() {
+                                    finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                                    let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                    break;
                                 }
+                                pending_interrupt_replacement = Some((turn_id, prompt));
                             }
                             continue;
                         }
 
+                        cancelling_active_turn = false;
+                        cancel_deadline = None;
                         let mut effective_prompt = if inject_handoff_on_next_prompt {
                             inject_handoff_on_next_prompt = false;
                             prepend_handoff_context(pending_handoff_context.take(), &prompt)
@@ -1057,8 +1064,16 @@ async fn run_acp_actor(
                     }
                     DriverCommand::Interrupt => {
                         pending_prompts.clear();
+                        pending_interrupt_replacement = None;
                         pending_perm_order.clear();
                         finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                        let had_active =
+                            active_prompt_rpc_key.is_some() || active_turn_id.is_some();
+                        cancelling_active_turn = had_active;
+                        if had_active {
+                            cancel_deadline =
+                                Some(tokio::time::Instant::now() + Duration::from_secs(10));
+                        }
                         for (_, p) in pending_perms.drain() {
                             let resp = json!({
                                 "jsonrpc": "2.0",
@@ -1265,6 +1280,8 @@ async fn run_acp_actor(
                                     || is_reattached_completion
                                 {
                                     reattached_turn_in_flight = false;
+                                    cancelling_active_turn = false;
+                                    cancel_deadline = None;
                                     active_prompt_rpc_key = None;
                                     pending_perms.clear();
                                     pending_perm_order.clear();
@@ -1340,7 +1357,9 @@ async fn run_acp_actor(
                                     last_dispatched_prompt = None;
 
                                     if let Some((next_tid, next_prompt)) =
-                                        pending_prompts.pop_front()
+                                        pending_interrupt_replacement
+                                            .take()
+                                            .or_else(|| pending_prompts.pop_front())
                                     {
                                         last_dispatched_prompt =
                                             Some((next_tid.clone(), next_prompt.clone()));
@@ -1386,7 +1405,9 @@ async fn run_acp_actor(
                                 }
                             }
                         } else if !has_id && method == Some("session/update") {
-                            if let Some(update) = val.pointer("/params/update") {
+                            if !cancelling_active_turn
+                                && let Some(update) = val.pointer("/params/update")
+                            {
                                 handle_generic_session_update(
                                     update,
                                     &mut mode,
@@ -1424,6 +1445,59 @@ async fn run_acp_actor(
                         break;
                     }
                     _ => {}
+                }
+            }
+
+            _ = async {
+                if let Some(deadline) = cancel_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if cancel_deadline.is_some() => {
+                cancel_deadline = None;
+                cancelling_active_turn = false;
+                reattached_turn_in_flight = false;
+                active_prompt_rpc_key = None;
+                active_turn_id = None;
+                pending_perms.clear();
+                pending_perm_order.clear();
+                finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                let _ = evt_tx
+                    .send(DriverEvent::Notice {
+                        level: "warning".into(),
+                        message: "ACP cancel timed out waiting for turn settlement; resetting active turn state.".into(),
+                    })
+                    .await;
+                if let Some((next_tid, next_prompt)) = pending_interrupt_replacement
+                    .take()
+                    .or_else(|| pending_prompts.pop_front())
+                {
+                    last_dispatched_prompt = Some((next_tid.clone(), next_prompt.clone()));
+                    if dispatch_acp_prompt(
+                        &shim,
+                        &session_id,
+                        cfg.attachments_dir.as_deref(),
+                        prompt_media_caps,
+                        &mut next_rpc_id,
+                        &mut active_turn_id,
+                        &mut active_prompt_rpc_key,
+                        &mut seg_state,
+                        &evt_tx,
+                        next_tid,
+                        next_prompt,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                        let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                        break;
+                    }
+                } else {
+                    let _ = evt_tx
+                        .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+                        .await;
                 }
             }
         }

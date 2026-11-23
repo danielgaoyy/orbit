@@ -430,34 +430,74 @@ fn read_pid_file(socket_path: &Path) -> Option<ShimPidRecord> {
 }
 
 #[cfg(unix)]
-fn signal_pid(pid: u32, signal: &str) {
-    if pid == 0 {
-        return;
+const UNIX_KILL_BINS: [&str; 3] = ["/bin/kill", "/usr/bin/kill", "kill"];
+
+#[cfg(unix)]
+fn build_kill_pid_args(pid: u32, signal: &str) -> Option<[String; 4]> {
+    if pid <= 1 {
+        return None;
     }
-    let _ = std::process::Command::new("/bin/kill")
-        .args([signal, &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let sig = signal.trim().trim_start_matches('-');
+    if sig.is_empty() {
+        return None;
+    }
+    Some([
+        "-s".to_string(),
+        sig.to_string(),
+        "--".to_string(),
+        pid.to_string(),
+    ])
+}
+
+#[cfg(unix)]
+fn build_kill_pgid_args(pgid: u32, signal: &str) -> Option<[String; 4]> {
+    if pgid <= 1 {
+        return None;
+    }
+    let sig = signal.trim().trim_start_matches('-');
+    if sig.is_empty() {
+        return None;
+    }
+    Some([
+        "-s".to_string(),
+        sig.to_string(),
+        "--".to_string(),
+        format!("-{pgid}"),
+    ])
+}
+
+#[cfg(unix)]
+fn run_unix_kill(args: [String; 4]) {
+    for bin in UNIX_KILL_BINS {
+        let status = std::process::Command::new(bin)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if status.is_ok() {
+            break;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, signal: &str) {
+    if let Some(args) = build_kill_pid_args(pid, signal) {
+        run_unix_kill(args);
+    }
 }
 
 #[cfg(unix)]
 fn signal_pid_group(pgid: u32, signal: &str) {
-    if pgid == 0 {
-        return;
+    if let Some(args) = build_kill_pgid_args(pgid, signal) {
+        run_unix_kill(args);
     }
-    let _ = std::process::Command::new("/bin/kill")
-        .args([signal, &format!("-{pgid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 #[cfg(unix)]
 fn is_orbit_shim_process(pid: u32, socket_path: &Path) -> bool {
-    if pid == 0 || pid == std::process::id() {
+    if pid <= 1 || pid == std::process::id() {
         return false;
     }
     let expected_sock = socket_path.to_string_lossy();
@@ -581,7 +621,7 @@ async fn terminate_child_process_group(child: &mut tokio::process::Child) -> (bo
 async fn reap_recorded_shim_pid(rec: &ShimPidRecord, socket_path: &Path) {
     #[cfg(unix)]
     {
-        if rec.shim_pid == 0 || rec.shim_pid == std::process::id() {
+        if rec.shim_pid <= 1 || rec.shim_pid == std::process::id() {
             return;
         }
         if !is_pid_alive(rec.shim_pid) || !is_orbit_shim_process(rec.shim_pid, socket_path) {
@@ -589,7 +629,7 @@ async fn reap_recorded_shim_pid(rec: &ShimPidRecord, socket_path: &Path) {
         }
         let safe_child_pgid = rec
             .child_pgid
-            .filter(|&pgid| pgid > 0 && pgid != std::process::id() && pgid != rec.shim_pid);
+            .filter(|&pgid| pgid > 1 && pgid != std::process::id() && pgid != rec.shim_pid);
         // Give a recently signalled shim a brief grace window to exit on its own.
         for _ in 0..6 {
             if !is_pid_alive(rec.shim_pid) {
@@ -623,7 +663,7 @@ async fn reap_recorded_shim_pid(rec: &ShimPidRecord, socket_path: &Path) {
     }
     #[cfg(windows)]
     {
-        if rec.shim_pid == 0 || rec.shim_pid == std::process::id() {
+        if rec.shim_pid <= 1 || rec.shim_pid == std::process::id() {
             return;
         }
         if !is_pid_alive(rec.shim_pid) || !is_orbit_shim_process(rec.shim_pid, socket_path) {
@@ -631,7 +671,7 @@ async fn reap_recorded_shim_pid(rec: &ShimPidRecord, socket_path: &Path) {
         }
         if let Some(child_pid) = rec
             .child_pid
-            .filter(|&p| p > 0 && p != std::process::id() && p != rec.shim_pid)
+            .filter(|&p| p > 1 && p != std::process::id() && p != rec.shim_pid)
         {
             kill_process_tree_async(child_pid).await;
         }
@@ -646,7 +686,7 @@ async fn reap_recorded_shim_pid(rec: &ShimPidRecord, socket_path: &Path) {
 fn reap_recorded_shim_pid_sync(rec: &ShimPidRecord, socket_path: &Path) {
     #[cfg(unix)]
     {
-        if rec.shim_pid == 0 || rec.shim_pid == std::process::id() {
+        if rec.shim_pid <= 1 || rec.shim_pid == std::process::id() {
             return;
         }
         if !is_pid_alive(rec.shim_pid) || !is_orbit_shim_process(rec.shim_pid, socket_path) {
@@ -654,7 +694,7 @@ fn reap_recorded_shim_pid_sync(rec: &ShimPidRecord, socket_path: &Path) {
         }
         let safe_child_pgid = rec
             .child_pgid
-            .filter(|&pgid| pgid > 0 && pgid != std::process::id() && pgid != rec.shim_pid);
+            .filter(|&pgid| pgid > 1 && pgid != std::process::id() && pgid != rec.shim_pid);
         if let Some(pgid) = safe_child_pgid {
             signal_pid_group(pgid, "-TERM");
         }
@@ -669,7 +709,7 @@ fn reap_recorded_shim_pid_sync(rec: &ShimPidRecord, socket_path: &Path) {
     }
     #[cfg(windows)]
     {
-        if rec.shim_pid == 0 || rec.shim_pid == std::process::id() {
+        if rec.shim_pid <= 1 || rec.shim_pid == std::process::id() {
             return;
         }
         if !is_pid_alive(rec.shim_pid) || !is_orbit_shim_process(rec.shim_pid, socket_path) {
@@ -677,7 +717,7 @@ fn reap_recorded_shim_pid_sync(rec: &ShimPidRecord, socket_path: &Path) {
         }
         if let Some(child_pid) = rec
             .child_pid
-            .filter(|&p| p > 0 && p != std::process::id() && p != rec.shim_pid)
+            .filter(|&p| p > 1 && p != std::process::id() && p != rec.shim_pid)
         {
             kill_process_tree_sync(child_pid);
         }
@@ -1554,10 +1594,10 @@ fn recorded_provider_targets(socket_path: &Path, shim_pid: u32) -> (Option<u32>,
         Some(rec) if rec.shim_pid == shim_pid => {
             let safe_child_pid = rec
                 .child_pid
-                .filter(|&p| p > 0 && p != std::process::id() && p != shim_pid);
+                .filter(|&p| p > 1 && p != std::process::id() && p != shim_pid);
             let safe_child_pgid = rec
                 .child_pgid
-                .filter(|&pg| pg > 0 && pg != std::process::id() && pg != shim_pid);
+                .filter(|&pg| pg > 1 && pg != std::process::id() && pg != shim_pid);
             (safe_child_pid, safe_child_pgid)
         }
         _ => (None, None),
@@ -2566,7 +2606,7 @@ fn is_pid_alive(pid: u32) -> bool {
     #[cfg(all(unix, not(target_os = "linux")))]
     {
         std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
+            .args(["-0", "--", &pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -3772,5 +3812,118 @@ mod tests {
             Some("CustomTerm")
         );
         assert_eq!(env.get("TERM").map(String::as_str), Some("screen-256color"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_kill_args_always_include_option_terminator_and_reject_pid_zero_or_one() {
+        assert_eq!(build_kill_pid_args(0, "-TERM"), None);
+        assert_eq!(build_kill_pid_args(1, "-TERM"), None);
+        assert_eq!(build_kill_pgid_args(0, "-TERM"), None);
+        assert_eq!(build_kill_pgid_args(1, "-TERM"), None);
+        assert_eq!(build_kill_pid_args(1042769, "  "), None);
+        assert_eq!(build_kill_pgid_args(1042769, "---"), None);
+
+        assert_eq!(
+            build_kill_pid_args(1042769, "-TERM"),
+            Some([
+                "-s".to_string(),
+                "TERM".to_string(),
+                "--".to_string(),
+                "1042769".to_string(),
+            ])
+        );
+        assert_eq!(
+            build_kill_pgid_args(1042769, "-TERM"),
+            Some([
+                "-s".to_string(),
+                "TERM".to_string(),
+                "--".to_string(),
+                "-1042769".to_string(),
+            ])
+        );
+        assert_eq!(
+            build_kill_pgid_args(1042769, "KILL"),
+            Some([
+                "-s".to_string(),
+                "KILL".to_string(),
+                "--".to_string(),
+                "-1042769".to_string(),
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_pid_group_kills_only_target_group_and_leaves_unrelated_sibling_alive() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
+
+        let mut target = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn target pgid leader");
+        let target_pid = target.id().expect("target pid");
+        assert!(target_pid > 1);
+
+        let stdout = target.stdout.take().expect("target stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("read grandchild pid timed out")
+            .expect("read grandchild pid io error");
+        let grandchild_pid: u32 = line.trim().parse().expect("parse grandchild pid");
+        assert!(grandchild_pid > 1);
+
+        let mut canary = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn sibling canary");
+
+        // Regression test: without `--` before `-<pgid>`, procps-ng /bin/kill misparsed `-1...`
+        // as `kill(-1, SIGTERM)` and wiped out unrelated processes in the user session.
+        signal_pid_group(target_pid, "-TERM");
+
+        let target_wait = tokio::time::timeout(Duration::from_secs(3), target.wait()).await;
+        if target_wait.is_err() {
+            signal_pid_group(target_pid, "-KILL");
+            let _ = tokio::time::timeout(Duration::from_secs(3), target.wait()).await;
+        }
+
+        let mut grandchild_dead = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if !is_pid_alive(grandchild_pid) {
+                grandchild_dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let canary_status = canary.try_wait();
+
+        // Always clean up before asserting so zero orphan sleep survives on failure.
+        let _ = canary.kill().await;
+        let _ = canary.wait().await;
+        if !grandchild_dead {
+            signal_pid_group(grandchild_pid, "-KILL");
+        }
+
+        assert!(
+            grandchild_dead,
+            "target process group's grandchild {grandchild_pid} should be dead"
+        );
+        assert!(
+            matches!(canary_status, Ok(None)),
+            "unrelated sibling canary process should still be alive, got {canary_status:?}"
+        );
     }
 }

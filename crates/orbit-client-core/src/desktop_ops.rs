@@ -2227,7 +2227,8 @@ fn local_unix_o_nofollow_flag() -> Option<i32> {
     }
     #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
     {
-        Some(0x10000)
+        // Linux arm/aarch64 `O_NOFOLLOW` is octal 0100000 (0x8000); 0x10000 is `O_DIRECT`.
+        Some(0o100000)
     }
     #[cfg(not(any(
         target_os = "macos",

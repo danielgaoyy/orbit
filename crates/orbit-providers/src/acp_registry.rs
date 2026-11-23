@@ -1369,12 +1369,14 @@ fn extract_auth_methods(val: Option<&Value>) -> Vec<String> {
 
 async fn kill_process_group_and_reap(child: &mut tokio::process::Child) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = child.id()
+        && pid > 1
+    {
         // Because the child was spawned with `process_group(0)`, signaling `-{pid}` cleanly
         // terminates the entire process tree (e.g. `npx`/`uvx` grandchildren) without unsafe code.
         let pgid_arg = format!("-{pid}");
         let _ = Command::new("/bin/kill")
-            .args(["-KILL", "--", &pgid_arg])
+            .args(["-s", "KILL", "--", &pgid_arg])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

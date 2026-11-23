@@ -359,17 +359,33 @@ pub fn configure_isolated_process_group(cmd: &mut tokio::process::Command) {
     }
 }
 
-/// Async, zero-`unsafe` process-tree termination (`kill -9 -<pid>` on Unix, `taskkill /PID <pid> /T /F` on Windows).
-pub async fn terminate_process_tree_async(pid: u32) {
+#[cfg(unix)]
+const UNIX_KILL_BINS: [&str; 3] = ["/bin/kill", "/usr/bin/kill", "kill"];
+
+#[cfg(unix)]
+fn build_unix_kill_pgid_args(pid: u32, signal: &str) -> Option<[String; 4]> {
     if pid <= 1 {
-        return;
+        return None;
     }
+    let sig = signal.trim().trim_start_matches('-');
+    if sig.is_empty() {
+        return None;
+    }
+    Some([
+        "-s".to_string(),
+        sig.to_string(),
+        "--".to_string(),
+        format!("-{pid}"),
+    ])
+}
+
+/// Async, zero-`unsafe` process-tree termination (`kill -s KILL -- -<pid>` on Unix, `taskkill /PID <pid> /T /F` on Windows).
+pub async fn terminate_process_tree_async(pid: u32) {
     #[cfg(unix)]
-    {
-        let target = format!("-{pid}");
-        for bin in ["/bin/kill", "/usr/bin/kill", "kill"] {
+    if let Some(args) = build_unix_kill_pgid_args(pid, "KILL") {
+        for bin in UNIX_KILL_BINS {
             let status = tokio::process::Command::new(bin)
-                .args(["-9", &target])
+                .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -382,6 +398,9 @@ pub async fn terminate_process_tree_async(pid: u32) {
     }
     #[cfg(windows)]
     {
+        if pid <= 1 {
+            return;
+        }
         let pid_str = pid.to_string();
         let mut cmd = tokio::process::Command::new("taskkill");
         cmd.args(["/PID", &pid_str, "/T", "/F"])
@@ -395,15 +414,11 @@ pub async fn terminate_process_tree_async(pid: u32) {
 
 /// Synchronous zero-`unsafe` process-tree termination for `Drop` guards.
 pub fn terminate_process_tree_sync(pid: u32) {
-    if pid <= 1 {
-        return;
-    }
     #[cfg(unix)]
-    {
-        let target = format!("-{pid}");
-        for bin in ["/bin/kill", "/usr/bin/kill", "kill"] {
+    if let Some(args) = build_unix_kill_pgid_args(pid, "KILL") {
+        for bin in UNIX_KILL_BINS {
             let status = std::process::Command::new(bin)
-                .args(["-9", &target])
+                .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -415,6 +430,9 @@ pub fn terminate_process_tree_sync(pid: u32) {
     }
     #[cfg(windows)]
     {
+        if pid <= 1 {
+            return;
+        }
         use std::os::windows::process::CommandExt;
         let pid_str = pid.to_string();
         let _ = std::process::Command::new("taskkill")
@@ -541,5 +559,159 @@ mod tests {
         assert!(!tmp.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_kill_pgid_args_include_double_dash_and_guard_init() {
+        assert_eq!(build_unix_kill_pgid_args(0, "KILL"), None);
+        assert_eq!(build_unix_kill_pgid_args(1, "KILL"), None);
+        assert_eq!(build_unix_kill_pgid_args(1042769, " "), None);
+        assert_eq!(
+            build_unix_kill_pgid_args(1042769, "KILL"),
+            Some([
+                "-s".to_string(),
+                "KILL".to_string(),
+                "--".to_string(),
+                "-1042769".to_string(),
+            ])
+        );
+        assert_eq!(
+            build_unix_kill_pgid_args(1042769, "-TERM"),
+            Some([
+                "-s".to_string(),
+                "TERM".to_string(),
+                "--".to_string(),
+                "-1042769".to_string(),
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    fn test_pid_alive(pid: u32) -> bool {
+        if pid <= 1 {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Path::new(&format!("/proc/{pid}")).exists()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::process::Command::new("/bin/kill")
+                .args(["-s", "0", "--", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_process_tree_kills_only_target_pgid_and_preserves_sibling() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut canary_cmd = tokio::process::Command::new("/bin/sh");
+        canary_cmd
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(false);
+        let mut canary = canary_cmd.spawn().expect("spawn canary");
+        let canary_pid = canary.id().expect("canary pid");
+
+        let spawn_target = || async {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 30 & echo $!; wait"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .kill_on_drop(false);
+            let mut child = cmd.spawn().expect("spawn target");
+            let pid = child.id().expect("target pid");
+            let stdout = child.stdout.take().expect("target stdout");
+            let mut lines = BufReader::new(stdout).lines();
+            let gpid_line =
+                tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+                    .await
+                    .expect("grandchild pid line timeout")
+                    .expect("grandchild line")
+                    .expect("grandchild pid");
+            let gpid: u32 = gpid_line.trim().parse().expect("parse grandchild pid");
+            drop(lines);
+            (child, pid, gpid)
+        };
+
+        // 1. Verify async PGID termination kills target + grandchild while keeping canary alive.
+        let (mut async_child, async_pid, async_gpid) = spawn_target().await;
+        assert!(test_pid_alive(async_pid));
+        assert!(test_pid_alive(async_gpid));
+        assert!(test_pid_alive(canary_pid));
+
+        terminate_process_tree_async(async_pid).await;
+        let async_reaped =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async_child.wait())
+                .await
+                .is_ok_and(|res| res.is_ok());
+
+        let mut async_gpid_dead = false;
+        for _ in 0..40 {
+            if !test_pid_alive(async_gpid) {
+                async_gpid_dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let canary_alive_after_async =
+            test_pid_alive(canary_pid) && matches!(canary.try_wait(), Ok(None));
+
+        // 2. Verify sync PGID termination kills target + grandchild while keeping canary alive.
+        let (mut sync_child, sync_pid, sync_gpid) = spawn_target().await;
+        assert!(test_pid_alive(sync_pid));
+        assert!(test_pid_alive(sync_gpid));
+
+        terminate_process_tree_sync(sync_pid);
+        let sync_reaped =
+            tokio::time::timeout(std::time::Duration::from_secs(2), sync_child.wait())
+                .await
+                .is_ok_and(|res| res.is_ok());
+
+        let mut sync_gpid_dead = false;
+        for _ in 0..40 {
+            if !test_pid_alive(sync_gpid) {
+                sync_gpid_dead = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let canary_alive_after_sync =
+            test_pid_alive(canary_pid) && matches!(canary.try_wait(), Ok(None));
+
+        let _ = canary.kill().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), canary.wait()).await;
+
+        assert!(async_reaped, "async target process group must exit");
+        assert!(
+            async_gpid_dead,
+            "async target grandchild {async_gpid} must be terminated"
+        );
+        assert!(
+            canary_alive_after_async,
+            "canary {canary_pid} must survive terminate_process_tree_async"
+        );
+        assert!(sync_reaped, "sync target process group must exit");
+        assert!(
+            sync_gpid_dead,
+            "sync target grandchild {sync_gpid} must be terminated"
+        );
+        assert!(
+            canary_alive_after_sync,
+            "canary {canary_pid} must survive terminate_process_tree_sync"
+        );
     }
 }

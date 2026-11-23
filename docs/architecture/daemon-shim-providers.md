@@ -8,6 +8,7 @@
 
 - **独立进程壳**：`crates/orbit-shim` 通过 `setsid` 创建独立会话组，借助 `portable-pty` 与 stdio pipe 托管长寿命有状态 Agent 进程（`claude`、`codex`、`agy`、`pi`、ACP 引擎）与用户交互终端 `PTY`。
 - **Unix Socket 通信**：Daemon 通过 `$ORBIT_HOME/shims/<shim-id>.sock` 与 Shim 双向通信并记录游标偏移，确保升级或重启 `orbit daemon` 时零中断重新附着正在运行的会话。
+- **Unix 进程组终止安全不变式**：在 `unsafe_code = "deny"` 约束下调用外部 `/bin/kill` 终止子进程或进程组（`crates/orbit-shim`、`crates/orbit-daemon/src/platform.rs`、`crates/orbit-providers`）时，**必须**先校验 `pid > 1` / `pgid > 1`，并在负进程组 ID 前强制传入 `--` 选项终止符（如 `/bin/kill -s TERM -- -<pgid>`），严禁省略 `--`（Linux `procps-ng 4.0.4` 的 `getopt_long` 会把未加 `--` 且以 `1` 开头的 `-1xxxxxx` 误解析为 `kill(-1, ...)`，误杀同 UID 下包括 `systemd --user` 与桌面会话在内的全部用户进程；由 `pitfall_07` 回归拦截）。
 - **单二进制内聚**：全部 `daemon` / `shim` / `relay` / CLI 子命令打包在单一静态 `orbit` 可执行文件（`crates/orbit-cli`）中，不得依赖外部 Node.js / Python 运行时。
 
 ---

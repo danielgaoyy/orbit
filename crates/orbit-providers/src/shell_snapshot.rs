@@ -1392,13 +1392,13 @@ fn build_probe_command_args(shell_path: &str, nonce: &str) -> Vec<String> {
 #[cfg(unix)]
 async fn kill_probe_process_group_and_wait(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id()
-        && pid > 0
+        && pid > 1
     {
         // The probe shell was launched in its own process group (`process_group(0)`), so
         // PGID == PID. Terminate the entire process group via safe `/bin/kill` so lingering
         // grandchildren (`sleep`, `nvm`, `brew`, etc.) never leak orphaned.
         let _ = tokio::process::Command::new("/bin/kill")
-            .args(["-KILL", "--", &format!("-{pid}")])
+            .args(["-s", "KILL", "--", &format!("-{pid}")])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

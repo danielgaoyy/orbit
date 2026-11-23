@@ -5,6 +5,7 @@
 //! 4. Off-LAN mobile relay propagation (`apply_relay_to_fleet` -> `ConfigureHostRelay`, `OnlineRelay`, Welcome adoption)
 //! 5. Mission Workspace parallel-first worktree isolation & historical handle alias resolution
 //! 6. Cross-turn late assistant finalization dedup over live WebSocket & fresh catchup
+//! 7. Archiving an agent kills ONLY that agent's shim/PGID without broadcast-signaling siblings (`--` before `-<pgid>`)
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1817,5 +1818,275 @@ async fn pitfall_06_late_assistant_finalization_cross_turn_dedup_over_ws() {
 
     drop_core(core1).await;
     drop_core(core2).await;
+    drop(rt);
+}
+
+#[cfg(unix)]
+fn is_non_zombie_pid_alive(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(rparen) = stat.rfind(')') else {
+            return false;
+        };
+        let state = stat[rparen + 1..].trim_start().chars().next();
+        !matches!(state, None | Some('Z') | Some('X'))
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "state="])
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let state = String::from_utf8_lossy(&out.stdout);
+        let trimmed = state.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('Z') && !trimmed.starts_with('X')
+    }
+}
+
+#[cfg(unix)]
+fn list_shim_pid_files(shims_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(shims_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("pid"))
+        .collect();
+    files.sort();
+    files
+}
+
+#[cfg(unix)]
+fn parse_shim_pid_record(pid_path: &Path) -> Option<(u32, Option<u32>)> {
+    let raw = std::fs::read_to_string(pid_path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let shim_pid = u32::try_from(val.get("shim_pid")?.as_u64()?).ok()?;
+    let child_pid = val
+        .get("child_pid")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    Some((shim_pid, child_pid))
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pitfall_07_archive_agent_terminates_only_target_shim_pgid_without_signaling_siblings() {
+    install_mock_script(
+        &MOCK_CLAUDE_PATH,
+        ProviderKind::ClaudeCode,
+        "mock_claude_reg.py",
+        MOCK_CLAUDE_SCRIPT,
+    );
+
+    let home = new_temp_dir("p7_h");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).expect("create work dir");
+    let shims_dir = home.join("shims");
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("spawn daemon");
+    let uri = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("offer")
+        .to_qr_uri()
+        .expect("uri");
+    let (core, host_id) = open_and_connect_core(home.join("c7.db"), uri).await;
+
+    // 1. Spawn Agent A and wait until its shim .pid file and initial turn settle.
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::ClaudeCode,
+        SessionMode::AcceptEdits,
+        "ECHO=AGENT_A",
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let sd = shims_dir.clone();
+            async move {
+                let agents_ready = c.host_detail(&hid).is_some_and(|d| {
+                    let real: Vec<_> = d
+                        .agents
+                        .iter()
+                        .filter(|a| !a.agent_id.starts_with("opt_"))
+                        .collect();
+                    real.len() == 1 && real[0].latest_seq > 0 && !real[0].is_running
+                });
+                agents_ready && list_shim_pid_files(&sd).len() == 1
+            }
+        })
+        .await,
+        "Agent A should spawn, write its shim .pid, and finish initial turn"
+    );
+
+    let agent_a_id = core
+        .host_detail(&host_id)
+        .expect("host detail after A")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_"))
+        .expect("agent A summary")
+        .agent_id;
+    let a_pid_path = list_shim_pid_files(&shims_dir)
+        .into_iter()
+        .next()
+        .expect("agent A .pid path");
+    let a_sock_path = a_pid_path.with_extension("sock");
+    let (a_shim_pid, a_child_pid) =
+        parse_shim_pid_record(&a_pid_path).expect("parse agent A shim pid record");
+    assert!(a_shim_pid > 1);
+
+    // 2. Spawn Agent B and wait until its distinct shim .pid file and initial turn settle.
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::ClaudeCode,
+        SessionMode::AcceptEdits,
+        "ECHO=AGENT_B",
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let sd = shims_dir.clone();
+            async move {
+                let agents_ready = c.host_detail(&hid).is_some_and(|d| {
+                    let real: Vec<_> = d
+                        .agents
+                        .iter()
+                        .filter(|a| !a.agent_id.starts_with("opt_"))
+                        .collect();
+                    real.len() == 2 && real.iter().all(|a| a.latest_seq > 0 && !a.is_running)
+                });
+                agents_ready && list_shim_pid_files(&sd).len() == 2
+            }
+        })
+        .await,
+        "Agent B should spawn, write its distinct shim .pid, and finish initial turn"
+    );
+
+    let agent_b_id = core
+        .host_detail(&host_id)
+        .expect("host detail after B")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_") && a.agent_id != agent_a_id)
+        .expect("agent B summary")
+        .agent_id;
+    let b_pid_path = list_shim_pid_files(&shims_dir)
+        .into_iter()
+        .find(|p| p != &a_pid_path)
+        .expect("agent B .pid path");
+    let b_sock_path = b_pid_path.with_extension("sock");
+    let (b_shim_pid, b_child_pid) =
+        parse_shim_pid_record(&b_pid_path).expect("parse agent B shim pid record");
+    assert!(b_shim_pid > 1);
+    assert_ne!(a_shim_pid, b_shim_pid);
+
+    // 3. Spawn an independent sibling canary in its own PGID to guard against kill(-1, SIGTERM).
+    let mut canary = tokio::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn external sibling canary");
+
+    // 4. Archive Agent A and verify ONLY Agent A's shim/PGID terminates.
+    core.archive_agent(&host_id, &agent_a_id);
+
+    let store_ref = rt.store.clone();
+    let aid_check = agent_a_id.clone();
+    let a_pid_check = a_pid_path.clone();
+    let a_sock_check = a_sock_path.clone();
+    let a_archived_and_dead = wait_until(Duration::from_secs(15), || {
+        let store = store_ref.clone();
+        let aid = aid_check.clone();
+        let pid_p = a_pid_check.clone();
+        let sock_p = a_sock_check.clone();
+        async move {
+            let archived = store
+                .get_agent(&aid)
+                .ok()
+                .flatten()
+                .is_some_and(|a| a.archived_at.is_some());
+            if !archived || pid_p.exists() {
+                return false;
+            }
+            if orbit_shim::probe_existing_shim(&sock_p).await {
+                return false;
+            }
+            if is_non_zombie_pid_alive(a_shim_pid) {
+                return false;
+            }
+            a_child_pid.is_none_or(|p| p <= 1 || !is_non_zombie_pid_alive(p))
+        }
+    })
+    .await;
+
+    let canary_status = canary.try_wait();
+
+    // Clean up canary unconditionally before any assertions so no sleep process leaks on failure.
+    let _ = canary.kill().await;
+    let _ = canary.wait().await;
+
+    assert!(
+        a_archived_and_dead,
+        "Agent A ({agent_a_id}) should be archived with dead shim {a_shim_pid} and removed .pid/.sock"
+    );
+    assert!(
+        matches!(canary_status, Ok(None)),
+        "external sibling canary must remain running when Agent A is archived, got {canary_status:?}"
+    );
+
+    // 5. Verify Agent B's shim + provider remain intact and functional.
+    assert!(b_pid_path.exists(), "Agent B .pid must remain intact");
+    assert!(
+        orbit_shim::probe_existing_shim(&b_sock_path).await,
+        "Agent B shim socket must remain reachable"
+    );
+    assert!(
+        is_non_zombie_pid_alive(b_shim_pid),
+        "Agent B shim PID {b_shim_pid} must stay alive"
+    );
+    if let Some(cpid) = b_child_pid {
+        assert!(
+            is_non_zombie_pid_alive(cpid),
+            "Agent B child PID {cpid} must stay alive"
+        );
+    }
+
+    core.open_agent_timeline(&host_id, &agent_b_id);
+    core.send_prompt(&host_id, &agent_b_id, "ECHO=STILL_ALIVE");
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_b_id.clone();
+            async move { stage_settled_with_text(&c, &hid, &aid, "REPLY=STILL_ALIVE") }
+        })
+        .await,
+        "Agent B should still process prompts cleanly after Agent A is archived"
+    );
+
+    drop_core(core).await;
     drop(rt);
 }

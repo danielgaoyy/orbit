@@ -669,11 +669,13 @@ fn start_detached_pid_service(
 fn stop_pid_file_process(pid_file: &Path) {
     if let Ok(raw) = fs::read_to_string(pid_file) {
         let pid = raw.trim();
-        if !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(pid_num) = pid.parse::<u32>()
+            && pid_num > 1
+        {
             #[cfg(unix)]
             {
                 let _ = Command::new("kill")
-                    .arg(pid)
+                    .args(["-s", "TERM", "--", &pid_num.to_string()])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
@@ -684,7 +686,7 @@ fn stop_pid_file_process(pid_file: &Path) {
                 // Terminate ONLY the daemon/relay PID (NEVER `/T`) so detached `orbit shim`
                 // agent and PTY child sessions survive daemon restarts and hot-upgrades!
                 let _ = Command::new("taskkill")
-                    .args(["/PID", pid, "/F"])
+                    .args(["/PID", &pid_num.to_string(), "/F"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())

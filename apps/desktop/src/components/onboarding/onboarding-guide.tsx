@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Copy,
   FolderPlus,
+  Laptop,
   Loader2,
   MessageSquarePlus,
   Plus,
@@ -28,7 +29,7 @@ import {
 } from "@/components/ui/dialog-tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useI18n } from "@/lib/i18n";
-import { type ProviderReadinessInfo, orbitIpc } from "@/lib/orbit-ipc";
+import { type LocalMachineInfo, type ProviderReadinessInfo, orbitIpc } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -61,6 +62,9 @@ function OnboardingGuideBody() {
 
   const [step, setStep] = useState<StepIndex>(0);
   const [reconnecting, setReconnecting] = useState(false);
+  const [localMachine, setLocalMachine] = useState<LocalMachineInfo | null>(null);
+  const [connectingLocal, setConnectingLocal] = useState(false);
+  const [localConnectError, setLocalConnectError] = useState<string | null>(null);
 
   // Step 2: Real local provider readiness probe
   const [providers, setProviders] = useState<ProviderReadinessInfo[]>([]);
@@ -112,6 +116,29 @@ function OnboardingGuideBody() {
     void runProbe();
   }, [runProbe]);
 
+  useEffect(() => {
+    let active = true;
+    void orbitIpc
+      .getLocalMachineInfo()
+      .then((info) => {
+        if (active) setLocalMachine(info);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [orderedHosts.length]);
+
+  const localAlreadyPaired = useMemo(
+    () =>
+      orderedHosts.some(
+        (h) =>
+          (localMachine?.host_id && h.host_id === localMachine.host_id) ||
+          isLocalHostCard(h),
+      ),
+    [localMachine?.host_id, orderedHosts],
+  );
+
   const providerSummary = useMemo(() => {
     let installed = 0;
     let ready = 0;
@@ -147,6 +174,21 @@ function OnboardingGuideBody() {
       await orbitActions.reloadFleetAndHosts(false);
     } finally {
       window.setTimeout(() => setReconnecting(false), 350);
+    }
+  };
+
+  const handleConnectLocal = async () => {
+    setLocalConnectError(null);
+    setConnectingLocal(true);
+    try {
+      const card = await orbitIpc.pairLocalHost();
+      await orbitActions.reloadFleetAndHosts(false);
+      orbitActions.selectHost(card.host_id);
+      orbitActions.showToast(`Connected ${card.display_name}`);
+    } catch (err) {
+      setLocalConnectError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConnectingLocal(false);
     }
   };
 
@@ -248,9 +290,41 @@ function OnboardingGuideBody() {
 
             <div className="border-border bg-background/60 divide-border divide-y overflow-hidden rounded-[12px] border">
               {orderedHosts.length === 0 ? (
-                <div className="text-muted-foreground flex items-center gap-2.5 px-4 py-4 text-[12.5px]">
-                  <Loader2 className="h-[14px] w-[14px] animate-spin opacity-75" />
-                  <span>{t("onboarding.noHostsYet")}</span>
+                <div className="space-y-3 px-4 py-3.5">
+                  <div className="text-muted-foreground flex items-center gap-2.5 text-[12.5px]">
+                    <Laptop className="h-[14px] w-[14px] shrink-0 opacity-75" />
+                    <span>{t("onboarding.noHostsYet")}</span>
+                  </div>
+                  {localMachine && !localAlreadyPaired && (
+                    <div className="border-border/80 bg-background/70 flex items-center justify-between gap-3 rounded-[10px] border px-3.5 py-2.5">
+                      <div className="min-w-0">
+                        <div className="text-foreground flex items-center gap-1.5 text-[13px] font-medium">
+                          <span className="truncate">{localMachine.hostname}</span>
+                          <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10.5px]">
+                            {t("common.local")}
+                          </span>
+                        </div>
+                        <div className="text-muted-foreground truncate text-[11.5px]">
+                          {t("onboarding.connectLocalHint")}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={connectingLocal}
+                        onClick={() => void handleConnectLocal()}
+                        className="bg-foreground text-background inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-45"
+                      >
+                        {connectingLocal && (
+                          <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />
+                        )}
+                        <span>
+                          {connectingLocal
+                            ? t("onboarding.connectingLocal")
+                            : t("onboarding.connectThisMachine")}
+                        </span>
+                      </button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 orderedHosts.map((host) => {
@@ -290,16 +364,39 @@ function OnboardingGuideBody() {
               )}
             </div>
 
+            {localConnectError && (
+              <div className="selectable-text px-0.5 text-[12px] text-rose-500">
+                {localConnectError}
+              </div>
+            )}
+
             <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                disabled={reconnecting}
-                onClick={() => void handleReconnectAll()}
-                className="border-border hover:bg-accent inline-flex h-[32px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:opacity-50"
-              >
-                <RefreshCw className={cn("h-[13px] w-[13px]", reconnecting && "animate-spin")} />
-                <span>{t("banner.reconnect")}</span>
-              </button>
+              {orderedHosts.length > 0 && (
+                <button
+                  type="button"
+                  disabled={reconnecting}
+                  onClick={() => void handleReconnectAll()}
+                  className="border-border hover:bg-accent inline-flex h-[32px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:opacity-50"
+                >
+                  <RefreshCw className={cn("h-[13px] w-[13px]", reconnecting && "animate-spin")} />
+                  <span>{t("banner.reconnect")}</span>
+                </button>
+              )}
+              {orderedHosts.length > 0 && localMachine && !localAlreadyPaired && (
+                <button
+                  type="button"
+                  disabled={connectingLocal}
+                  onClick={() => void handleConnectLocal()}
+                  className="border-border hover:bg-accent inline-flex h-[32px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:opacity-50"
+                >
+                  <Laptop className="h-[13px] w-[13px]" />
+                  <span>
+                    {connectingLocal
+                      ? t("onboarding.connectingLocal")
+                      : t("onboarding.connectThisMachine")}
+                  </span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={handleAddRemoteHost}

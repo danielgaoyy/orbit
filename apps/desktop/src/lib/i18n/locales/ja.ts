@@ -734,7 +734,11 @@ export const ja: MessageDictionary = {
   "onboarding.step1Title": "ホストとデーモン",
   "onboarding.step1Desc":
     "Orbit はローカルデーモンやリモートマシンにエンドツーエンド暗号化で接続します。",
-  "onboarding.noHostsYet": "ローカルの Orbit デーモンを待機中…",
+  "onboarding.noHostsYet": "まだホストが接続されていません。このマシンを接続するか、リモートホストを追加してください。",
+  "onboarding.connectThisMachine": "このマシンを接続",
+  "onboarding.connectingLocal": "接続中…",
+  "onboarding.connectLocalHint":
+    "任意 — このマシンのローカルデーモンを接続してローカルで実行します。",
   "onboarding.addRemoteHost": "リモートホストを追加",
   "onboarding.hostsSummary": "{total} 台のうち {online} 台オンライン",
   "onboarding.step2Title": "AI コーディング CLI",

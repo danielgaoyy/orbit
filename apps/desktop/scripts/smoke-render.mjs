@@ -208,6 +208,12 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           return [];
         case "load_older_agent_timeline":
           return true;
+        case "get_local_machine_info":
+          return {
+            hostname: "mock-mac",
+            host_id: null,
+            os_arch: "macos / aarch64",
+          };
         case "get_git_review":
           return {
             revision: 1,

@@ -737,7 +737,11 @@ export const en = {
   "onboarding.step1Title": "Host & Daemon",
   "onboarding.step1Desc":
     "Orbit connects to your local daemon and any remote workstations over end-to-end encrypted channels.",
-  "onboarding.noHostsYet": "Waiting for local Orbit daemon…",
+  "onboarding.noHostsYet": "No hosts connected yet. Connect this machine or add a remote host.",
+  "onboarding.connectThisMachine": "Connect This Machine",
+  "onboarding.connectingLocal": "Connecting…",
+  "onboarding.connectLocalHint":
+    "Optional — pair this device's local daemon to run agents locally.",
   "onboarding.addRemoteHost": "Add Remote Host",
   "onboarding.hostsSummary": "{online} of {total} online",
   "onboarding.step2Title": "AI Coding CLIs",

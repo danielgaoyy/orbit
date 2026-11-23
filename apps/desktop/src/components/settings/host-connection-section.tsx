@@ -438,24 +438,22 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         </div>
       </div>
 
-      {/* Danger Zone: Remove non-sole host */}
-      {fleet.hosts.length > 1 && (
-        <SettingCard>
-          <SettingRow
-            title="Remove host"
-            description="Unpair this machine from Orbit Desktop."
+      {/* Danger Zone: Remove host */}
+      <SettingCard>
+        <SettingRow
+          title="Remove host"
+          description="Unpair this machine from Orbit Desktop."
+        >
+          <button
+            type="button"
+            onClick={() => setConfirmRemoveOpen(true)}
+            className="inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border border-rose-500/25 px-3 text-[12px] font-medium text-rose-600 transition-colors hover:bg-rose-500/10 dark:text-rose-400"
           >
-            <button
-              type="button"
-              onClick={() => setConfirmRemoveOpen(true)}
-              className="inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border border-rose-500/25 px-3 text-[12px] font-medium text-rose-600 transition-colors hover:bg-rose-500/10 dark:text-rose-400"
-            >
-              <Trash2 className="h-[13px] w-[13px]" />
-              <span>Remove</span>
-            </button>
-          </SettingRow>
-        </SettingCard>
-      )}
+            <Trash2 className="h-[13px] w-[13px]" />
+            <span>Remove</span>
+          </button>
+        </SettingRow>
+      </SettingCard>
 
       <ConfirmDialog
         open={confirmRemoveOpen}

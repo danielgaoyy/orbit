@@ -359,7 +359,10 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
 
         let nextAgentId = s.isDraftNewSession ? null : s.selectedAgentId;
         let nextDraft = s.isDraftNewSession;
-        if (!s.isDraftNewSession && activeDetail && activeHostId) {
+        if (!activeHostId) {
+          nextAgentId = null;
+          nextDraft = true;
+        } else if (!s.isDraftNewSession && activeDetail) {
           const stillExists =
             nextAgentId &&
             !s.archivedThreads[threadScopeKey(activeHostId, nextAgentId)] &&
@@ -377,12 +380,13 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           !nextDraft && nextAgentId
             ? activeDetail?.agents.find((a) => a.agent_id === nextAgentId)
             : undefined;
-        const nextCwd =
-          activeAgent?.cwd ||
-          s.selectedWorkspaceCwd ||
-          activeDetail?.workspaces[0]?.cwd ||
-          activeDetail?.discovered_projects[0]?.path ||
-          "~";
+        const nextCwd = !activeHostId
+          ? "~"
+          : activeAgent?.cwd ||
+            s.selectedWorkspaceCwd ||
+            activeDetail?.workspaces[0]?.cwd ||
+            activeDetail?.discovered_projects[0]?.path ||
+            "~";
 
         const nextDraftProvider = resolveAvailableDraftProvider(activeDetail, s.draftProvider);
 

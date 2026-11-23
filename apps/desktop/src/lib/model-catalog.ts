@@ -177,6 +177,21 @@ export function formatCatalogModelLabel(
   return prettifyModelSlug(rawModelId, catalog.provider);
 }
 
+/**
+ * Determines whether a model should expose Fast mode in the Desktop UI.
+ * Explicitly disables Fast mode for `antigravity` and `acp` so Desktop never displays a
+ * non-functional Fast toggle even when connected to older pre-v0.9.1 daemons.
+ */
+export function modelSupportsFastMode(
+  provider: ProviderKind,
+  spec: Pick<ProviderModelSpec, "supports_fast_mode"> | null | undefined,
+): boolean {
+  if (provider === "antigravity" || provider === "acp") {
+    return false;
+  }
+  return Boolean(spec?.supports_fast_mode);
+}
+
 export function resolveSupportedEffortForModel(
   spec: ProviderModelSpec | null,
   desiredEffort: ReasoningEffort | null,

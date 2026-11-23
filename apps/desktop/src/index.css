@@ -639,6 +639,7 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
 /* Pause infinite ambient animations when the desktop window is hidden/minimized to save CPU/GPU. */
 html.orbit-window-hidden .agent-text-shimmer,
 html.orbit-window-hidden .animate-spin,
+html.orbit-window-hidden .animate-pulse,
 html.orbit-window-hidden [class*="animate-[spin"] {
   animation-play-state: paused !important;
 }

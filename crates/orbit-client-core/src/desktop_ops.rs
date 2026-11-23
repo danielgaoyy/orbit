@@ -1908,11 +1908,75 @@ fn resolve_allowed_local_file_path(
     Ok(canon)
 }
 
+fn is_local_path_inside_git(canonical_cwd: &Path, canonical_target: &Path) -> bool {
+    let Ok(rel) = canonical_target.strip_prefix(canonical_cwd) else {
+        return false;
+    };
+    rel.components().any(|c| match c {
+        std::path::Component::Normal(part) => part == ".git",
+        _ => false,
+    })
+}
+
+fn compute_local_file_writable(
+    cwd: &str,
+    trimmed: &str,
+    canonical: &Path,
+    meta: &fs::Metadata,
+) -> bool {
+    // Mutations strictly require relative workspace paths; never mark absolute or `~/` reads writable.
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed == "~"
+        || trimmed.starts_with("~/")
+        || Path::new(trimmed).is_absolute()
+    {
+        return false;
+    }
+    if meta.permissions().readonly() {
+        return false;
+    }
+    let resolved_cwd = if cwd.trim().is_empty() || cwd.trim() == "~" {
+        return false;
+    } else if let Some(rest) = cwd.trim().strip_prefix("~/") {
+        resolve_user_home()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(cwd.trim()))
+    } else {
+        PathBuf::from(cwd.trim())
+    };
+    let Ok(canonical_cwd) = fs::canonicalize(&resolved_cwd) else {
+        return false;
+    };
+    if !canonical.starts_with(&canonical_cwd) || is_local_path_inside_git(&canonical_cwd, canonical)
+    {
+        return false;
+    }
+    let direct_candidate = canonical_cwd.join(Path::new(trimmed));
+    if let Ok(sym_meta) = fs::symlink_metadata(&direct_candidate)
+        && sym_meta.file_type().is_symlink()
+    {
+        return false;
+    }
+    true
+}
+
 /// Local filesystem fallback when reading a workspace file on the current machine against an older daemon.
 pub fn read_local_workspace_file(
     cwd: &str,
     raw_path: &str,
     max_bytes: Option<u64>,
+) -> Result<LocalFileReadPayload, String> {
+    read_local_workspace_file_with_writable(cwd, raw_path, max_bytes, false)
+}
+
+/// Local filesystem reader for workspace files; computes `writable` using the same rules as the
+/// daemon when `allow_writable` is true (i.e., an active local daemon session can persist edits).
+pub fn read_local_workspace_file_with_writable(
+    cwd: &str,
+    raw_path: &str,
+    max_bytes: Option<u64>,
+    allow_writable: bool,
 ) -> Result<LocalFileReadPayload, String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use std::io::Read;
@@ -1930,9 +1994,7 @@ pub fn read_local_workspace_file(
 
     let size_bytes = meta.len();
     let mtime_unix_ms = local_metadata_mtime_unix_ms(&meta);
-    // Local fallback serves read-only previews when no capable daemon session is connected;
-    // never advertise `writable: true` if saving via daemon RPC would fail.
-    let writable = false;
+    let writable = allow_writable && compute_local_file_writable(cwd, trimmed, &canonical, &meta);
     let resolved_path = canonical.to_string_lossy().to_string();
 
     let mut file =

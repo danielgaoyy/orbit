@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { PanelLeft, PanelRight } from "lucide-react";
+import { resyncAllAmbientAnimations } from "@/lib/animation-sync";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/command/command-palette";
 import { MarkdownThemeProvider } from "@/components/markdown-blocks";
@@ -67,6 +68,7 @@ export default function App() {
     const onVisibility = () => {
       syncVisibilityClass();
       if (document.visibilityState === "visible") {
+        window.requestAnimationFrame(() => resyncAllAmbientAnimations());
         void orbitIpc.onAppForeground();
       } else {
         orbitActions.flushPendingSeenMarks();

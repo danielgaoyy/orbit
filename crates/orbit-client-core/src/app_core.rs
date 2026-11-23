@@ -68,7 +68,8 @@ use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
-    extract_ws_port, normalize_relay_input, read_local_workspace_file, stage_local_attachment,
+    extract_ws_port, normalize_relay_input, read_local_workspace_file,
+    read_local_workspace_file_with_writable, stage_local_attachment,
 };
 use crate::render::{
     DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator, TerminalScreenView,
@@ -6977,6 +6978,7 @@ impl OrbitAppCore {
         let now = Utc::now();
         let req_id = Uuid::new_v4();
         let visible_text = display_prompt.clone().unwrap_or_else(|| prompt.to_string());
+        let opt_msg_id = format!("u_{}", Uuid::new_v4().simple());
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
@@ -6999,7 +7001,7 @@ impl OrbitAppCore {
                 turn_id: None,
                 timestamp: now,
                 payload: TimelinePayload::UserPrompt {
-                    message_id: format!("opt_{}", Uuid::new_v4()),
+                    message_id: opt_msg_id.clone(),
                     text: visible_text,
                     badges: badges.clone(),
                 },
@@ -7027,7 +7029,7 @@ impl OrbitAppCore {
                 display_prompt,
                 badges,
                 active_turn_behavior,
-                message_id: None,
+                message_id: Some(opt_msg_id),
                 caller_agent_id: None,
                 notify_on_finish: None,
             },
@@ -11083,34 +11085,53 @@ impl OrbitAppCore {
             (h.session.clone(), h.is_local)
         };
 
-        let Some(session) = session else {
-            if is_local {
-                let owned_host = host_id.to_string();
-                let owned_cwd = cwd.to_string();
-                let owned_path = path.to_string();
-                return tokio::task::spawn_blocking(move || {
-                    let raw = read_local_workspace_file(&owned_cwd, &owned_path, None)?;
-                    Ok(build_workspace_file_view(
-                        &owned_host,
-                        &owned_cwd,
-                        &owned_path,
-                        RawFileReadResponse {
-                            resolved_path: raw.resolved_path,
-                            content_kind: raw.content_kind,
-                            mime_type: raw.mime_type,
-                            content: raw.content,
-                            size_bytes: raw.size_bytes,
-                            truncated: raw.truncated,
-                            etag: raw.etag,
-                            mtime_unix_ms: raw.mtime_unix_ms,
-                            writable: raw.writable,
-                            line_ending: raw.line_ending,
-                        },
-                    ))
-                })
-                .await
-                .map_err(|_| "local file read task cancelled".to_string())?;
+        // Fast path for the local host: read directly from disk (with identical canonicalized
+        // workspace & managed-root containment) to avoid WebSocket + Noise_NK + Zstd round-trips
+        // and outside-cwd daemon rejection retries when clicking file/artifact links in chat.
+        // Only advertise `writable: true` when a live local daemon session is connected to save edits.
+        if is_local {
+            let owned_host = host_id.to_string();
+            let owned_cwd = cwd.to_string();
+            let owned_path = path.to_string();
+            let has_session = session.is_some();
+            let local_res = tokio::task::spawn_blocking(move || {
+                let raw = read_local_workspace_file_with_writable(
+                    &owned_cwd,
+                    &owned_path,
+                    None,
+                    has_session,
+                )?;
+                Ok::<WorkspaceFileView, String>(build_workspace_file_view(
+                    &owned_host,
+                    &owned_cwd,
+                    &owned_path,
+                    RawFileReadResponse {
+                        resolved_path: raw.resolved_path,
+                        content_kind: raw.content_kind,
+                        mime_type: raw.mime_type,
+                        content: raw.content,
+                        size_bytes: raw.size_bytes,
+                        truncated: raw.truncated,
+                        etag: raw.etag,
+                        mtime_unix_ms: raw.mtime_unix_ms,
+                        writable: raw.writable,
+                        line_ending: raw.line_ending,
+                    },
+                ))
+            })
+            .await
+            .map_err(|_| "local file read task cancelled".to_string())?;
+
+            match local_res {
+                Ok(view) => return Ok(view),
+                Err(err) if !has_session => return Err(err),
+                Err(_) => {
+                    // Fall through to connected daemon RPC (e.g. for custom daemon-side attachment roots)
+                }
             }
+        }
+
+        let Some(session) = session else {
             return Err("Remote host is disconnected; reconnect to open files".into());
         };
 
@@ -15763,13 +15784,18 @@ fn build_workspace_file_view(
 ) -> WorkspaceFileView {
     let language = detect_language_for_path(path).to_string();
     let (highlighted_lines, markdown_blocks) = if raw.content_kind == "text" {
-        let lines = highlight_code_lines_capped(&language, &raw.content, 2500);
-        let md = if language == "markdown" {
-            parse_markdown_blocks(&raw.content, false)
+        if language == "markdown" {
+            // Markdown opens in Preview mode by default; skip expensive upfront 2,500-line
+            // `syntect` source highlighting so large Markdown artifacts open instantaneously.
+            // Source view falls back cleanly to raw content and lazily highlights on demand.
+            let md = parse_markdown_blocks(&raw.content, false);
+            (Vec::new(), md)
         } else {
-            Vec::new()
-        };
-        (lines, md)
+            // Highlight up to 600 lines eagerly for sub-15ms first paint; FileViewerTab virtualizes
+            // all lines and lazily highlights deeper ranges via `highlight_code_snippet` when scrolled.
+            let lines = highlight_code_lines_capped(&language, &raw.content, 600);
+            (lines, Vec::new())
+        }
     } else {
         (Vec::new(), Vec::new())
     };
@@ -16844,7 +16870,19 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
             ..
         } => {
             if incoming.seq > 0 {
-                // Replace optimistic `seq == 0` UserPrompt with matching text
+                // Replace optimistic `seq == 0` UserPrompt with matching message_id first, then text
+                if !inc_mid.is_empty()
+                    && let Some((idx, opt_slot)) = list.iter_mut().enumerate().find(|(_, ev)| {
+                        ev.seq == 0
+                            && matches!(
+                                &ev.payload,
+                                TimelinePayload::UserPrompt { message_id, .. } if message_id == inc_mid
+                            )
+                    })
+                {
+                    *opt_slot = incoming;
+                    return idx;
+                }
                 if let Some((idx, opt_slot)) = list.iter_mut().enumerate().find(|(_, ev)| {
                     ev.seq == 0
                         && matches!(

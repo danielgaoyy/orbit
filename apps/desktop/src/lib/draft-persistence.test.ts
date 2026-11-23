@@ -708,4 +708,124 @@ describe("draft-persistence", () => {
       `expected tight trim preserving >= 190 chars (not halved to ~110), got ${trimmedText.length}`,
     );
   });
+
+  it("persists staged image and file context items across reloads while stripping ephemeral blob URLs", () => {
+    const storage = new MemoryStorage();
+    const fakeWindow = new FakeEventTarget();
+    const fakeDoc = new FakeEventTarget();
+    const nowMs = 1_700_000_000_000;
+
+    const slices = emptySlices();
+    slices.contextItems = {
+      "host-1::agent-img": [
+        {
+          id: "img_1",
+          kind: "image",
+          filename: "screenshot.png",
+          path: "/Users/jess/.orbit/attachments/1795_shot.png",
+          previewUrl: "blob:tauri://localhost/ephemeral-uuid",
+          sizeBytes: 42_100,
+          stagedHostId: "host-1",
+          uploading: false,
+        },
+        {
+          id: "img_pending",
+          kind: "image",
+          filename: "uploading.png",
+          path: "",
+          previewUrl: "blob:tauri://localhost/not-staged-yet",
+          sizeBytes: 1024,
+          uploading: true,
+        },
+        {
+          id: "pdf_1",
+          kind: "file",
+          path: "/Users/jess/.orbit/attachments/spec.pdf",
+          filename: "spec.pdf",
+          sizeBytes: 88_000,
+          stagedHostId: "host-1",
+          mediaKind: "pdf",
+          mimeType: "application/pdf",
+          pdfPageCount: 4,
+        },
+      ],
+    };
+
+    assert.equal(hasNonEmptyScopeDraft(slices, "host-1::agent-img"), true);
+
+    const writer = createDraftPersistenceController(() => slices, {
+      storage,
+      windowTarget: fakeWindow,
+      documentTarget: fakeDoc,
+      debounceMs: 10,
+      now: () => nowMs,
+    });
+    writer.markDirty("host-1::agent-img");
+    writer.flushNow();
+
+    const reader = createDraftPersistenceController(() => emptySlices(), {
+      storage,
+      windowTarget: fakeWindow,
+      documentTarget: fakeDoc,
+      now: () => nowMs + 1_000,
+    });
+    const hydrated = reader.hydrate();
+    const restored = hydrated.contextItems["host-1::agent-img"] ?? [];
+    assert.equal(restored.length, 2, "only staged items with non-empty path persist");
+
+    const img = restored[0];
+    assert.equal(img?.kind, "image");
+    if (img?.kind === "image") {
+      assert.equal(img.path, "/Users/jess/.orbit/attachments/1795_shot.png");
+      assert.equal(img.filename, "screenshot.png");
+      assert.equal(img.stagedHostId, "host-1");
+      assert.equal(img.sizeBytes, 42_100);
+      assert.equal(img.previewUrl, "", "ephemeral blob URL must be stripped");
+    }
+
+    const pdf = restored[1];
+    assert.equal(pdf?.kind, "file");
+    if (pdf?.kind === "file") {
+      assert.equal(pdf.path, "/Users/jess/.orbit/attachments/spec.pdf");
+      assert.equal(pdf.mediaKind, "pdf");
+      assert.equal(pdf.pdfPageCount, 4);
+    }
+
+    writer.dispose();
+    reader.dispose();
+  });
+
+  it("sheds heavy terminal_output context before compact staged image references under tight entry budget", () => {
+    const nowMs = 1_700_000_000_000;
+    const slices = emptySlices();
+    slices.contextItems = {
+      "host-1::tight": [
+        {
+          id: "term_1",
+          kind: "terminal_output",
+          label: "Terminal · 10 lines",
+          lineCount: 10,
+          content: "x".repeat(400),
+        },
+        {
+          id: "img_1",
+          kind: "image",
+          filename: "keep-me.png",
+          path: "/Users/jess/.orbit/attachments/keep-me.png",
+          previewUrl: "",
+          sizeBytes: 2048,
+          stagedHostId: "host-1",
+        },
+      ],
+    };
+
+    const payload = buildPersistedDraftPayload(
+      slices,
+      { "host-1::tight": nowMs },
+      { nowMs, maxTotalBytes: 1024, maxEntryBytes: 380 },
+    );
+    const kept = payload.drafts["host-1::tight"]?.contextItems ?? [];
+    assert.equal(kept.length, 1);
+    assert.equal(kept[0]?.kind, "image");
+  });
 });

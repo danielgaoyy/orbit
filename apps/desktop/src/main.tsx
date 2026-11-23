@@ -1,8 +1,11 @@
 // Orbit Desktop Root Entrypoint (System-Adaptive Theme + Error Boundary)
 import { Component, type ErrorInfo, type ReactNode, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { installGlobalAnimationSync } from "@/lib/animation-sync";
 import "./index.css";
 import App from "./App.tsx";
+
+installGlobalAnimationSync();
 
 class RootErrorBoundary extends Component<
   { children: ReactNode },

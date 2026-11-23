@@ -173,19 +173,19 @@ export function InstructionsSection() {
     }
     if (activeHostId === selectedHostId) {
       if (selectedAgentId && detail) {
-        const ag = detail.agents.find((a) => a.agent_id === selectedAgentId);
+        const ag = (detail.agents ?? []).find((a) => a.agent_id === selectedAgentId);
         pushDir(ag?.cwd);
       }
       pushDir(selectedWorkspaceCwd);
     }
     if (detail) {
-      for (const ws of detail.workspaces) {
+      for (const ws of detail.workspaces ?? []) {
         if (!ws.archived_at) pushDir(ws.cwd);
       }
-      for (const proj of detail.discovered_projects) {
+      for (const proj of detail.discovered_projects ?? []) {
         pushDir(proj.path);
       }
-      for (const ag of detail.agents) {
+      for (const ag of detail.agents ?? []) {
         pushDir(ag.cwd);
       }
     }
@@ -256,7 +256,7 @@ export function InstructionsSection() {
 
   const selectedEntry: InstructionFileEntry | null = useMemo(() => {
     if (!snapshot || !selectedPath) return null;
-    return snapshot.files.find((f) => f.path === selectedPath) ?? null;
+    return (snapshot.files ?? []).find((f) => f.path === selectedPath) ?? null;
   }, [snapshot, selectedPath]);
 
   const loadFile = useCallback(
@@ -279,10 +279,11 @@ export function InstructionsSection() {
       try {
         const res = await orbitIpc.readInstructionFile(hostId, cwd, entry.path);
         if (readSeqRef.current !== seq) return;
-        const isCrlf = res.content.includes("\r\n");
-        const normalized = res.content.replace(/\r\n/g, "\n");
+        const rawContent = res.content ?? "";
+        const isCrlf = rawContent.includes("\r\n");
+        const normalized = rawContent.replace(/\r\n/g, "\n");
         setLoadedLineEnding(isCrlf ? "crlf" : "lf");
-        setLoadedExists(res.exists);
+        setLoadedExists(Boolean(res.exists));
         setLoadedEtag(res.etag ?? null);
         setLoadedContent(normalized);
         if (!res.exists && opts?.prefillTemplate) {
@@ -308,14 +309,22 @@ export function InstructionsSection() {
       setListLoading(true);
       setListError(null);
       try {
-        const snap = await orbitIpc.listInstructionFiles(hostId, cwd);
+        const rawSnap = await orbitIpc.listInstructionFiles(hostId, cwd);
         if (listSeqRef.current !== seq) return;
+        const files = (rawSnap.files ?? []).map((f) => ({
+          ...f,
+          imports: Array.isArray(f.imports) ? f.imports : [],
+        }));
+        const snap: InstructionFilesSnapshotView = {
+          ...rawSnap,
+          files,
+        };
         setSnapshot(snap);
 
         const nextSelection =
-          (preferredPath && snap.files.find((f) => f.path === preferredPath)) ||
-          snap.files.find((f) => f.exists) ||
-          snap.files[0] ||
+          (preferredPath && files.find((f) => f.path === preferredPath)) ||
+          files.find((f) => f.exists) ||
+          files[0] ||
           null;
 
         if (nextSelection) {
@@ -406,9 +415,15 @@ export function InstructionsSection() {
         }, 1600);
 
         // Refresh hierarchy metadata (tokens, imports, merged_preview) without clobbering editor
-        const snap = await orbitIpc.listInstructionFiles(activeHostId, activeCwd);
+        const rawSnap = await orbitIpc.listInstructionFiles(activeHostId, activeCwd);
         if (listSeqRef.current !== saveListSeq) return;
-        setSnapshot(snap);
+        setSnapshot({
+          ...rawSnap,
+          files: (rawSnap.files ?? []).map((f) => ({
+            ...f,
+            imports: Array.isArray(f.imports) ? f.imports : [],
+          })),
+        });
       } catch (err) {
         if (readSeqRef.current !== saveReadSeq) return;
         const msg = String(err);
@@ -741,7 +756,7 @@ export function InstructionsSection() {
                           </span>
                         </div>
 
-                        {entry.imports.length > 0 && (
+                        {(entry.imports?.length ?? 0) > 0 && (
                           <div className="text-muted-foreground/75 flex items-center gap-1 pl-5 text-[10.5px]">
                             <Link2 className="h-2.5 w-2.5 shrink-0" />
                             <span>
@@ -850,13 +865,13 @@ export function InstructionsSection() {
                 </div>
 
                 {/* Resolved @import Strip */}
-                {selectedEntry.imports.length > 0 && (
+                {(selectedEntry.imports?.length ?? 0) > 0 && (
                   <div className="border-border/50 bg-muted/25 flex flex-wrap items-center gap-1.5 border-b px-3.5 py-1.5">
                     <span className="text-muted-foreground inline-flex items-center gap-1 text-[11px]">
                       <Link2 className="h-3 w-3" />
                       Imports:
                     </span>
-                    {selectedEntry.imports.map((imp) => (
+                    {(selectedEntry.imports ?? []).map((imp) => (
                       <span
                         key={imp}
                         className="border-border/60 bg-background/80 text-foreground/80 rounded border px-1.5 py-0.5 font-mono text-[10.5px]"

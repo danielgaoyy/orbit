@@ -14,6 +14,7 @@ import {
   FileSearch,
   FoldVertical,
   GripVertical,
+  Image as ImageIcon,
   Layers,
   ListTodo,
   Paperclip,
@@ -29,7 +30,6 @@ import {
   collapseStrippedToken,
   normalizePermissionMode,
 } from "@/components/composer/composer-constants";
-import { ComposerFastToggle } from "@/components/composer/composer-fast-toggle";
 import { ContextOccupancyPill } from "@/components/composer/context-occupancy-pill";
 import { ComposerHeroHeader } from "@/components/composer/composer-hero-header";
 import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
@@ -55,6 +55,7 @@ import {
   type GitFileEntry,
   type ManagedSkillRecord,
   type MentionCandidateView,
+  type PromptBadge,
   type QueuedPromptView,
   type SessionMode,
   type SlashCommandView,
@@ -64,6 +65,11 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
+  getCachedPromptImage,
+  loadPromptImage,
+  lookupRecentSentTurnImage,
+} from "@/lib/prompt-image-cache";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -71,6 +77,7 @@ import {
   DropdownMenuTrigger,
   SimpleTooltip,
 } from "@/components/ui/overlays";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   type ContextMentionItem,
   type DiffQuoteSnippet,
@@ -94,6 +101,98 @@ const EMPTY_FILES: readonly string[] = [];
 const EMPTY_GIT_FILES: readonly GitFileEntry[] = [];
 const EMPTY_MENTIONS: MentionCandidateView[] = [];
 const EMPTY_MANAGED_SKILLS: readonly ManagedSkillRecord[] = [];
+const MAX_QUEUED_IMAGE_THUMBS = 3;
+
+/**
+ * Compact `20×20` inline image thumbnail for queued follow-up rows.
+ * Sized strictly inside the `28px` queue row so rows with and without images share identical height.
+ */
+const QueuedImageThumb = memo(function QueuedImageThumb({
+  badge,
+  displayText,
+  imageIndex,
+  hostId,
+  agentId,
+  cwd,
+  overflowCount = 0,
+  tooltip,
+}: {
+  badge: PromptBadge;
+  displayText: string;
+  imageIndex: number;
+  hostId: string;
+  agentId: string | null;
+  cwd: string;
+  overflowCount?: number;
+  tooltip: string;
+}) {
+  const recent = useMemo(
+    () =>
+      !badge.path
+        ? lookupRecentSentTurnImage(hostId, agentId, displayText, imageIndex, badge.label)
+        : null,
+    [badge.path, badge.label, displayText, imageIndex, hostId, agentId],
+  );
+  const effectivePath = badge.path?.trim() || recent?.path?.trim() || null;
+
+  const resolveSyncUrl = (): string | null => {
+    if (effectivePath && hostId) {
+      const cached = getCachedPromptImage(hostId, effectivePath);
+      if (cached?.status === "ready") return cached.url;
+    }
+    return recent?.previewUrl ?? null;
+  };
+
+  const [url, setUrl] = useState<string | null>(resolveSyncUrl);
+
+  useEffect(() => {
+    const sync = resolveSyncUrl();
+    if (sync) {
+      setUrl(sync);
+      return;
+    }
+    if (!effectivePath || !hostId) {
+      setUrl(null);
+      return;
+    }
+    let cancelled = false;
+    void loadPromptImage(hostId, cwd || "~", effectivePath).then((entry) => {
+      if (cancelled) return;
+      if (entry.status === "ready") {
+        setUrl(entry.url);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostId, agentId, cwd, effectivePath, badge.label]);
+
+  return (
+    <span
+      title={tooltip}
+      className="bg-muted/70 relative inline-flex size-[20px] shrink-0 items-center justify-center overflow-hidden rounded-[5px] border border-black/[0.08] dark:border-white/[0.11]"
+    >
+      {url ? (
+        <img
+          src={url}
+          alt={badge.label}
+          decoding="async"
+          draggable={false}
+          onError={() => setUrl(null)}
+          className="size-full object-cover"
+        />
+      ) : (
+        <ImageIcon className="text-muted-foreground/70 size-3 stroke-[1.7]" />
+      )}
+      {overflowCount > 0 && (
+        <span className="tabular-nums absolute inset-0 flex items-center justify-center bg-black/55 font-mono text-[9.5px] leading-none font-semibold text-white">
+          +{overflowCount}
+        </span>
+      )}
+    </span>
+  );
+});
 const EMPTY_INLINE_MENTIONS: readonly InlineMentionTarget[] = [];
 
 const IMAGE_URI_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|svg|avif|ico)(?:[?#].*)?$/i;
@@ -537,8 +636,27 @@ export const OmniComposer = memo(function OmniComposer({
   }, [draftText, scopeKey, slashDirective, directiveIndentPx, composerWidthPx]);
 
   useEffect(() => {
-    return orbitActions.onComposerFocusRequest(() => {
-      textareaRef.current?.focus();
+    return orbitActions.onComposerFocusRequest((opts) => {
+      const el = textareaRef.current;
+      if (!el) return;
+      const active = document.activeElement;
+      if (
+        opts?.onlyIfIdle &&
+        active instanceof HTMLElement &&
+        active !== el &&
+        (active.tagName === "INPUT" ||
+          active.tagName === "TEXTAREA" ||
+          active.tagName === "SELECT" ||
+          active.isContentEditable)
+      ) {
+        return;
+      }
+      const wasFocused = active === el;
+      el.focus({ preventScroll: true });
+      if (!wasFocused) {
+        const end = el.value.length;
+        el.setSelectionRange(end, end);
+      }
     });
   }, []);
 
@@ -1278,10 +1396,18 @@ export const OmniComposer = memo(function OmniComposer({
           }}
         />
 
-        {/* Queued Follow-Up Strip when Agent is Running */}
+        {/* Queued Follow-Up Strip when Agent is Running (fits 5 rows cleanly, scrolls beyond 5 with dedicated scrollbar gutter) */}
         {queued.length > 0 && (
-          <div className="approval-dock-surface orbit-stage-enter space-y-0.5 rounded-[14px] px-2 py-1.5 text-[12.5px]">
-            {queued.map((qItem, idx) => {
+          <div className="approval-dock-surface orbit-stage-enter overflow-hidden rounded-[14px] text-[12.5px]">
+            <ScrollArea
+              className="w-full"
+              viewportClassName={cn(
+                "max-h-[160px] overscroll-contain py-1.5 pl-2",
+                queued.length > 5 ? "pr-3.5" : "pr-2",
+              )}
+              contentClassName="space-y-0.5"
+            >
+              {queued.map((qItem, idx) => {
               const canDrag = queued.length > 1;
               const isDragged = queueDrag !== null && queueDrag.fromIndex === idx;
               let translateY = 0;
@@ -1303,9 +1429,23 @@ export const OmniComposer = memo(function OmniComposer({
                 }
               }
 
-              const visibleBadges = qItem.badges.slice(0, 2);
-              const hiddenBadgeCount = Math.max(0, qItem.badges.length - visibleBadges.length);
-              const hasDisplayText = Boolean(qItem.displayText?.trim());
+              const imageBadges = qItem.badges.filter((b) => b.kind === "image");
+              const otherBadges = qItem.badges.filter((b) => b.kind !== "image");
+              const visibleImages = imageBadges.slice(0, MAX_QUEUED_IMAGE_THUMBS);
+              const extraImageCount = Math.max(0, imageBadges.length - MAX_QUEUED_IMAGE_THUMBS);
+              const visibleOtherBadges = otherBadges.slice(0, 2);
+              const hiddenOtherBadgeCount = Math.max(
+                0,
+                otherBadges.length - visibleOtherBadges.length,
+              );
+              const trimmedDisplayText = qItem.displayText?.trim() ?? "";
+              const hasDisplayText = trimmedDisplayText.length > 0;
+              const imageOnlyLabel =
+                !hasDisplayText && otherBadges.length === 0 && imageBadges.length > 0
+                  ? imageBadges.length === 1
+                    ? "1 image"
+                    : `${imageBadges.length} images`
+                  : "";
 
               return (
                 <div
@@ -1350,7 +1490,32 @@ export const OmniComposer = memo(function OmniComposer({
                     ) : (
                       <CornerDownRight className="text-muted-foreground/60 size-3.5 shrink-0 stroke-[1.8]" />
                     )}
-                    {visibleBadges.map((b, bIdx) => (
+                    {visibleImages.length > 0 && (
+                      <div className="flex shrink-0 items-center gap-1">
+                        {visibleImages.map((imgBadge, imgIdx) => {
+                          const isLastWithOverflow =
+                            imgIdx === visibleImages.length - 1 && extraImageCount > 0;
+                          return (
+                            <QueuedImageThumb
+                              key={`qimg-${imgBadge.path ?? imgBadge.label}-${imgIdx}`}
+                              badge={imgBadge}
+                              displayText={trimmedDisplayText}
+                              imageIndex={imgIdx}
+                              hostId={selectedHostId}
+                              agentId={selectedAgentId}
+                              cwd={selectedCwd || "~"}
+                              overflowCount={isLastWithOverflow ? extraImageCount : 0}
+                              tooltip={
+                                isLastWithOverflow
+                                  ? `${imageBadges.length} images attached`
+                                  : imgBadge.label
+                              }
+                            />
+                          );
+                        })}
+                      </div>
+                    )}
+                    {visibleOtherBadges.map((b, bIdx) => (
                       <span
                         key={`${b.kind}-${bIdx}`}
                         title={b.label}
@@ -1362,22 +1527,26 @@ export const OmniComposer = memo(function OmniComposer({
                         {b.label}
                       </span>
                     ))}
-                    {hiddenBadgeCount > 0 && (
+                    {hiddenOtherBadgeCount > 0 && (
                       <span
-                        title={qItem.badges.map((b) => b.label).join(", ")}
+                        title={otherBadges.map((b) => b.label).join(", ")}
                         className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 font-mono text-[10.5px]"
                       >
-                        +{hiddenBadgeCount}
+                        +{hiddenOtherBadgeCount}
                       </span>
                     )}
-                    {qItem.displayText && (
+                    {hasDisplayText ? (
                       <span
                         title={qItem.displayText}
                         className="text-foreground/86 min-w-[64px] flex-1 truncate"
                       >
                         {qItem.displayText}
                       </span>
-                    )}
+                    ) : imageOnlyLabel ? (
+                      <span className="text-foreground/82 min-w-[48px] flex-1 truncate">
+                        {imageOnlyLabel}
+                      </span>
+                    ) : null}
                   </div>
                   <div
                     className={cn(
@@ -1416,6 +1585,7 @@ export const OmniComposer = memo(function OmniComposer({
                 </div>
               );
             })}
+            </ScrollArea>
           </div>
         )}
 
@@ -1654,6 +1824,7 @@ export const OmniComposer = memo(function OmniComposer({
                   }
                 }}
                 onPaste={handlePaste}
+                onBlur={ime.reset}
                 {...ime.compositionProps}
                 onKeyDown={handleKeyDown}
                 rows={1}
@@ -1712,14 +1883,13 @@ export const OmniComposer = memo(function OmniComposer({
                   </DropdownMenuContent>
                 </DropdownMenu>
 
-                {/* 2. Isolated Agent + Model + Thinking Mode Selector + Subtle Fast Toggle */}
+                {/* 2. Isolated Agent + Model + Thinking / Fast Selector */}
                 <ComposerModelPicker />
-                <ComposerFastToggle iconOnly={isCompactBar} />
               </div>
 
-              {/* Right Cluster: Context Occupancy Pill + Access Permissions Selector + `34×34` Primary Action Circle */}
-              <div className="flex shrink-0 items-center gap-1.5">
-                <ContextOccupancyPill compact={isCompactBar} />
+              {/* Right Cluster: Ambient Context Ring + Access Permissions Selector + `34×34` Primary Action Circle */}
+              <div className="flex shrink-0 items-center gap-1">
+                <ContextOccupancyPill />
                 <ComposerModePicker
                   mode={activeMode}
                   onSelectMode={handleSelectMode}

@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
   AlertTriangle,
@@ -21,7 +22,7 @@ import {
   WrapText,
   X,
 } from "lucide-react";
-import type { LspDiagnostic } from "@/lib/orbit-ipc";
+import { type HighlightedLineView, type LspDiagnostic, orbitIpc } from "@/lib/orbit-ipc";
 import {
   MarkdownBlocksView,
   MarkdownLinkProvider,
@@ -97,6 +98,9 @@ export const FileViewerTab = memo(function FileViewerTab({
   const [activeMatchIdx, setActiveMatchIdx] = useState(0);
   const [renderedLineCap, setRenderedLineCap] = useState(800);
   const [diagDrawerOpen, setDiagDrawerOpen] = useState(false);
+  const [lazyHighlights, setLazyHighlights] = useState<Record<number, HighlightedLineView>>({});
+  const lazyHighlightRequestedChunksRef = useRef<Set<number>>(new Set());
+  const lazyHighlightSeqRef = useRef(0);
   const [editorJumpTarget, setEditorJumpTarget] = useState<{
     line: number;
     col?: number;
@@ -105,6 +109,7 @@ export const FileViewerTab = memo(function FileViewerTab({
 
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const logViewportRef = useRef<HTMLDivElement | null>(null);
+  const codeViewportRef = useRef<HTMLDivElement | null>(null);
   const lineRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const ime = useImeCompositionGuard();
   const mod = modSymbol();
@@ -112,6 +117,9 @@ export const FileViewerTab = memo(function FileViewerTab({
   useEffect(() => {
     setRenderedLineCap(800);
     setLogFollow(isTaskLogPath);
+    lazyHighlightSeqRef.current += 1;
+    lazyHighlightRequestedChunksRef.current.clear();
+    setLazyHighlights({});
   }, [hostId, cwd, path, isTaskLogPath]);
 
   useEffect(() => {
@@ -163,10 +171,21 @@ export const FileViewerTab = memo(function FileViewerTab({
       relPath,
   );
 
+  // Defer LSP diagnostics slightly so panel slide-in & initial file paint complete without jank
   useEffect(() => {
     if (!isLspEligible) return;
-    void orbitActions.loadFileDiagnostics(hostId, cwd, path, true);
+    const timer = window.setTimeout(() => {
+      void orbitActions.loadFileDiagnostics(hostId, cwd, path, true);
+    }, 260);
+    return () => window.clearTimeout(timer);
   }, [isLspEligible, hostId, cwd, path, data?.etag]);
+
+  // Reset lazy highlight overlays whenever file content/etag changes
+  useEffect(() => {
+    lazyHighlightSeqRef.current += 1;
+    lazyHighlightRequestedChunksRef.current.clear();
+    setLazyHighlights({});
+  }, [data?.etag, data?.resolved_path]);
 
   const diagCounts = useMemo(() => {
     let errors = 0;
@@ -278,23 +297,118 @@ export const FileViewerTab = memo(function FileViewerTab({
     );
   }, [gitStatusFiles, relPath, path]);
 
+  // Build virtualized code lines lazily:
+  // - Non-markdown text files receive pre-highlighted initial lines from Rust (`data.highlighted_lines`).
+  // - Markdown files skip upfront `syntect` when opening in Preview mode; plain lines are materialized
+  //   only if the user switches to Source view, with visible chunks highlighted lazily in the background.
+  const isCodeViewActive = Boolean(
+    data &&
+      data.content_kind === "text" &&
+      !isLogFile &&
+      !isEditMode &&
+      (!isMarkdown || markdownMode === "source"),
+  );
+
+  const baseCodeLines = useMemo<readonly HighlightedLineView[]>(() => {
+    if (!isCodeViewActive || !data) return [];
+    if (data.highlighted_lines.length > 0) {
+      return data.highlighted_lines;
+    }
+    const raw = data.content.split(/\r?\n/);
+    return raw.map((text, idx) => ({
+      line_number: idx + 1,
+      tokens: text.length > 0 ? [{ text, fg_hex: "#E2E8F0", bold: false, italic: false }] : [],
+    }));
+  }, [isCodeViewActive, data]);
+
+  const codeVirtualizer = useVirtualizer({
+    count: isCodeViewActive ? baseCodeLines.length : 0,
+    getScrollElement: () => codeViewportRef.current,
+    estimateSize: () => 20,
+    overscan: 28,
+  });
+
+  const virtualCodeItems = codeVirtualizer.getVirtualItems();
+
+  // Lazily syntax-highlight unhighlighted visible 250-line chunks (e.g. lines > 600 or Markdown Source)
+  const firstVisibleIdx = virtualCodeItems[0]?.index ?? -1;
+  const lastVisibleIdx = virtualCodeItems[virtualCodeItems.length - 1]?.index ?? -1;
+  useEffect(() => {
+    if (!isCodeViewActive || !data || data.language === "text" || firstVisibleIdx < 0) return;
+    const CHUNK_SIZE = 250;
+    const startChunk = Math.floor(firstVisibleIdx / CHUNK_SIZE);
+    const endChunk = Math.floor(Math.max(firstVisibleIdx, lastVisibleIdx) / CHUNK_SIZE);
+    const missingChunks: number[] = [];
+
+    for (let c = startChunk; c <= endChunk; c += 1) {
+      if (lazyHighlightRequestedChunksRef.current.has(c)) continue;
+      const chunkStart = c * CHUNK_SIZE;
+      const chunkEnd = Math.min(baseCodeLines.length, chunkStart + CHUNK_SIZE);
+      // Skip chunks that already came pre-highlighted from Rust (non-markdown first 600 lines)
+      if (data.highlighted_lines.length > 0 && chunkEnd <= 600) {
+        lazyHighlightRequestedChunksRef.current.add(c);
+        continue;
+      }
+      if (chunkStart < chunkEnd) {
+        missingChunks.push(c);
+      }
+    }
+    if (missingChunks.length === 0) return;
+
+    const reqSeq = lazyHighlightSeqRef.current;
+    const timer = window.setTimeout(() => {
+      for (const c of missingChunks) {
+        if (lazyHighlightRequestedChunksRef.current.has(c)) continue;
+        lazyHighlightRequestedChunksRef.current.add(c);
+        const chunkStart = c * CHUNK_SIZE;
+        const chunkEnd = Math.min(baseCodeLines.length, chunkStart + CHUNK_SIZE);
+        const chunkText = baseCodeLines
+          .slice(chunkStart, chunkEnd)
+          .map((l) => l.tokens.map((t) => t.text).join(""))
+          .join("\n");
+        void orbitIpc
+          .highlightWorkspaceCode(data.language, chunkText, CHUNK_SIZE)
+          .then((highlighted) => {
+            if (lazyHighlightSeqRef.current !== reqSeq) return;
+            setLazyHighlights((prev) => {
+              const next = { ...prev };
+              for (let i = 0; i < highlighted.length; i += 1) {
+                const lineNum = chunkStart + i + 1;
+                next[lineNum] = {
+                  line_number: lineNum,
+                  tokens: highlighted[i].tokens,
+                };
+              }
+              return next;
+            });
+          })
+          .catch(() => {
+            lazyHighlightRequestedChunksRef.current.delete(c);
+          });
+      }
+    }, 60);
+
+    return () => window.clearTimeout(timer);
+  }, [isCodeViewActive, data, baseCodeLines, firstVisibleIdx, lastVisibleIdx]);
+
+  // Compute lowercase search buffer strictly on demand when Find bar is actively searching
+  const activeSearchQuery = findOpen ? findQuery.trim().toLowerCase() : "";
   const rawLowerLines = useMemo(() => {
-    if (!data || data.content_kind !== "text") return [];
+    if (!activeSearchQuery || !data || data.content_kind !== "text") return [];
     if (isLogFile) return logLines.map((l) => l.plain.toLowerCase());
     return data.content.split(/\r?\n/).map((l) => l.toLowerCase());
-  }, [data, isLogFile, logLines]);
+  }, [activeSearchQuery, data, isLogFile, logLines]);
 
   const matchLineNumbers = useMemo(() => {
-    const q = findQuery.trim().toLowerCase();
-    if (!q || rawLowerLines.length === 0) return [];
+    if (!activeSearchQuery || rawLowerLines.length === 0) return [];
     const matched: number[] = [];
     for (let i = 0; i < rawLowerLines.length; i += 1) {
-      if (rawLowerLines[i].includes(q)) {
+      if (rawLowerLines[i].includes(activeSearchQuery)) {
         matched.push(i + 1);
       }
     }
     return matched;
-  }, [findQuery, rawLowerLines]);
+  }, [activeSearchQuery, rawLowerLines]);
 
   const matchLineSet = useMemo(() => new Set(matchLineNumbers), [matchLineNumbers]);
 
@@ -312,17 +426,22 @@ export const FileViewerTab = memo(function FileViewerTab({
       ? activeTargetLine
       : (focusRange.endLine ?? focusRange.startLine);
 
-  // Ensure line window expands automatically to reach any requested focus range or find match
+  // Only log viewer uses `renderedLineCap`; code viewer is fully virtualized (O(1) jump to any line)
   useEffect(() => {
-    if (requiredMaxLine && requiredMaxLine > renderedLineCap) {
+    if (isLogFile && requiredMaxLine && requiredMaxLine > renderedLineCap) {
       setRenderedLineCap(requiredMaxLine + 200);
     }
-  }, [requiredMaxLine, renderedLineCap]);
+  }, [isLogFile, requiredMaxLine, renderedLineCap]);
 
-  // Scroll to requested line or active find match once DOM nodes finish layout
+  // Scroll to requested line or active find match (O(1) virtualizer jump for code, DOM scroll for logs)
   useEffect(() => {
     if (!activeTargetLine || isEditMode) return;
     const rafId = window.requestAnimationFrame(() => {
+      if (isCodeViewActive && baseCodeLines.length > 0) {
+        const clampedIdx = Math.max(0, Math.min(activeTargetLine - 1, baseCodeLines.length - 1));
+        codeVirtualizer.scrollToIndex(clampedIdx, { align: "center" });
+        return;
+      }
       const node = lineRefs.current.get(activeTargetLine);
       if (node) {
         node.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -336,6 +455,9 @@ export const FileViewerTab = memo(function FileViewerTab({
     markdownMode,
     renderedLineCap,
     isEditMode,
+    isCodeViewActive,
+    baseCodeLines.length,
+    codeVirtualizer,
   ]);
 
   const handleCopyContent = async () => {
@@ -465,7 +587,7 @@ export const FileViewerTab = memo(function FileViewerTab({
               className="size-[6px] shrink-0 rounded-full bg-amber-500/90"
             />
           )}
-          {data && (
+          {data && (isLogFile || isMarkdown || data.content_kind !== "text") && (
             <span className="text-muted-foreground/75 tabular-nums shrink-0 text-[11px]">
               {isLogFile
                 ? `${logLines.length.toLocaleString()} lines · ${formatFileSizeCompact(data.size_bytes)}`
@@ -520,6 +642,14 @@ export const FileViewerTab = memo(function FileViewerTab({
                 const targetLine = focusRange.startLine;
                 if (targetLine == null) return;
                 window.requestAnimationFrame(() => {
+                  if (isCodeViewActive && baseCodeLines.length > 0) {
+                    const clampedIdx = Math.max(
+                      0,
+                      Math.min(targetLine - 1, baseCodeLines.length - 1),
+                    );
+                    codeVirtualizer.scrollToIndex(clampedIdx, { align: "center" });
+                    return;
+                  }
                   const node = lineRefs.current.get(targetLine);
                   node?.scrollIntoView({ block: "center", behavior: "smooth" });
                 });
@@ -1099,180 +1229,185 @@ export const FileViewerTab = memo(function FileViewerTab({
           )}
         </div>
       ) : (
-        <ScrollArea
-          orientation="both"
-          className="bg-canvas min-h-0 flex-1"
-          viewportClassName="selectable-text py-2.5 font-mono text-[12px] leading-[1.6]"
-        >
-          {data.truncated && (
-            <div className="border-border text-muted-foreground mx-3 mb-2 rounded-lg border bg-amber-500/[0.06] px-3 py-1.5 font-sans text-[11.5px]">
-              Showing initial preview — file exceeds transfer cap ({formatFileSizeCompact(data.size_bytes)}).
-            </div>
-          )}
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <ScrollArea
+            orientation="both"
+            viewportRef={codeViewportRef}
+            className="bg-canvas min-h-0 flex-1"
+            viewportClassName="selectable-text py-2.5 font-mono text-[12px] leading-[20px]"
+          >
+            {data.truncated && (
+              <div className="border-border text-muted-foreground mx-3 mb-2 rounded-lg border bg-amber-500/[0.06] px-3 py-1.5 font-sans text-[11.5px]">
+                Showing initial preview — file exceeds transfer cap ({formatFileSizeCompact(data.size_bytes)}).
+              </div>
+            )}
 
-          {data.highlighted_lines.slice(0, renderedLineCap).map((line) => {
-            const isMatched = matchLineSet.has(line.line_number);
-            const isRangeFocused =
-              matchLineNumbers.length === 0 &&
-              focusRange.startLine != null &&
-              line.line_number >= focusRange.startLine &&
-              line.line_number <= (focusRange.endLine ?? focusRange.startLine);
-            const isFocused =
-              (matchLineNumbers.length > 0 &&
-                matchLineNumbers[Math.min(activeMatchIdx, matchLineNumbers.length - 1)] ===
-                  line.line_number) ||
-              isRangeFocused;
-            const rawLineText = line.tokens.map((t) => t.text).join("");
-            const lineDiag = diagByLine.get(line.line_number);
-            let runningCol = 1;
-
-            return (
-              <div
-                key={line.line_number}
-                ref={(el) => {
-                  if (el) lineRefs.current.set(line.line_number, el);
-                  else lineRefs.current.delete(line.line_number);
-                }}
-                onDoubleClick={() => {
-                  if (isEditable) {
-                    setFindOpen(false);
-                    orbitActions.enterFileEditMode(hostId, cwd, path);
+            <div
+              style={{ height: `${codeVirtualizer.getTotalSize()}px` }}
+              onClick={(e) => {
+                if (
+                  !isLspEligible ||
+                  !(e.metaKey || e.ctrlKey) ||
+                  e.shiftKey ||
+                  e.altKey
+                ) {
+                  return;
+                }
+                const targetEl = (e.target as HTMLElement | null)?.closest<HTMLElement>(
+                  "[data-tok-col]",
+                );
+                if (!targetEl) return;
+                const lineNum = Number(targetEl.dataset.tokLine);
+                const tokStartCol = Number(targetEl.dataset.tokCol);
+                const tokText = targetEl.textContent ?? "";
+                if (!Number.isFinite(lineNum) || !Number.isFinite(tokStartCol) || !tokText.trim()) {
+                  return;
+                }
+                e.preventDefault();
+                e.stopPropagation();
+                let offsetInTok = Math.floor(tokText.length / 2);
+                const doc = document as Document & {
+                  caretPositionFromPoint?: (
+                    x: number,
+                    y: number,
+                  ) => { offsetNode: Node; offset: number } | null;
+                  caretRangeFromPoint?: (x: number, y: number) => Range | null;
+                };
+                const caretPos = doc.caretPositionFromPoint?.(e.clientX, e.clientY);
+                if (
+                  caretPos &&
+                  targetEl.contains(caretPos.offsetNode) &&
+                  Number.isFinite(caretPos.offset)
+                ) {
+                  offsetInTok = Math.max(
+                    0,
+                    Math.min(caretPos.offset, Math.max(0, tokText.length - 1)),
+                  );
+                } else {
+                  const caretRange = doc.caretRangeFromPoint?.(e.clientX, e.clientY);
+                  if (
+                    caretRange &&
+                    targetEl.contains(caretRange.startContainer) &&
+                    Number.isFinite(caretRange.startOffset)
+                  ) {
+                    offsetInTok = Math.max(
+                      0,
+                      Math.min(caretRange.startOffset, Math.max(0, tokText.length - 1)),
+                    );
                   }
-                }}
-                className={cn(
-                  "group/fln flex min-w-fit items-start px-2 transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.035]",
-                  isFocused && "bg-primary/[0.12] shadow-[inset_2px_0_0_0_var(--color-primary)]",
-                  !isFocused && isMatched && "bg-amber-500/[0.12]",
-                )}
-              >
-                <span
-                  title={lineDiag ? `${lineDiag.severity}: ${lineDiag.message}` : undefined}
-                  className="tabular-nums inline-flex min-w-[2.75rem] shrink-0 items-center justify-end gap-1 pr-2 text-right text-[11px] text-zinc-400 select-none dark:text-zinc-600"
-                >
-                  {lineDiag && (
+                }
+                handleGotoDefinition(lineNum, Math.max(1, tokStartCol + offsetInTok));
+              }}
+              className="relative min-w-full"
+            >
+              {virtualCodeItems.map((vRow) => {
+                const baseLine = baseCodeLines[vRow.index];
+                if (!baseLine) return null;
+                const line = lazyHighlights[baseLine.line_number] ?? baseLine;
+                const isMatched = matchLineSet.has(line.line_number);
+                const isRangeFocused =
+                  matchLineNumbers.length === 0 &&
+                  focusRange.startLine != null &&
+                  line.line_number >= focusRange.startLine &&
+                  line.line_number <= (focusRange.endLine ?? focusRange.startLine);
+                const isFocused =
+                  (matchLineNumbers.length > 0 &&
+                    matchLineNumbers[Math.min(activeMatchIdx, matchLineNumbers.length - 1)] ===
+                      line.line_number) ||
+                  isRangeFocused;
+                const lineDiag = diagByLine.get(line.line_number);
+                let runningCol = 1;
+
+                return (
+                  <div
+                    key={line.line_number}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      height: `${vRow.size}px`,
+                      transform: `translate3d(0, ${vRow.start}px, 0)`,
+                    }}
+                    onDoubleClick={() => {
+                      if (isEditable) {
+                        setFindOpen(false);
+                        orbitActions.enterFileEditMode(hostId, cwd, path);
+                      }
+                    }}
+                    className={cn(
+                      "group/fln flex h-[20px] min-w-fit items-center px-2 transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.035]",
+                      isFocused &&
+                        "bg-primary/[0.12] shadow-[inset_2px_0_0_0_var(--color-primary)]",
+                      !isFocused && isMatched && "bg-amber-500/[0.12]",
+                    )}
+                  >
                     <span
-                      className={cn(
-                        "size-[5px] shrink-0 rounded-full",
-                        lineDiag.severity === "error"
-                          ? "bg-rose-500"
-                          : lineDiag.severity === "warning"
-                            ? "bg-amber-500"
-                            : "bg-sky-500",
+                      title={lineDiag ? `${lineDiag.severity}: ${lineDiag.message}` : undefined}
+                      className="tabular-nums inline-flex min-w-[2.75rem] shrink-0 items-center justify-end gap-1 pr-2 text-right text-[11px] text-zinc-400 select-none dark:text-zinc-600"
+                    >
+                      {lineDiag && (
+                        <span
+                          className={cn(
+                            "size-[5px] shrink-0 rounded-full",
+                            lineDiag.severity === "error"
+                              ? "bg-rose-500"
+                              : lineDiag.severity === "warning"
+                                ? "bg-amber-500"
+                                : "bg-sky-500",
+                          )}
+                        />
                       )}
-                    />
-                  )}
-                  <span>{line.line_number}</span>
-                </span>
-                <button
-                  type="button"
-                  title="Quote line into Composer"
-                  onClick={() =>
-                    orbitActions.quoteDiffLineToComposer(relPath, line.line_number, rawLineText)
-                  }
-                  className="text-muted-foreground hover:text-foreground mt-[2px] mr-1.5 inline-flex h-[16px] w-[16px] shrink-0 cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover/fln:opacity-100 hover:bg-black/[0.08] dark:hover:bg-white/[0.12]"
-                >
-                  <MessageSquarePlus className="h-[11.5px] w-[11.5px]" />
-                </button>
-                <span className="pr-4 whitespace-pre">
-                  {line.tokens.length === 0
-                    ? " "
-                    : line.tokens.map((tok, idx) => {
-                        const tokStartCol = runningCol;
-                        runningCol += tok.text.length;
-                        return (
-                          <span
-                            key={idx}
-                            onClick={(e) => {
-                              if (
-                                !isLspEligible ||
-                                !(e.metaKey || e.ctrlKey) ||
-                                e.shiftKey ||
-                                e.altKey
-                              ) {
-                                return;
-                              }
-                              if (!tok.text.trim()) return;
-                              e.preventDefault();
-                              e.stopPropagation();
-                              let offsetInTok = Math.floor(tok.text.length / 2);
-                              const doc = document as Document & {
-                                caretPositionFromPoint?: (
-                                  x: number,
-                                  y: number,
-                                ) => { offsetNode: Node; offset: number } | null;
-                                caretRangeFromPoint?: (x: number, y: number) => Range | null;
-                              };
-                              const caretPos = doc.caretPositionFromPoint?.(e.clientX, e.clientY);
-                              if (
-                                caretPos &&
-                                e.currentTarget.contains(caretPos.offsetNode) &&
-                                Number.isFinite(caretPos.offset)
-                              ) {
-                                offsetInTok = Math.max(
-                                  0,
-                                  Math.min(caretPos.offset, Math.max(0, tok.text.length - 1)),
-                                );
-                              } else {
-                                const caretRange = doc.caretRangeFromPoint?.(e.clientX, e.clientY);
-                                if (
-                                  caretRange &&
-                                  e.currentTarget.contains(caretRange.startContainer) &&
-                                  Number.isFinite(caretRange.startOffset)
-                                ) {
-                                  offsetInTok = Math.max(
-                                    0,
-                                    Math.min(
-                                      caretRange.startOffset,
-                                      Math.max(0, tok.text.length - 1),
-                                    ),
-                                  );
-                                }
-                              }
-                              handleGotoDefinition(
-                                line.line_number,
-                                Math.max(1, tokStartCol + offsetInTok),
-                              );
-                            }}
-                            style={{
-                              color: adaptTokenColor(tok.fg_hex, isDark),
-                              fontWeight: tok.bold ? 600 : undefined,
-                              fontStyle: tok.italic ? "italic" : undefined,
-                            }}
-                          >
-                            {tok.text}
-                          </span>
-                        );
-                      })}
-                </span>
-              </div>
-            );
-          })}
-
-          {data.highlighted_lines.length > renderedLineCap && (
-            <div className="mx-3 mt-3 flex items-center justify-between gap-2 rounded-lg border border-black/[0.08] bg-black/[0.02] px-3 py-2 font-sans text-[11.5px] dark:border-white/[0.08] dark:bg-white/[0.02]">
-              <span className="text-muted-foreground tabular-nums">
-                Showing {renderedLineCap.toLocaleString()} of{" "}
-                {data.highlighted_lines.length.toLocaleString()} lines
-              </span>
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => setRenderedLineCap((c) => c + 1200)}
-                  className="border-border bg-elevated text-foreground hover:bg-accent cursor-pointer rounded-md border px-2 py-0.5 font-medium transition-colors"
-                >
-                  Load more
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setRenderedLineCap(data.highlighted_lines.length)}
-                  className="text-muted-foreground hover:text-foreground cursor-pointer rounded-md px-2 py-0.5 transition-colors"
-                >
-                  Show all
-                </button>
-              </div>
+                      <span>{line.line_number}</span>
+                    </span>
+                    <button
+                      type="button"
+                      title="Quote line into Composer"
+                      onClick={() => {
+                        const rawLineText = line.tokens.map((t) => t.text).join("");
+                        orbitActions.quoteDiffLineToComposer(relPath, line.line_number, rawLineText);
+                      }}
+                      className="text-muted-foreground hover:text-foreground mr-1.5 inline-flex h-[16px] w-[16px] shrink-0 cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover/fln:opacity-100 hover:bg-black/[0.08] dark:hover:bg-white/[0.12]"
+                    >
+                      <MessageSquarePlus className="h-[11.5px] w-[11.5px]" />
+                    </button>
+                    <span className="pr-4 whitespace-pre">
+                      {line.tokens.length === 0
+                        ? " "
+                        : line.tokens.map((tok, idx) => {
+                            const tokStartCol = runningCol;
+                            runningCol += tok.text.length;
+                            return (
+                              <span
+                                key={idx}
+                                data-tok-line={isLspEligible ? line.line_number : undefined}
+                                data-tok-col={isLspEligible ? tokStartCol : undefined}
+                                style={{
+                                  color: adaptTokenColor(tok.fg_hex, isDark),
+                                  fontWeight: tok.bold ? 600 : undefined,
+                                  fontStyle: tok.italic ? "italic" : undefined,
+                                }}
+                              >
+                                {tok.text}
+                              </span>
+                            );
+                          })}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
-          )}
-        </ScrollArea>
+          </ScrollArea>
+
+          {/* Subtle bottom metadata strip (keeps top 36px breadcrumb bar airy & restrained) */}
+          <div className="border-border/60 text-muted-foreground/70 tabular-nums flex h-[22px] shrink-0 items-center justify-between gap-2 border-t px-3 font-mono text-[10.5px] select-none">
+            <span>{baseCodeLines.length.toLocaleString()} lines</span>
+            <div className="flex items-center gap-2.5">
+              <span>{data.language.toUpperCase()}</span>
+              <span>{formatFileSizeCompact(data.size_bytes)}</span>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

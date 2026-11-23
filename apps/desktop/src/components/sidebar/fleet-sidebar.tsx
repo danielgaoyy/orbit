@@ -718,7 +718,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const hasFilterActive = sidebarThreadFilter === "active_unread";
 
   return (
-    <aside className="bg-sidebar border-border flex h-full w-full flex-col border-r [contain:layout_style] select-none">
+    <aside className="bg-sidebar border-border flex h-full w-full flex-col border-r select-none">
       {/* 1. Native Window Titlebar Drag Strip (`40px`; single stationary `[◫]` button lives in shell) */}
       <div data-tauri-drag-region className="h-[40px] shrink-0" />
 
@@ -1065,7 +1065,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
               {hasFilterActive ? "No active or unread conversations" : "No projects yet"}
             </div>
           ) : (
-            <div className="space-y-1">
+            <div className="space-y-0.5">
               {displayProjects.map(({ project: proj, host, visibleConversations }) => {
                 const collapsed = Boolean(collapsedProjectIds[proj.id]);
                 const projMenuOpen = projMenu?.project.id === proj.id;
@@ -1563,7 +1563,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             )}
                           </div>
                         ) : (
-                          <div className="space-y-0.5 pt-0.5">
+                          <div className="space-y-0.5 py-0.5">
                             {/* 1. Optional Groups (borderless, lightweight collapsible sections — zero chrome when none exist) */}
                             {curatedWorkspaces.map((ws) => {
                               const wsCollapsed = Boolean(collapsedWorkspaceIds[ws.workspace_id]);
@@ -1928,7 +1928,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       </ScrollArea>
 
       {/* 4. Ultra-Clean Footer: Settings (`⌘,`) + Conditional Multi-Host Health Pill */}
-      <div className="flex shrink-0 items-center justify-between gap-1 border-t border-black/[0.05] px-2 py-2 dark:border-white/[0.06]">
+      <div className="flex shrink-0 items-center justify-between gap-1 px-2 py-2">
         <button
           type="button"
           onClick={() => orbitActions.openSettings("general")}

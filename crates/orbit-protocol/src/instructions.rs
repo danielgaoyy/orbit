@@ -61,7 +61,7 @@ pub struct InstructionFileEntry {
     #[serde(default)]
     pub preview: String,
     /// Resolved `@path/to/file.md` import targets (canonicalized & contained inside repo/home).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub imports: Vec<String>,
 }
 
@@ -141,5 +141,30 @@ mod tests {
                 serde_json::to_value(&decoded).expect("decoded")
             );
         }
+    }
+
+    #[test]
+    fn instruction_entry_always_serializes_empty_imports_array() {
+        let entry = InstructionFileEntry {
+            id: "repo_root:CLAUDE.md".into(),
+            path: "/workspace/orbit/CLAUDE.md".into(),
+            relative_path: "CLAUDE.md".into(),
+            filename: "CLAUDE.md".into(),
+            scope: InstructionScope::RepoRoot,
+            provider_hint: Some("claude_code".into()),
+            precedence_order: 2,
+            exists: true,
+            size_bytes: 64,
+            approx_tokens: 16,
+            etag: Some("d".repeat(64)),
+            preview: "# CLAUDE.md".into(),
+            imports: Vec::new(),
+        };
+        let value = serde_json::to_value(&entry).expect("serialize entry");
+        assert_eq!(
+            value.get("imports"),
+            Some(&serde_json::Value::Array(Vec::new())),
+            "empty imports must serialize as [] so WebKit frontend never hits undefined.length"
+        );
     }
 }

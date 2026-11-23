@@ -98,7 +98,7 @@ pub struct ExternalMcpServerRecord {
     pub env_keys: Vec<String>,
     #[serde(default)]
     pub masked_env: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub masked_headers: BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub enabled: bool,

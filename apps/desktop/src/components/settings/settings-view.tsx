@@ -1,26 +1,21 @@
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import {
   Activity,
-  Archive,
   Bell,
   BookOpen,
   Check,
   ChevronsUpDown,
   Cloud,
-  Code2,
   Cpu,
-  FileCode2,
   Keyboard,
   MessageSquare,
   Palette,
   Plug,
   Plus,
+  Search,
   Server,
   Settings2,
   ShieldCheck,
-  Sparkles,
-  Webhook,
-  Wifi,
   X,
 } from "lucide-react";
 import { AddHostSection } from "@/components/settings/add-host-section";
@@ -52,7 +47,6 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  SimpleTooltip,
 } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { HostCardView } from "@/lib/orbit-ipc";
@@ -66,39 +60,135 @@ import {
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-const APP_SECTIONS: {
-  id: Extract<
-    SettingsSection,
-    "general" | "instructions" | "cloud_sync" | "appearance" | "shortcuts" | "notifications" | "archived"
-  >;
-  label: string;
-  icon: React.ComponentType<{ className?: string }>;
-}[] = [
-  { id: "general", label: "General", icon: Settings2 },
-  { id: "instructions", label: "Instructions", icon: FileCode2 },
-  { id: "cloud_sync", label: "Cloud Sync", icon: Cloud },
-  { id: "appearance", label: "Appearance", icon: Palette },
-  { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
-  { id: "notifications", label: "Notifications", icon: Bell },
-  { id: "archived", label: "Archived", icon: Archive },
-];
+type RailNavId =
+  | "general"
+  | "appearance"
+  | "notifications"
+  | "shortcuts"
+  | "sync_data"
+  | "models_agents"
+  | "context"
+  | "extensions"
+  | "guardian"
+  | "usage"
+  | "channels"
+  | "hosts";
 
-const HOST_TABS: {
-  id: HostSettingsTab;
+interface RailItemSpec {
+  id: RailNavId;
+  group: "app" | "agents" | "fleet";
   label: string;
   icon: React.ComponentType<{ className?: string }>;
-}[] = [
-  { id: "agents", label: "Agents", icon: Cpu },
-  { id: "guardian", label: "Guardian", icon: ShieldCheck },
-  { id: "im_channels", label: "IM Channels", icon: MessageSquare },
-  { id: "skills", label: "Skills", icon: Sparkles },
-  { id: "acp", label: "ACP Agents", icon: Plug },
-  { id: "mcp", label: "MCP Servers", icon: Server },
-  { id: "rules", label: "Rules", icon: BookOpen },
-  { id: "hooks", label: "Hooks", icon: Webhook },
-  { id: "lsp", label: "Language Servers", icon: Code2 },
-  { id: "usage", label: "Usage", icon: Activity },
-  { id: "connection", label: "Connection", icon: Wifi },
+  keywords: string[];
+  requiresHost?: boolean;
+}
+
+const RAIL_ITEMS: RailItemSpec[] = [
+  // App (5)
+  {
+    id: "general",
+    group: "app",
+    label: "General",
+    icon: Settings2,
+    keywords: ["general", "enter", "editor", "worktree", "branch", "update", "version"],
+  },
+  {
+    id: "appearance",
+    group: "app",
+    label: "Appearance",
+    icon: Palette,
+    keywords: ["appearance", "theme", "dark", "light", "font", "diff", "terminal", "cursor"],
+  },
+  {
+    id: "notifications",
+    group: "app",
+    label: "Notifications",
+    icon: Bell,
+    keywords: ["notifications", "push", "apns", "fcm", "harmony", "quiet hours", "sound", "alert"],
+  },
+  {
+    id: "shortcuts",
+    group: "app",
+    label: "Shortcuts",
+    icon: Keyboard,
+    keywords: ["shortcuts", "keybindings", "hotkeys", "keyboard"],
+  },
+  {
+    id: "sync_data",
+    group: "app",
+    label: "Sync & Data",
+    icon: Cloud,
+    keywords: ["cloud", "sync", "gist", "backup", "archived", "archive", "history", "data"],
+  },
+  // Agents (4)
+  {
+    id: "models_agents",
+    group: "agents",
+    label: "Models & Agents",
+    icon: Cpu,
+    requiresHost: true,
+    keywords: [
+      "models",
+      "agents",
+      "providers",
+      "claude",
+      "codex",
+      "antigravity",
+      "acp",
+      "registry",
+      "profiles",
+      "fast",
+      "keep awake",
+      "orchestrator",
+    ],
+  },
+  {
+    id: "context",
+    group: "agents",
+    label: "Context",
+    icon: BookOpen,
+    keywords: ["context", "instructions", "agents.md", "claude.md", "rules", "glob", "skills"],
+  },
+  {
+    id: "extensions",
+    group: "agents",
+    label: "Extensions",
+    icon: Plug,
+    requiresHost: true,
+    keywords: ["extensions", "mcp", "servers", "hooks", "lifecycle", "lsp", "language servers"],
+  },
+  {
+    id: "guardian",
+    group: "agents",
+    label: "Guardian",
+    icon: ShieldCheck,
+    requiresHost: true,
+    keywords: ["guardian", "auto", "approval", "safety", "risk", "policy", "security", "blocked"],
+  },
+  // Operations & Fleet (3)
+  {
+    id: "usage",
+    group: "fleet",
+    label: "Usage",
+    icon: Activity,
+    requiresHost: true,
+    keywords: ["usage", "tokens", "cost", "spend", "quotas", "insights", "analytics"],
+  },
+  {
+    id: "channels",
+    group: "fleet",
+    label: "Channels",
+    icon: MessageSquare,
+    requiresHost: true,
+    keywords: ["channels", "im", "lark", "feishu", "slack", "telegram", "discord", "bot"],
+  },
+  {
+    id: "hosts",
+    group: "fleet",
+    label: "Hosts",
+    icon: Server,
+    keywords: ["hosts", "connection", "remote", "ssh", "relay", "pair", "pairing", "mobile", "add host"],
+  },
 ];
 
 function parseHostSection(
@@ -125,6 +215,42 @@ function parseHostSection(
     return null;
   }
   return { hostId, tab };
+}
+
+function resolveActiveRailId(
+  section: SettingsSection,
+  parsedHost: { hostId: string; tab: HostSettingsTab } | null,
+): RailNavId {
+  if (section === "general") return "general";
+  if (section === "appearance") return "appearance";
+  if (section === "notifications") return "notifications";
+  if (section === "shortcuts") return "shortcuts";
+  if (section === "cloud_sync" || section === "archived") return "sync_data";
+  if (section === "instructions") return "context";
+  if (section === "add_host") return "hosts";
+  if (parsedHost) {
+    switch (parsedHost.tab) {
+      case "agents":
+      case "acp":
+        return "models_agents";
+      case "rules":
+      case "skills":
+        return "context";
+      case "mcp":
+      case "hooks":
+      case "lsp":
+        return "extensions";
+      case "guardian":
+        return "guardian";
+      case "usage":
+        return "usage";
+      case "im_channels":
+        return "channels";
+      case "connection":
+        return "hosts";
+    }
+  }
+  return "general";
 }
 
 function orderHostsLocalFirst(hosts: HostCardView[]): HostCardView[] {
@@ -165,14 +291,14 @@ function SettingsRailButton({
       type="button"
       onClick={onClick}
       className={cn(
-        "flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 text-left text-[13.5px] transition-colors",
+        "flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 text-left text-[13px] transition-colors",
         active
           ? "bg-black/[0.06] text-foreground font-medium dark:bg-white/[0.085]"
           : "text-foreground/76 hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
       )}
     >
       <span className="flex min-w-0 items-center gap-2.5">
-        <Icon className="h-[15px] w-[15px] shrink-0 stroke-[1.75] opacity-80" />
+        <Icon className="h-[14.5px] w-[14.5px] shrink-0 stroke-[1.75] opacity-80" />
         <span className="truncate">{label}</span>
       </span>
       {badge}
@@ -180,25 +306,38 @@ function SettingsRailButton({
   );
 }
 
-function SettingsHostTabList({
-  hostId,
-  activeSection,
+function SettingsSubTabBar({
+  tabs,
+  activeId,
+  onSelect,
 }: {
-  hostId: string;
-  activeSection: SettingsSection;
+  tabs: { id: string; label: string; count?: number }[];
+  activeId: string;
+  onSelect: (id: string) => void;
 }) {
   return (
-    <div className="space-y-0.5">
-      {HOST_TABS.map((tab) => {
-        const targetSection: SettingsSection = `host:${hostId}:${tab.id}`;
+    <div className="mb-5 flex items-center gap-1 border-b border-black/[0.06] pb-2.5 dark:border-white/[0.07]">
+      {tabs.map((tab) => {
+        const selected = tab.id === activeId;
         return (
-          <SettingsRailButton
+          <button
             key={tab.id}
-            label={tab.label}
-            icon={tab.icon}
-            active={activeSection === targetSection}
-            onClick={() => orbitActions.setSettingsSection(targetSection)}
-          />
+            type="button"
+            onClick={() => onSelect(tab.id)}
+            className={cn(
+              "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] px-2.5 text-[12.5px] transition-colors",
+              selected
+                ? "bg-black/[0.06] text-foreground font-medium dark:bg-white/[0.09]"
+                : "text-muted-foreground hover:bg-black/[0.035] hover:text-foreground dark:hover:bg-white/[0.05]",
+            )}
+          >
+            <span>{tab.label}</span>
+            {tab.count !== undefined && tab.count > 0 && (
+              <span className="text-muted-foreground/75 tabular-nums text-[11px] font-normal">
+                {tab.count}
+              </span>
+            )}
+          </button>
         );
       })}
     </div>
@@ -211,6 +350,8 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+
+  const [filterQuery, setFilterQuery] = useState("");
 
   const archivedCount = useMemo(() => {
     const seen = new Set<string>();
@@ -225,22 +366,12 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
     return seen.size;
   }, [hostDetails, archivedThreads]);
 
-  const renderAppSectionBadge = (id: (typeof APP_SECTIONS)[number]["id"]) => {
-    if (id !== "archived" || archivedCount === 0) return undefined;
-    return (
-      <span className="text-muted-foreground/75 shrink-0 text-[11.5px] tabular-nums">
-        {archivedCount}
-      </span>
-    );
-  };
-
   const parsedHost = useMemo(() => parseHostSection(section), [section]);
   const orderedHosts = useMemo(() => orderHostsLocalFirst(fleet.hosts), [fleet.hosts]);
   const hasRemoteHosts = useMemo(
     () => orderedHosts.some((h) => !isLocalHostCard(h)),
     [orderedHosts],
   );
-  const isLocalOnlyMode = orderedHosts.length === 1 && !hasRemoteHosts;
   const isMultiOrRemoteMode = hasRemoteHosts || orderedHosts.length > 1;
 
   const [pickedHostId, setPickedHostId] = useState<string | null>(
@@ -278,14 +409,88 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
     return fallback ? { hostId: fallback.host_id, tab: parsedHost.tab } : null;
   }, [parsedHost, orderedHosts]);
 
+  const activeRailId = useMemo(
+    () => resolveActiveRailId(section, parsedHost),
+    [section, parsedHost],
+  );
+
   const handleSelectHost = (hostId: string) => {
     setPickedHostId(hostId);
     if (parsedHost) {
       orbitActions.setSettingsSection(`host:${hostId}:${parsedHost.tab}`);
     } else if (section === "add_host") {
-      orbitActions.setSettingsSection(`host:${hostId}:agents`);
+      orbitActions.setSettingsSection(`host:${hostId}:connection`);
     }
   };
+
+  const navigateRailItem = (id: RailNavId) => {
+    const hId = activeHost?.host_id ?? null;
+    switch (id) {
+      case "general":
+        orbitActions.setSettingsSection("general");
+        return;
+      case "appearance":
+        orbitActions.setSettingsSection("appearance");
+        return;
+      case "notifications":
+        orbitActions.setSettingsSection("notifications");
+        return;
+      case "shortcuts":
+        orbitActions.setSettingsSection("shortcuts");
+        return;
+      case "sync_data":
+        orbitActions.setSettingsSection("cloud_sync");
+        return;
+      case "models_agents":
+        orbitActions.setSettingsSection(hId ? `host:${hId}:agents` : "add_host");
+        return;
+      case "context":
+        orbitActions.setSettingsSection("instructions");
+        return;
+      case "extensions":
+        orbitActions.setSettingsSection(hId ? `host:${hId}:mcp` : "add_host");
+        return;
+      case "guardian":
+        orbitActions.setSettingsSection(hId ? `host:${hId}:guardian` : "add_host");
+        return;
+      case "usage":
+        orbitActions.setSettingsSection(hId ? `host:${hId}:usage` : "add_host");
+        return;
+      case "channels":
+        orbitActions.setSettingsSection(hId ? `host:${hId}:im_channels` : "add_host");
+        return;
+      case "hosts":
+        orbitActions.setSettingsSection(hId ? `host:${hId}:connection` : "add_host");
+        return;
+    }
+  };
+
+  const normalizedFilter = filterQuery.trim().toLowerCase();
+  const visibleRailItems = useMemo(() => {
+    return RAIL_ITEMS.filter((item) => {
+      if (item.requiresHost && !activeHost) return false;
+      if (!normalizedFilter) return true;
+      if (item.label.toLowerCase().includes(normalizedFilter)) return true;
+      return item.keywords.some((k) => k.includes(normalizedFilter));
+    });
+  }, [activeHost, normalizedFilter]);
+
+  const appItems = visibleRailItems.filter((i) => i.group === "app");
+  const agentItems = visibleRailItems.filter((i) => i.group === "agents");
+  const fleetItems = visibleRailItems.filter((i) => i.group === "fleet");
+
+  const renderRailBadge = (id: RailNavId) => {
+    if (id === "sync_data" && archivedCount > 0) {
+      return (
+        <span className="text-muted-foreground/70 shrink-0 text-[11px] tabular-nums">
+          {archivedCount}
+        </span>
+      );
+    }
+    return undefined;
+  };
+
+  const effectiveHostId = resolvedHost?.hostId ?? activeHost?.host_id ?? null;
 
   return (
     <div
@@ -324,121 +529,73 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
           <X className="h-[15.5px] w-[15.5px]" />
         </button>
 
-        {/* Left Settings Rail (232px) — Flat on Local-Only; Host Picker on Remote/Multi-Host */}
-        <aside className="border-border bg-sidebar/75 flex w-[232px] shrink-0 flex-col border-r px-3 py-4">
-          <div className="px-2.5 pb-3 text-[14.5px] font-semibold tracking-[-0.01em]">
+        {/* Left Settings Rail (232px) — Full-bleed ScrollArea so scrollbar hugs border without overlapping items */}
+        <aside className="border-border bg-sidebar/75 flex w-[232px] shrink-0 flex-col border-r py-4">
+          <div className="px-5 pb-2.5 text-[14.5px] font-semibold tracking-[-0.01em]">
             Settings
           </div>
 
-          <ScrollArea className="min-h-0 flex-1" viewportClassName="pr-0.5">
-            {orderedHosts.length === 0 ? (
-              <nav className="space-y-3">
+          <div className="mb-3 px-3">
+            <div className="relative px-0.5">
+              <Search className="text-muted-foreground/65 pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 stroke-[1.8]" />
+              <input
+                type="text"
+                value={filterQuery}
+                onChange={(e) => setFilterQuery(e.target.value)}
+                placeholder="Search settings…"
+                aria-label="Search settings"
+                className="border-border/75 bg-background/65 text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/25 h-[28px] w-full rounded-[8px] border pr-6 pl-7 text-[12px] outline-none transition-colors"
+              />
+              {filterQuery && (
+                <button
+                  type="button"
+                  aria-label="Clear settings search"
+                  onClick={() => setFilterQuery("")}
+                  className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2 cursor-pointer rounded p-0.5"
+                >
+                  <X className="size-3" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          <ScrollArea className="min-h-0 flex-1" viewportClassName="px-3 pb-1">
+            <nav className="space-y-3.5">
+              {appItems.length > 0 && (
                 <div className="space-y-0.5">
-                  {APP_SECTIONS.map((item) => (
-                    <SettingsRailButton
-                      key={item.id}
-                      label={item.label}
-                      icon={item.icon}
-                      active={section === item.id}
-                      badge={renderAppSectionBadge(item.id)}
-                      onClick={() => orbitActions.setSettingsSection(item.id)}
-                    />
-                  ))}
-                </div>
-
-                <div className="border-border/60 border-t pt-3">
-                  <SettingsRailButton
-                    label="Connect Remote Host"
-                    icon={Plus}
-                    active={section === "add_host"}
-                    onClick={() => orbitActions.setSettingsSection("add_host")}
-                  />
-                </div>
-              </nav>
-            ) : isLocalOnlyMode && activeHost ? (
-              <nav className="space-y-3">
-                <div className="space-y-0.5">
-                  {APP_SECTIONS.map((item) => (
-                    <SettingsRailButton
-                      key={item.id}
-                      label={item.label}
-                      icon={item.icon}
-                      active={section === item.id}
-                      badge={renderAppSectionBadge(item.id)}
-                      onClick={() => orbitActions.setSettingsSection(item.id)}
-                    />
-                  ))}
-                </div>
-
-                <div className="border-border/60 border-t pt-3">
-                  <SettingsHostTabList hostId={activeHost.host_id} activeSection={section} />
-                </div>
-
-                <div className="border-border/60 border-t pt-3">
-                  <SettingsRailButton
-                    label="Connect Remote Host"
-                    icon={Plus}
-                    active={section === "add_host"}
-                    onClick={() => orbitActions.setSettingsSection("add_host")}
-                  />
-                </div>
-              </nav>
-            ) : isMultiOrRemoteMode && activeHost ? (
-              <nav className="space-y-4">
-                {/* Group 1: App Preferences */}
-                <div className="space-y-1">
-                  <div className="px-2.5 pb-0.5 text-[11.5px] font-medium text-muted-foreground">
+                  <div className="text-muted-foreground/75 px-2.5 pb-0.5 text-[11px] font-medium">
                     App
                   </div>
-                  <div className="space-y-0.5">
-                    {APP_SECTIONS.map((item) => (
-                      <SettingsRailButton
-                        key={item.id}
-                        label={item.label}
-                        icon={item.icon}
-                        active={section === item.id}
-                        badge={renderAppSectionBadge(item.id)}
-                        onClick={() => orbitActions.setSettingsSection(item.id)}
-                      />
-                    ))}
-                  </div>
+                  {appItems.map((item) => (
+                    <SettingsRailButton
+                      key={item.id}
+                      label={item.label}
+                      icon={item.icon}
+                      active={activeRailId === item.id}
+                      badge={renderRailBadge(item.id)}
+                      onClick={() => navigateRailItem(item.id)}
+                    />
+                  ))}
                 </div>
+              )}
 
-                {/* Group 2: Host Picker + Flat Host Sections */}
-                <div className="space-y-1.5">
-                  <div className="flex h-[22px] items-center justify-between px-2.5">
-                    <span className="text-muted-foreground text-[11.5px] font-medium">Host</span>
-                    <SimpleTooltip label="Add host">
-                      <button
-                        type="button"
-                        aria-label="Add host"
-                        onClick={() => orbitActions.setSettingsSection("add_host")}
-                        className={cn(
-                          "inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors",
-                          section === "add_host"
-                            ? "bg-black/[0.07] text-foreground dark:bg-white/[0.10]"
-                            : "text-muted-foreground hover:bg-black/[0.045] hover:text-foreground dark:hover:bg-white/[0.06]",
-                        )}
-                      >
-                        <Plus className="h-[13.5px] w-[13.5px] stroke-[1.9]" />
-                      </button>
-                    </SimpleTooltip>
-                  </div>
-
+              {/* Multi-host selector appears cleanly above Host-scoped groups */}
+              {isMultiOrRemoteMode && activeHost && (agentItems.length > 0 || fleetItems.length > 0) && (
+                <div className="border-border/60 border-t pt-3">
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <button
                         type="button"
                         aria-label="Switch host"
-                        className="border-border/80 bg-background/70 hover:bg-accent/70 focus-visible:ring-foreground/20 flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] border px-2.5 text-left transition-colors outline-none focus-visible:ring-1"
+                        className="border-border/80 bg-background/70 hover:bg-accent/70 focus-visible:ring-foreground/20 flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] border px-2.5 text-left transition-colors outline-none focus-visible:ring-1"
                       >
                         <span className="flex min-w-0 flex-1 items-center gap-2">
                           <HostStatusIndicator state={activeHost.connection_state} />
-                          <span className="text-foreground truncate text-[13px] font-medium">
+                          <span className="text-foreground truncate text-[12.5px] font-medium">
                             {activeHost.display_name}
                           </span>
                           {isLocalHostCard(activeHost) && (
-                            <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-medium">
+                            <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium">
                               Local
                             </span>
                           )}
@@ -485,39 +642,178 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                           </DropdownMenuItem>
                         );
                       })}
-
                       <DropdownMenuSeparator />
-
                       <DropdownMenuItem
                         onSelect={() => orbitActions.setSettingsSection("add_host")}
                       >
                         <span className="flex items-center gap-2">
                           <Plus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.85]" />
-                          <span className="text-[12.5px]">Add Host</span>
+                          <span className="text-[12.5px]">Connect Host</span>
                         </span>
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
-
-                  <SettingsHostTabList hostId={activeHost.host_id} activeSection={section} />
                 </div>
-              </nav>
-            ) : null}
+              )}
+
+              {agentItems.length > 0 && (
+                <div className={cn("space-y-0.5", !isMultiOrRemoteMode && "border-border/60 border-t pt-3")}>
+                  <div className="text-muted-foreground/75 px-2.5 pb-0.5 text-[11px] font-medium">
+                    Agents
+                  </div>
+                  {agentItems.map((item) => (
+                    <SettingsRailButton
+                      key={item.id}
+                      label={item.label}
+                      icon={item.icon}
+                      active={activeRailId === item.id}
+                      onClick={() => navigateRailItem(item.id)}
+                    />
+                  ))}
+                </div>
+              )}
+
+              {fleetItems.length > 0 && (
+                <div className="border-border/60 space-y-0.5 border-t pt-3">
+                  <div className="text-muted-foreground/75 px-2.5 pb-0.5 text-[11px] font-medium">
+                    Operations & Fleet
+                  </div>
+                  {fleetItems.map((item) => (
+                    <SettingsRailButton
+                      key={item.id}
+                      label={item.label}
+                      icon={item.icon}
+                      active={activeRailId === item.id}
+                      onClick={() => navigateRailItem(item.id)}
+                    />
+                  ))}
+                </div>
+              )}
+
+              {visibleRailItems.length === 0 && (
+                <div className="text-muted-foreground/75 px-2.5 py-6 text-center text-[12px]">
+                  No matching settings
+                </div>
+              )}
+            </nav>
           </ScrollArea>
 
-          <div className="text-muted-foreground/65 px-2.5 pt-2 text-[11.5px]">Orbit</div>
+          <div className="text-muted-foreground/65 px-5 pt-2 text-[11.5px]">Orbit</div>
         </aside>
 
-        {/* Right Scrollable Settings Content */}
+        {/* Right Settings Content Area */}
         {section === "instructions" ? (
-          <div className="min-h-0 flex-1 overflow-hidden px-7 py-6">
-            <div key={section} className="orbit-stage-enter h-full w-full">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-7 pt-6 pb-5">
+            {effectiveHostId && (
+              <SettingsSubTabBar
+                activeId="instructions"
+                tabs={[
+                  { id: "instructions", label: "Instructions" },
+                  { id: "rules", label: "Rules" },
+                  { id: "skills", label: "Skills" },
+                ]}
+                onSelect={(tabId) => {
+                  if (tabId === "instructions") orbitActions.setSettingsSection("instructions");
+                  else if (tabId === "rules")
+                    orbitActions.setSettingsSection(`host:${effectiveHostId}:rules`);
+                  else if (tabId === "skills")
+                    orbitActions.setSettingsSection(`host:${effectiveHostId}:skills`);
+                }}
+              />
+            )}
+            <div key={section} className="orbit-stage-enter min-h-0 flex-1">
               <InstructionsSection />
             </div>
           </div>
         ) : (
-          <ScrollArea className="min-h-0 flex-1" viewportClassName="px-10 py-8">
+          <ScrollArea className="min-h-0 flex-1" viewportClassName="px-10 py-7">
             <div key={section} className="orbit-stage-enter mx-auto w-full max-w-[640px] pb-8">
+              {/* In-page sub-tabs for consolidated sections */}
+              {activeRailId === "sync_data" && (
+                <SettingsSubTabBar
+                  activeId={section === "archived" ? "archived" : "cloud_sync"}
+                  tabs={[
+                    { id: "cloud_sync", label: "Cloud Sync" },
+                    { id: "archived", label: "Archived", count: archivedCount },
+                  ]}
+                  onSelect={(tabId) =>
+                    orbitActions.setSettingsSection(
+                      tabId === "archived" ? "archived" : "cloud_sync",
+                    )
+                  }
+                />
+              )}
+
+              {activeRailId === "models_agents" && effectiveHostId && (
+                <SettingsSubTabBar
+                  activeId={resolvedHost?.tab === "acp" ? "acp" : "agents"}
+                  tabs={[
+                    { id: "agents", label: "Providers & Runtime" },
+                    { id: "acp", label: "ACP Registry" },
+                  ]}
+                  onSelect={(tabId) =>
+                    orbitActions.setSettingsSection(
+                      `host:${effectiveHostId}:${tabId === "acp" ? "acp" : "agents"}`,
+                    )
+                  }
+                />
+              )}
+
+              {activeRailId === "context" && effectiveHostId && (
+                <SettingsSubTabBar
+                  activeId={resolvedHost?.tab === "skills" ? "skills" : "rules"}
+                  tabs={[
+                    { id: "instructions", label: "Instructions" },
+                    { id: "rules", label: "Rules" },
+                    { id: "skills", label: "Skills" },
+                  ]}
+                  onSelect={(tabId) => {
+                    if (tabId === "instructions") orbitActions.setSettingsSection("instructions");
+                    else if (tabId === "rules")
+                      orbitActions.setSettingsSection(`host:${effectiveHostId}:rules`);
+                    else if (tabId === "skills")
+                      orbitActions.setSettingsSection(`host:${effectiveHostId}:skills`);
+                  }}
+                />
+              )}
+
+              {activeRailId === "extensions" && effectiveHostId && (
+                <SettingsSubTabBar
+                  activeId={
+                    resolvedHost?.tab === "hooks"
+                      ? "hooks"
+                      : resolvedHost?.tab === "lsp"
+                        ? "lsp"
+                        : "mcp"
+                  }
+                  tabs={[
+                    { id: "mcp", label: "MCP Servers" },
+                    { id: "hooks", label: "Hooks" },
+                    { id: "lsp", label: "Language Servers" },
+                  ]}
+                  onSelect={(tabId) =>
+                    orbitActions.setSettingsSection(
+                      `host:${effectiveHostId}:${tabId as "mcp" | "hooks" | "lsp"}`,
+                    )
+                  }
+                />
+              )}
+
+              {activeRailId === "hosts" && effectiveHostId && (
+                <SettingsSubTabBar
+                  activeId={section === "add_host" ? "add_host" : "connection"}
+                  tabs={[
+                    { id: "connection", label: "Host & Pairing" },
+                    { id: "add_host", label: "Connect Remote Host" },
+                  ]}
+                  onSelect={(tabId) =>
+                    orbitActions.setSettingsSection(
+                      tabId === "add_host" ? "add_host" : `host:${effectiveHostId}:connection`,
+                    )
+                  }
+                />
+              )}
+
               {section === "general" && <GeneralSection />}
               {section === "cloud_sync" && <CloudSyncSection />}
               {section === "appearance" && <AppearanceSection />}

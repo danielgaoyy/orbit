@@ -166,40 +166,7 @@ const SafeSvgPreview = memo(function SafeSvgPreview({
   }, [svgContent]);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="border-border/60 bg-elevated/35 text-muted-foreground flex h-[28px] shrink-0 items-center justify-between gap-2 border-b px-3 text-[11px]">
-        <span>Isolated SVG preview · Scripts disabled</span>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            title="Zoom out"
-            onClick={() => setZoom((z) => Math.max(0.25, Math.round((z - 0.25) * 100) / 100))}
-            className="hover:text-foreground inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded"
-          >
-            <ZoomOut className="h-3 w-3" />
-          </button>
-          <span className="tabular-nums min-w-[36px] text-center font-mono text-[10.5px]">
-            {Math.round(zoom * 100)}%
-          </span>
-          <button
-            type="button"
-            title="Zoom in"
-            onClick={() => setZoom((z) => Math.min(4, Math.round((z + 0.25) * 100) / 100))}
-            className="hover:text-foreground inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded"
-          >
-            <ZoomIn className="h-3 w-3" />
-          </button>
-          <button
-            type="button"
-            title="Reset zoom"
-            onClick={() => setZoom(1)}
-            className="hover:text-foreground inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded"
-          >
-            <RotateCcw className="h-3 w-3" />
-          </button>
-        </div>
-      </div>
-
+    <div className="group/svg relative flex min-h-0 flex-1 flex-col overflow-hidden">
       <ScrollArea
         orientation="both"
         className="min-h-0 flex-1"
@@ -222,6 +189,46 @@ const SafeSvgPreview = memo(function SafeSvgPreview({
           />
         ) : null}
       </ScrollArea>
+
+      {/* Subtle floating zoom pill (hover-revealed or pinned when zoomed) */}
+      <div
+        className={cn(
+          "border-border/75 bg-background/90 text-muted-foreground absolute right-3 bottom-3 flex items-center gap-0.5 rounded-lg border p-0.5 shadow-xs backdrop-blur-md transition-opacity duration-150 select-none",
+          zoom !== 1
+            ? "opacity-100"
+            : "opacity-0 group-focus-within/svg:opacity-100 group-hover/svg:opacity-100",
+        )}
+      >
+        <button
+          type="button"
+          title="Zoom out"
+          onClick={() => setZoom((z) => Math.max(0.25, Math.round((z - 0.25) * 100) / 100))}
+          className="hover:text-foreground inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded"
+        >
+          <ZoomOut className="h-3 w-3" />
+        </button>
+        <span className="tabular-nums min-w-[36px] text-center font-mono text-[10.5px]">
+          {Math.round(zoom * 100)}%
+        </span>
+        <button
+          type="button"
+          title="Zoom in"
+          onClick={() => setZoom((z) => Math.min(4, Math.round((z + 0.25) * 100) / 100))}
+          className="hover:text-foreground inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded"
+        >
+          <ZoomIn className="h-3 w-3" />
+        </button>
+        {zoom !== 1 && (
+          <button
+            type="button"
+            title="Reset zoom"
+            onClick={() => setZoom(1)}
+            className="hover:text-foreground inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded"
+          >
+            <RotateCcw className="h-3 w-3" />
+          </button>
+        )}
+      </div>
     </div>
   );
 });

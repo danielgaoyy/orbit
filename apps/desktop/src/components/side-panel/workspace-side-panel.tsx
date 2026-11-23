@@ -259,7 +259,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         {tabs.length > 0 ? (
           <div
             ref={tabStripRef}
-            className="flex h-full min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            className="flex h-full min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [mask-image:linear-gradient(to_right,black_calc(100%-16px),transparent)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             {tabs.map((tab) => {
               const isActive = tab.id === activeTab?.id;
@@ -332,7 +332,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                     }}
                     className={cn(
                       "ml-0.5 inline-flex h-[16px] w-[16px] shrink-0 cursor-pointer items-center justify-center rounded transition-opacity hover:bg-black/[0.08] dark:hover:bg-white/[0.12]",
-                      isActive || tab.kind === "subagent"
+                      isActive
                         ? "opacity-65 hover:opacity-100"
                         : "opacity-0 group-hover/stab:opacity-65 hover:!opacity-100",
                     )}

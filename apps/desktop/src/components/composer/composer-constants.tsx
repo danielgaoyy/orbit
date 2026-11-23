@@ -41,7 +41,7 @@ export const PERMISSION_MODES: {
   {
     id: "auto",
     label: "Auto",
-    desc: "Guardian risk filter",
+    desc: "Auto-approve safe reads & tests, ask on risky actions",
   },
   {
     id: "accept_edits",

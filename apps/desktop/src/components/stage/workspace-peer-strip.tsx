@@ -23,6 +23,7 @@ import {
 } from "@/lib/orbit-ipc";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { normalizeProjectPath } from "@/lib/projects";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import {
   Popover,
@@ -138,9 +139,9 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
   const canWorktree =
     Boolean(workspace?.git_branch) ||
     Boolean(gitInsp?.is_git_repo) ||
-    (gitInsp?.nested_git_repos.length ?? 0) > 0;
+    (gitInsp?.nested_git_repos?.length ?? 0) > 0;
   const worktreeCwd =
-    gitInsp && !gitInsp.is_git_repo && gitInsp.nested_git_repos.length > 0
+    gitInsp && !gitInsp.is_git_repo && (gitInsp.nested_git_repos?.length ?? 0) > 0
       ? gitInsp.nested_git_repos[0].path
       : rootCwd;
 
@@ -456,9 +457,9 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
   const canWorktree =
     Boolean(workspace?.git_branch) ||
     Boolean(gitInsp?.is_git_repo) ||
-    (gitInsp?.nested_git_repos.length ?? 0) > 0;
+    (gitInsp?.nested_git_repos?.length ?? 0) > 0;
   const worktreeCwd =
-    gitInsp && !gitInsp.is_git_repo && gitInsp.nested_git_repos.length > 0
+    gitInsp && !gitInsp.is_git_repo && (gitInsp.nested_git_repos?.length ?? 0) > 0
       ? gitInsp.nested_git_repos[0].path
       : rootCwd;
 
@@ -819,7 +820,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       className="inline-flex cursor-pointer items-center gap-1.5"
                     >
                       {peer.is_running ? (
-                        <Loader2 className="text-foreground/70 h-[10.5px] w-[10.5px] shrink-0 animate-spin" />
+                        <OrbitSpinner size={11} className="text-foreground/70" />
                       ) : peer.is_awaiting_permission ? (
                         <span className="h-[5.5px] w-[5.5px] shrink-0 rounded-full bg-amber-500" />
                       ) : peer.is_unread && !isActive ? (

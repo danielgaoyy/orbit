@@ -109,6 +109,7 @@ cd apps/android && gradle assembleDebug --no-daemon
 
 ## Documentation & Community
 
+- [docs/INDEX.md](docs/INDEX.md) — Authoritative registry & task routing index for all Orbit specs, skills, and scoped `AGENTS.md`
 - [ARCHITECTURE.md](ARCHITECTURE.md) — System design, process isolation, and crate topology
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Development setup, architecture redlines, and PR checklist
 - [SECURITY.md](SECURITY.md) — Threat model, cryptographic design, and private vulnerability reporting

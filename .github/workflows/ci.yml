@@ -25,6 +25,10 @@ jobs:
         run: |
           bash -n deploy/install.sh deploy/install-desktop-linux.sh
           sh -n deploy/install.sh deploy/install-desktop-linux.sh
+      - name: Documentation index & AGENTS.md governance checks
+        run: |
+          bash -n scripts/check-docs-index.sh
+          bash scripts/check-docs-index.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -1100,3 +1100,41 @@ public enum OrbitTimeLogic {
         }
     }
 }
+
+// MARK: - Local Database Backup Exclusion & Data Protection
+
+public enum OrbitStorageError: LocalizedError {
+    case applicationSupportUnavailable
+
+    public var errorDescription: String? {
+        switch self {
+        case .applicationSupportUnavailable:
+            return "Application Support directory is unavailable."
+        }
+    }
+}
+
+public enum OrbitStorageProtection {
+    /// Creates a dedicated directory under `baseDirectory` (e.g. `Application Support/Orbit`),
+    /// excludes it from iCloud/iTunes backup, and sets hardware-backed file protection on iOS.
+    /// SQLite database and `-wal`/`-shm` sidecars created inside inherit these protections automatically.
+    public static func prepareProtectedDatabaseURL(
+        in baseDirectory: URL,
+        subdirectory: String = "Orbit",
+        fileName: String = "orbit_ios_v3.sqlite"
+    ) throws -> URL {
+        let fm = FileManager.default
+        var storageDir = baseDirectory.appendingPathComponent(subdirectory, isDirectory: true)
+        try fm.createDirectory(at: storageDir, withIntermediateDirectories: true)
+        #if os(iOS)
+        try fm.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: storageDir.path
+        )
+        #endif
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try storageDir.setResourceValues(values)
+        return storageDir.appendingPathComponent(fileName, isDirectory: false)
+    }
+}

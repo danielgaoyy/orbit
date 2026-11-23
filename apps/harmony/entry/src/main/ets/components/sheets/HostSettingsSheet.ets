@@ -33,7 +33,7 @@ import {
 import { OrbitProviderBrandIcon } from '../composer/ModelPickerSheet';
 
 const APPEARANCE_MODES: string[] = ['system', 'light', 'dark'];
-const ROUTE_MODES: string[] = ['auto', 'direct_only', 'ssh_tunnel', 'relay_only'];
+const ROUTE_MODES: string[] = ['auto', 'direct_only', 'relay_only'];
 
 @ComponentV2
 export struct HostSettingsSheet {
@@ -41,8 +41,6 @@ export struct HostSettingsSheet {
   @Local inspectedHostId: string = '';
   @Local customNameDraft: string = '';
   @Local routeModeDraft: string = 'auto';
-  @Local sshAliasDraft: string = '';
-  @Local portDraft: string = '6868';
   @Local directEndpointDraft: string = '';
   @Local relayUrlDraft: string = '';
   @Local cloudTokenDraft: string = '';
@@ -75,8 +73,7 @@ export struct HostSettingsSheet {
 
   @Computed
   get routeModeIndex(): number {
-    const idx = ROUTE_MODES.indexOf(this.routeModeDraft);
-    return idx >= 0 ? idx : 0;
+    return ROUTE_MODES.indexOf(this.routeModeDraft);
   }
 
   @Computed
@@ -99,8 +96,6 @@ export struct HostSettingsSheet {
     this.inspectedHostId = host.host_id;
     this.customNameDraft = host.display_name;
     this.routeModeDraft = host.route_mode;
-    this.sshAliasDraft = host.ssh_alias ?? '';
-    this.portDraft = `${host.remote_daemon_port}`;
     this.directEndpointDraft = host.custom_direct_endpoint ?? '';
     this.relayUrlDraft = host.relay_url ?? '';
     this.navPathStack.pushPathByName('host_detail', null);
@@ -825,29 +820,58 @@ export struct HostSettingsSheet {
               Text('Route Mode')
                 .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
 
-              CapsuleSegmentButtonV2({
-                items: this.routeModeItems,
-                selectedIndex: this.routeModeIndex,
-                onItemClicked: (idx: number) => {
-                  if (idx >= 0 && idx < ROUTE_MODES.length) {
-                    this.routeModeDraft = ROUTE_MODES[idx];
-                    this.store.triggerHaptic(6);
+              if (this.routeModeIndex >= 0) {
+                CapsuleSegmentButtonV2({
+                  items: this.routeModeItems,
+                  selectedIndex: this.routeModeIndex,
+                  onItemClicked: (idx: number) => {
+                    if (idx >= 0 && idx < ROUTE_MODES.length) {
+                      this.routeModeDraft = ROUTE_MODES[idx];
+                      this.store.triggerHaptic(6);
+                    }
+                  },
+                  itemFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),
+                  itemSelectedFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),
+                  itemSelectedBackgroundColor: orbitSegmentSelectedBg(this.store.palette),
+                  itemSelectedFontColor: orbitSegmentSelectedFg(this.store.palette),
+                  itemMaxFontScale: 1.3,
+                  itemMinHeight: LengthMetrics.vp(36),
+                  itemPadding: {
+                    top: LengthMetrics.vp(4),
+                    bottom: LengthMetrics.vp(4),
+                    start: LengthMetrics.vp(4),
+                    end: LengthMetrics.vp(4)
                   }
-                },
-                itemFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),
-                itemSelectedFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),
-                itemSelectedBackgroundColor: orbitSegmentSelectedBg(this.store.palette),
-                itemSelectedFontColor: orbitSegmentSelectedFg(this.store.palette),
-                itemMaxFontScale: 1.3,
-                itemMinHeight: LengthMetrics.vp(36),
-                itemPadding: {
-                  top: LengthMetrics.vp(4),
-                  bottom: LengthMetrics.vp(4),
-                  start: LengthMetrics.vp(4),
-                  end: LengthMetrics.vp(4)
+                })
+                  .width('100%')
+              } else {
+                Column({ space: OrbitTokens.SPACE_XS }) {
+                  Text(`${formatRouteModeLabel(this.routeModeDraft)} (preserved unless changed)`)
+                    .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+
+                  Row({ space: OrbitTokens.SPACE_XS }) {
+                    ForEach(
+                      ROUTE_MODES,
+                      (mode: string) => {
+                        Button(formatRouteModeLabel(mode), { type: ButtonType.Capsule, stateEffect: true })
+                          .attributeModifier(
+                            orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
+                          )
+                          .height(36)
+                          .layoutWeight(1)
+                          .onClick(() => {
+                            this.routeModeDraft = mode;
+                            this.store.triggerHaptic(6);
+                          })
+                      },
+                      (mode: string) => mode
+                    )
+                  }
+                  .width('100%')
                 }
-              })
+                .alignItems(HorizontalAlign.Start)
                 .width('100%')
+              }
             }
             .alignItems(HorizontalAlign.Start)
             .width('100%')
@@ -935,61 +959,6 @@ export struct HostSettingsSheet {
             .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 10 })
           }
 
-          if (this.routeModeDraft === 'ssh_tunnel') {
-            ListItem() {
-              Row({ space: OrbitTokens.SPACE_MD }) {
-                Column({ space: 4 }) {
-                  Text('SSH Alias')
-                    .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
-                  TextInput({
-                    placeholder: 'devbox',
-                    text: this.sshAliasDraft
-                  })
-                    .attributeModifier(
-                      orbitInputMono(
-                        this.store.palette.fgPrimary,
-                        this.store.palette.fgMuted,
-                        Color.Transparent
-                      )
-                    )
-                    .height(36)
-                    .padding(0)
-                    .width('100%')
-                    .onChange((v: string) => {
-                      this.sshAliasDraft = v;
-                    })
-                }
-                .alignItems(HorizontalAlign.Start)
-                .layoutWeight(2)
-
-                Column({ space: 4 }) {
-                  Text('Port')
-                    .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
-                  TextInput({
-                    placeholder: '6868',
-                    text: this.portDraft
-                  })
-                    .attributeModifier(
-                      orbitInputMono(
-                        this.store.palette.fgPrimary,
-                        this.store.palette.fgMuted,
-                        Color.Transparent
-                      )
-                    )
-                    .height(36)
-                    .padding(0)
-                    .width('100%')
-                    .onChange((v: string) => {
-                      this.portDraft = v;
-                    })
-                }
-                .alignItems(HorizontalAlign.Start)
-                .layoutWeight(1)
-              }
-              .width('100%')
-              .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 10 })
-            }
-          }
         }
         .backgroundColor(this.store.palette.listCard)
         .borderRadius(OrbitTokens.RADIUS_LG)
@@ -1012,13 +981,12 @@ export struct HostSettingsSheet {
             .borderRadius(OrbitTokens.RADIUS_LG)
             .onClick(() => {
               dismissHarmonyKeyboard(this.getUIContext());
-              const portNum = parseInt(this.portDraft, 10);
               this.store.updateHostConfig(
                 host.host_id,
                 this.customNameDraft,
                 this.routeModeDraft,
-                this.sshAliasDraft,
-                Number.isNaN(portNum) ? 6868 : portNum,
+                host.ssh_alias ?? '',
+                host.remote_daemon_port > 0 ? host.remote_daemon_port : 6868,
                 this.directEndpointDraft,
                 this.relayUrlDraft
               );

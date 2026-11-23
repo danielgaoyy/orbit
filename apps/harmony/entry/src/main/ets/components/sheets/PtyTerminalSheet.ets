@@ -16,6 +16,25 @@ import {
 } from '../../theme/OrbitTokens';
 import { dismissHarmonyKeyboard } from '../common/OrbitCommonControls';
 
+interface PtyTerminalRenderSpan {
+  renderKey: string;
+  text: string;
+  fgColor: ResourceColor;
+  bgColor: ResourceColor | null;
+  bold: boolean;
+  underline: boolean;
+}
+
+interface PtyTerminalRenderRow {
+  rowIndex: number;
+  spans: PtyTerminalRenderSpan[];
+}
+
+interface PtyTerminalCell {
+  text: string;
+  width: number;
+}
+
 const DEV_KEYBAR_ITEMS: DevKeyItem[] = [
   { id: 'esc', label: 'ESC', sequence: '\x1b', isModifier: false, a11yLabel: 'Escape key' },
   { id: 'tab', label: 'TAB', sequence: '\t', isModifier: false, a11yLabel: 'Tab key' },
@@ -69,6 +88,325 @@ export struct PtyTerminalSheet {
   get activeTerminalId(): string {
     const detail = this.store.currentHostDetail;
     return detail !== null && detail.active_terminal_id !== null ? detail.active_terminal_id : '';
+  }
+
+  @Computed
+  get renderedRows(): PtyTerminalRenderRow[] {
+    const screen = this.store.terminalScreen;
+    const rows = this.store.terminalRows;
+    const cursorVisible = screen !== null && screen.cursor_visible !== false && screen.cols > 0;
+    const cursorRow = cursorVisible && screen !== null ? screen.cursor_row : -1;
+    const cursorCol = cursorVisible && screen !== null && screen.cursor_col >= 0
+      ? Math.min(screen.cursor_col, screen.cols - 1)
+      : -1;
+    const defaultFg = this.store.palette.terminalFg;
+    const defaultBg = this.store.palette.terminalBg;
+    const themeTag = this.store.palette.isDark ? 'd' : 'l';
+    const out: PtyTerminalRenderRow[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      out.push(
+        this.buildRenderedRow(
+          row,
+          row.row_index === cursorRow ? cursorCol : -1,
+          defaultFg,
+          defaultBg,
+          themeTag
+        )
+      );
+    }
+    return out;
+  }
+
+  private codePointCellWidth(cp: number): number {
+    if (
+      cp < 0x20 ||
+      (cp >= 0x7F && cp < 0xA0) ||
+      (cp >= 0x0300 && cp <= 0x036F) ||
+      (cp >= 0x1160 && cp <= 0x11FF) ||
+      (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+      (cp >= 0x1DC0 && cp <= 0x1DFF) ||
+      (cp >= 0x200B && cp <= 0x200F) ||
+      (cp >= 0x202A && cp <= 0x202E) ||
+      (cp >= 0x2060 && cp <= 0x206F) ||
+      (cp >= 0x20D0 && cp <= 0x20FF) ||
+      (cp >= 0xD7B0 && cp <= 0xD7FF) ||
+      (cp >= 0xFE00 && cp <= 0xFE0F) ||
+      (cp >= 0xFE20 && cp <= 0xFE2F) ||
+      cp === 0xFEFF ||
+      (cp >= 0xE0100 && cp <= 0xE01EF)
+    ) {
+      return 0;
+    }
+    if (
+      (cp >= 0x1100 && cp <= 0x115F) ||
+      cp === 0x2329 ||
+      cp === 0x232A ||
+      (cp >= 0x2E80 && cp <= 0x303E) ||
+      (cp >= 0x3040 && cp <= 0xA4CF) ||
+      (cp >= 0xAC00 && cp <= 0xD7A3) ||
+      (cp >= 0xF900 && cp <= 0xFAFF) ||
+      (cp >= 0xFE10 && cp <= 0xFE19) ||
+      (cp >= 0xFE30 && cp <= 0xFE6F) ||
+      (cp >= 0xFF00 && cp <= 0xFF60) ||
+      (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+      (cp >= 0x1F300 && cp <= 0x1FAFF) ||
+      (cp >= 0x20000 && cp <= 0x3FFFD)
+    ) {
+      return 2;
+    }
+    return 1;
+  }
+
+  private splitTerminalCells(text: string): PtyTerminalCell[] {
+    const out: PtyTerminalCell[] = [];
+    let i = 0;
+    while (i < text.length) {
+      const cp = text.codePointAt(i);
+      const step = cp !== undefined && cp > 0xFFFF ? 2 : 1;
+      const chunk = text.substring(i, i + step);
+      const width = cp !== undefined ? this.codePointCellWidth(cp) : 1;
+      if (width === 0 && out.length > 0) {
+        out[out.length - 1].text += chunk;
+      } else {
+        out.push({ text: chunk, width: width > 0 ? width : 1 });
+      }
+      i += step;
+    }
+    return out;
+  }
+
+  private joinCellRange(cells: PtyTerminalCell[], start: number, end: number): string {
+    let text = '';
+    for (let i = start; i < end; i++) {
+      text += cells[i].text;
+    }
+    return text;
+  }
+
+  private appendStyledSpan(
+    target: PtyTerminalRenderSpan[],
+    rowIndex: number,
+    text: string,
+    rawFg: ResourceColor,
+    rawFgTag: string,
+    rawBg: ResourceColor | null,
+    rawBgTag: string,
+    defaultBg: ResourceColor,
+    defaultBgTag: string,
+    invertForCursor: boolean,
+    bold: boolean,
+    underline: boolean
+  ): void {
+    if (text.length === 0) {
+      return;
+    }
+    // `orbit-client-core` already emits swapped `fg_hex`/`bg_hex` for `sp.inverse`;
+    // only swap here when rendering the cursor overlay cell.
+    const fgColor: ResourceColor = invertForCursor ? (rawBg !== null ? rawBg : defaultBg) : rawFg;
+    const fgTag = invertForCursor ? (rawBgTag.length > 0 ? rawBgTag : defaultBgTag) : rawFgTag;
+    const bgColor: ResourceColor | null = invertForCursor ? rawFg : rawBg;
+    const bgTag = invertForCursor ? rawFgTag : rawBgTag;
+    const idx = target.length;
+    target.push({
+      renderKey: `${rowIndex}|${idx}|${fgTag}|${bgTag}|${bold ? 1 : 0}|${underline ? 1 : 0}|${text}`,
+      text: text,
+      fgColor: fgColor,
+      bgColor: bgColor,
+      bold: bold,
+      underline: underline
+    });
+  }
+
+  private buildRenderedRow(
+    row: TerminalRowDto,
+    cursorCol: number,
+    defaultFg: ResourceColor,
+    defaultBg: ResourceColor,
+    themeTag: string
+  ): PtyTerminalRenderRow {
+    const spans: PtyTerminalRenderSpan[] = [];
+    const defaultFgTag = `dfg_${themeTag}`;
+    const defaultBgTag = `dbg_${themeTag}`;
+    let colOffset = 0;
+
+    for (let s = 0; s < row.spans.length; s++) {
+      const sp: TerminalSpanDto = row.spans[s];
+      const hasFg = sp.fg_hex.length > 0;
+      const rawFg: ResourceColor = hasFg ? sp.fg_hex : defaultFg;
+      const rawFgTag = hasFg ? sp.fg_hex : defaultFgTag;
+      const hasBg = sp.bg_hex !== null && sp.bg_hex.length > 0;
+      const rawBg: ResourceColor | null = hasBg ? (sp.bg_hex as string) : null;
+      const rawBgTag = hasBg ? (sp.bg_hex as string) : '';
+
+      const cells = this.splitTerminalCells(sp.text);
+      let spanCols = 0;
+      let cursorCellIdx = -1;
+      for (let c = 0; c < cells.length; c++) {
+        const cellStart = colOffset + spanCols;
+        const cellEnd = cellStart + cells[c].width;
+        if (cursorCol >= cellStart && cursorCol < cellEnd) {
+          cursorCellIdx = c;
+        }
+        spanCols += cells[c].width;
+      }
+
+      if (cursorCellIdx >= 0) {
+        if (cursorCellIdx > 0) {
+          this.appendStyledSpan(
+            spans,
+            row.row_index,
+            this.joinCellRange(cells, 0, cursorCellIdx),
+            rawFg,
+            rawFgTag,
+            rawBg,
+            rawBgTag,
+            defaultBg,
+            defaultBgTag,
+            false,
+            sp.bold,
+            sp.underline
+          );
+        }
+        this.appendStyledSpan(
+          spans,
+          row.row_index,
+          cells[cursorCellIdx].text,
+          rawFg,
+          rawFgTag,
+          rawBg,
+          rawBgTag,
+          defaultBg,
+          defaultBgTag,
+          true,
+          sp.bold,
+          sp.underline
+        );
+        if (cursorCellIdx + 1 < cells.length) {
+          this.appendStyledSpan(
+            spans,
+            row.row_index,
+            this.joinCellRange(cells, cursorCellIdx + 1, cells.length),
+            rawFg,
+            rawFgTag,
+            rawBg,
+            rawBgTag,
+            defaultBg,
+            defaultBgTag,
+            false,
+            sp.bold,
+            sp.underline
+          );
+        }
+      } else {
+        this.appendStyledSpan(
+          spans,
+          row.row_index,
+          sp.text,
+          rawFg,
+          rawFgTag,
+          rawBg,
+          rawBgTag,
+          defaultBg,
+          defaultBgTag,
+          false,
+          sp.bold,
+          sp.underline
+        );
+      }
+
+      colOffset += spanCols;
+    }
+
+    if (cursorCol >= colOffset && cursorCol >= 0) {
+      const padCount = cursorCol - colOffset;
+      if (padCount > 0) {
+        this.appendStyledSpan(
+          spans,
+          row.row_index,
+          ' '.repeat(padCount),
+          defaultFg,
+          defaultFgTag,
+          null,
+          '',
+          defaultBg,
+          defaultBgTag,
+          false,
+          false,
+          false
+        );
+      }
+      this.appendStyledSpan(
+        spans,
+        row.row_index,
+        ' ',
+        defaultFg,
+        defaultFgTag,
+        null,
+        '',
+        defaultBg,
+        defaultBgTag,
+        true,
+        false,
+        false
+      );
+    } else if (spans.length === 0) {
+      this.appendStyledSpan(
+        spans,
+        row.row_index,
+        ' ',
+        defaultFg,
+        defaultFgTag,
+        null,
+        '',
+        defaultBg,
+        defaultBgTag,
+        false,
+        false,
+        false
+      );
+    }
+
+    return {
+      rowIndex: row.row_index,
+      spans: spans
+    };
+  }
+
+  private inputPlaceholder(): string {
+    if (this.store.ctrlSticky && this.store.altSticky) {
+      return 'CTRL+ALT + key…';
+    }
+    if (this.store.ctrlSticky) {
+      return 'CTRL + key…';
+    }
+    if (this.store.altSticky) {
+      return 'ALT + key…';
+    }
+    return 'Send command or raw keys…';
+  }
+
+  private interceptArmedInsert(info: InsertValue): boolean {
+    if (this.store.ctrlSticky || this.store.altSticky) {
+      if (info.insertValue.length === 1) {
+        this.store.sendTerminalKeys(info.insertValue);
+        this.store.triggerHaptic(6);
+        return false;
+      }
+      this.store.ctrlSticky = false;
+      this.store.altSticky = false;
+    }
+    return true;
+  }
+
+  private submitShellInput(): void {
+    if (this.store.ctrlSticky || this.store.altSticky) {
+      this.store.sendTerminalKeys('\r');
+      return;
+    }
+    const payload = this.shellInput;
+    this.shellInput = '';
+    this.store.sendTerminalKeys(`${payload}\r`);
   }
 
   private isKeyActiveModifier(item: DevKeyItem): boolean {
@@ -246,62 +584,56 @@ export struct PtyTerminalSheet {
             .alignItems(HorizontalAlign.Center)
           } else {
             List({ space: 0 }) {
-              Repeat<TerminalRowDto>(this.store.terminalRows)
-                .each((ri: RepeatItem<TerminalRowDto>) => {
+              Repeat<PtyTerminalRenderRow>(this.renderedRows)
+                .each((ri: RepeatItem<PtyTerminalRenderRow>) => {
                   ListItem() {
                     Text() {
-                      if (ri.item.spans.length === 0) {
-                        Span(' ')
-                          .font(orbitSpanMonoFont())
-                          .fontColor(this.store.palette.terminalFg)
-                      } else {
-                        ForEach(
-                          ri.item.spans,
-                          (sp: TerminalSpanDto) => {
-                            if (sp.bg_hex !== null && sp.bg_hex.length > 0) {
-                              Span(sp.text)
-                                .font(
-                                  orbitSpanMonoFont(
-                                    sp.bold ? FontWeight.Bold : FontWeight.Normal
-                                  )
+                      ForEach(
+                        ri.item.spans,
+                        (sp: PtyTerminalRenderSpan) => {
+                          if (sp.bgColor !== null) {
+                            Span(sp.text)
+                              .font(
+                                orbitSpanMonoFont(
+                                  sp.bold ? FontWeight.Bold : FontWeight.Normal
                                 )
-                                .fontColor(sp.fg_hex)
-                                .textBackgroundStyle({
-                                  color: sp.bg_hex,
-                                  radius: 0
-                                })
-                                .decoration({
-                                  type: sp.underline
-                                    ? TextDecorationType.Underline
-                                    : TextDecorationType.None,
-                                  color: sp.fg_hex
-                                })
-                            } else {
-                              Span(sp.text)
-                                .font(
-                                  orbitSpanMonoFont(
-                                    sp.bold ? FontWeight.Bold : FontWeight.Normal
-                                  )
+                              )
+                              .fontColor(sp.fgColor)
+                              .textBackgroundStyle({
+                                color: sp.bgColor,
+                                radius: 0
+                              })
+                              .decoration({
+                                type: sp.underline
+                                  ? TextDecorationType.Underline
+                                  : TextDecorationType.None,
+                                color: sp.fgColor
+                              })
+                          } else {
+                            Span(sp.text)
+                              .font(
+                                orbitSpanMonoFont(
+                                  sp.bold ? FontWeight.Bold : FontWeight.Normal
                                 )
-                                .fontColor(sp.fg_hex)
-                                .decoration({
-                                  type: sp.underline
-                                    ? TextDecorationType.Underline
-                                    : TextDecorationType.None,
-                                  color: sp.fg_hex
-                                })
-                            }
-                          },
-                          (_sp: TerminalSpanDto, sIdx: number) => `${ri.item.row_index}_${sIdx}`
-                        )
-                      }
+                              )
+                              .fontColor(sp.fgColor)
+                              .decoration({
+                                type: sp.underline
+                                  ? TextDecorationType.Underline
+                                  : TextDecorationType.None,
+                                color: sp.fgColor
+                              })
+                          }
+                        },
+                        (sp: PtyTerminalRenderSpan) => sp.renderKey
+                      )
                     }
                     .copyOption(CopyOptions.LocalDevice)
                     .width('100%')
                   }
                 })
-                .key((r: TerminalRowDto) => r.row_index.toString())
-                .virtualScroll()
+                .key((r: PtyTerminalRenderRow) => r.rowIndex.toString())
+                .virtualScroll({ totalCount: this.renderedRows.length })
             }
             .width('100%')
             .height('100%')
@@ -367,7 +699,7 @@ export struct PtyTerminalSheet {
 
         Row({ space: OrbitTokens.SPACE_SM }) {
           TextInput({
-            placeholder: 'Send command or raw keys…',
+            placeholder: this.inputPlaceholder(),
             text: this.shellInput
           })
             .attributeModifier(
@@ -380,12 +712,14 @@ export struct PtyTerminalSheet {
             .height(OrbitTokens.HIT_MIN)
             .borderRadius(OrbitTokens.RADIUS_MD)
             .layoutWeight(1)
+            .onWillInsert((info: InsertValue): boolean => {
+              return this.interceptArmedInsert(info);
+            })
             .onChange((val: string) => {
               this.shellInput = val;
             })
             .onSubmit(() => {
-              this.store.sendTerminalKeys(`${this.shellInput}\r`);
-              this.shellInput = '';
+              this.submitShellInput();
             })
 
           Button({ type: ButtonType.Circle, stateEffect: true }) {
@@ -400,8 +734,7 @@ export struct PtyTerminalSheet {
           .backgroundColor(this.store.palette.accentPrimaryFill)
           .accessibilityText('Send terminal command')
           .onClick(() => {
-            this.store.sendTerminalKeys(`${this.shellInput}\r`);
-            this.shellInput = '';
+            this.submitShellInput();
           })
         }
         .width('100%')

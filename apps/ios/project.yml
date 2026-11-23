@@ -43,14 +43,16 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
         NSCameraUsageDescription: "Scan `orbit pair` QR codes and take photos to attach to your coding agents."
+        NSLocalNetworkUsageDescription: "Orbit connects to paired daemons on your local network."
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor
             CFBundleURLName: dev.orbit.app
             CFBundleURLSchemes:
               - orbit
-        ITSAppUsesNonExemptEncryption: false
+        # Orbit uses Noise_NK_25519_ChaChaPoly_SHA256 E2EE and AES-256-GCM encrypted cloud sync.
+        ITSAppUsesNonExemptEncryption: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.orbit.app

@@ -2677,6 +2677,8 @@ export class OrbitHarmonyStore {
       this.activeSlashDirective = '';
       if (q.length > 0) {
         this.askSideQuestion(q);
+      } else {
+        this.openSideQuestionSheet();
       }
       return;
     }
@@ -2990,6 +2992,8 @@ export class OrbitHarmonyStore {
       this.activeSlashDirective = '';
       if (q.length > 0) {
         this.askSideQuestion(q);
+      } else {
+        this.openSideQuestionSheet();
       }
       return;
     }
@@ -3450,19 +3454,42 @@ export class OrbitHarmonyStore {
     this.showToast('Attached @terminal to composer', false);
   }
 
+  private encodeCtrlByte(ch: string): string | null {
+    if (ch.length !== 1) {
+      return null;
+    }
+    const upper = ch.toUpperCase().charCodeAt(0);
+    if (upper >= 64 && upper <= 95) {
+      return String.fromCharCode(upper - 64);
+    }
+    if (ch === ' ') {
+      return '\x00';
+    }
+    if (ch === '/') {
+      return '\x1f';
+    }
+    if (ch === '?') {
+      return '\x7f';
+    }
+    return null;
+  }
+
   public sendTerminalKeys(rawKeys: string): void {
     if (this.core === null || this.selectedHostId.length === 0 || rawKeys.length === 0) {
       return;
     }
     let out = rawKeys;
-    if (this.ctrlSticky && rawKeys.length === 1) {
-      const code = rawKeys.toUpperCase().charCodeAt(0);
-      if (code >= 64 && code <= 95) {
-        out = String.fromCharCode(code - 64);
+    const ctrlArmed = this.ctrlSticky;
+    const altArmed = this.altSticky;
+    if (ctrlArmed) {
+      const ctrlSeq = this.encodeCtrlByte(rawKeys);
+      if (ctrlSeq !== null) {
+        out = ctrlSeq;
       }
       this.ctrlSticky = false;
-    } else if (this.altSticky) {
-      out = `\x1b${rawKeys}`;
+    }
+    if (altArmed) {
+      out = `\x1b${out}`;
       this.altSticky = false;
     }
     try {

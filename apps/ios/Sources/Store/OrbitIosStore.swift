@@ -736,18 +736,12 @@ public final class OrbitIosStore: ObservableObject {
            let tf = OrbitSidebarThreadFilter(rawValue: savedThreadFilter) {
             self.sidebarThreadFilter = tf
         }
-        let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-        let dbPath = docDir?.appendingPathComponent("orbit_ios_v3.sqlite").path ?? ":memory:"
-
         do {
-            let instance: OrbitMobileCore
-            do {
-                instance = try OrbitMobileCore.openWithOptions(dbPath: dbPath, autoDiscoverLocal: true)
-            } catch let openError {
-                NSLog("[OrbitIosStore] Failed to open SQLite at %@: %@ — falling back to in-memory store", dbPath, openError.localizedDescription)
-                self.lastError = "Storage fallback active: \(openError.localizedDescription)"
-                instance = try OrbitMobileCore.openInMemory()
+            guard let appSupportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+                throw OrbitStorageError.applicationSupportUnavailable
             }
+            let dbURL = try OrbitStorageProtection.prepareProtectedDatabaseURL(in: appSupportDir)
+            let instance = try OrbitMobileCore.openWithOptions(dbPath: dbURL.path, autoDiscoverLocal: true)
             self.core = instance
 
             if !UserDefaults.standard.bool(forKey: Self.migratedThreadPrefsDefaultsKey) {

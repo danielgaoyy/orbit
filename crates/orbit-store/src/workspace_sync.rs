@@ -14,6 +14,39 @@ use crate::{
     load_queued_prompts_for_agent, map_agent_row, map_workspace_row, parse_ts,
 };
 
+pub const LABEL_HANDLE_ALIASES: &str = "orbit.handle_aliases";
+const MAX_HANDLE_ALIASES: usize = 8;
+
+fn record_previous_handle_alias(
+    labels: &mut std::collections::HashMap<String, String>,
+    old_handle: &str,
+    new_handle: &str,
+) {
+    let old = old_handle.trim();
+    let new = new_handle.trim();
+    if old.is_empty() || old.eq_ignore_ascii_case(new) {
+        return;
+    }
+    let mut aliases = vec![old.to_string()];
+    if let Some(existing) = labels.get(LABEL_HANDLE_ALIASES) {
+        for raw in existing.split(',') {
+            let entry = raw.trim();
+            if entry.is_empty()
+                || entry.eq_ignore_ascii_case(old)
+                || entry.eq_ignore_ascii_case(new)
+                || aliases.iter().any(|a| a.eq_ignore_ascii_case(entry))
+            {
+                continue;
+            }
+            aliases.push(entry.to_string());
+            if aliases.len() >= MAX_HANDLE_ALIASES {
+                break;
+            }
+        }
+    }
+    labels.insert(LABEL_HANDLE_ALIASES.to_string(), aliases.join(","));
+}
+
 fn query_agent_with_queue(
     tx: &rusqlite::Transaction<'_>,
     agent_id: &str,
@@ -225,7 +258,8 @@ impl OrbitStore {
         Ok(updated)
     }
 
-    /// Update an agent's workspace-local collaborative handle (e.g. `lead`, `reviewer`).
+    /// Update an agent's workspace-local collaborative handle (e.g. `lead`, `reviewer`),
+    /// preserving any previous handle in `labels["orbit.handle_aliases"]`.
     pub fn set_agent_handle(
         &self,
         agent_id: &str,
@@ -233,17 +267,30 @@ impl OrbitStore {
     ) -> Result<Option<AgentSummary>, StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
+        let row_opt: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT handle, labels_json FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((old_handle, labels_json)) = row_opt else {
+            return Ok(None);
+        };
         let clean = handle
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned);
-        let rows = tx.execute(
-            "UPDATE agents SET handle = ?1, updated_at = ?2 WHERE agent_id = ?3",
-            params![clean, Utc::now().to_rfc3339(), agent_id],
-        )?;
-        if rows == 0 {
-            return Ok(None);
+        let mut labels: std::collections::HashMap<String, String> =
+            serde_json::from_str(&labels_json).unwrap_or_default();
+        if let (Some(old), Some(new)) = (old_handle.as_deref(), clean.as_deref()) {
+            record_previous_handle_alias(&mut labels, old, new);
         }
+        let next_labels_json = serde_json::to_string(&labels)?;
+        tx.execute(
+            "UPDATE agents SET handle = ?1, labels_json = ?2, updated_at = ?3 WHERE agent_id = ?4",
+            params![clean, next_labels_json, Utc::now().to_rfc3339(), agent_id],
+        )?;
         let updated = query_agent_with_queue(&tx, agent_id)?;
         tx.commit()?;
         Ok(updated)
@@ -422,6 +469,9 @@ impl OrbitStore {
             && let Some(h) = handle.map(str::trim).filter(|s| !s.is_empty())
             && cur_handle.as_deref() != Some(h)
         {
+            if let Some(ref old) = cur_handle {
+                record_previous_handle_alias(&mut labels, old, h);
+            }
             cur_handle = Some(h.to_string());
             changed = true;
         }
@@ -1119,6 +1169,7 @@ mod tests {
     };
 
     use crate::OrbitStore;
+    use crate::workspace_sync::{LABEL_HANDLE_ALIASES, MAX_HANDLE_ALIASES};
 
     fn sample_ws(id: &str, title: &str, cwd: &str) -> WorkspaceSummary {
         WorkspaceSummary {
@@ -1380,5 +1431,67 @@ mod tests {
         assert_eq!(ok2.revision, 2);
         assert!(ok2.content.contains("v1"));
         assert!(ok2.content.contains("core done"));
+    }
+
+    #[test]
+    fn handle_rename_preserves_bounded_aliases() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        store
+            .upsert_workspace(&sample_ws("ws_alias", "Alias Test", "/repo"))
+            .expect("ws");
+        let mut ag = sample_agent("ag_alias", "ws_alias", "/repo", 1);
+        ag.handle = Some("我这边对orbit".into());
+        store.upsert_agent(&ag, None).expect("upsert");
+
+        // Rename via semantic identity: old handle must move into `orbit.handle_aliases`
+        let r1 = store
+            .set_agent_semantic_identity("ag_alias", Some("大会话性能优化"), None, None)
+            .expect("rename 1")
+            .expect("exists");
+        assert_eq!(r1.handle.as_deref(), Some("大会话性能优化"));
+        assert_eq!(
+            r1.labels.get(LABEL_HANDLE_ALIASES).map(String::as_str),
+            Some("我这边对orbit")
+        );
+
+        // Chain renames: verify prepending, case-insensitive deduplication, active handle exclusion, and cap at 8
+        let mut current = r1;
+        for idx in 0..10 {
+            let next = format!("alias-{idx}");
+            current = store
+                .set_agent_handle(&current.agent_id, Some(&next))
+                .expect("rename")
+                .expect("exists");
+        }
+        let aliases: Vec<&str> = current
+            .labels
+            .get(LABEL_HANDLE_ALIASES)
+            .map(String::as_str)
+            .unwrap_or("")
+            .split(',')
+            .collect();
+        assert_eq!(aliases.len(), MAX_HANDLE_ALIASES);
+        assert_eq!(aliases[0], "alias-8");
+        assert!(!aliases.contains(&"alias-9"));
+
+        // Renaming back to an older alias removes the active name from the alias list
+        let back = store
+            .set_agent_handle(&current.agent_id, Some("ALIAS-8"))
+            .expect("rename back")
+            .expect("exists");
+        assert_eq!(back.handle.as_deref(), Some("ALIAS-8"));
+        let back_aliases: Vec<&str> = back
+            .labels
+            .get(LABEL_HANDLE_ALIASES)
+            .map(String::as_str)
+            .unwrap_or("")
+            .split(',')
+            .collect();
+        assert_eq!(back_aliases[0], "alias-9");
+        assert!(
+            !back_aliases
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("alias-8"))
+        );
     }
 }

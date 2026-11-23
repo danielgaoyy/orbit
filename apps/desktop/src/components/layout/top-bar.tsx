@@ -6,10 +6,13 @@ import {
   Copy,
   Download,
   FileText,
+  GitBranch,
+  GitFork,
   MoreHorizontal,
   Sparkles,
 } from "lucide-react";
 import { isAgentBackgroundWaiting, isMacDesktop } from "@/lib/orbit-ipc";
+import { isAgentInGitRepo } from "@/lib/projects";
 import { modSymbol } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { StandaloneGroupButton } from "@/components/stage/workspace-peer-strip";
@@ -52,6 +55,21 @@ export const TopBar = memo(function TopBar() {
     if (!ag || !detail) return null;
     const ws = detail.workspaces.find((w) => w.workspace_id === ag.workspace_id);
     return ws?.is_worktree ? ws : null;
+  });
+
+  const canForkWorktree = useOrbitSelector((s) => {
+    if (
+      s.workspacePanel !== "conversation" ||
+      s.isDraftNewSession ||
+      !s.selectedHostId ||
+      !s.selectedAgentId
+    ) {
+      return false;
+    }
+    const detail = s.hostDetails[s.selectedHostId];
+    const ag = detail?.agents.find((a) => a.agent_id === s.selectedAgentId);
+    if (!ag) return false;
+    return isAgentInGitRepo(s.selectedHostId, ag, detail, s.sidebarView);
   });
   // Primitive return keeps TopBar free from re-renders on unrelated store updates
   const overviewBadgeTone = useOrbitSelector<
@@ -204,26 +222,6 @@ export const TopBar = memo(function TopBar() {
       >
         {hasActiveSession && selectedHostId && selectedAgentId && (
           <>
-            {activeWorktreeWorkspace && (
-              <SimpleTooltip label="Apply or move worktree changes to local checkout">
-                <button
-                  type="button"
-                  onClick={() =>
-                    orbitActions.openWorktreeHandoffDialog({
-                      hostId: selectedHostId,
-                      workspaceId: activeWorktreeWorkspace.workspace_id,
-                      direction: "worktree_to_local",
-                      defaultMode: "apply",
-                      sourceCwd: activeWorktreeWorkspace.cwd,
-                    })
-                  }
-                  className="border-border text-foreground/78 hover:text-foreground inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] border px-2 text-[11.5px] font-medium transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-                >
-                  <ArrowLeftRight className="h-[12px] w-[12px] shrink-0 stroke-[1.75] opacity-75" />
-                  <span>Apply to Local</span>
-                </button>
-              </SimpleTooltip>
-            )}
             {workspaceArtifactCount > 0 && (
               <SimpleTooltip label="Artifacts">
                 <button
@@ -250,7 +248,55 @@ export const TopBar = memo(function TopBar() {
                   <MoreHorizontal className="h-[15.5px] w-[15.5px] stroke-[1.75]" />
                 </button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" sideOffset={6} className="min-w-[184px]">
+              <DropdownMenuContent align="end" sideOffset={6} className="min-w-[196px]">
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void orbitActions.forkAgent({
+                      hostId: selectedHostId,
+                      sourceAgentId: selectedAgentId,
+                    });
+                  }}
+                >
+                  <span className="flex items-center gap-2">
+                    <GitFork className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                    <span>Fork conversation</span>
+                  </span>
+                </DropdownMenuItem>
+                {canForkWorktree && (
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      void orbitActions.forkAgent({
+                        hostId: selectedHostId,
+                        sourceAgentId: selectedAgentId,
+                        worktree: true,
+                      });
+                    }}
+                  >
+                    <span className="flex items-center gap-2">
+                      <GitBranch className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                      <span>Fork in worktree</span>
+                    </span>
+                  </DropdownMenuItem>
+                )}
+                {activeWorktreeWorkspace && (
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      orbitActions.openWorktreeHandoffDialog({
+                        hostId: selectedHostId,
+                        workspaceId: activeWorktreeWorkspace.workspace_id,
+                        direction: "worktree_to_local",
+                        defaultMode: "apply",
+                        sourceCwd: activeWorktreeWorkspace.cwd,
+                      })
+                    }
+                  >
+                    <span className="flex items-center gap-2">
+                      <ArrowLeftRight className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                      <span>Apply to Local…</span>
+                    </span>
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onSelect={() => orbitActions.openExportDialog(selectedHostId, selectedAgentId)}
                 >

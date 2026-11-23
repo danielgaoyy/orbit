@@ -3,11 +3,11 @@ import {
   AlertCircle,
   Archive,
   ArrowUpRight,
+  Blocks,
   ChevronRight,
   CircleCheck,
   Clock,
   File,
-  FileCode2,
   FileDiff,
   FileText,
   MoreHorizontal,
@@ -130,7 +130,7 @@ const ArmedTimerRow = memo(function ArmedTimerRow({
         <span className="text-muted-foreground/60 shrink-0">·</span>
         <span className="text-muted-foreground truncate text-[11.5px]">{conditionLabel}</span>
       </div>
-      <div className="flex shrink-0 items-center gap-0.5">
+      <div className="hidden shrink-0 items-center gap-0.5 group-focus-within/timerrow:flex group-hover/timerrow:flex">
         <SimpleTooltip label="Run now">
           <button
             type="button"
@@ -215,6 +215,7 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
   hasAlert = false,
   runningTone = "spinner",
   headerAction,
+  footer,
   children,
 }: {
   id: OverviewSectionId;
@@ -225,6 +226,7 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
   hasAlert?: boolean;
   runningTone?: "spinner" | "emerald";
   headerAction?: React.ReactNode;
+  footer?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
@@ -233,7 +235,7 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
       <Collapsible
         open={!collapsed}
         onOpenChange={() => orbitActions.toggleOverviewSection(id)}
-        className="px-2.5 py-2"
+        className={cn("px-2.5 pt-2", !collapsed && footer ? "pb-0" : "pb-2")}
       >
         <div className="group/sechead hover:bg-accent/65 flex h-[30px] w-full items-center rounded-[8px] pr-1.5 transition-colors">
           <CollapsibleTrigger className="group/trigger focus-visible:ring-ring/50 flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded-[8px] pr-1 pl-2 text-left outline-none focus-visible:ring-2">
@@ -283,6 +285,7 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
         <CollapsibleContent>
           <div className="space-y-0.5 pt-1">{children}</div>
         </CollapsibleContent>
+        {!collapsed && footer}
       </Collapsible>
     </>
   );
@@ -339,6 +342,15 @@ const StageOverviewBody = memo(function StageOverviewBody({
     (currentAgent ? hostDetail?.workspace_boards?.[currentAgent.workspace_id]?.revision : 0) ??
     currentWorkspace?.board_revision ??
     0;
+  const workspaceArtifactCount = useMemo(() => {
+    const all = hostDetail?.artifacts ?? [];
+    if (all.length === 0) return 0;
+    if (currentAgent?.workspace_id) {
+      return all.filter((a) => a.workspace_id === currentAgent.workspace_id).length;
+    }
+    return all.length;
+  }, [hostDetail?.artifacts, currentAgent?.workspace_id]);
+
   const showGroupNotesRow = Boolean(
     currentAgent &&
       !currentAgent.parent_agent_id &&
@@ -590,6 +602,22 @@ const StageOverviewBody = memo(function StageOverviewBody({
             onClick={() => orbitActions.openFilesExplorerTab()}
           />
 
+          {workspaceArtifactCount > 0 && (
+            <OverviewActionRow
+              icon={Blocks}
+              label="Artifacts"
+              onClick={() => orbitActions.openArtifactsTab({ hostId })}
+              trailing={
+                <Badge
+                  variant="secondary"
+                  className="text-muted-foreground tabular-nums h-[18px] min-w-[18px] rounded-full border-transparent bg-black/[0.05] px-1.5 py-0 text-[11px] leading-none font-medium dark:bg-white/[0.08]"
+                >
+                  {workspaceArtifactCount}
+                </Badge>
+              }
+            />
+          )}
+
           <OverviewActionRow
             icon={SquareTerminal}
             label="Terminal"
@@ -624,13 +652,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
                   </span>
                 ) : undefined
               }
-            />
-          )}
-          {cwd && (
-            <OverviewActionRow
-              icon={FileCode2}
-              label="Instructions"
-              onClick={() => orbitActions.openProjectInstructions({ hostId, cwd })}
             />
           )}
         </div>
@@ -714,6 +735,25 @@ const StageOverviewBody = memo(function StageOverviewBody({
                   <Archive className="size-[13px] stroke-[1.75]" />
                 </button>
               </SimpleTooltip>
+            ) : undefined
+          }
+          footer={
+            orderedSubagents.length > defaultVisibleSubagentCount ? (
+              <div
+                className={cn(
+                  showAllSubagents
+                    ? "bg-elevated/95 sticky bottom-0 z-[2] -mx-2.5 pt-0.5 pr-2.5 pb-2 pl-[18px] backdrop-blur-[6px]"
+                    : "pt-0.5 pb-2 pl-2",
+                )}
+              >
+                <button
+                  type="button"
+                  onClick={() => setShowAllSubagents((v) => !v)}
+                  className="text-muted-foreground/75 hover:text-foreground inline-flex cursor-pointer items-center py-0.5 text-[11.5px] leading-[16px] font-medium transition-colors"
+                >
+                  {showAllSubagents ? "Show less" : `Show ${hiddenSubagentCount} more`}
+                </button>
+              </div>
             ) : undefined
           }
         >
@@ -888,23 +928,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
             );
           })}
           </div>
-          {orderedSubagents.length > defaultVisibleSubagentCount && (
-            <div
-              className={cn(
-                "pt-0.5 pl-2",
-                showAllSubagents &&
-                  "bg-elevated/95 sticky bottom-0 z-[1] -mx-2.5 mt-1 border-t border-black/[0.045] px-4 py-1 backdrop-blur-[4px] dark:border-white/[0.055]",
-              )}
-            >
-              <button
-                type="button"
-                onClick={() => setShowAllSubagents((v) => !v)}
-                className="text-muted-foreground/75 hover:text-foreground inline-flex cursor-pointer items-center py-0.5 text-[11.5px] leading-[16px] font-medium transition-colors"
-              >
-                {showAllSubagents ? "Show less" : `Show ${hiddenSubagentCount} more`}
-              </button>
-            </div>
-          )}
         </OverviewLayerSection>
       )}
 
@@ -917,6 +940,25 @@ const StageOverviewBody = memo(function StageOverviewBody({
           collapsed={collapsedSections.tasks}
           isRunning={hasRunningBgTask}
           runningTone="emerald"
+          footer={
+            orderedTasks.length > defaultVisibleTaskCount ? (
+              <div
+                className={cn(
+                  showAllTasks
+                    ? "bg-elevated/95 sticky bottom-0 z-[2] -mx-2.5 pt-0.5 pr-2.5 pb-2 pl-[18px] backdrop-blur-[6px]"
+                    : "pt-0.5 pb-2 pl-2",
+                )}
+              >
+                <button
+                  type="button"
+                  onClick={() => setShowAllTasks((v) => !v)}
+                  className="text-muted-foreground/75 hover:text-foreground inline-flex cursor-pointer items-center py-0.5 text-[11.5px] leading-[16px] font-medium transition-colors"
+                >
+                  {showAllTasks ? "Show less" : `Show ${hiddenTaskCount} more`}
+                </button>
+              </div>
+            ) : undefined
+          }
         >
           <div className="space-y-0.5">
             {visibleTasks.map((task) => {
@@ -1078,23 +1120,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
             );
           })}
           </div>
-          {orderedTasks.length > defaultVisibleTaskCount && (
-            <div
-              className={cn(
-                "pt-0.5 pl-2",
-                showAllTasks &&
-                  "bg-elevated/95 sticky bottom-0 z-[1] -mx-2.5 mt-1 border-t border-black/[0.045] px-4 py-1 backdrop-blur-[4px] dark:border-white/[0.055]",
-              )}
-            >
-              <button
-                type="button"
-                onClick={() => setShowAllTasks((v) => !v)}
-                className="text-muted-foreground/75 hover:text-foreground inline-flex cursor-pointer items-center py-0.5 text-[11.5px] leading-[16px] font-medium transition-colors"
-              >
-                {showAllTasks ? "Show less" : `Show ${hiddenTaskCount} more`}
-              </button>
-            </div>
-          )}
         </OverviewLayerSection>
       )}
         </div>

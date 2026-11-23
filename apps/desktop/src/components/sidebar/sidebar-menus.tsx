@@ -262,35 +262,59 @@ export function SharedConversationMenu({
           </span>
         </DropdownMenuItem>
 
-        <DropdownMenuItem
-          onSelect={() => {
-            void orbitActions.forkAgent({
-              hostId: host.host_id,
-              sourceAgentId: agent.agent_id,
-            });
-          }}
-          className={COMPACT_MENU_ITEM_CLASS}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>Fork</span>
-          </span>
-        </DropdownMenuItem>
-
-        {isGitRepo && (
+        {isGitRepo ? (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger className={COMPACT_MENU_ITEM_CLASS}>
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                <span>Fork</span>
+              </span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="w-max min-w-[168px] rounded-[12px] p-1">
+              <DropdownMenuItem
+                onSelect={() => {
+                  void orbitActions.forkAgent({
+                    hostId: host.host_id,
+                    sourceAgentId: agent.agent_id,
+                  });
+                }}
+                className={COMPACT_MENU_ITEM_CLASS}
+              >
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                  <span>Fork here</span>
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => {
+                  void orbitActions.forkAgent({
+                    hostId: host.host_id,
+                    sourceAgentId: agent.agent_id,
+                    worktree: true,
+                  });
+                }}
+                className={COMPACT_MENU_ITEM_CLASS}
+              >
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <GitBranch className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                  <span>Fork in new worktree</span>
+                </span>
+              </DropdownMenuItem>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ) : (
           <DropdownMenuItem
             onSelect={() => {
               void orbitActions.forkAgent({
                 hostId: host.host_id,
                 sourceAgentId: agent.agent_id,
-                worktree: true,
               });
             }}
             className={COMPACT_MENU_ITEM_CLASS}
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
-              <GitBranch className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>Fork in worktree</span>
+              <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+              <span>Fork</span>
             </span>
           </DropdownMenuItem>
         )}

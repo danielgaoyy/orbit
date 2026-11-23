@@ -517,7 +517,7 @@ pub struct DiscoveredProject {
     pub git_branch: Option<String>,
     pub is_git_repo: bool,
     pub last_modified_unix: i64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub nested_git_repos: Vec<NestedGitRepo>,
 }
 
@@ -557,7 +557,7 @@ pub struct GitStatusSnapshot {
     pub ahead: u32,
     pub behind: u32,
     pub files: Vec<GitFileEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub nested_git_repos: Vec<NestedGitRepo>,
 }
 

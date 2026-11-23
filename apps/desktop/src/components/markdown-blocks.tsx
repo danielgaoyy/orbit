@@ -21,7 +21,7 @@ import {
   type TableRowView,
   detectDiagramKind,
 } from "@/lib/orbit-ipc";
-import { openOrbitLink, parseOrbitLinkTarget } from "@/lib/file-links";
+import { openOrbitLink, parseOrbitLinkTarget, prefetchOrbitLink } from "@/lib/file-links";
 import {
   type ResolvedSubagentItem,
   type SubagentNameMatcher,
@@ -203,6 +203,11 @@ const InlineSpans = memo(
                 key={idx}
                 href={href}
                 title={linkTitle}
+                onMouseEnter={() => {
+                  if (parsed?.kind === "file") {
+                    prefetchOrbitLink(href, linkCtx);
+                  }
+                }}
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();

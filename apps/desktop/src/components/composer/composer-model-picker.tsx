@@ -8,6 +8,7 @@ import {
   formatCatalogModelLabel,
   formatEffortLabel,
   getCatalogForProvider,
+  modelSupportsFastMode,
   prettifyModelSlug,
   resolveActiveModelSpec,
   resolveSupportedEffortForModel,
@@ -56,6 +57,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
   const draftAcpAgentId = useOrbitSelector((s) => s.draftAcpAgentId);
   const draftModels = useOrbitSelector((s) => s.draftModels);
   const draftEffort = useOrbitSelector((s) => s.draftEffort);
+  const draftFastMode = useOrbitSelector((s) => s.draftFastMode);
   const draftProfileId = useOrbitSelector((s) => s.draftProfileId);
 
   const profiles = useOrbitSelector((s) =>
@@ -106,6 +108,13 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
       (a) => a.agent_id === s.selectedAgentId,
     );
     return ag?.effort ?? null;
+  });
+  const activeAgentFastMode = useOrbitSelector((s) => {
+    if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return false;
+    const ag = s.hostDetails[s.selectedHostId]?.agents.find(
+      (a) => a.agent_id === s.selectedAgentId,
+    );
+    return Boolean(ag?.fast_mode);
   });
 
   const modelPopoverRef = useRef<HTMLDivElement | null>(null);
@@ -193,12 +202,14 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
       provider: ProviderKind,
       model: string | null,
       effort: ReasoningEffort | null,
+      fastMode?: boolean,
     ) => {
       if (canSwitchAgentEngine) {
         orbitActions.setDraftConfig({
           provider,
           model,
           ...(effort ? { effort } : {}),
+          ...(fastMode !== undefined ? { fastMode } : {}),
         });
         return;
       }
@@ -207,11 +218,31 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
           provider: activeAgentProvider,
           model,
           ...(effort ? { effort } : {}),
+          ...(fastMode !== undefined ? { fastMode } : {}),
         });
         void orbitIpc.setAgentConfig(selectedHostId, selectedAgentId, model, effort);
+        if (fastMode === true && !activeAgentFastMode) {
+          void orbitIpc.updateAgent({
+            hostId: selectedHostId,
+            agentId: selectedAgentId,
+            fastMode: true,
+          });
+        } else if (fastMode === false && activeAgentFastMode) {
+          void orbitIpc.updateAgent({
+            hostId: selectedHostId,
+            agentId: selectedAgentId,
+            fastMode: false,
+          });
+        }
       }
     },
-    [canSwitchAgentEngine, selectedAgentId, selectedHostId, activeAgentProvider],
+    [
+      canSwitchAgentEngine,
+      selectedAgentId,
+      selectedHostId,
+      activeAgentProvider,
+      activeAgentFastMode,
+    ],
   );
 
   const rawBrowsedProvider: ProviderKind = canSwitchAgentEngine
@@ -251,6 +282,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
               is_default: true,
               default_effort: null,
               thinking_options: [],
+              supports_fast_mode: false,
             },
           ];
     return [
@@ -263,6 +295,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
               desc: rawActiveModel,
               defaultEffort: "medium" as ReasoningEffort,
               thinkingOptions: DEFAULT_CUSTOM_THINKING_OPTIONS,
+              supportsFastMode: false,
             },
           ]
         : []),
@@ -276,6 +309,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
         desc: m.description,
         defaultEffort: m.default_effort,
         thinkingOptions: m.thinking_options,
+        supportsFastMode: modelSupportsFastMode(effectiveBrowsedProvider, m),
       })),
     ];
   }, [
@@ -293,7 +327,13 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
   );
 
   useLayoutEffect(() => {
-    if (!modelPopoverOpen || !hoveredRow || hoveredRow.thinkingOptions.length === 0) return;
+    if (
+      !modelPopoverOpen ||
+      !hoveredRow ||
+      (hoveredRow.thinkingOptions.length === 0 && !hoveredRow.supportsFastMode)
+    ) {
+      return;
+    }
     const popEl = modelPopoverRef.current;
     const rowEl = hoveredRowElRef.current;
     const subEl = thinkingSubmenuRef.current;
@@ -341,6 +381,22 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
       ? (activeAcpSpec?.name ?? effectiveAcpAgentId ?? "ACP Agent")
       : formatCatalogModelLabel(activeCatalog, rawActiveModel);
 
+  const isFastActive = Boolean(
+    modelSupportsFastMode(activeProvider, activeModelSpec) &&
+      (!canSwitchAgentEngine ? activeAgentFastMode : draftFastMode),
+  );
+  const activeSecondaryMeta = useMemo(() => {
+    if (activeDraftProfile) return null;
+    const parts: string[] = [];
+    if (effectiveActiveEffort) {
+      parts.push(formatEffortLabel(effectiveActiveEffort));
+    }
+    if (isFastActive) {
+      parts.push("Fast");
+    }
+    return parts.length > 0 ? parts.join(" · ") : null;
+  }, [activeDraftProfile, effectiveActiveEffort, isFastActive]);
+
   if (disabled) {
     return (
       <button
@@ -353,9 +409,9 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
         <span className="text-foreground/88 truncate font-normal">
           {activeTriggerLabel}
         </span>
-        {!activeDraftProfile && effectiveActiveEffort && (
+        {activeSecondaryMeta && (
           <span className="text-foreground/48 shrink-0 font-normal">
-            {formatEffortLabel(effectiveActiveEffort)}
+            {activeSecondaryMeta}
           </span>
         )}
         <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
@@ -380,15 +436,20 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
       <PopoverTrigger asChild>
         <button
           type="button"
+          title={
+            isFastActive
+              ? `${activeTriggerLabel}${effectiveActiveEffort ? ` · ${formatEffortLabel(effectiveActiveEffort)}` : ""} · Fast mode (higher quota usage)`
+              : undefined
+          }
           className="hover:text-foreground inline-flex h-8.5 max-w-76 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13.5px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
         >
           <ProviderIcon provider={activeProvider} className="size-4" />
           <span className="text-foreground/88 truncate font-normal">
             {activeTriggerLabel}
           </span>
-          {!activeDraftProfile && effectiveActiveEffort && (
+          {activeSecondaryMeta && (
             <span className="text-foreground/48 shrink-0 font-normal">
-              {formatEffortLabel(effectiveActiveEffort)}
+              {activeSecondaryMeta}
             </span>
           )}
           <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
@@ -626,12 +687,19 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                   effectiveBrowsedProvider === activeProvider &&
                   resolvedSelectedModelIdOnActive?.toLowerCase() === row.id.toLowerCase();
                 const isSubOpen = hoveredModelKey === row.key;
-                const hasThinkingSubmenu = row.thinkingOptions.length > 0;
-                const rowEffort: ReasoningEffort | null = hasThinkingSubmenu
-                  ? isModelActive
-                    ? effectiveActiveEffort
-                    : (row.defaultEffort ?? row.thinkingOptions[0]?.effort ?? null)
-                  : null;
+                const hasFlyout = row.thinkingOptions.length > 0 || row.supportsFastMode;
+                const rowEffort: ReasoningEffort | null =
+                  row.thinkingOptions.length > 0
+                    ? isModelActive
+                      ? effectiveActiveEffort
+                      : (row.defaultEffort ?? row.thinkingOptions[0]?.effort ?? null)
+                    : null;
+                const rowSecondary = [
+                  rowEffort ? formatEffortLabel(rowEffort) : null,
+                  isModelActive && isFastActive ? "Fast" : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
 
                 return (
                   <button
@@ -646,6 +714,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                         effectiveBrowsedProvider,
                         row.id,
                         rowEffort,
+                        row.supportsFastMode ? undefined : false,
                       );
                       setModelPopoverOpen(false);
                     }}
@@ -669,9 +738,9 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                       >
                         {row.label}
                       </span>
-                      {rowEffort && (
+                      {rowSecondary && (
                         <span className="text-muted-foreground/85 shrink-0 text-[11.5px] leading-normal font-normal">
-                          {formatEffortLabel(rowEffort)}
+                          {rowSecondary}
                         </span>
                       )}
                     </div>
@@ -679,7 +748,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                     <div className="flex shrink-0 items-center">
                       {isModelActive ? (
                         <Check className="text-foreground size-3.5 shrink-0 stroke-[1.9]" />
-                      ) : hasThinkingSubmenu ? (
+                      ) : hasFlyout ? (
                         <ChevronRight className="text-muted-foreground/70 size-3.5 shrink-0 stroke-[1.75]" />
                       ) : null}
                     </div>
@@ -690,9 +759,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
               )}
             </ScrollArea>
 
-            {/* Zero-Footprint Overlay Anchor for Level-2 Thinking Mode Flyout */}
+            {/* Zero-Footprint Overlay Anchor for Level-2 Thinking & Fast Mode Flyout */}
             <div className="pointer-events-none absolute inset-0 overflow-visible">
-              {hoveredRow && hoveredRow.thinkingOptions.length > 0 && (
+              {hoveredRow &&
+                (hoveredRow.thinkingOptions.length > 0 || hoveredRow.supportsFastMode) && (
                 <div
                   ref={thinkingSubmenuRef}
                   style={{ top: `${submenuPos.top}px` }}
@@ -707,7 +777,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                       : "left-full pl-1.5",
                   )}
                 >
-                  <div className="bg-popover text-popover-foreground floating-surface orbit-inline-flyout-side w-[144px] space-y-0.5 rounded-[14px] border border-black/[0.09] p-1.5 dark:border-white/[0.10]">
+                  <div className="bg-popover text-popover-foreground floating-surface orbit-inline-flyout-side w-[152px] space-y-0.5 rounded-[14px] border border-black/[0.09] p-1.5 dark:border-white/[0.10]">
                     {hoveredRow.thinkingOptions.map((opt) => {
                       const isHoveredModelActive =
                         effectiveBrowsedProvider === activeProvider &&
@@ -727,6 +797,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                               effectiveBrowsedProvider,
                               hoveredRow.id,
                               opt.effort,
+                              hoveredRow.supportsFastMode ? undefined : false,
                             );
                             setModelPopoverOpen(false);
                           }}
@@ -753,6 +824,81 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                         </button>
                       );
                     })}
+
+                    {hoveredRow.supportsFastMode && (() => {
+                      const isHoveredModelActive =
+                        effectiveBrowsedProvider === activeProvider &&
+                        resolvedSelectedModelIdOnActive?.toLowerCase() ===
+                          hoveredRow.id.toLowerCase();
+                      const fastChecked = isHoveredModelActive && isFastActive;
+                      const targetEffort: ReasoningEffort | null =
+                        hoveredRow.thinkingOptions.length > 0
+                          ? isHoveredModelActive
+                            ? effectiveActiveEffort
+                            : (hoveredRow.defaultEffort ??
+                              hoveredRow.thinkingOptions[0]?.effort ??
+                              null)
+                          : null;
+                      return (
+                        <>
+                          {hoveredRow.thinkingOptions.length > 0 && (
+                            <div className="bg-border/65 my-1 h-px" />
+                          )}
+                          <button
+                            type="button"
+                            title="Faster output, higher quota usage"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const nextFast = !fastChecked;
+                              if (isHoveredModelActive) {
+                                orbitActions.toggleActiveFastMode(nextFast);
+                              } else {
+                                handleSelectModelAndEffort(
+                                  effectiveBrowsedProvider,
+                                  hoveredRow.id,
+                                  targetEffort,
+                                  nextFast,
+                                );
+                              }
+                              setModelPopoverOpen(false);
+                            }}
+                            className={cn(
+                              "flex h-[29px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 text-left transition-colors",
+                              fastChecked
+                                ? "bg-black/[0.04] hover:bg-accent/70 dark:bg-white/[0.06]"
+                                : "hover:bg-accent/65",
+                            )}
+                          >
+                            <span
+                              className={cn(
+                                "truncate text-[13px] leading-normal",
+                                fastChecked
+                                  ? "text-foreground font-medium"
+                                  : "text-foreground/84 font-normal",
+                              )}
+                            >
+                              Fast
+                            </span>
+                            <span
+                              aria-hidden="true"
+                              className={cn(
+                                "inline-flex h-[15px] w-[26px] shrink-0 items-center rounded-full p-[2px] transition-colors",
+                                fastChecked
+                                  ? "bg-foreground"
+                                  : "bg-black/[0.14] dark:bg-white/[0.18]",
+                              )}
+                            >
+                              <span
+                                className={cn(
+                                  "bg-background size-[11px] rounded-full shadow-2xs transition-transform duration-150",
+                                  fastChecked ? "translate-x-[11px]" : "translate-x-0",
+                                )}
+                              />
+                            </span>
+                          </button>
+                        </>
+                      );
+                    })()}
                   </div>
                 </div>
               )}

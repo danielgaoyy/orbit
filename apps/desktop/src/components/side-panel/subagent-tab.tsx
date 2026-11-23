@@ -10,11 +10,19 @@ import {
   TurnStageSection,
 } from "@/components/stage/stream-stage";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
-import { type StageTurnView, orbitIpc } from "@/lib/orbit-ipc";
+import { type SessionSubagentEntryView, type StageTurnView, orbitIpc } from "@/lib/orbit-ipc";
 import { computeSubagentTurnsFingerprint } from "@/lib/stage-cache";
+import {
+  type ResolvedSubagentItem,
+  areResolvedSubagentsEqual,
+  buildSubagentNameMatcher,
+  resolveSessionSubagents,
+} from "@/lib/subagents";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 const NOOP_REWIND = () => {};
+const EMPTY_STAGE_SUBAGENTS: readonly SessionSubagentEntryView[] = [];
+const EMPTY_RESOLVED_SUBAGENTS: readonly ResolvedSubagentItem[] = [];
 
 interface ThinkingTimingRecord {
   startedAtMs: number;
@@ -348,6 +356,83 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const contentVersion = `${childStage?.revision ?? 0}:${parentHostRevision}:${displayTurnsFingerprint}`;
   const effectiveAgentId = tab.childAgentId ?? tab.providerSubagentId ?? parentAgentId ?? "";
   const effectiveHostId = isManaged ? (hostId ?? "") : (parentHostId ?? "");
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const parentStageSubagents = useOrbitSelector((s) =>
+    parentHostId && parentAgentId
+      ? (s.stages[`${parentHostId}::${parentAgentId}`]?.insights.subagents ?? EMPTY_STAGE_SUBAGENTS)
+      : EMPTY_STAGE_SUBAGENTS,
+  );
+
+  const subagentSessionSubagentsRef = useRef<readonly ResolvedSubagentItem[]>(
+    EMPTY_RESOLVED_SUBAGENTS,
+  );
+  const subagentSessionSubagents = useMemo(() => {
+    const resolved = new Map<string, ResolvedSubagentItem>();
+    if (effectiveHostId && effectiveAgentId && childStage) {
+      for (const sa of resolveSessionSubagents({
+        hostId: effectiveHostId,
+        agentId: effectiveAgentId,
+        insightsSubagents: childStage.insights.subagents,
+        hostDetails,
+        fleetHosts,
+      })) {
+        resolved.set(sa.key, sa);
+      }
+    }
+    if (parentHostId && parentAgentId) {
+      for (const sa of resolveSessionSubagents({
+        hostId: parentHostId,
+        agentId: parentAgentId,
+        insightsSubagents: parentStageSubagents,
+        hostDetails,
+        fleetHosts,
+      })) {
+        if (!resolved.has(sa.key)) {
+          resolved.set(sa.key, sa);
+        }
+      }
+    }
+    const next = resolved.size === 0 ? EMPTY_RESOLVED_SUBAGENTS : Array.from(resolved.values());
+    if (areResolvedSubagentsEqual(subagentSessionSubagentsRef.current, next)) {
+      return subagentSessionSubagentsRef.current;
+    }
+    subagentSessionSubagentsRef.current = next;
+    return next;
+  }, [
+    effectiveHostId,
+    effectiveAgentId,
+    childStage,
+    parentHostId,
+    parentAgentId,
+    parentStageSubagents,
+    hostDetails,
+    fleetHosts,
+  ]);
+
+  const subagentNameMatcher = useMemo(
+    () => buildSubagentNameMatcher(subagentSessionSubagents),
+    [subagentSessionSubagents],
+  );
+
+  const handleOpenNestedSubagent = useCallback(
+    (sa: ResolvedSubagentItem) => {
+      if (sa.status === "awaiting_permission" && sa.isManaged && sa.childAgentId) {
+        orbitActions.selectAgent(sa.childHostId, sa.childAgentId);
+        return;
+      }
+      orbitActions.openSubagentTab({
+        callId: sa.callId,
+        role: sa.title,
+        promptPreview: sa.promptPreview,
+        childAgentId: sa.childAgentId,
+        childHostId: sa.childHostId || undefined,
+        providerSubagentId: sa.providerSubagentId,
+        parentAgentId: effectiveAgentId || parentAgentId || undefined,
+      });
+    },
+    [effectiveAgentId, parentAgentId],
+  );
 
   const latestTurn = displayTurns[displayTurns.length - 1] ?? null;
   const isLatestTurnActive = Boolean(latestTurn && status === "running");
@@ -499,6 +584,10 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                     holdViewport={holdViewport}
                     onRequestRewind={NOOP_REWIND}
                     onPreviewImage={setImagePreviewTarget}
+                    sessionSubagents={subagentSessionSubagents}
+                    sessionSubagentMatcher={subagentNameMatcher}
+                    onOpenSubagent={handleOpenNestedSubagent}
+                    parentMessageLabel="Sent to parent"
                   />
                 );
               })}

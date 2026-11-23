@@ -1,20 +1,28 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Activity,
   Archive,
+  Blocks,
+  BookOpen,
   Clock,
+  Code2,
+  Download,
   FileCode2,
   FolderOpen,
   FolderPlus,
   FolderTree,
   GitCompareArrows,
+  GitFork,
   Globe,
   LayoutList,
   MessageCircleQuestion,
+  MessageSquare,
   MessageSquareText,
   Monitor,
   Moon,
   PanelLeft,
   PanelRight,
+  Plug,
   Plus,
   Radio,
   RefreshCw,
@@ -22,9 +30,12 @@ import {
   Server,
   Settings2,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   SquareTerminal,
   Sun,
+  Webhook,
+  Zap,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog-tabs";
 import { Kbd, ShortcutKbd } from "@/components/ui/overlays";
@@ -143,6 +154,8 @@ function CommandPaletteDialog() {
   const fleet = useOrbitSelector((s) => s.fleet);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
+  const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
   const externalEditors = useOrbitSelector((s) => s.externalEditors);
   const theme = useOrbitSelector((s) => s.theme);
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
@@ -265,11 +278,66 @@ function CommandPaletteDialog() {
         id: "act-cycle-mode",
         section: "Actions",
         title: "Cycle Access Permissions",
-        subtitle: "Always Ask ⇄ Accept Edits ⇄ Full Access",
+        subtitle: "Always Ask ⇄ Auto ⇄ Accept Edits ⇄ Full Access",
         shortcut: "⇧Tab",
         icon: <Sparkles className="size-3.5" />,
         run: () => orbitActions.cycleActiveMode(),
       },
+      {
+        id: "act-toggle-fast",
+        section: "Actions",
+        title: "Toggle Fast Output Mode",
+        subtitle: "Lower latency, higher quota usage (when supported by active model)",
+        icon: <Zap className="size-3.5" />,
+        run: () => orbitActions.toggleActiveFastMode(),
+      },
+      ...(selectedHostId && selectedAgentId && !isDraftNewSession
+        ? [
+            {
+              id: "act-fork-thread",
+              section: "Actions",
+              title: "Fork Current Conversation",
+              subtitle: "Branch this session into a new thread",
+              icon: <GitFork className="size-3.5" />,
+              run: () => {
+                void orbitActions.forkAgent({
+                  hostId: selectedHostId,
+                  sourceAgentId: selectedAgentId,
+                });
+              },
+            },
+            {
+              id: "act-export-thread",
+              section: "Actions",
+              title: "Export Conversation…",
+              subtitle: "Save transcript as Markdown, JSON, or standalone HTML",
+              icon: <Download className="size-3.5" />,
+              run: () => orbitActions.openExportDialog(selectedHostId, selectedAgentId),
+            },
+            {
+              id: "act-copy-code-block",
+              section: "Actions",
+              title: "Copy Code Block…",
+              subtitle: "Pick and copy any fenced code block from this session",
+              icon: <Code2 className="size-3.5" />,
+              run: () => {
+                void orbitActions.openCopyCodeBlocksModal(selectedHostId, selectedAgentId);
+              },
+            },
+          ]
+        : []),
+      ...(selectedHostId
+        ? [
+            {
+              id: "act-open-artifacts",
+              section: "Actions",
+              title: "Open Artifacts",
+              subtitle: "Inspect saved documents, diagrams, and interactive MCP Apps",
+              icon: <Blocks className="size-3.5" />,
+              run: () => orbitActions.openArtifactsTab({ hostId: selectedHostId }),
+            },
+          ]
+        : []),
       {
         id: "act-toggle-overview",
         section: "Actions",
@@ -387,12 +455,13 @@ function CommandPaletteDialog() {
     }
 
     // 5. Settings & Fleet
+    const effectiveSettingsHostId = selectedHostId ?? fleet.hosts[0]?.host_id ?? null;
     list.push(
       {
         id: "settings-open",
         section: "Settings & Fleet",
         title: "Open Settings",
-        subtitle: "General, Hosts, Providers, Worktrees, Editor & Terminal, Keybindings",
+        subtitle: "General, Appearance, Notifications, Models & Agents, Context, Extensions, Hosts",
         shortcut: `${mod},`,
         icon: <Settings2 className="size-3.5" />,
         run: () => orbitActions.openSettings("general"),
@@ -408,19 +477,66 @@ function CommandPaletteDialog() {
       {
         id: "fleet-pair",
         section: "Settings & Fleet",
-        title: "Settings: Hosts & Zero-Knowledge Relay",
-        subtitle: "Pair new Orbit hosts or deploy SSH Noise_NK Relay",
+        title: "Settings: Hosts & Pairing",
+        subtitle: "Inspect host status, pair mobile devices, or connect a remote SSH host",
         icon: <Radio className="size-3.5" />,
-        run: () => orbitActions.openSettings("hosts"),
+        run: () =>
+          orbitActions.openSettings(
+            effectiveSettingsHostId ? `host:${effectiveSettingsHostId}:connection` : "add_host",
+          ),
       },
-      {
-        id: "fleet-quotas",
-        section: "Settings & Fleet",
-        title: "Settings: Providers & Live Quotas",
-        subtitle: "Configure default CLI engine and inspect 5h/weekly windows",
-        icon: <Sparkles className="size-3.5" />,
-        run: () => orbitActions.openSettings("providers"),
-      },
+      ...(effectiveSettingsHostId
+        ? [
+            {
+              id: "fleet-quotas",
+              section: "Settings & Fleet",
+              title: "Settings: Models, Providers & ACP Agents",
+              subtitle: "Configure native providers, profiles, and 34 ACP agent registry",
+              icon: <Plug className="size-3.5" />,
+              run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:agents`),
+            },
+            {
+              id: "settings-usage",
+              section: "Settings & Fleet",
+              title: "Settings: Usage & Quotas",
+              subtitle: "Token spend, daily trends, and quota depletion forecast",
+              icon: <Activity className="size-3.5" />,
+              run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:usage`),
+            },
+            {
+              id: "settings-rules",
+              section: "Settings & Fleet",
+              title: "Settings: Path-Scoped Rules & Skills",
+              subtitle: "Manage glob-scoped rules, skills, and project instructions",
+              icon: <BookOpen className="size-3.5" />,
+              run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:rules`),
+            },
+            {
+              id: "settings-mcp",
+              section: "Settings & Fleet",
+              title: "Settings: MCP Servers, Hooks & LSP",
+              subtitle: "Manage external MCP servers, lifecycle hooks, and language servers",
+              icon: <Webhook className="size-3.5" />,
+              run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:mcp`),
+            },
+            {
+              id: "settings-guardian",
+              section: "Settings & Fleet",
+              title: "Settings: Guardian Auto-Approval",
+              subtitle: "Configure AI risk policies, trusted prefixes, and blocked patterns",
+              icon: <ShieldCheck className="size-3.5" />,
+              run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:guardian`),
+            },
+            {
+              id: "settings-im",
+              section: "Settings & Fleet",
+              title: "Settings: IM Channels (Lark, Slack, Telegram, Discord)",
+              subtitle: "Configure bidirectional chat bots and remote tool approval cards",
+              icon: <MessageSquare className="size-3.5" />,
+              run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:im_channels`),
+            },
+          ]
+        : []),
       {
         id: "pref-theme-system",
         section: "Settings & Fleet",
@@ -476,6 +592,8 @@ function CommandPaletteDialog() {
     theme,
     enterToSend,
     selectedHostId,
+    selectedAgentId,
+    isDraftNewSession,
     threadCustomTitles,
     archivedThreads,
     mod,

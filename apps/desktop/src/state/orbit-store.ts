@@ -17,16 +17,20 @@ import {
   type RichMediaKind,
 } from "@/lib/media-utils";
 import {
+  getCachedPromptImage,
+  lookupRecentSentTurnImage,
   recordRecentSentTurnImages,
   seedPromptImagePreview,
   type SentImagePreviewMeta,
 } from "@/lib/prompt-image-cache";
 import {
   getCatalogForProvider,
+  modelSupportsFastMode,
   resolveActiveModelSpec,
   resolveSupportedEffortForModel,
   seedFallbackProviderCatalogs,
 } from "@/lib/model-catalog";
+import { sharedDisclosureStateStore } from "@/lib/disclosure-state";
 import {
   isBareHomeDir,
   isLocalHostCard,
@@ -1049,7 +1053,7 @@ const defaultInitialState: OrbitUiState = {
   composerDrafts: initialDrafts.composerDrafts,
   slashDirectives: initialDrafts.slashDirectives,
   inlineMentions: {},
-  contextItems: {},
+  contextItems: initialDrafts.contextItems,
   pastedAttachments: initialDrafts.pastedAttachments,
   diffQuotes: initialDrafts.diffQuotes,
   queuedPrompts: {},
@@ -1205,7 +1209,11 @@ let state: OrbitUiState = hmrData?.state
 const listeners = new Set<() => void>();
 const composerDraftListeners = new Set<() => void>();
 const draftPresenceListeners = new Set<() => void>();
-const composerFocusListeners = new Set<() => void>();
+export interface ComposerFocusOptions {
+  onlyIfIdle?: boolean;
+}
+
+const composerFocusListeners = new Set<(opts?: ComposerFocusOptions) => void>();
 
 const autoUpgradeAttempted = new Map<string, string>();
 
@@ -1618,6 +1626,7 @@ function syncDraftMutations(prev: OrbitUiState, next: OrbitUiState): void {
     prev.composerDrafts === next.composerDrafts &&
     prev.pastedAttachments === next.pastedAttachments &&
     prev.diffQuotes === next.diffQuotes &&
+    prev.contextItems === next.contextItems &&
     prev.slashDirectives === next.slashDirectives &&
     prev.sideQuestionDrafts === next.sideQuestionDrafts
   ) {
@@ -1628,6 +1637,7 @@ function syncDraftMutations(prev: OrbitUiState, next: OrbitUiState): void {
   collectChangedRecordKeys(prev.composerDrafts, next.composerDrafts, changedKeys);
   collectChangedRecordKeys(prev.pastedAttachments, next.pastedAttachments, changedKeys);
   collectChangedRecordKeys(prev.diffQuotes, next.diffQuotes, changedKeys);
+  collectChangedRecordKeys(prev.contextItems, next.contextItems, changedKeys);
   collectChangedRecordKeys(prev.slashDirectives, next.slashDirectives, changedKeys);
   collectChangedRecordKeys(prev.sideQuestionDrafts, next.sideQuestionDrafts, changedKeys);
 
@@ -2195,6 +2205,7 @@ async function uploadContextAttachmentToHost(
 const MAX_FILE_CACHE_ENTRIES = 20;
 const MAX_FILE_CACHE_BYTES = 64 * 1024 * 1024;
 const fileLoadSeqByKey = new Map<string, number>();
+const prefetchInFlightFileKeys = new Set<string>();
 
 function bumpFileLoadSeq(cKey: string): number {
   const next = (fileLoadSeqByKey.get(cKey) ?? 0) + 1;
@@ -3301,11 +3312,20 @@ export const orbitActions = {
           s.archivedThreads[threadScopeKey(hostId, nextAgentId)] ||
           !detail.agents.some((a) => a.agent_id === nextAgentId)
         ) {
+          const prevOptId =
+            nextAgentId &&
+            nextAgentId.startsWith("opt_") &&
+            !detail.agents.some((a) => a.agent_id === nextAgentId)
+              ? nextAgentId
+              : null;
           const firstVisible = detail.agents.find(
             (a) => !s.archivedThreads[threadScopeKey(hostId, a.agent_id)],
           );
           nextAgentId = firstVisible?.agent_id ?? null;
           nextDraft = nextAgentId === null;
+          if (prevOptId && nextAgentId && !nextAgentId.startsWith("opt_")) {
+            sharedDisclosureStateStore.migrateAgent(prevOptId, nextAgentId);
+          }
         }
       }
 
@@ -3613,6 +3633,12 @@ export const orbitActions = {
   selectAgent(hostId: string, agentId: string, jumpToSeq?: number | null): void {
     flushPendingSeenMarks();
     pendingDraftCreate = null;
+    const isSwitchingThread =
+      state.activeView !== "workspace" ||
+      state.workspacePanel !== "conversation" ||
+      state.isDraftNewSession ||
+      state.selectedHostId !== hostId ||
+      state.selectedAgentId !== agentId;
     const detail = state.hostDetails[hostId];
     const ag = detail?.agents.find((a) => a.agent_id === agentId);
     const nextCwd = ag?.cwd ?? state.selectedWorkspaceCwd;
@@ -3671,6 +3697,9 @@ export const orbitActions = {
 
     markThreadSeenInCore(hostId, agentId, seenSeq, true);
     orbitActions.refreshSidebarView();
+    if (isSwitchingThread) {
+      orbitActions.focusComposer({ onlyIfIdle: true });
+    }
     void orbitIpc.openAgentTimeline(hostId, agentId);
     void orbitIpc.markAgentRead(hostId, agentId);
     void orbitIpc.listProviderSubagents(hostId, agentId);
@@ -3765,15 +3794,15 @@ export const orbitActions = {
     }));
   },
 
-  focusComposer(): void {
+  focusComposer(opts?: ComposerFocusOptions): void {
     setTimeout(() => {
       for (const fn of composerFocusListeners) {
-        fn();
+        fn(opts);
       }
     }, 16);
   },
 
-  onComposerFocusRequest(cb: () => void): () => void {
+  onComposerFocusRequest(cb: (opts?: ComposerFocusOptions) => void): () => void {
     composerFocusListeners.add(cb);
     return () => composerFocusListeners.delete(cb);
   },
@@ -3881,9 +3910,10 @@ export const orbitActions = {
     const rawModel = activeAgent ? activeAgent.model : (state.draftModels[activeProvider] ?? null);
     const cat = getCatalogForProvider(detail?.provider_catalogs, activeProvider);
     const spec = resolveActiveModelSpec(cat, rawModel);
+    const modelAllowsFast = modelSupportsFastMode(activeProvider, spec);
     const isDraft = !activeAgent;
 
-    if (!spec?.supports_fast_mode && (isDraft || !activeAgent.fast_mode)) {
+    if (!modelAllowsFast && (isDraft || !activeAgent.fast_mode)) {
       if (isDraft && (action === false || action === "disable" || state.draftFastMode)) {
         orbitActions.setDraftConfig({ fastMode: false });
       }
@@ -3900,7 +3930,7 @@ export const orbitActions = {
           ? false
           : !current;
 
-    if (next && !spec?.supports_fast_mode) {
+    if (next && !modelAllowsFast) {
       notifyToast("Fast mode unavailable for this model");
       return;
     }
@@ -4724,10 +4754,15 @@ export const orbitActions = {
           URL.revokeObjectURL(ctx.previewUrl);
           revokedLocalUrls.add(ctx.previewUrl);
         }
+        const cachedEntry = ctx.path ? getCachedPromptImage(submitTarget.hostId, ctx.path) : null;
+        const safePreviewUrl =
+          ctx.previewUrl && !revokedLocalUrls.has(ctx.previewUrl) ? ctx.previewUrl : null;
+        const cachedPreview =
+          safePreviewUrl || (cachedEntry?.status === "ready" ? cachedEntry.url : null);
         sentImages.push({
           label: ctx.filename,
           path: ctx.path || null,
-          previewUrl: ctx.previewUrl || null,
+          previewUrl: cachedPreview,
         });
         if (ctx.path) {
           const queue = imagePathQueueByLabel.get(ctx.filename);
@@ -4908,9 +4943,9 @@ export const orbitActions = {
               cat.configured_default_effort,
             ));
       const supportsFast =
-        effectiveProvider === "acp"
+        effectiveProvider === "acp" || effectiveProvider === "antigravity"
           ? false
-          : (resolvedSel?.supports_fast_mode ?? Boolean(spec?.supports_fast_mode));
+          : (resolvedSel?.supports_fast_mode ?? modelSupportsFastMode(effectiveProvider, spec));
 
       const stillOnOriginDraft =
         state.selectedHostId === submitTarget.hostId &&
@@ -5548,6 +5583,7 @@ export const orbitActions = {
     toBeforeSeq: number,
     restoreFiles: boolean,
     fallbackPromptText?: string,
+    fallbackBadges?: readonly PromptBadge[],
   ): Promise<boolean> {
     const tKey = threadScopeKey(hostId, agentId);
     // Clear queued follow-ups before calling the daemon so transitioning to Idle never auto-dispatches stale prompts
@@ -5560,7 +5596,101 @@ export const orbitActions = {
 
     try {
       const res = await orbitIpc.rewindAgent(hostId, agentId, toBeforeSeq, restoreFiles);
-      const restoredDraft = (res.restored_prompt ?? fallbackPromptText ?? "").trim();
+      const rawFallback = (fallbackPromptText ?? "").trim();
+      const rawServerPrompt = (res.restored_prompt ?? "").trim();
+      const hasFallbackBadges = Boolean(fallbackBadges && fallbackBadges.length > 0);
+
+      // Reconstruct composer attachments (images, files, media, diffs) & slash directive from the rewound prompt
+      const restoredContexts: ContextMentionItem[] = [];
+      let restoredSlash: SlashDirective | null = null;
+      const nowToken = Date.now();
+      let imageIdx = 0;
+
+      if (fallbackBadges && fallbackBadges.length > 0) {
+        for (let i = 0; i < fallbackBadges.length; i += 1) {
+          const badge = fallbackBadges[i];
+          if (badge.kind === "image") {
+            const recent = lookupRecentSentTurnImage(
+              hostId,
+              agentId,
+              rawFallback || rawServerPrompt,
+              imageIdx,
+              badge.label,
+            );
+            imageIdx += 1;
+            const resolvedPath = badge.path?.trim() || recent?.path?.trim() || "";
+            if (!resolvedPath) continue;
+            const cached = getCachedPromptImage(hostId, resolvedPath);
+            restoredContexts.push({
+              id: `img_rw_${nowToken}_${i}`,
+              kind: "image",
+              filename: badge.label || basenameFromPath(resolvedPath) || "image.png",
+              path: resolvedPath,
+              previewUrl:
+                (cached?.status === "ready" ? cached.url : null) ?? recent?.previewUrl ?? "",
+              sizeBytes: 0,
+              stagedHostId: hostId,
+            });
+          } else if (
+            badge.kind === "pdf" ||
+            badge.kind === "audio" ||
+            badge.kind === "video"
+          ) {
+            const resolvedPath = badge.path?.trim() || "";
+            if (!resolvedPath) continue;
+            restoredContexts.push({
+              id: `${badge.kind}_rw_${nowToken}_${i}`,
+              kind: "file",
+              path: resolvedPath,
+              filename: badge.label || basenameFromPath(resolvedPath),
+              stagedHostId: hostId,
+              mediaKind: badge.kind,
+              mimeType: defaultMimeForMedia(badge.label || resolvedPath, badge.kind),
+            });
+          } else if (badge.kind === "file") {
+            const resolvedPath = badge.path?.trim() || "";
+            if (!resolvedPath) continue;
+            const isStaged = resolvedPath.startsWith("/");
+            restoredContexts.push({
+              id: `file_rw_${nowToken}_${i}`,
+              kind: "file",
+              path: resolvedPath,
+              filename: badge.label || basenameFromPath(resolvedPath),
+              ...(isStaged ? { stagedHostId: hostId } : {}),
+            });
+          } else if (badge.kind === "git_diff") {
+            const staged = /staged/i.test(badge.label);
+            restoredContexts.push({
+              id: `diff_rw_${staged ? "s" : "w"}_${nowToken}_${i}`,
+              kind: "git_diff",
+              staged,
+              label: badge.label || (staged ? "Staged Diff" : "Working Tree Diff"),
+            });
+          } else if (badge.kind === "slash") {
+            const rawCmd = badge.label.replace(/^\//, "").trim();
+            if (
+              rawCmd === "plan" ||
+              rawCmd === "review" ||
+              rawCmd === "compact" ||
+              rawCmd === "orbit" ||
+              rawCmd === "orbit-handoff" ||
+              rawCmd === "orbit-committee" ||
+              rawCmd === "orbit-advisor"
+            ) {
+              restoredSlash = rawCmd;
+            }
+          }
+        }
+      }
+
+      // If the prompt came from a legacy wire format (e.g. `Attached image file: \`/path\``) and we
+      // already extracted structured badges, prefer the clean text so raw attachment markup isn't duplicated.
+      const serverLooksLikeLegacyMarkup =
+        hasFallbackBadges &&
+        /^Attached (?:image|PDF|audio|video)? ?file:\s*`[^`]+`/m.test(rawServerPrompt);
+      const restoredDraft = serverLooksLikeLegacyMarkup
+        ? rawFallback
+        : rawServerPrompt || rawFallback;
       const cwd = res.agent?.cwd || state.selectedWorkspaceCwd;
 
       const openFileTabsToReload: Array<{ hostId: string; cwd: string; path: string }> = [];
@@ -5586,6 +5716,26 @@ export const orbitActions = {
             }
           }
         }
+
+        // Preserve any images/files already staged in the composer AND merge restored attachments from the rewound turn
+        const existingCtxs = s.contextItems[tKey] ?? [];
+        const mergedCtxs = [...existingCtxs];
+        for (const item of restoredContexts) {
+          const dup = mergedCtxs.some((cur) => {
+            if (cur.kind === "image" && item.kind === "image") {
+              return Boolean(cur.path && cur.path === item.path);
+            }
+            if (cur.kind === "file" && item.kind === "file") {
+              return Boolean(cur.path && cur.path === item.path);
+            }
+            if (cur.kind === "git_diff" && item.kind === "git_diff") {
+              return cur.staged === item.staged;
+            }
+            return false;
+          });
+          if (!dup) mergedCtxs.push(item);
+        }
+
         return {
           ...s,
           fileViewCache: nextFileCache,
@@ -5593,8 +5743,17 @@ export const orbitActions = {
           composerDrafts: restoredDraft
             ? { ...s.composerDrafts, [tKey]: restoredDraft }
             : s.composerDrafts,
+          contextItems:
+            mergedCtxs.length !== existingCtxs.length
+              ? { ...s.contextItems, [tKey]: mergedCtxs }
+              : s.contextItems,
+          slashDirectives:
+            restoredSlash && !s.slashDirectives[tKey]
+              ? { ...s.slashDirectives, [tKey]: restoredSlash }
+              : s.slashDirectives,
         };
       });
+      draftPersistence.flushNow();
 
       await Promise.all([
         orbitActions.pullStageDelta(hostId, agentId, true),
@@ -6892,6 +7051,55 @@ export const orbitActions = {
         }
       }
     })();
+  },
+
+  prefetchWorkspaceFile(
+    rawPath: string,
+    opts?: { hostId?: string; cwd?: string; fallbackPath?: string },
+  ): void {
+    const hostId = opts?.hostId ?? state.selectedHostId;
+    const cwd = opts?.cwd ?? state.selectedWorkspaceCwd ?? "~";
+    const normalizedCandidate = normalizeWorkspacePathCandidate(rawPath, cwd);
+    if (!hostId || !normalizedCandidate) return;
+
+    const cachedFiles = state.workspaceFilesCache[`${hostId}::${cwd}`];
+    const resolvedFromCache =
+      !normalizedCandidate.startsWith("/") && !normalizedCandidate.startsWith("~/")
+        ? resolveUniqueWorkspaceFileSuffix(normalizedCandidate, cachedFiles)
+        : null;
+    const cleanPath = resolvedFromCache ?? normalizedCandidate;
+    const cKey = fileCacheKey(hostId, cwd, cleanPath);
+    const existing = state.fileViewCache[cKey];
+    if (
+      existing?.status === "loading" ||
+      existing?.status === "ready" ||
+      prefetchInFlightFileKeys.has(cKey)
+    ) {
+      return;
+    }
+
+    prefetchInFlightFileKeys.add(cKey);
+    // Warm quietly in background without touching side-panel state or showing loading spinners
+    void orbitIpc
+      .readWorkspaceFile(hostId, cwd, cleanPath)
+      .then((data) => {
+        if (state.fileViewCache[cKey]?.status === "ready") return;
+        setState((s) => ({
+          ...s,
+          fileViewCache: upsertLruRecord(
+            s.fileViewCache,
+            cKey,
+            { status: "ready", data },
+            MAX_FILE_CACHE_ENTRIES,
+          ),
+        }));
+      })
+      .catch(() => {
+        // Ignore silent prefetch misses; real click handles fallback path resolution
+      })
+      .finally(() => {
+        prefetchInFlightFileKeys.delete(cKey);
+      });
   },
 
   async loadWorkspaceFile(
@@ -11297,6 +11505,9 @@ function upsertLruRecord<T>(
 registerOrbitLinkOpener({
   openFile(rawPath, opts) {
     orbitActions.openFileInSidePanel(rawPath, opts);
+  },
+  prefetchFile(rawPath, opts) {
+    orbitActions.prefetchWorkspaceFile(rawPath, opts);
   },
   openBrowser(url) {
     orbitActions.openBrowserTab(url);

@@ -386,7 +386,12 @@ function PermissionApprovalCard({
                     : "Low risk"}
             </span>
             <span className="shrink-0 opacity-45">·</span>
-            <span className="min-w-0 truncate opacity-90">{perm.guardian_assessment.reason}</span>
+            <span
+              title={perm.guardian_assessment.reason}
+              className="min-w-0 truncate opacity-90"
+            >
+              {perm.guardian_assessment.reason}
+            </span>
           </div>
         )}
         <div className="rounded-[10px] bg-black/[0.028] px-3 py-2 dark:bg-white/[0.035]">

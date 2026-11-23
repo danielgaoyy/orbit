@@ -125,9 +125,18 @@ import {
   type SubagentNameMatcher,
   areResolvedSubagentsEqual,
   buildSubagentNameMatcher,
+  extractSubagentMessageCall,
   resolveSessionSubagents,
   resolveToolCallSubagent,
 } from "@/lib/subagents";
+import {
+  type ToolCallTimelineItem,
+  computeWorkChunkDurationMs,
+  extractFallbackDispatchCall,
+  splitStepGroupChronologically,
+  summarizeWorkChunk,
+} from "@/lib/turn-delegation-split";
+import { sharedDisclosureStateStore } from "@/lib/disclosure-state";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -972,16 +981,31 @@ const StepItemRow = memo(function StepItemRow({
             </ScrollArea>
           )}
 
-          {item.detail.kind === "generic" && item.detail.arguments_json && (
-            <ScrollArea
-              className="border-border bg-muted/45 dark:bg-muted/25 rounded-lg border"
-              viewportClassName="max-h-44 overscroll-contain px-3 py-2"
-            >
-              <pre className="selectable-text text-muted-foreground font-mono text-[12px] whitespace-pre-wrap">
-                {formatJsonPreview(item.detail.arguments_json)}
-              </pre>
-            </ScrollArea>
-          )}
+          {item.detail.kind === "generic" && item.detail.arguments_json && (() => {
+            const msgCall = extractSubagentMessageCall(item);
+            if (msgCall && msgCall.message) {
+              return (
+                <ScrollArea
+                  className="border-border bg-muted/45 dark:bg-muted/25 rounded-lg border"
+                  viewportClassName="max-h-60 overscroll-contain px-3 py-2"
+                >
+                  <pre className="selectable-text text-foreground/85 font-sans text-[12.5px] leading-relaxed whitespace-pre-wrap break-words">
+                    {msgCall.message}
+                  </pre>
+                </ScrollArea>
+              );
+            }
+            return (
+              <ScrollArea
+                className="border-border bg-muted/45 dark:bg-muted/25 rounded-lg border"
+                viewportClassName="max-h-44 overscroll-contain px-3 py-2"
+              >
+                <pre className="selectable-text text-muted-foreground font-mono text-[12px] whitespace-pre-wrap">
+                  {formatJsonPreview(item.detail.arguments_json)}
+                </pre>
+              </ScrollArea>
+            );
+          })()}
         </div>
       )}
     </div>
@@ -1057,82 +1081,303 @@ const StepTimelineRail = memo(function StepTimelineRail({
   );
 });
 
+type DelegationMilestoneEntry =
+  | {
+      kind: "subagent";
+      key: string;
+      subagent: ResolvedSubagentItem;
+      action: "dispatch" | "message";
+      callStatus: "running" | "completed" | "failed" | "denied";
+    }
+  | {
+      kind: "expandable";
+      key: string;
+      variant: "message" | "dispatch";
+      label: string;
+      detailText: string;
+      detailIsMono: boolean;
+      status: "running" | "completed" | "failed" | "denied";
+    };
+
 /**
- * Quiet single-line flex-wrap row of clickable subagent pills rendered directly beneath
- * a `TurnActivityDisclosure` summary whenever a step group dispatches or messages subagents.
+ * First-class chronological milestone row for subagent dispatches (`Ran an agent`) and
+ * inter-agent messages (`Sent to parent` / `Sent to @handle`), rendered at their exact
+ * real-time timeline position rather than duplicated inside folded work disclosures.
  */
-const SubagentCallChips = memo(function SubagentCallChips({
+const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
   items,
   hostId,
   agentId,
   sessionSubagents,
   onOpenSubagent,
+  parentMessageLabel,
 }: {
-  items: TimelineItemView[];
+  items: readonly ToolCallTimelineItem[];
   hostId?: string;
   agentId?: string;
   sessionSubagents?: readonly ResolvedSubagentItem[];
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
+  parentMessageLabel?: string | null;
 }) {
-  const chips = useMemo(() => {
-    const byKey = new Map<string, { subagent: ResolvedSubagentItem; action: "dispatch" | "message" }>();
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const entries = useMemo(() => {
+    const out: DelegationMilestoneEntry[] = [];
+    const subagentIndexByKey = new Map<string, number>();
+
     for (const it of items) {
-      if (it.item_type !== "tool_call") continue;
       const resolved = resolveToolCallSubagent(it, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
-      if (!resolved) continue;
-      const existing = byKey.get(resolved.subagent.key);
-      if (!existing || (existing.action === "message" && resolved.action === "dispatch")) {
-        byKey.set(resolved.subagent.key, resolved);
+      if (resolved) {
+        const existingIdx = subagentIndexByKey.get(resolved.subagent.key);
+        if (existingIdx !== undefined) {
+          const prev = out[existingIdx];
+          if (prev?.kind === "subagent") {
+            const nextAction =
+              prev.action === "dispatch" || resolved.action === "dispatch"
+                ? "dispatch"
+                : "message";
+            out[existingIdx] = {
+              ...prev,
+              subagent: resolved.subagent,
+              action: nextAction,
+              callStatus: it.status,
+            };
+          }
+        } else {
+          subagentIndexByKey.set(resolved.subagent.key, out.length);
+          out.push({
+            kind: "subagent",
+            key: resolved.subagent.key,
+            subagent: resolved.subagent,
+            action: resolved.action,
+            callStatus: it.status,
+          });
+        }
+        continue;
+      }
+
+      const msgCall = extractSubagentMessageCall(it);
+      if (msgCall) {
+        const isNamedHandle =
+          msgCall.recipient.length > 0 &&
+          msgCall.recipient.length <= 24 &&
+          !/^[0-9a-f-]{16,}$/i.test(msgCall.recipient) &&
+          !msgCall.recipient.startsWith("ag_");
+        const label = isNamedHandle
+          ? `Sent to @${msgCall.recipient.replace(/^@+/, "")}`
+          : parentMessageLabel || "Send message";
+        const isFailed = msgCall.status === "failed" || msgCall.status === "denied";
+        const rawArgs =
+          it.detail.kind === "generic" ? it.detail.arguments_json.trim() : "";
+        const hasFallbackArgs =
+          isFailed && rawArgs.length > 0 && rawArgs !== "{}" && rawArgs !== "null";
+        const detailText =
+          msgCall.message || (hasFallbackArgs ? formatJsonPreview(rawArgs) : "");
+        out.push({
+          kind: "expandable",
+          key: `msg:${it.call_id || it.seq}`,
+          variant: "message",
+          label,
+          detailText,
+          detailIsMono: !msgCall.message && hasFallbackArgs,
+          status: msgCall.status,
+        });
+        continue;
+      }
+
+      const fallbackDispatch = extractFallbackDispatchCall(it);
+      if (fallbackDispatch) {
+        out.push({
+          kind: "expandable",
+          key: `dispatch:${fallbackDispatch.callId}`,
+          variant: "dispatch",
+          label: fallbackDispatch.label,
+          detailText: fallbackDispatch.preview,
+          detailIsMono: fallbackDispatch.preview.startsWith("{"),
+          status: fallbackDispatch.status,
+        });
       }
     }
-    return Array.from(byKey.values());
-  }, [items, sessionSubagents, hostId]);
 
-  if (chips.length === 0) return null;
+    return out;
+  }, [items, sessionSubagents, hostId, parentMessageLabel]);
+
+  if (entries.length === 0) return null;
+
+  const activeExpandable = expandedKey
+    ? (entries.find(
+        (e): e is Extract<DelegationMilestoneEntry, { kind: "expandable" }> =>
+          e.kind === "expandable" && e.key === expandedKey,
+      ) ?? null)
+    : null;
 
   return (
-    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-      {chips.map(({ subagent, action }) => (
-        <button
-          key={subagent.key}
-          type="button"
-          title={subagent.promptPreview || `Open ${subagent.title}`}
-          onClick={() => {
-            if (onOpenSubagent) {
-              onOpenSubagent(subagent);
-            } else {
-              orbitActions.openSubagentTab({
-                callId: subagent.callId,
-                role: subagent.title,
-                promptPreview: subagent.promptPreview,
-                childAgentId: subagent.childAgentId,
-                childHostId: subagent.childHostId || undefined,
-                providerSubagentId: subagent.providerSubagentId,
-                parentAgentId: agentId || undefined,
-              });
-            }
-          }}
-          className="group/sachip text-foreground/82 hover:text-foreground inline-flex h-[24px] max-w-[260px] cursor-pointer items-center gap-1.5 rounded-full border border-black/[0.07] bg-black/[0.02] px-2.5 text-[12px] leading-none transition-colors hover:border-black/[0.14] hover:bg-black/[0.045] dark:border-white/[0.09] dark:bg-white/[0.03] dark:hover:border-white/[0.16] dark:hover:bg-white/[0.06]"
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
+        {entries.map((entry) => {
+          if (entry.kind === "subagent") {
+            const { subagent, action, callStatus } = entry;
+            const isFailed =
+              callStatus === "failed" ||
+              callStatus === "denied" ||
+              subagent.status === "failed";
+            return (
+              <button
+                key={entry.key}
+                type="button"
+                title={subagent.promptPreview || `Open ${subagent.title}`}
+                onClick={() => {
+                  if (onOpenSubagent) {
+                    onOpenSubagent(subagent);
+                  } else {
+                    orbitActions.openSubagentTab({
+                      callId: subagent.callId,
+                      role: subagent.title,
+                      promptPreview: subagent.promptPreview,
+                      childAgentId: subagent.childAgentId,
+                      childHostId: subagent.childHostId || undefined,
+                      providerSubagentId: subagent.providerSubagentId,
+                      parentAgentId: agentId || undefined,
+                    });
+                  }
+                }}
+                className={cn(
+                  "group/sachip text-foreground/82 hover:text-foreground inline-flex h-[24px] max-w-[260px] cursor-pointer items-center gap-1.5 rounded-full border px-2.5 text-[12px] leading-none transition-colors",
+                  isFailed
+                    ? "border-rose-500/30 bg-rose-500/[0.04] hover:border-rose-500/45 hover:bg-rose-500/[0.08]"
+                    : "border-black/[0.07] bg-black/[0.02] hover:border-black/[0.14] hover:bg-black/[0.045] dark:border-white/[0.09] dark:bg-white/[0.03] dark:hover:border-white/[0.16] dark:hover:bg-white/[0.06]",
+                )}
+              >
+                <span className="flex size-3 shrink-0 items-center justify-center">
+                  {action === "message" ? (
+                    callStatus === "running" ? (
+                      <OrbitSpinner size={11} className="text-foreground/70" />
+                    ) : callStatus === "failed" || callStatus === "denied" ? (
+                      <AlertTriangle className="size-3 text-rose-500" />
+                    ) : (
+                      <ArrowRight className="text-muted-foreground/85 size-3 stroke-[1.9]" />
+                    )
+                  ) : subagent.status === "awaiting_permission" ? (
+                    <span className="size-[6px] rounded-full bg-amber-500 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]" />
+                  ) : subagent.status === "running" || callStatus === "running" ? (
+                    <OrbitSpinner size={11} className="text-foreground/70" />
+                  ) : isFailed ? (
+                    <AlertTriangle className="size-3 text-rose-500" />
+                  ) : subagent.status === "canceled" ? (
+                    <span className="bg-muted-foreground/45 size-[6px] rounded-full" />
+                  ) : (
+                    <Check className="size-3 stroke-[2.2] text-emerald-600/85 dark:text-emerald-400/85" />
+                  )}
+                </span>
+                <span className="min-w-0 truncate font-medium">{subagent.title}</span>
+                <ArrowUpRight className="text-muted-foreground/55 group-hover/sachip:text-foreground/85 size-3 shrink-0 opacity-45 transition-opacity group-hover/sachip:opacity-100" />
+              </button>
+            );
+          }
+
+          const isOpen = expandedKey === entry.key;
+          const canToggle = entry.detailText.length > 0;
+          const isFailed = entry.status === "failed" || entry.status === "denied";
+          return (
+            <button
+              key={entry.key}
+              type="button"
+              disabled={!canToggle}
+              title={entry.detailText ? entry.detailText.slice(0, 180) : entry.label}
+              onClick={() => {
+                if (!canToggle) return;
+                setExpandedKey((prev) => (prev === entry.key ? null : entry.key));
+              }}
+              className={cn(
+                "group/sachip text-foreground/82 inline-flex h-[24px] max-w-[260px] items-center gap-1.5 rounded-full border px-2.5 text-[12px] leading-none transition-colors",
+                isFailed
+                  ? "border-rose-500/30 bg-rose-500/[0.04]"
+                  : "border-black/[0.07] bg-black/[0.02] dark:border-white/[0.09] dark:bg-white/[0.03]",
+                canToggle &&
+                  (isFailed
+                    ? "hover:text-foreground cursor-pointer hover:border-rose-500/45 hover:bg-rose-500/[0.08]"
+                    : "hover:text-foreground cursor-pointer hover:border-black/[0.14] hover:bg-black/[0.045] dark:hover:border-white/[0.16] dark:hover:bg-white/[0.06]"),
+                isOpen &&
+                  (isFailed
+                    ? "border-rose-500/45 bg-rose-500/[0.08] text-foreground"
+                    : "border-black/[0.16] bg-black/[0.045] text-foreground dark:border-white/[0.18] dark:bg-white/[0.07]"),
+              )}
+            >
+              <span className="flex size-3 shrink-0 items-center justify-center">
+                {entry.status === "running" ? (
+                  <OrbitSpinner size={11} className="text-foreground/70" />
+                ) : isFailed ? (
+                  <AlertTriangle className="size-3 text-rose-500" />
+                ) : entry.variant === "dispatch" ? (
+                  <Check className="size-3 stroke-[2.2] text-emerald-600/85 dark:text-emerald-400/85" />
+                ) : (
+                  <ArrowRight className="text-muted-foreground/85 size-3 stroke-[1.9]" />
+                )}
+              </span>
+              <span className="min-w-0 truncate font-medium">{entry.label}</span>
+              {canToggle && (
+                <ChevronRight
+                  className={cn(
+                    "text-muted-foreground/60 size-3 shrink-0 transition-transform duration-150",
+                    isOpen && "rotate-90",
+                  )}
+                />
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {activeExpandable && activeExpandable.detailText && (
+        <div
+          className={cn(
+            "orbit-stage-enter relative rounded-xl border",
+            activeExpandable.status === "failed" || activeExpandable.status === "denied"
+              ? "border-rose-500/30 bg-rose-500/[0.04]"
+              : "border-border bg-muted/35 dark:bg-muted/20",
+          )}
         >
-          <span className="flex size-3 shrink-0 items-center justify-center">
-            {action === "message" ? (
-              <ArrowRight className="text-muted-foreground/85 size-3 stroke-[1.9]" />
-            ) : subagent.status === "awaiting_permission" ? (
-              <span className="size-[6px] rounded-full bg-amber-500 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]" />
-            ) : subagent.status === "running" ? (
-              <OrbitSpinner size={11} className="text-foreground/70" />
-            ) : subagent.status === "failed" ? (
-              <AlertTriangle className="size-3 text-rose-500" />
-            ) : subagent.status === "canceled" ? (
-              <span className="bg-muted-foreground/45 size-[6px] rounded-full" />
-            ) : (
-              <Check className="size-3 stroke-[2.2] text-emerald-600/85 dark:text-emerald-400/85" />
-            )}
-          </span>
-          <span className="min-w-0 truncate font-medium">{subagent.title}</span>
-          <ArrowUpRight className="text-muted-foreground/55 group-hover/sachip:text-foreground/85 size-3 shrink-0 opacity-45 transition-opacity group-hover/sachip:opacity-100" />
-        </button>
-      ))}
+          <div className="border-border/60 flex items-center justify-between gap-2 border-b px-3 py-1.5">
+            <span className="text-muted-foreground text-[11.5px] font-medium">
+              {activeExpandable.label}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard.writeText(activeExpandable.detailText);
+                setCopiedKey(activeExpandable.key);
+                window.setTimeout(() => {
+                  setCopiedKey((cur) => (cur === activeExpandable.key ? null : cur));
+                }, 1400);
+              }}
+              className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors"
+            >
+              {copiedKey === activeExpandable.key ? (
+                <>
+                  <Check className="size-3 text-emerald-500" />
+                  <span>Copied</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="size-3" />
+                  <span>Copy</span>
+                </>
+              )}
+            </button>
+          </div>
+          <ScrollArea viewportClassName="max-h-72 overscroll-contain px-3.5 py-2.5">
+            <pre
+              className={cn(
+                "selectable-text text-foreground/88 leading-relaxed whitespace-pre-wrap break-words",
+                activeExpandable.detailIsMono ? "font-mono text-[12px]" : "font-sans text-[12.5px]",
+              )}
+            >
+              {activeExpandable.detailText}
+            </pre>
+          </ScrollArea>
+        </div>
+      )}
     </div>
   );
 });
@@ -1162,6 +1407,9 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   hostId,
   cwd,
   agentId,
+  turnIndex,
+  turnAnchorSeq,
+  workOrdinal,
   thinkingSignature,
   getThinkingDurationMs,
   holdViewport,
@@ -1185,16 +1433,38 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   hostId?: string;
   cwd: string;
   agentId: string;
+  turnIndex?: number;
+  turnAnchorSeq?: number;
+  workOrdinal?: number;
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
   sessionSubagents?: readonly ResolvedSubagentItem[];
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
-  const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
+  const canPersist =
+    typeof turnIndex === "number" &&
+    typeof turnAnchorSeq === "number" &&
+    typeof workOrdinal === "number" &&
+    Boolean(agentId);
+
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(() =>
+    canPersist
+      ? sharedDisclosureStateStore.get(agentId, turnIndex, workOrdinal, turnAnchorSeq)
+      : null,
+  );
   const foldBtnRef = useRef<HTMLButtonElement | null>(null);
+  const pointerToggledRef = useRef(false);
   const fallbackStartRef = useRef<number>(Date.now());
   const effectiveLiveStartedAtMs = liveStartedAtMs ?? fallbackStartRef.current;
+
+  // Keep persisted disclosure override in sync if this component is reused across slot changes
+  // or when an optimistic turn (`anchorSeq === 0`) upgrades to a confirmed positive `anchorSeq`.
+  useEffect(() => {
+    if (!canPersist) return;
+    const saved = sharedDisclosureStateStore.get(agentId, turnIndex, workOrdinal, turnAnchorSeq);
+    setUserExpanded((prev) => (prev === saved ? prev : saved));
+  }, [canPersist, agentId, turnIndex, workOrdinal, turnAnchorSeq]);
 
   if (items.length === 0) {
     if (!isWorkActive) return null;
@@ -1213,6 +1483,17 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
 
   const defaultOpen = !defaultCollapsed || autoOpenForError;
   const isExpanded = userExpanded !== null ? userExpanded : defaultOpen;
+  const toggleExpanded = () => {
+    holdViewport(foldBtnRef.current, () => {
+      setUserExpanded((prev) => {
+        const next = !(prev !== null ? prev : defaultOpen);
+        if (canPersist) {
+          sharedDisclosureStateStore.set(agentId, turnIndex, workOrdinal, turnAnchorSeq, next);
+        }
+        return next;
+      });
+    });
+  };
   const showFailureBadge =
     !isWorkActive && summaryCounts.unrecovered_failure_count > 0 && !labelIncludesFailure;
   const showDiffNumbers =
@@ -1229,11 +1510,30 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
         ref={foldBtnRef}
         type="button"
         aria-expanded={isExpanded}
-        onClick={() =>
-          holdViewport(foldBtnRef.current, () =>
-            setUserExpanded((prev) => !(prev !== null ? prev : defaultOpen)),
-          )
-        }
+        onPointerDown={(e) => {
+          // Toggle immediately on primary pointer press so rapid streaming updates that shrink
+          // `liveLabel` or shift layout between mousedown and mouseup can never swallow the click.
+          if (e.button !== 0 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+          pointerToggledRef.current = true;
+          e.preventDefault();
+          toggleExpanded();
+          const clearGuard = () => {
+            window.removeEventListener("pointerup", clearGuard);
+            window.removeEventListener("pointercancel", clearGuard);
+            window.setTimeout(() => {
+              pointerToggledRef.current = false;
+            }, 0);
+          };
+          window.addEventListener("pointerup", clearGuard, { once: true });
+          window.addEventListener("pointercancel", clearGuard, { once: true });
+        }}
+        onClick={() => {
+          if (pointerToggledRef.current) {
+            pointerToggledRef.current = false;
+            return;
+          }
+          toggleExpanded();
+        }}
         className="group/fold text-muted-foreground hover:text-foreground hover:bg-accent/55 -ml-1.5 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[13.5px] font-normal transition-colors"
       >
         {isWorkActive ? (
@@ -1302,14 +1602,6 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
           )}
         />
       </button>
-
-      <SubagentCallChips
-        items={items}
-        hostId={hostId}
-        agentId={agentId}
-        sessionSubagents={sessionSubagents}
-        onOpenSubagent={onOpenSubagent}
-      />
 
       {isExpanded && (
         <div className="orbit-stage-enter">
@@ -1730,7 +2022,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
   cwd?: string;
   holdViewport: ViewportAnchorHoldFn;
   animateEntrance?: boolean;
-  onRequestRewind?: (seq: number, promptText: string) => void;
+  onRequestRewind?: (seq: number, promptText: string, badges: readonly PromptBadge[]) => void;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -1991,7 +2283,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
         </div>
       )}
 
-      <div className="mt-1 -mb-1.5 flex h-[22px] shrink-0 items-center justify-end gap-1 pr-1 whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100">
+      <div className="mt-3 flex h-[22px] shrink-0 items-center justify-end gap-1 pr-1 whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100">
         {promptTimestampMs !== null && (
           <RelativeTimestampPill timestampMs={promptTimestampMs} />
         )}
@@ -2003,7 +2295,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
         {onRequestRewind && item.seq > 0 && (
           <UndoActionButton
             label="Undo to this point"
-            onClick={() => onRequestRewind(item.seq, copyPayload)}
+            onClick={() => onRequestRewind(item.seq, cleanText, badges)}
           />
         )}
       </div>
@@ -2280,13 +2572,14 @@ function ForkActionButton({
   return (
     <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
       <HoverPillTooltip
-        label={menuOpen ? "" : "Fork from here"}
+        label={menuOpen ? "" : "Fork…"}
         delay={240}
         renderTrigger={(handlers) => (
           <DropdownMenuTrigger asChild>
             <button
               type="button"
               aria-label="Fork from here"
+              data-fork-menu-open={menuOpen ? "true" : undefined}
               {...handlers}
               className={cn(
                 "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
@@ -2359,21 +2652,21 @@ const ForkedFromBanner = memo(function ForkedFromBanner({
   );
 
   return (
-    <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,768px)] items-center pt-2 pb-0.5">
+    <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,768px)] items-center px-[10px] pt-2 pb-0.5">
       {canJump ? (
         <button
           type="button"
           onClick={() => orbitActions.selectAgent(hostId, sourceId)}
-          className="text-muted-foreground/85 hover:text-foreground border-border/65 bg-muted/35 hover:bg-muted/65 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11.5px] leading-tight transition-colors"
+          className="text-muted-foreground/75 hover:text-foreground inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-md py-0.5 text-[11.5px] leading-tight transition-colors"
         >
-          <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-75" />
+          <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-70" />
           <span className="truncate">
-            Forked from <span className="text-foreground/85 font-medium">{parentTitle}</span>
+            Forked from <span className="text-foreground/80 font-medium">{parentTitle}</span>
           </span>
         </button>
       ) : (
-        <span className="text-muted-foreground/75 border-border/55 bg-muted/25 inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11.5px] leading-tight">
-          <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-65" />
+        <span className="text-muted-foreground/65 inline-flex max-w-full items-center gap-1.5 py-0.5 text-[11.5px] leading-tight">
+          <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-60" />
           <span className="truncate">Forked from {parentTitle}</span>
         </span>
       )}
@@ -2391,6 +2684,7 @@ interface RewindFileEntry {
 interface RewindRequestTarget {
   seq: number;
   promptText: string;
+  promptBadges: readonly PromptBadge[];
   affectedTurnsCount: number;
   editedFiles: RewindFileEntry[];
 }
@@ -2715,7 +3009,7 @@ const TurnFooter = memo(function TurnFooter({
   };
 
   return (
-    <div className="mt-0.5 flex h-[22px] items-center gap-1">
+    <div className="flex h-[22px] items-center gap-1">
       {replyText && (
         <CopyActionButton
           copied={copied}
@@ -3021,6 +3315,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   sessionSubagents,
   sessionSubagentMatcher,
   onOpenSubagent,
+  parentMessageLabel,
 }: {
   turn: StageTurnView;
   isTurnActive: boolean;
@@ -3037,13 +3332,14 @@ export const TurnStageSection = memo(function TurnStageSection({
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
-  onRequestRewind: (seq: number, promptText: string) => void;
+  onRequestRewind: (seq: number, promptText: string, badges: readonly PromptBadge[]) => void;
   onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
   canForkWorktree?: boolean;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
   sessionSubagents?: readonly ResolvedSubagentItem[];
   sessionSubagentMatcher?: SubagentNameMatcher | null;
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
+  parentMessageLabel?: string | null;
 }) {
   const rawSegments = turn.live_segments;
   const hostArtifacts = useOrbitSelector(
@@ -3092,6 +3388,34 @@ export const TurnStageSection = memo(function TurnStageSection({
             lastRawSeg.item.item_type === "assistant_message" &&
             !lastRawSeg.item.streaming))));
 
+  // Pre-split any `step_group` containing subagent dispatches or inter-agent messages into
+  // strictly chronological `work` and `delegation` chunks so promoted pills sit at their exact
+  // real-time timeline position and are never duplicated inside folded step lists.
+  const stepGroupSplits = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof splitStepGroupChronologically>>();
+    for (const seg of segments) {
+      if (seg.kind === "step_group") {
+        map.set(seg.key, splitStepGroupChronologically(seg.items));
+      }
+    }
+    return map;
+  }, [segments]);
+
+  const isTrailingSettledDelegation = useMemo(() => {
+    if (!isTurnActive || lastRawSeg?.kind !== "step_group") return false;
+    const split = stepGroupSplits.get(lastRawSeg.key);
+    const lastChunk = split ? (split.chunks[split.chunks.length - 1] ?? null) : null;
+    if (!lastChunk || lastChunk.kind !== "delegation") return false;
+    return !lastChunk.items.some((it) => {
+      if (it.status === "running") return true;
+      const resolved = resolveToolCallSubagent(it, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
+      return (
+        resolved?.subagent.status === "running" ||
+        resolved?.subagent.status === "awaiting_permission"
+      );
+    });
+  }, [isTurnActive, lastRawSeg, stepGroupSplits, sessionSubagents, hostId]);
+
   // Show a lightweight trailing live indicator when the turn is active, but the last rendered
   // segment is already settled (unless `LiveBackgroundTasksBar` already owns the waiting state).
   const needsTrailingActivity =
@@ -3103,7 +3427,8 @@ export const TurnStageSection = memo(function TurnStageSection({
         !lastRawSeg.item.streaming) ||
       lastRawSeg.kind === "notice" ||
       lastRawSeg.kind === "wakeup" ||
-      lastRawSeg.kind === "compaction");
+      lastRawSeg.kind === "compaction" ||
+      isTrailingSettledDelegation);
 
   const hasBody = segments.length > 0 || needsTrailingActivity;
   const liveStartedAtMs = timing?.startedAtMs ?? turn.started_at_ms ?? null;
@@ -3138,9 +3463,11 @@ export const TurnStageSection = memo(function TurnStageSection({
       )}
 
       {hasBody && (
-        <div className="min-w-0 px-[10px]">
+        <div className="group/turn min-w-0 px-[10px]">
           <div className="min-w-0 space-y-3">
-            {segments.map((seg, idx) => {
+            {(() => {
+              let nextWorkOrdinal = 0;
+              return segments.map((seg, idx) => {
               const isLastSeg = idx === segments.length - 1;
 
               if (seg.kind === "compaction") {
@@ -3215,81 +3542,191 @@ export const TurnStageSection = memo(function TurnStageSection({
                 );
               }
 
-              // `step_group`
-              // Never render an already-failed trailing segment (with no running step) as active
-              // `Running ... waiting for response` — keep its failure visible while any new turn work
-              // shows cleanly in the trailing indicator below.
-              const isTrailingFailedGroup =
-                !seg.has_running_step && seg.summary.counts.unrecovered_failure_count > 0;
-              const hasRunningBgTask = seg.items.some(
-                (it) =>
-                  it.item_type === "tool_call" &&
-                  it.status === "running" &&
-                  Boolean(it.background_task),
-              );
-              const hasRunningNonBgTool = seg.items.some(
-                (it) =>
-                  it.item_type === "tool_call" &&
-                  it.status === "running" &&
-                  !it.background_task,
-              );
-              const isBackgroundWait = hasRunningBgTask && !hasRunningNonBgTool;
-              // Once prose, a notice, or a wakeup divider follows a step group, settle the
-              // pre-reply disclosure cleanly into its concise summary instead of keeping an
-              // extra shimmering `Running ... · running in background` line hovering above
-              // the reply (active background tasks stay visible in the trailing wait status
-              // and the Overview `Background Tasks` list).
-              const isGroupActive =
-                isTurnActive &&
-                !seg.has_following_content &&
-                (seg.has_running_step || (isLastSeg && !isTrailingFailedGroup));
-              const groupThoughtMs =
-                computeTotalThinkingDurationMs(seg.items, agentId, getThinkingDurationMs) ??
-                seg.thought_duration_ms ??
-                null;
-              const groupSettledLabel =
-                seg.summary.counts.action_steps === 0 && seg.summary.counts.thought_count > 0
-                  ? formatThoughtSummaryLabel(groupThoughtMs, seg.summary.counts.thought_count)
-                  : seg.summary.label;
-              const groupSettledDurationMs =
-                seg.work_duration_ms ??
-                (segments.length === 1
-                  ? (timing?.workDurationMs ?? turn.work_duration_ms ?? timing?.durationMs ?? null)
-                  : null);
-              const groupLiveStartMs = seg.started_at_ms ?? liveStartedAtMs;
+              // `step_group` — partition chronologically when subagent dispatches or inter-agent
+              // messages are present so promoted milestone pills never duplicate inside the fold
+              // and never jump above the steps that preceded them.
+              const split =
+                stepGroupSplits.get(seg.key) ?? splitStepGroupChronologically(seg.items);
 
-              return (
-                <TurnActivityDisclosure
-                  key={seg.key}
-                  items={seg.items}
-                  isWorkActive={isGroupActive}
-                  liveLabel={seg.summary.live_label}
-                  liveDetail={seg.summary.live_detail ?? null}
-                  settledLabel={groupSettledLabel}
-                  summaryCounts={seg.summary.counts}
-                  labelIncludesFailure={seg.summary.label_includes_failure}
-                  defaultCollapsed={autoFoldCompleted}
-                  autoOpenForError={
-                    !isGroupActive &&
-                    !seg.has_following_content &&
-                    seg.summary.counts.unrecovered_failure_count > 0
-                  }
-                  liveStartedAtMs={groupLiveStartMs}
-                  latestActivityMs={seg.latest_activity_ms ?? groupLiveStartMs}
-                  isNetworkOffline={isNetworkOffline}
-                  isBackgroundWait={isBackgroundWait}
-                  settledDurationMs={groupSettledDurationMs}
-                  hostId={hostId}
-                  cwd={cwd}
-                  agentId={agentId}
-                  thinkingSignature={_thinkingSignature}
-                  getThinkingDurationMs={getThinkingDurationMs}
-                  holdViewport={holdViewport}
-                  sessionSubagents={sessionSubagents}
-                  onOpenSubagent={onOpenSubagent}
-                />
-              );
-            })}
+              if (!split.hasDelegations) {
+                const workOrdinal = nextWorkOrdinal++;
+                // Fast-path: no delegation/message calls -> reuse Rust's precomputed summary verbatim.
+                const isTrailingFailedGroup =
+                  !seg.has_running_step && seg.summary.counts.unrecovered_failure_count > 0;
+                const hasRunningBgTask = seg.items.some(
+                  (it) =>
+                    it.item_type === "tool_call" &&
+                    it.status === "running" &&
+                    Boolean(it.background_task),
+                );
+                const hasRunningNonBgTool = seg.items.some(
+                  (it) =>
+                    it.item_type === "tool_call" &&
+                    it.status === "running" &&
+                    !it.background_task,
+                );
+                const isBackgroundWait = hasRunningBgTask && !hasRunningNonBgTool;
+                const isGroupActive =
+                  isTurnActive &&
+                  !seg.has_following_content &&
+                  (seg.has_running_step || (isLastSeg && !isTrailingFailedGroup));
+                const groupThoughtMs =
+                  computeTotalThinkingDurationMs(seg.items, agentId, getThinkingDurationMs) ??
+                  seg.thought_duration_ms ??
+                  null;
+                const groupSettledLabel =
+                  seg.summary.counts.action_steps === 0 && seg.summary.counts.thought_count > 0
+                    ? formatThoughtSummaryLabel(groupThoughtMs, seg.summary.counts.thought_count)
+                    : seg.summary.label;
+                const groupSettledDurationMs =
+                  seg.work_duration_ms ??
+                  (segments.length === 1
+                    ? (timing?.workDurationMs ?? turn.work_duration_ms ?? timing?.durationMs ?? null)
+                    : null);
+                const groupLiveStartMs = seg.started_at_ms ?? liveStartedAtMs;
+
+                return (
+                  <TurnActivityDisclosure
+                    key={seg.key}
+                    items={seg.items}
+                    isWorkActive={isGroupActive}
+                    liveLabel={seg.summary.live_label}
+                    liveDetail={seg.summary.live_detail ?? null}
+                    settledLabel={groupSettledLabel}
+                    summaryCounts={seg.summary.counts}
+                    labelIncludesFailure={seg.summary.label_includes_failure}
+                    defaultCollapsed={autoFoldCompleted}
+                    autoOpenForError={
+                      !isGroupActive &&
+                      !seg.has_following_content &&
+                      seg.summary.counts.unrecovered_failure_count > 0
+                    }
+                    liveStartedAtMs={groupLiveStartMs}
+                    latestActivityMs={seg.latest_activity_ms ?? groupLiveStartMs}
+                    isNetworkOffline={isNetworkOffline}
+                    isBackgroundWait={isBackgroundWait}
+                    settledDurationMs={groupSettledDurationMs}
+                    hostId={hostId}
+                    cwd={cwd}
+                    agentId={agentId}
+                    turnIndex={turn.turn_index}
+                    turnAnchorSeq={turn.anchor_seq}
+                    workOrdinal={workOrdinal}
+                    thinkingSignature={_thinkingSignature}
+                    getThinkingDurationMs={getThinkingDurationMs}
+                    holdViewport={holdViewport}
+                    sessionSubagents={sessionSubagents}
+                    onOpenSubagent={onOpenSubagent}
+                  />
+                );
+              }
+
+              return split.chunks.map((chunk, chunkIdx) => {
+                // Keep `seg.key` on a leading `work` chunk so transitioning from an unsplit
+                // fold to `[work, delegation]` while streaming preserves userExpanded state.
+                const chunkKey =
+                  chunkIdx === 0 && chunk.kind === "work"
+                    ? seg.key
+                    : `${seg.key}::${chunk.kind}::${chunk.anchorKey}`;
+
+                if (chunk.kind === "delegation") {
+                  return (
+                    <DelegationMilestoneRow
+                      key={chunkKey}
+                      items={chunk.items}
+                      hostId={hostId}
+                      agentId={agentId}
+                      sessionSubagents={sessionSubagents}
+                      onOpenSubagent={onOpenSubagent}
+                      parentMessageLabel={parentMessageLabel}
+                    />
+                  );
+                }
+
+                const workOrdinal = nextWorkOrdinal++;
+                const hasFollowingChunk = chunkIdx < split.chunks.length - 1;
+                const chunkHasFollowingContent = seg.has_following_content || hasFollowingChunk;
+                const chunkThoughtMs = computeTotalThinkingDurationMs(
+                  chunk.items,
+                  agentId,
+                  getThinkingDurationMs,
+                );
+                const chunkSummary = summarizeWorkChunk(chunk.items, chunkThoughtMs);
+                const chunkHasRunningStep = chunk.items.some(
+                  (it) => it.item_type === "tool_call" && it.status === "running",
+                );
+                const chunkIsTrailingFailed =
+                  !chunkHasRunningStep && chunkSummary.counts.unrecovered_failure_count > 0;
+                const chunkHasRunningBgTask = chunk.items.some(
+                  (it) =>
+                    it.item_type === "tool_call" &&
+                    it.status === "running" &&
+                    Boolean(it.background_task),
+                );
+                const chunkHasRunningNonBgTool = chunk.items.some(
+                  (it) =>
+                    it.item_type === "tool_call" &&
+                    it.status === "running" &&
+                    !it.background_task,
+                );
+                const chunkIsBackgroundWait = chunkHasRunningBgTask && !chunkHasRunningNonBgTool;
+                const isChunkActive =
+                  isTurnActive &&
+                  !chunkHasFollowingContent &&
+                  (chunkHasRunningStep || (isLastSeg && !chunkIsTrailingFailed));
+                const chunkSettledLabel =
+                  chunkSummary.counts.action_steps === 0 && chunkSummary.counts.thought_count > 0
+                    ? formatThoughtSummaryLabel(chunkThoughtMs, chunkSummary.counts.thought_count)
+                    : chunkSummary.label;
+                const chunkDurationMs = computeWorkChunkDurationMs(chunk.items);
+                const firstChunkTs = chunk.items[0]?.timestamp_ms ?? null;
+                const lastChunkTs = chunk.items[chunk.items.length - 1]?.timestamp_ms ?? null;
+                const chunkLiveStartMs =
+                  typeof firstChunkTs === "number" && firstChunkTs > 0
+                    ? firstChunkTs
+                    : (seg.started_at_ms ?? liveStartedAtMs);
+                const chunkLatestActivityMs =
+                  typeof lastChunkTs === "number" && lastChunkTs > 0
+                    ? lastChunkTs
+                    : (seg.latest_activity_ms ?? chunkLiveStartMs);
+
+                return (
+                  <TurnActivityDisclosure
+                    key={chunkKey}
+                    items={chunk.items}
+                    isWorkActive={isChunkActive}
+                    liveLabel={chunkSummary.live_label}
+                    liveDetail={chunkSummary.live_detail ?? null}
+                    settledLabel={chunkSettledLabel}
+                    summaryCounts={chunkSummary.counts}
+                    labelIncludesFailure={chunkSummary.label_includes_failure}
+                    defaultCollapsed={autoFoldCompleted}
+                    autoOpenForError={
+                      !isChunkActive &&
+                      !chunkHasFollowingContent &&
+                      chunkSummary.counts.unrecovered_failure_count > 0
+                    }
+                    liveStartedAtMs={chunkLiveStartMs}
+                    latestActivityMs={chunkLatestActivityMs}
+                    isNetworkOffline={isNetworkOffline}
+                    isBackgroundWait={chunkIsBackgroundWait}
+                    settledDurationMs={chunkDurationMs}
+                    hostId={hostId}
+                    cwd={cwd}
+                    agentId={agentId}
+                    turnIndex={turn.turn_index}
+                    turnAnchorSeq={turn.anchor_seq}
+                    workOrdinal={workOrdinal}
+                    thinkingSignature={_thinkingSignature}
+                    getThinkingDurationMs={getThinkingDurationMs}
+                    holdViewport={holdViewport}
+                    sessionSubagents={sessionSubagents}
+                    onOpenSubagent={onOpenSubagent}
+                  />
+                );
+              });
+            });
+            })()}
 
             {turnToolArtifactRefs.length > 0 && (
               <div className="flex flex-wrap items-center gap-2 pt-0.5">
@@ -3381,7 +3818,8 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.canForkWorktree === next.canForkWorktree &&
   prev.sessionSubagents === next.sessionSubagents &&
   prev.sessionSubagentMatcher === next.sessionSubagentMatcher &&
-  prev.onOpenSubagent === next.onOpenSubagent,
+  prev.onOpenSubagent === next.onOpenSubagent &&
+  prev.parentMessageLabel === next.parentMessageLabel,
 );
 
 function NewSessionLaunchpad() {
@@ -3764,7 +4202,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   thinkingTimingsRef: React.RefObject<Record<string, TurnTimingRecord>>;
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
-  onRequestRewind: (seq: number, promptText: string) => void;
+  onRequestRewind: (seq: number, promptText: string, badges: readonly PromptBadge[]) => void;
   onRequestFork: (upToSeq: number | null, worktree: boolean) => void;
   canForkWorktree: boolean;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
@@ -4550,56 +4988,60 @@ export function StreamStage() {
   const effectiveCwdRef = useRef("");
   effectiveCwdRef.current = selectedCwd || currentAgent?.cwd || "";
 
-  const handleRequestRewind = useCallback((seq: number, promptText: string) => {
-    const activeCwd = effectiveCwdRef.current;
-    const affected = stageTurnsRef.current.filter((t) => t.anchor_seq >= seq);
-    const byPath = new Map<string, RewindFileEntry>();
+  const handleRequestRewind = useCallback(
+    (seq: number, promptText: string, promptBadges: readonly PromptBadge[] = []) => {
+      const activeCwd = effectiveCwdRef.current;
+      const affected = stageTurnsRef.current.filter((t) => t.anchor_seq >= seq);
+      const byPath = new Map<string, RewindFileEntry>();
 
-    const recordFile = (rawPath: string, additions: number, deletions: number) => {
-      if (!isRevertibleWorkspaceFile(rawPath, activeCwd)) return;
-      const displayPath = stripWorkspacePrefix(rawPath, activeCwd).replace(/^\.\//, "");
-      if (!displayPath) return;
-      const prev = byPath.get(displayPath);
-      if (prev) {
-        prev.additions += additions;
-        prev.deletions += deletions;
-      } else {
-        const basename = displayPath.split("/").pop() || displayPath;
-        byPath.set(displayPath, {
-          displayPath,
-          basename,
-          additions,
-          deletions,
-        });
-      }
-    };
+      const recordFile = (rawPath: string, additions: number, deletions: number) => {
+        if (!isRevertibleWorkspaceFile(rawPath, activeCwd)) return;
+        const displayPath = stripWorkspacePrefix(rawPath, activeCwd).replace(/^\.\//, "");
+        if (!displayPath) return;
+        const prev = byPath.get(displayPath);
+        if (prev) {
+          prev.additions += additions;
+          prev.deletions += deletions;
+        } else {
+          const basename = displayPath.split("/").pop() || displayPath;
+          byPath.set(displayPath, {
+            displayPath,
+            basename,
+            additions,
+            deletions,
+          });
+        }
+      };
 
-    for (const turn of affected) {
-      for (const diff of turn.turn_diffs) {
-        if (diff.path) recordFile(diff.path, diff.additions, diff.deletions);
-      }
-      for (const seg of turn.live_segments) {
-        if (seg.kind !== "step_group") continue;
-        for (const step of seg.items) {
-          if (
-            step.item_type === "tool_call" &&
-            step.detail.kind === "file_edit" &&
-            step.detail.path &&
-            step.diff_files.length === 0
-          ) {
-            recordFile(step.detail.path, 0, 0);
+      for (const turn of affected) {
+        for (const diff of turn.turn_diffs) {
+          if (diff.path) recordFile(diff.path, diff.additions, diff.deletions);
+        }
+        for (const seg of turn.live_segments) {
+          if (seg.kind !== "step_group") continue;
+          for (const step of seg.items) {
+            if (
+              step.item_type === "tool_call" &&
+              step.detail.kind === "file_edit" &&
+              step.detail.path &&
+              step.diff_files.length === 0
+            ) {
+              recordFile(step.detail.path, 0, 0);
+            }
           }
         }
       }
-    }
 
-    setRewindTarget({
-      seq,
-      promptText,
-      affectedTurnsCount: Math.max(1, affected.length),
-      editedFiles: Array.from(byPath.values()),
-    });
-  }, []);
+      setRewindTarget({
+        seq,
+        promptText,
+        promptBadges,
+        affectedTurnsCount: Math.max(1, affected.length),
+        editedFiles: Array.from(byPath.values()),
+      });
+    },
+    [],
+  );
 
   const handleRequestFork = useCallback(
     (upToSeq: number | null, worktree: boolean) => {
@@ -4631,6 +5073,7 @@ export function StreamStage() {
           rewindTarget.seq,
           restoreFiles,
           rewindTarget.promptText,
+          rewindTarget.promptBadges,
         );
         if (ok) {
           setRewindTarget(null);
@@ -5321,26 +5764,55 @@ export function StreamStage() {
         }}
         onViewportTransitionEnd={onStageTransitionEnd}
         viewportClassName="pt-6 pb-11 pl-[24px]"
+        contentClassName={stageTurns.length === 0 ? "flex min-h-full flex-col" : undefined}
       >
         <div
           key={selectedAgentId}
           ref={contentRef}
           onTransitionEnd={onStageTransitionEnd}
           style={stagePushStyle}
-          className="mx-auto w-full min-w-0 max-w-[var(--orbit-stage-max-w,768px)]"
+          className={cn(
+            "mx-auto w-full min-w-0 max-w-[var(--orbit-stage-max-w,768px)]",
+            stageTurns.length === 0 && "flex flex-1 flex-col",
+          )}
         >
           {stageTurns.length === 0 &&
             wasSessionRewound &&
             stageView !== null &&
             (stageView.agent?.latest_seq ?? 0) === 0 &&
-            !isAgentRunning && (
-              <div className="text-muted-foreground flex flex-col items-center justify-center py-20 text-center">
-                <RotateCcw className="mb-2.5 size-5 opacity-45" />
-                <p className="text-[13.5px]">
-                  Rewound to the start of this session. Edit your prompt below to continue.
-                </p>
-              </div>
-            )}
+            !isAgentRunning && (() => {
+              const cleanDir = (effectiveCwd || "").replace(/\/+$/, "");
+              const folderLabel =
+                cleanDir && cleanDir !== "~" ? cleanDir.split("/").pop() || cleanDir : null;
+              const wsBranch =
+                currentAgent && hostDetail
+                  ? (hostDetail.workspaces.find(
+                      (w) => w.workspace_id === currentAgent.workspace_id,
+                    )?.git_branch ?? null)
+                  : null;
+              return (
+                <div className="flex flex-1 flex-col items-center justify-center pb-12 text-center select-none">
+                  <div className="bg-foreground/[0.035] text-muted-foreground/70 mb-3 flex size-9 items-center justify-center rounded-full ring-1 ring-inset ring-black/[0.06] dark:bg-white/[0.045] dark:ring-white/[0.08]">
+                    <RotateCcw className="size-4 stroke-[1.7]" />
+                  </div>
+                  <p className="text-foreground/85 text-[14px] font-medium tracking-[-0.012em]">
+                    Back to the start
+                  </p>
+                  {(folderLabel || wsBranch) && (
+                    <div className="text-muted-foreground/70 mt-1 flex items-center justify-center gap-1.5 text-[12px]">
+                      {folderLabel && <span className="max-w-[220px] truncate">{folderLabel}</span>}
+                      {folderLabel && wsBranch && <span className="opacity-45">·</span>}
+                      {wsBranch && (
+                        <span className="inline-flex max-w-[180px] items-center gap-1 truncate font-mono text-[11.5px]">
+                          <GitBranch className="size-3 shrink-0 opacity-75" />
+                          <span className="truncate">{wsBranch}</span>
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
           {stageTurns.length > 0 && (
             <VirtualizedTurnList

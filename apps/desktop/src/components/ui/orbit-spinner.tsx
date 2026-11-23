@@ -1,10 +1,16 @@
-import { memo, useId } from "react";
+import { memo, useId, useLayoutEffect, useRef } from "react";
+import {
+  ORBIT_SPINNER_DURATION_MS,
+  syncElementAmbientAnimations,
+} from "@/lib/animation-sync";
 import { cn } from "@/lib/utils";
 
 /**
  * Refined orbital comet spinner:
  * - Whisper-light full orbital track + tapered gradient comet arc.
  * - Pure SVG + GPU `transform: rotate()` animation (zero layout thrash).
+ * - Phase-locked to the global `document.timeline` clock so concurrent spinners across
+ *   Sidebar, Overview, Stage, and Peer Strip rotate in calm, synchronized unison.
  */
 export const OrbitSpinner = memo(function OrbitSpinner({
   size = 14,
@@ -14,8 +20,15 @@ export const OrbitSpinner = memo(function OrbitSpinner({
   className?: string;
 }) {
   const gradId = useId();
+  const svgRef = useRef<SVGSVGElement | null>(null);
+
+  useLayoutEffect(() => {
+    syncElementAmbientAnimations(svgRef.current, ORBIT_SPINNER_DURATION_MS);
+  }, []);
+
   return (
     <svg
+      ref={svgRef}
       width={size}
       height={size}
       viewBox="0 0 16 16"

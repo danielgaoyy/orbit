@@ -343,7 +343,24 @@ export function AutomationsView() {
     () => workflowRuns.filter((r) => r.status === "pending" || r.status === "running").length,
     [workflowRuns],
   );
-  const [sectionTab, setSectionTab] = useState<"automations" | "workflows">("automations");
+  const activeGoalCount = useMemo(
+    () =>
+      goalRuns.filter(
+        (g) => g.status === "running" || g.status === "verifying" || g.status === "paused",
+      ).length,
+    [goalRuns],
+  );
+  const activeMonitorCount = useMemo(
+    () =>
+      monitorWatches.filter((m) => m.status === "active" || m.status === "triggered").length,
+    [monitorWatches],
+  );
+  const eventTriggerCount = useOrbitSelector((s) =>
+    s.selectedHostId ? (s.eventTriggersByHost[s.selectedHostId]?.triggers.length ?? 0) : 0,
+  );
+  const [sectionTab, setSectionTab] = useState<
+    "schedules" | "triggers" | "live_runs" | "workflows"
+  >("schedules");
   useEffect(() => {
     if (selectedHostId) {
       void orbitActions.refreshGoalsAndMonitors(selectedHostId);
@@ -906,12 +923,19 @@ export function AutomationsView() {
         style={stagePushStyle}
         className="mx-auto w-full max-w-[var(--orbit-stage-max-w,768px)] space-y-6"
       >
-        {/* Top-level Automations / Workflows Section Switcher */}
+        {/* Top-level 4-Tab Navigation: Schedules · Triggers · Live Runs · Workflows */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="bg-muted/70 inline-flex items-center gap-0.5 rounded-[9px] p-0.5">
             {(
               [
-                { id: "automations", label: "Automations", count: cronSchedules.length },
+                { id: "schedules", label: "Schedules", count: cronSchedules.length },
+                { id: "triggers", label: "Triggers", count: eventTriggerCount },
+                {
+                  id: "live_runs",
+                  label: "Live Runs",
+                  count: activeGoalCount + activeMonitorCount + armedTimerCount,
+                  pulsing: activeGoalCount + activeMonitorCount + armedTimerCount > 0,
+                },
                 {
                   id: "workflows",
                   label: "Workflows",
@@ -947,17 +971,30 @@ export function AutomationsView() {
             })}
           </div>
 
-          {showHostContext && (
-            <span className="text-muted-foreground inline-flex items-center gap-1.5 text-[12px]">
-              <span
-                className={cn(
-                  "size-1.5 shrink-0 rounded-full",
-                  activeHostOnline ? "bg-emerald-500" : "bg-zinc-400",
-                )}
-              />
-              <span className="max-w-36 truncate">{activeHostLabel}</span>
-            </span>
-          )}
+          <div className="flex items-center gap-2.5">
+            {showHostContext && (
+              <span className="text-muted-foreground inline-flex items-center gap-1.5 text-[12px]">
+                <span
+                  className={cn(
+                    "size-1.5 shrink-0 rounded-full",
+                    activeHostOnline ? "bg-emerald-500" : "bg-zinc-400",
+                  )}
+                />
+                <span className="max-w-36 truncate">{activeHostLabel}</span>
+              </span>
+            )}
+            {sectionTab === "schedules" && cronSchedules.length > 0 && (
+              <button
+                type="button"
+                disabled={!selectedHostId}
+                onClick={() => openCreateDialog()}
+                className="bg-foreground text-background hover:opacity-90 inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-[8px] px-2.5 text-[12px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Plus className="size-3.5 stroke-[2]" />
+                <span>New</span>
+              </button>
+            )}
+          </div>
         </div>
 
         {sectionTab === "workflows" ? (
@@ -968,63 +1005,47 @@ export function AutomationsView() {
             projectChoices={hostProjects}
             runs={workflowRuns}
           />
-        ) : (
+        ) : sectionTab === "triggers" ? (
+          <EventTriggersSection
+            hostId={selectedHostId}
+            availableProviders={hostDetail?.host.available_providers ?? []}
+            activeAgents={activeAgentChoices}
+            hostProjects={hostProjects}
+            defaultCwd={effectiveProjectPath}
+            defaultProvider={draftProvider}
+          />
+        ) : sectionTab === "schedules" ? (
           <>
-        {/* Compact Single-Row Toolbar (shown once schedules exist) */}
+        {/* Quiet inline filter strip (avoids stacked double segmented controls) */}
         {cronSchedules.length > 0 && (
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="bg-muted/70 inline-flex items-center gap-0.5 rounded-[9px] p-0.5">
-              {(
-                [
-                  { id: "all", label: "All", count: cronSchedules.length },
-                  { id: "active", label: "Active", count: activeCount },
-                  { id: "paused", label: "Paused", count: pausedCount },
-                ] as const
-              ).map((tab) => {
-                const selected = filterTab === tab.id;
-                return (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setFilterTab(tab.id)}
-                    className={cn(
-                      "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] px-2.5 text-[12px] font-medium transition-colors",
-                      selected
-                        ? "bg-background text-foreground shadow-2xs"
-                        : "text-muted-foreground hover:text-foreground",
-                    )}
-                  >
-                    <span>{tab.label}</span>
-                    <span className="text-muted-foreground/75 tabular-nums text-[11px] font-normal">
-                      {tab.count}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-
-            <div className="flex items-center gap-2.5">
-              {showHostContext && (
-                <span className="text-muted-foreground inline-flex items-center gap-1.5 text-[12px]">
-                  <span
-                    className={cn(
-                      "size-1.5 shrink-0 rounded-full",
-                      activeHostOnline ? "bg-emerald-500" : "bg-zinc-400",
-                    )}
-                  />
-                  <span className="max-w-36 truncate">{activeHostLabel}</span>
-                </span>
-              )}
-              <button
-                type="button"
-                disabled={!selectedHostId}
-                onClick={() => openCreateDialog()}
-                className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[9px] px-3 text-[12.5px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <Plus className="size-3.5 stroke-[2]" />
-                <span>New</span>
-              </button>
-            </div>
+          <div className="flex items-center gap-1">
+            {(
+              [
+                { id: "all", label: "All", count: cronSchedules.length },
+                { id: "active", label: "Active", count: activeCount },
+                { id: "paused", label: "Paused", count: pausedCount },
+              ] as const
+            ).map((tab) => {
+              const selected = filterTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setFilterTab(tab.id)}
+                  className={cn(
+                    "inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[12px] transition-colors",
+                    selected
+                      ? "bg-black/[0.06] text-foreground font-medium dark:bg-white/[0.08]"
+                      : "text-muted-foreground hover:text-foreground hover:bg-black/[0.03] dark:hover:bg-white/[0.04]",
+                  )}
+                >
+                  <span>{tab.label}</span>
+                  <span className="text-muted-foreground/70 tabular-nums text-[11px]">
+                    {tab.count}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         )}
 
@@ -1164,170 +1185,7 @@ export function AutomationsView() {
           </div>
         )}
 
-        {/* External Event Triggers (GitHub, Slack, Linear, Generic Webhooks + PR Polling) */}
-        <EventTriggersSection
-          hostId={selectedHostId}
-          availableProviders={hostDetail?.host.available_providers ?? []}
-          activeAgents={activeAgentChoices}
-          hostProjects={hostProjects}
-          defaultCwd={effectiveProjectPath}
-          defaultProvider={draftProvider}
-        />
-
-        {/* One-Shot Conditional Timers — Active countdowns & recent history */}
-        <div className="space-y-2">
-          <div className="flex items-center justify-between gap-2 px-0.5">
-            <div className="text-muted-foreground/80 flex items-center gap-1.5 text-[11.5px] font-medium">
-              <span>Timers</span>
-              {armedTimerCount > 0 && (
-                <span className="text-muted-foreground/60 tabular-nums">
-                  {armedTimerCount} armed
-                </span>
-              )}
-            </div>
-            <button
-              type="button"
-              disabled={!selectedHostId || activeAgentChoices.length === 0}
-              onClick={openTimerDialog}
-              className="border-border/80 bg-elevated/50 hover:bg-accent text-foreground/85 inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-[7px] border px-2 text-[11.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Plus className="size-3 stroke-[2]" />
-              <span>One-Shot Timer</span>
-            </button>
-          </div>
-
-          {conditionalTimers.length === 0 ? (
-            <div className="border-border/65 text-muted-foreground/75 rounded-xl border border-dashed px-4 py-3 text-[12px]">
-              No active or recent one-shot conditional timers.
-            </div>
-          ) : (
-            <div className="border-border/80 bg-elevated/35 divide-border/70 divide-y overflow-hidden rounded-xl border">
-              {conditionalTimers.slice(0, 20).map((timer: ConditionalTimerRecord) => {
-                const isArmed = timer.state === "armed";
-                const targetAgent = hostDetail?.agents.find((a) => a.agent_id === timer.agent_id);
-                const stateLabel =
-                  timer.state === "fired"
-                    ? "Fired"
-                    : timer.state === "canceled_early"
-                      ? "Canceled early"
-                      : timer.state === "canceled_manual"
-                        ? "Canceled"
-                        : "Armed";
-                const busy = timerBusyId === timer.timer_id;
-                return (
-                  <div
-                    key={timer.timer_id}
-                    className="group flex items-center justify-between gap-3 px-4 py-2.5 transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.025]"
-                  >
-                    <div className="flex min-w-0 items-start gap-2.5">
-                      <Timer
-                        className={cn(
-                          "mt-0.5 size-3.5 shrink-0",
-                          isArmed ? "text-amber-500/85" : "text-muted-foreground/55",
-                        )}
-                      />
-                      <div className="min-w-0 space-y-0.5">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="text-foreground max-w-[320px] truncate text-[12.5px] font-medium">
-                            {timer.prompt}
-                          </span>
-                          {isArmed ? (
-                            <span className="text-foreground/90 tabular-nums shrink-0 rounded-md bg-amber-500/12 px-1.5 py-0.5 font-mono text-[11px] font-medium">
-                              {formatTimerCountdown(timer.fire_at_ms, timerNowMs)}
-                            </span>
-                          ) : (
-                            <span className="text-muted-foreground bg-muted/70 shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-medium">
-                              {stateLabel}
-                            </span>
-                          )}
-                          <span className="text-muted-foreground/80 border-border/70 shrink-0 rounded-md border px-1.5 py-0.5 text-[10.5px]">
-                            {formatTimerConditionLabel(timer.condition)}
-                          </span>
-                        </div>
-                        <div className="text-muted-foreground/80 flex flex-wrap items-center gap-1.5 text-[11.5px]">
-                          <span className="max-w-[200px] truncate">
-                            {targetAgent?.title ?? timer.agent_id}
-                          </span>
-                          {timer.resolved_reason && (
-                            <>
-                              <span>·</span>
-                              <span className="truncate">{timer.resolved_reason}</span>
-                            </>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    {selectedHostId && (
-                      <div className="flex shrink-0 items-center gap-1">
-                        <button
-                          type="button"
-                          onClick={() => orbitActions.selectAgent(selectedHostId, timer.agent_id)}
-                          className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors"
-                        >
-                          <span>Open</span>
-                          <ArrowUpRight className="size-3" />
-                        </button>
-                        {isArmed && (
-                          <>
-                            <SimpleTooltip label="Run now">
-                              <button
-                                type="button"
-                                disabled={busy}
-                                aria-label="Run timer now"
-                                onClick={() => {
-                                  setTimerBusyId(timer.timer_id);
-                                  void orbitActions
-                                    .fireConditionalTimerNow(selectedHostId, timer.timer_id)
-                                    .then(
-                                      () => orbitActions.showToast("Timer triggered"),
-                                      (err) =>
-                                        orbitActions.showToast(
-                                          `Failed to trigger timer: ${String(err)}`,
-                                        ),
-                                    )
-                                    .finally(() => setTimerBusyId(null));
-                                }}
-                                className="text-muted-foreground/75 hover:text-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:opacity-40"
-                              >
-                                <Play className="size-3 fill-current" />
-                              </button>
-                            </SimpleTooltip>
-                            <SimpleTooltip label="Cancel timer">
-                              <button
-                                type="button"
-                                disabled={busy}
-                                aria-label="Cancel timer"
-                                onClick={() => {
-                                  setTimerBusyId(timer.timer_id);
-                                  void orbitActions
-                                    .cancelConditionalTimer(selectedHostId, timer.timer_id)
-                                    .then(
-                                      () => orbitActions.showToast("Timer canceled"),
-                                      (err) =>
-                                        orbitActions.showToast(
-                                          `Failed to cancel timer: ${String(err)}`,
-                                        ),
-                                    )
-                                    .finally(() => setTimerBusyId(null));
-                                }}
-                                className="text-muted-foreground/75 hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500 disabled:opacity-40"
-                              >
-                                <X className="size-3.5 stroke-[1.8]" />
-                              </button>
-                            </SimpleTooltip>
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        {/* Live Agent Heartbeats — Unified Hairline List */}
+        {/* Live Agent Heartbeats — Unified Hairline List (kept alongside Schedules when present) */}
         {heartbeats.length > 0 && (
           <div className="space-y-2">
             <div className="text-muted-foreground/80 flex items-center gap-1.5 px-0.5 text-[11.5px] font-medium">
@@ -1422,6 +1280,171 @@ export function AutomationsView() {
             </div>
           </div>
         )}
+          </>
+        ) : (
+          /* Live Runs Tab: One-Shot Conditional Timers, Autonomous Goals & Streaming Monitors */
+          <div className="space-y-5">
+            {/* One-Shot Conditional Timers — Active countdowns & recent history */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2 px-0.5">
+                <div className="text-muted-foreground/80 flex items-center gap-1.5 text-[11.5px] font-medium">
+                  <span>Timers</span>
+                  {armedTimerCount > 0 && (
+                    <span className="text-muted-foreground/60 tabular-nums">
+                      {armedTimerCount} armed
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  disabled={!selectedHostId || activeAgentChoices.length === 0}
+                  onClick={openTimerDialog}
+                  className="border-border/80 bg-elevated/50 hover:bg-accent text-foreground/85 inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-[7px] border px-2 text-[11.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Plus className="size-3 stroke-[2]" />
+                  <span>One-Shot Timer</span>
+                </button>
+              </div>
+
+              {conditionalTimers.length === 0 ? (
+                <div className="border-border/65 text-muted-foreground/75 rounded-xl border border-dashed px-4 py-3 text-[12px]">
+                  No active or recent one-shot conditional timers.
+                </div>
+              ) : (
+                <div className="border-border/80 bg-elevated/35 divide-border/70 divide-y overflow-hidden rounded-xl border">
+                  {conditionalTimers.slice(0, 20).map((timer: ConditionalTimerRecord) => {
+                    const isArmed = timer.state === "armed";
+                    const targetAgent = hostDetail?.agents.find((a) => a.agent_id === timer.agent_id);
+                    const stateLabel =
+                      timer.state === "fired"
+                        ? "Fired"
+                        : timer.state === "canceled_early"
+                          ? "Canceled early"
+                          : timer.state === "canceled_manual"
+                            ? "Canceled"
+                            : "Armed";
+                    const busy = timerBusyId === timer.timer_id;
+                    return (
+                      <div
+                        key={timer.timer_id}
+                        className="group flex items-center justify-between gap-3 px-4 py-2.5 transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.025]"
+                      >
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          <Timer
+                            className={cn(
+                              "mt-0.5 size-3.5 shrink-0",
+                              isArmed ? "text-amber-500/85" : "text-muted-foreground/55",
+                            )}
+                          />
+                          <div className="min-w-0 space-y-0.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="text-foreground max-w-[320px] truncate text-[12.5px] font-medium">
+                                {timer.prompt}
+                              </span>
+                              {isArmed ? (
+                                <span className="text-foreground/90 tabular-nums shrink-0 rounded-md bg-amber-500/12 px-1.5 py-0.5 font-mono text-[11px] font-medium">
+                                  {formatTimerCountdown(timer.fire_at_ms, timerNowMs)}
+                                </span>
+                              ) : (
+                                <span className="text-muted-foreground bg-muted/70 shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-medium">
+                                  {stateLabel}
+                                </span>
+                              )}
+                              <span className="text-muted-foreground/80 border-border/70 shrink-0 rounded-md border px-1.5 py-0.5 text-[10.5px]">
+                                {formatTimerConditionLabel(timer.condition)}
+                              </span>
+                            </div>
+                            <div className="text-muted-foreground/80 flex flex-wrap items-center gap-1.5 text-[11.5px]">
+                              <span className="max-w-[200px] truncate">
+                                {targetAgent?.title ?? timer.agent_id}
+                              </span>
+                              {timer.resolved_reason && (
+                                <>
+                                  <span>·</span>
+                                  <span className="truncate">{timer.resolved_reason}</span>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {selectedHostId && (
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => orbitActions.selectAgent(selectedHostId, timer.agent_id)}
+                              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors"
+                            >
+                              <span>Open</span>
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                            {isArmed && (
+                              <>
+                                <SimpleTooltip label="Run now">
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    aria-label="Run timer now"
+                                    onClick={() => {
+                                      setTimerBusyId(timer.timer_id);
+                                      void orbitActions
+                                        .fireConditionalTimerNow(selectedHostId, timer.timer_id)
+                                        .then(
+                                          () => orbitActions.showToast("Timer triggered"),
+                                          (err) =>
+                                            orbitActions.showToast(
+                                              `Failed to trigger timer: ${String(err)}`,
+                                            ),
+                                        )
+                                        .finally(() => setTimerBusyId(null));
+                                    }}
+                                    className="text-muted-foreground/75 hover:text-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:opacity-40"
+                                  >
+                                    <Play className="size-3 fill-current" />
+                                  </button>
+                                </SimpleTooltip>
+                                <SimpleTooltip label="Cancel timer">
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    aria-label="Cancel timer"
+                                    onClick={() => {
+                                      setTimerBusyId(timer.timer_id);
+                                      void orbitActions
+                                        .cancelConditionalTimer(selectedHostId, timer.timer_id)
+                                        .then(
+                                          () => orbitActions.showToast("Timer canceled"),
+                                          (err) =>
+                                            orbitActions.showToast(
+                                              `Failed to cancel timer: ${String(err)}`,
+                                            ),
+                                        )
+                                        .finally(() => setTimerBusyId(null));
+                                    }}
+                                    className="text-muted-foreground/75 hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500 disabled:opacity-40"
+                                  >
+                                    <X className="size-3.5 stroke-[1.8]" />
+                                  </button>
+                                </SimpleTooltip>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {goalRuns.length === 0 && monitorWatches.length === 0 && conditionalTimers.length === 0 && (
+              <div className="flex flex-col items-center justify-center px-4 py-8 text-center">
+                <p className="text-muted-foreground max-w-md text-[12.5px] leading-relaxed">
+                  Autonomous <span className="text-foreground/85 font-mono">/goal</span> loops,
+                  streaming background monitors, and conditional timers appear here while active.
+                </p>
+              </div>
+            )}
         {/* Autonomous Goals & Streaming Monitors */}
         {(goalRuns.length > 0 || monitorWatches.length > 0) && (
           <div className="space-y-4">
@@ -1669,7 +1692,7 @@ export function AutomationsView() {
             )}
           </div>
         )}
-          </>
+          </div>
         )}
       </div>
 

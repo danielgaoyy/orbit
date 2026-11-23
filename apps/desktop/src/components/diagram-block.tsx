@@ -37,8 +37,6 @@ import { cn } from "@/lib/utils";
 const DIAGRAM_CACHE_LIMIT = 128;
 const diagramViewCache = new Map<string, RenderDiagramView>();
 
-const MIN_INLINE_ZOOM = 0.5;
-const MAX_INLINE_ZOOM = 2.5;
 const MIN_LIGHTBOX_ZOOM = 0.25;
 const MAX_LIGHTBOX_ZOOM = 5.0;
 
@@ -429,7 +427,6 @@ export const DiagramBlock = memo(
       () => getCachedDiagram(key) !== undefined,
     );
     const [viewMode, setViewMode] = useState<"diagram" | "code">("diagram");
-    const [inlineZoom, setInlineZoom] = useState<number>(1);
     const [rendered, setRendered] = useState<RenderDiagramView | null>(
       () => getCachedDiagram(key) ?? null,
     );
@@ -517,8 +514,7 @@ export const DiagramBlock = memo(
 
     const handleCopy = async () => {
       try {
-        const payload = showDiagram && rendered?.svg ? rendered.svg : block.raw_code;
-        await navigator.clipboard.writeText(payload);
+        await navigator.clipboard.writeText(block.raw_code);
         setCopied(true);
         if (copyTimerRef.current !== null) {
           window.clearTimeout(copyTimerRef.current);
@@ -544,7 +540,7 @@ export const DiagramBlock = memo(
       560,
     );
 
-    const keepToolbarVisible = !showDiagram || inlineZoom !== 1;
+    const keepToolbarVisible = !showDiagram;
 
     return (
       <div
@@ -587,7 +583,7 @@ export const DiagramBlock = memo(
           )}
         </div>
 
-        {/* Crisp floating hover toolbar */}
+        {/* Restrained 3-action floating hover toolbar (zoom & SVG export live inside fullscreen Lightbox) */}
         <div
           className={cn(
             "absolute top-2.5 right-2.5 z-10 flex items-center gap-0.5 rounded-lg border border-black/[0.08] bg-white/90 p-0.5 shadow-xs backdrop-blur-md transition-opacity duration-150 select-none dark:border-white/[0.1] dark:bg-zinc-900/90",
@@ -596,61 +592,10 @@ export const DiagramBlock = memo(
               : "pointer-events-none opacity-0 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100",
           )}
         >
-          {showDiagram && (
-            <>
-              <button
-                type="button"
-                onClick={() =>
-                  setInlineZoom((z) => clampZoom(z - 0.2, MIN_INLINE_ZOOM, MAX_INLINE_ZOOM))
-                }
-                disabled={inlineZoom <= MIN_INLINE_ZOOM}
-                title="Zoom out"
-                className="text-muted-foreground hover:text-foreground orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] disabled:cursor-default disabled:opacity-35 dark:hover:bg-white/[0.07]"
-              >
-                <ZoomOut className="size-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setInlineZoom(1)}
-                title="Reset zoom"
-                className={cn(
-                  "text-muted-foreground hover:text-foreground orbit-press inline-flex h-6 cursor-pointer items-center justify-center rounded-md px-1.5 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]",
-                  inlineZoom !== 1 ? "tabular-nums font-mono text-[10.5px]" : "w-6 px-0",
-                )}
-              >
-                {inlineZoom !== 1 ? (
-                  <span>{Math.round(inlineZoom * 100)}%</span>
-                ) : (
-                  <RotateCcw className="size-3" />
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={() =>
-                  setInlineZoom((z) => clampZoom(z + 0.2, MIN_INLINE_ZOOM, MAX_INLINE_ZOOM))
-                }
-                disabled={inlineZoom >= MAX_INLINE_ZOOM}
-                title="Zoom in"
-                className="text-muted-foreground hover:text-foreground orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] disabled:cursor-default disabled:opacity-35 dark:hover:bg-white/[0.07]"
-              >
-                <ZoomIn className="size-3.5" />
-              </button>
-              <div className="mx-0.5 h-3.5 w-px bg-black/[0.08] dark:bg-white/[0.1]" />
-              <button
-                type="button"
-                onClick={() => setLightboxOpen(true)}
-                title="Fullscreen"
-                className="text-muted-foreground hover:text-foreground orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
-              >
-                <Maximize2 className="size-3.5" />
-              </button>
-            </>
-          )}
-
           <button
             type="button"
             onClick={() => void handleCopy()}
-            title={showDiagram ? "Copy SVG" : "Copy source"}
+            title="Copy source"
             className="text-muted-foreground hover:text-foreground orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
           >
             {copied ? (
@@ -675,6 +620,17 @@ export const DiagramBlock = memo(
               {viewMode === "diagram" ? <Code2 className="size-3.5" /> : <Eye className="size-3.5" />}
             </button>
           )}
+
+          {showDiagram && (
+            <button
+              type="button"
+              onClick={() => setLightboxOpen(true)}
+              title="Fullscreen"
+              className="text-muted-foreground hover:text-foreground orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
+            >
+              <Maximize2 className="size-3.5" />
+            </button>
+          )}
         </div>
 
         {showDiagram && rendered?.svg ? (
@@ -684,23 +640,11 @@ export const DiagramBlock = memo(
               title="Double-click to expand"
               className="flex min-w-full cursor-zoom-in items-center justify-center transition-opacity duration-150 ease-out"
               style={{
-                minHeight: Math.min(Math.max(rendered.height * 0.42 * inlineZoom, 92), 340),
+                minHeight: Math.min(Math.max(rendered.height * 0.42, 92), 340),
               }}
             >
               <div
-                className={cn(
-                  "[&>svg]:block [&>svg]:h-auto",
-                  inlineZoom !== 1
-                    ? "shrink-0 [&>svg]:w-full [&>svg]:max-w-none"
-                    : "[&>svg]:max-w-full",
-                )}
-                style={
-                  inlineZoom !== 1
-                    ? {
-                        width: Math.max(120, Math.round(rendered.width * inlineZoom)),
-                      }
-                    : undefined
-                }
+                className="[&>svg]:block [&>svg]:h-auto [&>svg]:max-w-full"
                 dangerouslySetInnerHTML={{ __html: rendered.svg }}
               />
             </div>

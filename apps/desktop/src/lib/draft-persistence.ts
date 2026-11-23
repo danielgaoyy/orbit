@@ -1,4 +1,5 @@
 import type { SlashDirective } from "@/lib/orbit-ipc";
+import type { RichMediaKind } from "@/lib/media-utils";
 
 export const DRAFTS_STORAGE_KEY = "orbit.drafts.v1";
 export const DRAFT_SCHEMA_VERSION = 1 as const;
@@ -12,6 +13,13 @@ export const MAX_TEXT_DRAFT_BYTES = 64 * 1024;
 export const MAX_DIFF_QUOTE_CODE_BYTES = 16 * 1024;
 export const MAX_PASTES_PER_SCOPE = 16;
 export const MAX_QUOTES_PER_SCOPE = 32;
+export const MAX_CONTEXT_ITEMS_PER_SCOPE = 32;
+
+const VALID_RICH_MEDIA_KINDS: ReadonlySet<RichMediaKind> = new Set<RichMediaKind>([
+  "pdf",
+  "audio",
+  "video",
+]);
 
 const VALID_SLASH_DIRECTIVES: ReadonlySet<SlashDirective> = new Set<SlashDirective>([
   "plan",
@@ -42,11 +50,60 @@ export interface PersistedDiffQuote {
   code: string;
 }
 
+export type PersistedContextItem =
+  | {
+      id: string;
+      kind: "image";
+      filename: string;
+      path: string;
+      previewUrl: string;
+      sizeBytes: number;
+      stagedHostId?: string;
+    }
+  | {
+      id: string;
+      kind: "file";
+      path: string;
+      filename?: string;
+      sizeBytes?: number;
+      stagedHostId?: string;
+      mediaKind?: RichMediaKind;
+      mimeType?: string;
+      pdfPageCount?: number | null;
+    }
+  | {
+      id: string;
+      kind: "git_diff";
+      staged: boolean;
+      label: string;
+    }
+  | {
+      id: string;
+      kind: "terminal_output";
+      label: string;
+      lineCount: number;
+      content: string;
+    }
+  | {
+      id: string;
+      kind: "code_symbol";
+      path: string;
+      startLine: number;
+      endLine: number;
+      symbolName: string;
+      symbolKind: string;
+      signature?: string | null;
+      container?: string | null;
+      language: string;
+      snippet?: string | null;
+    };
+
 export interface PersistedScopeDraft {
   updatedAt: number;
   text?: string;
   pastedAttachments?: PersistedPastedAttachment[];
   diffQuotes?: PersistedDiffQuote[];
+  contextItems?: PersistedContextItem[];
   slashDirective?: SlashDirective;
   sideQuestionDraft?: string;
 }
@@ -67,11 +124,13 @@ export interface DraftStateSlices {
   composerDrafts: Record<string, string>;
   pastedAttachments: Record<string, PersistedPastedAttachment[]>;
   diffQuotes: Record<string, PersistedDiffQuote[]>;
+  contextItems?: Record<string, readonly unknown[]>;
   slashDirectives: Record<string, SlashDirective | null>;
   sideQuestionDrafts: Record<string, string>;
 }
 
-export interface HydratedDraftSlices extends DraftStateSlices {
+export interface HydratedDraftSlices extends Omit<DraftStateSlices, "contextItems"> {
+  contextItems: Record<string, PersistedContextItem[]>;
   updatedAtByScope: Record<string, number>;
   prunedCount: number;
 }
@@ -266,12 +325,156 @@ function normalizeDiffQuote(
   };
 }
 
+function normalizeContextItem(
+  raw: unknown,
+  maxPasteBytes: number,
+  maxQuoteCodeBytes: number,
+): PersistedContextItem | null {
+  if (!isPlainRecord(raw)) return null;
+  if (typeof raw.id !== "string" || raw.id.length === 0) return null;
+  const id = truncateUtf8(raw.id, 128);
+
+  if (raw.kind === "image") {
+    if (typeof raw.path !== "string" || raw.path.trim().length === 0) return null;
+    const path = truncateUtf8(raw.path.trim(), 2048);
+    const filename =
+      typeof raw.filename === "string" && raw.filename.trim().length > 0
+        ? truncateUtf8(raw.filename.trim(), 512)
+        : path.split("/").pop() || "image.png";
+    const sizeBytes =
+      typeof raw.sizeBytes === "number" && Number.isFinite(raw.sizeBytes) && raw.sizeBytes >= 0
+        ? Math.floor(raw.sizeBytes)
+        : 0;
+    const item: Extract<PersistedContextItem, { kind: "image" }> = {
+      id,
+      kind: "image",
+      filename,
+      path,
+      // Never persist ephemeral `blob:` URLs; ComposerImageThumb hydrates from staged host path.
+      previewUrl: "",
+      sizeBytes,
+    };
+    if (typeof raw.stagedHostId === "string" && raw.stagedHostId.trim().length > 0) {
+      item.stagedHostId = truncateUtf8(raw.stagedHostId.trim(), 256);
+    }
+    return item;
+  }
+
+  if (raw.kind === "file") {
+    if (typeof raw.path !== "string" || raw.path.trim().length === 0) return null;
+    const item: Extract<PersistedContextItem, { kind: "file" }> = {
+      id,
+      kind: "file",
+      path: truncateUtf8(raw.path.trim(), 2048),
+    };
+    if (typeof raw.filename === "string" && raw.filename.trim().length > 0) {
+      item.filename = truncateUtf8(raw.filename.trim(), 512);
+    }
+    if (typeof raw.sizeBytes === "number" && Number.isFinite(raw.sizeBytes) && raw.sizeBytes >= 0) {
+      item.sizeBytes = Math.floor(raw.sizeBytes);
+    }
+    if (typeof raw.stagedHostId === "string" && raw.stagedHostId.trim().length > 0) {
+      item.stagedHostId = truncateUtf8(raw.stagedHostId.trim(), 256);
+    }
+    if (
+      typeof raw.mediaKind === "string" &&
+      VALID_RICH_MEDIA_KINDS.has(raw.mediaKind as RichMediaKind)
+    ) {
+      item.mediaKind = raw.mediaKind as RichMediaKind;
+    }
+    if (typeof raw.mimeType === "string" && raw.mimeType.trim().length > 0) {
+      item.mimeType = truncateUtf8(raw.mimeType.trim(), 128);
+    }
+    if (
+      typeof raw.pdfPageCount === "number" &&
+      Number.isFinite(raw.pdfPageCount) &&
+      raw.pdfPageCount >= 0
+    ) {
+      item.pdfPageCount = Math.floor(raw.pdfPageCount);
+    }
+    return item;
+  }
+
+  if (raw.kind === "git_diff") {
+    if (typeof raw.staged !== "boolean") return null;
+    const label =
+      typeof raw.label === "string" && raw.label.trim().length > 0
+        ? truncateUtf8(raw.label.trim(), 256)
+        : raw.staged
+          ? "Staged Diff"
+          : "Working Tree Diff";
+    return {
+      id,
+      kind: "git_diff",
+      staged: raw.staged,
+      label,
+    };
+  }
+
+  if (raw.kind === "terminal_output") {
+    if (typeof raw.content !== "string" || raw.content.length === 0) return null;
+    if (utf8ByteLength(raw.content) > maxPasteBytes) return null;
+    const derivedLines = raw.content.split("\n").length;
+    const lineCount =
+      typeof raw.lineCount === "number" && Number.isFinite(raw.lineCount) && raw.lineCount >= 1
+        ? Math.floor(raw.lineCount)
+        : derivedLines;
+    const label =
+      typeof raw.label === "string" && raw.label.trim().length > 0
+        ? truncateUtf8(raw.label.trim(), 256)
+        : `Terminal · ${lineCount} lines`;
+    return {
+      id,
+      kind: "terminal_output",
+      label,
+      lineCount,
+      content: raw.content,
+    };
+  }
+
+  if (raw.kind === "code_symbol") {
+    if (typeof raw.path !== "string" || raw.path.trim().length === 0) return null;
+    if (typeof raw.symbolName !== "string" || raw.symbolName.trim().length === 0) return null;
+    if (typeof raw.startLine !== "number" || !Number.isFinite(raw.startLine)) return null;
+    if (typeof raw.endLine !== "number" || !Number.isFinite(raw.endLine)) return null;
+    const item: Extract<PersistedContextItem, { kind: "code_symbol" }> = {
+      id,
+      kind: "code_symbol",
+      path: truncateUtf8(raw.path.trim(), 1024),
+      startLine: Math.max(1, Math.floor(raw.startLine)),
+      endLine: Math.max(1, Math.floor(raw.endLine)),
+      symbolName: truncateUtf8(raw.symbolName.trim(), 256),
+      symbolKind:
+        typeof raw.symbolKind === "string" && raw.symbolKind.trim().length > 0
+          ? truncateUtf8(raw.symbolKind.trim(), 64)
+          : "symbol",
+      language:
+        typeof raw.language === "string" && raw.language.trim().length > 0
+          ? truncateUtf8(raw.language.trim(), 64)
+          : "text",
+    };
+    if (typeof raw.signature === "string" && raw.signature.length > 0) {
+      item.signature = truncateUtf8(raw.signature, 512);
+    }
+    if (typeof raw.container === "string" && raw.container.length > 0) {
+      item.container = truncateUtf8(raw.container, 256);
+    }
+    if (typeof raw.snippet === "string" && raw.snippet.length > 0) {
+      item.snippet = truncateUtf8(raw.snippet, maxQuoteCodeBytes);
+    }
+    return item;
+  }
+
+  return null;
+}
+
 function isScopeDraftPopulated(entry: PersistedScopeDraft): boolean {
   if (entry.text && entry.text.trim().length > 0) return true;
   if (entry.sideQuestionDraft && entry.sideQuestionDraft.trim().length > 0) return true;
   if (entry.slashDirective) return true;
   if (entry.pastedAttachments && entry.pastedAttachments.length > 0) return true;
   if (entry.diffQuotes && entry.diffQuotes.length > 0) return true;
+  if (entry.contextItems && entry.contextItems.length > 0) return true;
   return false;
 }
 
@@ -326,6 +529,19 @@ function capScopeDraftToBudget(
       next.diffQuotes = validQuotes;
     }
   }
+  if (entry.contextItems && entry.contextItems.length > 0) {
+    const validContexts: PersistedContextItem[] = [];
+    for (const ctx of entry.contextItems) {
+      const normalized = normalizeContextItem(ctx, budget.maxPasteBytes, budget.maxQuoteCodeBytes);
+      if (normalized) validContexts.push(normalized);
+    }
+    if (validContexts.length > MAX_CONTEXT_ITEMS_PER_SCOPE) {
+      validContexts.splice(0, validContexts.length - MAX_CONTEXT_ITEMS_PER_SCOPE);
+    }
+    if (validContexts.length > 0) {
+      next.contextItems = validContexts;
+    }
+  }
 
   if (!isScopeDraftPopulated(next)) {
     return null;
@@ -347,6 +563,19 @@ function capScopeDraftToBudget(
       next.diffQuotes.shift();
       if (next.diffQuotes.length === 0) {
         delete next.diffQuotes;
+      }
+      continue;
+    }
+    if (next.contextItems && next.contextItems.length > 0) {
+      // Shed heavy terminal_output contexts first before lightweight staged image/file refs
+      const heavyIdx = next.contextItems.findIndex((c) => c.kind === "terminal_output");
+      if (heavyIdx >= 0) {
+        next.contextItems.splice(heavyIdx, 1);
+      } else {
+        next.contextItems.shift();
+      }
+      if (next.contextItems.length === 0) {
+        delete next.contextItems;
       }
       continue;
     }
@@ -383,6 +612,7 @@ function emptyHydratedSlices(prunedCount = 0): HydratedDraftSlices {
     composerDrafts: {},
     pastedAttachments: {},
     diffQuotes: {},
+    contextItems: {},
     slashDirectives: {},
     sideQuestionDrafts: {},
     updatedAtByScope: {},
@@ -395,6 +625,18 @@ export function hasNonEmptyScopeDraft(slices: DraftStateSlices, scopeKey: string
   if ((slices.composerDrafts[scopeKey] ?? "").trim().length > 0) return true;
   if ((slices.pastedAttachments[scopeKey]?.length ?? 0) > 0) return true;
   if ((slices.diffQuotes[scopeKey]?.length ?? 0) > 0) return true;
+  const ctxs = slices.contextItems?.[scopeKey];
+  if (Array.isArray(ctxs) && ctxs.length > 0) {
+    for (const raw of ctxs) {
+      if (isPlainRecord(raw)) {
+        if (raw.kind === "image" || raw.kind === "file") {
+          if (typeof raw.path === "string" && raw.path.trim().length > 0) return true;
+        } else if (typeof raw.kind === "string") {
+          return true;
+        }
+      }
+    }
+  }
   if (slices.slashDirectives[scopeKey]) return true;
   if ((slices.sideQuestionDrafts[scopeKey] ?? "").trim().length > 0) return true;
   return false;
@@ -516,6 +758,9 @@ export function buildSerializedDraftPayload(
   for (const k of Object.keys(slices.composerDrafts)) scopeKeys.add(k);
   for (const k of Object.keys(slices.pastedAttachments)) scopeKeys.add(k);
   for (const k of Object.keys(slices.diffQuotes)) scopeKeys.add(k);
+  if (slices.contextItems) {
+    for (const k of Object.keys(slices.contextItems)) scopeKeys.add(k);
+  }
   for (const k of Object.keys(slices.slashDirectives)) scopeKeys.add(k);
   for (const k of Object.keys(slices.sideQuestionDrafts)) scopeKeys.add(k);
 
@@ -549,6 +794,21 @@ export function buildSerializedDraftPayload(
     const quotes = slices.diffQuotes[key];
     if (Array.isArray(quotes) && quotes.length > 0) {
       candidate.diffQuotes = quotes;
+    }
+    const contexts = slices.contextItems?.[key];
+    if (Array.isArray(contexts) && contexts.length > 0) {
+      const normalizedContexts: PersistedContextItem[] = [];
+      for (const rawCtx of contexts) {
+        const normalized = normalizeContextItem(
+          rawCtx,
+          budget.maxPasteBytes,
+          budget.maxQuoteCodeBytes,
+        );
+        if (normalized) normalizedContexts.push(normalized);
+      }
+      if (normalizedContexts.length > 0) {
+        candidate.contextItems = normalizedContexts;
+      }
     }
     const directive = slices.slashDirectives[key];
     if (isValidSlashDirective(directive)) {
@@ -698,6 +958,29 @@ export function parseAndValidatePersistedDrafts(
       }
     }
 
+    if (rawEntry.contextItems !== undefined) {
+      if (Array.isArray(rawEntry.contextItems)) {
+        const cleanContexts: PersistedContextItem[] = [];
+        for (const item of rawEntry.contextItems) {
+          const normalized = normalizeContextItem(
+            item,
+            budget.maxPasteBytes,
+            budget.maxQuoteCodeBytes,
+          );
+          if (normalized) {
+            cleanContexts.push(normalized);
+          } else {
+            entryHadInvalidField = true;
+          }
+        }
+        if (cleanContexts.length > 0) {
+          candidate.contextItems = cleanContexts;
+        }
+      } else {
+        entryHadInvalidField = true;
+      }
+    }
+
     const capped = capScopeDraftToBudget(scopeKey, candidate, budget);
     if (!capped) {
       prunedCount += 1;
@@ -723,6 +1006,9 @@ export function parseAndValidatePersistedDrafts(
     }
     if (entry.diffQuotes !== undefined) {
       result.diffQuotes[scopeKey] = entry.diffQuotes;
+    }
+    if (entry.contextItems !== undefined) {
+      result.contextItems[scopeKey] = entry.contextItems;
     }
     if (entry.slashDirective !== undefined) {
       result.slashDirectives[scopeKey] = entry.slashDirective;

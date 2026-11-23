@@ -6595,18 +6595,16 @@ pub fn antigravity_model_supports_fast_mode(
     {
         return explicit;
     }
-    let lower = model_id.trim().to_ascii_lowercase();
-    if lower.contains("orchestrator")
-        || lower.contains("flash")
-        || lower.contains("haiku")
-        || lower.starts_with("gpt-oss")
-    {
+    if !has_fast_config_option {
+        // Never fabricate fast-mode support for Antigravity unless `agy acp` explicitly
+        // advertises a `fast_mode` config option or per-model flag.
         return false;
     }
-    has_fast_config_option
-        || lower.starts_with("gemini-4-")
-        || lower.starts_with("gemini-3")
-        || lower.contains("opus")
+    let lower = model_id.trim().to_ascii_lowercase();
+    !(lower.contains("orchestrator")
+        || lower.contains("flash")
+        || lower.contains("haiku")
+        || lower.starts_with("gpt-oss"))
 }
 
 pub fn fallback_antigravity_models() -> ProviderModelCatalog {
@@ -9422,25 +9420,50 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let req_off = build_agy_set_fast_mode_request(43, "sess_1", false);
         assert_eq!(req_off["params"]["value"], "off");
 
+        // Fallback catalog must NOT advertise fake fast-mode support when `agy acp` has not
+        // advertised `fast_mode` in `configOptions`.
         let catalog = fallback_antigravity_models();
         let carbon = catalog
             .models
             .iter()
             .find(|m| m.id == "gemini-4-carbon")
             .expect("carbon");
-        assert!(carbon.supports_fast_mode);
+        assert!(!carbon.supports_fast_mode);
         let opus = catalog
             .models
             .iter()
             .find(|m| m.id == "claude-opus-5-5")
             .expect("opus");
-        assert!(opus.supports_fast_mode);
+        assert!(!opus.supports_fast_mode);
         let flash = catalog
             .models
             .iter()
             .find(|m| m.id == "gemini-3.8-flash")
             .expect("flash");
         assert!(!flash.supports_fast_mode);
+
+        // When `agy acp` explicitly advertises `fast_mode`, flagship models enable it while
+        // flash/orchestrator models remain excluded.
+        assert!(antigravity_model_supports_fast_mode(
+            "gemini-4-carbon",
+            None,
+            true
+        ));
+        assert!(antigravity_model_supports_fast_mode(
+            "claude-opus-5-5",
+            None,
+            true
+        ));
+        assert!(!antigravity_model_supports_fast_mode(
+            "gemini-3.8-flash",
+            None,
+            true
+        ));
+        assert!(antigravity_model_supports_fast_mode(
+            "gemini-4-carbon",
+            Some(&json!({ "supportsFastMode": true })),
+            false
+        ));
     }
 
     #[tokio::test]

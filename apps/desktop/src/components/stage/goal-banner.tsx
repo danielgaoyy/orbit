@@ -48,7 +48,7 @@ export const GoalBanner = memo(function GoalBanner({ hostId, agentId }: GoalBann
   };
 
   return (
-    <div className="mx-auto mb-1.5 w-full max-w-[780px] px-4 sm:px-6">
+    <div className="mx-auto mb-1.5 w-full max-w-[var(--orbit-stage-max-w,768px)] px-4 sm:px-6">
       <div className="border-border/80 bg-elevated/85 flex h-8 items-center justify-between gap-2.5 rounded-xl border px-3 backdrop-blur-sm">
         <div className="flex min-w-0 items-center gap-2">
           <span

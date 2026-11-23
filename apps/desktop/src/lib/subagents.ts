@@ -282,6 +282,41 @@ export interface ResolvedToolCallSubagent {
   action: "dispatch" | "message";
 }
 
+export interface SubagentMessageCallInfo {
+  callId: string;
+  recipient: string;
+  message: string;
+  status: "running" | "completed" | "failed" | "denied";
+}
+
+/**
+ * Extracts structured details from a generic inter-agent message tool call (`send_message`,
+ * `send_agent_prompt`, `message_peer`) so it can be surfaced cleanly outside folded tool groups
+ * even when the recipient is the parent agent rather than a child subagent.
+ */
+export function extractSubagentMessageCall(
+  item: Extract<TimelineItemView, { item_type: "tool_call" }>,
+): SubagentMessageCallInfo | null {
+  if (item.detail.kind !== "generic") return null;
+  if (classifyGenericSubagentTool(item.detail.tool_name) !== "message") return null;
+  const args = tryParseJsonObject(item.detail.arguments_json);
+  const recipient = readStringField(args, [
+    "handle",
+    "Recipient",
+    "recipient",
+    "agent_id",
+    "conversation_id",
+    "conversationId",
+  ]);
+  const message = readStringField(args, ["Message", "message", "prompt", "content", "text"]);
+  return {
+    callId: item.call_id || `msg-${item.seq}`,
+    recipient,
+    message,
+    status: item.status,
+  };
+}
+
 /** Structural value-equality check to keep `sessionSubagents` referentially stable across unrelated host ticks. */
 export function areResolvedSubagentsEqual(
   a: readonly ResolvedSubagentItem[],

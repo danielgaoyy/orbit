@@ -962,7 +962,34 @@ async fn run_acp_actor(
                         behavior,
                     } => {
                         if active_prompt_rpc_key.is_some() || active_turn_id.is_some() {
-                            if !pending_perms.is_empty() {
+                            if matches!(behavior, ActiveTurnBehavior::Interrupt) {
+                                pending_prompts.clear();
+                                pending_perm_order.clear();
+                                finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                                for (_, p) in pending_perms.drain() {
+                                    let resp = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": p.rpc_id,
+                                        "result": {
+                                            "outcome": { "outcome": "cancelled" }
+                                        }
+                                    })
+                                    .to_string();
+                                    let _ = shim.write_stdin_line(resp).await;
+                                }
+                                let cancel = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/cancel",
+                                    "params": { "sessionId": session_id }
+                                })
+                                .to_string();
+                                if shim.write_stdin_line(cancel).await.is_err() {
+                                    finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                                    let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                    break;
+                                }
+                                pending_prompts.push_back((turn_id, prompt));
+                            } else if !pending_perms.is_empty() {
                                 let _ = evt_tx
                                     .send(DriverEvent::Notice {
                                         level: "warning".into(),
@@ -975,9 +1002,8 @@ async fn run_acp_actor(
                                         pending_prompts.push_back((turn_id, prompt));
                                     }
                                     ActiveTurnBehavior::Steer => {
-                                        pending_prompts.push_front((turn_id, prompt));
-                                    }
-                                    ActiveTurnBehavior::Interrupt => {
+                                        pending_prompts.clear();
+                                        finalize_stream_segments(&mut seg_state, &evt_tx).await;
                                         let cancel = json!({
                                             "jsonrpc": "2.0",
                                             "method": "session/cancel",
@@ -989,8 +1015,9 @@ async fn run_acp_actor(
                                             let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                                             break;
                                         }
-                                        pending_prompts.push_front((turn_id, prompt));
+                                        pending_prompts.push_back((turn_id, prompt));
                                     }
+                                    ActiveTurnBehavior::Interrupt => unreachable!(),
                                 }
                             }
                             continue;
@@ -1031,6 +1058,7 @@ async fn run_acp_actor(
                     DriverCommand::Interrupt => {
                         pending_prompts.clear();
                         pending_perm_order.clear();
+                        finalize_stream_segments(&mut seg_state, &evt_tx).await;
                         for (_, p) in pending_perms.drain() {
                             let resp = json!({
                                 "jsonrpc": "2.0",

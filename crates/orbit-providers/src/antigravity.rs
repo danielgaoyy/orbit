@@ -949,6 +949,7 @@ async fn run_agy_actor(
         None
     };
     let mut user_interrupted = false;
+    let mut cancelling_active_turn = false;
     let mut pending_self_heal: Option<PendingSelfHeal> = None;
     let mut consecutive_self_heals: u32 = 0;
     let mut last_ask_question_raw: Option<Vec<QuestionItem>> = None;
@@ -970,7 +971,26 @@ async fn run_agy_actor(
                         pending_self_heal = None;
                         consecutive_self_heals = 0;
                         if active_prompt_rpc_key.is_some() || active_turn_id.is_some() {
-                            if !pending_perms.is_empty() || !pending_elicits.is_empty() {
+                            if matches!(behavior, ActiveTurnBehavior::Interrupt) {
+                                cancel_pending_agy_perms_and_elicits(
+                                    &shim,
+                                    &mut pending_perms,
+                                    &mut pending_elicits,
+                                    &mut last_ask_question_raw,
+                                )
+                                .await;
+                                finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+                                pending_prompts.clear();
+                                cancelling_active_turn = true;
+                                let cancel = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/cancel",
+                                    "params": { "sessionId": session_id }
+                                })
+                                .to_string();
+                                let _ = shim.write_stdin_line(cancel).await;
+                                pending_prompts.push_back((turn_id, prompt));
+                            } else if !pending_perms.is_empty() || !pending_elicits.is_empty() {
                                 let _ = evt_tx
                                     .send(DriverEvent::Notice {
                                         level: "warning".into(),
@@ -983,9 +1003,13 @@ async fn run_agy_actor(
                                         pending_prompts.push_back((turn_id, prompt));
                                     }
                                     ActiveTurnBehavior::Steer => {
-                                        pending_prompts.push_front((turn_id, prompt));
-                                    }
-                                    ActiveTurnBehavior::Interrupt => {
+                                        // `agy acp` has no native mid-RPC steer without `session/cancel`.
+                                        // Never stack prompts LIFO without cancelling (which shifts turns
+                                        // off-by-one); cancel cleanly, flush streaming buffers, clear stale
+                                        // queued prompts, and enqueue this replacement prompt.
+                                        finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+                                        pending_prompts.clear();
+                                        cancelling_active_turn = true;
                                         let cancel = json!({
                                             "jsonrpc": "2.0",
                                             "method": "session/cancel",
@@ -993,13 +1017,15 @@ async fn run_agy_actor(
                                         })
                                         .to_string();
                                         let _ = shim.write_stdin_line(cancel).await;
-                                        pending_prompts.push_front((turn_id, prompt));
+                                        pending_prompts.push_back((turn_id, prompt));
                                     }
+                                    ActiveTurnBehavior::Interrupt => unreachable!(),
                                 }
                             }
                             continue;
                         }
 
+                        cancelling_active_turn = false;
                         let effective_prompt = if inject_handoff_on_next_prompt {
                             inject_handoff_on_next_prompt = false;
                             prepend_handoff_context(pending_handoff_context.take(), &prompt)
@@ -1034,6 +1060,10 @@ async fn run_agy_actor(
                     DriverCommand::Interrupt => {
                         user_interrupted = true;
                         pending_self_heal = None;
+                        pending_prompts.clear();
+                        finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+                        cancelling_active_turn =
+                            active_prompt_rpc_key.is_some() || active_turn_id.is_some();
                         bg_tracker.clear();
                         cancel_agy_subagent_monitors(None, &mut subagent_monitors, &evt_tx).await;
                         if autonomous_turn_id.take().is_some() {
@@ -1056,31 +1086,13 @@ async fn run_agy_actor(
                                     .await;
                             }
                         }
-                        for (_, p) in pending_perms.drain() {
-                            let resp = json!({
-                                "jsonrpc": "2.0",
-                                "id": p.rpc_id,
-                                "result": {
-                                    "outcome": {
-                                        "outcome": "cancelled"
-                                    }
-                                }
-                            })
-                            .to_string();
-                            let _ = shim.write_stdin_line(resp).await;
-                        }
-                        for (_, el) in pending_elicits.drain() {
-                            let resp = json!({
-                                "jsonrpc": "2.0",
-                                "id": el.rpc_id,
-                                "result": {
-                                    "action": "cancel"
-                                }
-                            })
-                            .to_string();
-                            let _ = shim.write_stdin_line(resp).await;
-                        }
-                        last_ask_question_raw = None;
+                        cancel_pending_agy_perms_and_elicits(
+                            &shim,
+                            &mut pending_perms,
+                            &mut pending_elicits,
+                            &mut last_ask_question_raw,
+                        )
+                        .await;
                         let cancel = json!({
                             "jsonrpc": "2.0",
                             "method": "session/cancel",
@@ -1296,22 +1308,13 @@ async fn run_agy_actor(
                                     || is_reattached_completion
                                 {
                                     reattached_turn_in_flight = false;
+                                    cancelling_active_turn = false;
                                     active_prompt_rpc_key = None;
                                     pending_perms.clear();
                                     pending_elicits.clear();
                                     last_ask_question_raw = None;
-                                    seg_state.active_msg_id = None;
-                                    seg_state.active_thought_id = None;
                                     // Finalize any streaming message buffers
-                                    for (mid, text) in seg_state.msg_accum.drain() {
-                                        let _ = evt_tx
-                                            .send(DriverEvent::AssistantText {
-                                                item_id: mid,
-                                                text,
-                                                streaming: false,
-                                            })
-                                            .await;
-                                    }
+                                    finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
                                     active_turn_id = None;
 
                                     // Transparently recover when `session/load` silently accepted an
@@ -1532,7 +1535,8 @@ async fn run_agy_actor(
                                 // (e.g. `schedule` timers whose ACP update omits task IDs) so those
                                 // tool calls keep their chronological `seq` BEFORE the reply in SQLite
                                 // instead of spawning a detached step group below it.
-                                if !in_post_turn_wakeup
+                                if !cancelling_active_turn
+                                    && !in_post_turn_wakeup
                                     && update_kind == "agent_message_chunk"
                                     && seg_state.active_msg_id.is_none()
                                 {
@@ -1551,8 +1555,12 @@ async fn run_agy_actor(
                                         .await;
                                     }
                                 }
-                                let allow_update = !in_post_turn_wakeup
-                                    || matches!(update_kind, "tool_call" | "tool_call_update");
+                                let allow_update = !cancelling_active_turn
+                                    && (!in_post_turn_wakeup
+                                        || matches!(
+                                            update_kind,
+                                            "tool_call" | "tool_call_update"
+                                        ));
                                 if allow_update
                                     && let Some(sig_cancel) = handle_acp_session_update(
                                         &cfg.agent_id,
@@ -2204,6 +2212,56 @@ async fn apply_foreground_bg_deltas(
             }
         }
     }
+}
+
+async fn finalize_agy_stream_segments(
+    seg_state: &mut AgyStreamSegmentState,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    seg_state.active_msg_id = None;
+    seg_state.active_thought_id = None;
+    for (mid, text) in seg_state.msg_accum.drain() {
+        let _ = evt_tx
+            .send(DriverEvent::AssistantText {
+                item_id: mid,
+                text,
+                streaming: false,
+            })
+            .await;
+    }
+}
+
+async fn cancel_pending_agy_perms_and_elicits(
+    shim: &orbit_shim::ShimClient,
+    pending_perms: &mut HashMap<String, PendingPerm>,
+    pending_elicits: &mut HashMap<String, PendingElicitation>,
+    last_ask_question_raw: &mut Option<Vec<QuestionItem>>,
+) {
+    for (_, p) in pending_perms.drain() {
+        let resp = json!({
+            "jsonrpc": "2.0",
+            "id": p.rpc_id,
+            "result": {
+                "outcome": {
+                    "outcome": "cancelled"
+                }
+            }
+        })
+        .to_string();
+        let _ = shim.write_stdin_line(resp).await;
+    }
+    for (_, el) in pending_elicits.drain() {
+        let resp = json!({
+            "jsonrpc": "2.0",
+            "id": el.rpc_id,
+            "result": {
+                "action": "cancel"
+            }
+        })
+        .to_string();
+        let _ = shim.write_stdin_line(resp).await;
+    }
+    *last_ask_question_raw = None;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10321,5 +10379,394 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             extract_manage_subagents_cancel(Some(&json!({ "Action": "kill_all" })), None),
             Some(None)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agy_interrupt_and_active_interrupt_prompt_clear_stale_queue_and_finalize_without_shift()
+     {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let short_id: String = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect();
+        let sock_path = std::env::temp_dir().join(format!("o_agy_iq_{short_id}.sock"));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+
+        let received_prompts: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let prompts_bg = Arc::clone(&received_prompts);
+        let cancel_count = Arc::new(AtomicU64::new(0));
+        let cancel_bg = Arc::clone(&cancel_count);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+            }
+
+            let mut inflight_prompt_id: Option<Value> = None;
+
+            while let Ok(Some(raw_line)) = lines.next_line().await {
+                let Ok(frame) = serde_json::from_str::<ShimFrame>(&raw_line) else {
+                    continue;
+                };
+                if let ShimFrame::WriteStdin { line } = frame {
+                    let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                    match method {
+                        "initialize" => {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req["id"],
+                                    "result": { "protocolVersion": 1 }
+                                }),
+                            )
+                            .await;
+                        }
+                        "session/new" => {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req["id"],
+                                    "result": {
+                                        "sessionId": "sess-int-test",
+                                        "models": {
+                                            "currentModelId": "gemini-3.1-pro",
+                                            "availableModels": [{ "modelId": "gemini-3.1-pro" }]
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                        }
+                        "session/prompt" => {
+                            let text = req
+                                .pointer("/params/prompt/0/text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            prompts_bg.lock().await.push(text.clone());
+                            if text.starts_with("SLOW_") {
+                                // Emit a partial streaming chunk and hold the RPC open until `session/cancel`
+                                send_stdout(
+                                    &mut wh,
+                                    &mut seq,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "session/update",
+                                        "params": {
+                                            "sessionId": "sess-int-test",
+                                            "update": {
+                                                "sessionUpdate": "agent_message_chunk",
+                                                "content": { "type": "text", "text": format!("partial:{text}") }
+                                            }
+                                        }
+                                    }),
+                                )
+                                .await;
+                                inflight_prompt_id = Some(req["id"].clone());
+                            } else {
+                                send_stdout(
+                                    &mut wh,
+                                    &mut seq,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "session/update",
+                                        "params": {
+                                            "sessionId": "sess-int-test",
+                                            "update": {
+                                                "sessionUpdate": "agent_message_chunk",
+                                                "content": { "type": "text", "text": format!("reply:{text}") }
+                                            }
+                                        }
+                                    }),
+                                )
+                                .await;
+                                send_stdout(
+                                    &mut wh,
+                                    &mut seq,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req["id"],
+                                        "result": { "stopReason": "end_turn" }
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
+                        "session/cancel" => {
+                            cancel_bg.fetch_add(1, Ordering::SeqCst);
+                            if let Some(pid) = inflight_prompt_id.take() {
+                                // Emit a trailing chunk right before cancel completes to verify it is dropped!
+                                send_stdout(
+                                    &mut wh,
+                                    &mut seq,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "session/update",
+                                        "params": {
+                                            "sessionId": "sess-int-test",
+                                            "update": {
+                                                "sessionUpdate": "agent_message_chunk",
+                                                "content": { "type": "text", "text": "TRAILING_LEAK_MUST_DROP" }
+                                            }
+                                        }
+                                    }),
+                                )
+                                .await;
+                                send_stdout(
+                                    &mut wh,
+                                    &mut seq,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": pid,
+                                        "result": { "stopReason": "cancelled" }
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock shim");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let seq_tracker = Arc::new(AtomicU64::new(0));
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_int_test".into(),
+            provider: ProviderKind::Antigravity,
+            orbit_exe: PathBuf::from("/bin/true"),
+            executable: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::clone(&seq_tracker),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // Case 1: Start SLOW_1, queue STALE_QUEUED, then send DriverCommand::Interrupt ->
+        // partial text must finalize immediately, STALE_QUEUED must be cleared, and trailing leak dropped!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_slow_1".into(),
+                prompt: "SLOW_1".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("send slow 1");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("slow 1 stream")
+                .expect("ev");
+            if matches!(
+                ev,
+                DriverEvent::AssistantText {
+                    ref text,
+                    streaming: true,
+                    ..
+                } if text == "partial:SLOW_1"
+            ) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_stale_q".into(),
+                prompt: "STALE_QUEUED_MUST_NOT_RUN".into(),
+                behavior: ActiveTurnBehavior::Queue,
+            })
+            .await
+            .expect("queue stale");
+        cmd_tx
+            .send(DriverCommand::Interrupt)
+            .await
+            .expect("interrupt");
+
+        let mut saw_partial_final = false;
+        let mut saw_trailing_leak = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("interrupt settle")
+                .expect("ev");
+            match ev {
+                DriverEvent::AssistantText {
+                    text,
+                    streaming: false,
+                    ..
+                } if text == "partial:SLOW_1" => saw_partial_final = true,
+                DriverEvent::AssistantText { text, .. }
+                    if text.contains("TRAILING_LEAK_MUST_DROP") =>
+                {
+                    saw_trailing_leak = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_partial_final,
+            "Interrupt must finalize partial msg_accum"
+        );
+        assert!(
+            !saw_trailing_leak,
+            "trailing chunks during cancel teardown must be dropped"
+        );
+
+        // Case 2: Start SLOW_2, queue STALE_Q2, then preempt directly with ActiveTurnBehavior::Interrupt ->
+        // STALE_Q2 must be cleared and REPLACEMENT_NOW must execute immediately with ZERO off-by-one!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_slow_2".into(),
+                prompt: "SLOW_2".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("send slow 2");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("slow 2 stream")
+                .expect("ev");
+            if matches!(
+                ev,
+                DriverEvent::AssistantText {
+                    ref text,
+                    streaming: true,
+                    ..
+                } if text == "partial:SLOW_2"
+            ) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_stale_q2".into(),
+                prompt: "STALE_Q2_MUST_NOT_RUN".into(),
+                behavior: ActiveTurnBehavior::Queue,
+            })
+            .await
+            .expect("queue stale 2");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_replace".into(),
+                prompt: "REPLACEMENT_NOW".into(),
+                behavior: ActiveTurnBehavior::Interrupt,
+            })
+            .await
+            .expect("send interrupt replacement");
+
+        let mut saw_slow2_final = false;
+        let mut saw_replacement_reply = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("replace settle")
+                .expect("ev");
+            match ev {
+                DriverEvent::AssistantText {
+                    text,
+                    streaming: false,
+                    ..
+                } if text == "partial:SLOW_2" => saw_slow2_final = true,
+                DriverEvent::AssistantText {
+                    text,
+                    streaming: false,
+                    ..
+                } if text == "reply:REPLACEMENT_NOW" => saw_replacement_reply = true,
+                DriverEvent::AssistantText { text, .. }
+                    if text.contains("TRAILING_LEAK_MUST_DROP") =>
+                {
+                    panic!("trailing leak must not appear after replacement prompt");
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) => break,
+                _ => {}
+            }
+        }
+        assert!(saw_slow2_final);
+        assert!(saw_replacement_reply);
+
+        let prompts = received_prompts.lock().await;
+        assert_eq!(
+            *prompts,
+            vec![
+                "SLOW_1".to_string(),
+                "SLOW_2".to_string(),
+                "REPLACEMENT_NOW".to_string()
+            ],
+            "stale queued prompts must NEVER hijack turns or cause off-by-one shift"
+        );
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 2);
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

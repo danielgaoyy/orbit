@@ -2922,19 +2922,40 @@ impl AgentOrchestrator {
             .is_some_and(|ag| {
                 ag.status.is_foreground_busy()
                     || matches!(ag.status, AgentStatus::AwaitingPermission { .. })
-            });
+            })
+            || self.has_pending_permissions(agent_id).await;
+        // Never send a separate `DriverCommand::Interrupt` before `send_prompt_with_options`:
+        // doing so lets `session/cancel` settle while prompt pre-processing is still awaiting git
+        // snapshots, letting stale queued prompts or trailing turn finalization race ahead of the
+        // new `UserPrompt`. Instead, pass `ActiveTurnBehavior::Interrupt` directly on `SendPrompt`
+        // so the driver atomically cancels the active turn and dispatches this replacement prompt.
         if should_interrupt {
-            let _ = self.interrupt_agent(agent_id).await;
+            self.suppress_auto_drain
+                .write()
+                .await
+                .insert(agent_id.to_string());
+            self.cancel_pending_permissions_and_questions(agent_id)
+                .await;
         }
-        self.send_prompt_with_options(
-            agent_id,
-            item.wire_prompt,
-            Some(item.display_prompt),
-            item.badges,
-            ActiveTurnBehavior::Steer,
-            None,
-        )
-        .await
+        let behavior = if should_interrupt {
+            ActiveTurnBehavior::Interrupt
+        } else {
+            ActiveTurnBehavior::Steer
+        };
+        let res = self
+            .send_prompt_with_options(
+                agent_id,
+                item.wire_prompt,
+                Some(item.display_prompt),
+                item.badges,
+                behavior,
+                None,
+            )
+            .await;
+        if res.is_err() && should_interrupt {
+            self.suppress_auto_drain.write().await.remove(agent_id);
+        }
+        res
     }
 
     pub async fn reorder_queued_user_prompts(
@@ -2978,6 +2999,12 @@ impl AgentOrchestrator {
         let cmd_tx = self.get_or_resume_driver(&batch.recipient_id).await?;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
 
+        // Pre-compute workspace context augmentation BEFORE persisting `AgentMessage` events so
+        // there is no async gap between timeline persistence and driver dispatch.
+        let wire_prompt = self
+            .augment_prompt_with_workspace_context(&batch.recipient_id, batch.wire_prompt)
+            .await;
+
         // Persist structured `TimelinePayload::AgentMessage` cards for each entry in the coalesced batch
         if let Some(timers) = self.conditional_timers().await {
             for entry in &batch.entries {
@@ -3014,10 +3041,6 @@ impl AgentOrchestrator {
             let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
         }
 
-        let wire_prompt = self
-            .augment_prompt_with_workspace_context(&batch.recipient_id, batch.wire_prompt)
-            .await;
-
         cmd_tx
             .send(DriverCommand::SendPrompt {
                 turn_id,
@@ -3050,18 +3073,43 @@ impl AgentOrchestrator {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let msg_id = message_id.unwrap_or_else(|| format!("u_{}", Uuid::new_v4().simple()));
         let visible_text = display_prompt.unwrap_or_else(|| prompt.clone());
-        let rule_badges = badges.clone();
+        let sanitized = sanitize_human_prompt_for_wire(&prompt, &msg_id);
+
+        // Compute git checkpoint snapshot and prompt augmentations BEFORE appending `UserPrompt`
+        // so there is ZERO async `.await` gap between persisting `UserPrompt` and sending
+        // `DriverCommand::SendPrompt` to the driver.
+        let tree_oid = if let Ok(Some(ag)) = self.store.get_agent(agent_id) {
+            capture_git_tree_snapshot(Path::new(&ag.cwd)).await
+        } else {
+            None
+        };
+        let with_handoff = match handoff_context {
+            Some(ctx) => format!("{ctx}\n\n[Latest User Request]\n{sanitized}"),
+            None => sanitized.clone(),
+        };
+        let with_rules = self
+            .augment_prompt_with_path_rules(agent_id, &badges, &sanitized, with_handoff)
+            .await;
+        let wire_prompt = self
+            .augment_prompt_with_workspace_context(agent_id, with_rules)
+            .await;
+
         let ev = self.store.append_timeline_event(
             agent_id,
             1,
             Some(&turn_id),
             TimelinePayload::UserPrompt {
-                message_id: msg_id.clone(),
+                message_id: msg_id,
                 text: visible_text,
                 badges,
             },
         )?;
         let prompt_seq = ev.seq;
+        if let Some(ref oid) = tree_oid {
+            let _ = self
+                .store
+                .save_turn_checkpoint(agent_id, prompt_seq, Some(&turn_id), oid);
+        }
         // Advance authoritative read_seq on human prompt so other devices never flash unread for user input
         if let Ok(Some(read_ag)) = self.store.mark_agent_read_seq(agent_id, Some(prompt_seq)) {
             let _ = self
@@ -3069,26 +3117,6 @@ impl AgentOrchestrator {
                 .send(DaemonBroadcast::AgentUpdated(read_ag));
         }
         let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
-
-        let sanitized = sanitize_human_prompt_for_wire(&prompt, &msg_id);
-        // Capture a zero-side-effect pre-turn workspace tree snapshot before the agent mutates files.
-        if let Ok(Some(ag)) = self.store.get_agent(agent_id)
-            && let Some(tree_oid) = capture_git_tree_snapshot(Path::new(&ag.cwd)).await
-        {
-            let _ =
-                self.store
-                    .save_turn_checkpoint(agent_id, prompt_seq, Some(&turn_id), &tree_oid);
-        }
-        let with_handoff = match handoff_context {
-            Some(ctx) => format!("{ctx}\n\n[Latest User Request]\n{sanitized}"),
-            None => sanitized.clone(),
-        };
-        let with_rules = self
-            .augment_prompt_with_path_rules(agent_id, &rule_badges, &sanitized, with_handoff)
-            .await;
-        let wire_prompt = self
-            .augment_prompt_with_workspace_context(agent_id, with_rules)
-            .await;
 
         cmd_tx
             .send(DriverCommand::SendPrompt {
@@ -3135,14 +3163,7 @@ impl AgentOrchestrator {
         ))
     }
 
-    pub async fn interrupt_agent(&self, agent_id: &str) -> anyhow::Result<()> {
-        self.suppress_auto_drain
-            .write()
-            .await
-            .insert(agent_id.to_string());
-        if let Some(tx) = self.live_agent_tx(agent_id).await {
-            let _ = tx.send(DriverCommand::Interrupt).await;
-        }
+    async fn cancel_pending_permissions_and_questions(&self, agent_id: &str) {
         let cancelled_perms: Vec<String> = {
             let mut guard = self.pending_permissions.write().await;
             let req_ids: Vec<String> = guard
@@ -3185,6 +3206,18 @@ impl AgentOrchestrator {
                 let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
             }
         }
+    }
+
+    pub async fn interrupt_agent(&self, agent_id: &str) -> anyhow::Result<()> {
+        self.suppress_auto_drain
+            .write()
+            .await
+            .insert(agent_id.to_string());
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
+            let _ = tx.send(DriverCommand::Interrupt).await;
+        }
+        self.cancel_pending_permissions_and_questions(agent_id)
+            .await;
         Ok(())
     }
 
@@ -5751,9 +5784,16 @@ impl AgentOrchestrator {
             .append_timeline_event_deduped(agent_id, 1, None, payload)
             && mutated
         {
+            let saved_seq = saved_ev.seq;
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::TimelineLive(saved_ev));
+            if !is_status_change
+                && let Ok(Some(ag)) = self.store.get_agent(agent_id)
+                && saved_seq < ag.latest_seq
+            {
+                let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
+            }
         }
         if is_status_change && let Ok(Some(mut ag)) = self.store.get_agent(agent_id) {
             let mut drained_prompt = None;
@@ -8408,6 +8448,119 @@ mod fast_mode_orchestrator_tests {
                 id == "ag_cr_run" && body.contains("Cross-worktree conflict heads-up")
             }),
             "Running peer should receive active Conflict Radar steer: {delivered:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn flush_queued_user_prompt_now_dispatches_single_interrupt_send_prompt_without_race() {
+        let (home_dir, store, orch) = test_orchestrator("flush_q_now").await;
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir ws");
+        let now = Utc::now();
+
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_fq".into(),
+                title: "Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_fq".into(),
+                    workspace_id: "ws_fq".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Flush Queue Agent".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::FullAccess,
+                    status: AgentStatus::Running {
+                        turn_id: "t_running".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let agent_gen = orch.bump_generation("ag_fq").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_fq".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        let saved = store
+            .enqueue_agent_prompt("ag_fq", "q_now_1", "Run this now", "Run this now", &[])
+            .expect("enqueue");
+        orch.flush_queued_user_prompt_now("ag_fq", &saved.queue_id)
+            .await
+            .expect("flush queued prompt");
+
+        // Must receive ONLY a single `SendPrompt { behavior: ActiveTurnBehavior::Interrupt }`
+        // with NO preceding separate `DriverCommand::Interrupt`!
+        let first_cmd = cmd_rx.try_recv().expect("driver command sent");
+        match first_cmd {
+            DriverCommand::SendPrompt {
+                prompt, behavior, ..
+            } => {
+                assert_eq!(behavior, ActiveTurnBehavior::Interrupt);
+                assert!(prompt.contains("Run this now"));
+            }
+            other => panic!("expected direct SendPrompt(Interrupt), got {other:?}"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "must not emit extra DriverCommand::Interrupt before SendPrompt"
         );
 
         let _ = std::fs::remove_dir_all(&home_dir);

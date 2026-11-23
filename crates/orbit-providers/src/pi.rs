@@ -891,6 +891,7 @@ async fn run_pi_actor(
                                 }
                                 ActiveTurnBehavior::Interrupt => {
                                     cancel_pending_ext_reqs(&shim, &mut pending_ext_reqs).await;
+                                    pending_prompts.clear();
                                     inflight_followups.clear();
                                     let cmd_id = format!("pi_cmd_{next_cmd_id}");
                                     next_cmd_id += 1;
@@ -904,7 +905,7 @@ async fn run_pi_actor(
                                             .await;
                                         break;
                                     }
-                                    pending_prompts.push_front((turn_id, effective_prompt));
+                                    pending_prompts.push_back((turn_id, effective_prompt));
                                 }
                             }
                             continue;

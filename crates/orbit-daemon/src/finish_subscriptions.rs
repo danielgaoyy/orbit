@@ -571,7 +571,7 @@ impl FinishSubscriptionManager {
                 permission_context: Some(perm_ref),
             },
             body,
-            active_turn_behavior: ActiveTurnBehavior::Steer,
+            active_turn_behavior: ActiveTurnBehavior::Queue,
             session_mode: None,
             unarchive: false,
         };
@@ -633,7 +633,7 @@ impl FinishSubscriptionManager {
                 permission_context: Some(perm_ref),
             },
             body,
-            active_turn_behavior: ActiveTurnBehavior::Steer,
+            active_turn_behavior: ActiveTurnBehavior::Queue,
             session_mode: None,
             unarchive: false,
         };
@@ -679,7 +679,7 @@ impl FinishSubscriptionManager {
                 permission_context: None,
             },
             body,
-            active_turn_behavior: ActiveTurnBehavior::Steer,
+            active_turn_behavior: ActiveTurnBehavior::Queue,
             session_mode: None,
             unarchive: false,
         };
@@ -748,7 +748,7 @@ impl FinishSubscriptionManager {
                 permission_context: None,
             },
             body,
-            active_turn_behavior: ActiveTurnBehavior::Steer,
+            active_turn_behavior: ActiveTurnBehavior::Queue,
             session_mode: None,
             unarchive: false,
         };
@@ -790,7 +790,7 @@ impl FinishSubscriptionManager {
                 permission_context: None,
             },
             body,
-            active_turn_behavior: ActiveTurnBehavior::Steer,
+            active_turn_behavior: ActiveTurnBehavior::Queue,
             session_mode: None,
             unarchive: false,
         };

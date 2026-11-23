@@ -551,6 +551,7 @@ async fn run_codex_actor(
                                     continue;
                                 }
                                 ActiveTurnBehavior::Interrupt => {
+                                    queued_prompts.clear();
                                     let req_id = next_id;
                                     next_id += 1;
                                     let req = json!({
@@ -562,15 +563,18 @@ async fn run_codex_actor(
                                         }
                                     });
                                     let _ = shim.write_stdin_line(req.to_string()).await;
-                                    queued_prompts.push_front((turn_id, prompt));
+                                    queued_prompts.push_back((turn_id, prompt));
                                     continue;
                                 }
                             }
                         } else if client_turn_id.is_some() {
                             match behavior {
-                                ActiveTurnBehavior::Queue => queued_prompts.push_back((turn_id, prompt)),
-                                ActiveTurnBehavior::Steer | ActiveTurnBehavior::Interrupt => {
-                                    queued_prompts.push_front((turn_id, prompt));
+                                ActiveTurnBehavior::Queue | ActiveTurnBehavior::Steer => {
+                                    queued_prompts.push_back((turn_id, prompt));
+                                }
+                                ActiveTurnBehavior::Interrupt => {
+                                    queued_prompts.clear();
+                                    queued_prompts.push_back((turn_id, prompt));
                                 }
                             }
                             continue;
@@ -600,6 +604,7 @@ async fn run_codex_actor(
                         }
                     }
                     DriverCommand::Interrupt => {
+                        queued_prompts.clear();
                         if let Some(ref nat_tid) = native_turn_id {
                             let req_id = next_id;
                             next_id += 1;

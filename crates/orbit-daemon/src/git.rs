@@ -319,7 +319,159 @@ pub struct WorkspaceFilePayload {
     pub line_ending: Option<String>,
 }
 
-fn managed_artifact_roots(extra_attachments_dir: Option<&Path>) -> Vec<PathBuf> {
+#[derive(Debug, Clone, Default)]
+struct ManagedWorktreeRoots {
+    agy_worktree_roots: Vec<PathBuf>,
+    orbit_worktree_roots: Vec<PathBuf>,
+}
+
+impl ManagedWorktreeRoots {
+    fn from_env(home: Option<&Path>) -> Self {
+        let mut agy_worktree_roots = Vec::new();
+        let mut orbit_worktree_roots = Vec::new();
+
+        if let Some(dir) = std::env::var_os("ANTIGRAVITY_EXECUTABLE_DATA_DIR")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            agy_worktree_roots.push(dir.join("worktrees"));
+        }
+        if let Some(h) = home {
+            if let Ok(rel) = std::env::var("ANTIGRAVITY_CONFIG_REL_DIR") {
+                let rel_trimmed = rel.trim();
+                if !rel_trimmed.is_empty() {
+                    let custom = h.join(".gemini").join(rel_trimmed).join("worktrees");
+                    if !agy_worktree_roots.contains(&custom) {
+                        agy_worktree_roots.push(custom);
+                    }
+                }
+            }
+            let default_agy = h.join(".gemini").join("antigravity-cli").join("worktrees");
+            if !agy_worktree_roots.contains(&default_agy) {
+                agy_worktree_roots.push(default_agy);
+            }
+        }
+
+        if let Some(oh) = std::env::var_os("ORBIT_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            orbit_worktree_roots.push(oh.join("worktrees"));
+        }
+        if let Some(h) = home {
+            let default_orbit = h.join(".orbit").join("worktrees");
+            if !orbit_worktree_roots.contains(&default_orbit) {
+                orbit_worktree_roots.push(default_orbit);
+            }
+        }
+
+        Self {
+            agy_worktree_roots,
+            orbit_worktree_roots,
+        }
+    }
+
+    fn all_roots(&self) -> impl Iterator<Item = &PathBuf> {
+        self.agy_worktree_roots
+            .iter()
+            .chain(self.orbit_worktree_roots.iter())
+    }
+}
+
+fn canonicalize_existing_prefix_sync(path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(cur) {
+            let mut out = canon;
+            for seg in missing.into_iter().rev() {
+                out.push(seg);
+            }
+            return Some(out);
+        }
+        let name = cur.file_name()?.to_os_string();
+        missing.push(name);
+        cur = cur.parent()?;
+    }
+}
+
+fn strip_worktree_rel_with_skip(
+    candidate: &Path,
+    canon_candidate: Option<&Path>,
+    root: &Path,
+    skip_leading_segments: usize,
+) -> Option<PathBuf> {
+    let canon_root = std::fs::canonicalize(root).ok();
+    let tail = candidate
+        .strip_prefix(root)
+        .ok()
+        .or_else(|| {
+            canon_root
+                .as_deref()
+                .and_then(|cr| candidate.strip_prefix(cr).ok())
+        })
+        .or_else(|| canon_candidate.and_then(|cc| cc.strip_prefix(root).ok()))
+        .or_else(|| {
+            canon_candidate
+                .zip(canon_root.as_deref())
+                .and_then(|(cc, cr)| cc.strip_prefix(cr).ok())
+        })?;
+    let mut normals = Vec::new();
+    for comp in tail.components() {
+        match comp {
+            Component::Normal(seg) => normals.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    if normals.len() <= skip_leading_segments {
+        return None;
+    }
+    let mut rel = PathBuf::new();
+    for seg in &normals[skip_leading_segments..] {
+        rel.push(seg);
+    }
+    (!rel.as_os_str().is_empty()).then_some(rel)
+}
+
+/// Extract a safe workspace-relative path when `candidate` points inside a temporary Antigravity
+/// (`<agy_data>/worktrees/<conv>/<wt>/<rel>`) or Orbit (`<orbit_home>/worktrees/<wt>/<rel>`)
+/// subagent worktree that has already been cleaned up after merge.
+fn extract_deleted_worktree_relative_path(
+    candidate: &Path,
+    worktree_roots: &ManagedWorktreeRoots,
+) -> Option<PathBuf> {
+    if !candidate.is_absolute() {
+        return None;
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    let canon_candidate = canonicalize_existing_prefix_sync(candidate);
+    for root in &worktree_roots.agy_worktree_roots {
+        if let Some(rel) =
+            strip_worktree_rel_with_skip(candidate, canon_candidate.as_deref(), root, 2)
+        {
+            return Some(rel);
+        }
+    }
+    for root in &worktree_roots.orbit_worktree_roots {
+        if let Some(rel) =
+            strip_worktree_rel_with_skip(candidate, canon_candidate.as_deref(), root, 1)
+        {
+            return Some(rel);
+        }
+    }
+    None
+}
+
+fn managed_artifact_roots(
+    extra_attachments_dir: Option<&Path>,
+    worktree_roots: &ManagedWorktreeRoots,
+) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(extra) = extra_attachments_dir {
         roots.push(extra.to_path_buf());
@@ -338,6 +490,11 @@ fn managed_artifact_roots(extra_attachments_dir: Option<&Path>) -> Vec<PathBuf> 
         roots.push(h.join(".gemini").join("antigravity-cli").join("brain"));
         roots.push(h.join(".claude").join("projects"));
     }
+    for wt_root in worktree_roots.all_roots() {
+        if !roots.contains(wt_root) {
+            roots.push(wt_root.clone());
+        }
+    }
     roots.push(std::env::temp_dir().join("claude"));
     let tmp_claude = PathBuf::from("/tmp/claude");
     if !roots.contains(&tmp_claude) {
@@ -346,13 +503,14 @@ fn managed_artifact_roots(extra_attachments_dir: Option<&Path>) -> Vec<PathBuf> 
     roots
 }
 
-/// Resolve a path that points directly into an explicitly allowed read-only agent artifact/log root
-/// (such as `$ORBIT_HOME/attachments`, Antigravity brain task logs, or Claude Code task outputs)
-/// even when `cwd` is `"~"` or outside that root.
+/// Resolve a path that points directly into an explicitly allowed read-only agent artifact/log/worktree
+/// root (such as `$ORBIT_HOME/attachments`, `$ORBIT_HOME/worktrees`, Antigravity brain/worktrees,
+/// or Claude Code task outputs) even when `cwd` is `"~"` or outside that root.
 async fn resolve_managed_artifact_file_if_allowed(
     trimmed: &str,
     allow_managed_artifacts: bool,
     extra_attachments_dir: Option<&Path>,
+    worktree_roots: &ManagedWorktreeRoots,
 ) -> Option<PathBuf> {
     if !allow_managed_artifacts {
         return None;
@@ -373,7 +531,7 @@ async fn resolve_managed_artifact_file_if_allowed(
     let canonical = crate::platform::canonicalize_clean_async(&candidate)
         .await
         .ok()?;
-    for root in managed_artifact_roots(extra_attachments_dir) {
+    for root in managed_artifact_roots(extra_attachments_dir, worktree_roots) {
         if let Ok(canon_root) = crate::platform::canonicalize_clean_async(&root).await
             && canonical.starts_with(&canon_root)
         {
@@ -384,13 +542,32 @@ async fn resolve_managed_artifact_file_if_allowed(
 }
 
 /// Resolve a canonical file path strictly contained inside `cwd` (or an explicitly allowed
-/// read-only agent artifact/log root when `allow_managed_artifacts` is true), blocking
+/// read-only agent artifact/log/worktree root when `allow_managed_artifacts` is true), blocking
 /// path-traversal and symlink escapes.
 async fn resolve_contained_file_path(
     cwd: &Path,
     raw_path: &str,
     allow_managed_artifacts: bool,
     extra_attachments_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let home = crate::platform::resolve_user_home_dir();
+    let worktree_roots = ManagedWorktreeRoots::from_env(home.as_deref());
+    resolve_contained_file_path_with_roots(
+        cwd,
+        raw_path,
+        allow_managed_artifacts,
+        extra_attachments_dir,
+        &worktree_roots,
+    )
+    .await
+}
+
+async fn resolve_contained_file_path_with_roots(
+    cwd: &Path,
+    raw_path: &str,
+    allow_managed_artifacts: bool,
+    extra_attachments_dir: Option<&Path>,
+    worktree_roots: &ManagedWorktreeRoots,
 ) -> Result<PathBuf, String> {
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
@@ -401,6 +578,7 @@ async fn resolve_contained_file_path(
         trimmed,
         allow_managed_artifacts,
         extra_attachments_dir,
+        worktree_roots,
     )
     .await
     {
@@ -432,16 +610,28 @@ async fn resolve_contained_file_path(
         }
     };
 
-    let canonical = crate::platform::canonicalize_clean_async(&candidate)
-        .await
-        .map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
+    let canonical = match crate::platform::canonicalize_clean_async(&candidate).await {
+        Ok(canon) => canon,
+        Err(orig_err) => {
+            if allow_managed_artifacts
+                && let Some(rel) =
+                    extract_deleted_worktree_relative_path(&candidate, worktree_roots)
+                && let Ok(fallback) =
+                    crate::platform::canonicalize_clean_async(&canonical_cwd.join(&rel)).await
+                && fallback.starts_with(&canonical_cwd)
+            {
+                return Ok(fallback);
+            }
+            return Err(format!("Cannot read `{trimmed}`: {orig_err}"));
+        }
+    };
 
     if canonical.starts_with(&canonical_cwd) {
         return Ok(canonical);
     }
 
     if allow_managed_artifacts {
-        for root in managed_artifact_roots(extra_attachments_dir) {
+        for root in managed_artifact_roots(extra_attachments_dir, worktree_roots) {
             if let Ok(canon_root) = crate::platform::canonicalize_clean_async(&root).await
                 && canonical.starts_with(&canon_root)
             {
@@ -1453,6 +1643,148 @@ mod tests {
             )
             .await
             .is_err()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn subagent_worktree_reads_allow_live_and_deleted_fallback_readonly_and_block_escapes() {
+        let root = std::env::temp_dir().join(format!("orbit_wt_read_{}", Uuid::new_v4()));
+        let ws = root.join("primary_repo");
+        let agy_wt_root = root.join("agy_data").join("worktrees");
+        let agy_live_wt = agy_wt_root.join("conv-123").join("subagent-track-1-orbit");
+        let orbit_wt_root = root.join("orbit_home").join("worktrees");
+        let orbit_live_wt = orbit_wt_root.join("orbit-feat-foo");
+        let outside = root.join("outside_secrets");
+
+        tokio::fs::create_dir_all(ws.join("src"))
+            .await
+            .expect("mkdir ws");
+        tokio::fs::create_dir_all(agy_live_wt.join("src"))
+            .await
+            .expect("mkdir agy wt");
+        tokio::fs::create_dir_all(orbit_live_wt.join("src"))
+            .await
+            .expect("mkdir orbit wt");
+        tokio::fs::create_dir_all(&outside)
+            .await
+            .expect("mkdir outside");
+
+        let primary_file = ws.join("src").join("lib.rs");
+        let agy_live_file = agy_live_wt.join("src").join("lib.rs");
+        let orbit_live_file = orbit_live_wt.join("src").join("lib.rs");
+        let outside_file = outside.join("secret.txt");
+
+        tokio::fs::write(&primary_file, "pub fn primary() {}\n")
+            .await
+            .expect("write primary");
+        tokio::fs::write(&agy_live_file, "pub fn agy_live() {}\n")
+            .await
+            .expect("write agy live");
+        tokio::fs::write(&orbit_live_file, "pub fn orbit_live() {}\n")
+            .await
+            .expect("write orbit live");
+        tokio::fs::write(&outside_file, "top-secret\n")
+            .await
+            .expect("write outside");
+
+        let roots = ManagedWorktreeRoots {
+            agy_worktree_roots: vec![agy_wt_root.clone()],
+            orbit_worktree_roots: vec![orbit_wt_root.clone()],
+        };
+        let canon_primary = crate::platform::canonicalize_clean_async(&primary_file)
+            .await
+            .expect("canon primary");
+        let canon_agy_live = crate::platform::canonicalize_clean_async(&agy_live_file)
+            .await
+            .expect("canon agy live");
+        let canon_orbit_live = crate::platform::canonicalize_clean_async(&orbit_live_file)
+            .await
+            .expect("canon orbit live");
+
+        // (a) Live Antigravity and Orbit worktree files are allowed and strictly read-only
+        let agy_raw = agy_live_file.to_string_lossy().to_string();
+        let resolved_agy =
+            resolve_contained_file_path_with_roots(&ws, &agy_raw, true, None, &roots)
+                .await
+                .expect("live agy worktree file must resolve");
+        assert_eq!(resolved_agy, canon_agy_live);
+        let agy_meta = tokio::fs::metadata(&resolved_agy).await.expect("meta");
+        assert!(
+            !compute_workspace_file_writable(&ws, &agy_raw, &resolved_agy, &agy_meta).await,
+            "live agy worktree read must remain strictly read-only"
+        );
+
+        let orbit_raw = orbit_live_file.to_string_lossy().to_string();
+        let resolved_orbit =
+            resolve_contained_file_path_with_roots(&ws, &orbit_raw, true, None, &roots)
+                .await
+                .expect("live orbit worktree file must resolve");
+        assert_eq!(resolved_orbit, canon_orbit_live);
+        let orbit_meta = tokio::fs::metadata(&resolved_orbit).await.expect("meta");
+        assert!(
+            !compute_workspace_file_writable(&ws, &orbit_raw, &resolved_orbit, &orbit_meta).await,
+            "live orbit worktree read must remain strictly read-only"
+        );
+
+        // (b) Deleted worktree files gracefully fall back to primary workspace `cwd` (read-only)
+        let deleted_agy_path = agy_wt_root
+            .join("conv-999")
+            .join("deleted-subagent-wt")
+            .join("src")
+            .join("lib.rs");
+        let deleted_agy_raw = deleted_agy_path.to_string_lossy().to_string();
+        let fallback_agy =
+            resolve_contained_file_path_with_roots(&ws, &deleted_agy_raw, true, None, &roots)
+                .await
+                .expect("deleted agy worktree must fall back to primary cwd");
+        assert_eq!(fallback_agy, canon_primary);
+        let fb_meta = tokio::fs::metadata(&fallback_agy).await.expect("meta");
+        assert!(
+            !compute_workspace_file_writable(&ws, &deleted_agy_raw, &fallback_agy, &fb_meta).await,
+            "fallback absolute worktree read must remain strictly read-only"
+        );
+
+        let deleted_orbit_path = orbit_wt_root
+            .join("deleted-orbit-wt")
+            .join("src")
+            .join("lib.rs");
+        let deleted_orbit_raw = deleted_orbit_path.to_string_lossy().to_string();
+        let fallback_orbit =
+            resolve_contained_file_path_with_roots(&ws, &deleted_orbit_raw, true, None, &roots)
+                .await
+                .expect("deleted orbit worktree must fall back to primary cwd");
+        assert_eq!(fallback_orbit, canon_primary);
+
+        // (c) Traversal and outside-root escapes remain strictly denied
+        let traversal_agy = format!(
+            "{}/conv-999/deleted-wt/../../outside_secrets/secret.txt",
+            agy_wt_root.display()
+        );
+        assert!(
+            resolve_contained_file_path_with_roots(&ws, &traversal_agy, true, None, &roots)
+                .await
+                .is_err(),
+            "parent-dir traversal inside worktree path must be denied"
+        );
+        assert!(
+            resolve_contained_file_path_with_roots(
+                &ws,
+                outside_file.to_str().unwrap_or(""),
+                true,
+                None,
+                &roots,
+            )
+            .await
+            .is_err(),
+            "outside secret file must remain denied"
+        );
+        assert!(
+            resolve_contained_file_path_with_roots(&ws, &agy_raw, false, None, &roots)
+                .await
+                .is_err(),
+            "worktree read must be denied when allow_managed_artifacts is false"
         );
 
         let _ = tokio::fs::remove_dir_all(&root).await;

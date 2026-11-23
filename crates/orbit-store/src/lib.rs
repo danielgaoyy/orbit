@@ -1224,6 +1224,105 @@ impl OrbitStore {
 
         if let Some(ref key_val) = ckey {
             let boundary_seq = query_coalesce_boundary_seq(&tx, true, agent_id, &payload, None);
+            let is_late_finalization_target = matches!(
+                payload,
+                TimelinePayload::AssistantMessage {
+                    streaming: false,
+                    ..
+                } | TimelinePayload::AssistantThinking { .. }
+            );
+            if is_late_finalization_target && boundary_seq > 0 {
+                let existing_pre_boundary: Option<(i64, u32, Option<String>, String, String)> = tx
+                    .query_row(
+                        "SELECT seq, epoch, turn_id, timestamp, payload_json
+                         FROM timeline_events
+                         WHERE agent_id = ?1 AND seq <= ?2 AND coalesce_key = ?3 AND event_type = ?4
+                         ORDER BY seq DESC
+                         LIMIT 1",
+                        params![agent_id, boundary_seq, key_val, event_type],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, i64>(1)? as u32,
+                                r.get::<_, Option<String>>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, String>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((
+                    existing_seq,
+                    existing_epoch,
+                    existing_turn_id,
+                    existing_ts,
+                    existing_json,
+                )) = existing_pre_boundary
+                {
+                    let superseded_after: Vec<i64> = {
+                        if let Ok(mut sel_stmt) = tx.prepare_cached(
+                            "SELECT seq FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
+                        ) {
+                            sel_stmt
+                                .query_map(params![agent_id, boundary_seq, key_val], |r| {
+                                    r.get::<_, i64>(0)
+                                })
+                                .ok()
+                                .map(|rows| rows.flatten().collect())
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    if existing_json == payload_json && superseded_after.is_empty() {
+                        tx.commit()?;
+                        return Ok((
+                            TimelineEvent {
+                                seq: existing_seq as u64,
+                                epoch: existing_epoch,
+                                agent_id: agent_id.to_string(),
+                                turn_id: existing_turn_id
+                                    .or_else(|| turn_id.map(ToOwned::to_owned)),
+                                timestamp: parse_ts(&existing_ts),
+                                payload,
+                            },
+                            false,
+                        ));
+                    }
+                    if !superseded_after.is_empty() {
+                        search::delete_daemon_fts_by_seqs(&tx, &superseded_after)?;
+                        if let Ok(mut del_stmt) = tx.prepare_cached(
+                            "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
+                        ) {
+                            let _ = del_stmt.execute(params![agent_id, boundary_seq, key_val]);
+                        }
+                    }
+                    tx.execute(
+                        "UPDATE timeline_events SET payload_json = ?1 WHERE seq = ?2",
+                        params![payload_json, existing_seq],
+                    )?;
+                    search::delete_daemon_fts_by_seqs(&tx, &[existing_seq])?;
+                    search::sync_daemon_fts_upsert(&tx, existing_seq, agent_id, &payload)?;
+                    tx.execute(
+                        "UPDATE agents
+                         SET timeline_epoch = timeline_epoch + 1, updated_at = ?1
+                         WHERE agent_id = ?2",
+                        params![now_str, agent_id],
+                    )?;
+                    tx.commit()?;
+                    return Ok((
+                        TimelineEvent {
+                            seq: existing_seq as u64,
+                            epoch: existing_epoch,
+                            agent_id: agent_id.to_string(),
+                            turn_id: existing_turn_id.or_else(|| turn_id.map(ToOwned::to_owned)),
+                            timestamp: parse_ts(&existing_ts),
+                            payload,
+                        },
+                        true,
+                    ));
+                }
+            }
             let superseded_seqs: Vec<i64> = {
                 if let Ok(mut sel_stmt) = tx.prepare_cached(
                     "SELECT seq FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
@@ -6188,5 +6287,194 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn late_assistant_finalization_after_user_prompt_updates_pre_prompt_row_in_place() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_late_fin".into(),
+                title: "orbit".into(),
+                cwd: "/workspace/orbit".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_late_fin".into(),
+                    workspace_id: "ws_late_fin".into(),
+                    cwd: "/workspace/orbit".into(),
+                    title: "Late Finalization Agent".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        // Turn 1: prompt + streaming assistant reply
+        let p1 = store
+            .append_timeline_event(
+                "ag_late_fin",
+                1,
+                Some("turn_1"),
+                TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "First question".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("p1");
+        let a1_stream = store
+            .append_timeline_event(
+                "ag_late_fin",
+                1,
+                Some("turn_1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_turn_1_1".into(),
+                    text: "DraftAnswerTokenBeforePrompt".into(),
+                    streaming: true,
+                },
+            )
+            .expect("a1 stream");
+
+        // Turn 2 prompt lands BEFORE Turn 1's `streaming: false` finalization arrives
+        let p2 = store
+            .append_timeline_event(
+                "ag_late_fin",
+                1,
+                Some("turn_2"),
+                TimelinePayload::UserPrompt {
+                    message_id: "u2".into(),
+                    text: "Second question".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("p2");
+
+        // Late finalization for Turn 1's `item_id` arrives AFTER `p2`
+        let (a1_final, mutated) = store
+            .append_timeline_event_deduped(
+                "ag_late_fin",
+                1,
+                Some("turn_1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_turn_1_1".into(),
+                    text: "FinalAnswerTokenUnique99".into(),
+                    streaming: false,
+                },
+            )
+            .expect("late final");
+        assert!(mutated);
+        assert_eq!(
+            a1_final.seq, a1_stream.seq,
+            "late finalization MUST update original pre-prompt row in place"
+        );
+
+        let ag = store
+            .get_agent("ag_late_fin")
+            .expect("get agent")
+            .expect("agent exists");
+        assert_eq!(
+            ag.timeline_epoch, 1,
+            "in-place update must bump timeline_epoch"
+        );
+        assert_eq!(
+            ag.latest_seq, p2.seq,
+            "latest_seq must stay at p2 without inserting a duplicate row after p2"
+        );
+
+        let (events, _) = store
+            .fetch_timeline_since("ag_late_fin", 0, 50)
+            .expect("fetch timeline");
+        assert_eq!(
+            events.len(),
+            3,
+            "timeline must contain exactly [p1, a1_final, p2] with zero duplicate after p2"
+        );
+        assert_eq!(events[0].seq, p1.seq);
+        assert_eq!(events[1].seq, a1_stream.seq);
+        assert_eq!(events[2].seq, p2.seq);
+        assert!(matches!(
+            &events[1].payload,
+            TimelinePayload::AssistantMessage {
+                item_id,
+                text,
+                streaming: false,
+            } if item_id == "agy_msg_turn_1_1" && text == "FinalAnswerTokenUnique99"
+        ));
+
+        // FTS5 index reflects the finalized text at the original pre-prompt seq
+        let hits = store
+            .search_daemon_messages("FinalAnswerTokenUnique99", 10)
+            .expect("fts search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].seq, a1_stream.seq);
+
+        // Re-sending the exact same finalized payload is a no-op (`mutated == false`) and does not duplicate
+        let (a1_dup, mutated_dup) = store
+            .append_timeline_event_deduped(
+                "ag_late_fin",
+                1,
+                Some("turn_1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_turn_1_1".into(),
+                    text: "FinalAnswerTokenUnique99".into(),
+                    streaming: false,
+                },
+            )
+            .expect("dup final");
+        assert!(!mutated_dup);
+        assert_eq!(a1_dup.seq, a1_stream.seq);
+        let (events_after_dup, _) = store
+            .fetch_timeline_since("ag_late_fin", 0, 50)
+            .expect("fetch timeline after dup");
+        assert_eq!(events_after_dup.len(), 3);
     }
 }

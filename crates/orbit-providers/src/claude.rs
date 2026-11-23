@@ -886,6 +886,7 @@ async fn run_claude_actor(
                                     continue;
                                 }
                                 ActiveTurnBehavior::Interrupt => {
+                                    queued_prompts.clear();
                                     let rid = format!("ctrl_{ctrl_seq}");
                                     ctrl_seq += 1;
                                     let req = json!({
@@ -897,7 +898,7 @@ async fn run_claude_actor(
                                         }
                                     });
                                     let _ = shim.write_stdin_line(req.to_string()).await;
-                                    queued_prompts.push_front((turn_id, prompt));
+                                    queued_prompts.push_back((turn_id, prompt));
                                     continue;
                                 }
                                 ActiveTurnBehavior::Steer => {
@@ -945,6 +946,7 @@ async fn run_claude_actor(
                         }
                     }
                     DriverCommand::Interrupt => {
+                        queued_prompts.clear();
                         let rid = format!("ctrl_{ctrl_seq}");
                         ctrl_seq += 1;
                         let req = json!({

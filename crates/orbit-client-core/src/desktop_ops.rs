@@ -1866,10 +1866,176 @@ fn managed_attachment_root() -> Option<PathBuf> {
     orbit_home_dir.map(|oh| oh.join("attachments"))
 }
 
+#[derive(Debug, Clone, Default)]
+struct ManagedLocalWorktreeRoots {
+    agy_worktree_roots: Vec<PathBuf>,
+    orbit_worktree_roots: Vec<PathBuf>,
+}
+
+impl ManagedLocalWorktreeRoots {
+    fn from_env(home: Option<&Path>) -> Self {
+        let mut agy_worktree_roots = Vec::new();
+        let mut orbit_worktree_roots = Vec::new();
+
+        if let Some(dir) = std::env::var_os("ANTIGRAVITY_EXECUTABLE_DATA_DIR")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            agy_worktree_roots.push(dir.join("worktrees"));
+        }
+        if let Some(h) = home {
+            if let Ok(rel) = std::env::var("ANTIGRAVITY_CONFIG_REL_DIR") {
+                let rel_trimmed = rel.trim();
+                if !rel_trimmed.is_empty() {
+                    let custom = h.join(".gemini").join(rel_trimmed).join("worktrees");
+                    if !agy_worktree_roots.contains(&custom) {
+                        agy_worktree_roots.push(custom);
+                    }
+                }
+            }
+            let default_agy = h.join(".gemini").join("antigravity-cli").join("worktrees");
+            if !agy_worktree_roots.contains(&default_agy) {
+                agy_worktree_roots.push(default_agy);
+            }
+        }
+
+        if let Some(oh) = std::env::var_os("ORBIT_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            orbit_worktree_roots.push(oh.join("worktrees"));
+        }
+        if let Some(h) = home {
+            let default_orbit = h.join(".orbit").join("worktrees");
+            if !orbit_worktree_roots.contains(&default_orbit) {
+                orbit_worktree_roots.push(default_orbit);
+            }
+        }
+
+        Self {
+            agy_worktree_roots,
+            orbit_worktree_roots,
+        }
+    }
+
+    fn all_roots(&self) -> impl Iterator<Item = &PathBuf> {
+        self.agy_worktree_roots
+            .iter()
+            .chain(self.orbit_worktree_roots.iter())
+    }
+}
+
+fn canonicalize_local_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(canon) = fs::canonicalize(cur) {
+            let mut out = canon;
+            for seg in missing.into_iter().rev() {
+                out.push(seg);
+            }
+            return Some(out);
+        }
+        let name = cur.file_name()?.to_os_string();
+        missing.push(name);
+        cur = cur.parent()?;
+    }
+}
+
+fn strip_local_worktree_rel_with_skip(
+    candidate: &Path,
+    canon_candidate: Option<&Path>,
+    root: &Path,
+    skip_leading_segments: usize,
+) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let canon_root = fs::canonicalize(root).ok();
+    let tail = candidate
+        .strip_prefix(root)
+        .ok()
+        .or_else(|| {
+            canon_root
+                .as_deref()
+                .and_then(|cr| candidate.strip_prefix(cr).ok())
+        })
+        .or_else(|| canon_candidate.and_then(|cc| cc.strip_prefix(root).ok()))
+        .or_else(|| {
+            canon_candidate
+                .zip(canon_root.as_deref())
+                .and_then(|(cc, cr)| cc.strip_prefix(cr).ok())
+        })?;
+    let mut normals = Vec::new();
+    for comp in tail.components() {
+        match comp {
+            Component::Normal(seg) => normals.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    if normals.len() <= skip_leading_segments {
+        return None;
+    }
+    let mut rel = PathBuf::new();
+    for seg in &normals[skip_leading_segments..] {
+        rel.push(seg);
+    }
+    (!rel.as_os_str().is_empty()).then_some(rel)
+}
+
+fn extract_deleted_local_worktree_relative_path(
+    candidate: &Path,
+    worktree_roots: &ManagedLocalWorktreeRoots,
+) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !candidate.is_absolute() {
+        return None;
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    let canon_candidate = canonicalize_local_existing_prefix(candidate);
+    for root in &worktree_roots.agy_worktree_roots {
+        if let Some(rel) =
+            strip_local_worktree_rel_with_skip(candidate, canon_candidate.as_deref(), root, 2)
+        {
+            return Some(rel);
+        }
+    }
+    for root in &worktree_roots.orbit_worktree_roots {
+        if let Some(rel) =
+            strip_local_worktree_rel_with_skip(candidate, canon_candidate.as_deref(), root, 1)
+        {
+            return Some(rel);
+        }
+    }
+    None
+}
+
 fn resolve_allowed_local_file_path(
     cwd: Option<&str>,
     raw_path: &str,
     allow_agent_log_roots: bool,
+) -> Result<PathBuf, String> {
+    let home = resolve_user_home();
+    let worktree_roots = ManagedLocalWorktreeRoots::from_env(home.as_deref());
+    resolve_allowed_local_file_path_with_roots(
+        cwd,
+        raw_path,
+        allow_agent_log_roots,
+        &worktree_roots,
+    )
+}
+
+fn resolve_allowed_local_file_path_with_roots(
+    cwd: Option<&str>,
+    raw_path: &str,
+    allow_agent_log_roots: bool,
+    worktree_roots: &ManagedLocalWorktreeRoots,
 ) -> Result<PathBuf, String> {
     use std::path::Component;
 
@@ -1886,6 +2052,11 @@ fn resolve_allowed_local_file_path(
         if let Some(h) = resolve_user_home() {
             managed_artifact_roots.push(h.join(".gemini").join("antigravity-cli").join("brain"));
             managed_artifact_roots.push(h.join(".claude").join("projects"));
+        }
+        for wt_root in worktree_roots.all_roots() {
+            if !managed_artifact_roots.contains(wt_root) {
+                managed_artifact_roots.push(wt_root.clone());
+            }
         }
         managed_artifact_roots.push(std::env::temp_dir().join("claude"));
         let tmp_claude = PathBuf::from("/tmp/claude");
@@ -1962,8 +2133,20 @@ fn resolve_allowed_local_file_path(
         }
     };
 
-    let canon =
-        fs::canonicalize(&candidate).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
+    let canon = match fs::canonicalize(&candidate) {
+        Ok(c) => c,
+        Err(orig_err) => {
+            if allow_agent_log_roots
+                && let Some(rel) =
+                    extract_deleted_local_worktree_relative_path(&candidate, worktree_roots)
+                && let Ok(fallback) = fs::canonicalize(canonical_cwd.join(&rel))
+                && fallback.starts_with(&canonical_cwd)
+            {
+                return Ok(fallback);
+            }
+            return Err(format!("Cannot read `{trimmed}`: {orig_err}"));
+        }
+    };
     let allowed = canon.starts_with(&canonical_cwd) || is_in_managed_root(&canon);
     if !allowed {
         return Err(format!(
@@ -2515,6 +2698,125 @@ mod tests {
         assert_ne!(utf16_payload.content_kind, "audio");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_subagent_worktree_reads_allow_live_and_deleted_fallback_and_block_escapes() {
+        let root =
+            std::env::temp_dir().join(format!("orbit_local_wt_read_{}", uuid::Uuid::new_v4()));
+        let ws = root.join("primary_repo");
+        let agy_wt_root = root.join("agy_data").join("worktrees");
+        let agy_live_wt = agy_wt_root.join("conv-123").join("subagent-track-1-orbit");
+        let orbit_wt_root = root.join("orbit_home").join("worktrees");
+        let orbit_live_wt = orbit_wt_root.join("orbit-feat-foo");
+        let outside = root.join("outside_secrets");
+
+        fs::create_dir_all(ws.join("src")).expect("mkdir ws");
+        fs::create_dir_all(agy_live_wt.join("src")).expect("mkdir agy wt");
+        fs::create_dir_all(orbit_live_wt.join("src")).expect("mkdir orbit wt");
+        fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let primary_file = ws.join("src").join("lib.rs");
+        let agy_live_file = agy_live_wt.join("src").join("lib.rs");
+        let orbit_live_file = orbit_live_wt.join("src").join("lib.rs");
+        let outside_file = outside.join("secret.txt");
+
+        fs::write(&primary_file, "pub fn primary() {}\n").expect("write primary");
+        fs::write(&agy_live_file, "pub fn agy_live() {}\n").expect("write agy live");
+        fs::write(&orbit_live_file, "pub fn orbit_live() {}\n").expect("write orbit live");
+        fs::write(&outside_file, "top-secret\n").expect("write outside");
+
+        let roots = ManagedLocalWorktreeRoots {
+            agy_worktree_roots: vec![agy_wt_root.clone()],
+            orbit_worktree_roots: vec![orbit_wt_root.clone()],
+        };
+        let cwd_str = ws.to_string_lossy().to_string();
+        let canon_primary = fs::canonicalize(&primary_file).expect("canon primary");
+        let canon_agy_live = fs::canonicalize(&agy_live_file).expect("canon agy live");
+        let canon_orbit_live = fs::canonicalize(&orbit_live_file).expect("canon orbit live");
+
+        // (a) Live Antigravity and Orbit worktree files allowed read-only
+        let agy_raw = agy_live_file.to_string_lossy().to_string();
+        let resolved_agy =
+            resolve_allowed_local_file_path_with_roots(Some(&cwd_str), &agy_raw, true, &roots)
+                .expect("live agy worktree file must resolve");
+        assert_eq!(resolved_agy, canon_agy_live);
+        let agy_meta = fs::metadata(&resolved_agy).expect("meta");
+        assert!(
+            !compute_local_file_writable(&cwd_str, &agy_raw, &resolved_agy, &agy_meta),
+            "live agy worktree read must remain strictly read-only"
+        );
+
+        let orbit_raw = orbit_live_file.to_string_lossy().to_string();
+        let resolved_orbit =
+            resolve_allowed_local_file_path_with_roots(Some(&cwd_str), &orbit_raw, true, &roots)
+                .expect("live orbit worktree file must resolve");
+        assert_eq!(resolved_orbit, canon_orbit_live);
+
+        // (b) Deleted worktree files gracefully fall back to primary workspace `cwd`
+        let deleted_agy_raw = agy_wt_root
+            .join("conv-999")
+            .join("deleted-subagent-wt")
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .to_string();
+        let fallback_agy = resolve_allowed_local_file_path_with_roots(
+            Some(&cwd_str),
+            &deleted_agy_raw,
+            true,
+            &roots,
+        )
+        .expect("deleted agy worktree must fall back to primary cwd");
+        assert_eq!(fallback_agy, canon_primary);
+        let fb_meta = fs::metadata(&fallback_agy).expect("meta");
+        assert!(!compute_local_file_writable(
+            &cwd_str,
+            &deleted_agy_raw,
+            &fallback_agy,
+            &fb_meta
+        ));
+
+        let deleted_orbit_raw = orbit_wt_root
+            .join("deleted-orbit-wt")
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .to_string();
+        let fallback_orbit = resolve_allowed_local_file_path_with_roots(
+            Some(&cwd_str),
+            &deleted_orbit_raw,
+            true,
+            &roots,
+        )
+        .expect("deleted orbit worktree must fall back to primary cwd");
+        assert_eq!(fallback_orbit, canon_primary);
+
+        // (c) Traversal, outside files, and external-open (`allow_agent_log_roots = false`) stay denied
+        let traversal = format!(
+            "{}/conv-999/deleted-wt/../../outside_secrets/secret.txt",
+            agy_wt_root.display()
+        );
+        assert!(
+            resolve_allowed_local_file_path_with_roots(Some(&cwd_str), &traversal, true, &roots)
+                .is_err()
+        );
+        assert!(
+            resolve_allowed_local_file_path_with_roots(
+                Some(&cwd_str),
+                &outside_file.to_string_lossy(),
+                true,
+                &roots,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_allowed_local_file_path_with_roots(Some(&cwd_str), &agy_raw, false, &roots)
+                .is_err(),
+            "external open must not open arbitrary worktree files"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

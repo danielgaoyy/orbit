@@ -1817,6 +1817,9 @@ function subscribeCoreEvents(): Promise<void> {
           }, 150);
         }
       } else if (ev.kind === "terminal_changed") {
+        // Desktop streams PTY output directly over `subscribe_terminal_binary` (`InvokeResponseBody::Raw`);
+        // ignore empty notifications from the 33ms control channel so the store does zero work.
+        if (!ev.raw_bytes || ev.raw_bytes.length === 0) return;
         const chKey = `${ev.host_id}::${ev.slot}`;
         let ch = terminalChannels.get(chKey);
         if (!ch) {
@@ -10373,7 +10376,13 @@ export const orbitActions = {
     void orbitIpc.startTerminal(hostId, cwd, 110, 28);
   },
 
-  attachExistingTerminal(hostId: string, terminalId: string, cwd: string, title: string): void {
+  async attachExistingTerminal(
+    hostId: string,
+    terminalId: string,
+    cwd: string,
+    title: string,
+    preferredSlot?: number | null,
+  ): Promise<void> {
     detachedTerminalIds.delete(`${hostId}::${terminalId}`);
     const existing = state.terminalTabs.find(
       (t) => t.hostId === hostId && t.terminalId === terminalId,
@@ -10383,24 +10392,56 @@ export const orbitActions = {
       orbitActions.openTerminalTab({ spawnIfEmpty: false });
       return;
     }
-    const usedSlots = new Set(
-      state.terminalTabs.filter((t) => t.hostId === hostId).map((t) => t.slot),
+
+    // Query Rust core for the authoritative slot bound to `terminalId` (reusing its existing slot
+    // or allocating a free slot across BOTH main-window tabs and open floating detached windows!)
+    // so reattaching one terminal can never steal a slot from another open detached window.
+    const coreSlot =
+      preferredSlot && preferredSlot >= 1
+        ? preferredSlot
+        : await orbitIpc.ensureTerminalSlot(hostId, terminalId).catch(() => null);
+
+    // Re-check after async IPC in case a concurrent HostChanged event already inserted this tab
+    const existingAfterResolve = state.terminalTabs.find(
+      (t) => t.hostId === hostId && t.terminalId === terminalId,
     );
-    let slot = 1;
-    while (usedSlots.has(slot) && slot < 240) {
-      slot += 1;
+    if (existingAfterResolve) {
+      setState((s) => ({ ...s, activeTerminalTabKey: existingAfterResolve.key }));
+      orbitActions.openTerminalTab({ spawnIfEmpty: false });
+      return;
     }
+
+    let slot: number;
+    let shouldDispatchLegacyAttach = false;
+    if (coreSlot !== null && coreSlot >= 1) {
+      slot = coreSlot;
+    } else {
+      const usedSlots = new Set(
+        state.terminalTabs.filter((t) => t.hostId === hostId).map((t) => t.slot),
+      );
+      slot = 1;
+      while (usedSlots.has(slot) && slot < 240) {
+        slot += 1;
+      }
+      shouldDispatchLegacyAttach = true;
+    }
+
     const tabKey = `${hostId}::slot-${slot}`;
-    setState((s) => ({
-      ...s,
-      terminalTabs: [
-        ...s.terminalTabs,
-        { key: tabKey, hostId, terminalId, slot, cwd, title },
-      ],
-      activeTerminalTabKey: tabKey,
-    }));
+    setState((s) => {
+      const withoutDupKey = s.terminalTabs.filter((t) => t.key !== tabKey);
+      return {
+        ...s,
+        terminalTabs: [
+          ...withoutDupKey,
+          { key: tabKey, hostId, terminalId, slot, cwd, title },
+        ],
+        activeTerminalTabKey: tabKey,
+      };
+    });
     orbitActions.openTerminalTab({ spawnIfEmpty: false });
-    void orbitIpc.attachTerminal(hostId, terminalId, slot);
+    if (shouldDispatchLegacyAttach) {
+      void orbitIpc.attachTerminal(hostId, terminalId, slot);
+    }
   },
 
   async closeTerminalTab(
@@ -10476,6 +10517,61 @@ export const orbitActions = {
     return () => {
       ch?.subs.delete(onBytes);
     };
+  },
+
+  /**
+   * Append a raw binary PTY chunk into the non-reactive tail ring buffer (used by
+   * `captureActiveTerminalTail` for `@terminal` composer context) without causing store re-renders.
+   */
+  recordTerminalOutputChunk(hostId: string, slot: number, bytes: Uint8Array): void {
+    if (bytes.byteLength === 0) return;
+    const chKey = `${hostId}::${slot}`;
+    let ch = terminalChannels.get(chKey);
+    if (!ch) {
+      ch = { chunks: [], subs: new Set() };
+      terminalChannels.set(chKey, ch);
+    }
+    ch.chunks.push(bytes);
+    if (ch.chunks.length > 96) {
+      ch.chunks.splice(0, ch.chunks.length - 96);
+    }
+  },
+
+  /**
+   * Re-read persisted appearance & terminal typography preferences from localStorage
+   * so secondary floating windows stay live-synced when Settings change in the main window.
+   */
+  syncAppearanceFromStorage(): void {
+    const fresh = loadPrefs();
+    const nextLocale = fresh.locale ? resolveLocale(fresh.locale) : state.locale;
+    if (nextLocale !== state.locale) {
+      setI18nLocale(nextLocale);
+    }
+    const nextTheme: ThemeMode = fresh.theme ?? state.theme;
+    const nextResolved = resolveTheme(nextTheme);
+    applyDocumentTheme(nextResolved);
+    const nextFontSize = fresh.terminalFontSize ?? state.terminalFontSize;
+    const nextCursor = fresh.terminalCursorStyle ?? state.terminalCursorStyle;
+    const nextScrollback = fresh.terminalScrollback ?? state.terminalScrollback;
+    if (
+      nextLocale === state.locale &&
+      nextTheme === state.theme &&
+      nextResolved === state.resolvedTheme &&
+      nextFontSize === state.terminalFontSize &&
+      nextCursor === state.terminalCursorStyle &&
+      nextScrollback === state.terminalScrollback
+    ) {
+      return;
+    }
+    setState((s) => ({
+      ...s,
+      locale: nextLocale,
+      theme: nextTheme,
+      resolvedTheme: nextResolved,
+      terminalFontSize: nextFontSize,
+      terminalCursorStyle: nextCursor,
+      terminalScrollback: nextScrollback,
+    }));
   },
 
   async openWorkspaceInEditor(preferredKind?: ExternalEditorKind): Promise<void> {

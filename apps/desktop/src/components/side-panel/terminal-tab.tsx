@@ -1,5 +1,5 @@
 import { Suspense, lazy, memo, useEffect, useMemo, useState } from "react";
-import { ChevronDown, Plus, X } from "lucide-react";
+import { ChevronDown, PictureInPicture2, Plus, X } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   DropdownMenu,
@@ -7,8 +7,9 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
+  SimpleTooltip,
 } from "@/components/ui/overlays";
-import type { TerminalSummary } from "@/lib/orbit-ipc";
+import { type TerminalSummary, orbitIpc } from "@/lib/orbit-ipc";
 import { useI18n } from "@/lib/i18n";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -62,6 +63,11 @@ export const TerminalTab = memo(function TerminalTab({
   const hostTabs = useMemo(
     () => terminalTabs.filter((t) => t.hostId === selectedHostId),
     [terminalTabs, selectedHostId],
+  );
+
+  const activeHostTab = useMemo(
+    () => hostTabs.find((tab) => tab.key === activeTerminalTabKey) ?? hostTabs[0] ?? null,
+    [hostTabs, activeTerminalTabKey],
   );
 
   const detachedTerminals = useMemo(() => {
@@ -167,6 +173,33 @@ export const TerminalTab = memo(function TerminalTab({
             </DropdownMenu>
           )}
         </div>
+
+        {activeHostTab?.terminalId && (
+          <SimpleTooltip label={t("terminal.detachToWindow")}>
+            <button
+              type="button"
+              aria-label={t("terminal.detachToWindow")}
+              onClick={() => {
+                const target = activeHostTab;
+                if (!target.terminalId) return;
+                const tid = target.terminalId;
+                void orbitIpc
+                  .openDetachedTerminalWindow(target.hostId, tid, target.title, target.cwd)
+                  .then((label) => {
+                    if (label) {
+                      void orbitActions.closeTerminalTab(target.key, false, tid);
+                    }
+                  })
+                  .catch((err) => {
+                    orbitActions.showToast(String(err));
+                  });
+              }}
+              className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-lg transition-colors"
+            >
+              <PictureInPicture2 className="h-[13.5px] w-[13.5px]" />
+            </button>
+          </SimpleTooltip>
+        )}
       </div>
 
       {/* Persistent Multi-Host WebGL Xterm Pool (never unmount other hosts' live PTYs on host switch) */}
@@ -183,6 +216,7 @@ export const TerminalTab = memo(function TerminalTab({
               <LazyXtermPane
                 key={tab.key}
                 hostId={tab.hostId}
+                terminalId={tab.terminalId}
                 slot={tab.slot}
                 active={tab.hostId === selectedHostId && tab.key === activeTerminalTabKey}
                 visible={visible && hostTabs.length > 0}

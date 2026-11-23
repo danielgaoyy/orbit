@@ -2820,6 +2820,32 @@ export interface UpsertEventTriggerRequest {
   enabled: boolean;
 }
 
+export interface ReattachTerminalEvent {
+  host_id: string;
+  terminal_id: string;
+  title: string;
+  cwd: string;
+  slot?: number | null;
+}
+
+export function normalizeBinaryChunk(payload: unknown): Uint8Array | null {
+  if (payload instanceof Uint8Array) {
+    return payload.byteLength > 0 ? payload : null;
+  }
+  if (payload instanceof ArrayBuffer) {
+    return payload.byteLength > 0 ? new Uint8Array(payload) : null;
+  }
+  if (ArrayBuffer.isView(payload)) {
+    return payload.byteLength > 0
+      ? new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength)
+      : null;
+  }
+  if (Array.isArray(payload) && payload.length > 0) {
+    return Uint8Array.from(payload as number[]);
+  }
+  return null;
+}
+
 export const orbitIpc = {
   async subscribe(onNotification: (ev: CoreNotification) => void): Promise<void> {
     if (!isTauriRuntime()) return;
@@ -4371,6 +4397,47 @@ export const orbitIpc = {
     await invoke<void>("kill_terminal", { hostId, terminalId });
   },
 
+  subscribeTerminalBinary: async (
+    hostId: string,
+    terminalId: string,
+    onChunk: (bytes: Uint8Array) => void,
+    slot?: number,
+  ): Promise<string | null> => {
+    if (!isTauriRuntime()) return null;
+    const channel = new Channel<ArrayBuffer | Uint8Array | number[]>();
+    channel.onmessage = (payload) => {
+      const bytes = normalizeBinaryChunk(payload);
+      if (bytes) {
+        onChunk(bytes);
+      }
+    };
+    return invoke<string>("subscribe_terminal_binary", {
+      hostId,
+      terminalId,
+      slot: slot ?? null,
+      onChunk: channel,
+    });
+  },
+
+  unsubscribeTerminalBinary: async (subscriptionId: string): Promise<void> => {
+    if (!isTauriRuntime() || !subscriptionId) return;
+    await invoke<void>("unsubscribe_terminal_binary", { subscriptionId });
+  },
+
+  ensureTerminalSlot: async (hostId: string, terminalId: string): Promise<number | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<number>("ensure_terminal_slot", { hostId, terminalId });
+  },
+
+  writeTerminalInput: async (
+    hostId: string,
+    terminalId: string,
+    data: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("write_terminal_input", { hostId, terminalId, data });
+  },
+
   sendTerminalInputSlot: async (
     hostId: string,
     slot: number,
@@ -4378,6 +4445,21 @@ export const orbitIpc = {
   ): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("send_terminal_input_slot", { hostId, slot, data });
+  },
+
+  resizeTerminal: async (
+    hostId: string,
+    cols: number,
+    rows: number,
+    terminalId?: string | null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("resize_terminal", {
+      hostId,
+      cols,
+      rows,
+      terminalId: terminalId ?? null,
+    });
   },
 
   resizeTerminalSlot: async (
@@ -4388,6 +4470,47 @@ export const orbitIpc = {
   ): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("resize_terminal_slot", { hostId, slot, cols, rows });
+  },
+
+  openDetachedTerminalWindow: async (
+    hostId: string,
+    terminalId: string,
+    title: string,
+    cwd?: string,
+  ): Promise<string | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<string>("open_detached_terminal_window", {
+      hostId,
+      terminalId,
+      title,
+      cwd: cwd ?? null,
+    });
+  },
+
+  reattachDetachedTerminal: async (
+    hostId: string,
+    terminalId: string,
+    title: string,
+    cwd?: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("reattach_detached_terminal", {
+      hostId,
+      terminalId,
+      title,
+      cwd: cwd ?? null,
+    });
+  },
+
+  onReattachTerminal: async (
+    handler: (payload: ReattachTerminalEvent) => void,
+  ): Promise<() => void> => {
+    if (!isTauriRuntime()) return () => {};
+    return listen<ReattachTerminalEvent>("orbit://reattach-terminal", (event) => {
+      if (event.payload) {
+        handler(event.payload);
+      }
+    });
   },
 
   listSshHosts: async (): Promise<SshHostItem[]> => {

@@ -130,6 +130,239 @@ pub trait CoreEventSubscriber: Send + Sync {
     fn on_notification(&self, event: CoreNotification);
 }
 
+const MAX_TERMINAL_RAW_HISTORY_BYTES: usize = 256 * 1024;
+const MAX_TERMINAL_BINARY_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PENDING_SLOT_FRAMES: usize = 64;
+const TERMINAL_RESYNC_RESET_SEQ: &[u8] = b"\x1b[0m\x1b[2J\x1b[H";
+
+#[derive(Default)]
+struct TerminalBinaryQueueState {
+    /// Whole atomic chunks queued for delivery (never sliced mid-UTF-8 / mid-ANSI on overflow).
+    chunks: VecDeque<Vec<u8>>,
+    pending_bytes: usize,
+    overflowed: bool,
+    closed: bool,
+}
+
+struct TerminalBinaryQueue {
+    state: Mutex<TerminalBinaryQueueState>,
+    notify: tokio::sync::Notify,
+    max_bytes: usize,
+}
+
+impl TerminalBinaryQueue {
+    fn new(initial_bytes: Vec<u8>) -> Self {
+        Self::new_with_cap(initial_bytes, MAX_TERMINAL_BINARY_QUEUE_BYTES)
+    }
+
+    fn new_with_cap(initial_bytes: Vec<u8>, max_bytes: usize) -> Self {
+        let cap = max_bytes.max(TERMINAL_RESYNC_RESET_SEQ.len());
+        let mut chunks = VecDeque::new();
+        let mut pending_bytes = 0;
+        let mut overflowed = false;
+        if !initial_bytes.is_empty() {
+            if initial_bytes.len() <= cap {
+                pending_bytes = initial_bytes.len();
+                chunks.push_back(initial_bytes);
+            } else {
+                // Never slice arbitrary bytes out of an oversized replay buffer; emit a clean reset.
+                overflowed = true;
+                let reset = TERMINAL_RESYNC_RESET_SEQ.to_vec();
+                pending_bytes = reset.len();
+                chunks.push_back(reset);
+            }
+        }
+        Self {
+            state: Mutex::new(TerminalBinaryQueueState {
+                chunks,
+                pending_bytes,
+                overflowed,
+                closed: false,
+            }),
+            notify: tokio::sync::Notify::new(),
+            max_bytes: cap,
+        }
+    }
+
+    fn push_with_resync(&self, data: &[u8], make_resync: impl FnOnce() -> Vec<u8>) -> bool {
+        if data.is_empty() {
+            return !self.is_closed();
+        }
+        let Ok(mut guard) = self.state.lock() else {
+            return false;
+        };
+        if guard.closed {
+            return false;
+        }
+        if guard.pending_bytes.saturating_add(data.len()) > self.max_bytes {
+            guard.overflowed = true;
+            guard.chunks.clear();
+            guard.pending_bytes = 0;
+
+            let mut resync = make_resync();
+            if resync.is_empty() || !resync.starts_with(TERMINAL_RESYNC_RESET_SEQ) {
+                let mut prefixed =
+                    Vec::with_capacity(TERMINAL_RESYNC_RESET_SEQ.len() + resync.len());
+                prefixed.extend_from_slice(TERMINAL_RESYNC_RESET_SEQ);
+                prefixed.extend_from_slice(&resync);
+                resync = prefixed;
+            }
+            if resync.len() > self.max_bytes {
+                // Even a clean screen resync exceeded a tiny test/safety cap: emit pure reset
+                // rather than ever slicing mid-UTF-8 or mid-ANSI escape sequences.
+                resync = TERMINAL_RESYNC_RESET_SEQ.to_vec();
+            }
+            guard.pending_bytes = resync.len();
+            guard.chunks.push_back(resync);
+        } else {
+            guard.pending_bytes += data.len();
+            guard.chunks.push_back(data.to_vec());
+        }
+        drop(guard);
+        self.notify.notify_one();
+        true
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().map(|g| g.closed).unwrap_or(true)
+    }
+
+    fn close(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.closed = true;
+            guard.chunks.clear();
+            guard.pending_bytes = 0;
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn drain_locked(guard: &mut TerminalBinaryQueueState) -> Option<Vec<u8>> {
+        if guard.chunks.is_empty() {
+            return None;
+        }
+        let out = if guard.chunks.len() == 1 {
+            guard.chunks.pop_front().unwrap_or_default()
+        } else {
+            let mut merged = Vec::with_capacity(guard.pending_bytes);
+            while let Some(chunk) = guard.chunks.pop_front() {
+                merged.extend_from_slice(&chunk);
+            }
+            merged
+        };
+        guard.pending_bytes = 0;
+        guard.overflowed = false;
+        Some(out)
+    }
+
+    fn take_pending(&self) -> Option<Vec<u8>> {
+        let Ok(mut guard) = self.state.lock() else {
+            return None;
+        };
+        Self::drain_locked(&mut guard)
+    }
+}
+
+struct TerminalBinarySubscriberEntry {
+    subscription_id: String,
+    host_id: String,
+    terminal_id: String,
+    slot_fallback: Option<u8>,
+    queue: Arc<TerminalBinaryQueue>,
+}
+
+fn matches_terminal_binary_subscriber(
+    sub: &TerminalBinarySubscriberEntry,
+    host_id: &str,
+    slot: u8,
+    resolved_terminal_id: Option<&str>,
+) -> bool {
+    if sub.host_id != host_id {
+        return false;
+    }
+    if !sub.terminal_id.is_empty() {
+        resolved_terminal_id == Some(sub.terminal_id.as_str())
+    } else {
+        sub.slot_fallback == Some(slot)
+    }
+}
+
+fn append_terminal_history_or_resync(
+    buf: &mut Vec<u8>,
+    chunk: &[u8],
+    cap: usize,
+    make_resync: impl FnOnce() -> Vec<u8>,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    if buf.len().saturating_add(chunk.len()) <= cap {
+        buf.extend_from_slice(chunk);
+        return;
+    }
+    let resync = make_resync();
+    if !resync.is_empty() && resync.len() <= cap {
+        *buf = resync;
+    } else {
+        *buf = TERMINAL_RESYNC_RESET_SEQ.to_vec();
+    }
+}
+
+fn push_pending_slot_frame(queue: &mut VecDeque<TerminalBinaryFrame>, frame: TerminalBinaryFrame) {
+    // Coalesce consecutive Resize frames so only the latest viewport dimensions are sent
+    if matches!(frame, TerminalBinaryFrame::Resize { .. }) {
+        queue.retain(|existing| !matches!(existing, TerminalBinaryFrame::Resize { .. }));
+    }
+    while queue.len() >= MAX_PENDING_SLOT_FRAMES {
+        queue.pop_front();
+    }
+    queue.push_back(frame);
+}
+
+/// Dedicated low-latency binary PTY byte stream receiver for a single `(host_id, terminal_id)`.
+pub struct TerminalBinaryReceiver {
+    subscription_id: String,
+    queue: Arc<TerminalBinaryQueue>,
+}
+
+impl TerminalBinaryReceiver {
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+
+    /// Non-blocking drain of currently buffered raw bytes.
+    pub fn try_recv(&self) -> Option<Vec<u8>> {
+        self.queue.take_pending()
+    }
+
+    /// Await the next raw PTY byte chunk. Returns `None` once unsubscribed or terminal is closed.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let notified = self.queue.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Ok(mut guard) = self.queue.state.lock() {
+                if let Some(bytes) = TerminalBinaryQueue::drain_locked(&mut guard) {
+                    return Some(bytes);
+                }
+                if guard.closed {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+
+            notified.await;
+        }
+    }
+}
+
+impl Drop for TerminalBinaryReceiver {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientProjectView {
     pub project_id: String,
@@ -912,7 +1145,13 @@ struct HostMemoryState {
     active_terminal_id: Option<String>,
     active_terminal_slot: u8,
     slot_terminal_ids: HashMap<u8, String>,
+    slot_attach_dispatched_gen: HashMap<u8, u64>,
+    slot_confirmed_gen: HashMap<u8, u64>,
+    pending_slot_frames: HashMap<u8, VecDeque<TerminalBinaryFrame>>,
+    silent_attach_req_ids: HashSet<Uuid>,
     terminal_emulators: HashMap<u8, TerminalGridEmulator>,
+    terminal_raw_history: HashMap<String, Vec<u8>>,
+    pending_slot_raw_history: HashMap<u8, Vec<u8>>,
     git_statuses: HashMap<String, GitStatusSnapshot>,
     git_diffs: HashMap<String, String>,
     last_git_diff_staged: HashMap<String, bool>,
@@ -1059,7 +1298,13 @@ impl HostMemoryState {
             active_terminal_id: None,
             active_terminal_slot: 1,
             slot_terminal_ids: HashMap::new(),
+            slot_attach_dispatched_gen: HashMap::new(),
+            slot_confirmed_gen: HashMap::new(),
+            pending_slot_frames: HashMap::new(),
+            silent_attach_req_ids: HashSet::new(),
             terminal_emulators,
+            terminal_raw_history: HashMap::new(),
+            pending_slot_raw_history: HashMap::new(),
             git_statuses: HashMap::new(),
             git_diffs: HashMap::new(),
             last_git_diff_staged: HashMap::new(),
@@ -1361,6 +1606,8 @@ pub struct OrbitAppCore {
     thread_prefs: Arc<RwLock<HashMap<(String, String), ClientThreadPref>>>,
     pin_order_seq: Arc<AtomicU64>,
     subscribers: Arc<Mutex<Vec<Arc<dyn CoreEventSubscriber>>>>,
+    terminal_binary_subscribers: Arc<Mutex<Vec<TerminalBinarySubscriberEntry>>>,
+    terminal_binary_sub_seq: Arc<AtomicU64>,
     revision: Arc<AtomicU64>,
     cloud_sync_client: Arc<RwLock<GitHubCloudClient>>,
     cloud_sync_in_flight: Arc<AtomicBool>,
@@ -1541,6 +1788,8 @@ impl OrbitAppCore {
             thread_prefs: Arc::new(RwLock::new(initial_prefs)),
             pin_order_seq: Arc::new(AtomicU64::new(max_pin_order.saturating_add(1))),
             subscribers: Arc::new(Mutex::new(Vec::new())),
+            terminal_binary_subscribers: Arc::new(Mutex::new(Vec::new())),
+            terminal_binary_sub_seq: Arc::new(AtomicU64::new(1)),
             revision: Arc::new(AtomicU64::new(1)),
             cloud_sync_client: Arc::new(RwLock::new(GitHubCloudClient::new())),
             cloud_sync_in_flight: Arc::new(AtomicBool::new(false)),
@@ -3856,6 +4105,9 @@ impl OrbitAppCore {
             h.last_error = None;
             h.session = None;
             h.caught_up_agents.clear();
+            h.slot_attach_dispatched_gen.clear();
+            h.slot_confirmed_gen.clear();
+            h.silent_attach_req_ids.clear();
             if h.pending_outbox.is_empty() {
                 h.agent_req_by_req_id.clear();
             }
@@ -3868,7 +4120,13 @@ impl OrbitAppCore {
             Ok(handle) => {
                 let mut rx = handle.subscribe();
                 let welcome_host = handle.welcome_host.clone();
-                let (queued_outbox, resub_timelines, resub_provider_subagents, conn_gen) = {
+                let (
+                    queued_outbox,
+                    resub_timelines,
+                    resub_provider_subagents,
+                    resub_terminals,
+                    conn_gen,
+                ) = {
                     let Ok(mut guard) = self.hosts.write() else {
                         return;
                     };
@@ -3886,6 +4144,9 @@ impl OrbitAppCore {
                     let conn_gen = h.session_gen;
                     h.session = Some(handle.clone());
                     h.caught_up_agents.clear();
+                    h.slot_attach_dispatched_gen.clear();
+                    h.slot_confirmed_gen.clear();
+                    h.silent_attach_req_ids.clear();
 
                     let outbox = std::mem::take(&mut h.pending_outbox);
                     let resubs: Vec<(String, u64)> = h
@@ -3898,7 +4159,9 @@ impl OrbitAppCore {
                         })
                         .collect();
                     let resub_subagents = collect_provider_subagent_resubscriptions(h);
-                    (outbox, resubs, resub_subagents, conn_gen)
+                    let resub_terms =
+                        self.collect_reconnect_terminal_attaches(host_id, h, conn_gen, &outbox);
+                    (outbox, resubs, resub_subagents, resub_terms, conn_gen)
                 };
                 if let Some(host_info) = welcome_host {
                     self.handle_inbound_wire(host_id, WireMessage::Welcome { host: host_info });
@@ -4088,6 +4351,16 @@ impl OrbitAppCore {
                         .await;
                 }
 
+                for (request_id, slot, terminal_id) in resub_terminals {
+                    let _ = handle
+                        .send_wire(WireMessage::AttachTerminal {
+                            request_id,
+                            terminal_id,
+                            slot,
+                        })
+                        .await;
+                }
+
                 // Flush any prompts / agent launches queued while reconnecting!
                 for queued_msg in queued_outbox {
                     let _ = handle.send_wire(queued_msg).await;
@@ -4232,6 +4505,10 @@ impl OrbitAppCore {
             h.via_ssh_tunnel = false;
             h.session = None;
             h.caught_up_agents.clear();
+            h.slot_attach_dispatched_gen.clear();
+            h.slot_confirmed_gen.clear();
+            h.pending_slot_frames.clear();
+            h.silent_attach_req_ids.clear();
             if h.pending_outbox.is_empty() {
                 h.agent_req_by_req_id.clear();
                 h.pending_queue_adds.clear();
@@ -4312,6 +4589,8 @@ impl OrbitAppCore {
         type ServerPrefSync = (String, u64, Option<(bool, i64)>);
         let mut server_pref_syncs: Vec<ServerPrefSync> = Vec::new();
         let mut host_sync_to_apply: Option<(HostSyncState, bool)> = None;
+        let mut flush_terminal_frames: Option<(HostSessionHandle, VecDeque<TerminalBinaryFrame>)> =
+            None;
         let mut migrated_opt_pref: Option<(String, String)> = None;
         let mut rewound_seen_reset: Option<(String, u64)> = None;
 
@@ -5849,12 +6128,45 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(terminal.terminal_id));
                     } else {
                         let slot = slot.max(1);
+                        let tid = terminal.terminal_id.clone();
+                        let was_silent = state.silent_attach_req_ids.remove(&request_id);
+                        state.slot_terminal_ids.insert(slot, tid.clone());
                         state
-                            .slot_terminal_ids
-                            .insert(slot, terminal.terminal_id.clone());
+                            .slot_attach_dispatched_gen
+                            .insert(slot, state.session_gen);
+                        state.slot_confirmed_gen.insert(slot, state.session_gen);
                         let _ = state.emulator_slot_mut(slot);
-                        state.active_terminal_id = Some(terminal.terminal_id.clone());
-                        state.active_terminal_slot = slot;
+                        if let Some(pending_raw) = state.pending_slot_raw_history.remove(&slot) {
+                            let resync_bytes = state
+                                .terminal_emulators
+                                .get(&slot)
+                                .map(TerminalGridEmulator::render_resync_bytes)
+                                .unwrap_or_else(|| TERMINAL_RESYNC_RESET_SEQ.to_vec());
+                            let hist = state.terminal_raw_history.entry(tid.clone()).or_default();
+                            append_terminal_history_or_resync(
+                                hist,
+                                &pending_raw,
+                                MAX_TERMINAL_RAW_HISTORY_BYTES,
+                                || resync_bytes.clone(),
+                            );
+                            self.dispatch_terminal_binary_bytes(
+                                host_id,
+                                slot,
+                                Some(tid.as_str()),
+                                &pending_raw,
+                                || resync_bytes.clone(),
+                            );
+                        }
+                        if let Some(pending_frames) = state.pending_slot_frames.remove(&slot)
+                            && !pending_frames.is_empty()
+                            && let Some(handle) = state.session.clone()
+                        {
+                            flush_terminal_frames = Some((handle, pending_frames));
+                        }
+                        if !was_silent || state.active_terminal_id.is_none() {
+                            state.active_terminal_id = Some(tid);
+                            state.active_terminal_slot = slot;
+                        }
                         state
                             .terminals
                             .retain(|t| t.terminal_id != terminal.terminal_id);
@@ -6388,6 +6700,13 @@ impl OrbitAppCore {
             );
         }
 
+        if let Some((handle, pending_frames)) = flush_terminal_frames {
+            self.runtime.spawn(async move {
+                for frame in pending_frames {
+                    let _ = handle.send_terminal(frame).await;
+                }
+            });
+        }
         if notify_fleet {
             self.emit(|revision| CoreNotification::FleetChanged { revision });
         }
@@ -6413,6 +6732,31 @@ impl OrbitAppCore {
         }
     }
 
+    fn dispatch_terminal_binary_bytes(
+        &self,
+        host_id: &str,
+        slot: u8,
+        resolved_terminal_id: Option<&str>,
+        data: &[u8],
+        make_resync: impl Fn() -> Vec<u8>,
+    ) {
+        if data.is_empty() {
+            return;
+        }
+        if let Ok(mut subs) = self.terminal_binary_subscribers.lock() {
+            subs.retain(|sub| {
+                if sub.queue.is_closed() {
+                    return false;
+                }
+                if matches_terminal_binary_subscriber(sub, host_id, slot, resolved_terminal_id) {
+                    sub.queue.push_with_resync(data, &make_resync)
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
     fn handle_inbound_terminal(&self, host_id: &str, frame: TerminalBinaryFrame) {
         let mut raw_out: Option<(u8, Vec<u8>)> = None;
         if let Ok(mut guard) = self.hosts.write()
@@ -6422,6 +6766,38 @@ impl OrbitAppCore {
                 TerminalBinaryFrame::Output { slot, data } => {
                     let slot = slot.max(1);
                     state.emulator_slot_mut(slot).process(&data);
+                    let resync_fn = || {
+                        state
+                            .terminal_emulators
+                            .get(&slot)
+                            .map(TerminalGridEmulator::render_resync_bytes)
+                            .unwrap_or_else(|| TERMINAL_RESYNC_RESET_SEQ.to_vec())
+                    };
+                    let resolved_tid = state.slot_terminal_ids.get(&slot).cloned();
+                    if let Some(ref tid) = resolved_tid {
+                        let hist = state.terminal_raw_history.entry(tid.clone()).or_default();
+                        append_terminal_history_or_resync(
+                            hist,
+                            &data,
+                            MAX_TERMINAL_RAW_HISTORY_BYTES,
+                            resync_fn,
+                        );
+                    } else {
+                        let hist = state.pending_slot_raw_history.entry(slot).or_default();
+                        append_terminal_history_or_resync(
+                            hist,
+                            &data,
+                            MAX_TERMINAL_RAW_HISTORY_BYTES,
+                            resync_fn,
+                        );
+                    }
+                    self.dispatch_terminal_binary_bytes(
+                        host_id,
+                        slot,
+                        resolved_tid.as_deref(),
+                        &data,
+                        resync_fn,
+                    );
                     raw_out = Some((slot, data));
                 }
                 TerminalBinaryFrame::Snapshot { slot, data } => {
@@ -6429,6 +6805,40 @@ impl OrbitAppCore {
                     let emu = state.emulator_slot_mut(slot);
                     emu.clear();
                     emu.process(&data);
+                    let resync_fn = || {
+                        state
+                            .terminal_emulators
+                            .get(&slot)
+                            .map(TerminalGridEmulator::render_resync_bytes)
+                            .unwrap_or_else(|| TERMINAL_RESYNC_RESET_SEQ.to_vec())
+                    };
+                    let resolved_tid = state.slot_terminal_ids.get(&slot).cloned();
+                    if let Some(ref tid) = resolved_tid {
+                        let hist = state.terminal_raw_history.entry(tid.clone()).or_default();
+                        hist.clear();
+                        append_terminal_history_or_resync(
+                            hist,
+                            &data,
+                            MAX_TERMINAL_RAW_HISTORY_BYTES,
+                            resync_fn,
+                        );
+                    } else {
+                        let hist = state.pending_slot_raw_history.entry(slot).or_default();
+                        hist.clear();
+                        append_terminal_history_or_resync(
+                            hist,
+                            &data,
+                            MAX_TERMINAL_RAW_HISTORY_BYTES,
+                            resync_fn,
+                        );
+                    }
+                    self.dispatch_terminal_binary_bytes(
+                        host_id,
+                        slot,
+                        resolved_tid.as_deref(),
+                        &data,
+                        resync_fn,
+                    );
                     raw_out = Some((slot, data));
                 }
                 TerminalBinaryFrame::Resize { slot, cols, rows } => {
@@ -10482,8 +10892,13 @@ impl OrbitAppCore {
             let prev_id = h.slot_terminal_ids.get(&slot).map(String::as_str);
             if prev_id != Some(terminal_id) {
                 h.emulator_slot_mut(slot).clear();
+                h.pending_slot_frames.remove(&slot);
             }
             h.slot_terminal_ids.insert(slot, terminal_id.to_string());
+            h.slot_confirmed_gen.remove(&slot);
+            if h.session.is_some() {
+                h.slot_attach_dispatched_gen.insert(slot, h.session_gen);
+            }
             h.active_terminal_id = Some(terminal_id.to_string());
             h.active_terminal_slot = slot;
         }
@@ -10497,14 +10912,259 @@ impl OrbitAppCore {
         );
     }
 
+    /// Subscribe to a dedicated low-latency binary PTY byte stream for `(host_id, terminal_id)`.
+    pub fn subscribe_terminal_binary(
+        &self,
+        host_id: &str,
+        terminal_id: &str,
+    ) -> TerminalBinaryReceiver {
+        self.subscribe_terminal_binary_with_slot(host_id, terminal_id, None)
+    }
+
+    /// Subscribe to a dedicated binary PTY stream with an optional fallback wire slot when
+    /// `terminal_id` is empty. Atomically seeds any buffered raw scrollback history before live
+    /// bytes so late mounts and detached windows never miss output or observe duplicates.
+    pub fn subscribe_terminal_binary_with_slot(
+        &self,
+        host_id: &str,
+        terminal_id: &str,
+        slot_fallback: Option<u8>,
+    ) -> TerminalBinaryReceiver {
+        let seq = self.terminal_binary_sub_seq.fetch_add(1, Ordering::Relaxed);
+        let subscription_id = format!("term-bin-{seq}");
+        let trimmed_tid = terminal_id.trim().to_string();
+        let norm_slot = slot_fallback.map(|s| s.max(1));
+
+        // Strict lock order: `hosts` -> `terminal_binary_subscribers` to prevent gaps or races
+        // between history replay and incoming live PTY frames.
+        let hosts_guard = self.hosts.read().ok();
+        let replay = hosts_guard
+            .as_ref()
+            .and_then(|g| g.get(host_id))
+            .and_then(|h| {
+                if !trimmed_tid.is_empty() {
+                    h.terminal_raw_history.get(&trimmed_tid).cloned()
+                } else if let Some(slot) = norm_slot {
+                    h.slot_terminal_ids
+                        .get(&slot)
+                        .and_then(|tid| h.terminal_raw_history.get(tid))
+                        .or_else(|| h.pending_slot_raw_history.get(&slot))
+                        .cloned()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let queue = Arc::new(TerminalBinaryQueue::new(replay));
+        if let Ok(mut subs) = self.terminal_binary_subscribers.lock() {
+            subs.retain(|s| !s.queue.is_closed());
+            subs.push(TerminalBinarySubscriberEntry {
+                subscription_id: subscription_id.clone(),
+                host_id: host_id.to_string(),
+                terminal_id: trimmed_tid,
+                slot_fallback: norm_slot,
+                queue: Arc::clone(&queue),
+            });
+        }
+        drop(hosts_guard);
+
+        TerminalBinaryReceiver {
+            subscription_id,
+            queue,
+        }
+    }
+
+    /// Unsubscribe and immediately close a binary PTY stream by `subscription_id`.
+    pub fn unsubscribe_terminal_binary(&self, subscription_id: &str) -> bool {
+        let mut removed = false;
+        if let Ok(mut subs) = self.terminal_binary_subscribers.lock() {
+            subs.retain(|sub| {
+                if sub.subscription_id == subscription_id {
+                    sub.queue.close();
+                    removed = true;
+                    false
+                } else {
+                    !sub.queue.is_closed()
+                }
+            });
+        }
+        removed
+    }
+
+    /// Count active (non-closed) binary PTY subscribers.
+    pub fn active_terminal_binary_subscriber_count(&self) -> usize {
+        self.terminal_binary_subscribers
+            .lock()
+            .map(|mut subs| {
+                subs.retain(|s| !s.queue.is_closed());
+                subs.len()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Collect all live terminal bindings (existing slots + active binary PTY subscribers) that
+    /// must be reattached after a host reconnects on a fresh `conn_gen`.
+    /// Must be invoked while `self.hosts` write lock is held (maintains `hosts -> subscribers` order).
+    fn collect_reconnect_terminal_attaches(
+        &self,
+        host_id: &str,
+        h: &mut HostMemoryState,
+        conn_gen: u64,
+        outbox: &[WireMessage],
+    ) -> Vec<(Uuid, u8, String)> {
+        let mut already_queued: HashSet<(u8, String)> = HashSet::new();
+        for msg in outbox {
+            if let WireMessage::AttachTerminal {
+                terminal_id, slot, ..
+            } = msg
+            {
+                let norm_slot = (*slot).max(1);
+                already_queued.insert((norm_slot, terminal_id.clone()));
+                h.slot_attach_dispatched_gen.insert(norm_slot, conn_gen);
+            }
+        }
+
+        // Gather active binary subscriber terminal IDs for this host
+        let active_sub_tids: Vec<String> = self
+            .terminal_binary_subscribers
+            .lock()
+            .map(|mut subs| {
+                subs.retain(|s| !s.queue.is_closed());
+                subs.iter()
+                    .filter(|s| s.host_id == host_id && !s.terminal_id.is_empty())
+                    .map(|s| s.terminal_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Ensure every active binary subscriber has a bound slot
+        for tid in active_sub_tids {
+            let already_mapped = h
+                .slot_terminal_ids
+                .values()
+                .any(|mapped| mapped.as_str() == tid.as_str());
+            if !already_mapped {
+                let slot = (1u8..=250u8)
+                    .find(|s| !h.slot_terminal_ids.contains_key(s))
+                    .unwrap_or(1u8);
+                h.slot_terminal_ids.insert(slot, tid);
+            }
+        }
+
+        let mut attaches: Vec<(Uuid, u8, String)> = Vec::new();
+        let bound: Vec<(u8, String)> = h
+            .slot_terminal_ids
+            .iter()
+            .map(|(&slot, tid)| (slot.max(1), tid.clone()))
+            .collect();
+        for (slot, tid) in bound {
+            if already_queued.contains(&(slot, tid.clone())) {
+                continue;
+            }
+            let req_id = Uuid::new_v4();
+            h.slot_attach_dispatched_gen.insert(slot, conn_gen);
+            h.silent_attach_req_ids.insert(req_id);
+            attaches.push((req_id, slot, tid));
+        }
+        attaches
+    }
+
+    /// Ensure `terminal_id` is bound to a wire slot on `host_id` for the current `session_gen`
+    /// without disturbing the main window's active terminal slot if already mapped.
+    pub fn ensure_terminal_attached(
+        self: &Arc<Self>,
+        host_id: &str,
+        terminal_id: &str,
+    ) -> Option<u8> {
+        let tid = terminal_id.trim();
+        if tid.is_empty() {
+            return None;
+        }
+        let mut attach_req: Option<(Uuid, u8)> = None;
+        let resolved_slot = {
+            let Ok(mut guard) = self.hosts.write() else {
+                return None;
+            };
+            let h = guard.get_mut(host_id)?;
+            if let Some((&existing_slot, _)) = h
+                .slot_terminal_ids
+                .iter()
+                .find(|(_, mapped_tid)| mapped_tid.as_str() == tid)
+            {
+                let attached_for_live_gen = h.session.is_some()
+                    && h.slot_attach_dispatched_gen.get(&existing_slot) == Some(&h.session_gen);
+                if !attached_for_live_gen {
+                    let req_id = Uuid::new_v4();
+                    h.slot_confirmed_gen.remove(&existing_slot);
+                    if h.session.is_some() {
+                        h.slot_attach_dispatched_gen
+                            .insert(existing_slot, h.session_gen);
+                    }
+                    h.silent_attach_req_ids.insert(req_id);
+                    attach_req = Some((req_id, existing_slot));
+                }
+                existing_slot
+            } else {
+                let slot = (1u8..=250u8)
+                    .find(|s| !h.slot_terminal_ids.contains_key(s))
+                    .unwrap_or(1u8);
+                let req_id = Uuid::new_v4();
+                h.emulator_slot_mut(slot).clear();
+                h.pending_slot_frames.remove(&slot);
+                h.slot_confirmed_gen.remove(&slot);
+                h.slot_terminal_ids.insert(slot, tid.to_string());
+                if h.session.is_some() {
+                    h.slot_attach_dispatched_gen.insert(slot, h.session_gen);
+                }
+                h.silent_attach_req_ids.insert(req_id);
+                attach_req = Some((req_id, slot));
+                slot
+            }
+        };
+        if let Some((request_id, slot)) = attach_req {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::AttachTerminal {
+                    request_id,
+                    terminal_id: tid.to_string(),
+                    slot,
+                },
+            );
+        }
+        Some(resolved_slot)
+    }
+
     pub fn kill_terminal(&self, host_id: &str, terminal_id: &str) {
         let _ = self.store.delete_terminal(terminal_id);
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
             h.terminals.retain(|t| t.terminal_id != terminal_id);
+            h.terminal_raw_history.remove(terminal_id);
+            let removed_slots: Vec<u8> = h
+                .slot_terminal_ids
+                .iter()
+                .filter_map(|(&slot, mapped_tid)| (mapped_tid == terminal_id).then_some(slot))
+                .collect();
+            for slot in removed_slots {
+                h.slot_terminal_ids.remove(&slot);
+                h.slot_attach_dispatched_gen.remove(&slot);
+                h.slot_confirmed_gen.remove(&slot);
+                h.pending_slot_frames.remove(&slot);
+            }
             if h.active_terminal_id.as_deref() == Some(terminal_id) {
                 h.active_terminal_id = h.terminals.first().map(|t| t.terminal_id.clone());
+            }
+            if let Ok(mut subs) = self.terminal_binary_subscribers.lock() {
+                subs.retain(|sub| {
+                    if sub.host_id == host_id && sub.terminal_id == terminal_id {
+                        sub.queue.close();
+                        false
+                    } else {
+                        !sub.queue.is_closed()
+                    }
+                });
             }
         }
         self.dispatch_wire(
@@ -10520,6 +11180,36 @@ impl OrbitAppCore {
         });
     }
 
+    /// Sends a terminal binary frame immediately when `slot` is confirmed attached on the active
+    /// `session_gen`, or queues it in strict FIFO order on `pending_slot_frames[slot]` until
+    /// `WireMessage::TerminalAttached` confirms the daemon has bound the slot.
+    fn enqueue_or_send_terminal_frame(&self, host_id: &str, slot: u8, frame: TerminalBinaryFrame) {
+        let slot = slot.max(1);
+        let mut send_now: Option<(HostSessionHandle, TerminalBinaryFrame)> = None;
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if let TerminalBinaryFrame::Resize { cols, rows, .. } = frame {
+                h.emulator_slot_mut(slot).resize(cols, rows);
+            }
+            let slot_confirmed = h.slot_confirmed_gen.get(&slot) == Some(&h.session_gen);
+            if slot_confirmed && let Some(handle) = h.session.clone() {
+                send_now = Some((handle, frame));
+            } else if h.slot_terminal_ids.contains_key(&slot) {
+                let q = h.pending_slot_frames.entry(slot).or_default();
+                push_pending_slot_frame(q, frame);
+            } else if let Some(handle) = h.session.clone() {
+                // Legacy slot-only call with no tracked terminal_id binding
+                send_now = Some((handle, frame));
+            }
+        }
+        if let Some((handle, frame)) = send_now {
+            self.runtime.spawn(async move {
+                let _ = handle.send_terminal(frame).await;
+            });
+        }
+    }
+
     pub fn send_terminal_input(&self, host_id: &str, input_bytes: Vec<u8>) {
         let slot = self
             .hosts
@@ -10531,22 +11221,27 @@ impl OrbitAppCore {
         }
     }
 
-    pub fn send_terminal_input_slot(&self, host_id: &str, slot: u8, input_bytes: Vec<u8>) {
-        let handle_opt = self
-            .hosts
-            .read()
-            .ok()
-            .and_then(|g| g.get(host_id).and_then(|h| h.session.clone()));
-        if let Some(handle) = handle_opt {
-            self.runtime.spawn(async move {
-                let _ = handle
-                    .send_terminal(TerminalBinaryFrame::Input {
-                        slot,
-                        data: input_bytes,
-                    })
-                    .await;
-            });
+    pub fn send_terminal_input_by_id(
+        self: &Arc<Self>,
+        host_id: &str,
+        terminal_id: &str,
+        input_bytes: Vec<u8>,
+    ) {
+        if let Some(slot) = self.ensure_terminal_attached(host_id, terminal_id) {
+            self.send_terminal_input_slot(host_id, slot, input_bytes);
         }
+    }
+
+    pub fn send_terminal_input_slot(&self, host_id: &str, slot: u8, input_bytes: Vec<u8>) {
+        let slot = slot.max(1);
+        self.enqueue_or_send_terminal_frame(
+            host_id,
+            slot,
+            TerminalBinaryFrame::Input {
+                slot,
+                data: input_bytes,
+            },
+        );
     }
 
     pub fn resize_terminal(&self, host_id: &str, cols: u16, rows: u16) {
@@ -10560,22 +11255,25 @@ impl OrbitAppCore {
         }
     }
 
+    pub fn resize_terminal_by_id(
+        self: &Arc<Self>,
+        host_id: &str,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) {
+        if let Some(slot) = self.ensure_terminal_attached(host_id, terminal_id) {
+            self.resize_terminal_slot(host_id, slot, cols, rows);
+        }
+    }
+
     pub fn resize_terminal_slot(&self, host_id: &str, slot: u8, cols: u16, rows: u16) {
         let slot = slot.max(1);
-        let mut handle_opt = None;
-        if let Ok(mut guard) = self.hosts.write()
-            && let Some(h) = guard.get_mut(host_id)
-        {
-            h.emulator_slot_mut(slot).resize(cols, rows);
-            handle_opt = h.session.clone();
-        }
-        if let Some(handle) = handle_opt {
-            self.runtime.spawn(async move {
-                let _ = handle
-                    .send_terminal(TerminalBinaryFrame::Resize { slot, cols, rows })
-                    .await;
-            });
-        }
+        self.enqueue_or_send_terminal_frame(
+            host_id,
+            slot,
+            TerminalBinaryFrame::Resize { slot, cols, rows },
+        );
     }
 
     // --- Mobile App & Network Lifecycle Hooks (iOS / Android / HarmonyOS) ---
@@ -19513,6 +20211,386 @@ mod tests {
             n,
             CoreNotification::TerminalChanged { slot: 2, raw_bytes, .. } if raw_bytes.is_empty()
         )));
+    }
+
+    #[test]
+    fn terminal_binary_subscriber_delivers_exact_raw_bytes_filters_and_cleans_up() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let make_host = |id: &str| {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: id.into(),
+                hostname: format!("{id}-host"),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.slot_terminal_ids.insert(1, "term-a".into());
+            mem.slot_terminal_ids.insert(2, "term-b".into());
+            mem
+        };
+
+        {
+            let mut hosts = core.hosts.write().expect("hosts write");
+            hosts.insert("h1".into(), make_host("h1"));
+            hosts.insert("h2".into(), make_host("h2"));
+        }
+
+        // Seed history before subscribing so replay ordering is also verified
+        let snapshot_bytes = b"\x1b[32mprompt$\x1b[0m ".to_vec();
+        core.handle_inbound_terminal(
+            "h1",
+            TerminalBinaryFrame::Snapshot {
+                slot: 1,
+                data: snapshot_bytes.clone(),
+            },
+        );
+
+        let rx_h1_a = core.subscribe_terminal_binary("h1", "term-a");
+        let rx_h1_b = core.subscribe_terminal_binary("h1", "term-b");
+        let rx_h2_a = core.subscribe_terminal_binary("h2", "term-a");
+        assert_eq!(core.active_terminal_binary_subscriber_count(), 3);
+
+        // Late subscriber for h1/term-a receives exact replay bytes first
+        assert_eq!(rx_h1_a.try_recv(), Some(snapshot_bytes));
+        assert_eq!(rx_h1_b.try_recv(), None);
+        assert_eq!(rx_h2_a.try_recv(), None);
+
+        // Non-UTF-8 + ANSI raw binary chunks must pass through byte-for-byte untouched
+        let raw_chunk_a = vec![0x1b, b'[', b'1', b'm', 0x00, 0xff, 0xfe, b'A', b'\r', b'\n'];
+        let raw_chunk_b = b"terminal-b-only".to_vec();
+        let raw_chunk_h2 = b"host-two-only".to_vec();
+
+        core.handle_inbound_terminal(
+            "h1",
+            TerminalBinaryFrame::Output {
+                slot: 1,
+                data: raw_chunk_a.clone(),
+            },
+        );
+        core.handle_inbound_terminal(
+            "h1",
+            TerminalBinaryFrame::Output {
+                slot: 2,
+                data: raw_chunk_b.clone(),
+            },
+        );
+        core.handle_inbound_terminal(
+            "h2",
+            TerminalBinaryFrame::Output {
+                slot: 1,
+                data: raw_chunk_h2.clone(),
+            },
+        );
+
+        assert_eq!(rx_h1_a.try_recv(), Some(raw_chunk_a));
+        assert_eq!(rx_h1_b.try_recv(), Some(raw_chunk_b));
+        assert_eq!(rx_h2_a.try_recv(), Some(raw_chunk_h2));
+
+        // Explicit unsubscribe immediately cleans up and stops delivery
+        let sub_id_a = rx_h1_a.subscription_id().to_string();
+        assert!(core.unsubscribe_terminal_binary(&sub_id_a));
+        assert!(!core.unsubscribe_terminal_binary(&sub_id_a));
+        assert_eq!(core.active_terminal_binary_subscriber_count(), 2);
+
+        core.handle_inbound_terminal(
+            "h1",
+            TerminalBinaryFrame::Output {
+                slot: 1,
+                data: b"after-unsub".to_vec(),
+            },
+        );
+        assert_eq!(rx_h1_a.try_recv(), None);
+
+        // kill_terminal cleans up matching subscribers while preserving other hosts/terminals
+        core.kill_terminal("h1", "term-b");
+        assert_eq!(core.active_terminal_binary_subscriber_count(), 1);
+        core.handle_inbound_terminal(
+            "h1",
+            TerminalBinaryFrame::Output {
+                slot: 2,
+                data: b"after-kill".to_vec(),
+            },
+        );
+        assert_eq!(rx_h1_b.try_recv(), None);
+
+        // Dropping receiver marks closed and cleans up automatically
+        drop(rx_h2_a);
+        assert_eq!(core.active_terminal_binary_subscriber_count(), 0);
+    }
+
+    #[test]
+    fn terminal_binary_receiver_async_recv_wakes_and_exits_on_unsubscribe() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_async".into(),
+                hostname: "async-host".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.slot_terminal_ids.insert(1, "term-async".into());
+            core.hosts
+                .write()
+                .expect("hosts write")
+                .insert("h_async".into(), mem);
+        }
+
+        let mut rx = core.subscribe_terminal_binary("h_async", "term-async");
+        let sub_id = rx.subscription_id().to_string();
+        let core_clone = Arc::clone(&core);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+
+        rt.block_on(async move {
+            let producer = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                core_clone.handle_inbound_terminal(
+                    "h_async",
+                    TerminalBinaryFrame::Output {
+                        slot: 1,
+                        data: b"hello-binary".to_vec(),
+                    },
+                );
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                core_clone.unsubscribe_terminal_binary(&sub_id);
+            });
+
+            let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("first chunk timeout");
+            assert_eq!(first, Some(b"hello-binary".to_vec()));
+
+            let closed = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("close wakeup timeout");
+            assert_eq!(closed, None);
+
+            producer.await.expect("producer join");
+        });
+
+        assert_eq!(core.active_terminal_binary_subscriber_count(), 0);
+    }
+
+    #[test]
+    fn terminal_reconnect_reattaches_active_slots_and_invalidates_stale_session_gen() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_reconn".into(),
+                hostname: "reconn-host".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.session_gen = 1;
+            mem.connecting_in_flight = true;
+            mem.slot_terminal_ids.insert(1, "term-detached-a".into());
+            mem.slot_attach_dispatched_gen.insert(1, 1);
+            mem.slot_confirmed_gen.insert(1, 1);
+            core.hosts
+                .write()
+                .expect("hosts write")
+                .insert("h_reconn".into(), mem);
+        }
+
+        // Subscribe to both an already-slotted detached terminal AND an unslotted active terminal
+        let _rx_a = core.subscribe_terminal_binary("h_reconn", "term-detached-a");
+        let _rx_b = core.subscribe_terminal_binary("h_reconn", "term-detached-b");
+
+        // Simulate disconnect & reconnect advancing session_gen from 1 -> 2
+        let attaches = {
+            let mut hosts = core.hosts.write().expect("hosts write");
+            let h = hosts.get_mut("h_reconn").expect("host");
+            h.session_gen = 2;
+            h.slot_attach_dispatched_gen.clear();
+            h.slot_confirmed_gen.clear();
+            core.collect_reconnect_terminal_attaches("h_reconn", h, 2, &[])
+        };
+
+        assert_eq!(attaches.len(), 2);
+        assert!(
+            attaches
+                .iter()
+                .any(|(_, slot, tid)| *slot == 1 && tid == "term-detached-a"),
+            "existing slot 1 must be preserved and reattached on reconnect"
+        );
+        assert!(
+            attaches
+                .iter()
+                .any(|(_, slot, tid)| *slot == 2 && tid == "term-detached-b"),
+            "active binary subscriber without a slot must receive slot 2 without colliding with slot 1"
+        );
+
+        // Now verify ensure_terminal_attached re-dispatches when binding is from stale session_gen
+        {
+            let mut hosts = core.hosts.write().expect("hosts write");
+            let h = hosts.get_mut("h_reconn").expect("host");
+            h.session_gen = 3;
+            h.pending_outbox.clear();
+        }
+        let reused_slot = core
+            .ensure_terminal_attached("h_reconn", "term-detached-a")
+            .expect("slot");
+        assert_eq!(reused_slot, 1);
+        let hosts = core.hosts.read().expect("hosts read");
+        let h = hosts.get("h_reconn").expect("host");
+        assert!(
+            h.pending_outbox.iter().any(|m| matches!(
+                m,
+                WireMessage::AttachTerminal { terminal_id, slot: 1, .. } if terminal_id == "term-detached-a"
+            )),
+            "stale pre-reconnect binding must queue fresh AttachTerminal for new session_gen"
+        );
+    }
+
+    #[test]
+    fn terminal_input_and_resize_queue_until_attach_confirmed_and_preserve_other_slots() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_order".into(),
+                hostname: "order-host".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.session_gen = 4;
+            mem.connecting_in_flight = true;
+            // Detached floating terminal A already owns slot 1
+            mem.slot_terminal_ids.insert(1, "term-a".into());
+            mem.slot_attach_dispatched_gen.insert(1, 4);
+            mem.slot_confirmed_gen.insert(1, 4);
+            core.hosts
+                .write()
+                .expect("hosts write")
+                .insert("h_order".into(), mem);
+        }
+
+        // Newly attaching terminal B allocates slot 2 (never colliding with floating slot 1)
+        let slot_b = core
+            .ensure_terminal_attached("h_order", "term-b")
+            .expect("slot b");
+        assert_eq!(slot_b, 2);
+
+        // Input and multiple resizes before TerminalAttached confirmation must queue on slot 2
+        core.resize_terminal_by_id("h_order", "term-b", 80, 24);
+        core.send_terminal_input_by_id("h_order", "term-b", b"ls\n".to_vec());
+        core.resize_terminal_by_id("h_order", "term-b", 120, 40);
+
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_order").expect("host");
+            let q = h
+                .pending_slot_frames
+                .get(&2)
+                .expect("pending slot 2 frames");
+            // Two resizes coalesce into latest (120x40), keeping input ordered cleanly
+            assert_eq!(q.len(), 2);
+            assert!(matches!(
+                q.front(),
+                Some(TerminalBinaryFrame::Input { slot: 2, data }) if data == b"ls\n"
+            ));
+            assert!(matches!(
+                q.back(),
+                Some(TerminalBinaryFrame::Resize {
+                    slot: 2,
+                    cols: 120,
+                    rows: 40
+                })
+            ));
+        }
+
+        // Daemon confirms TerminalAttached for slot 2 -> marks slot_confirmed_gen and drains pending frames
+        core.handle_inbound_wire(
+            "h_order",
+            WireMessage::TerminalAttached {
+                request_id: Uuid::new_v4(),
+                terminal: TerminalSummary {
+                    terminal_id: "term-b".into(),
+                    title: "shell-b".into(),
+                    cwd: "/tmp".into(),
+                    cols: 120,
+                    rows: 40,
+                    created_at: Utc::now(),
+                },
+                slot: 2,
+            },
+        );
+
+        let hosts = core.hosts.read().expect("hosts read");
+        let h = hosts.get("h_order").expect("host");
+        assert_eq!(h.slot_confirmed_gen.get(&2), Some(&4));
+        assert!(!h.pending_slot_frames.contains_key(&2));
+        // Slot 1 (floating terminal A) remained completely untouched
+        assert_eq!(
+            h.slot_terminal_ids.get(&1).map(String::as_str),
+            Some("term-a")
+        );
+    }
+
+    #[test]
+    fn terminal_binary_queue_overflow_emits_clean_ansi_resync_without_mid_utf8_splice() {
+        let mut emu = TerminalGridEmulator::new(80, 24);
+        let queue = TerminalBinaryQueue::new_with_cap(Vec::new(), 512);
+
+        // Fill queue with colored multi-byte UTF-8 lines past the 512-byte cap
+        for i in 0..25 {
+            let line = format!("\x1b[38;2;120;200;255m第{i}行 🚀 orbit-build-ok\x1b[0m\r\n");
+            emu.process(line.as_bytes());
+            assert!(queue.push_with_resync(line.as_bytes(), || emu.render_resync_bytes()));
+        }
+
+        let drained = queue.take_pending().expect("resync bytes");
+        assert!(
+            drained.starts_with(TERMINAL_RESYNC_RESET_SEQ),
+            "overflow recovery must start with clean ANSI reset + clear + home sequence"
+        );
+        let decoded = String::from_utf8(drained)
+            .expect("overflow resync payload must be 100% valid UTF-8 with zero mid-char splice");
+        assert!(
+            decoded.contains("orbit-build-ok") || decoded.len() == TERMINAL_RESYNC_RESET_SEQ.len(),
+            "overflow payload must be either full clean screen resync or pure reset"
+        );
+
+        // After draining overflow resync, normal incremental delivery resumes cleanly
+        assert!(queue.push_with_resync(b"next-chunk", || emu.render_resync_bytes()));
+        assert_eq!(queue.take_pending(), Some(b"next-chunk".to_vec()));
     }
 
     #[test]

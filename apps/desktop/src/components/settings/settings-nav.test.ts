@@ -5,6 +5,7 @@ import { ja } from "../../lib/i18n/locales/ja.ts";
 import { zhCN } from "../../lib/i18n/locales/zh-CN.ts";
 import {
   SETTINGS_CORE_SECTIONS,
+  SETTINGS_NAV_GROUPS,
   type SettingsSection,
   buildSettingsSectionForTarget,
   getVisibleSubTabsForSection,
@@ -18,17 +19,24 @@ function makeTranslator(dict: MessageDictionary): (key: MessageKey) => string {
   return (key) => dict[key];
 }
 
-describe("Settings IA Consolidation (6 Core Sections + Deep-Links + Instant Search)", () => {
-  it("consolidates all 19 settings views cleanly into exactly 6 core sections", () => {
+describe("Settings IA (3 Domain Groups · 8 Core Sections · 19 Leaf Views)", () => {
+  it("organizes all 19 settings views cleanly across APP, HOST, and WORKSPACE groups", () => {
     assert.deepEqual(
-      SETTINGS_CORE_SECTIONS.map((s) => s.id),
+      SETTINGS_NAV_GROUPS.map((g) => g.id),
+      ["app", "host", "workspace"],
+    );
+
+    assert.deepEqual(
+      SETTINGS_CORE_SECTIONS.map((s) => `${s.group}:${s.id}`),
       [
-        "general",
-        "appearance",
-        "hosts",
-        "agents",
-        "extensions",
-        "notifications_sync",
+        "app:general",
+        "app:appearance",
+        "app:notifications_sync",
+        "host:hosts",
+        "host:agents",
+        "host:usage",
+        "workspace:instructions_rules",
+        "workspace:capabilities",
       ],
     );
 
@@ -44,20 +52,25 @@ describe("Settings IA Consolidation (6 Core Sections + Deep-Links + Instant Sear
     );
     assert.deepEqual(getVisibleSubTabsForSection("appearance", true), []);
     assert.deepEqual(
+      getVisibleSubTabsForSection("notifications_sync", true).map((t) => t.id),
+      ["notifications", "cloud_sync", "archived"],
+    );
+    assert.deepEqual(
       getVisibleSubTabsForSection("hosts", true).map((t) => t.id),
       ["connection", "add_host", "im_channels"],
     );
     assert.deepEqual(
       getVisibleSubTabsForSection("agents", true).map((t) => t.id),
-      ["agents", "acp", "guardian", "usage"],
+      ["agents", "acp", "guardian"],
+    );
+    assert.deepEqual(getVisibleSubTabsForSection("usage", true), []);
+    assert.deepEqual(
+      getVisibleSubTabsForSection("instructions_rules", true).map((t) => t.id),
+      ["instructions", "rules"],
     );
     assert.deepEqual(
-      getVisibleSubTabsForSection("extensions", true).map((t) => t.id),
-      ["instructions", "rules", "skills", "mcp", "hooks", "lsp"],
-    );
-    assert.deepEqual(
-      getVisibleSubTabsForSection("notifications_sync", true).map((t) => t.id),
-      ["notifications", "cloud_sync", "archived"],
+      getVisibleSubTabsForSection("capabilities", true).map((t) => t.id),
+      ["skills", "mcp", "hooks", "lsp"],
     );
 
     // Without a host, host-only sub-tabs gracefully filter out while non-host views stay accessible
@@ -66,12 +79,13 @@ describe("Settings IA Consolidation (6 Core Sections + Deep-Links + Instant Sear
       ["add_host"],
     );
     assert.deepEqual(
-      getVisibleSubTabsForSection("extensions", false).map((t) => t.id),
+      getVisibleSubTabsForSection("instructions_rules", false).map((t) => t.id),
       ["instructions"],
     );
+    assert.deepEqual(getVisibleSubTabsForSection("capabilities", false), []);
   });
 
-  it("resolves every legacy section ID and deep-link to the exact consolidated section and sub-tab", () => {
+  it("resolves every legacy section ID and deep-link to the exact grouped section and sub-tab", () => {
     const hostId = "local-mac";
 
     const cases: Array<{
@@ -93,22 +107,25 @@ describe("Settings IA Consolidation (6 Core Sections + Deep-Links + Instant Sear
       { target: "agents", expectedSection: `host:${hostId}:agents`, expectedCore: "agents", expectedSubTab: "agents" },
       { target: "acp", expectedSection: `host:${hostId}:acp`, expectedCore: "agents", expectedSubTab: "acp" },
       { target: "guardian", expectedSection: `host:${hostId}:guardian`, expectedCore: "agents", expectedSubTab: "guardian" },
-      { target: "usage", expectedSection: `host:${hostId}:usage`, expectedCore: "agents", expectedSubTab: "usage" },
-      { target: "extensions", expectedSection: "instructions", expectedCore: "extensions", expectedSubTab: "instructions" },
-      { target: "context", expectedSection: "instructions", expectedCore: "extensions", expectedSubTab: "instructions" },
-      { target: "instructions", expectedSection: "instructions", expectedCore: "extensions", expectedSubTab: "instructions" },
-      { target: "rules", expectedSection: `host:${hostId}:rules`, expectedCore: "extensions", expectedSubTab: "rules" },
-      { target: "skills", expectedSection: `host:${hostId}:skills`, expectedCore: "extensions", expectedSubTab: "skills" },
-      { target: "mcp", expectedSection: `host:${hostId}:mcp`, expectedCore: "extensions", expectedSubTab: "mcp" },
-      { target: "hooks", expectedSection: `host:${hostId}:hooks`, expectedCore: "extensions", expectedSubTab: "hooks" },
-      { target: "lsp", expectedSection: `host:${hostId}:lsp`, expectedCore: "extensions", expectedSubTab: "lsp" },
+      { target: "usage", expectedSection: `host:${hostId}:usage`, expectedCore: "usage", expectedSubTab: null },
+      { target: "extensions", expectedSection: "instructions", expectedCore: "instructions_rules", expectedSubTab: "instructions" },
+      { target: "context", expectedSection: "instructions", expectedCore: "instructions_rules", expectedSubTab: "instructions" },
+      { target: "instructions_rules", expectedSection: "instructions", expectedCore: "instructions_rules", expectedSubTab: "instructions" },
+      { target: "instructions", expectedSection: "instructions", expectedCore: "instructions_rules", expectedSubTab: "instructions" },
+      { target: "rules", expectedSection: `host:${hostId}:rules`, expectedCore: "instructions_rules", expectedSubTab: "rules" },
+      { target: "capabilities", expectedSection: `host:${hostId}:skills`, expectedCore: "capabilities", expectedSubTab: "skills" },
+      { target: "skills", expectedSection: `host:${hostId}:skills`, expectedCore: "capabilities", expectedSubTab: "skills" },
+      { target: "mcp", expectedSection: `host:${hostId}:mcp`, expectedCore: "capabilities", expectedSubTab: "mcp" },
+      { target: "hooks", expectedSection: `host:${hostId}:hooks`, expectedCore: "capabilities", expectedSubTab: "hooks" },
+      { target: "lsp", expectedSection: `host:${hostId}:lsp`, expectedCore: "capabilities", expectedSubTab: "lsp" },
       { target: "notifications", expectedSection: "notifications", expectedCore: "notifications_sync", expectedSubTab: "notifications" },
       { target: "notifications_sync", expectedSection: "notifications", expectedCore: "notifications_sync", expectedSubTab: "notifications" },
       { target: "sync_data", expectedSection: "cloud_sync", expectedCore: "notifications_sync", expectedSubTab: "cloud_sync" },
       { target: "cloud_sync", expectedSection: "cloud_sync", expectedCore: "notifications_sync", expectedSubTab: "cloud_sync" },
       { target: "archived", expectedSection: "archived", expectedCore: "notifications_sync", expectedSubTab: "archived" },
       { target: "host:devbox-1:acp", expectedSection: "host:devbox-1:acp", expectedCore: "agents", expectedSubTab: "acp" },
-      { target: "host:devbox-1:mcp", expectedSection: "host:devbox-1:mcp", expectedCore: "extensions", expectedSubTab: "mcp" },
+      { target: "host:devbox-1:usage", expectedSection: "host:devbox-1:usage", expectedCore: "usage", expectedSubTab: null },
+      { target: "host:devbox-1:mcp", expectedSection: "host:devbox-1:mcp", expectedCore: "capabilities", expectedSubTab: "mcp" },
       { target: "host:devbox-1:im_channels", expectedSection: "host:devbox-1:im_channels", expectedCore: "hosts", expectedSubTab: "im_channels" },
     ];
 
@@ -124,6 +141,7 @@ describe("Settings IA Consolidation (6 Core Sections + Deep-Links + Instant Sear
   it("handles hostless fallbacks, host IDs containing colons, and unknown targets safely", () => {
     assert.equal(resolveSettingsSectionTarget("hosts", null, "general"), "add_host");
     assert.equal(resolveSettingsSectionTarget("providers", null, "general"), "add_host");
+    assert.equal(resolveSettingsSectionTarget("usage", null, "general"), "add_host");
     assert.equal(resolveSettingsSectionTarget("skills", null, "general"), "instructions");
     assert.equal(resolveSettingsSectionTarget("mcp", null, "general"), "instructions");
     assert.equal(resolveSettingsSectionTarget("nonexistent_legacy_id", "h1", "appearance"), "appearance");
@@ -136,7 +154,10 @@ describe("Settings IA Consolidation (6 Core Sections + Deep-Links + Instant Sear
 
     assert.equal(buildSettingsSectionForTarget("hosts", "im_channels", "h2"), "host:h2:im_channels");
     assert.equal(buildSettingsSectionForTarget("hosts", "im_channels", null), "add_host");
-    assert.equal(buildSettingsSectionForTarget("extensions", "lsp", null), "instructions");
+    assert.equal(buildSettingsSectionForTarget("usage", null, "h2"), "host:h2:usage");
+    assert.equal(buildSettingsSectionForTarget("usage", null, null), "add_host");
+    assert.equal(buildSettingsSectionForTarget("capabilities", "lsp", null), "instructions");
+    assert.equal(buildSettingsSectionForTarget("capabilities", null, "h2"), "host:h2:skills");
     assert.equal(buildSettingsSectionForTarget("notifications_sync", null, "h2"), "notifications");
   });
 
@@ -150,9 +171,9 @@ describe("Settings IA Consolidation (6 Core Sections + Deep-Links + Instant Sear
 
     // Exact / primary sub-tab hits rank #1
     const mcpHits = searchSettingsEntries("mcp", { t: tEn });
-    assert.equal(mcpHits[0]?.coreSection, "extensions");
+    assert.equal(mcpHits[0]?.coreSection, "capabilities");
     assert.equal(mcpHits[0]?.subTab, "mcp");
-    assert.equal(mcpHits[0]?.parentLabelKey, "settings.navExtensions");
+    assert.equal(mcpHits[0]?.parentLabelKey, "settings.navCapabilities");
 
     const shortcutsHits = searchSettingsEntries("shortcuts", { t: tEn });
     assert.equal(shortcutsHits[0]?.coreSection, "general");
@@ -164,8 +185,14 @@ describe("Settings IA Consolidation (6 Core Sections + Deep-Links + Instant Sear
     assert.equal(larkHits[0]?.subTab, "im_channels");
 
     const claudeMdHits = searchSettingsEntries("CLAUDE.md", { t: tEn });
-    assert.equal(claudeMdHits[0]?.coreSection, "extensions");
+    assert.equal(claudeMdHits[0]?.coreSection, "instructions_rules");
     assert.equal(claudeMdHits[0]?.subTab, "instructions");
+
+    // Promoted top-level Usage & Quotas
+    const usageHits = searchSettingsEntries("quotas", { t: tEn });
+    assert.equal(usageHits[0]?.coreSection, "usage");
+    assert.equal(usageHits[0]?.subTab, null);
+    assert.equal(usageHits[0]?.parentLabelKey, null);
 
     // Chinese localized labels & keywords
     const zhShortcuts = searchSettingsEntries("快捷键", { t: tZh });
@@ -191,11 +218,12 @@ describe("Settings IA Consolidation (6 Core Sections + Deep-Links + Instant Sear
     assert.equal(jaShortcuts[0]?.subTab, "shortcuts");
 
     const jaUsage = searchSettingsEntries("使用量", { t: tJa });
-    assert.equal(jaUsage[0]?.coreSection, "agents");
-    assert.equal(jaUsage[0]?.subTab, "usage");
+    assert.equal(jaUsage[0]?.coreSection, "usage");
+    assert.equal(jaUsage[0]?.subTab, null);
 
-    // Hostless mode omits host-only sub-tabs cleanly
+    // Hostless mode omits host-only sections & sub-tabs cleanly
     assert.deepEqual(searchSettingsEntries("mcp", { t: tEn, hasHost: false }), []);
+    assert.deepEqual(searchSettingsEntries("quotas", { t: tEn, hasHost: false }), []);
     const hostlessAdd = searchSettingsEntries("ssh", { t: tEn, hasHost: false });
     assert.equal(hostlessAdd[0]?.coreSection, "hosts");
     assert.equal(hostlessAdd[0]?.subTab, "add_host");

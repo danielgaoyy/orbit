@@ -87,12 +87,12 @@ export function DetachedTerminalWindow({
   };
 
   return (
-    <div className="bg-canvas text-foreground flex h-screen w-screen flex-col overflow-hidden select-none dark:bg-[#0B0E14]">
+    <div className="bg-surface-recessed text-ink-primary flex h-screen w-screen flex-col overflow-hidden select-none">
       {/* Restrained draggable window header */}
       <header
         data-tauri-drag-region
         className={cn(
-          "border-border/70 bg-canvas flex h-[36px] shrink-0 items-center justify-between gap-2 border-b pr-2.5 dark:bg-[#0E121A]",
+          "border-border-subtle bg-surface-base flex h-[36px] shrink-0 items-center justify-between gap-2 border-b pr-2.5",
           isMac ? "pl-[78px]" : "pl-3",
         )}
       >

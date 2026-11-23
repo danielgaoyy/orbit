@@ -8,7 +8,8 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import { isMacDesktop } from "@/lib/orbit-ipc";
-import { ShortcutKbd } from "@/components/ui/overlays";
+import { Input } from "@/components/ui/input";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { useOrbitSelector } from "@/state/orbit-store";
 
 interface ShortcutItem {
@@ -36,6 +37,7 @@ export function ShortcutsSection() {
 
     const all: ShortcutItem[] = [
       { group: navGroup, action: t("settings.scCommandPalette"), keys: `${mod}K` },
+      { group: navGroup, action: t("settings.scFilterConversations"), keys: `${mod}F` },
       { group: navGroup, action: t("settings.scSettings"), keys: `${mod},` },
       { group: navGroup, action: t("settings.scNewConversation"), keys: `${mod}N` },
       { group: navGroup, action: t("settings.scNextApproval"), keys: `${mod}${shift}A` },
@@ -97,14 +99,14 @@ export function ShortcutsSection() {
         description={t("settings.shortcutsDesc")}
       />
 
-      <div className="border-border bg-background/60 flex h-[34px] items-center gap-2 rounded-[10px] border px-3">
-        <Search className="text-muted-foreground h-[14.5px] w-[14.5px] shrink-0" />
-        <input
+      <div className="relative">
+        <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-3 h-[14px] w-[14px] -translate-y-1/2" />
+        <Input
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder={t("settings.searchShortcutsPlaceholder")}
-          className="text-foreground placeholder:text-muted-foreground w-full bg-transparent text-[13px] outline-none"
+          className="h-[34px] rounded-[10px] pl-8.5 text-[13px]"
         />
       </div>
 

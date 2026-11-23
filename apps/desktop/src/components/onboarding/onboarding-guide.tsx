@@ -25,6 +25,9 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
+  Tabs,
+  TabsList,
+  TabsTrigger,
 } from "@/components/ui/dialog-tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useI18n } from "@/lib/i18n";
@@ -184,43 +187,44 @@ function OnboardingGuideBody() {
           </DialogDescription>
         </DialogHeader>
 
-        {/* Minimalist 3-Step Segmented Switcher */}
-        <div
-          role="tablist"
-          aria-label={t("onboarding.title")}
-          className="bg-muted/80 mt-4 grid grid-cols-3 gap-1 rounded-[10px] p-1"
+        {/* Official shadcn Tabs 3-Step Switcher */}
+        <Tabs
+          value={String(step)}
+          onValueChange={(next) => {
+            if (typeof next === "string") {
+              setStep(Number(next) as StepIndex);
+            }
+          }}
+          className="mt-4"
         >
-          {steps.map((s) => {
-            const active = step === s.idx;
-            return (
-              <button
-                key={s.idx}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                onClick={() => setStep(s.idx)}
-                className={cn(
-                  "flex cursor-pointer items-center justify-center gap-1.5 rounded-[7px] px-2.5 py-1.5 text-[12px] font-medium transition-colors",
-                  active
-                    ? "bg-background text-foreground shadow-2xs"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                <span
-                  className={cn(
-                    "inline-flex h-[16px] w-[16px] items-center justify-center rounded-full font-mono text-[10.5px]",
-                    active
-                      ? "bg-foreground text-background"
-                      : "bg-foreground/10 text-muted-foreground",
-                  )}
+          <TabsList
+            aria-label={t("onboarding.title")}
+            className="grid h-auto w-full grid-cols-3 gap-1 rounded-[10px] p-1"
+          >
+            {steps.map((s) => {
+              const active = step === s.idx;
+              return (
+                <TabsTrigger
+                  key={s.idx}
+                  value={String(s.idx)}
+                  className="h-[28px] rounded-[7px] px-2.5 text-[12px]"
                 >
-                  {s.idx + 1}
-                </span>
-                <span>{s.label}</span>
-              </button>
-            );
-          })}
-        </div>
+                  <span
+                    className={cn(
+                      "inline-flex h-[16px] w-[16px] items-center justify-center rounded-full font-mono text-[10.5px]",
+                      active
+                        ? "bg-action-primary-bg text-action-primary-fg"
+                        : "bg-border-default/60 text-ink-muted",
+                    )}
+                  >
+                    {s.idx + 1}
+                  </span>
+                  <span>{s.label}</span>
+                </TabsTrigger>
+              );
+            })}
+          </TabsList>
+        </Tabs>
       </div>
 
       {/* Step Content */}

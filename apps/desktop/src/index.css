@@ -1,67 +1,193 @@
 @import "tailwindcss";
 @import "@xterm/xterm/css/xterm.css";
+@import "@oneworks/avatar-react/renderer.css";
 
 @custom-variant dark (&:is(.dark *));
 
+/* ============================================================================
+ * Orbit Design System — "Orbital Quiet Precision"
+ * Same-hue OKLCH 258° surface elevation · 4-tier machined ink · 3-tier hairlines
+ * Monochrome precision primary actions · WCAG-AA semantic signals
+ * ============================================================================ */
+
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.185 0.004 260);
-  --surface-sidebar: oklch(0.968 0.002 260);
-  --surface-canvas: oklch(1 0 0);
-  --surface-elevated: oklch(1 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.185 0.004 260);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.185 0.004 260);
-  --primary: oklch(0.46 0.14 256);
+  /* 4-Layer Same-Hue Neutral Surfaces (Alabaster Drafting Paper) */
+  --surface-base: oklch(0.992 0.002 258);
+  --surface-recessed: oklch(0.962 0.003 258);
+  --surface-raised: oklch(1 0 0);
+  --surface-overlay: oklch(1 0 0);
+
+  /* 5-Tier Machined Ink Hierarchy */
+  --ink-primary: oklch(0.175 0.006 258);
+  --ink-secondary: oklch(0.375 0.006 258);
+  --ink-tertiary: oklch(0.515 0.006 258);
+  --ink-muted: oklch(0.585 0.005 258);
+  --ink-faint: oklch(0.675 0.005 258);
+
+  /* 3-Tier Hairline Borders */
+  --border-subtle: oklch(0.18 0.01 258 / 7%);
+  --border-default: oklch(0.18 0.01 258 / 11.5%);
+  --border-strong: oklch(0.18 0.01 258 / 18%);
+
+  /* Monochrome Precision Primary Action */
+  --action-primary-bg: oklch(0.18 0.006 258);
+  --action-primary-fg: oklch(0.985 0.002 258);
+  --action-primary-hover: oklch(0.26 0.006 258);
+
+  /* Semantic Signal Tokens (WCAG AA on Light Surfaces) */
+  --signal-success: oklch(0.49 0.145 152);
+  --signal-success-bg: oklch(0.54 0.145 152 / 10%);
+  --signal-success-border: oklch(0.54 0.145 152 / 24%);
+  --signal-warning: oklch(0.55 0.155 72);
+  --signal-warning-bg: oklch(0.68 0.16 74 / 12%);
+  --signal-warning-border: oklch(0.62 0.16 74 / 28%);
+  --signal-danger: oklch(0.53 0.185 22);
+  --signal-danger-bg: oklch(0.56 0.185 22 / 10%);
+  --signal-danger-border: oklch(0.56 0.185 22 / 24%);
+  --signal-info: oklch(0.50 0.145 252);
+  --signal-info-bg: oklch(0.54 0.145 252 / 10%);
+  --signal-info-border: oklch(0.54 0.145 252 / 24%);
+  --signal-relay: oklch(0.50 0.155 292);
+  --signal-relay-bg: oklch(0.54 0.155 292 / 10%);
+  --signal-relay-border: oklch(0.54 0.155 292 / 24%);
+
+  /* Official shadcn/ui Radius Scale (`--radius: 0.5rem` -> sm=4px, md=6px, lg=8px, xl=12px) */
+  --radius: 0.5rem;
+  --radius-xs: 4px;
+
+  /* Backward-Compatible Semantic Aliases (Sidebar & Stage share --surface-base) */
+  --background: var(--surface-base);
+  --foreground: var(--ink-primary);
+  --surface-sidebar: var(--surface-base);
+  --surface-canvas: var(--surface-base);
+  --surface-elevated: var(--surface-raised);
+  --card: var(--surface-raised);
+  --card-foreground: var(--ink-primary);
+  --popover: var(--surface-overlay);
+  --popover-foreground: var(--ink-primary);
+  --primary: var(--signal-info);
   --primary-foreground: oklch(0.99 0 0);
-  --secondary: oklch(0.958 0.002 260);
-  --secondary-foreground: oklch(0.205 0.004 260);
-  --muted: oklch(0.956 0.002 260);
-  --muted-foreground: oklch(0.475 0.006 260);
-  --accent: oklch(0.946 0.003 260);
-  --accent-foreground: oklch(0.18 0.004 260);
-  --destructive: oklch(0.56 0.20 25);
-  --border: oklch(0 0 0 / 7.2%);
-  --input: oklch(0 0 0 / 10%);
-  --ring: oklch(0.46 0.14 256);
-  --radius: 0.625rem;
+  --secondary: var(--surface-recessed);
+  --secondary-foreground: var(--ink-primary);
+  --muted: var(--surface-recessed);
+  --muted-foreground: var(--ink-tertiary);
+  --accent: oklch(0.18 0.01 258 / 4.8%);
+  --accent-foreground: var(--ink-primary);
+  --destructive: var(--signal-danger);
+  --border: var(--border-subtle);
+  --input: var(--border-default);
+  --ring: var(--signal-info);
 
   /* Global Motion System Tokens (Critically Damped, Natural Deceleration) */
-  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-expo: cubic-bezier(0.23, 1, 0.32, 1);
   --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
   --ease-panel: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-panel-out: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-exit: cubic-bezier(0.4, 0, 0.2, 1);
-  --duration-panel-in: 280ms;
-  --duration-panel-out: 240ms;
+  --duration-panel-in: 260ms;
+  --duration-panel-out: 225ms;
 }
 
 .dark {
-  --background: oklch(0.218 0.005 260);
-  --foreground: oklch(0.945 0.003 260);
-  --surface-sidebar: oklch(0.184 0.004 260);
-  --surface-canvas: oklch(0.218 0.005 260);
-  --surface-elevated: oklch(0.254 0.006 260);
-  --card: oklch(0.250 0.005 260);
-  --card-foreground: oklch(0.945 0.003 260);
-  --popover: oklch(0.258 0.006 260);
-  --popover-foreground: oklch(0.945 0.003 260);
-  --primary: oklch(0.70 0.13 254);
-  --primary-foreground: oklch(0.16 0.005 260);
-  --secondary: oklch(0.282 0.006 260);
-  --secondary-foreground: oklch(0.92 0.003 260);
-  --muted: oklch(0.275 0.005 260);
-  --muted-foreground: oklch(0.685 0.005 260);
-  --accent: oklch(0.292 0.006 260);
-  --accent-foreground: oklch(0.95 0.003 260);
-  --destructive: oklch(0.62 0.19 25);
-  --border: oklch(1 0 0 / 7.5%);
-  --input: oklch(1 0 0 / 10.5%);
-  --ring: oklch(0.70 0.13 254);
+  /* 4-Layer Same-Hue Neutral Surfaces (Deep Observatory Graphite) */
+  --surface-base: oklch(0.168 0.006 258);
+  --surface-recessed: oklch(0.144 0.006 258);
+  --surface-raised: oklch(0.204 0.006 258);
+  --surface-overlay: oklch(0.230 0.007 258);
+
+  /* 5-Tier Machined Ink Hierarchy */
+  --ink-primary: oklch(0.945 0.004 258);
+  --ink-secondary: oklch(0.795 0.005 258);
+  --ink-tertiary: oklch(0.640 0.006 258);
+  --ink-muted: oklch(0.565 0.006 258);
+  --ink-faint: oklch(0.475 0.006 258);
+
+  /* 3-Tier Hairline Borders */
+  --border-subtle: oklch(1 0 0 / 7.2%);
+  --border-default: oklch(1 0 0 / 11.5%);
+  --border-strong: oklch(1 0 0 / 18%);
+
+  /* Monochrome Precision Primary Action */
+  --action-primary-bg: oklch(0.95 0.003 258);
+  --action-primary-fg: oklch(0.16 0.006 258);
+  --action-primary-hover: oklch(0.99 0.002 258);
+
+  /* Semantic Signal Tokens (WCAG AA on Dark Surfaces) */
+  --signal-success: oklch(0.74 0.145 154);
+  --signal-success-bg: oklch(0.72 0.145 154 / 13%);
+  --signal-success-border: oklch(0.72 0.145 154 / 28%);
+  --signal-warning: oklch(0.80 0.145 78);
+  --signal-warning-bg: oklch(0.78 0.15 78 / 14%);
+  --signal-warning-border: oklch(0.78 0.15 78 / 30%);
+  --signal-danger: oklch(0.72 0.17 20);
+  --signal-danger-bg: oklch(0.68 0.17 20 / 14%);
+  --signal-danger-border: oklch(0.68 0.17 20 / 30%);
+  --signal-info: oklch(0.74 0.13 252);
+  --signal-info-bg: oklch(0.72 0.13 252 / 14%);
+  --signal-info-border: oklch(0.72 0.13 252 / 28%);
+  --signal-relay: oklch(0.76 0.14 294);
+  --signal-relay-bg: oklch(0.74 0.14 294 / 14%);
+  --signal-relay-border: oklch(0.74 0.14 294 / 28%);
+
+  /* Backward-Compatible Semantic Aliases */
+  --background: var(--surface-base);
+  --foreground: var(--ink-primary);
+  --surface-sidebar: var(--surface-base);
+  --surface-canvas: var(--surface-base);
+  --surface-elevated: var(--surface-raised);
+  --card: var(--surface-raised);
+  --card-foreground: var(--ink-primary);
+  --popover: var(--surface-overlay);
+  --popover-foreground: var(--ink-primary);
+  --primary: var(--signal-info);
+  --primary-foreground: oklch(0.15 0.006 258);
+  --secondary: oklch(0.242 0.006 258);
+  --secondary-foreground: var(--ink-primary);
+  --muted: var(--surface-recessed);
+  --muted-foreground: var(--ink-tertiary);
+  --accent: oklch(1 0 0 / 6.2%);
+  --accent-foreground: var(--ink-primary);
+  --destructive: var(--signal-danger);
+  --border: var(--border-subtle);
+  --input: var(--border-default);
+  --ring: var(--signal-info);
 }
 
 @theme inline {
+  /* New Precision Design Tokens */
+  --color-surface-base: var(--surface-base);
+  --color-surface-recessed: var(--surface-recessed);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-overlay: var(--surface-overlay);
+  --color-ink-primary: var(--ink-primary);
+  --color-ink-secondary: var(--ink-secondary);
+  --color-ink-tertiary: var(--ink-tertiary);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+  --color-border-subtle: var(--border-subtle);
+  --color-border-default: var(--border-default);
+  --color-border-strong: var(--border-strong);
+  --color-action-primary: var(--action-primary-bg);
+  --color-action-primary-bg: var(--action-primary-bg);
+  --color-action-primary-fg: var(--action-primary-fg);
+  --color-action-primary-hover: var(--action-primary-hover);
+  --color-signal-success: var(--signal-success);
+  --color-signal-success-bg: var(--signal-success-bg);
+  --color-signal-success-border: var(--signal-success-border);
+  --color-signal-warning: var(--signal-warning);
+  --color-signal-warning-bg: var(--signal-warning-bg);
+  --color-signal-warning-border: var(--signal-warning-border);
+  --color-signal-danger: var(--signal-danger);
+  --color-signal-danger-bg: var(--signal-danger-bg);
+  --color-signal-danger-border: var(--signal-danger-border);
+  --color-signal-info: var(--signal-info);
+  --color-signal-info-bg: var(--signal-info-bg);
+  --color-signal-info-border: var(--signal-info-border);
+  --color-signal-relay: var(--signal-relay);
+  --color-signal-relay-bg: var(--signal-relay-bg);
+  --color-signal-relay-border: var(--signal-relay-border);
+
+  /* Legacy Aliases */
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-sidebar: var(--surface-sidebar);
@@ -83,6 +209,7 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -96,7 +223,7 @@
 
   html,
   body {
-    @apply bg-background text-foreground;
+    @apply bg-surface-base text-ink-primary;
     font-family:
       -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Inter", "Segoe UI", Roboto, sans-serif;
     font-size: 13px;
@@ -128,151 +255,207 @@
   }
 
   ::selection {
-    background: oklch(0.62 0.16 255 / 20%);
+    background: oklch(0.62 0.14 252 / 20%);
   }
 
   .dark ::selection {
-    background: oklch(0.72 0.14 252 / 28%);
+    background: oklch(0.72 0.13 252 / 28%);
   }
 }
 
+/* ============================================================================
+ * Precision Surface Recipes (Consistent Rim & Quiet Atmospheric Depth)
+ * ============================================================================ */
+
 /* Tactile single-rim Composer surface with soft shadow & upward occlusion shadow */
 .composer-surface {
-  background: var(--surface-elevated);
-  border: 1px solid oklch(0 0 0 / 9%);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-default);
   box-shadow:
-    0 0 18px 0 oklch(0 0 0 / 3.4%),
-    0 1px 4px 0 oklch(0 0 0 / 2%);
-  transition: border-color 150ms cubic-bezier(0.16, 1, 0.3, 1);
+    0 1px 2px 0 oklch(0 0 0 / 3%),
+    0 6px 20px -4px oklch(0 0 0 / 4.5%);
+  transition:
+    border-color 150ms var(--ease-out-expo),
+    box-shadow 150ms var(--ease-out-expo);
 }
 
 .composer-surface:focus-within {
-  border-color: oklch(0 0 0 / 14%);
+  border-color: var(--border-strong);
   box-shadow:
-    0 0 22px 0 oklch(0 0 0 / 4.8%),
-    0 2px 6px 0 oklch(0 0 0 / 2.5%);
+    0 1px 3px 0 oklch(0 0 0 / 4%),
+    0 8px 24px -4px oklch(0 0 0 / 6.5%);
 }
 
 .composer-surface[data-occluding="true"] {
   box-shadow:
-    0 -10px 24px -6px oklch(0 0 0 / 6%),
-    0 0 18px 0 oklch(0 0 0 / 3.4%),
-    0 1px 4px 0 oklch(0 0 0 / 2%);
+    0 -10px 24px -8px oklch(0 0 0 / 5.5%),
+    0 1px 2px 0 oklch(0 0 0 / 3%),
+    0 6px 20px -4px oklch(0 0 0 / 4.5%);
 }
 
 .composer-surface[data-occluding="true"]:focus-within {
   box-shadow:
-    0 -10px 24px -6px oklch(0 0 0 / 6.5%),
-    0 0 22px 0 oklch(0 0 0 / 4.8%),
-    0 2px 6px 0 oklch(0 0 0 / 2.5%);
+    0 -10px 24px -8px oklch(0 0 0 / 6.5%),
+    0 1px 3px 0 oklch(0 0 0 / 4%),
+    0 8px 24px -4px oklch(0 0 0 / 6.5%);
 }
 
 .dark .composer-surface {
-  background: var(--surface-elevated);
-  border: 1px solid oklch(1 0 0 / 10%);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-default);
   box-shadow:
-    inset 0 0.5px 0 0 oklch(1 0 0 / 6%),
-    0 0 20px 0 oklch(0 0 0 / 18%),
-    0 2px 8px 0 oklch(0 0 0 / 14%);
+    inset 0 0.5px 0 0 oklch(1 0 0 / 6.5%),
+    0 2px 10px 0 oklch(0 0 0 / 22%),
+    0 10px 28px -6px oklch(0 0 0 / 28%);
 }
 
 .dark .composer-surface:focus-within {
-  border-color: oklch(1 0 0 / 15%);
+  border-color: var(--border-strong);
   box-shadow:
-    inset 0 0.5px 0 0 oklch(1 0 0 / 9%),
-    0 0 24px 0 oklch(0 0 0 / 24%),
-    0 2px 10px 0 oklch(0 0 0 / 18%);
+    inset 0 0.5px 0 0 oklch(1 0 0 / 9.5%),
+    0 2px 12px 0 oklch(0 0 0 / 26%),
+    0 12px 32px -6px oklch(0 0 0 / 34%);
 }
 
 .dark .composer-surface[data-occluding="true"] {
   box-shadow:
-    inset 0 0.5px 0 0 oklch(1 0 0 / 6%),
-    0 -12px 28px -6px oklch(0 0 0 / 34%),
-    0 0 20px 0 oklch(0 0 0 / 18%);
+    inset 0 0.5px 0 0 oklch(1 0 0 / 6.5%),
+    0 -12px 28px -6px oklch(0 0 0 / 38%),
+    0 2px 10px 0 oklch(0 0 0 / 22%);
 }
 
 .composer-surface[data-plan="true"] {
-  border-color: oklch(0.56 0.16 264 / 36%);
+  border-color: var(--signal-info-border);
 }
 
-.dark .composer-surface[data-plan="true"] {
-  border-color: oklch(0.68 0.15 264 / 38%);
-}
-
-/* Restrained companion surface for Sticky Permission & Clarification Cards above Composer */
+/* Unified Decision Dock surface (Parent & Subagent Approvals / Clarifications) */
 .approval-dock-surface {
-  background: var(--surface-elevated);
-  border: 1px solid oklch(0 0 0 / 8.5%);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-default);
   box-shadow:
-    0 0 18px 0 oklch(0 0 0 / 3%),
-    0 1px 4px 0 oklch(0 0 0 / 2%);
+    0 1px 3px 0 oklch(0 0 0 / 3%),
+    0 6px 18px -4px oklch(0 0 0 / 4%);
 }
 
 .dark .approval-dock-surface {
-  background: var(--surface-elevated);
-  border: 1px solid oklch(1 0 0 / 9.5%);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-default);
   box-shadow:
-    inset 0 0.5px 0 0 oklch(1 0 0 / 6%),
-    0 0 20px 0 oklch(0 0 0 / 18%),
-    0 2px 8px 0 oklch(0 0 0 / 14%);
+    inset 0 0.5px 0 0 oklch(1 0 0 / 6.5%),
+    0 2px 10px 0 oklch(0 0 0 / 20%),
+    0 8px 24px -6px oklch(0 0 0 / 26%);
 }
 
 /* Elevated User Prompt Bubble surface */
 .prompt-bubble-surface {
-  background: var(--surface-elevated);
-  border: 1px solid oklch(0 0 0 / 7.5%);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
   box-shadow:
-    0 0 14px 0 oklch(0 0 0 / 2.6%),
-    0 2px 8px 0 oklch(0 0 0 / 3%);
+    0 1px 2px 0 oklch(0 0 0 / 2.6%),
+    0 3px 10px -2px oklch(0 0 0 / 3%);
 }
 
 .dark .prompt-bubble-surface {
-  background: var(--surface-elevated);
-  border: 1px solid oklch(1 0 0 / 9.5%);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
   box-shadow:
     inset 0 0.5px 0 0 oklch(1 0 0 / 5.5%),
-    0 0 16px 0 oklch(0 0 0 / 18%),
     0 2px 10px 0 oklch(0 0 0 / 22%);
 }
 
-/* Floating Stage Overview Card surface (matches prompt-bubble geometry, slightly softer) */
+/* Antigravity-inspired Stage Overview HUD surface */
 .overview-card-surface {
-  background: var(--surface-elevated);
-  border: 1px solid oklch(0 0 0 / 6.8%);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
   box-shadow:
-    0 0 14px 0 oklch(0 0 0 / 2.2%),
-    0 2px 8px 0 oklch(0 0 0 / 2.5%);
+    0 1px 2px 0 oklch(0 0 0 / 2.2%),
+    0 6px 20px -6px oklch(0 0 0 / 4.5%);
 }
 
 .dark .overview-card-surface {
-  background: var(--surface-elevated);
-  border: 1px solid oklch(1 0 0 / 8.8%);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
   box-shadow:
-    inset 0 0.5px 0 0 oklch(1 0 0 / 5%),
-    0 0 16px 0 oklch(0 0 0 / 15%),
-    0 2px 10px 0 oklch(0 0 0 / 18%);
+    inset 0 0.5px 0 0 oklch(1 0 0 / 5.5%),
+    0 4px 16px -4px oklch(0 0 0 / 26%),
+    0 1px 4px 0 oklch(0 0 0 / 18%);
 }
 
-/* Omnidirectional floating surface for Popovers, Menus & Settings Modal */
+/* Omnidirectional floating surface for Popovers, Menus, Command Palette & Toasts */
 .floating-surface {
+  background: var(--surface-overlay);
+  border-color: var(--border-default);
   box-shadow:
-    0 0 24px 0 oklch(0 0 0 / 6%),
-    0 0 6px 0 oklch(0 0 0 / 2.8%);
+    0 4px 16px -2px oklch(0 0 0 / 7.5%),
+    0 1px 4px 0 oklch(0 0 0 / 3.5%);
 }
 
 .dark .floating-surface {
+  background: var(--surface-overlay);
+  border-color: var(--border-default);
   box-shadow:
-    inset 0 0.5px 0 0 oklch(1 0 0 / 7%),
-    0 0 28px 0 oklch(0 0 0 / 32%),
-    0 0 8px 0 oklch(0 0 0 / 18%);
+    inset 0 0.5px 0 0 oklch(1 0 0 / 7.5%),
+    0 8px 30px -4px oklch(0 0 0 / 42%),
+    0 2px 8px 0 oklch(0 0 0 / 24%);
+}
+
+/* OneWorks 3D Subagent Avatar optical ring outline (per interface-design SKILL Image Outlines) */
+.orbit-avatar-frame {
+  position: relative;
+  overflow: hidden;
+  border-radius: 9999px;
+}
+
+.orbit-avatar-frame::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1px oklch(0 0 0 / 9%);
+}
+
+.dark .orbit-avatar-frame::after {
+  box-shadow: inset 0 0 0 1px oklch(1 0 0 / 13%);
+}
+
+.orbit-avatar-frame[data-attention="true"] {
+  box-shadow:
+    0 0 0 1.5px var(--surface-base),
+    0 0 0 3px var(--signal-warning);
+}
+
+/* Neutralize OneWorks grab cursor inside non-interactive Orbit Subagent portraits */
+.orbit-avatar-noninteractive .interactive-avatar__canvas {
+  cursor: inherit !important;
+  pointer-events: none !important;
+}
+
+/* Long Folded Activity Disclosure: bounded scroll track + sticky header when full-expanded */
+.orbit-disclosure-track {
+  background: color-mix(in oklch, var(--surface-recessed) 68%, transparent);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.orbit-disclosure-scroll {
+  overscroll-behavior: auto;
+  scrollbar-gutter: stable;
+}
+
+.orbit-sticky-disclosure-bar {
+  position: sticky;
+  top: 0;
+  z-index: 12;
+  background: color-mix(in oklch, var(--surface-base) 92%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 
 /*
  * Native Composited Scrollbars:
  * - On macOS (html.orbit-mac), leave scrollbars untouched so WebKit uses 120Hz compositor-thread overlay NSScroller.
  * - On non-macOS platforms, apply subtle standard CSS thin scrollbars without breaking compositor scrolling.
- * - Settled heavy blocks keep CSS layout/style/paint containment so streaming tails never trigger full-subtree layout,
- *   while avoiding `content-visibility: auto` blank-tile raster flashes during fast WKWebView flicks.
  */
 html:not(.orbit-mac) .orbit-native-scroll {
   scrollbar-width: thin;
@@ -319,12 +502,12 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
     opacity: 0.92;
   }
   50% {
-    opacity: 0.44;
+    opacity: 0.48;
   }
 }
 
 .agent-text-shimmer {
-  color: var(--foreground);
+  color: var(--ink-primary);
   will-change: opacity;
   animation: orbit-status-pulse 1.8s ease-in-out infinite;
 }
@@ -533,7 +716,7 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   overflow: hidden;
 }
 
-/* Stage Cross-Dissolve, Fresh Message Bubble, Sticky Approval Dock, Pills & Toast */
+/* Stage Cross-Dissolve, Fresh Message Bubble, Decision Dock, Pills & Toast */
 @keyframes orbit-stage-in {
   from {
     opacity: 0;
@@ -651,7 +834,7 @@ html.orbit-linux .animate-spin {
   animation-timing-function: steps(12, end);
 }
 
-  /* System Accessibility Guard (`prefers-reduced-motion`) */
+/* System Accessibility Guard (`prefers-reduced-motion`) */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

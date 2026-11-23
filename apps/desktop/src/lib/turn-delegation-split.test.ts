@@ -4,6 +4,7 @@ import type { TimelineItemView } from "./orbit-ipc.ts";
 import {
   computeWorkChunkDurationMs,
   extractFallbackDispatchCall,
+  extractStateChangeMilestoneCall,
   isDelegationMilestoneToolCall,
   splitStepGroupChronologically,
   summarizeWorkChunk,
@@ -206,5 +207,46 @@ describe("turn-delegation-split", () => {
     ];
     assert.equal(computeWorkChunkDurationMs(items), 4500);
     assert.equal(computeWorkChunkDurationMs([makeReadTool(1, "/repo/a.ts", 10_000)]), null);
+  });
+
+  it("promotes session-level timer and worktree handoff calls into external milestones", () => {
+    const timerCall: TimelineItemView = {
+      item_type: "tool_call",
+      seq: 50,
+      call_id: "timer-50",
+      status: "completed",
+      summary_title: "Timer",
+      detail: {
+        kind: "generic",
+        tool_name: "mcp_orbit_orbit_timer",
+        arguments_json: JSON.stringify({ action: "create", duration_seconds: 120, prompt: "Check build" }),
+      },
+      diff_files: [],
+    };
+    const handoffCall: TimelineItemView = {
+      item_type: "tool_call",
+      seq: 51,
+      call_id: "handoff-51",
+      status: "completed",
+      summary_title: "Handoff",
+      detail: {
+        kind: "generic",
+        tool_name: "mcp_orbit_handoff_worktree",
+        arguments_json: JSON.stringify({ direction: "worktree_to_local", dry_run: false }),
+      },
+      diff_files: [],
+    };
+
+    assert.equal(isDelegationMilestoneToolCall(timerCall), true);
+    assert.equal(isDelegationMilestoneToolCall(handoffCall), true);
+
+    const timerInfo = extractStateChangeMilestoneCall(timerCall);
+    assert.equal(timerInfo?.kind, "timer");
+    assert.equal(timerInfo?.label, "Timer (2m)");
+    assert.equal(timerInfo?.preview, "Check build");
+
+    const handoffInfo = extractStateChangeMilestoneCall(handoffCall);
+    assert.equal(handoffInfo?.kind, "handoff");
+    assert.equal(handoffInfo?.label, "Handoff (worktree → local)");
   });
 });

@@ -52,6 +52,7 @@ import {
   isOfflineUploadError,
   resolveAvailableDraftProvider,
   slugifyPrefixedBranch,
+  syncStageRunningSubagentMeta,
 } from "../store-helpers";
 import type { OrbitStoreContext } from "../store-runtime";
 import type {
@@ -316,9 +317,18 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
               if (isViewing) {
                 latestSeqToMark = Math.max(mergedStage.latest_seq, mergedStage.agent?.latest_seq ?? 0);
               }
+              const nextStages = applyStageCacheUpdate(s, tlKey, mergedStage);
+              const nextRunningMeta = syncStageRunningSubagentMeta(
+                s.stageRunningSubagentMeta,
+                nextStages,
+                tlKey,
+                mergedStage,
+                reusePrevAux,
+              );
               return {
                 ...s,
-                stages: applyStageCacheUpdate(s, tlKey, mergedStage),
+                stages: nextStages,
+                stageRunningSubagentMeta: nextRunningMeta,
               };
             });
             if (needsFullRetry) {

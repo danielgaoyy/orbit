@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowUpRight,
   Bot,
   Check,
   ChevronDown,
@@ -17,6 +18,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  type GuardianAssessment,
   type QuestionItem,
   type TimelineItemView,
   type ToolCallDetail,
@@ -31,8 +33,15 @@ import {
   setFocusedDecisionTarget,
   stripWorkspacePrefix,
 } from "@/lib/timeline-coalesce";
+import { Button } from "@/components/ui/button";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { SubagentAvatar } from "@/components/ui/subagent-avatar";
+import type {
+  SessionSubagentWithAvatar,
+  UnifiedPendingSubagentPermission,
+} from "@/state/selectors/session-selectors";
 import { orbitActions } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -40,8 +49,27 @@ type PendingPermissionItem = Extract<TimelineItemView, { item_type: "permission_
 type PendingQuestionItem = Extract<TimelineItemView, { item_type: "question_request" }>;
 
 type QueuedDecision =
-  | { kind: "permission"; seq: number; item: PendingPermissionItem }
-  | { kind: "question"; seq: number; item: PendingQuestionItem };
+  | {
+      kind: "permission";
+      queueKey: string;
+      seq: number;
+      targetHostId: string;
+      targetAgentId: string;
+      requestId: string;
+      title: string;
+      detail: ToolCallDetail;
+      allowedDecisions: string[];
+      guardianAssessment?: GuardianAssessment | null;
+      subagent?: SessionSubagentWithAvatar;
+    }
+  | {
+      kind: "question";
+      queueKey: string;
+      seq: number;
+      targetHostId: string;
+      targetAgentId: string;
+      item: PendingQuestionItem;
+    };
 
 interface PermissionTargetPresentation {
   kindLabel: string;
@@ -257,7 +285,7 @@ function PermissionDetailExpanded({ content, isDiff }: { content: string; isDiff
   return (
     <ScrollArea
       orientation="both"
-      className="mt-2 rounded-[10px] border border-black/[0.06] bg-black/[0.022] dark:border-white/[0.07] dark:bg-white/[0.025]"
+      className="border-border-subtle bg-surface-recessed mt-2 rounded-[10px] border"
       viewportClassName="selectable-text max-h-40 overscroll-contain px-3 py-2 font-mono text-[12px] leading-[1.5]"
     >
       {isDiff ? (
@@ -295,8 +323,14 @@ function PermissionDetailExpanded({ content, isDiff }: { content: string; isDiff
 function PermissionApprovalCard({
   hostId,
   agentId,
+  parentAgentId,
   cwd,
-  perm,
+  requestId,
+  title,
+  detail,
+  allowedDecisions,
+  guardianAssessment,
+  subagent,
   queueIndex,
   queueTotal,
   onStepPrev,
@@ -304,8 +338,14 @@ function PermissionApprovalCard({
 }: {
   hostId: string;
   agentId: string;
+  parentAgentId: string;
   cwd: string;
-  perm: PendingPermissionItem;
+  requestId: string;
+  title: string;
+  detail: ToolCallDetail;
+  allowedDecisions: string[];
+  guardianAssessment?: GuardianAssessment | null;
+  subagent?: SessionSubagentWithAvatar;
   queueIndex: number;
   queueTotal: number;
   onStepPrev: () => void;
@@ -322,25 +362,19 @@ function PermissionApprovalCard({
     return () => window.clearTimeout(id);
   }, [submittingDecision]);
 
-  const decisions = useMemo(
-    () => orderDecisions(perm.allowed_decisions),
-    [perm.allowed_decisions],
-  );
+  const decisions = useMemo(() => orderDecisions(allowedDecisions), [allowedDecisions]);
   const primaryAllowChoice = decisions.find((d) => !isDenyDecision(d) && !isAlwaysDecision(d)) ?? null;
   const primaryAlwaysChoice = decisions.find((d) => isAlwaysDecision(d)) ?? null;
   const primaryDenyChoice = decisions.find((d) => isDenyDecision(d)) ?? null;
 
-  const target = useMemo(
-    () => describePermissionTarget(perm.detail, cwd, t),
-    [perm.detail, cwd, t],
-  );
+  const target = useMemo(() => describePermissionTarget(detail, cwd, t), [detail, cwd, t]);
   const KindIcon = target.icon;
 
   const handleResolve = async (dec: string) => {
     if (submittingDecision) return;
     setSubmittingDecision(dec);
     try {
-      await orbitIpc.resolvePermission(hostId, agentId, perm.request_id, dec);
+      await orbitIpc.resolvePermission(hostId, agentId, requestId, dec);
     } catch (err) {
       setSubmittingDecision(null);
       orbitActions.showToast(t("approval.permissionFailed", { error: String(err) }));
@@ -348,18 +382,46 @@ function PermissionApprovalCard({
   };
 
   return (
-    <div className="approval-dock-surface orbit-dock-enter overflow-hidden rounded-[18px]">
-      <div className="flex items-center justify-between gap-3 border-b border-black/[0.055] px-4 py-2.5 dark:border-white/[0.06]">
+    <div className="approval-dock-surface orbit-dock-enter overflow-hidden rounded-[16px]">
+      <div className="border-border-subtle flex items-center justify-between gap-3 border-b px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="size-1.5 shrink-0 rounded-full bg-amber-500/80" />
-          <KindIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
-          <span className="text-foreground/90 truncate text-[12.5px] font-medium">
-            {perm.title}
+          {subagent ? (
+            <SubagentAvatar
+              character={subagent.character}
+              status="awaiting_permission"
+              size="sm"
+            />
+          ) : (
+            <span className="bg-signal-warning size-1.5 shrink-0 rounded-full" />
+          )}
+          <KindIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+          <span className="text-ink-primary truncate text-[12px] font-medium">
+            {subagent ? `${subagent.title} · ${title}` : title}
           </span>
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
-          <span className="text-muted-foreground/75 text-[11px] font-medium">
+          {subagent && (
+            <button
+              type="button"
+              onClick={() =>
+                orbitActions.openSubagentTab({
+                  callId: subagent.callId,
+                  role: subagent.title,
+                  promptPreview: subagent.promptPreview,
+                  childAgentId: subagent.childAgentId,
+                  childHostId: subagent.childHostId || undefined,
+                  providerSubagentId: subagent.providerSubagentId,
+                  parentAgentId,
+                })
+              }
+              className="text-ink-tertiary hover:text-ink-primary hover:bg-accent inline-flex h-[22px] cursor-pointer items-center gap-0.5 rounded-[6px] px-1.5 text-[11px] font-medium transition-colors"
+            >
+              <span>Inspect</span>
+              <ArrowUpRight className="size-3 shrink-0" />
+            </button>
+          )}
+          <span className="text-ink-muted text-[11px] font-medium">
             {target.kindLabel}
           </span>
           <DecisionQueueStepper
@@ -372,39 +434,39 @@ function PermissionApprovalCard({
       </div>
 
       <div className="px-4 py-3">
-        {perm.guardian_assessment && (
+        {guardianAssessment && (
           <div
             className={cn(
-              "mb-2 flex items-center gap-1.5 rounded-[8px] px-2.5 py-1 text-[11.5px] leading-snug",
-              perm.guardian_assessment.risk_level === "critical" ||
-                perm.guardian_assessment.risk_level === "high"
-                ? "bg-rose-500/[0.08] text-rose-700 dark:bg-rose-500/[0.12] dark:text-rose-300"
-                : "bg-amber-500/[0.08] text-amber-800 dark:bg-amber-500/[0.12] dark:text-amber-200",
+              "mb-2 flex items-center gap-1.5 rounded-[8px] px-2.5 py-1 text-[11px] leading-snug",
+              guardianAssessment.risk_level === "critical" ||
+                guardianAssessment.risk_level === "high"
+                ? "bg-signal-danger-bg text-signal-danger"
+                : "bg-signal-warning-bg text-signal-warning",
             )}
           >
             <ShieldAlert className="size-3.5 shrink-0 stroke-[1.8]" />
             <span className="shrink-0 whitespace-nowrap font-medium">
-              {perm.guardian_assessment.risk_level === "critical"
+              {guardianAssessment.risk_level === "critical"
                 ? t("approval.criticalRisk")
-                : perm.guardian_assessment.risk_level === "high"
+                : guardianAssessment.risk_level === "high"
                   ? t("approval.highRisk")
-                  : perm.guardian_assessment.risk_level === "medium"
+                  : guardianAssessment.risk_level === "medium"
                     ? t("approval.mediumRisk")
                     : t("approval.lowRisk")}
             </span>
             <span className="shrink-0 opacity-45">·</span>
             <span
-              title={perm.guardian_assessment.reason}
+              title={guardianAssessment.reason}
               className="min-w-0 truncate opacity-90"
             >
-              {perm.guardian_assessment.reason}
+              {guardianAssessment.reason}
             </span>
           </div>
         )}
-        <div className="rounded-[10px] bg-black/[0.028] px-3 py-2 dark:bg-white/[0.035]">
-          <div className="selectable-text text-foreground/88 line-clamp-2 font-mono text-[12.5px] leading-[1.5] break-all">
+        <div className="bg-surface-recessed rounded-[10px] px-3 py-2">
+          <div className="selectable-text text-ink-primary line-clamp-2 font-mono text-[12px] leading-[1.5] break-all">
             {target.isShell && (
-              <span className="text-muted-foreground/65 mr-1.5 select-none">$</span>
+              <span className="text-ink-muted mr-1.5 select-none">$</span>
             )}
             <span>{target.preview}</span>
           </div>
@@ -415,7 +477,7 @@ function PermissionApprovalCard({
             <button
               type="button"
               onClick={() => setExpanded((v) => !v)}
-              className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 rounded-md px-1 py-0.5 text-[11.5px] font-medium transition-colors"
+              className="text-ink-tertiary hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 rounded-[6px] px-1 py-0.5 text-[11px] font-medium transition-colors"
             >
               <ChevronDown
                 className={cn(
@@ -435,7 +497,7 @@ function PermissionApprovalCard({
         )}
       </div>
 
-      <div className="flex flex-wrap items-center justify-end gap-1.5 border-t border-black/[0.05] px-4 py-2.5 dark:border-white/[0.055]">
+      <div className="border-border-subtle flex flex-wrap items-center justify-end gap-1.5 border-t px-4 py-2.5">
         {decisions.map((dec) => {
           const isDeny = isDenyDecision(dec);
           const isAlways = isAlwaysDecision(dec);
@@ -452,17 +514,17 @@ function PermissionApprovalCard({
               disabled={disabled}
               onClick={() => void handleResolve(dec)}
               className={cn(
-                "orbit-press inline-flex h-7.5 cursor-pointer items-center gap-1.5 rounded-full text-[12.5px] font-medium disabled:cursor-not-allowed disabled:opacity-50",
+                "orbit-press inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-full text-[12px] font-medium disabled:cursor-not-allowed disabled:opacity-45",
                 isDeny
-                  ? "text-muted-foreground px-3 hover:bg-rose-500/[0.08] hover:text-rose-600 dark:hover:text-rose-400"
+                  ? "text-ink-tertiary hover:bg-signal-danger-bg hover:text-signal-danger px-3"
                   : isAlways
-                    ? "text-foreground/85 border border-black/[0.09] px-3 hover:bg-black/[0.04] dark:border-white/[0.11] dark:hover:bg-white/[0.06]"
-                    : "bg-[#141416] px-3.5 text-white hover:bg-[#27272A] dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white",
+                    ? "text-ink-primary border-border-default hover:bg-accent border px-3"
+                    : "bg-action-primary text-action-primary-fg px-3.5 hover:opacity-90",
               )}
             >
               <span>{label}</span>
               {isPrimaryAllow && (
-                <span className="ml-0.5 text-[11px] font-normal opacity-55">{mod}Y</span>
+                <ShortcutKbd keys={`${mod}Y`} size="xs" variant="inverted" className="ml-0.5" />
               )}
             </button>
           );
@@ -593,7 +655,7 @@ function StickyQuestionDockCard({
       }}
       className="approval-dock-surface orbit-dock-enter overflow-hidden rounded-[18px]"
     >
-      <div className="flex items-center justify-between gap-3 border-b border-black/[0.055] px-4 py-2.5 dark:border-white/[0.06]">
+      <div className="border-border-subtle flex items-center justify-between gap-3 border-b px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-2">
           <span className="size-1.5 shrink-0 rounded-full bg-amber-500/80" />
           <MessageCircleQuestion className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
@@ -630,7 +692,7 @@ function StickyQuestionDockCard({
                 key={q.id || qIdx}
                 className={cn(
                   "space-y-2",
-                  qIdx > 0 && "border-t border-black/[0.05] pt-3.5 dark:border-white/[0.055]",
+                  qIdx > 0 && "border-border-subtle border-t pt-3.5",
                 )}
               >
                 <div className="space-y-0.5">
@@ -654,7 +716,7 @@ function StickyQuestionDockCard({
                   )}
                 </div>
 
-                <div className="divide-y divide-black/[0.05] overflow-hidden rounded-[12px] border border-black/[0.07] dark:divide-white/[0.055] dark:border-white/[0.085]">
+                <div className="divide-border-subtle border-border-subtle divide-y overflow-hidden rounded-[12px] border">
                   {q.options.map((opt, optIdx) => {
                     const chosen = selections[qIdx]?.includes(opt) ?? false;
                     const { label, recommended } = formatOptionDisplay(opt);
@@ -677,15 +739,15 @@ function StickyQuestionDockCard({
                             "mt-[2.5px] flex size-[15px] shrink-0 items-center justify-center border transition-colors",
                             q.is_multi_select ? "rounded-[4px]" : "rounded-full",
                             chosen
-                              ? "border-[#141416] bg-[#141416] dark:border-[#F4F4F6] dark:bg-[#F4F4F6]"
-                              : "border-black/22 dark:border-white/25",
+                              ? "border-action-primary-bg bg-action-primary-bg"
+                              : "border-border-strong",
                           )}
                         >
                           {chosen &&
                             (q.is_multi_select ? (
-                              <Check className="size-2.5 stroke-[2.6] text-white dark:text-[#141416]" />
+                              <Check className="text-action-primary-fg size-2.5 stroke-[2.6]" />
                             ) : (
-                              <span className="size-[5px] rounded-full bg-white dark:bg-[#141416]" />
+                              <span className="bg-action-primary-fg size-[5px] rounded-full" />
                             ))}
                         </span>
                         <span className="min-w-0 flex-1 break-words">
@@ -757,40 +819,50 @@ function StickyQuestionDockCard({
         </div>
       </ScrollArea>
 
-      <div className="flex items-center justify-between gap-2 border-t border-black/[0.05] px-4 py-2.5 dark:border-white/[0.055]">
-        <span className="text-muted-foreground/70 text-[11.5px]">
-          {canSubmit
-            ? t("approval.submitShortcut", { shortcut: `${mod}↵` })
-            : t("approval.chooseOptionOrWrite")}
+      <div className="border-border-subtle flex items-center justify-between gap-2 border-t px-4 py-2.5">
+        <span className="text-ink-muted inline-flex items-center gap-1.5 text-[11.5px]">
+          {canSubmit ? (
+            <>
+              <ShortcutKbd keys={`${mod}↵`} size="xs" variant="subtle" />
+              <span>{t("common.submit")}</span>
+            </>
+          ) : (
+            t("approval.chooseOptionOrWrite")
+          )}
         </span>
-        <button
+        <Button
           type="button"
+          size="sm"
           disabled={!canSubmit || submitting}
           onClick={() => void handleSubmit()}
-          className="orbit-press inline-flex h-7.5 cursor-pointer items-center rounded-full bg-[#141416] px-3.5 text-[12.5px] font-medium text-white hover:bg-[#27272A] disabled:cursor-not-allowed disabled:opacity-35 dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
+          className="rounded-full px-3.5"
         >
           {submitting ? t("common.submitting") : t("common.submit")}
-        </button>
+        </Button>
       </div>
     </div>
   );
 }
 
-export const StickyApprovalDock = memo(
-  function StickyApprovalDock({
+const EMPTY_SUBAGENT_PERMS: readonly UnifiedPendingSubagentPermission[] = [];
+
+export const DecisionDock = memo(
+  function DecisionDock({
     hostId,
     agentId,
     cwd,
     permissions,
     questions,
+    subagentPermissions = EMPTY_SUBAGENT_PERMS,
   }: {
     hostId: string;
     agentId: string;
     cwd: string;
-    permissions: PendingPermissionItem[];
-    questions: PendingQuestionItem[];
+    permissions: readonly PendingPermissionItem[];
+    questions: readonly PendingQuestionItem[];
+    subagentPermissions?: readonly UnifiedPendingSubagentPermission[];
   }) {
-    const [focusedRequestId, setFocusedRequestId] = useState<string | null>(null);
+    const [focusedKey, setFocusedKey] = useState<string | null>(null);
     const [fallbackSlotIndex, setFallbackSlotIndex] = useState<number>(0);
 
     const queue = useMemo<QueuedDecision[]>(() => {
@@ -798,32 +870,70 @@ export const StickyApprovalDock = memo(
       const merged: QueuedDecision[] = [];
 
       for (const item of permissions) {
-        const key = `permission:${item.request_id}`;
+        const key = `permission:${hostId}:${agentId}:${item.request_id}`;
         if (!seen.has(key)) {
           seen.add(key);
-          merged.push({ kind: "permission", seq: item.seq, item });
+          merged.push({
+            kind: "permission",
+            queueKey: key,
+            seq: item.seq,
+            targetHostId: hostId,
+            targetAgentId: agentId,
+            requestId: item.request_id,
+            title: item.title,
+            detail: item.detail,
+            allowedDecisions: item.allowed_decisions,
+            guardianAssessment: item.guardian_assessment,
+          });
         }
       }
       for (const item of questions) {
-        const key = `question:${item.request_id}`;
+        const key = `question:${hostId}:${agentId}:${item.request_id}`;
         if (!seen.has(key)) {
           seen.add(key);
-          merged.push({ kind: "question", seq: item.seq, item });
+          merged.push({
+            kind: "question",
+            queueKey: key,
+            seq: item.seq,
+            targetHostId: hostId,
+            targetAgentId: agentId,
+            item,
+          });
+        }
+      }
+      for (const subPerm of subagentPermissions) {
+        const key = `subperm:${subPerm.key}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const ts = Date.parse(subPerm.permission.created_at);
+          merged.push({
+            kind: "permission",
+            queueKey: key,
+            seq: Number.isFinite(ts) ? ts : Number.MAX_SAFE_INTEGER,
+            targetHostId: subPerm.hostId,
+            targetAgentId: subPerm.agentId,
+            requestId: subPerm.permission.request_id,
+            title: subPerm.permission.title,
+            detail: subPerm.permission.detail,
+            allowedDecisions: subPerm.permission.allowed_decisions,
+            guardianAssessment: subPerm.permission.guardian_assessment,
+            subagent: subPerm.subagent,
+          });
         }
       }
 
       merged.sort((a, b) => a.seq - b.seq);
       return merged;
-    }, [permissions, questions]);
+    }, [hostId, agentId, permissions, questions, subagentPermissions]);
 
     const activeIndex = useMemo(() => {
       if (queue.length === 0) return 0;
-      if (focusedRequestId) {
-        const idx = queue.findIndex((entry) => entry.item.request_id === focusedRequestId);
+      if (focusedKey) {
+        const idx = queue.findIndex((entry) => entry.queueKey === focusedKey);
         if (idx >= 0) return idx;
       }
       return Math.min(Math.max(0, fallbackSlotIndex), queue.length - 1);
-    }, [queue, focusedRequestId, fallbackSlotIndex]);
+    }, [queue, focusedKey, fallbackSlotIndex]);
 
     const activeEntry = queue[activeIndex] ?? null;
 
@@ -832,10 +942,17 @@ export const StickyApprovalDock = memo(
         setFocusedDecisionTarget(null);
         return;
       }
-      setFocusedDecisionTarget({
-        kind: activeEntry.kind,
-        requestId: activeEntry.item.request_id,
-      });
+      if (activeEntry.kind === "permission") {
+        setFocusedDecisionTarget({
+          kind: "permission",
+          requestId: activeEntry.requestId,
+        });
+      } else {
+        setFocusedDecisionTarget({
+          kind: "question",
+          requestId: activeEntry.item.request_id,
+        });
+      }
       return () => {
         setFocusedDecisionTarget(null);
       };
@@ -847,19 +964,25 @@ export const StickyApprovalDock = memo(
       if (queue.length <= 1) return;
       const nextIdx = (activeIndex + delta + queue.length) % queue.length;
       setFallbackSlotIndex(nextIdx);
-      setFocusedRequestId(queue[nextIdx].item.request_id);
+      setFocusedKey(queue[nextIdx].queueKey);
     };
 
     return (
       <div className="w-full px-[24px] pb-2.5">
-        <div className="mx-auto w-full max-w-[var(--orbit-stage-max-w,768px)]">
+        <div className="mx-auto w-full max-w-[var(--orbit-stage-max-w,740px)]">
           {activeEntry.kind === "permission" ? (
             <PermissionApprovalCard
-              key={activeEntry.item.request_id}
-              hostId={hostId}
-              agentId={agentId}
+              key={activeEntry.queueKey}
+              hostId={activeEntry.targetHostId}
+              agentId={activeEntry.targetAgentId}
+              parentAgentId={agentId}
               cwd={cwd}
-              perm={activeEntry.item}
+              requestId={activeEntry.requestId}
+              title={activeEntry.title}
+              detail={activeEntry.detail}
+              allowedDecisions={activeEntry.allowedDecisions}
+              guardianAssessment={activeEntry.guardianAssessment}
+              subagent={activeEntry.subagent}
               queueIndex={activeIndex}
               queueTotal={queue.length}
               onStepPrev={() => handleStep(-1)}
@@ -867,9 +990,9 @@ export const StickyApprovalDock = memo(
             />
           ) : (
             <StickyQuestionDockCard
-              key={activeEntry.item.request_id}
-              hostId={hostId}
-              agentId={agentId}
+              key={activeEntry.queueKey}
+              hostId={activeEntry.targetHostId}
+              agentId={activeEntry.targetAgentId}
               requestId={activeEntry.item.request_id}
               questions={activeEntry.item.questions}
               queueIndex={activeIndex}
@@ -888,6 +1011,12 @@ export const StickyApprovalDock = memo(
     prev.cwd === next.cwd &&
     prev.permissions.length === next.permissions.length &&
     prev.questions.length === next.questions.length &&
+    (prev.subagentPermissions?.length ?? 0) === (next.subagentPermissions?.length ?? 0) &&
     prev.permissions.every((p, i) => p.request_id === next.permissions[i]?.request_id) &&
-    prev.questions.every((q, i) => q.request_id === next.questions[i]?.request_id),
+    prev.questions.every((q, i) => q.request_id === next.questions[i]?.request_id) &&
+    (prev.subagentPermissions ?? EMPTY_SUBAGENT_PERMS).every(
+      (sp, i) => sp.key === next.subagentPermissions?.[i]?.key,
+    ),
 );
+
+export const StickyApprovalDock = DecisionDock;

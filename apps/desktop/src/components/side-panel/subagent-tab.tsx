@@ -9,7 +9,9 @@ import {
   type PromptImagePreviewTarget,
   TurnStageSection,
 } from "@/components/stage/stream-stage";
+import { ContextBanner } from "@/components/ui/context-banner";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { SubagentAvatar } from "@/components/ui/subagent-avatar";
 import { type SessionSubagentEntryView, type StageTurnView, orbitIpc } from "@/lib/orbit-ipc";
 import { computeSubagentTurnsFingerprint } from "@/lib/stage-cache";
 import {
@@ -510,34 +512,40 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const showInlineContextBar = needsApproval || Boolean(remoteHostName);
 
   return (
-    <div className="orbit-stage-enter bg-canvas flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div className="orbit-stage-enter bg-surface-base flex min-h-0 flex-1 flex-col overflow-hidden">
       {showInlineContextBar && (
-        <div className="flex h-[30px] shrink-0 items-center justify-between gap-2 border-b border-black/[0.055] px-3.5 text-[12px] dark:border-white/[0.06]">
-          <div className="flex min-w-0 items-center gap-2">
-            {needsApproval && (
-              <span className="inline-flex items-center gap-1.5 font-medium text-amber-600/90 dark:text-amber-400/90">
-                <span className="size-[6px] rounded-full bg-amber-500 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]" />
-                <span>Approval required</span>
-              </span>
-            )}
+        <ContextBanner
+          variant="strip"
+          tone={needsApproval ? "warning" : "neutral"}
+          icon={
+            <SubagentAvatar
+              seedKey={tab.childAgentId || tab.providerSubagentId || tab.subagentCallId || tab.title}
+              status={status}
+              size="xs"
+            />
+          }
+          actions={
+            needsApproval ? (
+              <button
+                type="button"
+                onClick={handleOpenThread}
+                className="text-signal-warning hover:bg-signal-warning-bg inline-flex h-[22px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11px] font-medium transition-colors"
+              >
+                <span>Review</span>
+                <ArrowUpRight className="size-3" />
+              </button>
+            ) : undefined
+          }
+        >
+          <span className="inline-flex items-center gap-2">
+            {needsApproval && <span className="font-medium">Approval required</span>}
             {remoteHostName && (
-              <span className="text-muted-foreground/75 inline-flex max-w-[180px] items-center truncate rounded-full bg-black/[0.04] px-2 py-0.5 text-[11px] leading-none dark:bg-white/[0.07]">
+              <span className="bg-surface-recessed text-ink-tertiary border-border-subtle inline-flex max-w-[180px] items-center truncate rounded-[6px] border px-1.5 py-0.5 text-[11px] leading-none">
                 {remoteHostName}
               </span>
             )}
-          </div>
-
-          {needsApproval && (
-            <button
-              type="button"
-              onClick={handleOpenThread}
-              className="inline-flex h-[22px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11.5px] font-medium text-amber-700 transition-colors hover:bg-amber-500/12 dark:text-amber-300"
-            >
-              <span>Review</span>
-              <ArrowUpRight className="size-[12px]" />
-            </button>
-          )}
-        </div>
+          </span>
+        </ContextBanner>
       )}
 
       {/* Main Conversation Stream Parity (identical TurnStageSection, spacing, and typography; no Composer) */}
@@ -550,7 +558,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
         stickToBottomRef={stickToBottomRef}
         viewportClassName="px-6 pt-6 pb-11"
       >
-        <div className="orbit-stage-enter mx-auto w-full min-w-0 max-w-[768px]">
+        <div className="orbit-stage-enter mx-auto w-full min-w-0 max-w-[740px]">
           {displayTurns.length > 0 ? (
             <div className="space-y-[32px]">
               {displayTurns.map((turn, idx) => {

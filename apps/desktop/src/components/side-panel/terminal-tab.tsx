@@ -4,6 +4,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
@@ -80,12 +81,12 @@ export const TerminalTab = memo(function TerminalTab({
   return (
     <div
       className={cn(
-        "bg-canvas flex min-h-0 flex-1 flex-col overflow-hidden select-none dark:bg-[#0B0E14]",
+        "bg-surface-recessed flex min-h-0 flex-1 flex-col overflow-hidden select-none",
         !visible && "hidden",
       )}
     >
-      {/* Compact PTY Session Sub-Bar */}
-      <div className="border-border/70 bg-canvas flex h-[38px] shrink-0 items-center justify-between gap-1.5 border-b px-3 dark:bg-[#0E121A]">
+      {/* Compact PTY Session Sub-Bar — seamless with Workbench chrome */}
+      <div className="border-border-subtle bg-surface-base flex h-[36px] shrink-0 items-center justify-between gap-1.5 border-b px-2.5">
         <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
           {hostTabs.map((tab) => {
             const active = tab.key === activeTerminalTabKey;
@@ -94,16 +95,16 @@ export const TerminalTab = memo(function TerminalTab({
                 key={tab.key}
                 onClick={() => orbitActions.setActiveTerminalTab(tab.key)}
                 className={cn(
-                  "group inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[11.5px] transition-colors",
+                  "group inline-flex h-[24px] cursor-pointer items-center gap-1.5 rounded-[7px] border px-2 text-[11px] transition-colors",
                   active
-                    ? "border-border bg-elevated text-foreground font-medium shadow-2xs dark:bg-white/[0.07]"
-                    : "text-muted-foreground hover:bg-accent/60 hover:text-foreground border-transparent",
+                    ? "border-border-default bg-surface-raised text-ink-primary font-medium"
+                    : "text-ink-tertiary hover:bg-accent hover:text-ink-primary border-transparent",
                 )}
               >
                 <span
                   className={cn(
-                    "h-1.5 w-1.5 shrink-0 rounded-full",
-                    active ? "bg-emerald-500" : "bg-muted-foreground/40",
+                    "size-1.5 shrink-0 rounded-full",
+                    active ? "bg-signal-success" : "bg-ink-muted/50",
                   )}
                 />
                 <span className="max-w-36 truncate font-mono">
@@ -150,25 +151,27 @@ export const TerminalTab = memo(function TerminalTab({
                   <ChevronDown className="h-[11.5px] w-[11.5px]" />
                 </button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" className="w-56">
-                <DropdownMenuLabel>Surviving Shim Shells</DropdownMenuLabel>
-                {detachedTerminals.map((t) => (
-                  <DropdownMenuItem
-                    key={t.terminal_id}
-                    onSelect={() =>
-                      orbitActions.attachExistingTerminal(
-                        selectedHostId,
-                        t.terminal_id,
-                        t.cwd,
-                        t.title,
-                      )
-                    }
-                  >
-                    <span className="truncate font-mono text-[12px]">
-                      {t.title} · {shortDir(t.cwd)}
-                    </span>
-                  </DropdownMenuItem>
-                ))}
+              <DropdownMenuContent align="start" className="min-w-[208px] max-w-[280px]">
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel>Surviving Shim Shells</DropdownMenuLabel>
+                  {detachedTerminals.map((t) => (
+                    <DropdownMenuItem
+                      key={t.terminal_id}
+                      onSelect={() =>
+                        orbitActions.attachExistingTerminal(
+                          selectedHostId,
+                          t.terminal_id,
+                          t.cwd,
+                          t.title,
+                        )
+                      }
+                    >
+                      <span className="truncate font-mono text-[12px]">
+                        {t.title} · {shortDir(t.cwd)}
+                      </span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuGroup>
               </DropdownMenuContent>
             </DropdownMenu>
           )}

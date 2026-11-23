@@ -2,6 +2,7 @@ import { memo, useMemo } from "react";
 import { AlertTriangle } from "lucide-react";
 import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { AgentMessageCard } from "@/components/stage/subagents-track";
+import { ContextBanner } from "@/components/ui/context-banner";
 import type {
   ArtifactSummary,
   PromptBadge,
@@ -19,7 +20,6 @@ import {
   splitStepGroupChronologically,
   summarizeWorkChunk,
 } from "@/lib/turn-delegation-split";
-import { cn } from "@/lib/utils";
 import { useOrbitSelector } from "@/state/orbit-store";
 import {
   EMPTY_ARTIFACTS,
@@ -55,33 +55,19 @@ const StageNoticeSegment = memo(function StageNoticeSegment({
 }: {
   item: Extract<TimelineItemView, { item_type: "notice" }>;
 }) {
-  const isError = item.level === "error";
-  const isWarning = item.level === "warning";
+  const tone =
+    item.level === "error" ? "danger" : item.level === "warning" ? "warning" : "neutral";
   return (
-    <div
-      className={cn(
-        "flex items-start gap-2 rounded-xl border px-3.5 py-2 text-[13px] leading-[1.45]",
-        isError
-          ? "border-rose-500/30 bg-rose-500/[0.07] text-rose-700 dark:text-rose-300"
-          : isWarning
-            ? "border-amber-500/30 bg-amber-500/[0.07] text-amber-800 dark:text-amber-200"
-            : "text-muted-foreground border-border bg-muted/50",
-      )}
+    <ContextBanner
+      variant="inline"
+      tone={tone}
+      icon={<AlertTriangle className="size-3.5 shrink-0" />}
+      className="items-start py-2 text-[13px]"
     >
-      <AlertTriangle
-        className={cn(
-          "mt-[2px] size-4 shrink-0",
-          isError
-            ? "text-rose-600 dark:text-rose-400"
-            : isWarning
-              ? "text-amber-600 dark:text-amber-400"
-              : "text-muted-foreground",
-        )}
-      />
       <span className="selectable-text min-w-0 whitespace-pre-wrap break-words">
         {item.message}
       </span>
-    </div>
+    </ContextBanner>
   );
 });
 
@@ -308,7 +294,12 @@ export const TurnStageSection = memo(function TurnStageSection({
       )}
 
       {turn.agent_message?.item_type === "agent_message" && (
-        <AgentMessageCard hostId={hostId} agentId={agentId} item={turn.agent_message} />
+        <AgentMessageCard
+          hostId={hostId}
+          agentId={agentId}
+          item={turn.agent_message}
+          sessionSubagents={sessionSubagents}
+        />
       )}
 
       {hasBody && (
@@ -357,6 +348,7 @@ export const TurnStageSection = memo(function TurnStageSection({
                       agentId={agentId}
                       item={seg.item}
                       inline
+                      sessionSubagents={sessionSubagents}
                     />
                   );
                 }

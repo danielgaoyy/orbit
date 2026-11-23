@@ -31,8 +31,11 @@ import {
   semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Textarea } from "@/components/ui/textarea";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -554,7 +557,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
 
           {editingGoal ? (
             <div className="space-y-2">
-              <input
+              <Input
                 autoFocus
                 value={goalDraft}
                 onChange={(e) => setGoalDraft(e.target.value)}
@@ -565,24 +568,20 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   if (e.key === "Escape") setEditingGoal(false);
                 }}
                 placeholder="Describe the shared goal for this group…"
-                className="border-border bg-canvas text-foreground w-full rounded-md border px-2.5 py-1.5 text-[12.5px] outline-none"
               />
               <div className="flex justify-end gap-1.5">
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="xs"
                   onClick={() => setEditingGoal(false)}
-                  className="text-muted-foreground hover:text-foreground cursor-pointer px-2 py-0.5 text-[11.5px]"
                 >
                   Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleSaveGoal()}
-                  className="bg-foreground text-background inline-flex cursor-pointer items-center gap-1 rounded-md px-2.5 py-0.5 text-[11.5px] font-medium"
-                >
+                </Button>
+                <Button type="button" size="xs" onClick={() => void handleSaveGoal()}>
                   <Check className="h-[11px] w-[11px]" />
                   <span>Save</span>
-                </button>
+                </Button>
               </div>
             </div>
           ) : (
@@ -717,29 +716,30 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
 
           {editingBoard ? (
             <div className="space-y-2">
-              <textarea
+              <Textarea
                 rows={12}
                 value={boardDraft}
                 onChange={(e) => setBoardDraft(e.target.value)}
                 placeholder={"## Decisions & Contracts\n- ...\n\n## Tasks\n- ...\n\n## Findings\n- ..."}
-                className="border-border bg-canvas text-foreground w-full rounded-xl border p-3 font-mono text-[12px] leading-relaxed outline-none"
+                className="p-3 font-mono text-[12px] leading-relaxed"
               />
               <div className="flex justify-end gap-2">
-                <button
+                <Button
                   type="button"
+                  variant="outline"
+                  size="sm"
                   onClick={() => {
                     setBoardDraft(board?.content ?? "");
                     setEditingBoard(false);
                   }}
-                  className="border-border hover:bg-accent cursor-pointer rounded-lg border px-2.5 py-1 text-[12px]"
                 >
                   Cancel
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
+                  size="sm"
                   disabled={savingBoard}
                   onClick={() => void handleSaveBoard()}
-                  className="bg-foreground text-background inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-3 py-1 text-[12px] font-medium disabled:opacity-40"
                 >
                   {savingBoard ? (
                     <Loader2 className="h-[12px] w-[12px] animate-spin" />
@@ -747,7 +747,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                     <Save className="h-[12px] w-[12px]" />
                   )}
                   <span>Save</span>
-                </button>
+                </Button>
               </div>
             </div>
           ) : parsedDoc.sections.length > 0 ? (

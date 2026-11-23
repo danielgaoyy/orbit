@@ -8,10 +8,12 @@ import {
   useState,
 } from "react";
 import {
+  BarChart3,
   Bell,
   Check,
   ChevronsUpDown,
   Cpu,
+  FileText,
   Palette,
   Plug,
   Plus,
@@ -40,6 +42,7 @@ import { InstructionsSection } from "@/components/settings/instructions-section"
 import { NotificationsSection } from "@/components/settings/notifications-section";
 import {
   SETTINGS_CORE_SECTIONS,
+  SETTINGS_NAV_GROUPS,
   type SettingsCoreSectionId,
   type SettingsSearchResult,
   type SettingsSubTabId,
@@ -55,9 +58,13 @@ import {
 } from "@/components/settings/settings-primitives";
 import { ShortcutsSection } from "@/components/settings/shortcuts-section";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/dialog-tabs";
+import { IconButton } from "@/components/ui/icon-button";
+import { Input } from "@/components/ui/input";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
@@ -81,10 +88,12 @@ const CORE_SECTION_ICONS: Record<
 > = {
   general: Settings2,
   appearance: Palette,
+  notifications_sync: Bell,
   hosts: Server,
   agents: Cpu,
-  extensions: Plug,
-  notifications_sync: Bell,
+  usage: BarChart3,
+  instructions_rules: FileText,
+  capabilities: Plug,
 };
 
 function orderHostsLocalFirst(hosts: HostCardView[]): HostCardView[] {
@@ -129,14 +138,19 @@ function SettingsRailButton({
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 text-left text-[13px] transition-colors",
+        "flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2.5 text-left text-[13px] transition-colors",
         active
-          ? "bg-black/[0.06] text-foreground font-medium dark:bg-white/[0.085]"
-          : "text-foreground/76 hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
+          ? "bg-accent text-ink-primary font-medium"
+          : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
       )}
     >
       <span className="flex min-w-0 items-center gap-2.5">
-        <Icon className="h-[14.5px] w-[14.5px] shrink-0 stroke-[1.75] opacity-80" />
+        <Icon
+          className={cn(
+            "h-[14px] w-[14px] shrink-0 stroke-[1.75]",
+            active ? "text-ink-primary" : "text-ink-muted",
+          )}
+        />
         <span className="truncate">{label}</span>
       </span>
       {badge}
@@ -158,7 +172,7 @@ function SettingsSubTabBar({
   if (tabs.length <= 1) return null;
 
   return (
-    <div className="shrink-0 border-b border-black/[0.06] py-3 pr-14 pl-8 dark:border-white/[0.07]">
+    <div className="border-border-subtle shrink-0 border-b py-3 pr-14 pl-8">
       <Tabs
         value={activeId}
         onValueChange={(value) => {
@@ -169,17 +183,17 @@ function SettingsSubTabBar({
       >
         <TabsList
           aria-label={ariaLabel}
-          className="h-auto min-h-[30px] max-w-full flex-wrap justify-start gap-0.5 rounded-[9px] bg-black/[0.045] p-[3px] dark:bg-white/[0.06]"
+          className="bg-surface-recessed border-border-subtle/70 h-auto min-h-[30px] max-w-full flex-wrap justify-start gap-0.5 rounded-[9px] border p-[3px]"
         >
           {tabs.map((tab) => (
             <TabsTrigger
               key={tab.id}
               value={tab.id}
-              className="text-muted-foreground hover:text-foreground data-[active]:bg-background data-[active]:text-foreground h-[24px] rounded-[6.5px] px-2.5 py-0 text-[12px] font-medium transition-colors data-[active]:shadow-2xs"
+              className="text-ink-muted hover:text-ink-primary data-[active]:bg-surface-raised data-[active]:text-ink-primary h-[24px] rounded-[6px] px-2.5 py-0 text-[12px] font-medium transition-colors data-[active]:shadow-2xs"
             >
               <span>{tab.label}</span>
               {tab.count !== undefined && tab.count > 0 && (
-                <span className="text-muted-foreground/75 text-[10.5px] font-normal tabular-nums">
+                <span className="text-ink-faint text-[11px] font-normal tabular-nums">
                   {tab.count}
                 </span>
               )}
@@ -256,7 +270,6 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
     () => parsedHost?.hostId ?? selectedHostId ?? orderedHosts[0]?.host_id ?? null,
   );
 
-  // Sync picked host whenever navigated directly into a host tab
   useEffect(() => {
     if (parsedHost?.hostId && orderedHosts.some((h) => h.host_id === parsedHost.hostId)) {
       setPickedHostId(parsedHost.hostId);
@@ -414,7 +427,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
   const renderCoreBadge = (id: SettingsCoreSectionId) => {
     if (id === "notifications_sync" && archivedCount > 0) {
       return (
-        <span className="text-muted-foreground/70 shrink-0 text-[11px] tabular-nums">
+        <span className="text-ink-faint shrink-0 font-mono text-[11px] tabular-nums">
           {archivedCount}
         </span>
       );
@@ -425,6 +438,8 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
   const subTabsAriaLabel = t("settings.subTabsAria", {
     section: t(activeCoreSpec.labelKey),
   });
+
+  const isWidePanel = resolvedHost?.tab === "usage";
 
   return (
     <div
@@ -439,7 +454,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
           : "orbit-backdrop-in 195ms var(--ease-out-quart)",
       }}
       className={cn(
-        "fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6 backdrop-blur-[2px] select-none",
+        "fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-5 backdrop-blur-[3px] select-none",
         closing && "pointer-events-none",
       )}
     >
@@ -452,27 +467,27 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
             ? "orbit-modal-card-out 155ms var(--ease-exit) forwards"
             : "orbit-modal-card-in 210ms var(--ease-out-expo)",
         }}
-        className="border-border bg-elevated text-foreground floating-surface relative flex h-[min(720px,86vh)] w-[min(1020px,92vw)] overflow-hidden rounded-[18px] border"
+        className="border-border-default bg-surface-base text-ink-primary floating-surface relative flex h-[min(760px,88vh)] w-[min(1100px,94vw)] overflow-hidden rounded-[16px] border"
       >
-        <button
-          type="button"
-          aria-label={t("settings.closeSettings")}
+        <IconButton
+          size="md"
+          tooltip={t("settings.closeSettings")}
           onClick={() => orbitActions.closeSettings()}
-          className="text-muted-foreground hover:text-foreground hover:bg-accent absolute top-3 right-4 z-10 inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-[9px] transition-colors"
+          className="absolute top-3 right-3.5 z-10"
         >
-          <X className="h-[15.5px] w-[15.5px]" />
-        </button>
+          <X className="h-[15px] w-[15px]" />
+        </IconButton>
 
-        {/* Left Settings Rail (244px): Restrained 6 Core Sections + Instant Filter Search */}
-        <aside className="border-border bg-sidebar/75 flex w-[244px] shrink-0 flex-col border-r py-4">
-          <div className="px-5 pb-3 text-[14.5px] font-semibold tracking-[-0.01em]">
+        {/* Left Settings Rail (236px): 3 Domain Groups (App / Host / Workspace) + Search */}
+        <aside className="border-border-subtle bg-surface-recessed/70 flex w-[236px] shrink-0 flex-col border-r py-4">
+          <div className="px-4 pb-3 text-[14px] font-semibold tracking-[-0.015em]">
             {t("settings.title")}
           </div>
 
           <div className="mb-3 px-3">
-            <div className="relative px-0.5">
-              <Search className="text-muted-foreground/65 pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 stroke-[1.8]" />
-              <input
+            <div className="group/search relative">
+              <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 stroke-[1.8]" />
+              <Input
                 ref={searchInputRef}
                 type="text"
                 value={filterQuery}
@@ -482,7 +497,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                 onKeyDown={handleSearchKeyDown}
                 placeholder={t("settings.searchPlaceholder")}
                 aria-label={t("settings.searchAria")}
-                className="border-border/75 bg-background/65 text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/25 h-[30px] w-full rounded-[8px] border pr-8 pl-7.5 text-[12px] outline-none transition-colors"
+                className="h-[30px] pr-11 pl-7.5 text-[12px] shadow-none"
               />
               {filterQuery ? (
                 <button
@@ -492,29 +507,29 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                     setFilterQuery("");
                     searchInputRef.current?.focus();
                   }}
-                  className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2 cursor-pointer rounded p-0.5 transition-colors"
+                  className="text-ink-muted hover:text-ink-primary absolute top-1/2 right-2 -translate-y-1/2 cursor-pointer rounded p-0.5 transition-colors"
                 >
                   <X className="size-3" />
                 </button>
               ) : (
                 !searchFocused && (
-                  <span
-                    aria-hidden="true"
-                    className="text-muted-foreground/50 pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 text-[10.5px] font-medium"
-                  >
-                    {mod}F
-                  </span>
+                  <ShortcutKbd
+                    keys={`${mod}F`}
+                    size="xs"
+                    variant="subtle"
+                    className="pointer-events-none absolute top-1/2 right-1.5 -translate-y-1/2 opacity-0 transition-opacity group-hover/search:opacity-100"
+                  />
                 )
               )}
             </div>
           </div>
 
-          <ScrollArea className="min-h-0 flex-1" viewportClassName="px-3 pb-1">
+          <ScrollArea className="min-h-0 flex-1" viewportClassName="px-3 pb-2">
             {isSearching ? (
               <div className="space-y-1">
                 {searchResults.length > 0 ? (
                   <>
-                    <div className="text-muted-foreground/70 px-2.5 pb-0.5 text-[11px] font-medium">
+                    <div className="text-ink-faint px-2.5 pb-1 text-[10.5px] font-semibold tracking-[0.05em] uppercase">
                       {t("settings.searchResultsLabel")}
                     </div>
                     <nav className="space-y-0.5">
@@ -532,14 +547,14 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                             onMouseEnter={() => setSelectedSearchIndex(idx)}
                             onClick={() => handleJumpToSearchResult(result)}
                             className={cn(
-                              "flex w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 py-1.5 text-left transition-colors",
+                              "flex w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2.5 py-1.5 text-left transition-colors",
                               isHighlighted || isActiveDest
-                                ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
-                                : "text-foreground/80 hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
+                                ? "bg-accent text-ink-primary"
+                                : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
                             )}
                           >
                             <span className="flex min-w-0 items-center gap-2.5">
-                              <Icon className="h-[14px] w-[14px] shrink-0 stroke-[1.75] opacity-75" />
+                              <Icon className="text-ink-muted h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
                               <span className="min-w-0">
                                 <span
                                   className={cn(
@@ -550,14 +565,14 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                                   {t(result.labelKey)}
                                 </span>
                                 {result.parentLabelKey && (
-                                  <span className="text-muted-foreground/75 block truncate text-[11px] leading-tight">
+                                  <span className="text-ink-faint block truncate text-[11px] leading-tight">
                                     {t(result.parentLabelKey)}
                                   </span>
                                 )}
                               </span>
                             </span>
                             {result.subTab === "archived" && archivedCount > 0 && (
-                              <span className="text-muted-foreground/70 shrink-0 text-[11px] tabular-nums">
+                              <span className="text-ink-faint shrink-0 font-mono text-[11px] tabular-nums">
                                 {archivedCount}
                               </span>
                             )}
@@ -567,112 +582,126 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                     </nav>
                   </>
                 ) : (
-                  <div className="text-muted-foreground/75 px-2.5 py-8 text-center text-[12px]">
+                  <div className="text-ink-muted px-2.5 py-8 text-center text-[12px]">
                     {t("settings.noMatches")}
                   </div>
                 )}
               </div>
             ) : (
-              <nav className="space-y-1">
-                {SETTINGS_CORE_SECTIONS.map((item) => (
-                  <SettingsRailButton
-                    key={item.id}
-                    label={t(item.labelKey)}
-                    icon={CORE_SECTION_ICONS[item.id]}
-                    active={activeCoreSection === item.id}
-                    badge={renderCoreBadge(item.id)}
-                    onClick={() => navigateCoreSection(item.id)}
-                  />
-                ))}
+              <nav className="space-y-4">
+                {SETTINGS_NAV_GROUPS.map((group) => {
+                  const groupItems = SETTINGS_CORE_SECTIONS.filter(
+                    (item) => item.group === group.id,
+                  );
+                  return (
+                    <div key={group.id} className="space-y-1">
+                      <div className="text-ink-faint px-2.5 pb-0.5 text-[10.5px] font-semibold tracking-[0.06em] uppercase">
+                        {t(group.labelKey)}
+                      </div>
 
-                {/* Multi-host selector appears cleanly below the 6 core sections only when multiple/remote hosts exist */}
-                {isMultiOrRemoteMode && activeHost && (
-                  <div className="border-border/60 mt-4 border-t pt-3.5">
-                    <div className="text-muted-foreground/70 px-2.5 pb-1.5 text-[11px] font-medium">
-                      {t("settings.hostScope")}
-                    </div>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          type="button"
-                          aria-label={t("settings.switchHost")}
-                          className="border-border/80 bg-background/70 hover:bg-accent/70 focus-visible:ring-foreground/20 flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] border px-2.5 text-left transition-colors outline-none focus-visible:ring-1"
-                        >
-                          <span className="flex min-w-0 flex-1 items-center gap-2">
-                            <HostStatusIndicator state={activeHost.connection_state} />
-                            <span className="text-foreground truncate text-[12.5px] font-medium">
-                              {activeHost.display_name}
-                            </span>
-                            {isLocalHostCard(activeHost) && (
-                              <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium">
-                                {t("common.local")}
-                              </span>
-                            )}
-                          </span>
-                          <ChevronsUpDown className="text-muted-foreground/75 h-[13px] w-[13px] shrink-0" />
-                        </button>
-                      </DropdownMenuTrigger>
-
-                      <DropdownMenuContent
-                        align="start"
-                        sideOffset={5}
-                        finalFocus={false}
-                        className="w-[220px] p-1.5"
-                      >
-                        {orderedHosts.map((host) => {
-                          const selected = host.host_id === activeHost.host_id;
-                          return (
-                            <DropdownMenuItem
-                              key={host.host_id}
-                              onSelect={() => handleSelectHost(host.host_id)}
-                              className="items-center py-1.5"
-                            >
-                              <span className="flex min-w-0 flex-1 items-center gap-2.5">
-                                <HostStatusIndicator state={host.connection_state} />
-                                <span className="min-w-0 flex-1">
-                                  <span
-                                    className={cn(
-                                      "block truncate text-[12.5px]",
-                                      selected
-                                        ? "text-foreground font-medium"
-                                        : "text-foreground/90 font-normal",
-                                    )}
-                                  >
-                                    {host.display_name}
+                      {/* Multi-host selector lives right at the top of the HOST group */}
+                      {group.id === "host" && isMultiOrRemoteMode && activeHost && (
+                        <div className="pb-1">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <button
+                                type="button"
+                                aria-label={t("settings.switchHost")}
+                                className="border-border-subtle bg-surface-base hover:bg-accent/50 focus-visible:ring-border-strong flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] border px-2.5 text-left transition-colors outline-none focus-visible:ring-1"
+                              >
+                                <span className="flex min-w-0 flex-1 items-center gap-2">
+                                  <HostStatusIndicator state={activeHost.connection_state} />
+                                  <span className="text-ink-primary truncate text-[12px] font-medium">
+                                    {activeHost.display_name}
                                   </span>
-                                  <span className="text-muted-foreground block truncate text-[11px]">
-                                    {formatHostTransportSubtitle(host, t)}
-                                  </span>
+                                  {isLocalHostCard(activeHost) && (
+                                    <span className="bg-surface-recessed text-ink-muted shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium">
+                                      {t("common.local")}
+                                    </span>
+                                  )}
                                 </span>
-                              </span>
-                              {selected && (
-                                <Check className="text-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[2]" />
-                              )}
-                            </DropdownMenuItem>
-                          );
-                        })}
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          onSelect={() => orbitActions.setSettingsSection("add_host")}
-                        >
-                          <span className="flex items-center gap-2">
-                            <Plus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.85]" />
-                            <span className="text-[12.5px]">{t("settings.connectHost")}</span>
-                          </span>
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                )}
+                                <ChevronsUpDown className="text-ink-faint h-[12.5px] w-[12.5px] shrink-0" />
+                              </button>
+                            </DropdownMenuTrigger>
+
+                            <DropdownMenuContent
+                              align="start"
+                              sideOffset={5}
+                              finalFocus={false}
+                              className="min-w-[212px] max-w-[260px]"
+                            >
+                              <DropdownMenuGroup>
+                                {orderedHosts.map((host) => {
+                                  const selected = host.host_id === activeHost.host_id;
+                                  return (
+                                    <DropdownMenuItem
+                                      key={host.host_id}
+                                      onSelect={() => handleSelectHost(host.host_id)}
+                                      className="items-center py-1.5"
+                                    >
+                                      <span className="flex min-w-0 flex-1 items-center gap-2.5">
+                                        <HostStatusIndicator state={host.connection_state} />
+                                        <span className="min-w-0 flex-1">
+                                          <span
+                                            className={cn(
+                                              "block truncate text-[12.5px]",
+                                              selected
+                                                ? "text-ink-primary font-medium"
+                                                : "text-ink-secondary font-normal",
+                                            )}
+                                          >
+                                            {host.display_name}
+                                          </span>
+                                          <span className="text-ink-faint block truncate text-[11px]">
+                                            {formatHostTransportSubtitle(host, t)}
+                                          </span>
+                                        </span>
+                                      </span>
+                                      {selected && (
+                                        <Check className="text-ink-primary h-[13px] w-[13px] shrink-0 stroke-[2]" />
+                                      )}
+                                    </DropdownMenuItem>
+                                  );
+                                })}
+                              </DropdownMenuGroup>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuGroup>
+                                <DropdownMenuItem
+                                  onSelect={() => orbitActions.setSettingsSection("add_host")}
+                                >
+                                  <span className="flex items-center gap-2 whitespace-nowrap">
+                                    <Plus className="text-ink-muted size-[13px] stroke-[1.85]" />
+                                    <span>{t("settings.connectHost")}</span>
+                                  </span>
+                                </DropdownMenuItem>
+                              </DropdownMenuGroup>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
+                      )}
+
+                      <div className="space-y-0.5">
+                        {groupItems.map((item) => (
+                          <SettingsRailButton
+                            key={item.id}
+                            label={t(item.labelKey)}
+                            icon={CORE_SECTION_ICONS[item.id]}
+                            active={activeCoreSection === item.id}
+                            badge={renderCoreBadge(item.id)}
+                            onClick={() => navigateCoreSection(item.id)}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
               </nav>
             )}
           </ScrollArea>
-
-          <div className="text-muted-foreground/65 px-5 pt-2 text-[11.5px]">Orbit</div>
         </aside>
 
         {/* Right Settings Content Area */}
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="bg-surface-base flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           {activeSubTabId && visibleSubTabs.length > 1 && (
             <SettingsSubTabBar
               ariaLabel={subTabsAriaLabel}
@@ -691,8 +720,14 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               </div>
             </div>
           ) : (
-            <ScrollArea className="min-h-0 flex-1" viewportClassName="px-9 py-6">
-              <div key={section} className="orbit-stage-enter mx-auto w-full max-w-[660px] pb-8">
+            <ScrollArea className="min-h-0 flex-1" viewportClassName="px-8 py-6">
+              <div
+                key={section}
+                className={cn(
+                  "orbit-stage-enter mx-auto w-full pb-8",
+                  isWidePanel ? "max-w-[840px]" : "max-w-[680px]",
+                )}
+              >
                 <PanelErrorBoundary panelName={activePanelName}>
                   {section === "general" && <GeneralSection />}
                   {section === "shortcuts" && <ShortcutsSection />}
@@ -706,7 +741,10 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                     <HostConnectionSection hostId={resolvedHost.hostId} />
                   )}
                   {resolvedHost?.tab === "im_channels" && (
-                    <HostImChannelsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                    <HostImChannelsSection
+                      key={resolvedHost.hostId}
+                      hostId={resolvedHost.hostId}
+                    />
                   )}
                   {resolvedHost?.tab === "agents" && (
                     <HostAgentsSection hostId={resolvedHost.hostId} />
@@ -715,22 +753,34 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                     <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
                   )}
                   {resolvedHost?.tab === "guardian" && (
-                    <HostGuardianSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                    <HostGuardianSection
+                      key={resolvedHost.hostId}
+                      hostId={resolvedHost.hostId}
+                    />
                   )}
                   {resolvedHost?.tab === "usage" && (
                     <HostUsageSection hostId={resolvedHost.hostId} />
                   )}
                   {resolvedHost?.tab === "rules" && (
-                    <HostRulesSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                    <HostRulesSection
+                      key={resolvedHost.hostId}
+                      hostId={resolvedHost.hostId}
+                    />
                   )}
                   {resolvedHost?.tab === "skills" && (
-                    <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                    <HostSkillsSection
+                      key={resolvedHost.hostId}
+                      hostId={resolvedHost.hostId}
+                    />
                   )}
                   {resolvedHost?.tab === "mcp" && (
                     <HostMcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
                   )}
                   {resolvedHost?.tab === "hooks" && (
-                    <HostHooksSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                    <HostHooksSection
+                      key={resolvedHost.hostId}
+                      hostId={resolvedHost.hostId}
+                    />
                   )}
                   {resolvedHost?.tab === "lsp" && (
                     <HostLspSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />

@@ -20,7 +20,9 @@ import {
   SettingSectionHeader,
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Input } from "@/components/ui/input";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import {
@@ -322,7 +324,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           </p>
 
           <div className="flex gap-2">
-            <input
+            <Input
               type="text"
               value={relayInput}
               onChange={(e) => setRelayInput(e.target.value)}
@@ -332,24 +334,25 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                 if (e.key === "Enter" && relayDirty) void handleSaveRelay(false);
               }}
               placeholder="wss://relay.example.com"
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground h-[34px] flex-1 rounded-lg border px-3 font-mono text-[12.5px] outline-none focus:border-foreground/30"
+              className="h-[34px] flex-1 px-3 font-mono"
             />
-            <button
+            <Button
               type="button"
               disabled={!relayDirty}
               onClick={() => void handleSaveRelay(false)}
-              className="bg-foreground text-background inline-flex h-[34px] cursor-pointer items-center rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-40"
+              className="h-[34px] px-3.5"
             >
               Save
-            </button>
+            </Button>
             {host.relay_url && (
-              <button
+              <Button
                 type="button"
+                variant="outline"
                 onClick={() => void handleSaveRelay(true)}
-                className="border-border hover:bg-accent inline-flex h-[34px] cursor-pointer items-center rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
+                className="h-[34px] px-3"
               >
                 Clear
-              </button>
+              </Button>
             )}
           </div>
 

@@ -16,7 +16,11 @@ import {
   normalizeSemver,
 } from "@/lib/orbit-ipc";
 import { isBareHomeDir } from "@/lib/projects";
-import { SIDE_PANEL_DEFAULT_WIDTH_PX } from "@/lib/workspace-layout";
+import {
+  SIDEBAR_DEFAULT_WIDTH_PX,
+  SIDE_PANEL_DEFAULT_WIDTH_PX,
+  clampSidebarPrefWidth,
+} from "@/lib/workspace-layout";
 import type {
   FileViewCacheEntry,
   OrbitUiState,
@@ -24,8 +28,10 @@ import type {
   ResolvedTheme,
   SidePanelTab,
   SimpleSyncGate,
+  StageRunningSubagentRef,
   TerminalTabSession,
   ThemeMode,
+  WindowedAgentStageView,
   WorkspaceLineEnding,
 } from "./store-types";
 
@@ -157,6 +163,7 @@ export function buildPersistedPrefsPayload(snap: OrbitUiState): PersistedPrefs {
     terminalFontSize: snap.terminalFontSize,
     terminalCursorStyle: snap.terminalCursorStyle,
     terminalScrollback: snap.terminalScrollback,
+    terminalThemeMode: snap.terminalThemeMode,
     sidebarOpen: snap.sidebarDesktopOpenPref,
     sidebarWidth: snap.sidebarWidth,
     hiddenProjectKeys: snap.hiddenProjectKeys,
@@ -164,7 +171,7 @@ export function buildPersistedPrefsPayload(snap: OrbitUiState): PersistedPrefs {
     archivedThreads: snap.archivedThreads,
     archivedSubagents: snap.archivedSubagents,
     collapsedProjectIds: snap.collapsedProjectIds,
-    collapsedInboxProjectIds: snap.collapsedInboxProjectIds,
+    collapsedWorkspaceIds: snap.collapsedWorkspaceIds,
     threadManualOrder: snap.threadManualOrder,
     sidebarProjectSort: snap.sidebarProjectSort,
     sidebarThreadFilter: snap.sidebarThreadFilter,
@@ -539,6 +546,7 @@ export function createDefaultInitialState(
 
     stages: {},
     sidebarView: null,
+    stageRunningSubagentMeta: {},
     slashCommands: [],
     rewoundSessions: {},
 
@@ -578,6 +586,7 @@ export function createDefaultInitialState(
       terminal: initialPrefs.overviewCollapsedSections?.terminal ?? false,
       tasks: initialPrefs.overviewCollapsedSections?.tasks ?? false,
       subagents: initialPrefs.overviewCollapsedSections?.subagents ?? false,
+      touched_files: initialPrefs.overviewCollapsedSections?.touched_files ?? true,
     },
     quickOpenFilesOpen: false,
 
@@ -589,14 +598,14 @@ export function createDefaultInitialState(
     sidebarWidth:
       initialPrefs.sidebarWidth &&
       initialPrefs.sidebarWidth !== 248 &&
+      initialPrefs.sidebarWidth !== 256 &&
       initialPrefs.sidebarWidth !== 260 &&
       initialPrefs.sidebarWidth !== 276
-        ? initialPrefs.sidebarWidth
-        : 256,
+        ? clampSidebarPrefWidth(initialPrefs.sidebarWidth)
+        : SIDEBAR_DEFAULT_WIDTH_PX,
     collapsedHostIds: {},
     collapsedProjectIds: initialPrefs.collapsedProjectIds ?? {},
-    collapsedWorkspaceIds: {},
-    collapsedInboxProjectIds: initialPrefs.collapsedInboxProjectIds ?? {},
+    collapsedWorkspaceIds: initialPrefs.collapsedWorkspaceIds ?? {},
     hiddenProjectKeys: initialPrefs.hiddenProjectKeys ?? {},
     threadCustomTitles: initialPrefs.threadCustomTitles ?? {},
     archivedThreads: initialPrefs.archivedThreads ?? {},
@@ -604,6 +613,7 @@ export function createDefaultInitialState(
     threadManualOrder: initialPrefs.threadManualOrder ?? {},
     sidebarProjectSort: initialPrefs.sidebarProjectSort ?? "recent",
     sidebarThreadFilter: initialPrefs.sidebarThreadFilter ?? "all",
+    sidebarFilterFocusNonce: 0,
 
     terminalTabs: [],
     activeTerminalTabKey: null,
@@ -679,5 +689,82 @@ export function createDefaultInitialState(
         : 13,
     terminalCursorStyle: initialPrefs.terminalCursorStyle ?? "bar",
     terminalScrollback: initialPrefs.terminalScrollback ?? 5000,
+    terminalThemeMode: initialPrefs.terminalThemeMode ?? "harmonized",
   };
+}
+
+function runningSubagentRefsEqual(
+  a: readonly StageRunningSubagentRef[] | undefined,
+  b: readonly StageRunningSubagentRef[],
+): boolean {
+  if (!a) return b.length === 0;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (
+      (a[i].child_agent_id ?? null) !== (b[i].child_agent_id ?? null) ||
+      (a[i].provider_subagent_id ?? null) !== (b[i].provider_subagent_id ?? null)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Incrementally synchronizes `stageRunningSubagentMeta` (on the low-frequency `fleet` topic)
+ * whenever a stage's `insights.subagents` or evicted stage keys change.
+ * Returns the exact previous object reference when nothing changed so high-frequency token
+ * deltas emit ZERO `fleet` topic notifications.
+ */
+export function syncStageRunningSubagentMeta(
+  prevMap: Record<string, readonly StageRunningSubagentRef[]>,
+  nextStages: Record<string, WindowedAgentStageView>,
+  tlKey: string,
+  nextStage: WindowedAgentStageView,
+  reusePrevAux: boolean,
+): Record<string, readonly StageRunningSubagentRef[]> {
+  let evictedChanged = false;
+  for (const existingKey of Object.keys(prevMap)) {
+    if (!(existingKey in nextStages)) {
+      evictedChanged = true;
+      break;
+    }
+  }
+
+  let nextRefsForKey: StageRunningSubagentRef[] | null = null;
+  let keyChanged = false;
+  if (!reusePrevAux) {
+    const subs = nextStage.insights?.subagents ?? [];
+    const running: StageRunningSubagentRef[] = [];
+    for (let i = 0; i < subs.length; i += 1) {
+      const sa = subs[i];
+      if (sa.status === "running") {
+        running.push({
+          child_agent_id: sa.child_agent_id ?? null,
+          provider_subagent_id: sa.provider_subagent_id ?? null,
+        });
+      }
+    }
+    nextRefsForKey = running;
+    keyChanged = !runningSubagentRefsEqual(prevMap[tlKey], running);
+  }
+
+  if (!evictedChanged && !keyChanged) {
+    return prevMap;
+  }
+
+  const nextMap: Record<string, readonly StageRunningSubagentRef[]> = {};
+  for (const [k, refs] of Object.entries(prevMap)) {
+    if (k in nextStages && k !== tlKey) {
+      nextMap[k] = refs;
+    }
+  }
+  if (reusePrevAux) {
+    if (prevMap[tlKey] && tlKey in nextStages) {
+      nextMap[tlKey] = prevMap[tlKey];
+    }
+  } else if (nextRefsForKey && nextRefsForKey.length > 0 && tlKey in nextStages) {
+    nextMap[tlKey] = nextRefsForKey;
+  }
+  return nextMap;
 }

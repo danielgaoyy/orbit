@@ -14,6 +14,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
 import { Button } from "@/components/ui/button";
+import { Field, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ToggleSwitch } from "@/components/settings/settings-primitives";
 import {
@@ -313,10 +315,10 @@ function WorktreeHandoffModalBody({
       </DialogHeader>
 
       {/* Mode segmented control */}
-      <div className="space-y-1.5">
+      <Field>
         <div className="flex items-center justify-between">
-          <span className="text-muted-foreground text-[12px] font-medium">Mode</span>
-          <span className="text-muted-foreground/80 text-[11.5px]">
+          <FieldLabel>Mode</FieldLabel>
+          <span className="text-ink-muted text-[11.5px]">
             {mode === "apply"
               ? "Keep source intact"
               : "Reset uncommitted source after transfer"}
@@ -353,7 +355,7 @@ function WorktreeHandoffModalBody({
             );
           })}
         </div>
-      </div>
+      </Field>
 
       {/* Conditional options: Include commits (Worktree -> Local) or Branch name (Local -> New worktree) */}
       {direction === "worktree_to_local" && (preview?.commit_count ?? 0) > 0 && (
@@ -375,23 +377,20 @@ function WorktreeHandoffModalBody({
       )}
 
       {direction === "local_to_worktree" && !targetWorkspaceId && (
-        <div className="space-y-1.5">
-          <label
-            htmlFor="orbit-handoff-branch"
-            className="text-muted-foreground text-[12px] font-medium"
-          >
-            Branch name <span className="opacity-65">(optional)</span>
-          </label>
-          <input
+        <Field>
+          <FieldLabel htmlFor="orbit-handoff-branch">
+            Branch name <span className="text-ink-muted font-normal">(optional)</span>
+          </FieldLabel>
+          <Input
             id="orbit-handoff-branch"
             type="text"
             value={branchName}
             disabled={executing}
             onChange={(e) => setBranchName(e.target.value)}
             placeholder="Auto-generated branch"
-            className="border-border bg-background text-foreground placeholder:text-muted-foreground/70 focus:border-foreground/30 h-[34px] w-full rounded-[9px] border px-3 font-mono text-[12.5px] outline-none transition-colors disabled:opacity-50"
+            className="h-[34px] px-3 font-mono"
           />
-        </div>
+        </Field>
       )}
 
       {/* Live dry-run diff preview */}

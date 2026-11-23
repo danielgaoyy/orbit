@@ -19,15 +19,10 @@ import {
 import { ArrowDown, GitBranch, RotateCcw, RotateCw } from "lucide-react";
 import { OmniComposer } from "@/components/composer/omni-composer";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
-import { GoalBanner } from "@/components/stage/goal-banner";
-import { StickyApprovalDock } from "@/components/stage/stage-approval-dock";
+import { DecisionDock } from "@/components/stage/stage-approval-dock";
 import { ChatOutlineRail } from "@/components/stage/stage-outline-rail";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
-import {
-  ParentSubagentBanner,
-  SubagentApprovalBanner,
-  SubagentsTrack,
-} from "@/components/stage/subagents-track";
+import { ParentSubagentBanner } from "@/components/stage/subagents-track";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -43,19 +38,20 @@ import {
   type SubagentNameMatcher,
   areResolvedSubagentsEqual,
   buildSubagentNameMatcher,
-  filterVisibleSubagents,
-  resolveSessionSubagents,
 } from "@/lib/subagents";
 import { computePrependRestoredScrollTop } from "@/lib/stage-pagination";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { cn } from "@/lib/utils";
+import {
+  type SessionSubagentWithAvatar,
+  selectPendingDecisions,
+  selectSessionSubagents,
+} from "@/state/selectors/session-selectors";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import {
   EMPTY_ARTIFACTS,
   EMPTY_DIFF_FILES,
   EMPTY_INSIGHTS,
-  EMPTY_SUBAGENTS,
-  EMPTY_TIMELINE_ITEMS,
   EMPTY_TURNS,
   FAST_FLICK_PX_PER_SEC,
   IDLE_LOOKAHEAD_DOWN_PX,
@@ -159,8 +155,8 @@ const StageHydratingFallback = memo(function StageHydratingFallback({
 const NewSessionLaunchpad = memo(function NewSessionLaunchpad() {
   return (
     <div className="orbit-stage-enter flex h-full w-full flex-col justify-center px-[24px] py-12 pb-[10vh]">
-      <div className="mx-auto w-full max-w-[var(--orbit-stage-max-w,768px)] space-y-6">
-        <h1 className="text-foreground/90 px-1 text-center text-[26px] font-normal tracking-[-0.018em]">
+      <div className="mx-auto w-full max-w-[var(--orbit-stage-max-w,740px)] space-y-6">
+        <h1 className="text-ink-primary px-1 text-center text-[24px] font-medium tracking-[-0.02em]">
           What would you like to build?
         </h1>
 
@@ -209,18 +205,12 @@ const STAGE_TOP_PAGINATE_THRESHOLD_PX = 480;
 
 const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
   scrollUiStore,
-  hostId,
-  agentId,
-  hasVisibleSubagents,
   stagePushStyle,
   overviewReservePx,
   overviewReserveTransition,
   onJumpLatest,
 }: {
   scrollUiStore: StageScrollUiStore;
-  hostId: string;
-  agentId: string;
-  hasVisibleSubagents: boolean;
   stagePushStyle: CSSProperties;
   overviewReservePx: number;
   overviewReserveTransition: string;
@@ -231,12 +221,11 @@ const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
     scrollUiStore.getSnapshot,
     scrollUiStore.getSnapshot,
   );
-  const showFadeMask = hasVisibleSubagents || snap.showJumpLatest || snap.isOccludingText;
-  const tallFade = hasVisibleSubagents || snap.showJumpLatest;
+  const showFadeMask = snap.showJumpLatest || snap.isOccludingText;
 
   return (
     <div className="pointer-events-none absolute right-0 bottom-0 left-0 z-10">
-      {/* Smooth bottom gradient fade mask — leaves far-right scrollbar & docked overview clear */}
+      {/* Subtle 24px bottom feather above Composer — never obscures streaming lines */}
       <div
         style={{
           paddingRight: `${Math.max(20, overviewReservePx)}px`,
@@ -246,14 +235,13 @@ const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
       >
         <div
           className={cn(
-            "from-canvas via-canvas/85 w-full bg-gradient-to-t to-transparent transition-[opacity,height] duration-200 ease-out",
-            tallFade ? "h-16" : "h-7",
+            "from-surface-base via-surface-base/75 h-6 w-full bg-gradient-to-t to-transparent transition-opacity duration-200 ease-out",
             showFadeMask ? "opacity-100" : "opacity-0",
           )}
         />
       </div>
 
-      {/* Aligned floating controls row: Subagents capsule (left) + Jump-to-Latest (centered) */}
+      {/* Centered Jump-to-Latest circular button — zero collision since Subagent capsule moved to Overview/TopBar */}
       <div
         style={{
           paddingRight: `${overviewReservePx}px`,
@@ -262,7 +250,7 @@ const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
         className="pointer-events-none relative"
       >
         <div style={stagePushStyle} className="pointer-events-none relative px-[24px]">
-          <div className="@container pointer-events-none relative mx-auto flex w-full max-w-[var(--orbit-stage-max-w,768px)] items-end justify-start">
+          <div className="pointer-events-none relative mx-auto flex w-full max-w-[var(--orbit-stage-max-w,740px)] items-end justify-center">
             <button
               type="button"
               aria-label="Scroll to latest"
@@ -270,25 +258,14 @@ const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
               tabIndex={snap.showJumpLatest ? 0 : -1}
               onClick={onJumpLatest}
               className={cn(
-                "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute left-1/2 inline-flex size-9.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-[transform,opacity,color,border-color,bottom] duration-200 ease-[var(--ease-out-expo)] dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
-                hasVisibleSubagents ? "bottom-11 @[460px]:bottom-2" : "bottom-2",
+                "border-border-default bg-surface-raised text-ink-tertiary hover:text-ink-primary hover:border-border-strong floating-surface absolute bottom-3 left-1/2 inline-flex size-[32px] -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border transition-[transform,opacity,color,border-color] duration-200 ease-[var(--ease-out-expo)]",
                 snap.showJumpLatest
                   ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
                   : "pointer-events-none translate-y-1 scale-95 opacity-0",
               )}
             >
-              <ArrowDown className="size-[18px] stroke-[1.9]" />
+              <ArrowDown className="size-[16px] stroke-[1.9]" />
             </button>
-
-            {hasVisibleSubagents && (
-              <div className="pointer-events-none pb-2 [&>div]:mx-0 [&>div]:mb-0 [&>div]:max-w-none [&>div]:px-0 [&_button]:pointer-events-auto">
-                <SubagentsTrack
-                  hostId={hostId}
-                  agentId={agentId}
-                  variant="floating"
-                />
-              </div>
-            )}
           </div>
         </div>
       </div>
@@ -888,7 +865,7 @@ export function StreamStage() {
     onStageTransitionEnd,
   } = useWorkspaceMotion();
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const fleet = useOrbitSelector((s) => s.fleet);
   const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
   const stageView = useOrbitSelector((s) =>
@@ -1006,58 +983,48 @@ export function StreamStage() {
       : null;
   const activeSessionScopeRef = useRef<string | null>(activeSessionScope);
   activeSessionScopeRef.current = activeSessionScope;
-  const pendingPermissions = useMemo(
-    () =>
-      (stageView?.pending_permissions ?? EMPTY_TIMELINE_ITEMS).filter(
-        (it): it is Extract<TimelineItemView, { item_type: "permission_request" }> =>
-          it.item_type === "permission_request",
-      ),
-    [stageView?.pending_permissions],
+  const selectorSlice = useMemo(
+    () => ({
+      hostDetails,
+      fleet,
+      archivedSubagents,
+      stages:
+        selectedHostId && selectedAgentId && stageView
+          ? { [`${selectedHostId}::${selectedAgentId}`]: stageView }
+          : {},
+    }),
+    [hostDetails, fleet, archivedSubagents, selectedHostId, selectedAgentId, stageView],
   );
-  const pendingQuestions = useMemo(
-    () =>
-      (stageView?.pending_questions ?? EMPTY_TIMELINE_ITEMS).filter(
-        (it): it is Extract<TimelineItemView, { item_type: "question_request" }> =>
-          it.item_type === "question_request",
-      ),
-    [stageView?.pending_questions],
+
+  const unifiedDecisions = useMemo(
+    () => selectPendingDecisions(selectorSlice, selectedHostId, selectedAgentId),
+    [selectorSlice, selectedHostId, selectedAgentId],
   );
+  const pendingPermissions = unifiedDecisions.parentPermissions;
+  const pendingQuestions = unifiedDecisions.parentQuestions;
+  const subagentPermissions = unifiedDecisions.subagentPermissions;
   const sessionTurnDiffs = stageView?.session_turn_diffs ?? EMPTY_DIFF_FILES;
   const stageInsights = stageView?.insights ?? EMPTY_INSIGHTS;
 
-  const sessionSubagentsRef = useRef<readonly ResolvedSubagentItem[]>(EMPTY_SUBAGENTS);
+  const sessionSubagentsRef = useRef<readonly SessionSubagentWithAvatar[]>([]);
   const sessionSubagents = useMemo(() => {
-    const resolved = resolveSessionSubagents({
-      hostId: selectedHostId,
-      agentId: selectedAgentId,
-      insightsSubagents: stageInsights.subagents,
-      hostDetails,
-      fleetHosts,
-    });
-    const next = resolved.length === 0 ? EMPTY_SUBAGENTS : resolved;
-    if (areResolvedSubagentsEqual(sessionSubagentsRef.current, next)) {
+    const summary = selectSessionSubagents(selectorSlice, selectedHostId, selectedAgentId);
+    const next = summary.all;
+    if (
+      areResolvedSubagentsEqual(sessionSubagentsRef.current, next) &&
+      sessionSubagentsRef.current.length === next.length &&
+      sessionSubagentsRef.current.every((s, idx) => s.character.id === next[idx]?.character.id)
+    ) {
       return sessionSubagentsRef.current;
     }
     sessionSubagentsRef.current = next;
     return next;
-  }, [selectedHostId, selectedAgentId, stageInsights.subagents, hostDetails, fleetHosts]);
+  }, [selectorSlice, selectedHostId, selectedAgentId]);
 
   const sessionSubagentMatcher = useMemo(
     () => buildSubagentNameMatcher(sessionSubagents),
     [sessionSubagents],
   );
-
-  const hasVisibleSubagents = useMemo(() => {
-    if (!selectedHostId || !selectedAgentId || sessionSubagents.length === 0) return false;
-    return (
-      filterVisibleSubagents(
-        sessionSubagents,
-        archivedSubagents,
-        selectedHostId,
-        selectedAgentId,
-      ).length > 0
-    );
-  }, [archivedSubagents, selectedHostId, selectedAgentId, sessionSubagents]);
 
   const handleOpenSubagent = useCallback(
     (sa: ResolvedSubagentItem) => {
@@ -2138,10 +2105,7 @@ export function StreamStage() {
             transition: overviewReserveTransition,
           }}
           onViewportTransitionEnd={onStageTransitionEnd}
-          viewportClassName={cn(
-            "pt-6 pl-[24px]",
-            hasVisibleSubagents ? "pb-[64px]" : "pb-11",
-          )}
+          viewportClassName="pt-6 pb-[56px] pl-[24px]"
           contentClassName={stageTurns.length === 0 ? "flex min-h-full flex-col" : undefined}
         >
           <div
@@ -2150,7 +2114,7 @@ export function StreamStage() {
             onTransitionEnd={onStageTransitionEnd}
             style={stagePushStyle}
             className={cn(
-              "mx-auto w-full min-w-0 max-w-[var(--orbit-stage-max-w,768px)]",
+              "mx-auto w-full min-w-0 max-w-[var(--orbit-stage-max-w,740px)]",
               stageTurns.length === 0 && "flex flex-1 flex-col",
             )}
           >
@@ -2193,48 +2157,56 @@ export function StreamStage() {
               })()}
 
             {stageTurns.length > 0 && (
-              <VirtualizedTurnList
-                key={activeSessionScope ?? selectedAgentId}
-                selectedHostId={selectedHostId}
-                selectedAgentId={selectedAgentId}
-                stageTurns={stageTurns}
-                highlightedTurnKey={highlightedTurnKey}
-                hasPendingJump={hasPendingJumpForActive}
-                isLatestTurnActive={isLatestTurnActive}
-                agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
-                hasLiveBackgroundTasks={stageInsights.background_tasks.length > 0}
-                baselineMaxSeq={baselineMaxSeq}
-                isNetworkOffline={isNetworkOffline}
-                autoFoldCompleted={coalesceExploration}
-                effectiveCwd={effectiveCwd}
-                stageMaxContentWidthPx={stageMaxContentWidthPx}
-                hostArtifacts={stableHostArtifacts}
-                timingTick={timingTick}
-                scrollRef={scrollRef}
-                stickToBottomRef={stickToBottomRef}
-                holdActiveRef={holdActiveRef}
-                virtualizerRef={virtualizerRef}
-                turnTimingsRef={turnTimingsRef}
-                thinkingTimingsRef={thinkingTimingsRef}
-                getThinkingDurationMs={getThinkingDurationMs}
-                holdViewport={holdViewport}
-                onRequestRewind={handleRequestRewind}
-                onRequestFork={handleRequestFork}
-                canForkWorktree={canForkWorktree}
-                onPreviewImage={setImagePreviewTarget}
-                sessionSubagents={sessionSubagents}
-                sessionSubagentMatcher={sessionSubagentMatcher}
-                onOpenSubagent={handleOpenSubagent}
-              />
+              <>
+                <VirtualizedTurnList
+                  key={activeSessionScope ?? selectedAgentId}
+                  selectedHostId={selectedHostId}
+                  selectedAgentId={selectedAgentId}
+                  stageTurns={stageTurns}
+                  highlightedTurnKey={highlightedTurnKey}
+                  hasPendingJump={hasPendingJumpForActive}
+                  isLatestTurnActive={isLatestTurnActive}
+                  agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
+                  hasLiveBackgroundTasks={stageInsights.background_tasks.length > 0}
+                  baselineMaxSeq={baselineMaxSeq}
+                  isNetworkOffline={isNetworkOffline}
+                  autoFoldCompleted={coalesceExploration}
+                  effectiveCwd={effectiveCwd}
+                  stageMaxContentWidthPx={stageMaxContentWidthPx}
+                  hostArtifacts={stableHostArtifacts}
+                  timingTick={timingTick}
+                  scrollRef={scrollRef}
+                  stickToBottomRef={stickToBottomRef}
+                  holdActiveRef={holdActiveRef}
+                  virtualizerRef={virtualizerRef}
+                  turnTimingsRef={turnTimingsRef}
+                  thinkingTimingsRef={thinkingTimingsRef}
+                  getThinkingDurationMs={getThinkingDurationMs}
+                  holdViewport={holdViewport}
+                  onRequestRewind={handleRequestRewind}
+                  onRequestFork={handleRequestFork}
+                  canForkWorktree={canForkWorktree}
+                  onPreviewImage={setImagePreviewTarget}
+                  sessionSubagents={sessionSubagents}
+                  sessionSubagentMatcher={sessionSubagentMatcher}
+                  onOpenSubagent={handleOpenSubagent}
+                />
+
+                {/* Dynamic Reading Runway: gives active streaming output a calm centered eye-zone cushion above Composer */}
+                <div
+                  aria-hidden="true"
+                  className={cn(
+                    "w-full shrink-0 transition-[height] duration-300 ease-[var(--ease-out-expo)]",
+                    isLatestTurnActive ? "h-[clamp(120px,26vh,220px)]" : "h-0",
+                  )}
+                />
+              </>
             )}
           </div>
         </ScrollArea>
 
         <StageBottomViewportOverlay
           scrollUiStore={scrollUiStore}
-          hostId={selectedHostId}
-          agentId={selectedAgentId}
-          hasVisibleSubagents={hasVisibleSubagents}
           stagePushStyle={stagePushStyle}
           overviewReservePx={overviewReservePx}
           overviewReserveTransition={overviewReserveTransition}
@@ -2242,8 +2214,8 @@ export function StreamStage() {
         />
       </div>
 
-      {/* 2. Docked Composer Shelf — normal flex sibling below scrollRef (scrollbar never enters here) */}
-      <div ref={composerShelfRef} className="bg-canvas relative z-20 shrink-0">
+      {/* 2. Docked Composer Shelf — Pure Input & Unified Decision Bay (no Subagent/Goal pileup!) */}
+      <div ref={composerShelfRef} className="bg-surface-base relative z-20 shrink-0">
         <div
           style={{
             paddingRight: `${overviewReservePx}px`,
@@ -2251,14 +2223,13 @@ export function StreamStage() {
           }}
         >
           <div style={stagePushStyle}>
-            <GoalBanner hostId={selectedHostId} agentId={selectedAgentId} />
-            <SubagentApprovalBanner hostId={selectedHostId} agentId={selectedAgentId} />
-            <StickyApprovalDock
+            <DecisionDock
               hostId={selectedHostId}
               agentId={selectedAgentId}
               cwd={effectiveCwd}
               permissions={pendingPermissions}
               questions={pendingQuestions}
+              subagentPermissions={subagentPermissions}
             />
             <StageDockedComposer scrollUiStore={scrollUiStore} />
           </div>

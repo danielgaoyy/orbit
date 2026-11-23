@@ -24,13 +24,28 @@ export type SettingsSection =
   | "add_host"
   | `host:${string}:${HostSettingsTab}`;
 
+export type SettingsNavGroupId = "app" | "host" | "workspace";
+
+export interface SettingsNavGroupSpec {
+  id: SettingsNavGroupId;
+  labelKey: MessageKey;
+}
+
+export const SETTINGS_NAV_GROUPS: readonly SettingsNavGroupSpec[] = [
+  { id: "app", labelKey: "settings.navGroupApp" },
+  { id: "host", labelKey: "settings.navGroupHost" },
+  { id: "workspace", labelKey: "settings.navGroupWorkspace" },
+];
+
 export type SettingsCoreSectionId =
   | "general"
   | "appearance"
+  | "notifications_sync"
   | "hosts"
   | "agents"
-  | "extensions"
-  | "notifications_sync";
+  | "usage"
+  | "instructions_rules"
+  | "capabilities";
 
 export type SettingsSubTabId =
   | "general"
@@ -62,6 +77,8 @@ export type SettingsLegacyAlias =
   | "channels"
   | "agents"
   | "extensions"
+  | "instructions_rules"
+  | "capabilities"
   | "notifications_sync"
   | "connection"
   | "acp"
@@ -84,6 +101,7 @@ export interface SettingsSubTabSpec {
 
 export interface SettingsCoreSectionSpec {
   id: SettingsCoreSectionId;
+  group: SettingsNavGroupId;
   labelKey: MessageKey;
   requiresHost?: boolean;
   keywords: readonly string[];
@@ -133,8 +151,10 @@ const DIRECT_NON_HOST_SECTIONS = new Set<string>([
 ]);
 
 export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
+  // ── APP ────────────────────────────────────────────────────────────────────
   {
     id: "general",
+    group: "app",
     labelKey: "settings.navGeneral",
     keywords: [
       "general",
@@ -214,6 +234,7 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
   },
   {
     id: "appearance",
+    group: "app",
     labelKey: "settings.navAppearance",
     keywords: [
       "appearance",
@@ -234,6 +255,8 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
       "split",
       "unified",
       "terminal",
+      "palette",
+      "contrast",
       "cursor",
       "scrollback",
       "外观",
@@ -243,6 +266,7 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
       "语言",
       "字号",
       "终端",
+      "配色",
       "外観",
       "テーマ",
       "言語",
@@ -251,7 +275,106 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
     subTabs: [],
   },
   {
+    id: "notifications_sync",
+    group: "app",
+    labelKey: "settings.navNotificationsSync",
+    keywords: [
+      "notifications",
+      "push",
+      "apns",
+      "fcm",
+      "harmony",
+      "quiet hours",
+      "sound",
+      "alert",
+      "cloud",
+      "sync",
+      "github",
+      "gist",
+      "backup",
+      "archived",
+      "archive",
+      "history",
+      "data",
+      "通知",
+      "推送",
+      "提示音",
+      "云同步",
+      "同步",
+      "归档",
+      "アーカイブ",
+      "同期",
+    ],
+    subTabs: [
+      {
+        id: "notifications",
+        labelKey: "settings.subTabNotifications",
+        keywords: [
+          "notifications",
+          "push",
+          "desktop",
+          "mobile",
+          "apns",
+          "fcm",
+          "harmony",
+          "quiet hours",
+          "sound",
+          "chime",
+          "alert",
+          "通知",
+          "推送",
+          "免打扰",
+          "提示音",
+          "プッシュ",
+          "サウンド",
+        ],
+      },
+      {
+        id: "cloud_sync",
+        labelKey: "settings.subTabCloudSync",
+        keywords: [
+          "cloud",
+          "sync",
+          "github",
+          "gist",
+          "oauth",
+          "pat",
+          "e2ee",
+          "backup",
+          "passphrase",
+          "云同步",
+          "同步",
+          "备份",
+          "クラウド同期",
+          "同期",
+        ],
+      },
+      {
+        id: "archived",
+        labelKey: "settings.subTabArchived",
+        keywords: [
+          "archived",
+          "archive",
+          "threads",
+          "conversations",
+          "restore",
+          "delete",
+          "history",
+          "已归档",
+          "归档",
+          "恢复",
+          "历史",
+          "アーカイブ",
+          "復元",
+        ],
+      },
+    ],
+  },
+
+  // ── HOST ───────────────────────────────────────────────────────────────────
+  {
     id: "hosts",
+    group: "host",
     labelKey: "settings.navHosts",
     keywords: [
       "hosts",
@@ -363,6 +486,7 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
   },
   {
     id: "agents",
+    group: "host",
     labelKey: "settings.navAgents",
     requiresHost: true,
     keywords: [
@@ -387,24 +511,14 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
       "safety",
       "risk",
       "policy",
-      "usage",
-      "tokens",
-      "cost",
-      "spend",
-      "quotas",
-      "insights",
       "代理",
       "模型",
       "提供商",
       "审批",
       "风控",
-      "用量",
-      "配额",
       "エージェント",
       "モデル",
       "プロバイダ",
-      "使用量",
-      "クォータ",
     ],
     subTabs: [
       {
@@ -472,64 +586,62 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
           "セキュリティ",
         ],
       },
-      {
-        id: "usage",
-        labelKey: "settings.subTabUsage",
-        requiresHost: true,
-        keywords: [
-          "usage",
-          "tokens",
-          "cost",
-          "spend",
-          "quotas",
-          "insights",
-          "analytics",
-          "forecast",
-          "用量",
-          "配额",
-          "统计",
-          "费用",
-          "使用量",
-          "トークン",
-          "クォータ",
-        ],
-      },
     ],
   },
   {
-    id: "extensions",
-    labelKey: "settings.navExtensions",
+    id: "usage",
+    group: "host",
+    labelKey: "settings.navUsage",
+    requiresHost: true,
+    keywords: [
+      "usage",
+      "tokens",
+      "cost",
+      "spend",
+      "quotas",
+      "insights",
+      "analytics",
+      "forecast",
+      "cache",
+      "billing",
+      "budget",
+      "burn rate",
+      "用量",
+      "配额",
+      "统计",
+      "费用",
+      "使用量",
+      "トークン",
+      "クォータ",
+    ],
+    subTabs: [],
+  },
+
+  // ── WORKSPACE ──────────────────────────────────────────────────────────────
+  {
+    id: "instructions_rules",
+    group: "workspace",
+    labelKey: "settings.navInstructionsRules",
     keywords: [
       "workspace",
-      "extensions",
       "context",
       "instructions",
       "claude.md",
       "agents.md",
       "rules",
       "glob",
-      "skills",
-      "mcp",
-      "servers",
-      "hooks",
-      "lifecycle",
-      "lsp",
-      "language servers",
+      "path",
+      "memory",
+      "prompt",
       "工作区",
-      "扩展",
       "上下文",
       "项目指令",
+      "指令",
       "规则",
-      "技能",
-      "钩子",
-      "语言服务器",
+      "路径规则",
       "ワークスペース",
-      "拡張",
       "指示",
       "ルール",
-      "スキル",
-      "フック",
-      "言語サーバー",
     ],
     subTabs: [
       {
@@ -565,6 +677,36 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
           "ルール",
         ],
       },
+    ],
+  },
+  {
+    id: "capabilities",
+    group: "workspace",
+    labelKey: "settings.navCapabilities",
+    requiresHost: true,
+    keywords: [
+      "capabilities",
+      "extensions",
+      "skills",
+      "skill.md",
+      "plugins",
+      "mcp",
+      "servers",
+      "hooks",
+      "lifecycle",
+      "lsp",
+      "language servers",
+      "扩展",
+      "能力",
+      "技能",
+      "钩子",
+      "语言服务器",
+      "拡張",
+      "スキル",
+      "フック",
+      "言語サーバー",
+    ],
+    subTabs: [
       {
         id: "skills",
         labelKey: "settings.subTabSkills",
@@ -629,101 +771,6 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
       },
     ],
   },
-  {
-    id: "notifications_sync",
-    labelKey: "settings.navNotificationsSync",
-    keywords: [
-      "notifications",
-      "push",
-      "apns",
-      "fcm",
-      "harmony",
-      "quiet hours",
-      "sound",
-      "alert",
-      "cloud",
-      "sync",
-      "github",
-      "gist",
-      "backup",
-      "archived",
-      "archive",
-      "history",
-      "data",
-      "通知",
-      "推送",
-      "提示音",
-      "云同步",
-      "同步",
-      "归档",
-      "アーカイブ",
-      "同期",
-    ],
-    subTabs: [
-      {
-        id: "notifications",
-        labelKey: "settings.subTabNotifications",
-        keywords: [
-          "notifications",
-          "push",
-          "desktop",
-          "mobile",
-          "apns",
-          "fcm",
-          "harmony",
-          "quiet hours",
-          "sound",
-          "chime",
-          "alert",
-          "通知",
-          "推送",
-          "免打扰",
-          "提示音",
-          "プッシュ",
-          "サウンド",
-        ],
-      },
-      {
-        id: "cloud_sync",
-        labelKey: "settings.subTabCloudSync",
-        keywords: [
-          "cloud",
-          "sync",
-          "github",
-          "gist",
-          "oauth",
-          "pat",
-          "e2ee",
-          "backup",
-          "passphrase",
-          "云同步",
-          "同步",
-          "备份",
-          "クラウド同期",
-          "同期",
-        ],
-      },
-      {
-        id: "archived",
-        labelKey: "settings.subTabArchived",
-        keywords: [
-          "archived",
-          "archive",
-          "threads",
-          "conversations",
-          "restore",
-          "delete",
-          "history",
-          "已归档",
-          "归档",
-          "恢复",
-          "历史",
-          "アーカイブ",
-          "復元",
-        ],
-      },
-    ],
-  },
 ];
 
 export function parseHostSettingsSection(
@@ -774,7 +821,10 @@ export function resolveSettingsSectionTarget(
       return defaultHostId ? `host:${defaultHostId}:usage` : "add_host";
     case "extensions":
     case "context":
+    case "instructions_rules":
       return "instructions";
+    case "capabilities":
+      return defaultHostId ? `host:${defaultHostId}:skills` : "instructions";
     case "rules":
       return defaultHostId ? `host:${defaultHostId}:rules` : "instructions";
     case "skills":
@@ -817,20 +867,32 @@ export function resolveActiveSettingsLocation(
       case "agents":
       case "acp":
       case "guardian":
-      case "usage":
         return {
           coreSection: "agents",
           subTab: parsedHost.tab,
           hostId: parsedHost.hostId,
           section,
         };
+      case "usage":
+        return {
+          coreSection: "usage",
+          subTab: null,
+          hostId: parsedHost.hostId,
+          section,
+        };
       case "rules":
+        return {
+          coreSection: "instructions_rules",
+          subTab: "rules",
+          hostId: parsedHost.hostId,
+          section,
+        };
       case "skills":
       case "mcp":
       case "hooks":
       case "lsp":
         return {
-          coreSection: "extensions",
+          coreSection: "capabilities",
           subTab: parsedHost.tab,
           hostId: parsedHost.hostId,
           section,
@@ -848,7 +910,12 @@ export function resolveActiveSettingsLocation(
     case "add_host":
       return { coreSection: "hosts", subTab: "add_host", hostId: null, section };
     case "instructions":
-      return { coreSection: "extensions", subTab: "instructions", hostId: null, section };
+      return {
+        coreSection: "instructions_rules",
+        subTab: "instructions",
+        hostId: null,
+        section,
+      };
     case "notifications":
       return {
         coreSection: "notifications_sync",
@@ -917,14 +984,18 @@ export function buildSettingsSectionForTarget(
       return "general";
     case "appearance":
       return "appearance";
+    case "notifications_sync":
+      return "notifications";
     case "hosts":
       return hostId ? `host:${hostId}:connection` : "add_host";
     case "agents":
       return hostId ? `host:${hostId}:agents` : "add_host";
-    case "extensions":
+    case "usage":
+      return hostId ? `host:${hostId}:usage` : "add_host";
+    case "instructions_rules":
       return "instructions";
-    case "notifications_sync":
-      return "notifications";
+    case "capabilities":
+      return hostId ? `host:${hostId}:skills` : "instructions";
   }
 }
 

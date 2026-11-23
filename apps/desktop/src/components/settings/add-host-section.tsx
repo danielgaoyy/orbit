@@ -5,6 +5,8 @@ import {
   SettingGroupLabel,
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { type SshHostItem, orbitIpc } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -78,14 +80,16 @@ export function AddHostSection() {
               </div>
             </div>
           </div>
-          <button
+          <Button
             type="button"
+            variant="outline"
+            size="sm"
             onClick={() => orbitActions.setSettingsSection("cloud_sync")}
-            className="border-border bg-background hover:bg-accent inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12px] font-medium transition-colors"
+            className="shrink-0"
           >
             <span>{cloudSyncStatus?.state === "locked" ? "Unlock" : "Sign in"}</span>
             <ArrowRight className="h-3.5 w-3.5" />
-          </button>
+          </Button>
         </div>
       )}
 
@@ -135,11 +139,12 @@ export function AddHostSection() {
                       Connected
                     </span>
                   ) : (
-                    <button
+                    <Button
                       type="button"
+                      size="sm"
                       disabled={connectingSshAlias !== null}
                       onClick={() => void handlePairSsh(ssh)}
-                      className="bg-foreground text-background inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-45"
+                      className="shrink-0"
                     >
                       {busy ? (
                         <>
@@ -149,7 +154,7 @@ export function AddHostSection() {
                       ) : (
                         <span>Connect</span>
                       )}
-                    </button>
+                    </Button>
                   )}
                 </div>
               );
@@ -170,7 +175,7 @@ export function AddHostSection() {
               on the target machine and paste the URI below.
             </div>
             <div className="flex gap-2">
-              <input
+              <Input
                 type="text"
                 value={pairingUri}
                 onChange={(e) => setPairingUri(e.target.value)}
@@ -180,16 +185,16 @@ export function AddHostSection() {
                   if (e.key === "Enter") void handlePairUri();
                 }}
                 placeholder="orbit://pair/..."
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground h-[34px] flex-1 rounded-lg border px-3 font-mono text-[12.5px] outline-none focus:border-foreground/30"
+                className="h-[34px] flex-1 px-3 font-mono"
               />
-              <button
+              <Button
                 type="button"
                 onClick={() => void handlePairUri()}
-                className="bg-foreground text-background inline-flex h-[34px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90"
+                className="shrink-0 gap-1.5"
               >
                 <Plus className="h-[14.5px] w-[14.5px]" />
                 <span>Pair</span>
-              </button>
+              </Button>
             </div>
           </div>
         </div>

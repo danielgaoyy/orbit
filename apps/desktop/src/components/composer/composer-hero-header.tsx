@@ -23,6 +23,7 @@ import {
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -606,40 +607,46 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                 align="start"
                 side="bottom"
                 finalFocus={false}
-                className="w-56 p-1.5"
+                className="min-w-[204px] max-w-[260px]"
               >
-                <DropdownMenuLabel>Group</DropdownMenuLabel>
-                <DropdownMenuItem
-                  onSelect={() => orbitActions.setDraftConfig({ workspaceId: null })}
-                >
-                  <span className="text-muted-foreground flex min-w-0 items-center gap-2">
-                    <span className="truncate">None</span>
-                  </span>
-                  {!selectedDraftWs && <Check className="size-3.5 shrink-0" />}
-                </DropdownMenuItem>
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel>Group</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={() => orbitActions.setDraftConfig({ workspaceId: null })}
+                  >
+                    <span className="text-ink-muted flex min-w-0 items-center gap-2">
+                      <span className="truncate">None</span>
+                    </span>
+                    {!selectedDraftWs && <Check className="size-3.5 shrink-0" />}
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
                 {curatedWorkspacesForProject.length > 0 && <DropdownMenuSeparator />}
-                {curatedWorkspacesForProject.map((ws) => {
-                  const active = draftWorkspaceId === ws.workspace_id;
-                  return (
-                    <DropdownMenuItem
-                      key={ws.workspace_id}
-                      onSelect={() =>
-                        orbitActions.setDraftConfig({ workspaceId: ws.workspace_id })
-                      }
-                    >
-                      <span className="flex min-w-0 flex-1 items-center gap-2">
-                        <Layers className="text-muted-foreground size-3.5 shrink-0" />
-                        <span className="truncate">{ws.title}</span>
-                      </span>
-                      <span className="flex shrink-0 items-center gap-1.5">
-                        <span className="text-muted-foreground text-[11px] tabular-nums">
-                          {ws.peer_count}
-                        </span>
-                        {active && <Check className="size-3.5 shrink-0" />}
-                      </span>
-                    </DropdownMenuItem>
-                  );
-                })}
+                {curatedWorkspacesForProject.length > 0 && (
+                  <DropdownMenuGroup>
+                    {curatedWorkspacesForProject.map((ws) => {
+                      const active = draftWorkspaceId === ws.workspace_id;
+                      return (
+                        <DropdownMenuItem
+                          key={ws.workspace_id}
+                          onSelect={() =>
+                            orbitActions.setDraftConfig({ workspaceId: ws.workspace_id })
+                          }
+                        >
+                          <span className="flex min-w-0 flex-1 items-center gap-2">
+                            <Layers className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                            <span className="truncate">{ws.title}</span>
+                          </span>
+                          <span className="flex shrink-0 items-center gap-1.5">
+                            <span className="text-ink-faint text-[11px] tabular-nums">
+                              {ws.peer_count}
+                            </span>
+                            {active && <Check className="size-3.5 shrink-0" />}
+                          </span>
+                        </DropdownMenuItem>
+                      );
+                    })}
+                  </DropdownMenuGroup>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
           </>
@@ -662,34 +669,38 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
               align="start"
               side="bottom"
               finalFocus={false}
-              className="w-54 p-1.5"
+              className="min-w-[204px] max-w-[260px]"
             >
-              <DropdownMenuLabel>Target Host</DropdownMenuLabel>
-              {fleet.hosts.map((h) => {
-                const active = h.host_id === selectedHostId;
-                const online = h.connection_state.startsWith("online");
-                return (
-                  <DropdownMenuItem
-                    key={h.host_id}
-                    onSelect={() => orbitActions.selectHost(h.host_id, { keepDraft: true })}
-                  >
-                    <span className="flex min-w-0 items-center gap-2">
-                      <span
-                        className={cn(
-                          "size-1.5 shrink-0 rounded-full",
-                          online ? "bg-emerald-500" : "bg-zinc-400",
-                        )}
-                      />
-                      <span className="truncate">{h.display_name}</span>
-                    </span>
-                    {active && <Check className="size-3.5 shrink-0" />}
-                  </DropdownMenuItem>
-                );
-              })}
+              <DropdownMenuGroup>
+                <DropdownMenuLabel>Target Host</DropdownMenuLabel>
+                {fleet.hosts.map((h) => {
+                  const active = h.host_id === selectedHostId;
+                  const online = h.connection_state.startsWith("online");
+                  return (
+                    <DropdownMenuItem
+                      key={h.host_id}
+                      onSelect={() => orbitActions.selectHost(h.host_id, { keepDraft: true })}
+                    >
+                      <span className="flex min-w-0 items-center gap-2">
+                        <span
+                          className={cn(
+                            "size-1.5 shrink-0 rounded-full",
+                            online ? "bg-emerald-500" : "bg-zinc-400",
+                          )}
+                        />
+                        <span className="truncate">{h.display_name}</span>
+                      </span>
+                      {active && <Check className="size-3.5 shrink-0" />}
+                    </DropdownMenuItem>
+                  );
+                })}
+              </DropdownMenuGroup>
               <DropdownMenuSeparator />
-              <DropdownMenuItem onSelect={() => orbitActions.openSettings("hosts")}>
-                <span className="text-muted-foreground">Manage Hosts…</span>
-              </DropdownMenuItem>
+              <DropdownMenuGroup>
+                <DropdownMenuItem onSelect={() => orbitActions.openSettings("hosts")}>
+                  <span className="text-ink-muted">Manage Hosts…</span>
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
             </DropdownMenuContent>
           </DropdownMenu>
         )}

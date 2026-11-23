@@ -20,6 +20,20 @@ import {
   SettingSectionHeader,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Tabs,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/dialog-tabs";
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import {
   type ExternalMcpServerRecord,
   type McpProbeResult,
@@ -167,7 +181,7 @@ function KvEditorRows({
                 : valuePlaceholder;
             return (
               <div key={row.id} className="flex items-center gap-1.5">
-                <input
+                <Input
                   type="text"
                   value={row.key}
                   onChange={(e) =>
@@ -180,10 +194,10 @@ function KvEditorRows({
                     )
                   }
                   placeholder={keyPlaceholder}
-                  className="border-border bg-background text-foreground placeholder:text-muted-foreground/55 h-[30px] w-[42%] rounded-lg border px-2.5 font-mono text-[12px] outline-none focus:border-foreground/40"
+                  className="h-[30px] w-[42%] font-mono text-[12px]"
                 />
                 <div className="relative flex-1">
-                  <input
+                  <Input
                     type={secret ? "password" : "text"}
                     value={row.value}
                     onChange={(e) =>
@@ -192,17 +206,19 @@ function KvEditorRows({
                       )
                     }
                     placeholder={placeholder}
-                    className="border-border bg-background text-foreground placeholder:text-muted-foreground/55 h-[30px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none focus:border-foreground/40"
+                    className="h-[30px] font-mono text-[12px]"
                   />
                 </div>
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon"
                   aria-label={`Remove ${row.key || "row"}`}
                   onClick={() => onChange(rows.filter((r) => r.id !== row.id))}
-                  className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[28px] w-[28px] shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors"
+                  className="h-[28px] w-[28px] shrink-0"
                 >
                   <X className="h-[13px] w-[13px]" />
-                </button>
+                </Button>
               </div>
             );
           })}
@@ -368,222 +384,186 @@ function McpServerModal({
   };
 
   return (
-    <div
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !saving) onClose();
+    <Dialog
+      open
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && !saving) onClose();
       }}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 backdrop-blur-[2px]"
     >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={isEdit ? "Edit MCP Server" : "Add MCP Server"}
-        className="border-border bg-elevated text-foreground floating-surface flex max-h-[85vh] w-full max-w-[490px] flex-col overflow-hidden rounded-[14px] border p-0"
+      <DialogContent
+        closeDisabled={saving}
+        className="flex max-h-[85vh] max-w-[490px] flex-col gap-0 p-0"
       >
-        <div className="flex items-center justify-between px-5 pt-5 pb-4">
-          <div>
-            <h3 className="text-[15px] font-semibold tracking-[-0.01em]">
-              {isEdit
-                ? "Edit MCP Server"
-                : importingFrom
-                  ? "Import MCP Server"
-                  : "Add MCP Server"}
-            </h3>
-            <p className="text-muted-foreground mt-0.5 text-[12px]">
-              {importingFrom
-                ? `Import "${importingFrom.name}" into Orbit. Existing secrets stay on the host.`
-                : "Configure a stdio or Streamable HTTP MCP server on this host."}
-            </p>
-          </div>
-          <button
-            type="button"
-            aria-label="Close"
-            onClick={onClose}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-lg transition-colors"
-          >
-            <X className="h-[15px] w-[15px]" />
-          </button>
-        </div>
+        <DialogHeader className="px-5 pt-5 pr-12 pb-4">
+          <DialogTitle>
+            {isEdit
+              ? "Edit MCP Server"
+              : importingFrom
+                ? "Import MCP Server"
+                : "Add MCP Server"}
+          </DialogTitle>
+          <DialogDescription>
+            {importingFrom
+              ? `Import "${importingFrom.name}" into Orbit. Existing secrets stay on the host.`
+              : "Configure a stdio or Streamable HTTP MCP server on this host."}
+          </DialogDescription>
+        </DialogHeader>
 
         <form
           onSubmit={(e) => void handleSubmit(e)}
-          className="orbit-native-scroll min-h-0 flex-1 space-y-3.5 overflow-y-auto overscroll-contain px-5 pb-5"
+          className="orbit-native-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5"
         >
-          {/* Scope + Transport toggles */}
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <span className="text-muted-foreground text-[11.5px] font-medium">Scope</span>
-              <div className="border-border bg-background/60 grid grid-cols-2 gap-0.5 rounded-[9px] border p-0.5">
-                <button
-                  type="button"
-                  disabled={isEdit}
-                  onClick={() => setScope("user")}
-                  className={cn(
-                    "h-[26px] cursor-pointer rounded-[7px] text-[12px] transition-colors disabled:cursor-not-allowed disabled:opacity-65",
-                    scope === "user"
-                      ? "bg-foreground/9 text-foreground font-medium dark:bg-white/[0.11]"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
+          <FieldGroup>
+            {/* Scope + Transport toggles */}
+            <div className="grid grid-cols-2 gap-3">
+              <Field>
+                <FieldLabel className="text-[11.5px]">Scope</FieldLabel>
+                <Tabs value={scope} onValueChange={(v) => setScope(v as McpWriteScope)}>
+                  <TabsList className="grid w-full grid-cols-2">
+                    <TabsTrigger value="user" disabled={isEdit} className="text-[12px]">
+                      User
+                    </TabsTrigger>
+                    <TabsTrigger
+                      value="project"
+                      disabled={isEdit || !workspaceCwd}
+                      title={workspaceCwd ? `${workspaceCwd}/.mcp.json` : "No active workspace"}
+                      className="text-[12px]"
+                    >
+                      Project .mcp.json
+                    </TabsTrigger>
+                  </TabsList>
+                </Tabs>
+              </Field>
+
+              <Field>
+                <FieldLabel className="text-[11.5px]">Transport</FieldLabel>
+                <Tabs
+                  value={transportKind}
+                  onValueChange={(v) => setTransportKind(v as "stdio" | "streamable_http")}
                 >
-                  User
-                </button>
-                <button
-                  type="button"
-                  disabled={isEdit || !workspaceCwd}
-                  title={workspaceCwd ? `${workspaceCwd}/.mcp.json` : "No active workspace"}
-                  onClick={() => setScope("project")}
-                  className={cn(
-                    "h-[26px] cursor-pointer rounded-[7px] text-[12px] transition-colors disabled:cursor-not-allowed disabled:opacity-45",
-                    scope === "project"
-                      ? "bg-foreground/9 text-foreground font-medium dark:bg-white/[0.11]"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  Project .mcp.json
-                </button>
-              </div>
+                  <TabsList className="grid w-full grid-cols-2">
+                    <TabsTrigger value="stdio" className="text-[12px]">
+                      stdio
+                    </TabsTrigger>
+                    <TabsTrigger value="streamable_http" className="text-[12px]">
+                      HTTP / SSE
+                    </TabsTrigger>
+                  </TabsList>
+                </Tabs>
+              </Field>
             </div>
 
-            <div className="space-y-1">
-              <span className="text-muted-foreground text-[11.5px] font-medium">Transport</span>
-              <div className="border-border bg-background/60 grid grid-cols-2 gap-0.5 rounded-[9px] border p-0.5">
-                <button
-                  type="button"
-                  onClick={() => setTransportKind("stdio")}
-                  className={cn(
-                    "h-[26px] cursor-pointer rounded-[7px] text-[12px] transition-colors",
-                    transportKind === "stdio"
-                      ? "bg-foreground/9 text-foreground font-medium dark:bg-white/[0.11]"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  stdio
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setTransportKind("streamable_http")}
-                  className={cn(
-                    "h-[26px] cursor-pointer rounded-[7px] text-[12px] transition-colors",
-                    transportKind === "streamable_http"
-                      ? "bg-foreground/9 text-foreground font-medium dark:bg-white/[0.11]"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  HTTP / SSE
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <label className="block space-y-1">
-            <span className="text-muted-foreground text-[11.5px] font-medium">Server Name</span>
-            <input
-              type="text"
-              autoFocus={!isEdit}
-              value={name}
-              disabled={isEdit}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="github"
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12.5px] outline-none focus:border-foreground/40 disabled:opacity-60"
-            />
-          </label>
-
-          {transportKind === "stdio" ? (
-            <>
-              <div className="grid grid-cols-2 gap-3">
-                <label className="block space-y-1">
-                  <span className="text-muted-foreground text-[11.5px] font-medium">Command</span>
-                  <input
-                    type="text"
-                    value={command}
-                    onChange={(e) => setCommand(e.target.value)}
-                    placeholder="npx or uvx"
-                    className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12.5px] outline-none focus:border-foreground/40"
-                  />
-                </label>
-                <label className="block space-y-1">
-                  <span className="text-muted-foreground text-[11.5px] font-medium">Arguments</span>
-                  <input
-                    type="text"
-                    value={argsText}
-                    onChange={(e) => setArgsText(e.target.value)}
-                    placeholder="-y @modelcontextprotocol/server-github"
-                    className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12.5px] outline-none focus:border-foreground/40"
-                  />
-                </label>
-              </div>
-
-              <KvEditorRows
-                label="Environment Variables"
-                addLabel="Add variable"
-                keyPlaceholder="GITHUB_TOKEN"
-                valuePlaceholder="Value"
-                rows={envRows}
-                onChange={setEnvRows}
+            <Field>
+              <FieldLabel htmlFor="mcp-server-name" className="text-[11.5px]">
+                Server Name
+              </FieldLabel>
+              <Input
+                id="mcp-server-name"
+                type="text"
+                autoFocus={!isEdit}
+                value={name}
+                disabled={isEdit}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="github"
+                className="font-mono"
               />
-            </>
-          ) : (
-            <>
-              <label className="block space-y-1">
-                <span className="text-muted-foreground text-[11.5px] font-medium">
-                  Endpoint URL
-                </span>
-                <input
-                  type="text"
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  placeholder="https://mcp.example.com/mcp"
-                  className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12.5px] outline-none focus:border-foreground/40"
+            </Field>
+
+            {transportKind === "stdio" ? (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field>
+                    <FieldLabel htmlFor="mcp-server-command" className="text-[11.5px]">
+                      Command
+                    </FieldLabel>
+                    <Input
+                      id="mcp-server-command"
+                      type="text"
+                      value={command}
+                      onChange={(e) => setCommand(e.target.value)}
+                      placeholder="npx or uvx"
+                      className="font-mono"
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="mcp-server-args" className="text-[11.5px]">
+                      Arguments
+                    </FieldLabel>
+                    <Input
+                      id="mcp-server-args"
+                      type="text"
+                      value={argsText}
+                      onChange={(e) => setArgsText(e.target.value)}
+                      placeholder="-y @modelcontextprotocol/server-github"
+                      className="font-mono"
+                    />
+                  </Field>
+                </div>
+
+                <KvEditorRows
+                  label="Environment Variables"
+                  addLabel="Add variable"
+                  keyPlaceholder="GITHUB_TOKEN"
+                  valuePlaceholder="Value"
+                  rows={envRows}
+                  onChange={setEnvRows}
                 />
-              </label>
+              </>
+            ) : (
+              <>
+                <Field>
+                  <FieldLabel htmlFor="mcp-server-url" className="text-[11.5px]">
+                    Endpoint URL
+                  </FieldLabel>
+                  <Input
+                    id="mcp-server-url"
+                    type="text"
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    placeholder="https://mcp.example.com/mcp"
+                    className="font-mono"
+                  />
+                </Field>
 
-              <KvEditorRows
-                label="HTTP Headers"
-                addLabel="Add header"
-                keyPlaceholder="Authorization"
-                valuePlaceholder="Bearer …"
-                rows={headerRows}
-                onChange={setHeaderRows}
+                <KvEditorRows
+                  label="HTTP Headers"
+                  addLabel="Add header"
+                  keyPlaceholder="Authorization"
+                  valuePlaceholder="Bearer …"
+                  rows={headerRows}
+                  onChange={setHeaderRows}
+                />
+              </>
+            )}
+
+            <Field orientation="horizontal" className="pt-0.5">
+              <FieldLabel className="font-normal">Enabled</FieldLabel>
+              <ToggleSwitch
+                checked={enabled}
+                onChange={setEnabled}
+                ariaLabel="Enable MCP server"
               />
-            </>
-          )}
+            </Field>
 
-          <div className="flex items-center justify-between pt-0.5">
-            <span className="text-muted-foreground text-[12px]">Enabled</span>
-            <ToggleSwitch
-              checked={enabled}
-              onChange={setEnabled}
-              ariaLabel="Enable MCP server"
-            />
-          </div>
+            {error && (
+              <div className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-[12px] text-red-600 dark:text-red-400">
+                {error}
+              </div>
+            )}
 
-          {error && (
-            <div className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-[12px] text-red-600 dark:text-red-400">
-              {error}
-            </div>
-          )}
-
-          <div className="flex items-center justify-end gap-2 pt-2">
-            <button
-              type="button"
-              disabled={saving}
-              onClick={onClose}
-              className="border-border hover:bg-accent h-[30px] cursor-pointer rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:opacity-50"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={saving}
-              className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:opacity-50"
-            >
-              {saving && <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />}
-              <span>{isEdit ? "Save Changes" : importingFrom ? "Import" : "Add Server"}</span>
-            </button>
-          </div>
+            <DialogFooter className="pt-2">
+              <Button type="button" variant="outline" size="sm" disabled={saving} onClick={onClose}>
+                Cancel
+              </Button>
+              <Button type="submit" size="sm" disabled={saving}>
+                {saving && <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />}
+                <span>{isEdit ? "Save Changes" : importingFrom ? "Import" : "Add Server"}</span>
+              </Button>
+            </DialogFooter>
+          </FieldGroup>
         </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -802,41 +782,29 @@ export function HostMcpSection({ hostId }: { hostId: string }) {
 
       {/* Filter bar */}
       <div className="flex flex-wrap items-center justify-between gap-2.5">
-        <div
-          role="tablist"
-          aria-label="Filter MCP server scope"
-          className="border-border bg-background/60 inline-flex items-center gap-0.5 rounded-[9px] border p-0.5"
+        <Tabs
+          value={filter}
+          onValueChange={(next) => {
+            if (typeof next === "string") setFilter(next as McpScopeFilter);
+          }}
         >
-          {(
-            [
-              { id: "all", label: "All", count: servers.length },
-              { id: "managed", label: "Managed", count: managedCount },
-              { id: "discovered", label: "Discovered", count: discoveredCount },
-            ] as const
-          ).map((tab) => {
-            const active = filter === tab.id;
-            return (
-              <button
-                key={tab.id}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                onClick={() => setFilter(tab.id)}
-                className={cn(
-                  "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] px-2.5 text-[12px] transition-colors",
-                  active
-                    ? "bg-foreground/9 text-foreground font-medium dark:bg-white/[0.11]"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
+          <TabsList aria-label="Filter MCP server scope">
+            {(
+              [
+                { id: "all", label: "All", count: servers.length },
+                { id: "managed", label: "Managed", count: managedCount },
+                { id: "discovered", label: "Discovered", count: discoveredCount },
+              ] as const
+            ).map((tab) => (
+              <TabsTrigger key={tab.id} value={tab.id}>
                 <span>{tab.label}</span>
-                <span className="text-muted-foreground/75 text-[11px] tabular-nums">
+                <span className="text-ink-faint font-mono text-[11px] font-normal tabular-nums">
                   {tab.count}
                 </span>
-              </button>
-            );
-          })}
-        </div>
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
 
         {workspaceCwd && (
           <span

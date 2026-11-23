@@ -13,12 +13,12 @@ import type { CSSProperties } from "react";
  *    absorbs window changes (zero unnecessary reflow inside Diff / Code / Terminal).
  * 3. Once the center stage reaches its 440px comfort floor, the right side panel yields
  *    smoothly to a 50/50 peer split (down to 320px) so the main conversation is never
- *    crushed, and the left sidebar gently yields toward 220px only if the window gets tight.
+ *    crushed, and the left sidebar gently yields toward 240px only if the window gets tight.
  */
 
-export const SIDEBAR_DEFAULT_WIDTH_PX = 256;
-export const SIDEBAR_MIN_WIDTH_PX = 220;
-export const SIDEBAR_MAX_WIDTH_PX = 400;
+export const SIDEBAR_DEFAULT_WIDTH_PX = 280;
+export const SIDEBAR_MIN_WIDTH_PX = 240;
+export const SIDEBAR_MAX_WIDTH_PX = 420;
 
 export const SIDE_PANEL_DEFAULT_WIDTH_PX = 480;
 export const SIDE_PANEL_MIN_WIDTH_PX = 320;

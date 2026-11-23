@@ -1490,13 +1490,13 @@ function CommandPaletteDialog() {
           })}
         </div>
 
-        <div className="text-muted-foreground/65 hidden items-center gap-2.5 sm:flex">
+        <div className="text-ink-muted hidden items-center gap-2.5 sm:flex">
           <span className="inline-flex items-center gap-1">
-            <Kbd className="h-[17px] min-w-[17px] px-1 text-[10px]">↑↓</Kbd>
+            <Kbd size="xs">↑↓</Kbd>
             <span>{t("palette.hintNavigate")}</span>
           </span>
           <span className="inline-flex items-center gap-1">
-            <Kbd className="h-[17px] min-w-[17px] px-1 text-[10px]">↵</Kbd>
+            <Kbd size="xs">↵</Kbd>
             <span>{t("palette.hintOpen")}</span>
           </span>
         </div>

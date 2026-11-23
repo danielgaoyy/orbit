@@ -1,33 +1,49 @@
-import { memo } from "react";
+import { memo, useMemo } from "react";
 import {
   ArrowLeftRight,
-  Blocks,
   Code2,
   Copy,
   Download,
-  FileText,
   GitBranch,
   GitFork,
   MoreHorizontal,
+  PanelTop,
   Sparkles,
 } from "lucide-react";
-import { isAgentBackgroundWaiting, isMacDesktop } from "@/lib/orbit-ipc";
+import { isMacDesktop } from "@/lib/orbit-ipc";
 import { useI18n } from "@/lib/i18n";
 import { isAgentInGitRepo } from "@/lib/projects";
 import { modSymbol } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
+import { SubagentCrewMiniDock } from "@/components/stage/subagent-crew-dock";
 import { StandaloneGroupButton } from "@/components/stage/workspace-peer-strip";
+import { IconButton } from "@/components/ui/icon-button";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  SimpleTooltip,
 } from "@/components/ui/overlays";
+import { Separator } from "@/components/ui/separator";
+import {
+  selectSessionRuntimeActivity,
+  selectSessionSubagents,
+} from "@/state/selectors/session-selectors";
 import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
+/**
+ * Precision 40px Stage Header:
+ * - Left: Conversation title + quiet worktree branch chip (when applicable).
+ * - Right (strict icon budget, zero duplication with Overview):
+ *   1. Conditional SubagentCrewMiniDock (ONLY when Overview is hidden or narrow)
+ *   2. Conversation actions: Collaborate (`Users`) + More (`MoreHorizontal`)
+ *   3. 1px hairline divider
+ *   4. View toggle: Overview (`⌘⌥O`) with subtle semantic indicator dot when hidden
+ *      (Side Panel toggle stays stationary at top-right of App shell)
+ */
 export const TopBar = memo(function TopBar() {
   const { t } = useI18n();
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
@@ -73,52 +89,41 @@ export const TopBar = memo(function TopBar() {
     if (!ag) return false;
     return isAgentInGitRepo(s.selectedHostId, ag, detail, s.sidebarView);
   });
-  // Primitive return keeps TopBar free from re-renders on unrelated store updates
-  const overviewBadgeTone = useOrbitSelector<
-    "none" | "approval" | "subagent_running" | "bg_running"
-  >((s) => {
-    if (
-      s.workspacePanel !== "conversation" ||
-      s.isDraftNewSession ||
-      !s.selectedHostId ||
-      !s.selectedAgentId
-    ) {
-      return "none";
-    }
-    const parentHostId = s.selectedHostId;
-    const parentAgentId = s.selectedAgentId;
-    const ag = s.hostDetails[parentHostId]?.agents.find((a) => a.agent_id === parentAgentId);
-    const stageInsights = s.stages[`${parentHostId}::${parentAgentId}`]?.insights;
 
-    let hasRunningSubagent = Boolean(
-      stageInsights?.subagents?.some((sa) => sa.status === "running"),
-    );
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const fleet = useOrbitSelector((s) => s.fleet);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
+  const activeStage = useOrbitSelector((s) =>
+    hasActiveSession && s.selectedHostId && s.selectedAgentId
+      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
+      : null,
+  );
 
-    const providerSubs = s.hostDetails[parentHostId]?.provider_subagents?.[parentAgentId];
-    if (providerSubs?.some((ps) => ps.status === "running")) {
-      hasRunningSubagent = true;
-    }
+  const stageSlice = useMemo(() => {
+    const stages =
+      hasActiveSession && selectedHostId && selectedAgentId && activeStage
+        ? { [`${selectedHostId}::${selectedAgentId}`]: activeStage }
+        : {};
+    return { hostDetails, fleet, archivedSubagents, stages };
+  }, [hasActiveSession, selectedHostId, selectedAgentId, activeStage, hostDetails, fleet, archivedSubagents]);
 
-    for (const detail of Object.values(s.hostDetails)) {
-      for (const child of detail.agents) {
-        if (child.archived_at_rfc3339) continue;
-        if (
-          child.parent_agent_id === parentAgentId &&
-          (!child.parent_host_id || child.parent_host_id === parentHostId)
-        ) {
-          if (child.is_awaiting_permission) return "approval";
-          if (child.is_running || child.has_background_tasks) hasRunningSubagent = true;
-        }
-      }
-    }
+  const subagentSummary = useMemo(
+    () =>
+      hasActiveSession
+        ? selectSessionSubagents(stageSlice, selectedHostId, selectedAgentId)
+        : null,
+    [hasActiveSession, stageSlice, selectedHostId, selectedAgentId],
+  );
 
-    if (hasRunningSubagent) return "subagent_running";
+  const runtimeActivity = useMemo(
+    () =>
+      hasActiveSession
+        ? selectSessionRuntimeActivity(stageSlice, selectedHostId, selectedAgentId)
+        : null,
+    [hasActiveSession, stageSlice, selectedHostId, selectedAgentId],
+  );
 
-    const hasRunningBgTask =
-      isAgentBackgroundWaiting(ag) ||
-      Boolean(stageInsights?.background_tasks?.some((t) => t.status === "running"));
-    return hasRunningBgTask ? "bg_running" : "none";
-  });
+  const overviewIndicatorTone = runtimeActivity?.overviewIndicatorTone ?? "none";
 
   const {
     topbarUseOpenLeftPad,
@@ -131,7 +136,6 @@ export const TopBar = memo(function TopBar() {
     isAnimating,
   } = useWorkspaceMotion();
 
-  // Primitive selector prevents `TopBar` from re-rendering on streaming tokens or background host ticks
   const rawHeaderTitle = useOrbitSelector((s) => {
     if (s.workspacePanel === "automations") return "__AUTOMATIONS__";
     if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) {
@@ -146,6 +150,7 @@ export const TopBar = memo(function TopBar() {
       s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.agent;
     return ag?.title || "__NEW_CONVERSATION__";
   });
+
   const headerTitle =
     rawHeaderTitle === "__AUTOMATIONS__"
       ? t("common.automations")
@@ -153,26 +158,36 @@ export const TopBar = memo(function TopBar() {
         ? t("common.newConversation")
         : rawHeaderTitle;
 
-  const workspaceArtifactCount = useOrbitSelector((s) => {
-    if (!s.selectedHostId) return 0;
-    const detail = s.hostDetails[s.selectedHostId];
-    const all = detail?.artifacts ?? [];
-    if (all.length === 0) return 0;
-    const ag =
-      !s.isDraftNewSession && s.selectedAgentId
-        ? detail?.agents.find((a) => a.agent_id === s.selectedAgentId)
-        : null;
-    if (ag?.workspace_id) {
-      return all.filter((a) => a.workspace_id === ag.workspace_id).length;
-    }
-    return all.length;
-  });
-
   const mod = modSymbol();
   const isMac = isMacDesktop();
-
   const showBottomBorder =
     workspacePanel === "automations" || (!isDraft && Boolean(selectedAgentId));
+
+  const showTopBarCrewRelay =
+    hasActiveSession &&
+    !overviewVisible &&
+    Boolean(selectedAgentId) &&
+    (subagentSummary?.visible.length ?? 0) > 0;
+
+  const indicatorDotTone = overviewVisible
+    ? "none"
+    : overviewIndicatorTone === "approval"
+      ? "warning"
+      : overviewIndicatorTone === "running"
+        ? "success"
+        : overviewIndicatorTone === "goal"
+          ? "info"
+          : "none";
+
+  const overviewTooltip = overviewVisible
+    ? t("topbar.hideOverview")
+    : overviewIndicatorTone === "approval"
+      ? t("topbar.showOverviewApproval")
+      : overviewIndicatorTone === "running"
+        ? t("topbar.showOverviewSubagent")
+        : overviewIndicatorTone === "goal"
+          ? t("topbar.showOverviewBackground")
+          : t("topbar.showOverview");
 
   return (
     <header
@@ -183,16 +198,15 @@ export const TopBar = memo(function TopBar() {
           : undefined
       }
       className={cn(
-        "@container bg-canvas flex h-[40px] min-w-0 shrink-0 items-center justify-between gap-2 overflow-hidden select-none @[460px]:gap-3",
-        showBottomBorder &&
-          "shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.055)] dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.06)]",
+        "@container bg-surface-base flex h-[40px] min-w-0 shrink-0 items-center justify-between gap-2 overflow-hidden select-none @[460px]:gap-3",
+        showBottomBorder && "border-border-subtle border-b",
         topbarUseOpenLeftPad ? "pl-[16px]" : isMac ? "pl-[114px]" : "pl-[48px]",
         topbarReserveRightToggle ? "pr-[42px]" : "pr-[12px]",
       )}
     >
-      {/* Left: Conversation Title (glides smoothly via pure GPU translate3d) */}
+      {/* Left: Conversation Title + quiet Worktree Branch chip */}
       <div
-        className="flex min-w-0 flex-1 items-center overflow-hidden"
+        className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden"
         data-tauri-drag-region
         style={{
           transform:
@@ -205,17 +219,28 @@ export const TopBar = memo(function TopBar() {
           data-tauri-drag-region
           title={headerTitle}
           className={cn(
-            "block min-w-0 translate-y-[0.5px] truncate text-[13.5px] leading-[20px] font-medium",
+            "block min-w-0 truncate text-[13px] leading-[20px] font-medium",
             workspacePanel === "conversation" && isDraft
-              ? "text-foreground/72"
-              : "text-foreground/92",
+              ? "text-ink-tertiary"
+              : "text-ink-primary",
           )}
         >
           {headerTitle}
         </span>
+
+        {activeWorktreeWorkspace?.git_branch && (
+          <span
+            data-tauri-drag-region
+            title={`Worktree branch: ${activeWorktreeWorkspace.git_branch}`}
+            className="text-ink-muted hidden max-w-[160px] shrink-0 items-center gap-1 font-mono text-[11.5px] leading-none @[520px]:inline-flex"
+          >
+            <GitBranch className="size-3 shrink-0 opacity-70" />
+            <span className="truncate">{activeWorktreeWorkspace.git_branch}</span>
+          </span>
+        )}
       </div>
 
-      {/* Right: Stage Overview Toggle (Side Panel toggle is stationary in App shell; GPU-slid on panel open/close) */}
+      {/* Right: Zero-duplication Crew Relay + Conversation Actions | Hairline | Overview Toggle */}
       <div
         style={{
           transform:
@@ -227,164 +252,142 @@ export const TopBar = memo(function TopBar() {
           transition: topbarRightTransition,
           willChange: isAnimating ? "transform" : undefined,
         }}
-        className="flex shrink-0 items-center gap-0.5 @[460px]:gap-1"
+        className="flex shrink-0 items-center gap-1"
       >
         {hasActiveSession && selectedHostId && selectedAgentId && (
           <>
-            {workspaceArtifactCount > 0 && (
-              <SimpleTooltip label={t("topbar.artifactsCount", { count: workspaceArtifactCount })}>
-                <button
-                  type="button"
-                  aria-label={t("topbar.artifactsCount", { count: workspaceArtifactCount })}
-                  onClick={() => orbitActions.openArtifactsTab({ hostId: selectedHostId })}
-                  className="text-foreground/70 hover:text-foreground inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center gap-1 rounded-[7px] px-0 text-[12px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06] @[460px]:w-auto @[460px]:px-2"
-                >
-                  <Blocks className="h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                  <span className="hidden text-[11px] tabular-nums opacity-80 @[460px]:inline">
-                    {workspaceArtifactCount}
-                  </span>
-                </button>
-              </SimpleTooltip>
+            {showTopBarCrewRelay && subagentSummary && (
+              <>
+                <SubagentCrewMiniDock
+                  agentId={selectedAgentId}
+                  subagents={subagentSummary.visible}
+                />
+                <span aria-hidden="true" className="bg-border-subtle mx-1 h-[14px] w-px shrink-0" />
+              </>
             )}
+
             <StandaloneGroupButton />
+
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
+                <IconButton
+                  size="md"
                   aria-label={t("topbar.conversationActions")}
-                  className="text-foreground/65 hover:text-foreground inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
                 >
-                  <MoreHorizontal className="h-[15.5px] w-[15.5px] stroke-[1.75]" />
-                </button>
+                  <MoreHorizontal className="size-[15px] stroke-[1.75]" />
+                </IconButton>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" sideOffset={6} className="min-w-[196px]">
-                <DropdownMenuItem
-                  onSelect={() => {
-                    void orbitActions.forkAgent({
-                      hostId: selectedHostId,
-                      sourceAgentId: selectedAgentId,
-                    });
-                  }}
-                >
-                  <span className="flex items-center gap-2">
-                    <GitFork className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>{t("topbar.forkConversation")}</span>
-                  </span>
-                </DropdownMenuItem>
-                {canForkWorktree && (
+              <DropdownMenuContent align="end" sideOffset={6} className="min-w-[188px]">
+                <DropdownMenuGroup>
                   <DropdownMenuItem
                     onSelect={() => {
                       void orbitActions.forkAgent({
                         hostId: selectedHostId,
                         sourceAgentId: selectedAgentId,
-                        worktree: true,
                       });
                     }}
                   >
-                    <span className="flex items-center gap-2">
-                      <GitBranch className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                      <span>{t("topbar.forkInWorktree")}</span>
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <GitFork className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("topbar.forkConversation")}</span>
                     </span>
                   </DropdownMenuItem>
-                )}
-                {activeWorktreeWorkspace && (
+                  {canForkWorktree && (
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        void orbitActions.forkAgent({
+                          hostId: selectedHostId,
+                          sourceAgentId: selectedAgentId,
+                          worktree: true,
+                        });
+                      }}
+                    >
+                      <span className="flex items-center gap-2 whitespace-nowrap">
+                        <GitBranch className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                        <span>{t("topbar.forkInWorktree")}</span>
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+                  {activeWorktreeWorkspace && (
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        orbitActions.openWorktreeHandoffDialog({
+                          hostId: selectedHostId,
+                          workspaceId: activeWorktreeWorkspace.workspace_id,
+                          direction: "worktree_to_local",
+                          defaultMode: "apply",
+                          sourceCwd: activeWorktreeWorkspace.cwd,
+                        })
+                      }
+                    >
+                      <span className="flex items-center gap-2 whitespace-nowrap">
+                        <ArrowLeftRight className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                        <span>{t("topbar.applyToLocal")}</span>
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuGroup>
+                <DropdownMenuSeparator />
+                <DropdownMenuGroup>
                   <DropdownMenuItem
-                    onSelect={() =>
-                      orbitActions.openWorktreeHandoffDialog({
-                        hostId: selectedHostId,
-                        workspaceId: activeWorktreeWorkspace.workspace_id,
-                        direction: "worktree_to_local",
-                        defaultMode: "apply",
-                        sourceCwd: activeWorktreeWorkspace.cwd,
-                      })
-                    }
+                    onSelect={() => orbitActions.openExportDialog(selectedHostId, selectedAgentId)}
                   >
-                    <span className="flex items-center gap-2">
-                      <ArrowLeftRight className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                      <span>{t("topbar.applyToLocal")}</span>
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Download className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("topbar.export")}</span>
                     </span>
                   </DropdownMenuItem>
-                )}
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      void orbitActions.openCopyCodeBlocksModal(selectedHostId, selectedAgentId);
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Code2 className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("topbar.copyCodeBlock")}</span>
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      void orbitActions.copyThread(selectedHostId, selectedAgentId);
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Copy className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("topbar.copyTranscript")}</span>
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onSelect={() => orbitActions.openExportDialog(selectedHostId, selectedAgentId)}
-                >
-                  <span className="flex items-center gap-2">
-                    <Download className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>{t("topbar.export")}</span>
-                  </span>
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onSelect={() => {
-                    void orbitActions.openCopyCodeBlocksModal(selectedHostId, selectedAgentId);
-                  }}
-                >
-                  <span className="flex items-center gap-2">
-                    <Code2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>{t("topbar.copyCodeBlock")}</span>
-                  </span>
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onSelect={() => {
-                    void orbitActions.copyThread(selectedHostId, selectedAgentId);
-                  }}
-                >
-                  <span className="flex items-center gap-2">
-                    <Copy className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>{t("topbar.copyTranscript")}</span>
-                  </span>
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onSelect={() => {
-                    void orbitActions.summarizeAgent(selectedHostId, selectedAgentId);
-                  }}
-                >
-                  <span className="flex items-center gap-2">
-                    <Sparkles className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>{t("topbar.summarize")}</span>
-                  </span>
-                </DropdownMenuItem>
+                <DropdownMenuGroup>
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      void orbitActions.summarizeAgent(selectedHostId, selectedAgentId);
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Sparkles className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("topbar.summarize")}</span>
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
               </DropdownMenuContent>
             </DropdownMenu>
-            <SimpleTooltip
-            label={
-              overviewVisible
-                ? t("topbar.hideOverview")
-                : overviewBadgeTone === "approval"
-                  ? t("topbar.showOverviewApproval")
-                  : overviewBadgeTone === "subagent_running"
-                    ? t("topbar.showOverviewSubagent")
-                    : overviewBadgeTone === "bg_running"
-                      ? t("topbar.showOverviewBackground")
-                      : t("topbar.showOverview")
-            }
-            shortcut={`${mod}⌥O`}
-          >
-            <button
-              type="button"
+
+            <Separator orientation="vertical" className="mx-0.5 h-[14px]" />
+
+            <IconButton
+              size="md"
               data-overview-trigger
+              active={overviewVisible}
+              indicatorTone={indicatorDotTone}
+              tooltip={overviewTooltip}
+              shortcut={`${mod}⌥O`}
               aria-label={overviewVisible ? t("topbar.hideOverview") : t("topbar.showOverview")}
               onClick={() => orbitActions.toggleOverviewPanel()}
-              className={cn(
-                "relative inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",
-                overviewVisible
-                  ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
-                  : "text-foreground/65 hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
-              )}
             >
-              <FileText className="h-[15.5px] w-[15.5px] stroke-[1.75]" />
-              {!overviewVisible && overviewBadgeTone !== "none" && (
-                <span
-                  aria-hidden="true"
-                  className={cn(
-                    "ring-canvas absolute top-[5px] right-[5px] h-[5px] w-[5px] rounded-full ring-[1.5px]",
-                    overviewBadgeTone === "approval" ? "bg-amber-500" : "bg-emerald-500/90",
-                  )}
-                />
-              )}
-            </button>
-          </SimpleTooltip>
+              <PanelTop className="size-[15px] stroke-[1.75]" />
+            </IconButton>
           </>
         )}
       </div>

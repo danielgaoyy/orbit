@@ -241,21 +241,21 @@ describe("createCachedStateSnapshot", () => {
     assert.strictEqual(unstableWarnings, 1);
   });
 
-  it("keeps SubagentsTrack insightsSubagents fallback stabilized via EMPTY_STAGE_SUBAGENTS", () => {
-    const source = readFileSync(
-      new URL("../components/stage/subagents-track.tsx", import.meta.url),
+  it("keeps session-selectors empty fallbacks frozen and avoids inline empty arrays in subagent crew dock", () => {
+    const selectorSource = readFileSync(
+      new URL("../state/selectors/session-selectors.ts", import.meta.url),
       "utf8",
     );
-    assert.match(source, /const\s+EMPTY_STAGE_SUBAGENTS\b[^=]*=\s*Object\.freeze\(\[\]\)/);
+    assert.match(selectorSource, /const\s+EMPTY_INSIGHT_SUBAGENTS\b[^=]*=\s*Object\.freeze\(\[\]\)/);
+    assert.match(selectorSource, /const\s+EMPTY_SUBAGENT_LIST\b[^=]*=\s*Object\.freeze\(\[\]\)/);
 
-    const selectorMatch = source.match(
-      /const\s+insightsSubagents\s*=\s*useOrbitSelector\(([\s\S]*?)\n\s*\);/,
+    const dockSource = readFileSync(
+      new URL("../components/stage/subagent-crew-dock.tsx", import.meta.url),
+      "utf8",
     );
-    assert.ok(selectorMatch, "Expected insightsSubagents selector in subagents-track.tsx");
-    const selectorBody = selectorMatch[1];
-    assert.match(selectorBody, /EMPTY_STAGE_SUBAGENTS/);
-    assert.doesNotMatch(selectorBody, /\?\?\s*\[\]/);
-    assert.doesNotMatch(selectorBody, /:\s*\[\]/);
+    for (const call of extractSelectorCalls(dockSource)) {
+      assert.deepEqual(findUnstableReturnIssues(call.body), []);
+    }
   });
 
   it("audits every useOrbitSelector call across src/ against returning fresh object/array allocations", () => {

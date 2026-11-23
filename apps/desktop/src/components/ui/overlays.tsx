@@ -108,7 +108,7 @@ export function PopoverContent({
           initialFocus={initialFocus}
           finalFocus={finalFocus}
           className={cn(
-            "bg-popover text-popover-foreground floating-surface orbit-floating-content w-72 rounded-[14px] border border-black/[0.09] p-3 outline-none dark:border-white/[0.10]",
+            "text-ink-primary floating-surface orbit-floating-content w-72 rounded-[14px] border p-3 outline-none",
             className,
           )}
           {...props}
@@ -123,6 +123,7 @@ export function PopoverContent({
  * ============================================================================ */
 
 export const DropdownMenu = BaseMenu.Root;
+export const DropdownMenuGroup = BaseMenu.Group;
 
 export type DropdownMenuTriggerProps = Omit<
   React.ComponentProps<typeof BaseMenu.Trigger>,
@@ -183,7 +184,7 @@ export function DropdownMenuContent({
           data-slot="dropdown-menu-content"
           finalFocus={finalFocus}
           className={cn(
-            "bg-popover text-popover-foreground floating-surface orbit-floating-content min-w-44 overflow-hidden rounded-[14px] border border-black/[0.09] p-1.5 outline-none dark:border-white/[0.10]",
+            "text-ink-primary floating-surface orbit-floating-content w-max min-w-[180px] max-w-[calc(100vw-16px)] overflow-hidden rounded-[10px] border p-1 outline-none",
             className,
           )}
           {...props}
@@ -196,10 +197,12 @@ export function DropdownMenuContent({
 export interface DropdownMenuItemProps
   extends Omit<React.ComponentProps<typeof BaseMenu.Item>, "onSelect"> {
   onSelect?: (event: React.MouseEvent<HTMLDivElement>) => void;
+  variant?: "default" | "destructive";
 }
 
 export function DropdownMenuItem({
   className,
+  variant = "default",
   onSelect,
   onClick,
   ...props
@@ -207,12 +210,16 @@ export function DropdownMenuItem({
   return (
     <BaseMenu.Item
       data-slot="dropdown-menu-item"
+      data-variant={variant}
       onClick={(e) => {
         onSelect?.(e);
         onClick?.(e);
       }}
       className={cn(
-        "focus:bg-accent focus:text-accent-foreground data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground relative flex cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-[13px] transition-colors duration-100 outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-45",
+        "relative flex min-h-[28px] cursor-pointer items-center justify-between gap-2 rounded-[6px] px-2 py-1 text-[12.5px] transition-colors duration-100 outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-45 [&_svg]:pointer-events-none [&_svg]:shrink-0",
+        variant === "destructive"
+          ? "text-signal-danger focus:bg-signal-danger-bg focus:text-signal-danger data-[highlighted]:bg-signal-danger-bg data-[highlighted]:text-signal-danger"
+          : "focus:bg-accent focus:text-ink-primary data-[highlighted]:bg-accent data-[highlighted]:text-ink-primary",
         className,
       )}
       {...props}
@@ -227,7 +234,7 @@ export function DropdownMenuSeparator({
   return (
     <BaseMenu.Separator
       data-slot="dropdown-menu-separator"
-      className={cn("bg-border -mx-1 my-1 h-px", className)}
+      className={cn("bg-border-subtle -mx-1 my-1 h-px", className)}
       {...props}
     />
   );
@@ -240,7 +247,7 @@ export function DropdownMenuLabel({
   return (
     <div
       data-slot="dropdown-menu-label"
-      className={cn("text-muted-foreground px-2.5 py-1 text-[12px] font-medium select-none", className)}
+      className={cn("text-ink-muted px-2 py-1 text-[11px] font-medium select-none", className)}
       {...props}
     />
   );
@@ -253,7 +260,7 @@ export function DropdownMenuShortcut({
   return (
     <span
       data-slot="dropdown-menu-shortcut"
-      className={cn("text-muted-foreground ml-auto text-[11.5px] tracking-widest", className)}
+      className={cn("text-ink-faint ml-auto text-[11px] tracking-widest", className)}
       {...props}
     />
   );
@@ -273,13 +280,13 @@ export function DropdownMenuSubTrigger({
     <BaseMenu.SubmenuTrigger
       data-slot="dropdown-menu-sub-trigger"
       className={cn(
-        "focus:bg-accent focus:text-accent-foreground data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[popup-open]:bg-accent data-[popup-open]:text-accent-foreground relative flex cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-[13px] transition-colors duration-100 outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-45",
+        "focus:bg-accent focus:text-ink-primary data-[highlighted]:bg-accent data-[highlighted]:text-ink-primary data-[popup-open]:bg-accent data-[popup-open]:text-ink-primary relative flex min-h-[28px] cursor-pointer items-center justify-between gap-2 rounded-[6px] px-2 py-1 text-[12.5px] transition-colors duration-100 outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-45 [&_svg]:pointer-events-none [&_svg]:shrink-0",
         className,
       )}
       {...props}
     >
       {children}
-      <ChevronRight className="text-muted-foreground/75 ml-auto h-[13px] w-[13px] shrink-0 stroke-[1.75]" />
+      <ChevronRight className="text-ink-muted ml-auto h-[13px] w-[13px] shrink-0 stroke-[1.75]" />
     </BaseMenu.SubmenuTrigger>
   );
 }
@@ -318,7 +325,7 @@ export function DropdownMenuSubContent({
           data-slot="dropdown-menu-sub-content"
           finalFocus={finalFocus}
           className={cn(
-            "bg-popover text-popover-foreground floating-surface orbit-floating-content w-max min-w-[168px] overflow-hidden rounded-[12px] border border-black/[0.09] p-1 outline-none dark:border-white/[0.10]",
+            "text-ink-primary floating-surface orbit-floating-content w-max min-w-[172px] max-w-[260px] overflow-hidden rounded-[10px] border p-1 outline-none",
             className,
           )}
           {...props}
@@ -357,9 +364,12 @@ export function SimpleTooltip({
       <BaseTooltip.Trigger render={resolved.render}>{resolved.children}</BaseTooltip.Trigger>
       <BaseTooltip.Portal>
         <BaseTooltip.Positioner side={side} sideOffset={6} className="z-50 pointer-events-none">
-          <BaseTooltip.Popup className="bg-popover text-popover-foreground floating-surface orbit-tooltip-content flex items-center gap-1.5 rounded-lg border border-black/[0.08] px-2.5 py-1 text-[12px] select-none dark:border-white/[0.11]">
+          <BaseTooltip.Popup
+            data-slot="tooltip-content"
+            className="text-ink-primary floating-surface orbit-tooltip-content flex items-center gap-1.5 rounded-[8px] border px-2.5 py-1 text-[12px] select-none"
+          >
             <span>{label}</span>
-            {shortcut && <ShortcutKbd keys={shortcut} />}
+            {shortcut && <ShortcutKbd keys={shortcut} size="sm" />}
           </BaseTooltip.Popup>
         </BaseTooltip.Positioner>
       </BaseTooltip.Portal>

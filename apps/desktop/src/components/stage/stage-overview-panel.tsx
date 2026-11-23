@@ -2,34 +2,43 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefOb
 import {
   ArrowUpRight,
   Blocks,
+  CheckCircle2,
   ChevronRight,
   Clock,
   File,
   FileDiff,
   FileText,
+  Pause,
   Play,
   Square,
   SquareTerminal,
+  Target,
   Timer,
   X,
-  type LucideIcon,
 } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
-import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
+import {
+  SubagentCrewList,
+  archiveSettledSubagentsList,
+} from "@/components/stage/subagent-crew-dock";
+import { Badge } from "@/components/ui/badge";
+import { Card } from "@/components/ui/card";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { SimpleTooltip } from "@/components/ui/overlays";
+import { DiffStat } from "@/components/ui/diff-stat";
+import { IconButton } from "@/components/ui/icon-button";
+import { ListRow } from "@/components/ui/list-row";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { Separator } from "@/components/ui/separator";
 import {
   type AgentCardView,
   type ConditionalTimerRecord,
   type DiffFileView,
+  type GoalControlAction,
+  type GoalRunRecord,
   type SessionInsightsView,
   formatTimerConditionLabel,
   formatTimerCountdown,
@@ -37,8 +46,12 @@ import {
   isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
-import { normalizeCwdForCompare } from "@/lib/stage-cache";
 import { formatDurationCompact } from "@/lib/timeline-coalesce";
+import {
+  selectSessionRuntimeActivity,
+  selectSessionSubagents,
+  selectWorkspaceToolSummary,
+} from "@/state/selectors/session-selectors";
 import {
   type OverviewSectionId,
   orbitActions,
@@ -81,11 +94,97 @@ function TaskElapsedLabel({ startedAtMs }: { startedAtMs: number }) {
   if (elapsed < 1000) return null;
 
   return (
-    <span className="text-muted-foreground/60 tabular-nums shrink-0 font-mono text-[11px]">
+    <span className="text-ink-muted tabular-nums shrink-0 font-mono text-[11px]">
       {formatDurationCompact(elapsed)}
     </span>
   );
 }
+
+const OverviewGoalRow = memo(function OverviewGoalRow({
+  hostId,
+  goal,
+}: {
+  hostId: string;
+  goal: GoalRunRecord;
+}) {
+  const [busyAction, setBusyAction] = useState<GoalControlAction | null>(null);
+  const isPaused = goal.status === "paused";
+  const isVerifying = goal.status === "verifying";
+
+  const handleControl = async (action: GoalControlAction) => {
+    setBusyAction(action);
+    try {
+      await orbitActions.controlGoalRun(hostId, goal.goal_id, action);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  return (
+    <div
+      title={goal.verify_command ? `${goal.objective}\nVerify: ${goal.verify_command}` : goal.objective}
+      className="group/goalrow hover:bg-accent/70 flex min-h-[38px] w-full items-center justify-between gap-2 rounded-[8px] px-2 py-1.5 transition-colors"
+    >
+      <div className="flex min-w-0 flex-1 items-start gap-2">
+        <span className="mt-[4px] flex size-[14px] shrink-0 items-center justify-center">
+          <span
+            className={cn(
+              "size-[6px] rounded-full",
+              isVerifying
+                ? "bg-signal-info animate-pulse"
+                : isPaused
+                  ? "bg-signal-warning"
+                  : "bg-signal-success animate-pulse",
+            )}
+          />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="text-ink-primary truncate text-[12px] leading-[16px] font-medium">
+            {goal.objective}
+          </div>
+          <div className="text-ink-tertiary flex items-center gap-1.5 text-[11px] leading-[15px]">
+            <Target className="size-[11px] shrink-0 opacity-75" />
+            <span>{isVerifying ? "Verifying" : isPaused ? "Paused" : "Goal"}</span>
+            <span className="opacity-45">·</span>
+            <span className="font-mono tabular-nums">
+              Iter {goal.current_iteration}/{goal.max_iterations}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="hidden shrink-0 items-center gap-0.5 group-focus-within/goalrow:flex group-hover/goalrow:flex">
+        {!isVerifying && (
+          <IconButton
+            size="xs"
+            tooltip="Verify now"
+            disabled={busyAction !== null}
+            onClick={() => void handleControl("verify_now")}
+          >
+            <CheckCircle2 className="size-3" />
+          </IconButton>
+        )}
+        <IconButton
+          size="xs"
+          tooltip={isPaused ? "Resume goal" : "Pause goal"}
+          disabled={busyAction !== null || isVerifying}
+          onClick={() => void handleControl(isPaused ? "resume" : "pause")}
+        >
+          {isPaused ? <Play className="size-3" /> : <Pause className="size-3" />}
+        </IconButton>
+        <IconButton
+          size="xs"
+          tone="danger"
+          tooltip="Stop goal"
+          disabled={busyAction !== null}
+          onClick={() => void handleControl("cancel")}
+        >
+          <Square className="size-[9px] fill-current" />
+        </IconButton>
+      </div>
+    </div>
+  );
+});
 
 const ArmedTimerRow = memo(function ArmedTimerRow({
   hostId,
@@ -97,102 +196,66 @@ const ArmedTimerRow = memo(function ArmedTimerRow({
   nowMs: number;
 }) {
   const [busy, setBusy] = useState(false);
-
   const countdown = formatTimerCountdown(timer.fire_at_ms, nowMs);
   const conditionLabel = formatTimerConditionLabel(timer.condition);
 
   return (
     <div
       title={timer.prompt}
-      className="group/timerrow hover:bg-accent/65 flex h-[30px] w-full items-center justify-between gap-1.5 rounded-[8px] px-2 transition-colors"
+      className="group/timerrow hover:bg-accent/70 flex h-[30px] w-full items-center justify-between gap-1.5 rounded-[8px] px-2 transition-colors"
     >
       <div className="flex min-w-0 items-center gap-1.5 text-[12px]">
-        <Timer className="text-amber-500/85 size-[13.5px] shrink-0 stroke-[1.8]" />
-        <span className="text-foreground/85 shrink-0 font-medium">Timer</span>
-        <span className="text-muted-foreground/60 shrink-0">·</span>
-        <span className="text-foreground/90 tabular-nums shrink-0 font-mono text-[11.5px]">
+        <Timer className="text-signal-warning size-[13px] shrink-0 stroke-[1.8]" />
+        <span className="text-ink-primary tabular-nums shrink-0 font-mono text-[11px] font-medium">
           {countdown}
         </span>
-        <span className="text-muted-foreground/60 shrink-0">·</span>
-        <span className="text-muted-foreground truncate text-[11.5px]">{conditionLabel}</span>
+        <span className="text-ink-muted shrink-0">·</span>
+        <span className="text-ink-tertiary truncate text-[11px]">{conditionLabel}</span>
       </div>
       <div className="hidden shrink-0 items-center gap-0.5 group-focus-within/timerrow:flex group-hover/timerrow:flex">
-        <SimpleTooltip label="Run now">
-          <button
-            type="button"
-            disabled={busy}
-            aria-label="Run timer now"
-            onClick={() => {
-              if (busy) return;
-              setBusy(true);
-              void orbitActions.fireConditionalTimerNow(hostId, timer.timer_id).then(
-                () => orbitActions.showToast("Timer triggered"),
-                (err) => {
-                  setBusy(false);
-                  orbitActions.showToast(`Failed to trigger timer: ${String(err)}`);
-                },
-              );
-            }}
-            className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[5px] transition-colors disabled:opacity-40"
-          >
-            <Play className="size-[10.5px] fill-current" />
-          </button>
-        </SimpleTooltip>
-        <SimpleTooltip label="Cancel timer">
-          <button
-            type="button"
-            disabled={busy}
-            aria-label="Cancel timer"
-            onClick={() => {
-              if (busy) return;
-              setBusy(true);
-              void orbitActions.cancelConditionalTimer(hostId, timer.timer_id).then(
-                () => orbitActions.showToast("Timer canceled"),
-                (err) => {
-                  setBusy(false);
-                  orbitActions.showToast(`Failed to cancel timer: ${String(err)}`);
-                },
-              );
-            }}
-            className="text-muted-foreground hover:bg-rose-500/12 hover:text-rose-600 dark:hover:text-rose-400 inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[5px] transition-colors disabled:opacity-40"
-          >
-            <X className="size-[12px] stroke-[1.9]" />
-          </button>
-        </SimpleTooltip>
+        <IconButton
+          size="xs"
+          tooltip="Run now"
+          disabled={busy}
+          onClick={() => {
+            if (busy) return;
+            setBusy(true);
+            void orbitActions.fireConditionalTimerNow(hostId, timer.timer_id).then(
+              () => orbitActions.showToast("Timer triggered"),
+              (err) => {
+                setBusy(false);
+                orbitActions.showToast(`Failed to trigger timer: ${String(err)}`);
+              },
+            );
+          }}
+        >
+          <Play className="size-[10px] fill-current" />
+        </IconButton>
+        <IconButton
+          size="xs"
+          tone="danger"
+          tooltip="Cancel timer"
+          disabled={busy}
+          onClick={() => {
+            if (busy) return;
+            setBusy(true);
+            void orbitActions.cancelConditionalTimer(hostId, timer.timer_id).then(
+              () => orbitActions.showToast("Timer canceled"),
+              (err) => {
+                setBusy(false);
+                orbitActions.showToast(`Failed to cancel timer: ${String(err)}`);
+              },
+            );
+          }}
+        >
+          <X className="size-3 stroke-[1.9]" />
+        </IconButton>
       </div>
     </div>
   );
 });
 
-const OverviewActionRow = memo(function OverviewActionRow({
-  icon: Icon,
-  label,
-  trailing,
-  onClick,
-}: {
-  icon: LucideIcon;
-  label: string;
-  trailing?: React.ReactNode;
-  onClick: () => void;
-}) {
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="sm"
-      onClick={onClick}
-      className="group/ovrow text-foreground/88 hover:bg-accent/65 hover:text-foreground h-[32px] w-full justify-between gap-2 rounded-[8px] px-2 text-[13px] font-normal shadow-none transition-colors"
-    >
-      <span className="flex min-w-0 items-center gap-2.5">
-        <Icon className="text-muted-foreground group-hover/ovrow:text-foreground/85 size-[15px] shrink-0 stroke-[1.65] transition-colors" />
-        <span className="truncate">{label}</span>
-      </span>
-      {trailing && <span className="shrink-0">{trailing}</span>}
-    </Button>
-  );
-});
-
-const OverviewLayerSection = memo(function OverviewLayerSection({
+const OverviewSection = memo(function OverviewSection({
   id,
   label,
   count,
@@ -200,40 +263,41 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
   isRunning = false,
   hasAlert = false,
   runningTone = "spinner",
+  trailingMeta,
   headerAction,
   footer,
   children,
 }: {
   id: OverviewSectionId;
   label: string;
-  count: number;
+  count?: number;
   collapsed: boolean;
   isRunning?: boolean;
   hasAlert?: boolean;
   runningTone?: "spinner" | "emerald";
+  trailingMeta?: React.ReactNode;
   headerAction?: React.ReactNode;
   footer?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
     <>
-      <Separator className="bg-black/[0.058] dark:bg-white/[0.07]" />
+      <Separator className="bg-border-subtle" />
       <Collapsible
         open={!collapsed}
         onOpenChange={() => orbitActions.toggleOverviewSection(id)}
-        className={cn("px-2.5 pt-2", !collapsed && footer ? "pb-0" : "pb-2")}
+        className={cn("px-2 pt-1.5", !collapsed && footer ? "pb-0" : "pb-1.5")}
       >
-        <div className="group/sechead hover:bg-accent/65 flex h-[30px] w-full items-center rounded-[8px] pr-1.5 transition-colors">
+        <div className="group/sechead hover:bg-accent/65 flex h-[28px] w-full items-center rounded-[8px] pr-1 transition-colors">
           <CollapsibleTrigger className="group/trigger focus-visible:ring-ring/50 flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded-[8px] pr-1 pl-2 text-left outline-none focus-visible:ring-2">
-            <span className="text-muted-foreground group-hover/sechead:text-foreground truncate text-[12.5px] font-medium transition-colors">
+            <span className="text-ink-tertiary group-hover/sechead:text-ink-primary truncate text-[11px] font-medium tracking-[0.03em] uppercase transition-colors">
               {label}
             </span>
-            <Badge
-              variant="secondary"
-              className="text-muted-foreground tabular-nums h-[18px] min-w-[18px] rounded-full border-transparent bg-black/[0.05] px-1.5 py-0 text-[11px] leading-none font-medium dark:bg-white/[0.08]"
-            >
-              {count}
-            </Badge>
+            {typeof count === "number" && (
+              <span className="text-ink-muted tabular-nums font-mono text-[11px]">
+                {count}
+              </span>
+            )}
           </CollapsibleTrigger>
 
           <div className="flex shrink-0 items-center gap-1">
@@ -242,34 +306,43 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
                 {headerAction}
               </div>
             )}
+            {trailingMeta && (
+              <span
+                className={cn(
+                  "flex items-center",
+                  headerAction && "group-focus-within/sechead:hidden group-hover/sechead:hidden",
+                )}
+              >
+                {trailingMeta}
+              </span>
+            )}
             {collapsed && (hasAlert || isRunning) && (
               <span
                 className={cn(
                   "flex items-center",
-                  headerAction &&
-                    "group-focus-within/sechead:hidden group-hover/sechead:hidden",
+                  headerAction && "group-focus-within/sechead:hidden group-hover/sechead:hidden",
                 )}
               >
                 {hasAlert ? (
-                  <span className="size-[6px] shrink-0 rounded-full bg-amber-500" />
+                  <span className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
                 ) : runningTone === "emerald" ? (
-                  <span className="size-[6px] shrink-0 rounded-full bg-emerald-500/85" />
+                  <span className="bg-signal-success size-[6px] shrink-0 rounded-full" />
                 ) : (
-                  <OrbitSpinner size={13} className="text-foreground/65" />
+                  <OrbitSpinner size={12} className="text-ink-secondary" />
                 )}
               </span>
             )}
             <CollapsibleTrigger
               aria-label={`Toggle ${label}`}
-              className="group/trigger text-muted-foreground/70 inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[5px] outline-none"
+              className="group/trigger text-ink-muted inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[6px] outline-none"
             >
-              <ChevronRight className="size-3.5 shrink-0 transition-transform duration-[220ms] ease-[var(--ease-panel)] group-data-[panel-open]/trigger:rotate-90" />
+              <ChevronRight className="size-3 shrink-0 transition-transform duration-200 ease-[var(--ease-panel)] group-data-[panel-open]/trigger:rotate-90" />
             </CollapsibleTrigger>
           </div>
         </div>
 
         <CollapsibleContent>
-          <div className="space-y-0.5 pt-1">{children}</div>
+          <div className="pt-1">{children}</div>
         </CollapsibleContent>
         {!collapsed && footer}
       </Collapsible>
@@ -291,56 +364,58 @@ const StageOverviewBody = memo(function StageOverviewBody({
   hostId,
   agentId,
   cwd,
-  insights: baseInsights,
+  insights,
   sessionTurnDiffs,
   currentAgent,
   cardMaxHeightExpr,
 }: StageOverviewContentProps) {
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const hostDetail = hostDetails[hostId] ?? null;
-  const gitReview = useOrbitSelector((s) => {
-    if (!cwd) return null;
-    const exact = s.gitReviews[`${hostId}::${cwd}`];
-    if (exact) return exact;
-    const norm = normalizeCwdForCompare(cwd);
-    if (!norm) return null;
-    const prefix = `${hostId}::`;
-    for (const [key, val] of Object.entries(s.gitReviews)) {
-      if (key.startsWith(prefix) && normalizeCwdForCompare(key.slice(prefix.length)) === norm) {
-        return val;
-      }
-    }
-    return null;
-  });
+  const fleet = useOrbitSelector((s) => s.fleet);
+  const gitReviews = useOrbitSelector((s) => s.gitReviews);
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
+  const activeStage = useOrbitSelector((s) => s.stages[`${hostId}::${agentId}`] ?? null);
+
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const [stoppingBg, setStoppingBg] = useState(false);
+  const [showAllTasks, setShowAllTasks] = useState(false);
 
-  const currentWorkspace = useMemo(() => {
-    if (!hostDetail || !currentAgent) return null;
-    return hostDetail.workspaces.find((w) => w.workspace_id === currentAgent.workspace_id) ?? null;
-  }, [hostDetail, currentAgent]);
-  const currentBoardRev =
-    (currentAgent ? hostDetail?.workspace_boards?.[currentAgent.workspace_id]?.revision : 0) ??
-    currentWorkspace?.board_revision ??
-    0;
-  const workspaceArtifactCount = useMemo(() => {
-    const all = hostDetail?.artifacts ?? [];
-    if (all.length === 0) return 0;
-    if (currentAgent?.workspace_id) {
-      return all.filter((a) => a.workspace_id === currentAgent.workspace_id).length;
-    }
-    return all.length;
-  }, [hostDetail?.artifacts, currentAgent?.workspace_id]);
-
-  const showGroupNotesRow = Boolean(
-    currentAgent &&
-      !currentAgent.parent_agent_id &&
-      (currentWorkspace?.is_curated || currentBoardRev > 0),
+  const selectorSlice = useMemo(
+    () => ({
+      hostDetails,
+      fleet,
+      gitReviews,
+      terminalTabs,
+      archivedSubagents,
+      stages: activeStage ? { [`${hostId}::${agentId}`]: activeStage } : {},
+    }),
+    [hostDetails, fleet, gitReviews, terminalTabs, archivedSubagents, activeStage, hostId, agentId],
   );
 
-  const insights = baseInsights;
+  const toolSummary = useMemo(
+    () =>
+      selectWorkspaceToolSummary(
+        selectorSlice,
+        hostId,
+        agentId,
+        cwd,
+        sessionTurnDiffs,
+        currentAgent,
+      ),
+    [selectorSlice, hostId, agentId, cwd, sessionTurnDiffs, currentAgent],
+  );
+
+  const subagentSummary = useMemo(
+    () => selectSessionSubagents(selectorSlice, hostId, agentId),
+    [selectorSlice, hostId, agentId],
+  );
+
+  const runtimeActivity = useMemo(
+    () => selectSessionRuntimeActivity(selectorSlice, hostId, agentId),
+    [selectorSlice, hostId, agentId],
+  );
+
   const backgroundTasks = insights.background_tasks;
   const hasRunningBgTask = backgroundTasks.some((t) => t.status === "running");
   const canStopBackground =
@@ -350,83 +425,11 @@ const StageOverviewBody = memo(function StageOverviewBody({
 
   useEffect(() => {
     setStoppingBg(false);
+    setShowAllTasks(false);
   }, [agentId, backgroundTasks.length]);
 
-  const reviewSummary = useMemo(() => {
-    const gitFiles = gitReview?.diff_files ?? [];
-    const statusFiles = gitReview?.status?.files ?? [];
-    const diffByPath = new Map(gitFiles.map((f) => [f.path, f]));
-
-    if (statusFiles.length > 0 || gitFiles.length > 0) {
-      const mergedMap = new Map<
-        string,
-        { path: string; additions: number; deletions: number }
-      >();
-      for (const sf of statusFiles) {
-        const df = diffByPath.get(sf.path);
-        if (!mergedMap.has(sf.path)) {
-          mergedMap.set(sf.path, {
-            path: sf.path,
-            additions: df?.additions ?? 0,
-            deletions: df?.deletions ?? 0,
-          });
-        }
-      }
-      for (const df of gitFiles) {
-        if (!mergedMap.has(df.path)) {
-          mergedMap.set(df.path, {
-            path: df.path,
-            additions: df.additions,
-            deletions: df.deletions,
-          });
-        }
-      }
-      const allMerged = Array.from(mergedMap.values());
-      const additions = allMerged.reduce((acc, f) => acc + f.additions, 0);
-      const deletions = allMerged.reduce((acc, f) => acc + f.deletions, 0);
-      return {
-        scope: "working_tree" as const,
-        count: allMerged.length,
-        additions,
-        deletions,
-      };
-    }
-
-    if (sessionTurnDiffs.length > 0) {
-      const additions = sessionTurnDiffs.reduce((acc, f) => acc + f.additions, 0);
-      const deletions = sessionTurnDiffs.reduce((acc, f) => acc + f.deletions, 0);
-      return {
-        scope: "session_turns" as const,
-        count: sessionTurnDiffs.length,
-        additions,
-        deletions,
-      };
-    }
-
-    return {
-      scope: "working_tree" as const,
-      count: 0,
-      additions: 0,
-      deletions: 0,
-    };
-  }, [gitReview, sessionTurnDiffs]);
-
-  const terminalCount = useMemo(() => {
-    const openForHost = terminalTabs.filter((t) => t.hostId === hostId);
-    const openIds = new Set(openForHost.map((t) => t.terminalId).filter(Boolean));
-    const detachedCount = (hostDetail?.terminals ?? []).filter(
-      (t) => !openIds.has(t.terminal_id),
-    ).length;
-    return openForHost.length + detachedCount;
-  }, [terminalTabs, hostId, hostDetail?.terminals]);
-
-  const armedTimers = useMemo(
-    () =>
-      (hostDetail?.conditional_timers ?? []).filter(
-        (t) => t.agent_id === agentId && t.state === "armed",
-      ),
-    [hostDetail?.conditional_timers, agentId],
-  );
+  const armedTimers = runtimeActivity.armedTimers;
+  const activeGoal = runtimeActivity.activeGoal;
   const hasArmedTimers = armedTimers.length > 0;
   const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
 
@@ -436,9 +439,9 @@ const StageOverviewBody = memo(function StageOverviewBody({
     const id = window.setInterval(() => setTimerNowMs(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, [hasArmedTimers]);
-  const [showAllTasks, setShowAllTasks] = useState(false);
+
   const layer1Ref = useRef<HTMLDivElement | null>(null);
-  const [layer1HeightPx, setLayer1HeightPx] = useState(176);
+  const [layer1HeightPx, setLayer1HeightPx] = useState(148);
 
   useLayoutEffect(() => {
     const el = layer1Ref.current;
@@ -454,11 +457,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
     const ro = new ResizeObserver(syncHeight);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [showGroupNotesRow, cwd, armedTimers.length]);
-
-  useEffect(() => {
-    setShowAllTasks(false);
-  }, [agentId]);
+  }, [toolSummary.showGroupNotes, toolSummary.artifactCount, cwd]);
 
   const orderedTasks = useMemo(() => {
     const running = backgroundTasks.filter((t) => t.status === "running");
@@ -473,330 +472,427 @@ const StageOverviewBody = memo(function StageOverviewBody({
     ? orderedTasks
     : orderedTasks.slice(0, defaultVisibleTaskCount);
   const hiddenTaskCount = Math.max(0, orderedTasks.length - visibleTasks.length);
-  const hasSecondarySections = backgroundTasks.length > 0;
+
+  const settledSubagents = useMemo(
+    () =>
+      subagentSummary.visible.filter(
+        (sa) => sa.status !== "running" && sa.status !== "awaiting_permission",
+      ),
+    [subagentSummary.visible],
+  );
+
+  const touchedFiles = toolSummary.touchedFiles;
+  const hasGoalOrTimers = Boolean(activeGoal) || hasArmedTimers;
+  const hasSecondarySections =
+    subagentSummary.visible.length > 0 ||
+    hasGoalOrTimers ||
+    backgroundTasks.length > 0 ||
+    touchedFiles.length > 0;
 
   return (
     <>
-      {/* Layer 1: Primary Overview Shortcuts (pinned non-scrolling header block) */}
-      <div ref={layer1Ref} className="shrink-0 px-2.5 pt-2.5 pb-2 select-none">
-        <div className="flex h-[24px] items-center px-2 pb-0.5">
-          <span className="text-muted-foreground text-[12px] font-medium">Overview</span>
+      {/* 1. Fixed Top Workspace Quick Bar */}
+      <div ref={layer1Ref} className="shrink-0 px-2 pt-2.5 pb-1.5 select-none">
+        <div className="flex h-[22px] items-center justify-between px-2 pb-0.5">
+          <span className="text-ink-tertiary text-[11px] font-medium tracking-[0.04em] uppercase">
+            Overview
+          </span>
         </div>
 
         <div className="space-y-0.5">
-          <OverviewActionRow
-            icon={FileDiff}
-            label="Review"
+          <ListRow
+            density="compact"
+            leading={<FileDiff className="size-[14px] stroke-[1.7]" />}
             onClick={() =>
-              orbitActions.openReviewTab({ path: null, scope: reviewSummary.scope })
+              orbitActions.openReviewTab({ path: null, scope: toolSummary.reviewScope })
             }
             trailing={
-              reviewSummary.count > 0 ? (
-                reviewSummary.additions > 0 || reviewSummary.deletions > 0 ? (
-                  <span className="tabular-nums inline-flex items-center gap-1 font-mono text-[11px]">
-                    {reviewSummary.additions > 0 && (
-                      <span className="text-emerald-600 dark:text-emerald-400">
-                        +{reviewSummary.additions}
-                      </span>
-                    )}
-                    {reviewSummary.deletions > 0 && (
-                      <span className="text-rose-600 dark:text-rose-400">
-                        -{reviewSummary.deletions}
-                      </span>
-                    )}
-                  </span>
+              toolSummary.reviewCount > 0 ? (
+                toolSummary.reviewAdditions > 0 || toolSummary.reviewDeletions > 0 ? (
+                  <DiffStat
+                    additions={toolSummary.reviewAdditions}
+                    deletions={toolSummary.reviewDeletions}
+                  />
                 ) : (
-                  <Badge
-                    variant="secondary"
-                    className="text-muted-foreground tabular-nums h-[18px] min-w-[18px] rounded-full border-transparent bg-black/[0.05] px-1.5 py-0 text-[11px] leading-none font-medium dark:bg-white/[0.08]"
-                  >
-                    {reviewSummary.count}
+                  <Badge variant="secondary" className="h-[18px] rounded-full px-1.5 font-mono tabular-nums">
+                    {toolSummary.reviewCount}
                   </Badge>
                 )
               ) : undefined
             }
-          />
+          >
+            Review
+          </ListRow>
 
-          <OverviewActionRow
-            icon={File}
-            label="Files"
+          <ListRow
+            density="compact"
+            leading={<File className="size-[14px] stroke-[1.7]" />}
             onClick={() => orbitActions.openFilesExplorerTab()}
-          />
+          >
+            Files
+          </ListRow>
 
-          {workspaceArtifactCount > 0 && (
-            <OverviewActionRow
-              icon={Blocks}
-              label="Artifacts"
-              onClick={() => orbitActions.openArtifactsTab({ hostId })}
-              trailing={
-                <Badge
-                  variant="secondary"
-                  className="text-muted-foreground tabular-nums h-[18px] min-w-[18px] rounded-full border-transparent bg-black/[0.05] px-1.5 py-0 text-[11px] leading-none font-medium dark:bg-white/[0.08]"
-                >
-                  {workspaceArtifactCount}
-                </Badge>
-              }
-            />
-          )}
-
-          <OverviewActionRow
-            icon={SquareTerminal}
-            label="Terminal"
+          <ListRow
+            density="compact"
+            leading={<SquareTerminal className="size-[14px] stroke-[1.7]" />}
             onClick={() => orbitActions.openTerminalTab()}
             trailing={
-              terminalCount > 0 ? (
-                <Badge
-                  variant="secondary"
-                  className="text-muted-foreground tabular-nums h-[18px] min-w-[18px] rounded-full border-transparent bg-black/[0.05] px-1.5 py-0 text-[11px] leading-none font-medium dark:bg-white/[0.08]"
-                >
-                  {terminalCount}
+              toolSummary.terminalCount > 0 ? (
+                <Badge variant="secondary" className="h-[18px] rounded-full px-1.5 font-mono tabular-nums">
+                  {toolSummary.terminalCount}
                 </Badge>
               ) : undefined
             }
-          />
+          >
+            Terminal
+          </ListRow>
 
-          {showGroupNotesRow && currentAgent && (
-            <OverviewActionRow
-              icon={FileText}
-              label="Group notes"
+          {toolSummary.artifactCount > 0 && (
+            <ListRow
+              density="compact"
+              leading={<Blocks className="size-[14px] stroke-[1.7]" />}
+              onClick={() => orbitActions.openArtifactsTab({ hostId })}
+              trailing={
+                <Badge variant="secondary" className="h-[18px] rounded-full px-1.5 font-mono tabular-nums">
+                  {toolSummary.artifactCount}
+                </Badge>
+              }
+            >
+              Artifacts
+            </ListRow>
+          )}
+
+          {toolSummary.showGroupNotes && toolSummary.workspaceId && (
+            <ListRow
+              density="compact"
+              leading={<FileText className="size-[14px] stroke-[1.7]" />}
               onClick={() =>
                 orbitActions.openWorkspaceBoardTab(
                   hostId,
-                  currentAgent.workspace_id,
-                  currentWorkspace?.title,
+                  toolSummary.workspaceId!,
+                  toolSummary.groupTitle ?? undefined,
                 )
               }
               trailing={
-                currentBoardRev > 0 ? (
-                  <span className="text-muted-foreground/70 font-mono text-[11px]">
-                    v{currentBoardRev}
+                toolSummary.groupBoardRevision > 0 ? (
+                  <span className="text-ink-muted font-mono text-[11px] tabular-nums">
+                    v{toolSummary.groupBoardRevision}
                   </span>
                 ) : undefined
               }
-            />
+            >
+              Group notes
+            </ListRow>
           )}
         </div>
-        {hasArmedTimers && (
-          <div className="orbit-native-scroll -mx-2.5 mt-1.5 max-h-[96px] space-y-0.5 overflow-y-auto overscroll-contain border-t border-black/[0.058] px-2.5 pt-1.5 dark:border-white/[0.07]">
-            {armedTimers.slice(0, 2).map((timer) => (
-              <ArmedTimerRow
-                key={timer.timer_id}
-                hostId={hostId}
-                timer={timer}
-                nowMs={timerNowMs}
-              />
-            ))}
-            {armedTimers.length > 2 && (
-              <button
-                type="button"
-                onClick={() => orbitActions.openAutomations()}
-                className="text-muted-foreground hover:text-foreground hover:bg-accent/65 flex h-[24px] w-full cursor-pointer items-center justify-between rounded-[6px] px-2 text-[11px] font-medium transition-colors"
-              >
-                <span>+{armedTimers.length - 2} more timers</span>
-                <ArrowUpRight className="size-3 shrink-0" />
-              </button>
-            )}
-          </div>
-        )}
       </div>
 
-      {/* Single outer scroll container for secondary sections (dynamically bounded by measured Layer 1 height + 2px Card border) */}
+      {/* Shared Scrollable Body for Live Situational Sections */}
       {hasSecondarySections && (
         <div
           style={{ maxHeight: `calc(${cardMaxHeightExpr} - ${layer1HeightPx + 2}px)` }}
           className="orbit-native-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain select-none"
         >
-          {/* Layer 2: Background Tasks (minimal single-line rows; actions appear quietly on hover) */}
-      {backgroundTasks.length > 0 && (
-        <OverviewLayerSection
-          id="tasks"
-          label="Background Tasks"
-          count={backgroundTasks.length}
-          collapsed={collapsedSections.tasks}
-          isRunning={hasRunningBgTask}
-          runningTone="emerald"
-          footer={
-            orderedTasks.length > defaultVisibleTaskCount ? (
-              <div
-                className={cn(
-                  showAllTasks
-                    ? "bg-elevated/95 sticky bottom-0 z-[2] -mx-2.5 pt-1 pr-2.5 pb-2 pl-[18px] backdrop-blur-[6px]"
-                    : "pt-0.5 pb-2 pl-2",
-                )}
-              >
-                <button
-                  type="button"
-                  onClick={() => setShowAllTasks((v) => !v)}
-                  className="text-muted-foreground/75 hover:text-foreground inline-flex cursor-pointer items-center py-0.5 text-[11.5px] leading-[16px] font-medium transition-colors"
-                >
-                  {showAllTasks ? "Show less" : `Show ${hiddenTaskCount} more`}
-                </button>
-              </div>
-            ) : undefined
-          }
-        >
-          <div className="space-y-0.5 pb-1.5">
-            {visibleTasks.map((task) => {
-            const cleanPreview = cleanBackgroundOutputPreview(task.output_preview);
-            const hasDetails = Boolean(task.command || cleanPreview || task.log_path);
-            const isExpanded = Boolean(expandedTasks[task.id]);
-            const showStopAction = canStopBackground && task.status === "running";
-            const hasHoverActions = Boolean(task.log_path || showStopAction);
-            return (
-              <div
-                key={task.id}
-                className={cn(
-                  "group/bgtask flex w-full flex-col rounded-[8px] transition-colors",
-                  isExpanded
-                    ? "bg-black/[0.025] dark:bg-white/[0.03]"
-                    : "hover:bg-accent/65",
-                )}
-              >
-                <div className="relative flex h-[32px] min-w-0 w-full items-center">
+          {/* 2. Living Subagents Crew (OneWorks 3D Avatars) */}
+          {subagentSummary.visible.length > 0 && (
+            <OverviewSection
+              id="subagents"
+              label="Subagents"
+              count={subagentSummary.visible.length}
+              collapsed={collapsedSections.subagents}
+              isRunning={subagentSummary.activeCount > 0}
+              hasAlert={subagentSummary.awaitingCount > 0}
+              headerAction={
+                settledSubagents.length > 0 ? (
                   <button
                     type="button"
-                    aria-expanded={hasDetails ? isExpanded : undefined}
-                    onClick={() => {
-                      if (!hasDetails) return;
-                      setExpandedTasks((prev) => ({ ...prev, [task.id]: !prev[task.id] }));
-                    }}
-                    className={cn(
-                      "flex h-full min-w-0 flex-1 items-center gap-2.5 px-2 text-left",
-                      hasDetails ? "cursor-pointer" : "cursor-default",
-                    )}
+                    onClick={() => archiveSettledSubagentsList(hostId, agentId, settledSubagents)}
+                    className="text-ink-tertiary hover:text-ink-primary cursor-pointer rounded-[6px] px-1.5 py-0.5 text-[11px] font-medium transition-colors"
                   >
-                    <span className="flex size-[15px] shrink-0 items-center justify-center">
-                      {task.status === "running" ? (
-                        <span className="size-[6px] rounded-full bg-emerald-500/85" />
-                      ) : (
-                        <Clock className="text-muted-foreground/75 size-[13.5px] stroke-[1.7]" />
-                      )}
-                    </span>
-                    <span className="text-foreground/88 min-w-0 flex-1 truncate text-[12.5px] leading-[18px] font-normal">
-                      {task.title}
-                    </span>
+                    Archive done
                   </button>
+                ) : undefined
+              }
+            >
+              <SubagentCrewList
+                hostId={hostId}
+                agentId={agentId}
+                subagents={subagentSummary.visible}
+              />
+            </OverviewSection>
+          )}
 
-                  {/* Resting: quiet elapsed timer; Hover/Expanded: minimalist icon actions */}
-                  <div className="flex shrink-0 items-center pr-1.5">
-                    {typeof task.started_at_ms === "number" && (
-                      <div
-                        className={cn(
-                          "pr-0.5 transition-opacity duration-150",
-                          hasHoverActions &&
-                            (isExpanded
-                              ? "hidden"
-                              : "group-hover/bgtask:hidden group-focus-within/bgtask:hidden"),
-                        )}
-                      >
-                        <TaskElapsedLabel startedAtMs={task.started_at_ms} />
-                      </div>
-                    )}
-
-                    {hasHoverActions && (
-                      <div
-                        className={cn(
-                          "items-center gap-0.5",
-                          isExpanded
-                            ? "flex"
-                            : "hidden group-hover/bgtask:flex group-focus-within/bgtask:flex",
-                        )}
-                      >
-                        {task.log_path && (
-                          <SimpleTooltip label="Open log">
-                            <button
-                              type="button"
-                              aria-label="Open task log"
-                              onClick={() => {
-                                if (task.log_path) {
-                                  orbitActions.openFileInSidePanel(task.log_path, {
-                                    hostId,
-                                    cwd,
-                                  });
-                                }
-                              }}
-                              className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
-                            >
-                              <ArrowUpRight className="size-[13px] stroke-[1.8]" />
-                            </button>
-                          </SimpleTooltip>
-                        )}
-                        {showStopAction && (
-                          <SimpleTooltip
-                            label={
-                              backgroundTasks.length > 1
-                                ? "Stop background tasks"
-                                : "Stop background task"
-                            }
-                          >
-                            <button
-                              type="button"
-                              disabled={stoppingBg}
-                              aria-label="Stop background task"
-                              onClick={() => {
-                                if (stoppingBg) return;
-                                setStoppingBg(true);
-                                void orbitIpc.interruptAgent(hostId, agentId).then(
-                                  () => {
-                                    orbitActions.showToast("Stopped background tasks");
-                                  },
-                                  (err) => {
-                                    setStoppingBg(false);
-                                    orbitActions.showToast(
-                                      `Failed to stop background tasks: ${String(err)}`,
-                                    );
-                                  },
-                                );
-                              }}
-                              className={cn(
-                                "text-muted-foreground hover:bg-rose-500/12 hover:text-rose-600 dark:hover:text-rose-400 inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors",
-                                stoppingBg && "pointer-events-none opacity-45",
-                              )}
-                            >
-                              <Square className="size-[9.5px] fill-current" />
-                            </button>
-                          </SimpleTooltip>
-                        )}
-                      </div>
-                    )}
-                  </div>
+          {/* 3. Active Goal & Armed Timers (Conditional) */}
+          {hasGoalOrTimers && (
+            <>
+              <Separator className="bg-border-subtle" />
+              <div className="space-y-0.5 px-2 py-1.5">
+                <div className="flex h-[24px] items-center justify-between px-2">
+                  <span className="text-ink-tertiary text-[11px] font-medium tracking-[0.03em] uppercase">
+                    {activeGoal && hasArmedTimers
+                      ? "Goal & Timers"
+                      : activeGoal
+                        ? "Active Goal"
+                        : "Armed Timers"}
+                  </span>
+                  <span className="text-ink-muted font-mono text-[11px] tabular-nums">
+                    {(activeGoal ? 1 : 0) + armedTimers.length}
+                  </span>
                 </div>
 
-                {hasDetails && isExpanded && (
-                  <div className="selectable-text space-y-1.5 px-2.5 pt-0.5 pb-2 font-mono text-[11px] leading-relaxed">
-                    {task.command && (
-                      <div className="text-foreground/78 break-all whitespace-pre-wrap">
-                        <span className="text-muted-foreground/50 select-none">$ </span>
-                        {task.command}
-                      </div>
-                    )}
-                    {cleanPreview && (
-                      <pre className="text-muted-foreground/75 max-h-[88px] overflow-hidden break-words whitespace-pre-wrap">
-                        {cleanPreview.slice(0, 320)}
-                      </pre>
-                    )}
-                    {!task.command && !cleanPreview && task.log_path && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (task.log_path) {
-                            orbitActions.openFileInSidePanel(task.log_path, { hostId, cwd });
-                          }
-                        }}
-                        className="text-muted-foreground hover:text-foreground inline-flex max-w-full cursor-pointer items-center gap-1 text-left transition-colors"
-                      >
-                        <span className="truncate">{task.log_path}</span>
-                        <ArrowUpRight className="size-3 shrink-0" />
-                      </button>
-                    )}
-                  </div>
+                {activeGoal && <OverviewGoalRow hostId={hostId} goal={activeGoal} />}
+
+                {armedTimers.slice(0, 3).map((timer) => (
+                  <ArmedTimerRow
+                    key={timer.timer_id}
+                    hostId={hostId}
+                    timer={timer}
+                    nowMs={timerNowMs}
+                  />
+                ))}
+
+                {armedTimers.length > 3 && (
+                  <button
+                    type="button"
+                    onClick={() => orbitActions.openAutomations()}
+                    className="text-ink-tertiary hover:text-ink-primary hover:bg-accent/70 flex h-[24px] w-full cursor-pointer items-center justify-between rounded-[6px] px-2 text-[11px] font-medium transition-colors"
+                  >
+                    <span>+{armedTimers.length - 3} more timers</span>
+                    <ArrowUpRight className="size-3 shrink-0" />
+                  </button>
                 )}
               </div>
-            );
-          })}
-          </div>
-        </OverviewLayerSection>
-      )}
+            </>
+          )}
+
+          {/* 4. Background Tasks (Conditional) */}
+          {backgroundTasks.length > 0 && (
+            <OverviewSection
+              id="tasks"
+              label="Background Tasks"
+              count={backgroundTasks.length}
+              collapsed={collapsedSections.tasks}
+              isRunning={hasRunningBgTask}
+              runningTone="emerald"
+              footer={
+                orderedTasks.length > defaultVisibleTaskCount ? (
+                  <div
+                    className={cn(
+                      showAllTasks
+                        ? "bg-surface-raised/95 sticky bottom-0 z-[2] -mx-2 pt-1 pr-2 pb-2 pl-4 backdrop-blur-[6px]"
+                        : "pt-0.5 pb-1.5 pl-2",
+                    )}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setShowAllTasks((v) => !v)}
+                      className="text-ink-tertiary hover:text-ink-primary inline-flex cursor-pointer items-center py-0.5 text-[11px] font-medium transition-colors"
+                    >
+                      {showAllTasks ? "Show less" : `Show ${hiddenTaskCount} more`}
+                    </button>
+                  </div>
+                ) : undefined
+              }
+            >
+              <div className="space-y-0.5 pb-1">
+                {visibleTasks.map((task) => {
+                  const cleanPreview = cleanBackgroundOutputPreview(task.output_preview);
+                  const hasDetails = Boolean(task.command || cleanPreview || task.log_path);
+                  const isExpanded = Boolean(expandedTasks[task.id]);
+                  const showStopAction = canStopBackground && task.status === "running";
+                  const hasHoverActions = Boolean(task.log_path || showStopAction);
+                  return (
+                    <div
+                      key={task.id}
+                      className={cn(
+                        "group/bgtask flex w-full flex-col rounded-[8px] transition-colors",
+                        isExpanded ? "bg-surface-recessed/70" : "hover:bg-accent/70",
+                      )}
+                    >
+                      <div className="relative flex h-[30px] min-w-0 w-full items-center">
+                        <button
+                          type="button"
+                          aria-expanded={hasDetails ? isExpanded : undefined}
+                          onClick={() => {
+                            if (!hasDetails) return;
+                            setExpandedTasks((prev) => ({ ...prev, [task.id]: !prev[task.id] }));
+                          }}
+                          className={cn(
+                            "flex h-full min-w-0 flex-1 items-center gap-2 px-2 text-left",
+                            hasDetails ? "cursor-pointer" : "cursor-default",
+                          )}
+                        >
+                          <span className="flex size-[14px] shrink-0 items-center justify-center">
+                            {task.status === "running" ? (
+                              <span className="bg-signal-success size-[6px] rounded-full" />
+                            ) : (
+                              <Clock className="text-ink-muted size-[13px] stroke-[1.7]" />
+                            )}
+                          </span>
+                          <span className="text-ink-primary min-w-0 flex-1 truncate text-[12px] leading-[18px]">
+                            {task.title}
+                          </span>
+                        </button>
+
+                        <div className="flex shrink-0 items-center pr-1.5">
+                          {typeof task.started_at_ms === "number" && (
+                            <div
+                              className={cn(
+                                "pr-0.5",
+                                hasHoverActions &&
+                                  (isExpanded
+                                    ? "hidden"
+                                    : "group-hover/bgtask:hidden group-focus-within/bgtask:hidden"),
+                              )}
+                            >
+                              <TaskElapsedLabel startedAtMs={task.started_at_ms} />
+                            </div>
+                          )}
+
+                          {hasHoverActions && (
+                            <div
+                              className={cn(
+                                "items-center gap-0.5",
+                                isExpanded
+                                  ? "flex"
+                                  : "hidden group-hover/bgtask:flex group-focus-within/bgtask:flex",
+                              )}
+                            >
+                              {task.log_path && (
+                                <IconButton
+                                  size="xs"
+                                  tooltip="Open log"
+                                  onClick={() => {
+                                    if (task.log_path) {
+                                      orbitActions.openFileInSidePanel(task.log_path, {
+                                        hostId,
+                                        cwd,
+                                      });
+                                    }
+                                  }}
+                                >
+                                  <ArrowUpRight className="size-3" />
+                                </IconButton>
+                              )}
+                              {showStopAction && (
+                                <IconButton
+                                  size="xs"
+                                  tone="danger"
+                                  tooltip="Stop background task"
+                                  disabled={stoppingBg}
+                                  onClick={() => {
+                                    if (stoppingBg) return;
+                                    setStoppingBg(true);
+                                    void orbitIpc.interruptAgent(hostId, agentId).then(
+                                      () => orbitActions.showToast("Stopped background tasks"),
+                                      (err) => {
+                                        setStoppingBg(false);
+                                        orbitActions.showToast(
+                                          `Failed to stop background tasks: ${String(err)}`,
+                                        );
+                                      },
+                                    );
+                                  }}
+                                >
+                                  <Square className="size-[9px] fill-current" />
+                                </IconButton>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {hasDetails && isExpanded && (
+                        <div className="selectable-text space-y-1.5 px-2.5 pt-0.5 pb-2 font-mono text-[11px] leading-relaxed">
+                          {task.command && (
+                            <div className="text-ink-secondary break-all whitespace-pre-wrap">
+                              <span className="text-ink-muted select-none">$ </span>
+                              {task.command}
+                            </div>
+                          )}
+                          {cleanPreview && (
+                            <pre className="text-ink-tertiary max-h-[88px] overflow-hidden break-words whitespace-pre-wrap">
+                              {cleanPreview.slice(0, 320)}
+                            </pre>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </OverviewSection>
+          )}
+
+          {/* 5. Touched Files (Conditional, collapsed by default for clean density) */}
+          {touchedFiles.length > 0 && (
+            <OverviewSection
+              id="touched_files"
+              label="Touched Files"
+              count={touchedFiles.length}
+              collapsed={collapsedSections.touched_files}
+              trailingMeta={
+                toolSummary.touchedAdditions > 0 || toolSummary.touchedDeletions > 0 ? (
+                  <DiffStat
+                    size="xs"
+                    additions={toolSummary.touchedAdditions}
+                    deletions={toolSummary.touchedDeletions}
+                  />
+                ) : undefined
+              }
+            >
+              <div className="space-y-0.5 pb-1">
+                {touchedFiles.slice(0, 8).map((file) => {
+                  const basename = file.display_path.split("/").pop() || file.display_path;
+                  return (
+                    <ListRow
+                      key={file.path}
+                      density="compact"
+                      title={file.display_path}
+                      onClick={() =>
+                        orbitActions.openFileInSidePanel(file.path, { hostId, cwd })
+                      }
+                      leading={
+                        <span
+                          className={cn(
+                            "size-[6px] rounded-full",
+                            file.action === "created"
+                              ? "bg-signal-success"
+                              : file.action === "edited"
+                                ? "bg-signal-info"
+                                : "bg-ink-muted/60",
+                          )}
+                        />
+                      }
+                      trailing={
+                        file.additions > 0 || file.deletions > 0 ? (
+                          <DiffStat
+                            size="xs"
+                            additions={file.additions}
+                            deletions={file.deletions}
+                          />
+                        ) : undefined
+                      }
+                    >
+                      <span className="font-mono text-[12px]">{basename}</span>
+                    </ListRow>
+                  );
+                })}
+                {touchedFiles.length > 8 && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      orbitActions.openReviewTab({ path: null, scope: toolSummary.reviewScope })
+                    }
+                    className="text-ink-tertiary hover:text-ink-primary flex h-[24px] w-full cursor-pointer items-center justify-between rounded-[6px] px-2 text-[11px] font-medium transition-colors"
+                  >
+                    <span>View all {touchedFiles.length} files</span>
+                    <ArrowUpRight className="size-3 shrink-0" />
+                  </button>
+                )}
+              </div>
+            </OverviewSection>
+          )}
         </div>
       )}
     </>
@@ -804,11 +900,10 @@ const StageOverviewBody = memo(function StageOverviewBody({
 });
 
 /**
- * Responsive Floating Overview Card:
- * - Spacious stage (`canDock = true`): floats cleanly in the top-right corner inside the unified
- *   stage so the stage scrollbar remains on the far right edge and the card adapts to content height.
- * - Compact/split stage (`canDock = false`): opens on demand as the same floating card anchored
- *   at the top-right corner of the stage.
+ * Antigravity-inspired 288px Session Overview HUD:
+ * - Spacious stage (`canDock = true`): docks cleanly at top-right (left of scrollbar).
+ * - Compact/split stage (`canDock = false`): opens on demand via TopBar Overview toggle (`⌘⌥O`),
+ *   while TopBar relays living Subagent avatars whenever Overview is hidden.
  */
 export const StageOverviewPanel = memo(function StageOverviewPanel({
   canDock,
@@ -873,7 +968,6 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
   const [popoverMounted, setPopoverMounted] = useState(isPopoverVisible);
   const [popoverVisualOpen, setPopoverVisualOpen] = useState(isPopoverVisible);
 
-  // Symmetric interruptible enter & exit for compact floating popover
   useEffect(() => {
     if (isPopoverVisible) {
       setPopoverMounted(true);
@@ -893,7 +987,6 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
     return () => window.clearTimeout(timer);
   }, [isPopoverVisible]);
 
-  // Auto-dismiss floating popover cleanly on outside click or Escape
   useEffect(() => {
     if (!isPopoverVisible) return;
     const onPointerDown = (ev: MouseEvent) => {
@@ -921,20 +1014,18 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
     };
   }, [isPopoverVisible]);
 
-  // Clear popover flag once space opens back up for docked presentation
   useEffect(() => {
     if (canDock && popoverOpen) {
       orbitActions.setOverviewPopoverOpen(false);
     }
   }, [canDock, popoverOpen]);
 
-  const dockedCardMaxHeightExpr = `min(calc(100vh - ${dockedTopPx + 84}px), 600px)`;
-  const popoverMaxHeightPx = Math.min(540, Math.max(240, stageHeightPx - 24));
+  const dockedCardMaxHeightExpr = `min(calc(100vh - ${dockedTopPx + 84}px), 620px)`;
+  const popoverMaxHeightPx = Math.min(560, Math.max(240, stageHeightPx - 24));
   const popoverCardMaxHeightExpr = `${popoverMaxHeightPx}px`;
 
   return (
     <>
-      {/* 1. Spacious Stage: Viewport-Anchored Top-Right Card (pure GPU coordinated, zero settle flash) */}
       {dockedOverviewMounted && (
         <aside
           aria-label="Session overview"
@@ -946,13 +1037,13 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
             transition: dockedOverviewTransition,
           }}
           className={cn(
-            "fixed right-4 z-[15] w-[312px] origin-top-right will-change-[transform,opacity]",
+            "fixed right-4 z-[15] w-[288px] origin-top-right will-change-[transform,opacity]",
             !dockedOverviewVisualOpen && "pointer-events-none",
           )}
         >
           <Card
             style={{ maxHeight: dockedCardMaxHeightExpr }}
-            className="overview-card-surface flex w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0"
+            className="overview-card-surface flex w-full flex-col gap-0 overflow-hidden rounded-[12px] p-0"
           >
             <StageOverviewBody
               hostId={hostId}
@@ -967,7 +1058,6 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
         </aside>
       )}
 
-      {/* 2. Compact / Split Stage: On-Demand Top-Right Floating Popover Card */}
       {popoverMounted && (
         <div
           ref={popoverRef}
@@ -976,7 +1066,7 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
           inert={!popoverVisualOpen}
           style={{ maxHeight: popoverCardMaxHeightExpr }}
           className={cn(
-            "absolute top-3 right-4 z-30 w-[312px] max-w-[calc(100%-32px)] origin-top-right will-change-[transform,opacity]",
+            "absolute top-3 right-4 z-30 w-[288px] max-w-[calc(100%-32px)] origin-top-right will-change-[transform,opacity]",
             popoverVisualOpen
               ? "translate-x-0 translate-y-0 scale-100 opacity-100 transition-[opacity,transform] duration-[190ms] ease-[var(--ease-out-expo)]"
               : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[145ms] ease-[var(--ease-exit)]",
@@ -984,7 +1074,7 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
         >
           <Card
             style={{ maxHeight: popoverCardMaxHeightExpr }}
-            className="overview-card-surface floating-surface flex w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0"
+            className="overview-card-surface floating-surface flex w-full flex-col gap-0 overflow-hidden rounded-[12px] p-0"
           >
             <StageOverviewBody
               hostId={hostId}

@@ -14,7 +14,6 @@ import {
   ShieldCheck,
   Terminal,
   Trash2,
-  X,
 } from "lucide-react";
 import {
   SettingCard,
@@ -24,6 +23,20 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  Tabs,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/dialog-tabs";
+import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -369,57 +382,39 @@ function HookEditorModal({
   };
 
   return (
-    <div
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !busy) onClose();
+    <Dialog
+      open
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && !busy) onClose();
       }}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 backdrop-blur-[2px]"
     >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={editing ? "Edit lifecycle hook" : "Add lifecycle hook"}
-        className="border-border bg-elevated text-foreground floating-surface flex max-h-[88vh] w-full max-w-[540px] flex-col overflow-hidden rounded-[14px] border p-0"
+      <DialogContent
+        closeDisabled={busy}
+        className="flex max-h-[88vh] max-w-[540px] flex-col gap-0 p-0"
       >
-        <div className="flex items-center justify-between gap-2 px-5 pt-5 pb-4">
-          <div className="min-w-0">
-            <h3 className="text-[15px] font-semibold tracking-[-0.01em]">
-              {editing ? `Edit ${editing.name}` : "Add Lifecycle Hook"}
-            </h3>
-            <p className="text-muted-foreground text-[12px]">
-              {eventMeta(event).hint}
-            </p>
-          </div>
-          <button
-            type="button"
-            aria-label="Close"
-            disabled={busy}
-            onClick={onClose}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[8px] transition-colors"
-          >
-            <X className="h-[14px] w-[14px]" />
-          </button>
-        </div>
+        <DialogHeader className="px-5 pt-5 pr-12 pb-4">
+          <DialogTitle>{editing ? `Edit ${editing.name}` : "Add Lifecycle Hook"}</DialogTitle>
+          <DialogDescription>{eventMeta(event).hint}</DialogDescription>
+        </DialogHeader>
 
         <form
           onSubmit={(e) => void handleSubmit(e)}
           className="orbit-native-scroll flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto overscroll-contain px-5 pb-5"
         >
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="space-y-1">
-              <label className="text-muted-foreground block text-[12px] font-medium">Name</label>
-              <input
+            <Field>
+              <FieldLabel>Name</FieldLabel>
+              <Input
                 type="text"
                 value={name}
                 disabled={busy}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="Format Rust files"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 h-[32px] w-full rounded-[8px] border px-2.5 text-[12.5px] outline-none"
               />
-            </div>
+            </Field>
 
-            <div className="space-y-1">
-              <label className="text-muted-foreground block text-[12px] font-medium">Scope</label>
+            <Field>
+              <FieldLabel>Scope</FieldLabel>
               <SettingSelect
                 value={scope}
                 options={scopeOptions}
@@ -427,12 +422,12 @@ function HookEditorModal({
                 onChange={setScope}
                 triggerClassName="h-[32px] w-full"
               />
-            </div>
+            </Field>
           </div>
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="space-y-1">
-              <label className="text-muted-foreground block text-[12px] font-medium">Event</label>
+            <Field>
+              <FieldLabel>Event</FieldLabel>
               <SettingSelect
                 value={event}
                 options={EVENT_OPTIONS}
@@ -440,13 +435,12 @@ function HookEditorModal({
                 onChange={setEvent}
                 triggerClassName="h-[32px] w-full"
               />
-            </div>
+            </Field>
 
-            <div className="space-y-1">
-              <label className="text-muted-foreground block text-[12px] font-medium">
-                Timeout (ms, max 30000)
-              </label>
-              <input
+            <Field>
+              <FieldLabel htmlFor="hook-timeout">Timeout (ms, max 30000)</FieldLabel>
+              <Input
+                id="hook-timeout"
                 type="number"
                 min={100}
                 max={MAX_TIMEOUT_MS}
@@ -454,172 +448,169 @@ function HookEditorModal({
                 value={timeoutMs}
                 disabled={busy}
                 onChange={(e) => setTimeoutMs(e.target.value)}
-                className="border-border bg-background text-foreground focus:border-foreground/35 h-[32px] w-full rounded-[8px] border px-2.5 font-mono text-[12.5px] outline-none"
+                className="font-mono"
               />
-            </div>
+            </Field>
           </div>
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="space-y-1">
-              <label className="text-muted-foreground block text-[12px] font-medium">
+            <Field>
+              <FieldLabel htmlFor="hook-matcher">
                 Matcher <span className="font-normal opacity-70">(optional)</span>
-              </label>
-              <input
+              </FieldLabel>
+              <Input
+                id="hook-matcher"
                 type="text"
                 value={matcher}
                 disabled={busy}
                 onChange={(e) => setMatcher(e.target.value)}
                 placeholder="*.rs|*.ts or codex"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 h-[32px] w-full rounded-[8px] border px-2.5 font-mono text-[12px] outline-none"
+                className="font-mono text-[12px]"
               />
-            </div>
+            </Field>
 
-            <div className="space-y-1">
-              <label className="text-muted-foreground block text-[12px] font-medium">
+            <Field>
+              <FieldLabel htmlFor="hook-description">
                 Description <span className="font-normal opacity-70">(optional)</span>
-              </label>
-              <input
+              </FieldLabel>
+              <Input
+                id="hook-description"
                 type="text"
                 value={description}
                 disabled={busy}
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="Short summary"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 h-[32px] w-full rounded-[8px] border px-2.5 text-[12.5px] outline-none"
               />
-            </div>
+            </Field>
           </div>
 
           {/* Action Kind Switcher */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <label className="text-muted-foreground text-[12px] font-medium">Action</label>
-              <div className="border-border bg-muted/45 inline-flex rounded-[8px] border p-0.5">
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => setActionKind("command")}
-                  className={cn(
-                    "inline-flex h-[24px] cursor-pointer items-center gap-1.5 rounded-[6px] px-2.5 text-[11.5px] font-medium transition-colors",
-                    actionKind === "command"
-                      ? "bg-background text-foreground shadow-2xs"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  <Terminal className="h-[11.5px] w-[11.5px]" />
-                  Command
-                </button>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => setActionKind("http_webhook")}
-                  className={cn(
-                    "inline-flex h-[24px] cursor-pointer items-center gap-1.5 rounded-[6px] px-2.5 text-[11.5px] font-medium transition-colors",
-                    actionKind === "http_webhook"
-                      ? "bg-background text-foreground shadow-2xs"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  <Globe className="h-[11.5px] w-[11.5px]" />
-                  HTTP Webhook
-                </button>
-              </div>
+          <FieldGroup className="gap-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <FieldLabel>Action</FieldLabel>
+              <Tabs
+                value={actionKind}
+                onValueChange={(v) => setActionKind(v as "command" | "http_webhook")}
+              >
+                <TabsList className="h-[28px]">
+                  <TabsTrigger value="command" disabled={busy} className="gap-1.5 text-[11.5px]">
+                    <Terminal className="h-[11.5px] w-[11.5px]" />
+                    Command
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="http_webhook"
+                    disabled={busy}
+                    className="gap-1.5 text-[11.5px]"
+                  >
+                    <Globe className="h-[11.5px] w-[11.5px]" />
+                    HTTP Webhook
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
             </div>
 
             {actionKind === "command" ? (
-              <div className="space-y-2.5">
-                <div className="space-y-1">
-                  <label className="text-muted-foreground block text-[11.5px]">
+              <FieldGroup className="gap-2.5">
+                <Field>
+                  <FieldLabel htmlFor="hook-command" className="text-[11.5px]">
                     Executable (spawned directly, no shell)
-                  </label>
-                  <input
+                  </FieldLabel>
+                  <Input
+                    id="hook-command"
                     type="text"
                     value={command}
                     disabled={busy}
                     onChange={(e) => setCommand(e.target.value)}
                     placeholder="rustfmt"
-                    className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 h-[32px] w-full rounded-[8px] border px-2.5 font-mono text-[12px] outline-none"
+                    className="font-mono text-[12px]"
                   />
-                </div>
+                </Field>
                 <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-                  <div className="space-y-1">
-                    <label className="text-muted-foreground block text-[11.5px]">
-                      Arguments <span className="opacity-70">(one per line)</span>
-                    </label>
-                    <textarea
+                  <Field>
+                    <FieldLabel htmlFor="hook-args" className="text-[11.5px]">
+                      Arguments <span className="font-normal opacity-70">(one per line)</span>
+                    </FieldLabel>
+                    <Textarea
+                      id="hook-args"
                       rows={3}
                       value={argsText}
                       disabled={busy}
                       onChange={(e) => setArgsText(e.target.value)}
                       placeholder={"--edition\n2024"}
-                      className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 w-full resize-none rounded-[8px] border px-2.5 py-1.5 font-mono text-[11.5px] outline-none"
+                      className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11.5px]"
                     />
-                  </div>
-                  <div className="space-y-1">
-                    <label className="text-muted-foreground block text-[11.5px]">
-                      Env Vars <span className="opacity-70">(KEY=VALUE)</span>
-                    </label>
-                    <textarea
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="hook-env" className="text-[11.5px]">
+                      Env Vars <span className="font-normal opacity-70">(KEY=VALUE)</span>
+                    </FieldLabel>
+                    <Textarea
+                      id="hook-env"
                       rows={3}
                       value={envText}
                       disabled={busy}
                       onChange={(e) => setEnvText(e.target.value)}
                       placeholder={"RUST_LOG=warn"}
-                      className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 w-full resize-none rounded-[8px] border px-2.5 py-1.5 font-mono text-[11.5px] outline-none"
+                      className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11.5px]"
                     />
-                  </div>
+                  </Field>
                 </div>
-                <p className="text-muted-foreground/75 text-[11px] leading-snug">
+                <FieldDescription className="text-[11px]">
                   Event JSON is piped to stdin. Exit <code className="font-mono">0</code> allows (or
                   returns JSON decision), exit <code className="font-mono">2</code> blocks.
                   {editing && hasMaskedValues(envText)
                     ? " Leave masked •••• values unchanged to preserve stored secrets."
                     : ""}
-                </p>
-              </div>
+                </FieldDescription>
+              </FieldGroup>
             ) : (
-              <div className="space-y-2.5">
-                <div className="space-y-1">
-                  <label className="text-muted-foreground block text-[11.5px]">Webhook URL</label>
-                  <input
+              <FieldGroup className="gap-2.5">
+                <Field>
+                  <FieldLabel htmlFor="hook-webhook-url" className="text-[11.5px]">
+                    Webhook URL
+                  </FieldLabel>
+                  <Input
+                    id="hook-webhook-url"
                     type="url"
                     value={webhookUrl}
                     disabled={busy}
                     onChange={(e) => setWebhookUrl(e.target.value)}
                     placeholder="https://hooks.example.com/orbit"
-                    className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 h-[32px] w-full rounded-[8px] border px-2.5 font-mono text-[12px] outline-none"
+                    className="font-mono text-[12px]"
                   />
-                </div>
-                <div className="space-y-1">
-                  <label className="text-muted-foreground block text-[11.5px]">
-                    Headers <span className="opacity-70">(Header: Value per line)</span>
-                  </label>
-                  <textarea
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="hook-headers" className="text-[11.5px]">
+                    Headers <span className="font-normal opacity-70">(Header: Value per line)</span>
+                  </FieldLabel>
+                  <Textarea
+                    id="hook-headers"
                     rows={3}
                     value={headersText}
                     disabled={busy}
                     onChange={(e) => setHeadersText(e.target.value)}
                     placeholder={"Authorization: Bearer …"}
-                    className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 w-full resize-none rounded-[8px] border px-2.5 py-1.5 font-mono text-[11.5px] outline-none"
+                    className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11.5px]"
                   />
                   {editing && hasMaskedValues(headersText) && (
-                    <p className="text-muted-foreground/75 text-[11px] leading-snug">
+                    <FieldDescription className="text-[11px]">
                       Leave masked •••• values unchanged to preserve stored secrets.
-                    </p>
+                    </FieldDescription>
                   )}
-                </div>
-              </div>
+                </Field>
+              </FieldGroup>
             )}
-          </div>
+          </FieldGroup>
 
-          <div className="flex items-center justify-between pt-0.5">
-            <span className="text-foreground text-[12.5px] font-medium">Enabled</span>
+          <Field orientation="horizontal" className="pt-0.5">
+            <FieldLabel className="text-ink-primary text-[12.5px]">Enabled</FieldLabel>
             <ToggleSwitch
               checked={enabled}
               onChange={setEnabled}
               disabled={busy}
               ariaLabel="Enable hook"
             />
-          </div>
+          </Field>
 
           {error && (
             <div className="rounded-lg border border-rose-500/25 bg-rose-500/[0.07] px-3 py-2 text-[12px] text-rose-700 dark:text-rose-300">
@@ -630,61 +621,56 @@ function HookEditorModal({
           <div className="border-border/70 mt-1 flex items-center justify-between gap-2 border-t pt-3">
             <div>
               {editing && !confirmDelete && (
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="sm"
                   disabled={busy}
                   onClick={() => setConfirmDelete(true)}
-                  className="text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-2 text-[12px] transition-colors"
+                  className="text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400"
                 >
                   <Trash2 className="h-[13px] w-[13px]" />
                   Delete
-                </button>
+                </Button>
               )}
               {editing && confirmDelete && (
                 <div className="flex items-center gap-1.5">
-                  <button
+                  <Button
                     type="button"
+                    variant="destructive"
+                    size="xs"
                     disabled={busy}
                     onClick={() => void handleDelete()}
-                    className="inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-lg bg-rose-600 px-2.5 text-[11.5px] font-medium text-white hover:bg-rose-700 disabled:opacity-50"
                   >
                     {deleting && <Loader2 className="h-[11.5px] w-[11.5px] animate-spin" />}
-                    Confirm Delete
-                  </button>
-                  <button
+                    Delete
+                  </Button>
+                  <Button
                     type="button"
+                    variant="ghost"
+                    size="xs"
                     disabled={busy}
                     onClick={() => setConfirmDelete(false)}
-                    className="text-muted-foreground hover:text-foreground h-[28px] cursor-pointer px-2 text-[11.5px]"
                   >
                     Cancel
-                  </button>
+                  </Button>
                 </div>
               )}
             </div>
 
             <div className="flex items-center gap-2">
-              <button
-                type="button"
-                disabled={busy}
-                onClick={onClose}
-                className="border-border bg-background hover:bg-accent text-foreground h-[30px] cursor-pointer rounded-lg border px-3 text-[12px] font-medium transition-colors disabled:opacity-50"
-              >
+              <Button type="button" variant="outline" size="sm" disabled={busy} onClick={onClose}>
                 Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={busy}
-                className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3.5 text-[12px] font-medium transition-opacity disabled:opacity-50"
-              >
+              </Button>
+              <Button type="submit" size="sm" disabled={busy}>
                 {saving && <Loader2 className="h-[12px] w-[12px] animate-spin" />}
                 {editing ? "Save" : "Add Hook"}
-              </button>
+              </Button>
             </div>
           </div>
         </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

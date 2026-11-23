@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Archive, ArrowUpRight, RotateCcw, Search, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -225,13 +226,13 @@ export function ArchivedSection() {
           {/* Search & Project Filter Bar */}
           <div className="space-y-2.5">
             <div className="relative">
-              <Search className="text-muted-foreground/70 pointer-events-none absolute top-1/2 left-3 h-[14px] w-[14px] -translate-y-1/2" />
-              <input
+              <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-3 h-[14px] w-[14px] -translate-y-1/2" />
+              <Input
                 type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search archived conversations or projects…"
-                className="border-border bg-background/80 text-foreground placeholder:text-muted-foreground/65 focus:ring-foreground/20 h-[34px] w-full rounded-[9px] border pr-8 pl-9 text-[13px] outline-none focus:ring-1"
+                className="h-[34px] rounded-[9px] pr-8 pl-9 text-[13px]"
               />
               {query && (
                 <button

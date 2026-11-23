@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   Archive,
   ArrowLeftRight,
@@ -16,9 +16,7 @@ import {
   GitMerge,
   Hash,
   Inbox,
-  Laptop,
   Layers,
-  Loader2,
   MoreHorizontal,
   Pencil,
   Pin,
@@ -44,6 +42,7 @@ import {
 import { isAgentInGitRepo, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
 import { useI18n } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import {
   Dialog,
   DialogContent,
@@ -54,6 +53,7 @@ import {
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -98,11 +98,10 @@ export interface ActiveWorkspaceMenuState {
   anchor: MenuAnchorBox;
 }
 
-export interface CreateWorkspaceDialogTarget {
+export interface CreateWorkspaceRequest {
+  projectId?: string;
   hostId: string;
   projectRoot: string;
-  projectName: string;
-  isGitRepo: boolean;
   moveAgentId?: string | null;
 }
 
@@ -111,8 +110,6 @@ export interface DeleteConversationTarget {
   agent: AgentCardView;
   title: string;
 }
-
-const COMPACT_MENU_ITEM_CLASS = "h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]";
 
 /**
  * Single shared Conversation Action/Context Menu for the entire `FleetSidebar`.
@@ -128,7 +125,7 @@ export function SharedConversationMenu({
   target: ActiveConversationMenuState | null;
   onClose: () => void;
   onStartRename: (threadKey: string) => void;
-  onRequestCreateWorkspace?: (req: CreateWorkspaceDialogTarget) => void;
+  onRequestCreateWorkspace?: (req: CreateWorkspaceRequest) => void;
   onRequestDelete: (target: DeleteConversationTarget) => void;
 }) {
   const { t } = useI18n();
@@ -195,391 +192,380 @@ export function SharedConversationMenu({
         />
       </DropdownMenuTrigger>
 
-      <DropdownMenuContent
-        align="start"
-        sideOffset={4}
-        finalFocus={false}
-        className="w-max min-w-[184px] rounded-[12px] p-1"
-      >
-        <DropdownMenuItem
-          onSelect={() => {
-            onClose();
-            window.requestAnimationFrame(() => onStartRename(threadKey));
-          }}
-          className={COMPACT_MENU_ITEM_CLASS}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <Pencil className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>{t("common.rename")}</span>
-          </span>
-        </DropdownMenuItem>
-
-        <DropdownMenuItem
-          onSelect={() => orbitActions.togglePinThread(host.host_id, agent.agent_id)}
-          className={COMPACT_MENU_ITEM_CLASS}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            {isPinned ? (
-              <PinOff className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            ) : (
-              <Pin className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            )}
-            <span>{isPinned ? t("sidebar.unpin") : t("sidebar.pin")}</span>
-          </span>
-        </DropdownMenuItem>
-
-        {!isForegroundRunning && (
-          <DropdownMenuItem
-            onSelect={() => {
-              if (isUnread) {
-                orbitActions.markThreadRead(host.host_id, agent.agent_id);
-              } else {
-                orbitActions.markThreadUnread(host.host_id, agent.agent_id);
-              }
-            }}
-            className={COMPACT_MENU_ITEM_CLASS}
-          >
-            <span className="flex items-center gap-2 whitespace-nowrap">
-              {isUnread ? (
-                <CheckCircle2 className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              ) : (
-                <Circle className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              )}
-              <span>{isUnread ? t("sidebar.markRead") : t("sidebar.markUnread")}</span>
-            </span>
-          </DropdownMenuItem>
-        )}
-
-        <DropdownMenuSeparator className="my-1" />
-
-        <DropdownMenuItem
-          onSelect={() => {
-            orbitActions.openPeerSplitTab(host.host_id, agent.agent_id, tabLabel);
-          }}
-          className={COMPACT_MENU_ITEM_CLASS}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <Columns2 className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>{t("sidebar.openSplit")}</span>
-          </span>
-        </DropdownMenuItem>
-
-        {isGitRepo ? (
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger className={COMPACT_MENU_ITEM_CLASS}>
-              <span className="flex items-center gap-2 whitespace-nowrap">
-                <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>{t("sidebar.fork")}</span>
-              </span>
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent className="w-max min-w-[168px] rounded-[12px] p-1">
-              <DropdownMenuItem
-                onSelect={() => {
-                  void orbitActions.forkAgent({
-                    hostId: host.host_id,
-                    sourceAgentId: agent.agent_id,
-                  });
-                }}
-                className={COMPACT_MENU_ITEM_CLASS}
-              >
-                <span className="flex items-center gap-2 whitespace-nowrap">
-                  <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>{t("sidebar.forkHere")}</span>
-                </span>
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onSelect={() => {
-                  void orbitActions.forkAgent({
-                    hostId: host.host_id,
-                    sourceAgentId: agent.agent_id,
-                    worktree: true,
-                  });
-                }}
-                className={COMPACT_MENU_ITEM_CLASS}
-              >
-                <span className="flex items-center gap-2 whitespace-nowrap">
-                  <GitBranch className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>{t("sidebar.forkInNewWorktree")}</span>
-                </span>
-              </DropdownMenuItem>
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-        ) : (
-          <DropdownMenuItem
-            onSelect={() => {
-              void orbitActions.forkAgent({
-                hostId: host.host_id,
-                sourceAgentId: agent.agent_id,
-              });
-            }}
-            className={COMPACT_MENU_ITEM_CLASS}
-          >
-            <span className="flex items-center gap-2 whitespace-nowrap">
-              <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{t("sidebar.fork")}</span>
-            </span>
-          </DropdownMenuItem>
-        )}
-
-        {activeWs?.is_worktree && (
+      <DropdownMenuContent align="start" sideOffset={4} finalFocus={false}>
+        <DropdownMenuGroup>
           <DropdownMenuItem
             onSelect={() => {
               onClose();
-              orbitActions.openWorktreeHandoffDialog({
-                hostId: host.host_id,
-                workspaceId: activeWs.workspace_id,
-                direction: "worktree_to_local",
-                defaultMode: "apply",
-                sourceCwd: activeWs.cwd,
-              });
+              window.requestAnimationFrame(() => onStartRename(threadKey));
             }}
-            className={COMPACT_MENU_ITEM_CLASS}
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
-              <ArrowLeftRight className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{t("topbar.applyToLocal")}</span>
+              <Pencil className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              <span>{t("common.rename")}</span>
             </span>
           </DropdownMenuItem>
-        )}
 
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger className={COMPACT_MENU_ITEM_CLASS}>
+          <DropdownMenuItem
+            onSelect={() => orbitActions.togglePinThread(host.host_id, agent.agent_id)}
+          >
             <span className="flex items-center gap-2 whitespace-nowrap">
-              <Layers className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{t("sidebar.group")}</span>
+              {isPinned ? (
+                <PinOff className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              ) : (
+                <Pin className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              )}
+              <span>{isPinned ? t("sidebar.unpin") : t("sidebar.pin")}</span>
             </span>
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent className="w-max max-w-[240px] min-w-[172px] rounded-[12px] p-1">
-            {otherWorkspaces.length > 0 && (
-              <>
-                <DropdownMenuLabel className="px-2 py-1 text-[11px] font-medium">
-                  {t("sidebar.moveTo")}
-                </DropdownMenuLabel>
-                {otherWorkspaces.map((ws) => (
+          </DropdownMenuItem>
+
+          {!isForegroundRunning && (
+            <DropdownMenuItem
+              onSelect={() => {
+                if (isUnread) {
+                  orbitActions.markThreadRead(host.host_id, agent.agent_id);
+                } else {
+                  orbitActions.markThreadUnread(host.host_id, agent.agent_id);
+                }
+              }}
+            >
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                {isUnread ? (
+                  <CheckCircle2 className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                ) : (
+                  <Circle className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                )}
+                <span>{isUnread ? t("sidebar.markRead") : t("sidebar.markUnread")}</span>
+              </span>
+            </DropdownMenuItem>
+          )}
+        </DropdownMenuGroup>
+
+        <DropdownMenuSeparator />
+
+        <DropdownMenuGroup>
+          <DropdownMenuItem
+            onSelect={() => {
+              orbitActions.openPeerSplitTab(host.host_id, agent.agent_id, tabLabel);
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <Columns2 className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              <span>{t("sidebar.openSplit")}</span>
+            </span>
+          </DropdownMenuItem>
+
+          {isGitRepo ? (
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger>
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <GitFork className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                  <span>{t("sidebar.fork")}</span>
+                </span>
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent>
+                <DropdownMenuGroup>
                   <DropdownMenuItem
-                    key={ws.workspace_id}
                     onSelect={() => {
-                      void orbitActions.moveAgentToWorkspace(
-                        host.host_id,
-                        agent.agent_id,
-                        ws.workspace_id,
-                      );
+                      void orbitActions.forkAgent({
+                        hostId: host.host_id,
+                        sourceAgentId: agent.agent_id,
+                      });
                     }}
-                    className={COMPACT_MENU_ITEM_CLASS}
                   >
-                    <span className="flex min-w-0 items-center gap-2">
-                      <FolderInput className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                      <span className="truncate">{ws.title}</span>
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <GitFork className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("sidebar.forkHere")}</span>
                     </span>
                   </DropdownMenuItem>
-                ))}
-                <DropdownMenuSeparator className="my-1" />
-              </>
-            )}
-
-            {onRequestCreateWorkspace && (
-              <DropdownMenuItem
-                onSelect={() => {
-                  onClose();
-                  onRequestCreateWorkspace({
-                    hostId: host.host_id,
-                    projectRoot,
-                    projectName: projectRoot.split("/").filter(Boolean).pop() || projectRoot,
-                    isGitRepo: Boolean(activeWs?.git_branch),
-                    moveAgentId: agent.agent_id,
-                  });
-                }}
-                className={COMPACT_MENU_ITEM_CLASS}
-              >
-                <span className="flex items-center gap-2 whitespace-nowrap">
-                  <FolderPlus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>{t("sidebar.newGroup")}</span>
-                </span>
-              </DropdownMenuItem>
-            )}
-
-            {!isCuratedWs && (
-              <DropdownMenuItem
-                onSelect={() => {
-                  void orbitActions.organizeProjectWorkspaces(
-                    host.host_id,
-                    projectRoot,
-                    [agent.agent_id],
-                    true,
-                  );
-                }}
-                className={COMPACT_MENU_ITEM_CLASS}
-              >
-                <span className="flex items-center gap-2 whitespace-nowrap">
-                  <Sparkles className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>{t("sidebar.assignAutomatically")}</span>
-                </span>
-              </DropdownMenuItem>
-            )}
-
-            {isCuratedWs && (
-              <DropdownMenuItem
-                onSelect={() => {
-                  orbitActions.openWorkspaceBoardTab(
-                    host.host_id,
-                    agent.workspace_id,
-                    activeWs?.title,
-                  );
-                }}
-                className={COMPACT_MENU_ITEM_CLASS}
-              >
-                <span className="flex items-center gap-2 whitespace-nowrap">
-                  <FileText className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>{t("sidebar.groupNotes")}</span>
-                </span>
-              </DropdownMenuItem>
-            )}
-
-            {isCuratedWs && (
-              <>
-                <DropdownMenuSeparator className="my-1" />
-                <DropdownMenuItem
-                  onSelect={() => {
-                    void orbitActions.moveAgentToWorkspace(host.host_id, agent.agent_id, null, {
-                      makeUnclassified: true,
-                    });
-                  }}
-                  className={COMPACT_MENU_ITEM_CLASS}
-                >
-                  <span className="flex items-center gap-2 whitespace-nowrap">
-                    <Inbox className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                    <span>{t("sidebar.removeFromGroup")}</span>
-                  </span>
-                </DropdownMenuItem>
-              </>
-            )}
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger className={COMPACT_MENU_ITEM_CLASS}>
-            <span className="flex items-center gap-2 whitespace-nowrap">
-              <MoreHorizontal className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{t("common.more")}</span>
-            </span>
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent className="w-max min-w-[172px] rounded-[12px] p-1">
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      void orbitActions.forkAgent({
+                        hostId: host.host_id,
+                        sourceAgentId: agent.agent_id,
+                        worktree: true,
+                      });
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <GitBranch className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("sidebar.forkInNewWorktree")}</span>
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          ) : (
             <DropdownMenuItem
               onSelect={() => {
-                void orbitActions.spawnWorkspacePeer(
-                  {
-                    host_id: host.host_id,
-                    workspace_id: agent.workspace_id,
-                    cwd: agent.cwd,
-                    provider: altProvider,
-                    mode: "plan",
-                    handle: "reviewer",
-                    initial_prompt: `Join this group alongside @${tabLabel}. Read BOARD.md and inspect recent changes to provide a concise code review.`,
-                  },
-                  { openInSplit: true },
-                );
+                void orbitActions.forkAgent({
+                  hostId: host.host_id,
+                  sourceAgentId: agent.agent_id,
+                });
               }}
-              className={COMPACT_MENU_ITEM_CLASS}
             >
               <span className="flex items-center gap-2 whitespace-nowrap">
-                <UserPlus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>{t("sidebar.addReviewer")}</span>
+                <GitFork className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                <span>{t("sidebar.fork")}</span>
               </span>
             </DropdownMenuItem>
+          )}
 
-            <DropdownMenuItem
-              onSelect={() => {
-                void orbitActions.summarizeAgent(host.host_id, agent.agent_id);
-              }}
-              className={COMPACT_MENU_ITEM_CLASS}
-            >
-              <span className="flex items-center gap-2 whitespace-nowrap">
-                <Sparkles className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>{t("topbar.summarize")}</span>
-              </span>
-            </DropdownMenuItem>
-
-            <DropdownMenuSeparator className="my-1" />
-
+          {activeWs?.is_worktree && (
             <DropdownMenuItem
               onSelect={() => {
                 onClose();
-                orbitActions.openExportDialog(host.host_id, agent.agent_id);
-              }}
-              className={COMPACT_MENU_ITEM_CLASS}
-            >
-              <span className="flex items-center gap-2 whitespace-nowrap">
-                <Download className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>{t("topbar.export")}</span>
-              </span>
-            </DropdownMenuItem>
-
-            <DropdownMenuItem
-              onSelect={() => {
-                void orbitActions.copyThread(host.host_id, agent.agent_id);
-              }}
-              className={COMPACT_MENU_ITEM_CLASS}
-            >
-              <span className="flex items-center gap-2 whitespace-nowrap">
-                <Copy className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>{t("topbar.copyTranscript")}</span>
-              </span>
-            </DropdownMenuItem>
-
-            <DropdownMenuItem
-              onSelect={() => {
-                void navigator.clipboard.writeText(agent.agent_id).then(() => {
-                  orbitActions.showToast(t("sidebar.copiedId", { id: agent.agent_id }));
+                orbitActions.openWorktreeHandoffDialog({
+                  hostId: host.host_id,
+                  workspaceId: activeWs.workspace_id,
+                  direction: "worktree_to_local",
+                  defaultMode: "apply",
+                  sourceCwd: activeWs.cwd,
                 });
               }}
-              className={COMPACT_MENU_ITEM_CLASS}
             >
               <span className="flex items-center gap-2 whitespace-nowrap">
-                <Hash className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>{t("sidebar.copyId")}</span>
+                <ArrowLeftRight className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                <span>{t("topbar.applyToLocal")}</span>
               </span>
             </DropdownMenuItem>
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
+          )}
 
-        <DropdownMenuSeparator className="my-1" />
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <Layers className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                <span>{t("sidebar.group")}</span>
+              </span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              {otherWorkspaces.length > 0 && (
+                <>
+                  <DropdownMenuGroup>
+                    <DropdownMenuLabel>{t("sidebar.moveTo")}</DropdownMenuLabel>
+                    {otherWorkspaces.map((ws) => (
+                      <DropdownMenuItem
+                        key={ws.workspace_id}
+                        onSelect={() => {
+                          void orbitActions.moveAgentToWorkspace(
+                            host.host_id,
+                            agent.agent_id,
+                            ws.workspace_id,
+                          );
+                        }}
+                      >
+                        <span className="flex min-w-0 items-center gap-2">
+                          <FolderInput className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                          <span className="truncate">{ws.title}</span>
+                        </span>
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuGroup>
+                  <DropdownMenuSeparator />
+                </>
+              )}
 
-        {agent.parent_agent_id && (
+              <DropdownMenuGroup>
+                {onRequestCreateWorkspace && (
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      onClose();
+                      onRequestCreateWorkspace({
+                        hostId: host.host_id,
+                        projectRoot,
+                        moveAgentId: agent.agent_id,
+                      });
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <FolderPlus className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("sidebar.newGroup")}</span>
+                    </span>
+                  </DropdownMenuItem>
+                )}
+
+                {!isCuratedWs && (
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      void orbitActions.organizeProjectWorkspaces(
+                        host.host_id,
+                        projectRoot,
+                        [agent.agent_id],
+                        true,
+                      );
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Sparkles className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("sidebar.assignAutomatically")}</span>
+                    </span>
+                  </DropdownMenuItem>
+                )}
+
+                {isCuratedWs && (
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      orbitActions.openWorkspaceBoardTab(
+                        host.host_id,
+                        agent.workspace_id,
+                        activeWs?.title,
+                      );
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <FileText className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("sidebar.groupNotes")}</span>
+                    </span>
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuGroup>
+
+              {isCuratedWs && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuGroup>
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        void orbitActions.moveAgentToWorkspace(host.host_id, agent.agent_id, null, {
+                          makeUnclassified: true,
+                        });
+                      }}
+                    >
+                      <span className="flex items-center gap-2 whitespace-nowrap">
+                        <Inbox className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                        <span>{t("sidebar.removeFromGroup")}</span>
+                      </span>
+                    </DropdownMenuItem>
+                  </DropdownMenuGroup>
+                </>
+              )}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <MoreHorizontal className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                <span>{t("common.more")}</span>
+              </span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              <DropdownMenuGroup>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void orbitActions.spawnWorkspacePeer(
+                      {
+                        host_id: host.host_id,
+                        workspace_id: agent.workspace_id,
+                        cwd: agent.cwd,
+                        provider: altProvider,
+                        mode: "plan",
+                        handle: "reviewer",
+                        initial_prompt: `Join this group alongside @${tabLabel}. Read BOARD.md and inspect recent changes to provide a concise code review.`,
+                      },
+                      { openInSplit: true },
+                    );
+                  }}
+                >
+                  <span className="flex items-center gap-2 whitespace-nowrap">
+                    <UserPlus className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                    <span>{t("sidebar.addReviewer")}</span>
+                  </span>
+                </DropdownMenuItem>
+
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void orbitActions.summarizeAgent(host.host_id, agent.agent_id);
+                  }}
+                >
+                  <span className="flex items-center gap-2 whitespace-nowrap">
+                    <Sparkles className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                    <span>{t("topbar.summarize")}</span>
+                  </span>
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+
+              <DropdownMenuSeparator />
+
+              <DropdownMenuGroup>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    onClose();
+                    orbitActions.openExportDialog(host.host_id, agent.agent_id);
+                  }}
+                >
+                  <span className="flex items-center gap-2 whitespace-nowrap">
+                    <Download className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                    <span>{t("topbar.export")}</span>
+                  </span>
+                </DropdownMenuItem>
+
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void orbitActions.copyThread(host.host_id, agent.agent_id);
+                  }}
+                >
+                  <span className="flex items-center gap-2 whitespace-nowrap">
+                    <Copy className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                    <span>{t("topbar.copyTranscript")}</span>
+                  </span>
+                </DropdownMenuItem>
+
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void navigator.clipboard.writeText(agent.agent_id).then(() => {
+                      orbitActions.showToast(t("sidebar.copiedId", { id: agent.agent_id }));
+                    });
+                  }}
+                >
+                  <span className="flex items-center gap-2 whitespace-nowrap">
+                    <Hash className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                    <span>{t("sidebar.copyId")}</span>
+                  </span>
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        </DropdownMenuGroup>
+
+        <DropdownMenuSeparator />
+
+        <DropdownMenuGroup>
+          {agent.parent_agent_id && (
+            <DropdownMenuItem
+              onSelect={() => {
+                void orbitActions.detachAgent(host.host_id, agent.agent_id);
+              }}
+            >
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <Unlink className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                <span>{t("sidebar.detach")}</span>
+              </span>
+            </DropdownMenuItem>
+          )}
+
           <DropdownMenuItem
-            onSelect={() => {
-              void orbitActions.detachAgent(host.host_id, agent.agent_id);
-            }}
-            className={COMPACT_MENU_ITEM_CLASS}
+            onSelect={() => orbitActions.archiveThread(host.host_id, agent.agent_id)}
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
-              <Unlink className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{t("sidebar.detach")}</span>
+              <Archive className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              <span>{t("common.archive")}</span>
             </span>
           </DropdownMenuItem>
-        )}
 
-        <DropdownMenuItem
-          onSelect={() => orbitActions.archiveThread(host.host_id, agent.agent_id)}
-          className={COMPACT_MENU_ITEM_CLASS}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <Archive className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>{t("common.archive")}</span>
-          </span>
-        </DropdownMenuItem>
-
-        <DropdownMenuItem
-          onSelect={() => {
-            onClose();
-            onRequestDelete({ host, agent, title: effectiveTitle });
-          }}
-          className={COMPACT_MENU_ITEM_CLASS}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap text-rose-600 dark:text-rose-400">
-            <Trash2 className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>{t("common.delete")}</span>
-          </span>
-        </DropdownMenuItem>
+          <DropdownMenuItem
+            variant="destructive"
+            onSelect={() => {
+              onClose();
+              onRequestDelete({ host, agent, title: effectiveTitle });
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <Trash2 className="size-[13.5px] stroke-[1.75]" />
+              <span>{t("common.delete")}</span>
+            </span>
+          </DropdownMenuItem>
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -601,7 +587,7 @@ export function SharedProjectMenu({
   onClose: () => void;
   onStartRenameProject: (project: SidebarProjectGroupView) => void;
   onRequestDelete: (project: SidebarProjectGroupView) => void;
-  onRequestCreateWorkspace?: (req: CreateWorkspaceDialogTarget) => void;
+  onRequestCreateWorkspace?: (req: CreateWorkspaceRequest) => void;
 }) {
   const { t } = useI18n();
   if (!target) return null;
@@ -635,123 +621,125 @@ export function SharedProjectMenu({
         />
       </DropdownMenuTrigger>
 
-      <DropdownMenuContent
-        align="start"
-        sideOffset={4}
-        finalFocus={false}
-        className="w-max min-w-[180px] rounded-[12px] p-1"
-      >
-        <DropdownMenuItem
-          onSelect={() => {
-            onClose();
-            window.requestAnimationFrame(() => onStartRenameProject(proj));
-          }}
-          className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <Pencil className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>{t("common.rename")}</span>
-          </span>
-        </DropdownMenuItem>
-
-        {isLocal && (
-          <DropdownMenuItem
-            onSelect={() => {
-              void orbitIpc.openInEditor("file_manager", proj.primary_cwd, null);
-            }}
-            className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
-          >
-            <span className="flex items-center gap-2 whitespace-nowrap">
-              <FolderOpen className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>
-                {isMac
-                  ? t("sidebar.revealInFinder")
-                  : isWindowsDesktop()
-                    ? t("sidebar.revealInExplorer")
-                    : t("sidebar.openFolder")}
-              </span>
-            </span>
-          </DropdownMenuItem>
-        )}
-
-        <DropdownMenuItem
-          onSelect={() => {
-            void navigator.clipboard.writeText(proj.primary_cwd);
-            orbitActions.showToast(t("sidebar.copiedProjectPath"));
-          }}
-          className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <Copy className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>{t("sidebar.copyPath")}</span>
-          </span>
-        </DropdownMenuItem>
-
-        {!isLocal && isDisconnected && (
-          <DropdownMenuItem
-            onSelect={() => {
-              void orbitIpc.connectHost(host.host_id);
-              void orbitIpc.refreshHost(host.host_id);
-            }}
-            className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
-          >
-            <span className="flex items-center gap-2 whitespace-nowrap">
-              <RefreshCw className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{t("banner.reconnect")}</span>
-            </span>
-          </DropdownMenuItem>
-        )}
-
-        {(onRequestCreateWorkspace || canAutoGroup) && <DropdownMenuSeparator className="my-1" />}
-
-        {onRequestCreateWorkspace && (
+      <DropdownMenuContent align="start" sideOffset={4} finalFocus={false}>
+        <DropdownMenuGroup>
           <DropdownMenuItem
             onSelect={() => {
               onClose();
-              onRequestCreateWorkspace({
-                hostId: proj.host_id,
-                projectRoot: proj.primary_cwd,
-                projectName: proj.name,
-                isGitRepo: Boolean(proj.is_git_repo),
-              });
+              window.requestAnimationFrame(() => onStartRenameProject(proj));
             }}
-            className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
-              <FolderPlus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{t("sidebar.newThreadGroup")}</span>
+              <Pencil className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              <span>{t("common.rename")}</span>
             </span>
           </DropdownMenuItem>
-        )}
 
-        {canAutoGroup && (
+          {isLocal && (
+            <DropdownMenuItem
+              onSelect={() => {
+                void orbitIpc.openInEditor("file_manager", proj.primary_cwd, null);
+              }}
+            >
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <FolderOpen className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                <span>
+                  {isMac
+                    ? t("sidebar.revealInFinder")
+                    : isWindowsDesktop()
+                      ? t("sidebar.revealInExplorer")
+                      : t("sidebar.openFolder")}
+                </span>
+              </span>
+            </DropdownMenuItem>
+          )}
+
           <DropdownMenuItem
             onSelect={() => {
-              void orbitActions.organizeProjectWorkspaces(proj.host_id, proj.primary_cwd, [], true);
+              void navigator.clipboard.writeText(proj.primary_cwd);
+              orbitActions.showToast(t("sidebar.copiedProjectPath"));
             }}
-            className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
-              <Sparkles className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{t("sidebar.organizeThreads")}</span>
+              <Copy className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              <span>{t("sidebar.copyPath")}</span>
             </span>
           </DropdownMenuItem>
+
+          {!isLocal && isDisconnected && (
+            <DropdownMenuItem
+              onSelect={() => {
+                void orbitIpc.connectHost(host.host_id);
+                void orbitIpc.refreshHost(host.host_id);
+              }}
+            >
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <RefreshCw className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                <span>{t("banner.reconnect")}</span>
+              </span>
+            </DropdownMenuItem>
+          )}
+        </DropdownMenuGroup>
+
+        {(onRequestCreateWorkspace || canAutoGroup) && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuGroup>
+              {onRequestCreateWorkspace && (
+                <DropdownMenuItem
+                  onSelect={() => {
+                    onClose();
+                    onRequestCreateWorkspace({
+                      projectId: proj.id,
+                      hostId: proj.host_id,
+                      projectRoot: proj.primary_cwd,
+                    });
+                  }}
+                >
+                  <span className="flex items-center gap-2 whitespace-nowrap">
+                    <FolderPlus className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                    <span>{t("sidebar.newThreadGroup")}</span>
+                  </span>
+                </DropdownMenuItem>
+              )}
+
+              {canAutoGroup && (
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void orbitActions.organizeProjectWorkspaces(
+                      proj.host_id,
+                      proj.primary_cwd,
+                      [],
+                      true,
+                    );
+                  }}
+                >
+                  <span className="flex items-center gap-2 whitespace-nowrap">
+                    <Sparkles className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                    <span>{t("sidebar.organizeThreads")}</span>
+                  </span>
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuGroup>
+          </>
         )}
 
-        <DropdownMenuSeparator className="my-1" />
+        <DropdownMenuSeparator />
 
-        <DropdownMenuItem
-          onSelect={() => {
-            onClose();
-            onRequestDelete(proj);
-          }}
-          className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap text-rose-600 dark:text-rose-400">
-            <Trash2 className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>{t("common.delete")}</span>
-          </span>
-        </DropdownMenuItem>
+        <DropdownMenuGroup>
+          <DropdownMenuItem
+            variant="destructive"
+            onSelect={() => {
+              onClose();
+              onRequestDelete(proj);
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <Trash2 className="size-[13.5px] stroke-[1.75]" />
+              <span>{t("common.delete")}</span>
+            </span>
+          </DropdownMenuItem>
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -760,21 +748,27 @@ export function SharedProjectMenu({
 function formatConversationDeleteSummary(
   activeCount: number,
   archivedCount: number,
+  t: ReturnType<typeof useI18n>["t"],
 ): string {
   const parts: string[] = [];
   if (activeCount > 0) {
     parts.push(
-      activeCount === 1 ? "1 active conversation" : `${activeCount} active conversations`,
+      activeCount === 1
+        ? t("sidebar.deleteProjectActiveOne")
+        : t("sidebar.deleteProjectActiveMany", { count: activeCount }),
     );
   }
   if (archivedCount > 0) {
     parts.push(
       archivedCount === 1
-        ? "1 archived conversation"
-        : `${archivedCount} archived conversations`,
+        ? t("sidebar.deleteProjectArchivedOne")
+        : t("sidebar.deleteProjectArchivedMany", { count: archivedCount }),
     );
   }
-  return parts.join(" and ");
+  if (parts.length === 2) {
+    return t("sidebar.deleteProjectSummaryJoin", { a: parts[0], b: parts[1] });
+  }
+  return parts[0] ?? "";
 }
 
 export function DeleteConversationDialog({
@@ -816,34 +810,30 @@ export function DeleteConversationDialog({
     >
       <DialogContent className="max-w-md gap-4 p-5 select-none">
         <DialogHeader className="gap-1.5 pr-6">
-          <DialogTitle className="text-[15.5px]">Delete Conversation</DialogTitle>
-          <DialogDescription className="text-foreground/80 text-[13.5px] leading-relaxed">
-            Are you sure you want to permanently delete{" "}
-            <strong className="text-foreground font-semibold">{target?.title ?? ""}</strong>? This
-            action cannot be undone.
+          <DialogTitle className="text-[15.5px]">
+            {t("sidebar.deleteConversationTitle")}
+          </DialogTitle>
+          <DialogDescription className="text-ink-secondary text-[13px] leading-relaxed">
+            {t("sidebar.deleteConversationConfirm", { title: target?.title ?? "" })}
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-2 text-[13px] leading-relaxed">
+        <div className="space-y-2 text-[12.5px] leading-relaxed">
           {isRunning && (
-            <p className="text-amber-600 dark:text-amber-400">
-              This conversation is currently running and will be stopped first.
-            </p>
+            <p className="text-signal-warning">{t("sidebar.deleteConversationRunningWarn")}</p>
           )}
-          <p className="text-muted-foreground text-[12.5px]">
-            Files on disk will not be deleted.
-          </p>
+          <p className="text-ink-muted">{t("sidebar.filesOnDiskUntouched")}</p>
         </div>
 
-        <div className="flex justify-end gap-2.5 pt-1">
+        <div className="flex justify-end gap-2 pt-1">
           <Button
             type="button"
-            variant="secondary"
+            variant="outline"
             size="sm"
             disabled={deleting}
             onClick={onClose}
           >
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button
             type="button"
@@ -855,11 +845,11 @@ export function DeleteConversationDialog({
           >
             {deleting ? (
               <>
-                <Loader2 className="h-[13.5px] w-[13.5px] animate-spin" />
-                <span>Deleting…</span>
+                <OrbitSpinner size={13} />
+                <span>{t("sidebar.deleting")}</span>
               </>
             ) : (
-              "Delete"
+              t("common.delete")
             )}
           </Button>
         </div>
@@ -877,6 +867,7 @@ export function DeleteProjectDialog({
   archivedThreads: Record<string, ArchivedThreadEntry>;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const [deleting, setDeleting] = useState(false);
 
   let activeCount = 0;
@@ -884,8 +875,10 @@ export function DeleteProjectDialog({
   let runningCount = 0;
   if (project) {
     for (const { agent } of project.conversations) {
+      if (agent.background) continue;
       const isArchived = Boolean(
-        archivedThreads[threadScopeKey(project.host_id, agent.agent_id)],
+        agent.archived_at_rfc3339 ||
+          archivedThreads[threadScopeKey(project.host_id, agent.agent_id)],
       );
       if (isArchived) {
         archivedCount += 1;
@@ -901,7 +894,7 @@ export function DeleteProjectDialog({
       }
     }
   }
-  const conversationSummary = formatConversationDeleteSummary(activeCount, archivedCount);
+  const conversationSummary = formatConversationDeleteSummary(activeCount, archivedCount, t);
 
   const handleConfirm = async () => {
     if (!project || deleting) return;
@@ -925,46 +918,37 @@ export function DeleteProjectDialog({
     >
       <DialogContent className="max-w-md gap-4 p-5 select-none">
         <DialogHeader className="gap-1.5 pr-6">
-          <DialogTitle className="text-[15.5px]">Delete Project &amp; Threads</DialogTitle>
-          <DialogDescription className="text-foreground/80 text-[13.5px] leading-relaxed">
-            Are you sure you want to permanently delete{" "}
-            <strong className="text-foreground font-semibold">{project?.name ?? ""}</strong> from
-            Orbit?
+          <DialogTitle className="text-[15.5px]">{t("sidebar.deleteProjectTitle")}</DialogTitle>
+          <DialogDescription className="text-ink-secondary text-[13px] leading-relaxed">
+            {t("sidebar.deleteProjectConfirm", { project: project?.name ?? "" })}
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-2 text-[13px] leading-relaxed">
+        <div className="space-y-2 text-[12.5px] leading-relaxed">
           {conversationSummary && (
-            <p className="text-foreground/80">
-              This will permanently delete{" "}
-              <strong className="text-foreground font-semibold">
-                {conversationSummary}
-              </strong>{" "}
-              within it.
+            <p className="text-ink-secondary">
+              {t("sidebar.deleteProjectSummary", { summary: conversationSummary })}
             </p>
           )}
           {runningCount > 0 && (
-            <p className="text-amber-600 dark:text-amber-400">
+            <p className="text-signal-warning">
               {runningCount === 1
-                ? "1 running conversation"
-                : `${runningCount} running conversations`}{" "}
-              will be stopped first.
+                ? t("sidebar.deleteProjectRunningOne")
+                : t("sidebar.deleteProjectRunningMany", { count: runningCount })}
             </p>
           )}
-          <p className="text-muted-foreground text-[12.5px]">
-            Files on disk will not be deleted.
-          </p>
+          <p className="text-ink-muted">{t("sidebar.filesOnDiskUntouched")}</p>
         </div>
 
-        <div className="flex justify-end gap-2.5 pt-1">
+        <div className="flex justify-end gap-2 pt-1">
           <Button
             type="button"
-            variant="secondary"
+            variant="outline"
             size="sm"
             disabled={deleting}
             onClick={onClose}
           >
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button
             type="button"
@@ -976,11 +960,11 @@ export function DeleteProjectDialog({
           >
             {deleting ? (
               <>
-                <Loader2 className="h-[13.5px] w-[13.5px] animate-spin" />
-                <span>Deleting…</span>
+                <OrbitSpinner size={13} />
+                <span>{t("sidebar.deleting")}</span>
               </>
             ) : (
-              "Delete"
+              t("common.delete")
             )}
           </Button>
         </div>
@@ -1001,6 +985,10 @@ export function SharedWorkspaceMenu({
   onClose: () => void;
   onStartRenameWorkspace: (workspaceId: string) => void;
 }) {
+  const { t } = useI18n();
+  const hostDetail = useOrbitSelector((s) =>
+    target ? (s.hostDetails[target.project.host_id] ?? null) : null,
+  );
   const wsSummary = useOrbitSelector((s) =>
     target
       ? (s.hostDetails[target.project.host_id]?.workspaces.find(
@@ -1015,6 +1003,16 @@ export function SharedWorkspaceMenu({
   const siblingWorkspaces = (proj.workspaces ?? []).filter(
     (w) => w.workspace_id !== ws.workspace_id && w.is_curated !== false,
   );
+  const activeThreadCount = hostDetail
+    ? hostDetail.agents.filter(
+        (a) =>
+          a.workspace_id === ws.workspace_id &&
+          !a.archived_at_rfc3339 &&
+          !a.background &&
+          !a.parent_agent_id,
+      ).length
+    : ws.conversations.length || ws.peer_count;
+  const hasThreads = activeThreadCount > 0;
 
   return (
     <DropdownMenu
@@ -1038,289 +1036,157 @@ export function SharedWorkspaceMenu({
         />
       </DropdownMenuTrigger>
 
-      <DropdownMenuContent
-        align="start"
-        sideOffset={4}
-        finalFocus={false}
-        className="w-56 p-1.5"
-      >
-        <DropdownMenuItem
-          onSelect={() => {
-            onClose();
-            orbitActions.startNewThreadDraft(
-              proj.host_id,
-              ws.cwd || proj.primary_cwd,
-              undefined,
-              undefined,
-              ws.workspace_id,
-            );
-          }}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <Plus className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>New thread in group</span>
-          </span>
-        </DropdownMenuItem>
-
-        <DropdownMenuItem
-          onSelect={() => {
-            onClose();
-            window.requestAnimationFrame(() => onStartRenameWorkspace(ws.workspace_id));
-          }}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <Pencil className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>Rename group</span>
-          </span>
-        </DropdownMenuItem>
-
-        <DropdownMenuItem
-          onSelect={() => {
-            onClose();
-            orbitActions.openWorkspaceBoardTab(proj.host_id, ws.workspace_id, ws.title);
-          }}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <FileText className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>Group notes</span>
-          </span>
-        </DropdownMenuItem>
-
-        {canHandoff && (
+      <DropdownMenuContent align="start" sideOffset={4} finalFocus={false}>
+        <DropdownMenuGroup>
           <DropdownMenuItem
             onSelect={() => {
               onClose();
-              orbitActions.openWorktreeHandoffDialog({
-                hostId: proj.host_id,
-                workspaceId: ws.workspace_id,
-                direction: isWorktreeWs ? "worktree_to_local" : "local_to_worktree",
-                defaultMode: isWorktreeWs ? "apply" : "move",
-                sourceCwd: wsSummary?.cwd || ws.cwd || proj.primary_cwd,
-              });
+              orbitActions.startNewThreadDraft(
+                proj.host_id,
+                ws.cwd || proj.primary_cwd,
+                undefined,
+                undefined,
+                ws.workspace_id,
+              );
             }}
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
-              <ArrowLeftRight className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-              <span>{isWorktreeWs ? "Apply to Local…" : "Move to Worktree…"}</span>
+              <Plus className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              <span>{t("sidebar.groupNewConversation")}</span>
             </span>
           </DropdownMenuItem>
-        )}
 
-        {siblingWorkspaces.length > 0 && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onClose();
+              window.requestAnimationFrame(() => onStartRenameWorkspace(ws.workspace_id));
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <Pencil className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              <span>{t("common.rename")}</span>
+            </span>
+          </DropdownMenuItem>
+
+          <DropdownMenuItem
+            onSelect={() => {
+              onClose();
+              orbitActions.openWorkspaceBoardTab(proj.host_id, ws.workspace_id, ws.title);
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <FileText className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              <span>{t("sidebar.groupNotes")}</span>
+            </span>
+          </DropdownMenuItem>
+        </DropdownMenuGroup>
+
+        {(canHandoff || siblingWorkspaces.length > 0) && (
           <>
             <DropdownMenuSeparator />
-            <DropdownMenuLabel className="text-[10.5px]">Merge into</DropdownMenuLabel>
-            {siblingWorkspaces.slice(0, 6).map((other) => (
-              <DropdownMenuItem
-                key={other.workspace_id}
-                onSelect={() => {
-                  void orbitActions.mergeWorkspaces(
-                    proj.host_id,
-                    ws.workspace_id,
-                    other.workspace_id,
-                  );
-                }}
-              >
-                <span className="flex min-w-0 items-center gap-2">
-                  <GitMerge className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span className="truncate">{other.title}</span>
-                </span>
-              </DropdownMenuItem>
-            ))}
+            <DropdownMenuGroup>
+              {canHandoff && (
+                <DropdownMenuItem
+                  onSelect={() => {
+                    onClose();
+                    orbitActions.openWorktreeHandoffDialog({
+                      hostId: proj.host_id,
+                      workspaceId: ws.workspace_id,
+                      direction: isWorktreeWs ? "worktree_to_local" : "local_to_worktree",
+                      defaultMode: isWorktreeWs ? "apply" : "move",
+                      sourceCwd: wsSummary?.cwd || ws.cwd || proj.primary_cwd,
+                    });
+                  }}
+                >
+                  <span className="flex items-center gap-2 whitespace-nowrap">
+                    <ArrowLeftRight className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                    <span>
+                      {isWorktreeWs ? t("topbar.applyToLocal") : t("sidebar.moveToWorktree")}
+                    </span>
+                  </span>
+                </DropdownMenuItem>
+              )}
+
+              {siblingWorkspaces.length > 0 && (
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger>
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <GitMerge className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("sidebar.mergeInto")}</span>
+                    </span>
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent>
+                    <DropdownMenuGroup>
+                      {siblingWorkspaces.slice(0, 8).map((other) => (
+                        <DropdownMenuItem
+                          key={other.workspace_id}
+                          onSelect={() => {
+                            void orbitActions.mergeWorkspaces(
+                              proj.host_id,
+                              ws.workspace_id,
+                              other.workspace_id,
+                            );
+                          }}
+                        >
+                          <span className="flex min-w-0 items-center gap-2">
+                            <Layers className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                            <span className="truncate">{other.title}</span>
+                          </span>
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuGroup>
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+              )}
+            </DropdownMenuGroup>
           </>
         )}
 
         <DropdownMenuSeparator />
 
-        <DropdownMenuItem
-          onSelect={() => {
-            void orbitActions.archiveWorkspace(proj.host_id, ws.workspace_id, true);
-          }}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <Inbox className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>Ungroup threads</span>
-          </span>
-        </DropdownMenuItem>
+        <DropdownMenuGroup>
+          {hasThreads ? (
+            <>
+              <DropdownMenuItem
+                onSelect={() => {
+                  void orbitActions.archiveWorkspace(proj.host_id, ws.workspace_id, true);
+                }}
+              >
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <Inbox className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                  <span>{t("sidebar.ungroup")}</span>
+                </span>
+              </DropdownMenuItem>
 
-        <DropdownMenuItem
-          onSelect={() => {
-            void orbitActions.archiveWorkspace(proj.host_id, ws.workspace_id, false);
-          }}
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap text-rose-600 dark:text-rose-400">
-            <Archive className="h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>Archive group & threads</span>
-          </span>
-        </DropdownMenuItem>
+              <DropdownMenuItem
+                variant="destructive"
+                onSelect={() => {
+                  void orbitActions.archiveWorkspace(proj.host_id, ws.workspace_id, false);
+                }}
+              >
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <Archive className="size-[13.5px] stroke-[1.75]" />
+                  <span>{t("sidebar.archiveAll")}</span>
+                </span>
+              </DropdownMenuItem>
+            </>
+          ) : (
+            <DropdownMenuItem
+              variant="destructive"
+              onSelect={() => {
+                void orbitActions.archiveWorkspace(proj.host_id, ws.workspace_id, true, {
+                  emptyDelete: true,
+                });
+              }}
+            >
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <Trash2 className="size-[13.5px] stroke-[1.75]" />
+                <span>{t("common.delete")}</span>
+              </span>
+            </DropdownMenuItem>
+          )}
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
-  );
-}
-
-/**
- * Dialog for manually creating a curated Mission Workspace (and optionally moving an agent into it).
- */
-export function CreateWorkspaceDialog({
-  target,
-  onClose,
-}: {
-  target: CreateWorkspaceDialogTarget | null;
-  onClose: () => void;
-}) {
-  const [title, setTitle] = useState("");
-  const [goal, setGoal] = useState("");
-  const [isolation, setIsolation] = useState<"local" | "worktree">("local");
-  const [submitting, setSubmitting] = useState(false);
-
-  useEffect(() => {
-    if (target) {
-      setTitle("");
-      setGoal("");
-      setIsolation("local");
-    }
-  }, [target]);
-
-  const handleSubmit = async () => {
-    if (!target || !title.trim() || submitting) return;
-    setSubmitting(true);
-    try {
-      if (target.moveAgentId) {
-        await orbitActions.moveAgentToWorkspace(target.hostId, target.moveAgentId, null, {
-          newWorkspaceTitle: title.trim(),
-        });
-      } else {
-        await orbitActions.createMissionWorkspace({
-          hostId: target.hostId,
-          sourceCwd: target.projectRoot,
-          title: title.trim(),
-          missionGoal: goal.trim() || null,
-          isolation: target.isGitRepo ? isolation : "local",
-        });
-      }
-      onClose();
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog
-      open={Boolean(target)}
-      onOpenChange={(open) => {
-        if (!open && !submitting) onClose();
-      }}
-    >
-      <DialogContent className="max-w-md gap-4 p-5 select-none">
-        <DialogHeader className="gap-1.5 pr-6">
-          <DialogTitle className="flex items-center gap-2 text-[15.5px]">
-            <Layers className="text-muted-foreground h-[16px] w-[16px]" />
-            <span>{target?.moveAgentId ? "New group" : "Create group"}</span>
-          </DialogTitle>
-          <DialogDescription className="text-muted-foreground text-[12.5px]">
-            Project: <span className="text-foreground font-medium">{target?.projectName}</span> ·
-            Threads in the same group share context and notes automatically.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-3">
-          <div className="space-y-1">
-            <label className="text-foreground/85 text-[12px] font-medium">Name</label>
-            <input
-              autoFocus
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && title.trim()) {
-                  e.preventDefault();
-                  void handleSubmit();
-                }
-              }}
-              placeholder="e.g. Payments refactor, Release v0.8"
-              className="border-border bg-canvas text-foreground focus:ring-foreground/25 w-full rounded-lg border px-3 py-2 text-[13px] outline-none focus:ring-1"
-            />
-          </div>
-
-          {!target?.moveAgentId && (
-            <div className="space-y-1">
-              <label className="text-foreground/85 text-[12px] font-medium">
-                Goal (optional)
-              </label>
-              <input
-                value={goal}
-                onChange={(e) => setGoal(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && title.trim()) {
-                    e.preventDefault();
-                    void handleSubmit();
-                  }
-                }}
-                placeholder="One-line goal shared across collaborating threads…"
-                className="border-border bg-canvas text-foreground focus:ring-foreground/25 w-full rounded-lg border px-3 py-2 text-[12.5px] outline-none focus:ring-1"
-              />
-            </div>
-          )}
-
-          {!target?.moveAgentId && target?.isGitRepo && (
-            <div className="space-y-1">
-              <label className="text-foreground/85 text-[12px] font-medium">Directory</label>
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  onClick={() => setIsolation("local")}
-                  className={
-                    isolation === "local"
-                      ? "border-foreground/40 bg-foreground/[0.06] text-foreground flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-left text-[12.5px] font-medium"
-                      : "border-border text-muted-foreground hover:text-foreground flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-left text-[12.5px]"
-                  }
-                >
-                  <Laptop className="h-[14px] w-[14px] shrink-0" />
-                  <span>Local</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setIsolation("worktree")}
-                  className={
-                    isolation === "worktree"
-                      ? "border-foreground/40 bg-foreground/[0.06] text-foreground flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-left text-[12.5px] font-medium"
-                      : "border-border text-muted-foreground hover:text-foreground flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-left text-[12.5px]"
-                  }
-                >
-                  <GitBranch className="h-[14px] w-[14px] shrink-0" />
-                  <span>Git Worktree</span>
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="flex justify-end gap-2 pt-1">
-          <Button
-            type="button"
-            variant="secondary"
-            size="sm"
-            disabled={submitting}
-            onClick={onClose}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            disabled={!title.trim() || submitting}
-            onClick={() => void handleSubmit()}
-          >
-            {submitting ? (
-              <>
-                <Loader2 className="h-[13.5px] w-[13.5px] animate-spin" />
-                <span>Creating…</span>
-              </>
-            ) : (
-              "Create"
-            )}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
   );
 }

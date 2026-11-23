@@ -2,6 +2,9 @@ import {
   t,
 } from "@/lib/i18n";
 import {
+  collectVisibleSidebarThreads,
+} from "@/components/sidebar/sidebar-model";
+import {
   defaultMimeForMedia,
 } from "@/lib/media-utils";
 import {
@@ -1085,16 +1088,24 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
 
 
     selectThreadByIndex(indexZeroBased: number): void {
-      const ordered: { hostId: string; agentId: string }[] = [];
-      for (const h of getState().fleet.hosts) {
-        const detail = getState().hostDetails[h.host_id];
-        if (!detail) continue;
-        for (const ag of detail.agents) {
-          if (!getState().archivedThreads[threadScopeKey(h.host_id, ag.agent_id)]) {
-            ordered.push({ hostId: h.host_id, agentId: ag.agent_id });
-          }
-        }
-      }
+      const snap = getState();
+      const ordered = collectVisibleSidebarThreads({
+        hosts: snap.fleet.hosts,
+        sidebarView: snap.sidebarView,
+        hostDetails: snap.hostDetails,
+        archivedThreads: snap.archivedThreads,
+        hiddenProjectKeys: snap.hiddenProjectKeys,
+        threadCustomTitles: snap.threadCustomTitles,
+        collapsedProjectIds: snap.collapsedProjectIds,
+        collapsedWorkspaceIds: snap.collapsedWorkspaceIds,
+        sidebarProjectSort: snap.sidebarProjectSort,
+        threadManualOrder: snap.threadManualOrder,
+        workspacePanel: snap.workspacePanel,
+        isDraftNewSession: snap.isDraftNewSession,
+        selectedHostId: snap.selectedHostId,
+        selectedAgentId: snap.selectedAgentId,
+        selectedWorkspaceCwd: snap.selectedWorkspaceCwd,
+      });
       const target = ordered[indexZeroBased];
       if (target) {
         ctx.actions.selectAgent(target.hostId, target.agentId);
@@ -1691,7 +1702,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       if (wasSelected && fallbackAgentId) {
         ctx.actions.selectAgent(hostId, fallbackAgentId);
       }
-      notifyToast("Conversation archived", {
+      notifyToast(t("store.conversationArchived"), {
         hostId,
         agentId,
         title: targetAgent?.title ?? agentId,
@@ -1742,7 +1753,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       if (shouldOpen) {
         ctx.actions.selectAgent(hostId, agentId);
       }
-      notifyToast("Conversation restored");
+      notifyToast(t("store.conversationRestored"));
     },
 
 
@@ -1769,6 +1780,10 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             archivedThreads: omitRecordKeys(s.archivedThreads, deletedThreadKeys),
             threadCustomTitles: omitRecordKeys(s.threadCustomTitles, deletedThreadKeys),
             stages: omitRecordKeys(s.stages, deletedThreadKeys),
+            stageRunningSubagentMeta: omitRecordKeys(
+              s.stageRunningSubagentMeta,
+              deletedThreadKeys,
+            ),
             composerDrafts: omitRecordKeys(s.composerDrafts, deletedThreadKeys),
             slashDirectives: omitRecordKeys(s.slashDirectives, deletedThreadKeys),
             inlineMentions: omitRecordKeys(s.inlineMentions, deletedThreadKeys),
@@ -1864,11 +1879,16 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           delete nextSideQDrafts[tKey];
           const nextRewound = { ...s.rewoundSessions };
           delete nextRewound[tKey];
+          const nextRunningMeta =
+            tKey in s.stageRunningSubagentMeta
+              ? omitRecordKeys(s.stageRunningSubagentMeta, new Set([tKey]))
+              : s.stageRunningSubagentMeta;
           return {
             ...s,
             archivedThreads: nextArchived,
             threadCustomTitles: nextTitles,
             stages: nextStages,
+            stageRunningSubagentMeta: nextRunningMeta,
             composerDrafts: nextDrafts,
             slashDirectives: nextDirectives,
             inlineMentions: nextInline,
@@ -1891,7 +1911,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       ctx.pruneStageKeyAccess(new Set([tKey]));
       await orbitIpc.deleteAgent(hostId, agentId);
       ctx.actions.refreshSidebarView();
-      notifyToast("Conversation deleted");
+      notifyToast(t("store.conversationDeleted"));
     },
 
 
@@ -1927,6 +1947,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       );
       if (prevSort !== "manual") {
         ctx.actions.refreshSidebarView();
+        notifyToast(t("sidebar.switchedToCustomOrder"));
       }
     },
 
@@ -1944,6 +1965,21 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           };
         },
         !isCompact,
+      );
+    },
+
+
+    focusSidebarFilter(): void {
+      const isCompact = getState().isCompactViewport;
+      setState(
+        (s) => ({
+          ...s,
+          sidebarOpen: true,
+          sidebarAutoYieldedForSidePanel: false,
+          sidebarDesktopOpenPref: s.isCompactViewport ? s.sidebarDesktopOpenPref : true,
+          sidebarFilterFocusNonce: s.sidebarFilterFocusNonce + 1,
+        }),
+        !isCompact && !getState().sidebarOpen,
       );
     },
 
@@ -2059,9 +2095,9 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         });
         await ctx.actions.reloadFleetOnly();
         ctx.actions.refreshSidebarView();
-        notifyToast(`Renamed project to "${cleanName}"`);
+        notifyToast(t("store.projectRenamed", { name: cleanName }));
       } catch (err) {
-        notifyToast(`Failed to rename project: ${String(err)}`);
+        notifyToast(t("store.failedRenameProject", { detail: String(err) }));
       }
     },
 
@@ -2094,7 +2130,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         await ctx.actions.reloadFleetOnly();
         ctx.actions.startNewThreadDraft(hostId, created.directories[0] ?? cleanPath);
       } catch (err) {
-        notifyToast(`Failed to add project: ${String(err)}`);
+        notifyToast(t("store.failedAddProject", { detail: String(err) }));
       }
     },
 
@@ -2146,7 +2182,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         await orbitIpc.removeProject(projectId);
         await ctx.actions.reloadFleetOnly();
       } catch (err) {
-        notifyToast(`Failed to remove project: ${String(err)}`);
+        notifyToast(t("store.failedRemoveProject", { detail: String(err) }));
       }
     },
 
@@ -2254,6 +2290,10 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             archivedThreads: omitRecordKeys(s.archivedThreads, deletedThreadKeys),
             threadCustomTitles: omitRecordKeys(s.threadCustomTitles, deletedThreadKeys),
             stages: omitRecordKeys(s.stages, deletedThreadKeys),
+            stageRunningSubagentMeta: omitRecordKeys(
+              s.stageRunningSubagentMeta,
+              deletedThreadKeys,
+            ),
             composerDrafts: omitRecordKeys(s.composerDrafts, deletedThreadKeys),
             slashDirectives: omitRecordKeys(s.slashDirectives, deletedThreadKeys),
             inlineMentions: omitRecordKeys(s.inlineMentions, deletedThreadKeys),
@@ -2270,9 +2310,9 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         await ctx.actions.reloadFleetOnly();
         await ctx.actions.reloadHostDetail(hostId, false);
         ctx.actions.refreshSidebarView();
-        notifyToast("Project deleted");
+        notifyToast(t("store.projectDeleted"));
       } catch (err) {
-        notifyToast(`Failed to delete project: ${String(err)}`);
+        notifyToast(t("store.failedDeleteProject", { detail: String(err) }));
         throw err;
       }
     },
@@ -2307,34 +2347,28 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
 
 
     async reorderProjects(orderedKeys: string[]): Promise<void> {
+      const prevSort = getState().sidebarProjectSort;
       try {
         await orbitIpc.reorderProjects(orderedKeys);
+        if (prevSort !== "manual") {
+          setState((s) => ({ ...s, sidebarProjectSort: "manual" }), true);
+          notifyToast(t("sidebar.switchedToCustomOrder"));
+        }
         await ctx.actions.reloadFleetOnly();
         ctx.actions.refreshSidebarView();
       } catch (err) {
-        notifyToast(`Failed to reorder projects: ${String(err)}`);
+        notifyToast(t("store.failedReorderProjects", { detail: String(err) }));
       }
     },
 
 
     toggleWorkspaceCollapsed(workspaceId: string): void {
-      setState((s) => ({
-        ...s,
-        collapsedWorkspaceIds: {
-          ...s.collapsedWorkspaceIds,
-          [workspaceId]: !s.collapsedWorkspaceIds[workspaceId],
-        },
-      }));
-    },
-
-
-    toggleProjectInboxCollapsed(projectId: string): void {
       setState(
         (s) => ({
           ...s,
-          collapsedInboxProjectIds: {
-            ...s.collapsedInboxProjectIds,
-            [projectId]: !s.collapsedInboxProjectIds[projectId],
+          collapsedWorkspaceIds: {
+            ...s.collapsedWorkspaceIds,
+            [workspaceId]: !s.collapsedWorkspaceIds[workspaceId],
           },
         }),
         true,

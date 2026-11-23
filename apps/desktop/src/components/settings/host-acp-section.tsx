@@ -12,12 +12,26 @@ import {
   RefreshCw,
   Search,
   Trash2,
-  X,
 } from "lucide-react";
 import {
   SettingCard,
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Tabs,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/dialog-tabs";
+import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   type AcpAgentAvailability,
   type AcpAgentSpec,
@@ -185,153 +199,144 @@ function CustomAcpAgentModal({
   };
 
   return (
-    <div
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !saving) onClose();
+    <Dialog
+      open
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && !saving) onClose();
       }}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 backdrop-blur-[2px]"
     >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={editing ? "Edit custom ACP agent" : "Add custom ACP agent"}
-        className="border-border bg-elevated text-foreground floating-surface w-full max-w-[460px] rounded-[14px] border p-5"
-      >
-        <div className="mb-4 flex items-center justify-between">
-          <div>
-            <h3 className="text-[15px] font-semibold tracking-[-0.01em]">
-              {editing ? "Edit Custom ACP Agent" : "Add Custom ACP Agent"}
-            </h3>
-            <p className="text-muted-foreground mt-0.5 text-[12px]">
-              Configure any stdio JSON-RPC 2.0 ACP executable on this host.
-            </p>
-          </div>
-          <button
-            type="button"
-            aria-label="Close"
-            onClick={onClose}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-lg transition-colors"
-          >
-            <X className="h-[15px] w-[15px]" />
-          </button>
-        </div>
+      <DialogContent closeDisabled={saving} className="max-w-[460px] gap-4 p-5">
+        <DialogHeader className="pr-8">
+          <DialogTitle>
+            {editing ? "Edit Custom ACP Agent" : "Add Custom ACP Agent"}
+          </DialogTitle>
+          <DialogDescription>
+            Configure any stdio JSON-RPC 2.0 ACP executable on this host.
+          </DialogDescription>
+        </DialogHeader>
 
-        <form onSubmit={(e) => void handleSubmit(e)} className="space-y-3">
-          <div className="grid grid-cols-2 gap-3">
-            <label className="block space-y-1">
-              <span className="text-muted-foreground text-[11.5px] font-medium">ID</span>
-              <input
-                type="text"
-                autoFocus={!editing}
-                value={id}
-                disabled={Boolean(editing)}
-                onChange={(e) => setId(e.target.value)}
-                placeholder="my-coder"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12.5px] outline-none focus:border-foreground/40 disabled:opacity-60"
-              />
-            </label>
-            <label className="block space-y-1">
-              <span className="text-muted-foreground text-[11.5px] font-medium">Name</span>
-              <input
-                type="text"
-                autoFocus={Boolean(editing)}
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="My Coder"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 text-[12.5px] outline-none focus:border-foreground/40"
-              />
-            </label>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <label className="block space-y-1">
-              <span className="text-muted-foreground text-[11.5px] font-medium">Command</span>
-              <input
-                type="text"
-                value={command}
-                onChange={(e) => setCommand(e.target.value)}
-                placeholder="opencode or /usr/local/bin/agent"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12.5px] outline-none focus:border-foreground/40"
-              />
-            </label>
-            <label className="block space-y-1">
-              <span className="text-muted-foreground text-[11.5px] font-medium">Arguments</span>
-              <input
-                type="text"
-                value={argsText}
-                onChange={(e) => setArgsText(e.target.value)}
-                placeholder="acp --stdio"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12.5px] outline-none focus:border-foreground/40"
-              />
-            </label>
-          </div>
-
-          <label className="block space-y-1">
-            <span className="text-muted-foreground text-[11.5px] font-medium">
-              Environment (optional, KEY=VALUE per line)
-            </span>
-            <textarea
-              rows={3}
-              value={envText}
-              onChange={(e) => setEnvText(e.target.value)}
-              placeholder={"API_BASE=https://api.example.com\nLOG_LEVEL=warn"}
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 w-full resize-none rounded-lg border px-2.5 py-2 font-mono text-[12px] outline-none focus:border-foreground/40"
-            />
-          </label>
-
-          <label className="block space-y-1">
-            <span className="text-muted-foreground text-[11.5px] font-medium">
-              Description (optional)
-            </span>
-            <input
-              type="text"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="Concise summary of this ACP agent"
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 text-[12.5px] outline-none focus:border-foreground/40"
-            />
-          </label>
-
-          <label className="block space-y-1">
-            <span className="text-muted-foreground text-[11.5px] font-medium">
-              Install hint (optional)
-            </span>
-            <input
-              type="text"
-              value={installHint}
-              onChange={(e) => setInstallHint(e.target.value)}
-              placeholder="brew install my-coder"
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none focus:border-foreground/40"
-            />
-          </label>
-
-          {error && (
-            <div className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-[12px] text-red-600 dark:text-red-400">
-              {error}
+        <form onSubmit={(e) => void handleSubmit(e)}>
+          <FieldGroup className="gap-3">
+            <div className="grid grid-cols-2 gap-3">
+              <Field>
+                <FieldLabel htmlFor="acp-id" className="text-[11.5px]">
+                  ID
+                </FieldLabel>
+                <Input
+                  id="acp-id"
+                  type="text"
+                  autoFocus={!editing}
+                  value={id}
+                  disabled={Boolean(editing)}
+                  onChange={(e) => setId(e.target.value)}
+                  placeholder="my-coder"
+                  className="font-mono"
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="acp-name" className="text-[11.5px]">
+                  Name
+                </FieldLabel>
+                <Input
+                  id="acp-name"
+                  type="text"
+                  autoFocus={Boolean(editing)}
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="My Coder"
+                />
+              </Field>
             </div>
-          )}
 
-          <div className="flex items-center justify-end gap-2 pt-2">
-            <button
-              type="button"
-              disabled={saving}
-              onClick={onClose}
-              className="border-border hover:bg-accent h-[30px] cursor-pointer rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:opacity-50"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={saving}
-              className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:opacity-50"
-            >
-              {saving && <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />}
-              <span>{editing ? "Save Changes" : "Add Agent"}</span>
-            </button>
-          </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Field>
+                <FieldLabel htmlFor="acp-command" className="text-[11.5px]">
+                  Command
+                </FieldLabel>
+                <Input
+                  id="acp-command"
+                  type="text"
+                  value={command}
+                  onChange={(e) => setCommand(e.target.value)}
+                  placeholder="opencode or /usr/local/bin/agent"
+                  className="font-mono"
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="acp-args" className="text-[11.5px]">
+                  Arguments
+                </FieldLabel>
+                <Input
+                  id="acp-args"
+                  type="text"
+                  value={argsText}
+                  onChange={(e) => setArgsText(e.target.value)}
+                  placeholder="acp --stdio"
+                  className="font-mono"
+                />
+              </Field>
+            </div>
+
+            <Field>
+              <FieldLabel htmlFor="acp-env" className="text-[11.5px]">
+                Environment (optional, KEY=VALUE per line)
+              </FieldLabel>
+              <Textarea
+                id="acp-env"
+                rows={3}
+                value={envText}
+                onChange={(e) => setEnvText(e.target.value)}
+                placeholder={"API_BASE=https://api.example.com\nLOG_LEVEL=warn"}
+                className="min-h-[72px] resize-none font-mono text-[12px]"
+              />
+            </Field>
+
+            <Field>
+              <FieldLabel htmlFor="acp-description" className="text-[11.5px]">
+                Description (optional)
+              </FieldLabel>
+              <Input
+                id="acp-description"
+                type="text"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Concise summary of this ACP agent"
+              />
+            </Field>
+
+            <Field>
+              <FieldLabel htmlFor="acp-install-hint" className="text-[11.5px]">
+                Install hint (optional)
+              </FieldLabel>
+              <Input
+                id="acp-install-hint"
+                type="text"
+                value={installHint}
+                onChange={(e) => setInstallHint(e.target.value)}
+                placeholder="brew install my-coder"
+                className="font-mono text-[12px]"
+              />
+            </Field>
+
+            {error && (
+              <FieldError className="border-signal-danger-border bg-signal-danger-bg rounded-lg border px-3 py-2">
+                {error}
+              </FieldError>
+            )}
+
+            <DialogFooter className="pt-2">
+              <Button type="button" variant="outline" size="sm" disabled={saving} onClick={onClose}>
+                Cancel
+              </Button>
+              <Button type="submit" size="sm" disabled={saving}>
+                {saving && <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />}
+                <span>{editing ? "Save Changes" : "Add Agent"}</span>
+              </Button>
+            </DialogFooter>
+          </FieldGroup>
         </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -578,51 +583,39 @@ export function HostAcpSection({ hostId }: { hostId: string }) {
 
       {/* Compact filter + search bar */}
       <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
-        <div
-          role="tablist"
-          aria-label="Filter ACP agent category"
-          className="border-border bg-background/60 inline-flex items-center gap-0.5 rounded-[9px] border p-0.5"
+        <Tabs
+          value={filter}
+          onValueChange={(next) => {
+            if (typeof next === "string") setFilter(next as AcpFilter);
+          }}
         >
-          {(
-            [
-              { id: "installed", label: "Installed", count: installedCount },
-              { id: "all", label: "All Catalog", count: acpAgents.length },
-              { id: "custom", label: "Custom", count: customCount },
-            ] as const
-          ).map((tab) => {
-            const active = filter === tab.id;
-            return (
-              <button
-                key={tab.id}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                onClick={() => setFilter(tab.id)}
-                className={cn(
-                  "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] px-2.5 text-[12px] transition-colors",
-                  active
-                    ? "bg-foreground/9 text-foreground font-medium dark:bg-white/[0.11]"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
+          <TabsList aria-label="Filter ACP agent category">
+            {(
+              [
+                { id: "installed", label: "Installed", count: installedCount },
+                { id: "all", label: "All Catalog", count: acpAgents.length },
+                { id: "custom", label: "Custom", count: customCount },
+              ] as const
+            ).map((tab) => (
+              <TabsTrigger key={tab.id} value={tab.id}>
                 <span>{tab.label}</span>
-                <span className="text-muted-foreground/75 text-[11px] tabular-nums">
+                <span className="text-ink-faint font-mono text-[11px] font-normal tabular-nums">
                   {tab.count}
                 </span>
-              </button>
-            );
-          })}
-        </div>
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
 
         <div className="relative w-full sm:w-[220px]">
-          <Search className="text-muted-foreground/70 pointer-events-none absolute top-1/2 left-2.5 h-[13.5px] w-[13.5px] -translate-y-1/2" />
-          <input
+          <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-2.5 h-[13.5px] w-[13.5px] -translate-y-1/2" />
+          <Input
             type="text"
             aria-label="Filter ACP agents"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Filter agents…"
-            className="border-border bg-background/60 text-foreground placeholder:text-muted-foreground/65 h-[30px] w-full rounded-[9px] border pr-2.5 pl-8 text-[12.5px] outline-none focus:border-foreground/35"
+            className="h-[30px] pl-8"
           />
         </div>
       </div>

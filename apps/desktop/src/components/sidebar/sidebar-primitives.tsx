@@ -1,21 +1,22 @@
-import { memo, useEffect, useState } from "react";
-import { FolderPlus, GitBranch, ShieldCheck, Timer } from "lucide-react";
+import { memo, useSyncExternalStore } from "react";
+import { FolderPlus, GitBranch, Timer } from "lucide-react";
 import {
   type AgentCardView,
   type HostCardView,
-  type HostConnectionState,
   isAgentBackgroundWaiting,
 } from "@/lib/orbit-ipc";
+import { useI18n } from "@/lib/i18n";
 import { isLocalHostCard } from "@/lib/projects";
+import { IconButton } from "@/components/ui/icon-button";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
-  SimpleTooltip,
 } from "@/components/ui/overlays";
-import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { HostStatusIndicator } from "@/components/ui/status-indicator";
 import { orbitActions } from "@/state/orbit-store";
 
 export function formatCompactRelativeTime(rfc3339: string, nowMs: number): string {
@@ -37,60 +38,82 @@ export function formatCompactRelativeTime(rfc3339: string, nowMs: number): strin
   return `${years}y`;
 }
 
-export function useSidebarRelativeClock(enabled: boolean): number {
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    if (!enabled) return;
-    setNowMs(Date.now());
-    const id = window.setInterval(() => {
-      setNowMs(Date.now());
-    }, 30_000);
-    return () => window.clearInterval(id);
-  }, [enabled]);
-  return nowMs;
+// Shared singleton 30s relative clock so individual timestamp spans update without
+// triggering full-sidebar React reconciliation every 30 seconds.
+let sharedClockNowMs = Date.now();
+const clockListeners = new Set<() => void>();
+let clockIntervalId: number | null = null;
+let clockVisibilityAttached = false;
+
+function tickRelativeClock(): void {
+  if (typeof document !== "undefined" && document.hidden) return;
+  sharedClockNowMs = Date.now();
+  for (const listener of clockListeners) {
+    listener();
+  }
 }
 
-export const HostStateDot = memo(function HostStateDot({
-  state,
-}: {
-  state: HostConnectionState;
-}) {
-  switch (state) {
-    case "online_direct":
-      return (
-        <span
-          className="h-[5.5px] w-[5.5px] shrink-0 rounded-full bg-emerald-500"
-          title="Online"
-        />
-      );
-    case "online_relay":
-      return (
-        <ShieldCheck
-          className="h-[12px] w-[12px] shrink-0 text-indigo-400"
-          aria-label="Noise E2EE Relay"
-        />
-      );
-    case "connecting_direct":
-    case "connecting_relay":
-      return <OrbitSpinner size={12} className="text-amber-500" />;
-    default:
-      return (
-        <span
-          className="h-[5.5px] w-[5.5px] shrink-0 rounded-full bg-zinc-400/70"
-          title="Offline"
-        />
-      );
+function handleVisibilityChange(): void {
+  if (typeof document !== "undefined" && !document.hidden) {
+    tickRelativeClock();
   }
+}
+
+function subscribeRelativeClock(listener: () => void): () => void {
+  clockListeners.add(listener);
+  if (clockIntervalId === null && typeof window !== "undefined") {
+    sharedClockNowMs = Date.now();
+    clockIntervalId = window.setInterval(tickRelativeClock, 30_000);
+    if (!clockVisibilityAttached && typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+      clockVisibilityAttached = true;
+    }
+  }
+  return () => {
+    clockListeners.delete(listener);
+    if (clockListeners.size === 0 && clockIntervalId !== null && typeof window !== "undefined") {
+      window.clearInterval(clockIntervalId);
+      clockIntervalId = null;
+      if (clockVisibilityAttached && typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+        clockVisibilityAttached = false;
+      }
+    }
+  };
+}
+
+function getRelativeClockSnapshot(): number {
+  return sharedClockNowMs;
+}
+
+const noopSubscribe = () => () => {};
+
+export function useSidebarRelativeClock(enabled: boolean): number {
+  return useSyncExternalStore(
+    enabled ? subscribeRelativeClock : noopSubscribe,
+    getRelativeClockSnapshot,
+    getRelativeClockSnapshot,
+  );
+}
+
+export const SidebarRelativeTime = memo(function SidebarRelativeTime({
+  rfc3339,
+  className,
+}: {
+  rfc3339: string;
+  className?: string;
+}) {
+  const nowMs = useSidebarRelativeClock(true);
+  return <span className={className}>{formatCompactRelativeTime(rfc3339, nowMs)}</span>;
 });
 
 /**
  * Left `16×16px` semantic status slot (running spinner lives in the right time/action slot):
- * - Blocked / awaiting input -> `6.5px` amber dot
- * - Unread completed -> `6px` sky-blue dot
- * - Error -> `6px` rose dot
- * - Background task / timer running -> `12.5px` calm `Timer` glyph (never a colored dot, so it cannot be confused with unread)
- * - Idle & read inside isolated Git worktree -> `12.5px` muted branch glyph
- * - Normal local idle & read -> completely blank (zero gray bullet clutter)
+ * - Blocked / awaiting input -> warning signal dot
+ * - Unread completed -> info signal dot
+ * - Error -> danger signal dot
+ * - Background task / timer running -> calm `Timer` glyph
+ * - Idle & read inside isolated Git worktree -> muted branch glyph
  */
 export const ConversationStatusGlyph = memo(function ConversationStatusGlyph({
   agent,
@@ -101,29 +124,28 @@ export const ConversationStatusGlyph = memo(function ConversationStatusGlyph({
   isWorktree: boolean;
   isUnread: boolean;
 }) {
+  const { t } = useI18n();
   if (agent.is_awaiting_permission) {
-    return <span className="h-[6.5px] w-[6.5px] shrink-0 rounded-full bg-amber-500" />;
+    return <span className="bg-signal-warning size-[6px] shrink-0 rounded-full" />;
   }
   if (isUnread) {
-    return <span className="h-[6px] w-[6px] shrink-0 rounded-full bg-sky-500" />;
+    return <span className="bg-signal-info size-[6px] shrink-0 rounded-full" />;
   }
   if (agent.status_label === "Error") {
-    return <span className="h-[6px] w-[6px] shrink-0 rounded-full bg-rose-500" />;
+    return <span className="bg-signal-danger size-[6px] shrink-0 rounded-full" />;
   }
   if (isAgentBackgroundWaiting(agent)) {
     return (
       <span
-        title={agent.status_label || "Background task running"}
+        title={agent.status_label || t("sidebar.backgroundTaskRunning")}
         className="inline-flex shrink-0 items-center justify-center"
       >
-        <Timer className="text-muted-foreground/75 h-[12.5px] w-[12.5px] shrink-0 stroke-[1.75]" />
+        <Timer className="text-ink-tertiary size-[12px] shrink-0 stroke-[1.75]" />
       </span>
     );
   }
   if (isWorktree) {
-    return (
-      <GitBranch className="text-muted-foreground/55 h-[12.5px] w-[12.5px] shrink-0 stroke-[1.75]" />
-    );
+    return <GitBranch className="text-ink-muted size-[12px] shrink-0 stroke-[1.75]" />;
   }
   return null;
 });
@@ -133,66 +155,61 @@ export const AddProjectButton = memo(function AddProjectButton({
 }: {
   hosts: HostCardView[];
 }) {
+  const { t } = useI18n();
+
   if (hosts.length === 0) {
     return (
-      <SimpleTooltip label="Connect host">
-        <button
-          type="button"
-          onClick={() => orbitActions.openSettings("hosts")}
-          className="text-muted-foreground hover:text-foreground inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-        >
-          <FolderPlus className="h-[14px] w-[14px] stroke-[1.75]" />
-        </button>
-      </SimpleTooltip>
+      <IconButton
+        size="xs"
+        tooltip={t("sidebar.connectHost")}
+        onClick={() => orbitActions.openSettings("hosts")}
+      >
+        <FolderPlus className="size-[14px] stroke-[1.75]" />
+      </IconButton>
     );
   }
 
   if (hosts.length === 1) {
     return (
-      <SimpleTooltip label="Add project">
-        <button
-          type="button"
-          onClick={() => void orbitActions.promptAddProject(hosts[0].host_id)}
-          className="text-muted-foreground hover:text-foreground inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-        >
-          <FolderPlus className="h-[14px] w-[14px] stroke-[1.75]" />
-        </button>
-      </SimpleTooltip>
+      <IconButton
+        size="xs"
+        tooltip={t("sidebar.addProject")}
+        onClick={() => void orbitActions.promptAddProject(hosts[0].host_id)}
+      >
+        <FolderPlus className="size-[14px] stroke-[1.75]" />
+      </IconButton>
     );
   }
 
   return (
     <DropdownMenu>
-      <SimpleTooltip label="Add project">
-        <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            className="text-muted-foreground hover:text-foreground inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-          >
-            <FolderPlus className="h-[14px] w-[14px] stroke-[1.75]" />
-          </button>
-        </DropdownMenuTrigger>
-      </SimpleTooltip>
+      <DropdownMenuTrigger asChild>
+        <IconButton size="xs" tooltip={t("sidebar.addProject")}>
+          <FolderPlus className="size-[14px] stroke-[1.75]" />
+        </IconButton>
+      </DropdownMenuTrigger>
 
-      <DropdownMenuContent align="start" sideOffset={6} className="w-[224px] p-1.5">
-        <DropdownMenuLabel>Add Project From</DropdownMenuLabel>
-        {hosts.map((h) => {
-          const isLocal = isLocalHostCard(h);
-          return (
-            <DropdownMenuItem
-              key={h.host_id}
-              onSelect={() => void orbitActions.promptAddProject(h.host_id)}
-            >
-              <span className="flex min-w-0 items-center gap-2">
-                <HostStateDot state={h.connection_state} />
-                <span className="truncate">{h.display_name}</span>
-              </span>
-              <span className="text-muted-foreground shrink-0 text-[11.5px]">
-                {isLocal ? "Local" : h.ssh_alias ? "SSH" : "Remote"}
-              </span>
-            </DropdownMenuItem>
-          );
-        })}
+      <DropdownMenuContent align="start" sideOffset={6} className="min-w-[208px] max-w-[260px]">
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>{t("sidebar.addProjectFrom")}</DropdownMenuLabel>
+          {hosts.map((h) => {
+            const isLocal = isLocalHostCard(h);
+            return (
+              <DropdownMenuItem
+                key={h.host_id}
+                onSelect={() => void orbitActions.promptAddProject(h.host_id)}
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  <HostStatusIndicator state={h.connection_state} />
+                  <span className="truncate">{h.display_name}</span>
+                </span>
+                <span className="text-ink-tertiary shrink-0 text-[11px]">
+                  {isLocal ? t("sidebar.hostLocal") : h.ssh_alias ? "SSH" : t("sidebar.hostRemote")}
+                </span>
+              </DropdownMenuItem>
+            );
+          })}
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );

@@ -473,7 +473,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                         </button>
                         <button
                           type="button"
-                          title={t("sidePanel.deleteFolder")}
+                          title={t("common.delete")}
                           aria-label={`Delete ${node.name}`}
                           onClick={(e) => {
                             e.stopPropagation();
@@ -601,7 +601,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                     </button>
                     <button
                       type="button"
-                      title={t("sidePanel.deleteFile")}
+                      title={t("common.delete")}
                       aria-label={`Delete ${node.name}`}
                       onClick={(e) => {
                         e.stopPropagation();

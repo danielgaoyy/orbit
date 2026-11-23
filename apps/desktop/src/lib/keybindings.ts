@@ -44,6 +44,28 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
+      // 1a. Filter Sidebar Conversations (`⌘F` / `Ctrl+F`) — yield to terminal search & modal overlays
+      if (mod && !e.shiftKey && !e.altKey && keyLower === "f" && !snap.terminalFocused) {
+        const isOverlayOpen =
+          snap.activeView === "settings" ||
+          snap.commandPaletteOpen ||
+          snap.quickOpenFilesOpen ||
+          snap.pairDialogOpen ||
+          snap.relayDialogOpen ||
+          snap.remoteFolderPickerHostId !== null ||
+          snap.exportDialogTarget !== null ||
+          snap.copyCodeBlocksTarget !== null ||
+          snap.handoffDialogTarget !== null ||
+          snap.mediaPreviewTarget !== null ||
+          Boolean(document.querySelector('[data-slot="dialog-content"]'));
+        if (!isOverlayOpen) {
+          e.preventDefault();
+          if (e.repeat) return;
+          orbitActions.focusSidebarFilter();
+          return;
+        }
+      }
+
       // 1b. Settings Center (`⌘,` / `Ctrl+,`) — native standard preferences shortcut
       if (mod && !e.shiftKey && !e.altKey && e.key === ",") {
         e.preventDefault();

@@ -8,6 +8,8 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import type {
   GuardianAuditEntry,
   GuardianDecision,
@@ -113,7 +115,7 @@ function PatternListEditor({
       </div>
 
       <div className="flex items-center gap-2">
-        <input
+        <Input
           type="text"
           value={draft}
           disabled={disabled}
@@ -125,17 +127,19 @@ function PatternListEditor({
             }
           }}
           placeholder={placeholder}
-          className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[30px] min-w-0 flex-1 rounded-lg border px-2.5 font-mono text-[12px] outline-none focus:border-foreground/35 disabled:opacity-50"
+          className="h-[30px] flex-1 font-mono text-[12px]"
         />
-        <button
+        <Button
           type="button"
+          variant="outline"
+          size="sm"
           disabled={disabled || !draft.trim()}
           onClick={handleAdd}
-          className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45"
+          className="gap-1 px-2.5"
         >
           <Plus className="h-[12.5px] w-[12.5px]" />
           Add
-        </button>
+        </Button>
       </div>
 
       {items.length > 0 && (

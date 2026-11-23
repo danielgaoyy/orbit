@@ -21,7 +21,8 @@
 
 ## 2. UI 与界面改动约定
 
-- 凡涉及 `apps/` 下任何界面设计、布局、样式或交互的改动，动手前**必须**先读取并遵循 `.agents/skills/interface-design/SKILL.md`（若仓库中已生成 `.interface-design/system.md`，需一并读取）。
+- 凡涉及 `apps/` 下任何界面设计、布局、样式或交互的改动，动手前**必须**先读取 `.agents/skills/interface-design/SKILL.md`（及 `.interface-design/system.md`）与 `.agents/skills/shadcn/SKILL.md`。
+- **优先使用 shadcn/ui 组件**：编写 UI 前先查看 `apps/desktop/src/components/ui/` 中已有组件（缺少标准组件时按 `shadcn` skill 查阅或补充），尽量复用并组合官方组件、仅叠加设计令牌样式，避免重复手写基础控件。
 
 ---
 

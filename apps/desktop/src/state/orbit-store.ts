@@ -137,6 +137,7 @@ export type {
   SlashDirective,
   TerminalCursorStyle,
   TerminalTabSession,
+  TerminalThemeMode,
   ThemeMode,
   ToastAction,
   UndoArchiveEntry,

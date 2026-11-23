@@ -31,7 +31,12 @@ import {
   ToggleSwitch,
   type SettingSelectOption,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/dialog-tabs";
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import { SimpleTooltip } from "@/components/ui/overlays";
+import { Textarea } from "@/components/ui/textarea";
 import { orbitActions } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -417,100 +422,95 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
       {/* Restrained Segmented Launcher */}
       <div className="border-border/80 bg-elevated/35 space-y-4 rounded-xl border p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="bg-muted/70 inline-flex items-center gap-0.5 rounded-[9px] p-0.5">
-            {(
-              [
-                { id: "best_of_n", label: "Best-of-N Arena", icon: Trophy },
-                { id: "batch_csv", label: "Batch CSV", icon: Layers },
-                { id: "dag", label: "DAG Pipeline", icon: Workflow },
-              ] as const
-            ).map((tab) => {
-              const Icon = tab.icon;
-              const active = launcherMode === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  type="button"
-                  onClick={() => setLauncherMode(tab.id)}
-                  className={cn(
-                    "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] px-2.5 text-[12px] font-medium transition-colors",
-                    active
-                      ? "bg-background text-foreground shadow-2xs"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  <Icon className="size-3.5 stroke-[1.75]" />
-                  <span>{tab.label}</span>
-                </button>
-              );
-            })}
-          </div>
+          <Tabs
+            value={launcherMode}
+            onValueChange={(v) => setLauncherMode(v as LauncherMode)}
+          >
+            <TabsList>
+              {(
+                [
+                  { id: "best_of_n", label: "Best-of-N Arena", icon: Trophy },
+                  { id: "batch_csv", label: "Batch CSV", icon: Layers },
+                  { id: "dag", label: "DAG Pipeline", icon: Workflow },
+                ] as const
+              ).map((tab) => {
+                const Icon = tab.icon;
+                return (
+                  <TabsTrigger key={tab.id} value={tab.id} className="gap-1.5 text-[12px]">
+                    <Icon className="size-3.5 stroke-[1.75]" />
+                    <span>{tab.label}</span>
+                  </TabsTrigger>
+                );
+              })}
+            </TabsList>
+          </Tabs>
 
-          <button
+          <Button
             type="button"
+            size="sm"
             disabled={!hostId || launching || !cwd}
             onClick={() => void handleLaunch()}
-            className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[9px] px-3 text-[12px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
           >
             <Play className="size-3 fill-current" />
             <span>{launching ? "Starting…" : "Run"}</span>
-          </button>
+          </Button>
         </div>
 
         {/* Shared compact metadata row */}
         <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
-          <label className="flex flex-col gap-1 text-[11.5px]">
-            <span className="text-muted-foreground font-medium">Workspace</span>
+          <Field>
+            <FieldLabel className="text-[11.5px]">Workspace</FieldLabel>
             <SettingSelect
               value={cwd}
               onChange={setCwd}
               options={projectOptions}
               placeholder="Select project"
             />
-          </label>
-          <label className="flex flex-col gap-1 text-[11.5px]">
-            <span className="text-muted-foreground font-medium">Run Name</span>
-            <input
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="workflow-run-name" className="text-[11.5px]">
+              Run Name
+            </FieldLabel>
+            <Input
+              id="workflow-run-name"
               value={runName}
               onChange={(e) => setRunName(e.target.value)}
               placeholder="Optional title"
-              className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[32px] w-full rounded-lg border px-2.5 text-[12.5px] outline-none"
             />
-          </label>
-          <label className="flex flex-col gap-1 text-[11.5px]">
-            <span className="text-muted-foreground font-medium">Permissions</span>
+          </Field>
+          <Field>
+            <FieldLabel className="text-[11.5px]">Permissions</FieldLabel>
             <SettingSelect value={mode} onChange={setMode} options={MODE_OPTIONS} />
-          </label>
+          </Field>
         </div>
 
         {/* Mode-specific inputs */}
         {launcherMode === "best_of_n" && (
-          <div className="space-y-3">
-            <label className="flex flex-col gap-1 text-[11.5px]">
-              <span className="text-muted-foreground font-medium">Shared Prompt</span>
-              <textarea
+          <FieldGroup className="gap-3">
+            <Field>
+              <FieldLabel htmlFor="workflow-arena-prompt" className="text-[11.5px]">
+                Shared Prompt
+              </FieldLabel>
+              <Textarea
+                id="workflow-arena-prompt"
                 rows={3}
                 value={arenaPrompt}
                 onChange={(e) => setArenaPrompt(e.target.value)}
                 placeholder="Task solved in parallel across isolated candidate worktrees…"
-                className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 w-full resize-none rounded-lg border px-3 py-2 text-[12.5px] leading-relaxed outline-none"
+                className="resize-none leading-relaxed"
               />
-            </label>
+            </Field>
 
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <span className="text-muted-foreground text-[11.5px] font-medium">
+                <FieldLabel className="text-[11.5px]">
                   Candidates ({candidates.length}/5)
-                </span>
+                </FieldLabel>
                 {candidates.length < 5 && (
-                  <button
-                    type="button"
-                    onClick={addCandidate}
-                    className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 text-[11.5px] font-medium"
-                  >
+                  <Button type="button" variant="ghost" size="xs" onClick={addCandidate}>
                     <Plus className="size-3" />
                     <span>Add candidate</span>
-                  </button>
+                  </Button>
                 )}
               </div>
               <div className="space-y-1.5">
@@ -519,7 +519,7 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                     key={cand.id}
                     className="grid grid-cols-[1fr_140px_1fr_104px_26px] items-center gap-1.5"
                   >
-                    <input
+                    <Input
                       value={cand.label}
                       onChange={(e) =>
                         setCandidates((prev) =>
@@ -527,7 +527,7 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                         )
                       }
                       placeholder={`Candidate ${idx + 1}`}
-                      className="border-border bg-canvas text-foreground focus:border-foreground/30 h-[30px] rounded-md border px-2 text-[12px] outline-none"
+                      className="h-[30px] px-2 text-[12px]"
                     />
                     <SettingSelect
                       value={cand.provider}
@@ -538,7 +538,7 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                       }
                       options={PROVIDER_OPTIONS}
                     />
-                    <input
+                    <Input
                       value={cand.model}
                       onChange={(e) =>
                         setCandidates((prev) =>
@@ -546,7 +546,7 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                         )
                       }
                       placeholder="Model (default)"
-                      className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[30px] rounded-md border px-2 font-mono text-[11.5px] outline-none"
+                      className="h-[30px] px-2 font-mono text-[11.5px]"
                     />
                     <SettingSelect
                       value={cand.effort}
@@ -557,127 +557,132 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                       }
                       options={EFFORT_OPTIONS}
                     />
-                    <button
+                    <Button
                       type="button"
+                      variant="ghost"
+                      size="icon"
                       disabled={candidates.length <= 2}
                       onClick={() => removeCandidate(cand.id)}
                       aria-label="Remove candidate"
-                      className="text-muted-foreground hover:text-rose-500 inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md disabled:cursor-not-allowed disabled:opacity-30"
+                      className="text-muted-foreground size-[26px] hover:text-rose-500"
                     >
                       <Trash2 className="size-3.5" />
-                    </button>
+                    </Button>
                   </div>
                 ))}
               </div>
             </div>
 
-            <label className="flex flex-col gap-1 text-[11.5px]">
-              <span className="text-muted-foreground font-medium">
+            <Field>
+              <FieldLabel htmlFor="workflow-verify-cmd" className="text-[11.5px]">
                 Verify Command <span className="text-muted-foreground/60 font-normal">(optional)</span>
-              </span>
-              <input
+              </FieldLabel>
+              <Input
+                id="workflow-verify-cmd"
                 value={verifyCommand}
                 onChange={(e) => setVerifyCommand(e.target.value)}
                 placeholder="e.g. cargo test --quiet"
-                className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[30px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none"
+                className="h-[30px] font-mono text-[12px]"
               />
-            </label>
-          </div>
+            </Field>
+          </FieldGroup>
         )}
 
         {launcherMode === "batch_csv" && (
-          <div className="space-y-3">
+          <FieldGroup className="gap-3">
             <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
-              <label className="flex flex-col gap-1 text-[11.5px]">
-                <span className="text-muted-foreground font-medium">Provider</span>
+              <Field>
+                <FieldLabel className="text-[11.5px]">Provider</FieldLabel>
                 <SettingSelect
                   value={batchProvider}
                   onChange={setBatchProvider}
                   options={PROVIDER_OPTIONS}
                 />
-              </label>
-              <label className="flex flex-col gap-1 text-[11.5px]">
-                <span className="text-muted-foreground font-medium">Concurrency (1–8)</span>
-                <input
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="workflow-batch-concurrency" className="text-[11.5px]">
+                  Concurrency (1–8)
+                </FieldLabel>
+                <Input
+                  id="workflow-batch-concurrency"
                   type="number"
                   min={1}
                   max={8}
                   value={batchConcurrency}
                   onChange={(e) => setBatchConcurrency(e.target.value)}
-                  className="border-border bg-canvas text-foreground focus:border-foreground/30 h-[32px] rounded-lg border px-2.5 font-mono text-[12px] outline-none"
+                  className="font-mono text-[12px]"
                 />
-              </label>
-              <div className="flex items-end justify-between pb-1">
-                <span className="text-muted-foreground text-[12px] font-medium">
-                  Isolated worktree
-                </span>
+              </Field>
+              <Field orientation="horizontal" className="items-end pb-1">
+                <FieldLabel>Isolated worktree</FieldLabel>
                 <ToggleSwitch checked={batchWorktree} onChange={setBatchWorktree} />
-              </div>
+              </Field>
             </div>
 
-            <label className="flex flex-col gap-1 text-[11.5px]">
-              <span className="text-muted-foreground font-medium">CSV Rows (max 200)</span>
-              <textarea
+            <Field>
+              <FieldLabel htmlFor="workflow-batch-csv" className="text-[11.5px]">
+                CSV Rows (max 200)
+              </FieldLabel>
+              <Textarea
+                id="workflow-batch-csv"
                 rows={4}
                 value={batchCsv}
                 onChange={(e) => setBatchCsv(e.target.value)}
                 placeholder="col_a,col_b&#10;val_1,val_2"
-                className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 w-full resize-y rounded-lg border px-3 py-2 font-mono text-[11.5px] leading-relaxed outline-none"
+                className="resize-y font-mono text-[11.5px] leading-relaxed"
               />
-            </label>
+            </Field>
 
-            <label className="flex flex-col gap-1 text-[11.5px]">
-              <span className="text-muted-foreground font-medium">
+            <Field>
+              <FieldLabel htmlFor="workflow-batch-template" className="text-[11.5px]">
                 Prompt Template{" "}
-                <span className="text-muted-foreground/60 font-mono">{"{{column}}"}</span>
-              </span>
-              <textarea
+                <span className="text-muted-foreground/60 font-mono font-normal">{"{{column}}"}</span>
+              </FieldLabel>
+              <Textarea
+                id="workflow-batch-template"
                 rows={2}
                 value={batchTemplate}
                 onChange={(e) => setBatchTemplate(e.target.value)}
-                className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 w-full resize-none rounded-lg border px-3 py-2 text-[12.5px] outline-none"
+                className="min-h-[60px] resize-none"
               />
-            </label>
-          </div>
+            </Field>
+          </FieldGroup>
         )}
 
         {launcherMode === "dag" && (
-          <div className="space-y-3">
+          <FieldGroup className="gap-3">
             <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-              <label className="flex flex-col gap-1 text-[11.5px]">
-                <span className="text-muted-foreground font-medium">Default Provider</span>
+              <Field>
+                <FieldLabel className="text-[11.5px]">Default Provider</FieldLabel>
                 <SettingSelect
                   value={dagProvider}
                   onChange={setDagProvider}
                   options={PROVIDER_OPTIONS}
                 />
-              </label>
-              <label className="flex flex-col gap-1 text-[11.5px]">
-                <span className="text-muted-foreground font-medium">Concurrency (1–8)</span>
-                <input
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="workflow-dag-concurrency" className="text-[11.5px]">
+                  Concurrency (1–8)
+                </FieldLabel>
+                <Input
+                  id="workflow-dag-concurrency"
                   type="number"
                   min={1}
                   max={8}
                   value={dagConcurrency}
                   onChange={(e) => setDagConcurrency(e.target.value)}
-                  className="border-border bg-canvas text-foreground focus:border-foreground/30 h-[32px] rounded-lg border px-2.5 font-mono text-[12px] outline-none"
+                  className="font-mono text-[12px]"
                 />
-              </label>
+              </Field>
             </div>
 
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <span className="text-muted-foreground text-[11.5px] font-medium">
-                  Steps ({dagSteps.length}/64)
-                </span>
-                <button
-                  type="button"
-                  onClick={addDagStep}
-                  className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 text-[11.5px] font-medium"
-                >
+                <FieldLabel className="text-[11.5px]">Steps ({dagSteps.length}/64)</FieldLabel>
+                <Button type="button" variant="ghost" size="xs" onClick={addDagStep}>
                   <Plus className="size-3" />
                   <span>Add step</span>
-                </button>
+                </Button>
               </div>
               <div className="space-y-2">
                 {dagSteps.map((st) => (
@@ -686,7 +691,7 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                     className="border-border/70 bg-canvas/70 space-y-2 rounded-lg border p-2.5"
                   >
                     <div className="grid grid-cols-[110px_1fr_130px_26px] items-center gap-1.5">
-                      <input
+                      <Input
                         value={st.stepId}
                         onChange={(e) =>
                           setDagSteps((prev) =>
@@ -694,9 +699,9 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                           )
                         }
                         placeholder="step_id"
-                        className="border-border bg-canvas text-foreground h-[28px] rounded-md border px-2 font-mono text-[11.5px] outline-none"
+                        className="h-[28px] px-2 font-mono text-[11.5px]"
                       />
-                      <input
+                      <Input
                         value={st.name}
                         onChange={(e) =>
                           setDagSteps((prev) =>
@@ -704,9 +709,9 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                           )
                         }
                         placeholder="Step label"
-                        className="border-border bg-canvas text-foreground h-[28px] rounded-md border px-2 text-[12px] outline-none"
+                        className="h-[28px] px-2 text-[12px]"
                       />
-                      <input
+                      <Input
                         value={st.dependsOn}
                         onChange={(e) =>
                           setDagSteps((prev) =>
@@ -716,19 +721,21 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                           )
                         }
                         placeholder="depends_on (csv)"
-                        className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 h-[28px] rounded-md border px-2 font-mono text-[11px] outline-none"
+                        className="h-[28px] px-2 font-mono text-[11px]"
                       />
-                      <button
+                      <Button
                         type="button"
+                        variant="ghost"
+                        size="icon"
                         disabled={dagSteps.length <= 1}
                         onClick={() => removeDagStep(st.id)}
                         aria-label="Remove step"
-                        className="text-muted-foreground hover:text-rose-500 inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md disabled:cursor-not-allowed disabled:opacity-30"
+                        className="text-muted-foreground size-[26px] hover:text-rose-500"
                       >
                         <Trash2 className="size-3.5" />
-                      </button>
+                      </Button>
                     </div>
-                    <textarea
+                    <Textarea
                       rows={2}
                       value={st.promptTemplate}
                       onChange={(e) =>
@@ -739,13 +746,13 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                         )
                       }
                       placeholder="Prompt (supports {{step.<id>.output}})"
-                      className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 w-full resize-none rounded-md border px-2.5 py-1.5 text-[12px] outline-none"
+                      className="min-h-[54px] resize-none px-2.5 py-1.5 text-[12px]"
                     />
                   </div>
                 ))}
               </div>
             </div>
-          </div>
+          </FieldGroup>
         )}
       </div>
 

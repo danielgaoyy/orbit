@@ -1,13 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
   Blocks,
-  ChevronRight,
-  Clock,
   CornerDownLeft,
   File,
   FileDiff,
   Globe,
-  Loader2,
   MessageCircleQuestion,
   Search,
   SquareTerminal,
@@ -19,6 +16,7 @@ import {
   WorkspaceScriptsSection,
   useWorkspaceScripts,
 } from "@/components/side-panel/scripts-panel";
+import { DiffStat } from "@/components/ui/diff-stat";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -192,8 +190,6 @@ export function SidePanelLaunchpad({
   const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
-  const [showAllTasks, setShowAllTasks] = useState(false);
-  const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const inputRef = useRef<HTMLInputElement | null>(null);
   const ime = useImeCompositionGuard();
 
@@ -226,7 +222,6 @@ export function SidePanelLaunchpad({
 
   const cwd = currentAgent?.cwd || selectedWorkspaceCwd || "~";
   const insights = stage?.insights ?? EMPTY_INSIGHTS;
-  const backgroundTasks = insights.background_tasks;
 
   const sessionTurnDiffs = stage?.session_turn_diffs ?? EMPTY_DIFFS;
   const gitReview =
@@ -281,14 +276,10 @@ export function SidePanelLaunchpad({
         trailing:
           reviewSummary.count > 0 ? (
             reviewSummary.additions > 0 || reviewSummary.deletions > 0 ? (
-              <span className="font-mono text-[11.5px] tabular-nums">
-                <span className="text-emerald-600 dark:text-emerald-400">
-                  +{reviewSummary.additions}
-                </span>{" "}
-                <span className="text-red-500 dark:text-red-400">
-                  -{reviewSummary.deletions}
-                </span>
-              </span>
+              <DiffStat
+                additions={reviewSummary.additions}
+                deletions={reviewSummary.deletions}
+              />
             ) : (
               <span className="text-muted-foreground/75 text-[11.5px] tabular-nums">
                 {reviewSummary.count === 1
@@ -529,9 +520,6 @@ export function SidePanelLaunchpad({
     }
   };
 
-  const visibleBackgroundTasks = showAllTasks
-    ? backgroundTasks
-    : backgroundTasks.slice(0, 4);
   const recentFiles = insights.touched_files.slice(0, 5);
   const { scripts: workspaceScripts } = useWorkspaceScripts(selectedHostId);
   const hasWorkspaceScripts = workspaceScripts.length > 0;
@@ -732,102 +720,10 @@ export function SidePanelLaunchpad({
               })}
             </div>
 
-            {(hasWorkspaceScripts || backgroundTasks.length > 0 || recentFiles.length > 0) && (
-              <div className="border-border/60 mt-4 flex flex-col gap-5 border-t pt-4">
+            {(hasWorkspaceScripts || recentFiles.length > 0) && (
+              <div className="border-border-subtle mt-4 flex flex-col gap-5 border-t pt-4">
                 {/* Workspace Services & Scripts (orbit.json / paseo.json — 0px when none configured) */}
                 <WorkspaceScriptsSection hostId={selectedHostId} />
-                {/* Background Tasks */}
-                {backgroundTasks.length > 0 && (
-                  <section>
-                    <div className="mb-1.5 flex items-center gap-1.5 px-2.5 text-[11.5px] font-medium">
-                      <span className="text-muted-foreground/75">
-                        {t("sidePanel.backgroundTasks")}
-                      </span>
-                      <span className="text-muted-foreground/55 tabular-nums">
-                        {backgroundTasks.length}
-                      </span>
-                    </div>
-                    <div className="flex flex-col gap-0.5">
-                      {visibleBackgroundTasks.map((task) => {
-                        const isRunning = task.status === "running";
-                        const isTimerLike =
-                          task.kind === "wakeup" || /\btimer\b/i.test(task.title);
-                        const hasDetails = Boolean(
-                          task.command || task.output_preview || task.log_path,
-                        );
-                        const isExpanded = Boolean(expandedTasks[task.id]);
-                        return (
-                          <div key={task.id} className="flex flex-col rounded-[7px]">
-                            <button
-                              type="button"
-                              title={task.command || task.title}
-                              onClick={() => {
-                                if (!hasDetails) return;
-                                setExpandedTasks((prev) => ({
-                                  ...prev,
-                                  [task.id]: !prev[task.id],
-                                }));
-                              }}
-                              className={cn(
-                                "text-foreground/85 flex min-h-[32px] w-full items-center justify-between gap-2 rounded-[7px] px-2.5 py-1 text-left text-[12.5px] transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]",
-                                hasDetails ? "cursor-pointer" : "cursor-default",
-                              )}
-                            >
-                              <span className="flex min-w-0 items-center gap-2.5">
-                                {isRunning ? (
-                                  <Loader2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 animate-spin" />
-                                ) : isTimerLike ? (
-                                  <Clock className="text-muted-foreground/75 h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                                ) : (
-                                  <SquareTerminal className="text-muted-foreground/75 h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                                )}
-                                <span className="min-w-0 truncate">{task.title}</span>
-                              </span>
-                              {hasDetails && (
-                                <ChevronRight
-                                  className={cn(
-                                    "text-muted-foreground/50 h-[13px] w-[13px] shrink-0 transition-transform",
-                                    isExpanded && "rotate-90",
-                                  )}
-                                />
-                              )}
-                            </button>
-                            {hasDetails && isExpanded && (
-                              <div className="border-border/75 selectable-text mx-2.5 mb-1.5 space-y-1 rounded-r-md border-l-2 bg-black/[0.025] px-2.5 py-1.5 font-mono text-[11px] dark:bg-white/[0.035]">
-                                {task.command && (
-                                  <div className="text-foreground/85 break-all whitespace-pre-wrap">
-                                    $ {task.command}
-                                  </div>
-                                )}
-                                {task.log_path && (
-                                  <div className="text-muted-foreground break-all">
-                                    Log: {task.log_path}
-                                  </div>
-                                )}
-                                {task.output_preview && (
-                                  <pre className="text-muted-foreground max-h-[120px] overflow-auto break-words whitespace-pre-wrap">
-                                    {task.output_preview.slice(0, 600)}
-                                  </pre>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                      {backgroundTasks.length > 4 && (
-                        <button
-                          type="button"
-                          onClick={() => setShowAllTasks((prev) => !prev)}
-                          className="text-muted-foreground hover:text-foreground mt-0.5 w-fit cursor-pointer px-2.5 py-1 text-[12px] transition-colors"
-                        >
-                          {showAllTasks
-                            ? t("common.showLess")
-                            : t("common.showMore", { count: backgroundTasks.length - 4 })}
-                        </button>
-                      )}
-                    </div>
-                  </section>
-                )}
 
                 {/* Recent Files */}
                 {recentFiles.length > 0 && (

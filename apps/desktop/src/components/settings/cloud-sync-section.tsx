@@ -21,8 +21,10 @@ import {
   SettingSectionHeader,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Input } from "@/components/ui/input";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { orbitIpc } from "@/lib/orbit-ipc";
@@ -303,7 +305,7 @@ export function CloudSyncSection() {
                             </button>
                             ). No client secret is needed.
                           </div>
-                          <input
+                          <Input
                             type="text"
                             value={clientIdInput}
                             onChange={(e) => setClientIdInput(e.target.value)}
@@ -313,16 +315,16 @@ export function CloudSyncSection() {
                               if (e.key === "Enter") void handleStartDeviceLogin();
                             }}
                             placeholder="Ov23li..."
-                            className="border-border bg-background text-foreground placeholder:text-muted-foreground h-[34px] w-full rounded-lg border px-3 font-mono text-[12.5px] outline-none focus:border-foreground/30"
+                            className="h-[34px] px-3 font-mono"
                           />
                         </div>
                       )}
 
-                      <button
+                      <Button
                         type="button"
                         disabled={busy}
                         onClick={() => void handleStartDeviceLogin()}
-                        className="bg-foreground text-background inline-flex h-[36px] cursor-pointer items-center gap-2 rounded-lg px-4 text-[13px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-50"
+                        className="h-[36px] gap-2 px-4 text-[13px]"
                       >
                         {busy ? (
                           <Loader2 className="h-4 w-4 animate-spin" />
@@ -330,7 +332,7 @@ export function CloudSyncSection() {
                           <Cloud className="h-4 w-4" />
                         )}
                         <span>Sign in with GitHub</span>
-                      </button>
+                      </Button>
                     </div>
                   ) : (
                     <div className="space-y-3">
@@ -354,7 +356,7 @@ export function CloudSyncSection() {
                         </button>
                       </div>
                       <div className="flex gap-2">
-                        <input
+                        <Input
                           type="password"
                           value={tokenInput}
                           onChange={(e) => setTokenInput(e.target.value)}
@@ -364,13 +366,13 @@ export function CloudSyncSection() {
                             if (e.key === "Enter") void handleTokenLogin();
                           }}
                           placeholder="ghp_... or github_pat_..."
-                          className="border-border bg-background text-foreground placeholder:text-muted-foreground h-[34px] flex-1 rounded-lg border px-3 font-mono text-[12.5px] outline-none focus:border-foreground/30"
+                          className="h-[34px] flex-1 px-3 font-mono"
                         />
-                        <button
+                        <Button
                           type="button"
                           disabled={busy}
                           onClick={() => void handleTokenLogin()}
-                          className="bg-foreground text-background inline-flex h-[34px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-50"
+                          className="h-[34px] shrink-0 gap-1.5 px-3.5"
                         >
                           {busy ? (
                             <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -378,7 +380,7 @@ export function CloudSyncSection() {
                             <KeyRound className="h-3.5 w-3.5" />
                           )}
                           <span>Continue</span>
-                        </button>
+                        </Button>
                       </div>
                     </div>
                   )}
@@ -485,7 +487,7 @@ export function CloudSyncSection() {
                 )}
 
                 <div className="space-y-2">
-                  <input
+                  <Input
                     type={generatedKey ? "text" : "password"}
                     value={passphraseInput}
                     onChange={(e) => {
@@ -506,11 +508,11 @@ export function CloudSyncSection() {
                         ? "Enter your Sync Passphrase or Recovery Key"
                         : "Choose a Sync Passphrase (or click Generate Recovery Key)"
                     }
-                    className="border-border bg-background text-foreground placeholder:text-muted-foreground h-[36px] w-full rounded-lg border px-3 text-[13px] outline-none focus:border-foreground/30"
+                    className="h-[36px] px-3 text-[13px]"
                   />
 
                   {!status.remote_vault_exists && !generatedKey && (
-                    <input
+                    <Input
                       type="password"
                       value={confirmPassphraseInput}
                       onChange={(e) => setConfirmPassphraseInput(e.target.value)}
@@ -520,7 +522,7 @@ export function CloudSyncSection() {
                         if (e.key === "Enter") void handleUnlock();
                       }}
                       placeholder="Confirm Sync Passphrase"
-                      className="border-border bg-background text-foreground placeholder:text-muted-foreground h-[36px] w-full rounded-lg border px-3 text-[13px] outline-none focus:border-foreground/30"
+                      className="h-[36px] px-3 text-[13px]"
                     />
                   )}
                 </div>
@@ -529,11 +531,11 @@ export function CloudSyncSection() {
                   <span className="text-muted-foreground text-[11.5px]">
                     Cached locally after unlock — you only enter this once per device.
                   </span>
-                  <button
+                  <Button
                     type="button"
                     disabled={busy}
                     onClick={() => void handleUnlock()}
-                    className="bg-foreground text-background inline-flex h-[34px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-4 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-50"
+                    className="h-[34px] shrink-0 gap-1.5 px-4"
                   >
                     {busy ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -543,7 +545,7 @@ export function CloudSyncSection() {
                     <span>
                       {status.remote_vault_exists ? "Unlock & Sync" : "Encrypt & Start Sync"}
                     </span>
-                  </button>
+                  </Button>
                 </div>
               </div>
             </SettingCard>

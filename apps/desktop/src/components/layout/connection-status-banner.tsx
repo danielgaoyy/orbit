@@ -1,7 +1,7 @@
 import { memo, useEffect, useState } from "react";
-import { AlertTriangle, RefreshCw, WifiOff, X } from "lucide-react";
+import { AlertTriangle, RefreshCw, WifiOff } from "lucide-react";
+import { ContextBanner } from "@/components/ui/context-banner";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
-import { SimpleTooltip } from "@/components/ui/overlays";
 import { useI18n } from "@/lib/i18n";
 import { compareSemver, normalizeSemver } from "@/lib/orbit-ipc";
 import {
@@ -34,7 +34,6 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
   const [reconnecting, setReconnecting] = useState(false);
   const [showLocalUpgradeStrip, setShowLocalUpgradeStrip] = useState(false);
 
-  // Local sidecar upgrades usually complete in < 600ms; delay showing any strip so fast swaps are 100% invisible
   useEffect(() => {
     if (upgradeState?.status !== "upgrading" || upgradeState.mode !== "local") {
       setShowLocalUpgradeStrip(false);
@@ -44,25 +43,19 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
     return () => window.clearTimeout(timer);
   }, [upgradeState?.status, upgradeState?.mode, upgradeState?.startedAt]);
 
-  // 1. OS/WebView internet offline — highest priority (loopback daemon stays green even when internet drops)
   if (isBrowserOffline) {
     const offlineText = t("banner.networkOffline");
     return (
-      <div
-        role="status"
-        className="@container orbit-stage-enter flex min-h-[30px] min-w-0 shrink-0 items-center justify-between gap-2 overflow-hidden border-b border-amber-500/20 bg-amber-500/[0.055] px-3 py-1 text-[12px] text-amber-800 dark:text-amber-200 @[560px]:px-4"
+      <ContextBanner
+        variant="strip"
+        tone="warning"
+        icon={<WifiOff className="size-3.5 shrink-0" />}
       >
-        <div className="flex min-w-0 items-center gap-2">
-          <WifiOff className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
-          <span title={offlineText} className="truncate">
-            {offlineText}
-          </span>
-        </div>
-      </div>
+        <span title={offlineText}>{offlineText}</span>
+      </ContextBanner>
     );
   }
 
-  // 1.5 Active fleet-wide update progress (persists even after closing Settings)
   if (
     fleetUpdate.phase === "upgrading_hosts" ||
     fleetUpdate.phase === "upgrading_desktop"
@@ -80,28 +73,25 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
             })
           : (fleetUpdate.summaryMessage ?? t("banner.updatingFleet"));
     return (
-      <div
-        role="status"
-        className="@container orbit-stage-enter border-border/70 bg-canvas text-muted-foreground flex min-h-[30px] min-w-0 shrink-0 items-center justify-between gap-2 overflow-hidden border-b px-3 py-1 text-[12px] @[560px]:px-4"
+      <ContextBanner
+        variant="strip"
+        tone="neutral"
+        icon={<OrbitSpinner size={12} className="text-signal-info" />}
+        actions={
+          <button
+            type="button"
+            onClick={() => orbitActions.openSettings("general")}
+            className="text-ink-primary hover:bg-accent cursor-pointer rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-colors"
+          >
+            {t("banner.viewProgress")}
+          </button>
+        }
       >
-        <div className="flex min-w-0 items-center gap-2">
-          <OrbitSpinner size={12} className="shrink-0 text-sky-500" />
-          <span title={label} className="truncate">
-            {label}
-          </span>
-        </div>
-        <button
-          type="button"
-          onClick={() => orbitActions.openSettings("general")}
-          className="text-foreground/80 hover:text-foreground shrink-0 cursor-pointer rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-        >
-          {t("banner.viewProgress")}
-        </button>
-      </div>
+        <span title={label}>{label}</span>
+      </ContextBanner>
     );
   }
 
-  // 2. Active silent background daemon upgrade (remote SSH/E2EE wire or slow local fallback)
   if (
     selectedHost &&
     upgradeState?.status === "upgrading" &&
@@ -109,55 +99,46 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
   ) {
     const upgradingText = t("banner.updatingHostInBackground", { host: selectedHost.display_name });
     return (
-      <div
-        role="status"
-        className="@container orbit-stage-enter border-border/70 bg-canvas text-muted-foreground flex min-h-[30px] min-w-0 shrink-0 items-center gap-2 overflow-hidden border-b px-3 py-1 text-[12px] @[560px]:px-4"
+      <ContextBanner
+        variant="strip"
+        tone="neutral"
+        icon={<OrbitSpinner size={12} className="text-ink-tertiary" />}
       >
-        <OrbitSpinner size={12} className="text-muted-foreground/80 shrink-0" />
-        <span title={upgradingText} className="truncate">
-          {upgradingText}
-        </span>
-      </div>
+        <span title={upgradingText}>{upgradingText}</span>
+      </ContextBanner>
     );
   }
 
-  // 3. Selected host disconnected / reconnecting
   if (selectedHost && selectedHost.connection_state === "disconnected") {
     const errSnippet = selectedHost.last_error?.trim() || null;
     const disconnectedText = `${t("banner.disconnectedFrom", { host: selectedHost.display_name })}${errSnippet ? ` · ${errSnippet}` : ""}`;
     const reconnectLabel = reconnecting ? t("banner.reconnecting") : t("banner.reconnect");
     return (
-      <div
-        role="status"
-        className="@container orbit-stage-enter flex min-h-[30px] min-w-0 shrink-0 items-center justify-between gap-2 overflow-hidden border-b border-rose-500/20 bg-rose-500/[0.055] px-3 py-1 text-[12px] text-rose-800 dark:text-rose-200 @[560px]:px-4"
+      <ContextBanner
+        variant="strip"
+        tone="danger"
+        icon={<AlertTriangle className="size-3.5 shrink-0" />}
+        actions={
+          <button
+            type="button"
+            aria-label={reconnectLabel}
+            disabled={reconnecting}
+            onClick={() => {
+              if (!selectedHostId) return;
+              setReconnecting(true);
+              void orbitActions.reconnectHost(selectedHostId).finally(() => {
+                setReconnecting(false);
+              });
+            }}
+            className="bg-signal-danger/12 text-signal-danger hover:bg-signal-danger/20 inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11px] font-medium transition-colors disabled:opacity-60"
+          >
+            <RefreshCw className={reconnecting ? "size-3 shrink-0 animate-spin" : "size-3 shrink-0"} />
+            <span className="hidden @[460px]:inline">{reconnectLabel}</span>
+          </button>
+        }
       >
-        <div className="flex min-w-0 items-center gap-2">
-          <AlertTriangle className="size-3.5 shrink-0 text-rose-600 dark:text-rose-400" />
-          <span title={disconnectedText} className="truncate">
-            {disconnectedText}
-          </span>
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          <SimpleTooltip label={reconnectLabel}>
-            <button
-              type="button"
-              aria-label={reconnectLabel}
-              disabled={reconnecting}
-              onClick={() => {
-                if (!selectedHostId) return;
-                setReconnecting(true);
-                void orbitActions.reconnectHost(selectedHostId).finally(() => {
-                  setReconnecting(false);
-                });
-              }}
-              className="inline-flex h-[22px] cursor-pointer items-center justify-center gap-1 rounded-md bg-rose-500/[0.11] px-1.5 text-[11.5px] font-medium text-rose-700 transition-colors hover:bg-rose-500/[0.18] disabled:opacity-60 dark:text-rose-200 @[460px]:px-2"
-            >
-              <RefreshCw className={reconnecting ? "size-3 shrink-0 animate-spin" : "size-3 shrink-0"} />
-              <span className="hidden @[460px]:inline">{reconnectLabel}</span>
-            </button>
-          </SimpleTooltip>
-        </div>
-      </div>
+        <span title={disconnectedText}>{disconnectedText}</span>
+      </ContextBanner>
     );
   }
 
@@ -175,20 +156,16 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
       mode: modeLabel,
     });
     return (
-      <div
-        role="status"
-        className="@container orbit-stage-enter border-border/70 bg-canvas text-muted-foreground flex min-h-[30px] min-w-0 shrink-0 items-center gap-2 overflow-hidden border-b px-3 py-1 text-[12px] @[560px]:px-4"
+      <ContextBanner
+        variant="strip"
+        tone="neutral"
+        icon={<OrbitSpinner size={12} className="text-ink-tertiary" />}
       >
-        <OrbitSpinner size={12} className="text-muted-foreground/80 shrink-0" />
-        <span title={connectingText} className="truncate">
-          {connectingText}
-        </span>
-      </div>
+        <span title={connectingText}>{connectingText}</span>
+      </ContextBanner>
     );
   }
 
-  // 4. Protocol-lagging daemon fallback (ONLY when protocol is behind AND automatic upgrade hasn't completed)
-  // Always offers a direct 1-click Update button — never asks the user to copy/paste shell commands.
   const targetVersion = resolveFleetTargetVersion(appVersion, releaseUpdateInfo);
   const normApp = normalizeSemver(appVersion);
   const normDaemon = normalizeSemver(selectedHost?.daemon_version);
@@ -229,57 +206,43 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
     });
     const updateAllFull = t("banner.updateAllCount", { count: outdatedFleetHostsCount });
     return (
-      <div
-        role="status"
-        className="@container orbit-stage-enter border-border/70 bg-canvas text-muted-foreground flex min-h-[30px] min-w-0 shrink-0 items-center justify-between gap-2 overflow-hidden border-b px-3 py-1 text-[12px] @[560px]:px-4"
-      >
-        <div className="flex min-w-0 items-center gap-2">
-          <span title={mismatchText} className="truncate">
-            {mismatchText}
-          </span>
-        </div>
-        <div className="flex shrink-0 items-center gap-0.5 @[520px]:gap-1">
-          {outdatedFleetHostsCount > 1 && (
-            <SimpleTooltip label={updateAllFull}>
+      <ContextBanner
+        variant="strip"
+        tone="neutral"
+        dismissLabel={t("banner.dismissNotice")}
+        onDismiss={() => orbitActions.dismissVersionMismatch(selectedHost.host_id, normDaemon)}
+        actions={
+          <>
+            {outdatedFleetHostsCount > 1 && (
               <button
                 type="button"
                 aria-label={updateAllFull}
                 onClick={() => void orbitActions.upgradeAllConnectedHosts()}
-                className="inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md px-1.5 text-[11.5px] font-medium text-sky-600 transition-colors hover:bg-sky-500/12 dark:text-sky-400 @[520px]:px-2"
+                className="text-signal-info hover:bg-signal-info-bg inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11px] font-medium transition-colors"
               >
                 <span className="hidden @[560px]:inline">{updateAllFull}</span>
                 <span className="@[560px]:hidden">
                   {t("banner.updateAllShort", { count: outdatedFleetHostsCount })}
                 </span>
               </button>
-            </SimpleTooltip>
-          )}
-          <button
-            type="button"
-            onClick={() =>
-              void orbitActions.upgradeHostDaemon(selectedHost.host_id, {
-                force: true,
-                targetVersion,
-              })
-            }
-            className="text-foreground/85 hover:text-foreground inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md px-1.5 text-[11.5px] font-medium transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06] @[520px]:px-2"
-          >
-            <span>
-              {upgradeState?.status === "failed" ? t("banner.retryUpdate") : t("common.update")}
-            </span>
-          </button>
-          <SimpleTooltip label={t("banner.dismissNotice")}>
+            )}
             <button
               type="button"
-              aria-label={t("banner.dismissNotice")}
-              onClick={() => orbitActions.dismissVersionMismatch(selectedHost.host_id, normDaemon)}
-              className="text-muted-foreground hover:text-foreground inline-flex size-5 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+              onClick={() =>
+                void orbitActions.upgradeHostDaemon(selectedHost.host_id, {
+                  force: true,
+                  targetVersion,
+                })
+              }
+              className="text-ink-primary hover:bg-accent inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11px] font-medium transition-colors"
             >
-              <X className="size-3" />
+              {upgradeState?.status === "failed" ? t("banner.retryUpdate") : t("common.update")}
             </button>
-          </SimpleTooltip>
-        </div>
-      </div>
+          </>
+        }
+      >
+        <span title={mismatchText}>{mismatchText}</span>
+      </ContextBanner>
     );
   }
 

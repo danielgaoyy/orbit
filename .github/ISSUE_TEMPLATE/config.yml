@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability Report
+    url: https://github.com/danielgaoyy/orbit/security/advisories/new
+    about: Please report security issues privately through GitHub Security Advisories (see SECURITY.md).
+  - name: Architecture & Contributing Guide
+    url: https://github.com/danielgaoyy/orbit/blob/main/CONTRIBUTING.md
+    about: Review local development commands, architecture redlines, and PR guidelines before opening a proposal.

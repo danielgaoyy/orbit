@@ -1,12 +1,13 @@
 mod qr;
 mod tray;
 mod updater;
+mod window_state;
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static NEXT_LOCAL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -76,8 +77,9 @@ use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnVie
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
     ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
-    EventTriggerDelivery, ExternalMcpServerRecord, GuardianPolicyConfig, HookExecutionRecord,
-    HookScope, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult, GitCreatePrResult,
+    GitMutationOutcome, GitPushResult, GuardianPolicyConfig, HookExecutionRecord, HookScope,
+    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
     ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
     ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
@@ -88,10 +90,62 @@ use orbit_providers::{
     ProviderReadinessInfo, SideQuestionSpec,
     probe_local_provider_readiness as run_local_provider_readiness_probe, run_side_question,
 };
-use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
+use tauri::{
+    AppHandle, Emitter, Manager, State, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    ipc::{Channel, InvokeResponseBody},
+};
 
 struct DesktopAppState {
     core: Arc<OrbitAppCore>,
+    window_terminal_subs: Arc<Mutex<HashMap<String, Vec<String>>>>,
+}
+
+impl DesktopAppState {
+    fn new(core: Arc<OrbitAppCore>) -> Self {
+        Self {
+            core,
+            window_terminal_subs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn register_window_terminal_subscription(&self, window_label: &str, subscription_id: &str) {
+        if let Ok(mut map) = self.window_terminal_subs.lock() {
+            let entry = map.entry(window_label.to_string()).or_default();
+            if !entry.iter().any(|id| id == subscription_id) {
+                entry.push(subscription_id.to_string());
+            }
+        }
+    }
+
+    fn unregister_window_terminal_subscription(&self, subscription_id: &str) {
+        remove_window_terminal_subscription(&self.window_terminal_subs, subscription_id);
+    }
+
+    fn cleanup_window_terminal_subscriptions(&self, window_label: &str) -> usize {
+        let sub_ids = self
+            .window_terminal_subs
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(window_label))
+            .unwrap_or_default();
+        let count = sub_ids.len();
+        for sub_id in sub_ids {
+            self.core.unsubscribe_terminal_binary(&sub_id);
+        }
+        count
+    }
+}
+
+fn remove_window_terminal_subscription(
+    subs_by_window: &Mutex<HashMap<String, Vec<String>>>,
+    subscription_id: &str,
+) {
+    if let Ok(mut map) = subs_by_window.lock() {
+        map.retain(|_, ids| {
+            ids.retain(|id| id != subscription_id);
+            !ids.is_empty()
+        });
+    }
 }
 
 struct TauriChannelSubscriber {
@@ -118,10 +172,91 @@ fn subscribe_core_events(state: State<'_, DesktopAppState>, on_event: Channel<Co
     state.core.replace_subscribers(
         SubscribeOptions {
             min_interval_ms: 33,
-            include_terminal_raw_bytes: true,
+            // PTY output streams over the dedicated raw binary IPC channel (`subscribe_terminal_binary`)
+            // so high-throughput terminal builds never churn JSON arrays or the main store.
+            include_terminal_raw_bytes: false,
         },
         Arc::new(TauriChannelSubscriber { channel: on_event }),
     );
+}
+
+#[tauri::command]
+fn subscribe_terminal_binary(
+    window: WebviewWindow,
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    terminal_id: String,
+    slot: Option<u8>,
+    on_chunk: Channel<InvokeResponseBody>,
+) -> Result<String, String> {
+    let trimmed_host = host_id.trim();
+    if trimmed_host.is_empty() {
+        return Err("host_id is required for binary terminal subscription".into());
+    }
+    let trimmed_tid = terminal_id.trim();
+    if trimmed_tid.is_empty() && slot.is_none() {
+        return Err("terminal_id or slot is required for binary terminal subscription".into());
+    }
+    if !trimmed_tid.is_empty() {
+        let _ = state
+            .core
+            .ensure_terminal_attached(trimmed_host, trimmed_tid);
+    }
+
+    let mut rx = state
+        .core
+        .subscribe_terminal_binary_with_slot(trimmed_host, trimmed_tid, slot);
+    let subscription_id = rx.subscription_id().to_string();
+    state.register_window_terminal_subscription(window.label(), &subscription_id);
+
+    let core = Arc::clone(&state.core);
+    let window_subs = Arc::clone(&state.window_terminal_subs);
+    let sub_id_for_task = subscription_id.clone();
+
+    tauri::async_runtime::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            if chunk.is_empty() {
+                continue;
+            }
+            if on_chunk.send(InvokeResponseBody::Raw(chunk)).is_err() {
+                break;
+            }
+        }
+        remove_window_terminal_subscription(&window_subs, &sub_id_for_task);
+        core.unsubscribe_terminal_binary(&sub_id_for_task);
+    });
+
+    Ok(subscription_id)
+}
+
+#[tauri::command]
+fn unsubscribe_terminal_binary(
+    state: State<'_, DesktopAppState>,
+    subscription_id: String,
+) -> Result<(), String> {
+    let trimmed = subscription_id.trim();
+    if !trimmed.is_empty() {
+        state.unregister_window_terminal_subscription(trimmed);
+        state.core.unsubscribe_terminal_binary(trimmed);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn ensure_terminal_slot(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    terminal_id: String,
+) -> Result<u8, String> {
+    let trimmed_host = host_id.trim();
+    let trimmed_tid = terminal_id.trim();
+    if trimmed_host.is_empty() || trimmed_tid.is_empty() {
+        return Err("host_id and terminal_id are required".into());
+    }
+    state
+        .core
+        .ensure_terminal_attached(trimmed_host, trimmed_tid)
+        .ok_or_else(|| format!("host `{trimmed_host}` not found"))
 }
 
 #[tauri::command]
@@ -1663,6 +1798,128 @@ fn fetch_git_diff(
 }
 
 #[tauri::command]
+async fn git_stage_files(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    paths: Vec<String>,
+    all: Option<bool>,
+) -> Result<GitMutationOutcome, String> {
+    state
+        .core
+        .git_stage_files_on_host(&host_id, &cwd, paths, all.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_unstage_files(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    paths: Vec<String>,
+    all: Option<bool>,
+) -> Result<GitMutationOutcome, String> {
+    state
+        .core
+        .git_unstage_files_on_host(&host_id, &cwd, paths, all.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_apply_hunk(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    patch: String,
+    reverse: Option<bool>,
+    cached: Option<bool>,
+) -> Result<GitMutationOutcome, String> {
+    state
+        .core
+        .git_apply_hunk_on_host(
+            &host_id,
+            &cwd,
+            patch,
+            reverse.unwrap_or(false),
+            cached.unwrap_or(false),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn git_discard_files(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    paths: Vec<String>,
+    include_untracked: Option<bool>,
+) -> Result<GitMutationOutcome, String> {
+    state
+        .core
+        .git_discard_files_on_host(&host_id, &cwd, paths, include_untracked.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_commit(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    message: String,
+    amend: Option<bool>,
+) -> Result<GitCommitResult, String> {
+    state
+        .core
+        .git_commit_on_host(&host_id, &cwd, message, amend.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_push(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    remote: Option<String>,
+    branch: Option<String>,
+    set_upstream: Option<bool>,
+) -> Result<GitPushResult, String> {
+    state
+        .core
+        .git_push_on_host(
+            &host_id,
+            &cwd,
+            remote,
+            branch,
+            set_upstream.unwrap_or(false),
+        )
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn git_create_pr(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    title: String,
+    body: Option<String>,
+    base: Option<String>,
+    draft: Option<bool>,
+) -> Result<GitCreatePrResult, String> {
+    state
+        .core
+        .git_create_pr_on_host(
+            &host_id,
+            &cwd,
+            title,
+            body.unwrap_or_default(),
+            base,
+            draft.unwrap_or(false),
+        )
+        .await
+}
+
+#[tauri::command]
 fn start_terminal(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -1694,6 +1951,24 @@ fn send_terminal_input(state: State<'_, DesktopAppState>, host_id: String, data:
 }
 
 #[tauri::command]
+fn write_terminal_input(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    terminal_id: String,
+    data: String,
+) -> Result<(), String> {
+    let trimmed_host = host_id.trim();
+    let trimmed_tid = terminal_id.trim();
+    if trimmed_host.is_empty() || trimmed_tid.is_empty() {
+        return Err("host_id and terminal_id are required".into());
+    }
+    state
+        .core
+        .send_terminal_input_by_id(trimmed_host, trimmed_tid, data.into_bytes());
+    Ok(())
+}
+
+#[tauri::command]
 fn send_terminal_input_slot(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -1706,8 +1981,22 @@ fn send_terminal_input_slot(
 }
 
 #[tauri::command]
-fn resize_terminal(state: State<'_, DesktopAppState>, host_id: String, cols: u16, rows: u16) {
-    state.core.resize_terminal(&host_id, cols, rows);
+fn resize_terminal(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cols: u16,
+    rows: u16,
+    terminal_id: Option<String>,
+) {
+    if let Some(tid) = terminal_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        state.core.resize_terminal_by_id(&host_id, tid, cols, rows);
+    } else {
+        state.core.resize_terminal(&host_id, cols, rows);
+    }
 }
 
 #[tauri::command]
@@ -1719,6 +2008,179 @@ fn resize_terminal_slot(
     rows: u16,
 ) {
     state.core.resize_terminal_slot(&host_id, slot, cols, rows);
+}
+
+const DETACHED_TERMINAL_WINDOW_PREFIX: &str = "orbit-terminal-";
+const REATTACH_TERMINAL_EVENT: &str = "orbit://reattach-terminal";
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ReattachTerminalPayload {
+    host_id: String,
+    terminal_id: String,
+    title: String,
+    cwd: String,
+    slot: Option<u8>,
+}
+
+fn fnv1a_64(parts: &[&[u8]]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            hash ^= 0x1f;
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        for &byte in *part {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// Deterministic, bounded, Tauri-safe window label (`orbit-terminal-<slug>-<hash16>`, <= 48 chars).
+fn detached_terminal_window_label(host_id: &str, terminal_id: &str) -> String {
+    let digest = fnv1a_64(&[host_id.trim().as_bytes(), terminal_id.trim().as_bytes()]);
+    let slug: String = terminal_id
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .take(12)
+        .collect();
+    if slug.is_empty() {
+        format!("{DETACHED_TERMINAL_WINDOW_PREFIX}{digest:016x}")
+    } else {
+        format!("{DETACHED_TERMINAL_WINDOW_PREFIX}{slug}-{digest:016x}")
+    }
+}
+
+fn encode_query_component(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn build_detached_terminal_url(
+    host_id: &str,
+    terminal_id: &str,
+    title: &str,
+    cwd: Option<&str>,
+) -> String {
+    let mut url = format!(
+        "index.html?detachedTerminal=1&hostId={}&terminalId={}&title={}",
+        encode_query_component(host_id),
+        encode_query_component(terminal_id),
+        encode_query_component(title),
+    );
+    if let Some(dir) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+        url.push_str("&cwd=");
+        url.push_str(&encode_query_component(dir));
+    }
+    url
+}
+
+#[tauri::command]
+async fn open_detached_terminal_window(
+    app: AppHandle,
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    terminal_id: String,
+    title: String,
+    cwd: Option<String>,
+) -> Result<String, String> {
+    let trimmed_host = host_id.trim();
+    let trimmed_tid = terminal_id.trim();
+    if trimmed_host.is_empty() || trimmed_tid.is_empty() {
+        return Err("host_id and terminal_id are required to detach terminal".into());
+    }
+
+    let clean_title: String = title
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .collect();
+    let effective_title = if clean_title.is_empty() {
+        "Orbit Terminal".to_string()
+    } else {
+        clean_title
+    };
+
+    let _ = state
+        .core
+        .ensure_terminal_attached(trimmed_host, trimmed_tid);
+
+    let label = detached_terminal_window_label(trimmed_host, trimmed_tid);
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.unminimize();
+        let _ = existing.show();
+        existing
+            .set_focus()
+            .map_err(|e| format!("Failed to focus detached terminal window: {e}"))?;
+        return Ok(label);
+    }
+
+    let app_url =
+        build_detached_terminal_url(trimmed_host, trimmed_tid, &effective_title, cwd.as_deref());
+    let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(PathBuf::from(app_url)))
+        .title(&effective_title)
+        .inner_size(860.0, 540.0)
+        .min_inner_size(460.0, 300.0);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
+
+    builder
+        .build()
+        .map_err(|e| format!("Failed to open detached terminal window: {e}"))?;
+
+    Ok(label)
+}
+
+#[tauri::command]
+async fn reattach_detached_terminal(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    terminal_id: String,
+    title: String,
+    cwd: Option<String>,
+) -> Result<(), String> {
+    let trimmed_host = host_id.trim().to_string();
+    let trimmed_tid = terminal_id.trim().to_string();
+    let slot = if !trimmed_host.is_empty() && !trimmed_tid.is_empty() {
+        state
+            .core
+            .ensure_terminal_attached(&trimmed_host, &trimmed_tid)
+    } else {
+        None
+    };
+    let payload = ReattachTerminalPayload {
+        host_id: trimmed_host,
+        terminal_id: trimmed_tid,
+        title: title.trim().to_string(),
+        cwd: cwd.unwrap_or_default().trim().to_string(),
+        slot,
+    };
+    let _ = app.emit_to("main", REATTACH_TERMINAL_EVENT, payload);
+    let _ = tray::focus_main_window_impl(&app);
+    if window.label() != "main" {
+        state.cleanup_window_terminal_subscriptions(window.label());
+        let _ = window.close();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3401,14 +3863,25 @@ pub fn run() {
     core.connect_all_hosts();
 
     tauri::Builder::default()
-        .manage(DesktopAppState { core })
+        .manage(DesktopAppState::new(core))
         .manage(tray::TrayMenuState::default())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event
+                && let Some(app_state) = window.try_state::<DesktopAppState>()
+            {
+                app_state.cleanup_window_terminal_subscriptions(window.label());
+            }
+        })
         .setup(|app| {
+            window_state::setup_main_window_state(app);
             tray::setup_system_tray(app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             subscribe_core_events,
+            subscribe_terminal_binary,
+            unsubscribe_terminal_binary,
+            ensure_terminal_slot,
             get_bridge_info,
             get_fleet_overview,
             search_messages,
@@ -3543,13 +4016,23 @@ pub fn run() {
             answer_question,
             fetch_git_status,
             fetch_git_diff,
+            git_stage_files,
+            git_unstage_files,
+            git_apply_hunk,
+            git_discard_files,
+            git_commit,
+            git_push,
+            git_create_pr,
             start_terminal,
             attach_terminal,
             kill_terminal,
             send_terminal_input,
+            write_terminal_input,
             send_terminal_input_slot,
             resize_terminal,
             resize_terminal_slot,
+            open_detached_terminal_window,
+            reattach_detached_terminal,
             list_ssh_hosts,
             list_external_editors,
             open_in_editor,
@@ -3655,4 +4138,99 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Orbit Tauri desktop application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_terminal_window_label_is_bounded_sanitized_and_deterministic() {
+        let label_a = detached_terminal_window_label("host-1", "term_abc/123");
+        let label_a_again = detached_terminal_window_label("host-1", "term_abc/123");
+        let label_b = detached_terminal_window_label("host-1", "term_abc/456");
+        let label_other_host = detached_terminal_window_label("host-2", "term_abc/123");
+        let label_long = detached_terminal_window_label(
+            &"h".repeat(200),
+            &format!("../../weird space 🚀 {}", "x".repeat(300)),
+        );
+        let label_symbols = detached_terminal_window_label("h1", "///!!!");
+
+        assert_eq!(label_a, label_a_again);
+        assert_ne!(label_a, label_b);
+        assert_ne!(label_a, label_other_host);
+
+        for lbl in [
+            &label_a,
+            &label_b,
+            &label_other_host,
+            &label_long,
+            &label_symbols,
+        ] {
+            assert!(
+                lbl.starts_with(DETACHED_TERMINAL_WINDOW_PREFIX),
+                "unexpected prefix in {lbl}"
+            );
+            assert!(lbl.len() <= 48, "label exceeded 48 chars: {lbl}");
+            assert!(
+                lbl.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "unsafe chars in label: {lbl}"
+            );
+        }
+    }
+
+    #[test]
+    fn detached_terminal_url_encodes_and_roundtrips_components() {
+        let url = build_detached_terminal_url(
+            "host/alpha?1",
+            "term#42&ok",
+            "Build & Test 🚀",
+            Some("/Users/dev/my repo"),
+        );
+        assert!(url.starts_with("index.html?detachedTerminal=1&hostId="));
+        assert!(!url.contains(' '));
+        assert!(!url.contains('#'));
+
+        let encoded = encode_query_component("Build & Test 🚀 /a?b=c");
+        assert_eq!(decode_percent_utf8(&encoded), "Build & Test 🚀 /a?b=c");
+    }
+
+    #[test]
+    fn window_destroyed_cleans_up_only_that_windows_terminal_subscriptions() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let state = DesktopAppState::new(Arc::clone(&core));
+
+        let mut rx_a1 = core.subscribe_terminal_binary("h1", "term-a1");
+        let mut rx_a2 = core.subscribe_terminal_binary("h1", "term-a2");
+        let rx_b1 = core.subscribe_terminal_binary("h1", "term-b1");
+
+        state.register_window_terminal_subscription("orbit-terminal-a", rx_a1.subscription_id());
+        state.register_window_terminal_subscription("orbit-terminal-a", rx_a2.subscription_id());
+        state.register_window_terminal_subscription("orbit-terminal-b", rx_b1.subscription_id());
+        assert_eq!(core.active_terminal_binary_subscriber_count(), 3);
+
+        // Destroying window A unsubscribes & closes only window A's idle subscriptions
+        let cleaned = state.cleanup_window_terminal_subscriptions("orbit-terminal-a");
+        assert_eq!(cleaned, 2);
+        assert_eq!(core.active_terminal_binary_subscriber_count(), 1);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            assert_eq!(rx_a1.recv().await, None);
+            assert_eq!(rx_a2.recv().await, None);
+        });
+
+        // Window B's subscription remains live until unregistered/destroyed
+        state.unregister_window_terminal_subscription(rx_b1.subscription_id());
+        assert_eq!(
+            state.cleanup_window_terminal_subscriptions("orbit-terminal-b"),
+            0
+        );
+        core.unsubscribe_terminal_binary(rx_b1.subscription_id());
+        assert_eq!(core.active_terminal_binary_subscriber_count(), 0);
+    }
 }

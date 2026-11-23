@@ -49,6 +49,58 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 4;
 
+/// Canonical default GitHub repository (`owner/repo`) for Orbit releases, self-updates,
+/// and remote installer bootstrapping.
+///
+/// Forks and organizations can override this in one place at runtime or compile time via
+/// `ORBIT_GITHUB_REPO=owner/repo` (validated by [`configured_github_repo`]).
+pub const DEFAULT_GITHUB_REPO: &str = "danielgaoyy/orbit";
+
+/// Validate a GitHub `owner/repo` slug against strict safe ASCII characters
+/// (`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`), rejecting `.` segments, `..` traversal,
+/// extra slashes, whitespace, or shell/URL injection characters.
+pub fn is_valid_github_repo(raw: &str) -> bool {
+    let Some((owner, repo)) = raw.split_once('/') else {
+        return false;
+    };
+    if owner.is_empty() || repo.is_empty() || owner.len() > 100 || repo.len() > 100 {
+        return false;
+    }
+    if owner == "." || repo == "." || owner.contains("..") || repo.contains("..") {
+        return false;
+    }
+    let is_safe_segment = |part: &str| {
+        part.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    is_safe_segment(owner) && is_safe_segment(repo)
+}
+
+fn resolve_github_repo_from(runtime_env: Option<&str>, compile_env: Option<&str>) -> String {
+    if let Some(val) = runtime_env
+        && is_valid_github_repo(val)
+    {
+        return val.to_string();
+    }
+    if let Some(val) = compile_env
+        && is_valid_github_repo(val)
+    {
+        return val.to_string();
+    }
+    DEFAULT_GITHUB_REPO.to_string()
+}
+
+/// Resolve the configured GitHub repository (`owner/repo`) for release downloads and updates.
+///
+/// Precedence:
+/// 1. Runtime `ORBIT_GITHUB_REPO` environment variable (if strictly valid).
+/// 2. Compile-time `option_env!("ORBIT_GITHUB_REPO")` (if strictly valid).
+/// 3. [`DEFAULT_GITHUB_REPO`] (`"danielgaoyy/orbit"`).
+pub fn configured_github_repo() -> String {
+    let runtime = std::env::var("ORBIT_GITHUB_REPO").ok();
+    resolve_github_repo_from(runtime.as_deref(), option_env!("ORBIT_GITHUB_REPO"))
+}
+
 fn wire_default_true() -> bool {
     true
 }
@@ -561,6 +613,58 @@ pub struct GitStatusSnapshot {
     pub nested_git_repos: Vec<NestedGitRepo>,
 }
 
+/// Result payload returned after committing staged changes in a Git repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommitResult {
+    pub commit_sha: String,
+    pub short_sha: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// Result payload returned after pushing commits to a Git remote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPushResult {
+    pub remote: String,
+    pub branch: String,
+    pub output: String,
+}
+
+/// Result payload returned after creating a Pull Request via GitHub CLI (`gh pr create`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCreatePrResult {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
+    pub title: String,
+}
+
+/// Typed outcome returned by `WireMessage::GitMutationResult`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitMutationOutcome {
+    FilesStaged {
+        paths: Vec<String>,
+        all: bool,
+    },
+    FilesUnstaged {
+        paths: Vec<String>,
+        all: bool,
+    },
+    HunkApplied {
+        reverse: bool,
+        cached: bool,
+    },
+    FilesDiscarded {
+        paths: Vec<String>,
+        include_untracked: bool,
+    },
+    Committed(GitCommitResult),
+    Pushed(GitPushResult),
+    PrCreated(GitCreatePrResult),
+}
+
 /// Synchronized follow-up prompt queued on the host daemon for multi-device visibility & offline drain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedPromptView {
@@ -1035,6 +1139,73 @@ pub enum WireMessage {
         cwd: String,
         path: Option<String>,
         unified_diff: String,
+    },
+    GitStageFiles {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default)]
+        paths: Vec<String>,
+        #[serde(default)]
+        all: bool,
+    },
+    GitUnstageFiles {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default)]
+        paths: Vec<String>,
+        #[serde(default)]
+        all: bool,
+    },
+    GitApplyHunk {
+        request_id: Uuid,
+        cwd: String,
+        patch: String,
+        #[serde(default)]
+        reverse: bool,
+        #[serde(default)]
+        cached: bool,
+    },
+    GitDiscardFiles {
+        request_id: Uuid,
+        cwd: String,
+        paths: Vec<String>,
+        #[serde(default)]
+        include_untracked: bool,
+    },
+    GitCommit {
+        request_id: Uuid,
+        cwd: String,
+        message: String,
+        #[serde(default)]
+        amend: bool,
+    },
+    GitPush {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default)]
+        set_upstream: bool,
+    },
+    GitCreatePr {
+        request_id: Uuid,
+        cwd: String,
+        title: String,
+        #[serde(default)]
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+        #[serde(default)]
+        draft: bool,
+    },
+    GitMutationResult {
+        request_id: Uuid,
+        cwd: String,
+        result: GitMutationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<GitStatusSnapshot>,
     },
     ListWorkspaceFiles {
         request_id: Uuid,
@@ -4670,5 +4841,213 @@ mod tests {
                 serde_json::to_value(&decoded).expect("decoded")
             );
         }
+    }
+
+    #[test]
+    fn git_write_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let sample_status = GitStatusSnapshot {
+            cwd: "/workspace/repo".into(),
+            is_git_repo: true,
+            branch: Some("feat/git-write".into()),
+            upstream: Some("origin/feat/git-write".into()),
+            ahead: 1,
+            behind: 0,
+            files: vec![GitFileEntry {
+                path: "src/lib.rs".into(),
+                status: "M".into(),
+                staged: true,
+                untracked: false,
+            }],
+            nested_git_repos: Vec::new(),
+        };
+        let commit_res = GitCommitResult {
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            short_sha: "0123456".into(),
+            summary: "feat: add safe git write backend".into(),
+            branch: Some("feat/git-write".into()),
+        };
+        let push_res = GitPushResult {
+            remote: "origin".into(),
+            branch: "feat/git-write".into(),
+            output: "To origin\n * [new branch] feat/git-write -> feat/git-write".into(),
+        };
+        let pr_res = GitCreatePrResult {
+            url: "https://github.com/orbit-ai/orbit/pull/42".into(),
+            number: Some(42),
+            title: "Safe Git Write Backend".into(),
+        };
+        let messages = vec![
+            WireMessage::GitStageFiles {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                paths: vec!["src/lib.rs".into()],
+                all: false,
+            },
+            WireMessage::GitUnstageFiles {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                paths: Vec::new(),
+                all: true,
+            },
+            WireMessage::GitApplyHunk {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                patch:
+                    "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n fn a() {}\n+fn b() {}\n"
+                        .into(),
+                reverse: false,
+                cached: true,
+            },
+            WireMessage::GitDiscardFiles {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                paths: vec!["src/lib.rs".into(), "scratch.txt".into()],
+                include_untracked: true,
+            },
+            WireMessage::GitCommit {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                message: "feat: safe git commit\n\nWith $special `chars`".into(),
+                amend: false,
+            },
+            WireMessage::GitPush {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                remote: Some("origin".into()),
+                branch: Some("feat/git-write".into()),
+                set_upstream: true,
+            },
+            WireMessage::GitCreatePr {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                title: "Safe Git Write Backend".into(),
+                body: "## Summary\n- Adds git write RPCs".into(),
+                base: Some("main".into()),
+                draft: true,
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["src/lib.rs".into()],
+                    all: false,
+                },
+                status: Some(sample_status.clone()),
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                result: GitMutationOutcome::Committed(commit_res),
+                status: Some(sample_status.clone()),
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                result: GitMutationOutcome::Pushed(push_res),
+                status: None,
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/workspace/repo".into(),
+                result: GitMutationOutcome::PrCreated(pr_res),
+                status: Some(sample_status),
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode git write wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode git write wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+
+        // Verify internally tagged JSON shape for TypeScript parity
+        let committed_json = serde_json::to_value(GitMutationOutcome::Committed(GitCommitResult {
+            commit_sha: "abc".into(),
+            short_sha: "abc".into(),
+            summary: "hi".into(),
+            branch: Some("main".into()),
+        }))
+        .expect("serialize committed outcome");
+        assert_eq!(committed_json["kind"], "committed");
+        assert_eq!(committed_json["commit_sha"], "abc");
+        assert_eq!(committed_json["branch"], "main");
+    }
+
+    #[test]
+    fn github_repo_validation_accepts_valid_slugs_and_rejects_traversal_or_injection() {
+        for valid in [
+            DEFAULT_GITHUB_REPO,
+            "my-org/orbit",
+            "Org_123/orbit.rs",
+            "a/b",
+            "foo.bar/baz-qux_9",
+        ] {
+            assert!(
+                is_valid_github_repo(valid),
+                "expected valid github repo slug `{valid}`"
+            );
+        }
+
+        let overlong = format!("{}/orbit", "a".repeat(101));
+        for invalid in [
+            "",
+            "orbit",
+            "/orbit",
+            "owner/",
+            "owner/repo/extra",
+            "../orbit",
+            "owner/..",
+            "owner/a..b",
+            "a..b/orbit",
+            "./orbit",
+            "owner/.",
+            "owner/repo?foo=bar",
+            "owner/repo#frag",
+            "owner/repo;id",
+            "owner/repo | sh",
+            "owner/repo\n",
+            " owner/repo",
+            "owner/repo ",
+            "owner/repo\0",
+            "https://github.com/danielgaoyy/orbit",
+            "owner/örbit",
+            overlong.as_str(),
+        ] {
+            assert!(
+                !is_valid_github_repo(invalid),
+                "expected invalid github repo slug `{invalid:?}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn github_repo_resolution_precedence_and_fallback() {
+        assert_eq!(
+            resolve_github_repo_from(Some("fork-org/orbit"), Some("compile-org/orbit")),
+            "fork-org/orbit"
+        );
+        assert_eq!(
+            resolve_github_repo_from(Some("../evil"), Some("compile-org/orbit")),
+            "compile-org/orbit"
+        );
+        assert_eq!(
+            resolve_github_repo_from(None, Some("compile-org/orbit.v2")),
+            "compile-org/orbit.v2"
+        );
+        assert_eq!(
+            resolve_github_repo_from(Some("bad slug"), Some("also/../bad")),
+            DEFAULT_GITHUB_REPO
+        );
+        assert_eq!(resolve_github_repo_from(None, None), DEFAULT_GITHUB_REPO);
+
+        let effective = configured_github_repo();
+        assert!(
+            is_valid_github_repo(&effective),
+            "configured_github_repo() must always return a valid slug, got `{effective}`"
+        );
     }
 }

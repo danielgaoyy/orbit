@@ -19,8 +19,11 @@ import {
   MoreHorizontal,
   Plus,
   RefreshCw,
+  Search,
   Settings,
+  X,
 } from "lucide-react";
+import { fuzzyMatch, splitHighlightSegments } from "@/lib/fuzzy-match";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type AgentCardView,
@@ -145,6 +148,12 @@ export const FleetSidebar = memo(function FleetSidebar() {
     fleetUpdate.phase === "upgrading_hosts" || fleetUpdate.phase === "upgrading_desktop";
 
   const [expandedMoreProjects, setExpandedMoreProjects] = useState<Record<string, boolean>>({});
+  const [filterQuery, setFilterQuery] = useState("");
+  const [isFilterFocused, setIsFilterFocused] = useState(false);
+  const [keyboardFocusedNavId, setKeyboardFocusedNavId] = useState<string | null>(null);
+  const filterInputRef = useRef<HTMLInputElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const navRowRefs = useRef<Map<string, HTMLElement>>(new Map());
   const [renamingThreadKey, setRenamingThreadKey] = useState<string | null>(null);
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [projectRenameDraft, setProjectRenameDraft] = useState("");
@@ -719,6 +728,319 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const hasFilterActive = sidebarThreadFilter === "active_unread";
   const { t } = useI18n();
 
+  const trimmedFilter = filterQuery.trim();
+  const isFilteringThreads = trimmedFilter.length > 0;
+
+  const matchSidebarThread = useCallback(
+    (
+      effectiveTitle: string,
+      projectName: string,
+      host: HostCardView,
+      agent: AgentCardView,
+    ): { matched: boolean; titleIndices?: number[] } => {
+      if (!isFilteringThreads) return { matched: true };
+      const titleHit = fuzzyMatch(trimmedFilter, effectiveTitle);
+      if (titleHit) {
+        return { matched: true, titleIndices: titleHit.indices };
+      }
+      if (fuzzyMatch(trimmedFilter, projectName)) {
+        return { matched: true };
+      }
+      if (agent.handle && fuzzyMatch(trimmedFilter, agent.handle)) {
+        return { matched: true };
+      }
+      if (!singleHostMode && fuzzyMatch(trimmedFilter, host.display_name)) {
+        return { matched: true };
+      }
+      return { matched: false };
+    },
+    [isFilteringThreads, trimmedFilter, singleHostMode],
+  );
+
+  const filteredAttentionItems = useMemo(() => {
+    const out: Array<
+      (typeof attentionItems)[number] & { navId: string; titleIndices?: number[] }
+    > = [];
+    for (const item of attentionItems) {
+      const m = matchSidebarThread(item.effectiveTitle, item.projectName, item.host, item.agent);
+      if (!m.matched) continue;
+      out.push({
+        ...item,
+        navId: `attn:${item.host.host_id}:${item.agent.agent_id}`,
+        titleIndices: m.titleIndices,
+      });
+    }
+    return out;
+  }, [attentionItems, matchSidebarThread]);
+
+  const filteredPinnedEntries = useMemo(() => {
+    const out: Array<
+      (typeof pinnedEntries)[number] & {
+        navId: string;
+        effectiveTitle: string;
+        titleIndices?: number[];
+      }
+    > = [];
+    for (const entry of pinnedEntries) {
+      const effectiveTitle = threadCustomTitles[entry.key] || entry.conv.agent.title;
+      const m = matchSidebarThread(effectiveTitle, entry.projectName, entry.host, entry.conv.agent);
+      if (!m.matched) continue;
+      out.push({
+        ...entry,
+        navId: `pin:${entry.key}`,
+        effectiveTitle,
+        titleIndices: m.titleIndices,
+      });
+    }
+    return out;
+  }, [pinnedEntries, threadCustomTitles, matchSidebarThread]);
+
+  const projectRenderModels = useMemo(() => {
+    const useManualThreadOrder = sidebarProjectSort === "manual";
+    const models: Array<{
+      project: SidebarProjectGroupView;
+      host: HostCardView;
+      visibleConversations: SidebarConversationView[];
+      collapsed: boolean;
+      projThreadScopeKey: string;
+      normProjRoot: string;
+      curatedWorkspaces: Array<
+        NonNullable<SidebarProjectGroupView["workspaces"]>[number] & {
+          threadScopeKey: string;
+          visiblePeers: SidebarConversationView[];
+          wsCollapsed: boolean;
+        }
+      >;
+      unclassifiedConversations: SidebarConversationView[];
+      slicedUnclassified: SidebarConversationView[];
+      selectedUnclassifiedIdx: number;
+      isExpandedAll: boolean;
+      totalUnclassified: number;
+      hiddenCount: number;
+      titleIndicesByThreadKey: Map<string, number[]>;
+    }> = [];
+
+    for (const { project: proj, host, visibleConversations: baseVisible } of displayProjects) {
+      const titleIndicesByThreadKey = new Map<string, number[]>();
+      const visibleConversations = isFilteringThreads
+        ? baseVisible.filter((c) => {
+            const tKey = threadScopeKey(proj.host_id, c.agent.agent_id);
+            const effectiveTitle = threadCustomTitles[tKey] || c.agent.title;
+            const m = matchSidebarThread(effectiveTitle, proj.name, host, c.agent);
+            if (m.matched && m.titleIndices) {
+              titleIndicesByThreadKey.set(tKey, m.titleIndices);
+            }
+            return m.matched;
+          })
+        : baseVisible;
+
+      if (isFilteringThreads && visibleConversations.length === 0) {
+        continue;
+      }
+
+      const collapsed = isFilteringThreads ? false : Boolean(collapsedProjectIds[proj.id]);
+      const visibleIdSet = new Set(visibleConversations.map((c) => c.agent.agent_id));
+      const normProjRoot = normalizeProjectPath(proj.primary_cwd);
+      const projThreadScopeKey = `proj:${proj.host_id}::${normProjRoot}`;
+
+      const curatedWorkspaces = (proj.workspaces ?? [])
+        .filter((ws) => ws.is_curated !== false)
+        .map((ws) => {
+          const wsScopeKey = `ws:${proj.host_id}::${ws.workspace_id}`;
+          const filteredPeers = ws.conversations.filter((c) =>
+            visibleIdSet.has(c.agent.agent_id),
+          );
+          const visiblePeers = useManualThreadOrder
+            ? applyManualThreadOrder(filteredPeers, threadManualOrder[wsScopeKey])
+            : filteredPeers;
+          return {
+            ...ws,
+            threadScopeKey: wsScopeKey,
+            visiblePeers,
+            wsCollapsed: isFilteringThreads
+              ? false
+              : Boolean(collapsedWorkspaceIds[ws.workspace_id]),
+          };
+        })
+        .filter((ws) => !isFilteringThreads || ws.visiblePeers.length > 0);
+
+      const curatedAgentIdSet = new Set<string>();
+      for (const ws of curatedWorkspaces) {
+        for (const c of ws.visiblePeers) {
+          curatedAgentIdSet.add(c.agent.agent_id);
+        }
+      }
+
+      const rawUnclassified =
+        proj.unclassified_conversations !== undefined
+          ? proj.unclassified_conversations.filter((c) => visibleIdSet.has(c.agent.agent_id))
+          : visibleConversations.filter((c) => !curatedAgentIdSet.has(c.agent.agent_id));
+      const unclassifiedConversations = useManualThreadOrder
+        ? applyManualThreadOrder(rawUnclassified, threadManualOrder[projThreadScopeKey])
+        : rawUnclassified;
+
+      const selectedUnclassifiedIdx = unclassifiedConversations.findIndex(
+        (c) =>
+          workspacePanel === "conversation" &&
+          !isDraftNewSession &&
+          selectedHostId === proj.host_id &&
+          selectedAgentId === c.agent.agent_id,
+      );
+      const isExpandedAll =
+        isFilteringThreads ||
+        Boolean(expandedMoreProjects[proj.id]) ||
+        selectedUnclassifiedIdx >= MAX_VISIBLE_CONVERSATIONS_PER_PROJECT;
+      const totalUnclassified = unclassifiedConversations.length;
+      const hiddenCount = Math.max(
+        0,
+        totalUnclassified - MAX_VISIBLE_CONVERSATIONS_PER_PROJECT,
+      );
+      const slicedUnclassified = isExpandedAll
+        ? unclassifiedConversations
+        : unclassifiedConversations.slice(0, MAX_VISIBLE_CONVERSATIONS_PER_PROJECT);
+
+      models.push({
+        project: proj,
+        host,
+        visibleConversations,
+        collapsed,
+        projThreadScopeKey,
+        normProjRoot,
+        curatedWorkspaces,
+        unclassifiedConversations,
+        slicedUnclassified,
+        selectedUnclassifiedIdx,
+        isExpandedAll,
+        totalUnclassified,
+        hiddenCount,
+        titleIndicesByThreadKey,
+      });
+    }
+
+    return models;
+  }, [
+    displayProjects,
+    isFilteringThreads,
+    threadCustomTitles,
+    matchSidebarThread,
+    collapsedProjectIds,
+    collapsedWorkspaceIds,
+    sidebarProjectSort,
+    threadManualOrder,
+    workspacePanel,
+    isDraftNewSession,
+    selectedHostId,
+    selectedAgentId,
+    expandedMoreProjects,
+  ]);
+
+  const visibleNavItems = useMemo(() => {
+    const items: Array<{ navId: string; hostId: string; agentId: string }> = [];
+    for (const item of filteredAttentionItems) {
+      items.push({ navId: item.navId, hostId: item.host.host_id, agentId: item.agent.agent_id });
+    }
+    for (const entry of filteredPinnedEntries) {
+      items.push({
+        navId: entry.navId,
+        hostId: entry.host.host_id,
+        agentId: entry.conv.agent.agent_id,
+      });
+    }
+    for (const model of projectRenderModels) {
+      if (model.collapsed) continue;
+      for (const ws of model.curatedWorkspaces) {
+        if (ws.wsCollapsed) continue;
+        for (const conv of ws.visiblePeers) {
+          items.push({
+            navId: `ws:${ws.workspace_id}:${model.project.host_id}:${conv.agent.agent_id}`,
+            hostId: model.project.host_id,
+            agentId: conv.agent.agent_id,
+          });
+        }
+      }
+      for (const conv of model.slicedUnclassified) {
+        items.push({
+          navId: `proj:${model.project.id}:${model.project.host_id}:${conv.agent.agent_id}`,
+          hostId: model.project.host_id,
+          agentId: conv.agent.agent_id,
+        });
+      }
+    }
+    return items;
+  }, [filteredAttentionItems, filteredPinnedEntries, projectRenderModels]);
+
+  // Keep keyboard highlight synced with live filtered results only while filter input is focused
+  useEffect(() => {
+    if (!isFilterFocused) {
+      setKeyboardFocusedNavId(null);
+      return;
+    }
+    if (!isFilteringThreads) {
+      setKeyboardFocusedNavId((prev) =>
+        prev && visibleNavItems.some((it) => it.navId === prev) ? prev : null,
+      );
+      return;
+    }
+    setKeyboardFocusedNavId((prev) => {
+      if (prev && visibleNavItems.some((it) => it.navId === prev)) return prev;
+      return visibleNavItems[0]?.navId ?? null;
+    });
+  }, [isFilterFocused, isFilteringThreads, trimmedFilter, visibleNavItems]);
+
+  const handleFilterKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (ime.shouldIgnoreKeyDown(e)) return;
+    if (e.key === "ArrowDown") {
+      if (visibleNavItems.length === 0) return;
+      e.preventDefault();
+      const curIdx = keyboardFocusedNavId
+        ? visibleNavItems.findIndex((it) => it.navId === keyboardFocusedNavId)
+        : -1;
+      const next = visibleNavItems[(curIdx + 1) % visibleNavItems.length];
+      setKeyboardFocusedNavId(next.navId);
+      navRowRefs.current.get(next.navId)?.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      if (visibleNavItems.length === 0) return;
+      e.preventDefault();
+      const curIdx = keyboardFocusedNavId
+        ? visibleNavItems.findIndex((it) => it.navId === keyboardFocusedNavId)
+        : -1;
+      const nextIdx = curIdx <= 0 ? visibleNavItems.length - 1 : curIdx - 1;
+      const next = visibleNavItems[nextIdx];
+      setKeyboardFocusedNavId(next.navId);
+      navRowRefs.current.get(next.navId)?.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    if (e.key === "Enter") {
+      const target =
+        (keyboardFocusedNavId
+          ? visibleNavItems.find((it) => it.navId === keyboardFocusedNavId)
+          : undefined) ?? (isFilteringThreads ? visibleNavItems[0] : undefined);
+      if (!target) return;
+      e.preventDefault();
+      setKeyboardFocusedNavId(null);
+      filterInputRef.current?.blur();
+      orbitActions.selectAgent(target.hostId, target.agentId);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      e.nativeEvent.stopImmediatePropagation?.();
+      setFilterQuery("");
+      setKeyboardFocusedNavId(null);
+      filterInputRef.current?.blur();
+      const prev = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (prev && prev.isConnected && prev !== filterInputRef.current) {
+        prev.focus({ preventScroll: true });
+      } else {
+        orbitActions.focusComposer();
+      }
+    }
+  };
+
   return (
     <aside className="bg-sidebar border-border flex h-full w-full flex-col border-r select-none">
       {/* 1. Native Window Titlebar Drag Strip (`40px`; single stationary `[◫]` button lives in shell) */}
@@ -759,56 +1081,129 @@ export const FleetSidebar = memo(function FleetSidebar() {
         </button>
       </div>
 
+      {/* 2B. Sticky Sidebar Quick Filter (keyboard-navigable ↑/↓/Enter/Esc without hijacking Composer) */}
+      <div className="px-2 pb-2">
+        <div className="group/filter flex h-[28px] items-center gap-1.5 rounded-[8px] border border-transparent bg-black/[0.03] px-2 transition-colors focus-within:border-foreground/15 focus-within:bg-background/85 dark:bg-white/[0.04] dark:focus-within:border-white/[0.14] dark:focus-within:bg-white/[0.06]">
+          <Search className="text-muted-foreground/65 group-focus-within/filter:text-foreground/75 h-[13px] w-[13px] shrink-0 stroke-[1.8] transition-colors" />
+          <input
+            ref={filterInputRef}
+            type="text"
+            value={filterQuery}
+            onFocus={(e) => {
+              const prev = e.relatedTarget as HTMLElement | null;
+              if (prev && prev !== filterInputRef.current) {
+                previousFocusRef.current = prev;
+              }
+              setIsFilterFocused(true);
+            }}
+            onBlur={() => {
+              setIsFilterFocused(false);
+              setKeyboardFocusedNavId(null);
+            }}
+            onChange={(e) => setFilterQuery(e.target.value)}
+            {...ime.compositionProps}
+            onKeyDown={handleFilterKeyDown}
+            placeholder={t("sidebar.filterThreadsPlaceholder")}
+            aria-label={t("sidebar.filterThreadsAria")}
+            className="text-foreground placeholder:text-muted-foreground/60 min-w-0 flex-1 bg-transparent text-[12.5px] select-text focus:outline-none"
+          />
+          {isFilteringThreads && (
+            <span className="text-muted-foreground/60 shrink-0 text-[10.5px] tabular-nums">
+              {visibleNavItems.length}
+            </span>
+          )}
+          {filterQuery.length > 0 && (
+            <button
+              type="button"
+              aria-label={t("sidebar.clearThreadFilter")}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                setFilterQuery("");
+                setKeyboardFocusedNavId(null);
+                filterInputRef.current?.focus({ preventScroll: true });
+              }}
+              className="text-muted-foreground/65 hover:text-foreground inline-flex h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
+            >
+              <X className="h-[11.5px] w-[11.5px]" />
+            </button>
+          )}
+        </div>
+      </div>
+
       {/* 3. Scrollable Mission-Control Body */}
       <ScrollArea className="min-h-0 flex-1" viewportClassName="px-2 pb-2">
         <div className="space-y-3.5">
         {/* 3A. Conditional `Needs Attention` Section — Borderless, Restrained, 0px When Clear */}
-        {attentionItems.length > 0 && (
+        {filteredAttentionItems.length > 0 && (
           <div className="orbit-stage-enter space-y-0.5">
             <div className="flex h-[22px] items-center justify-between px-2">
               <span className="text-[11.5px] font-medium text-amber-600 dark:text-amber-400">
                 {t("sidebar.needsAttention")}
               </span>
               <span className="tabular-nums text-[11.5px] font-medium text-amber-600/80 dark:text-amber-400/80">
-                {attentionItems.length}
+                {filteredAttentionItems.length}
               </span>
             </div>
 
-            {attentionItems.map(({ host, agent, projectName, effectiveTitle }) => {
-              const active =
-                workspacePanel === "conversation" &&
-                !isDraftNewSession &&
-                selectedHostId === host.host_id &&
-                selectedAgentId === agent.agent_id;
-              return (
-                <button
-                  key={`attn-${host.host_id}-${agent.agent_id}`}
-                  type="button"
-                  onClick={() => orbitActions.selectAgent(host.host_id, agent.agent_id)}
-                  className={cn(
-                    "flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left text-[13.5px] transition-colors",
-                    active
-                      ? "text-foreground bg-black/[0.06] font-medium dark:bg-white/[0.085]"
-                      : "text-foreground/86 hover:text-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.05]",
-                  )}
-                >
-                  <span className="flex min-w-0 flex-1 items-center gap-2.5">
-                    <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
-                      <span className="h-[6.5px] w-[6.5px] rounded-full bg-amber-500" />
+            {filteredAttentionItems.map(
+              ({ host, agent, projectName, effectiveTitle, navId, titleIndices }) => {
+                const active =
+                  workspacePanel === "conversation" &&
+                  !isDraftNewSession &&
+                  selectedHostId === host.host_id &&
+                  selectedAgentId === agent.agent_id;
+                const isKbFocused = keyboardFocusedNavId === navId;
+                return (
+                  <button
+                    key={`attn-${host.host_id}-${agent.agent_id}`}
+                    ref={(el) => {
+                      if (el) navRowRefs.current.set(navId, el);
+                      else navRowRefs.current.delete(navId);
+                    }}
+                    type="button"
+                    onClick={() => orbitActions.selectAgent(host.host_id, agent.agent_id)}
+                    className={cn(
+                      "flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left text-[13.5px] transition-colors",
+                      active
+                        ? "text-foreground bg-black/[0.06] font-medium dark:bg-white/[0.085]"
+                        : "text-foreground/86 hover:text-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.05]",
+                      isKbFocused &&
+                        "bg-black/[0.055] text-foreground ring-foreground/20 ring-1 ring-inset dark:bg-white/[0.085]",
+                    )}
+                  >
+                    <span className="flex min-w-0 flex-1 items-center gap-2.5">
+                      <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+                        <span className="h-[6.5px] w-[6.5px] rounded-full bg-amber-500" />
+                      </span>
+                      <span className="truncate">
+                        {titleIndices && titleIndices.length > 0
+                          ? splitHighlightSegments(effectiveTitle, titleIndices).map((seg, i) =>
+                              seg.matched ? (
+                                <mark
+                                  key={i}
+                                  className="text-foreground rounded-[2px] bg-foreground/[0.08] font-semibold dark:bg-foreground/[0.15]"
+                                >
+                                  {seg.text}
+                                </mark>
+                              ) : (
+                                <span key={i}>{seg.text}</span>
+                              ),
+                            )
+                          : effectiveTitle}
+                      </span>
                     </span>
-                    <span className="truncate">{effectiveTitle}</span>
-                  </span>
-                  <span className="text-muted-foreground/65 max-w-20 shrink-0 truncate text-[11.5px]">
-                    {projectName}
-                  </span>
-                </button>
-              );
-            })}
+                    <span className="text-muted-foreground/65 max-w-20 shrink-0 truncate text-[11.5px]">
+                      {projectName}
+                    </span>
+                  </button>
+                );
+              },
+            )}
           </div>
         )}
 
         {/* 3B. Conditional `Pinned` Section — 0px When Empty */}
-        {pinnedEntries.length > 0 && (
+        {filteredPinnedEntries.length > 0 && (
           <div className="orbit-stage-enter space-y-0.5">
             <div className="flex h-[22px] items-center px-2">
               <span className="text-muted-foreground text-[12px] font-medium">
@@ -816,37 +1211,44 @@ export const FleetSidebar = memo(function FleetSidebar() {
               </span>
             </div>
 
-            {pinnedEntries.map(({ key, host, projectName, conv }) => {
-              const selected =
-                workspacePanel === "conversation" &&
-                !isDraftNewSession &&
-                selectedHostId === host.host_id &&
-                selectedAgentId === conv.agent.agent_id;
-              const unread = isConvUnread(conv);
-              const effectiveTitle = threadCustomTitles[key] || conv.agent.title;
+            {filteredPinnedEntries.map(
+              ({ key, host, projectName, conv, navId, effectiveTitle, titleIndices }) => {
+                const selected =
+                  workspacePanel === "conversation" &&
+                  !isDraftNewSession &&
+                  selectedHostId === host.host_id &&
+                  selectedAgentId === conv.agent.agent_id;
+                const unread = isConvUnread(conv);
 
-              return (
-                <SidebarConversationRow
-                  key={`pin-${key}`}
-                  threadKey={key}
-                  host={host}
-                  agent={conv.agent}
-                  projectName={projectName}
-                  effectiveTitle={effectiveTitle}
-                  isWorktree={conv.is_worktree}
-                  isPinned={true}
-                  isUnread={unread}
-                  selected={selected}
-                  isChild={false}
-                  nowMs={nowMs}
-                  menuOpen={convMenu?.threadKey === key}
-                  isRenaming={renamingThreadKey === key}
-                  onOpenMenu={handleOpenConvMenu}
-                  onStartRename={handleStartRename}
-                  onFinishRename={handleFinishRename}
-                />
-              );
-            })}
+                return (
+                  <SidebarConversationRow
+                    key={`pin-${key}`}
+                    threadKey={key}
+                    host={host}
+                    agent={conv.agent}
+                    projectName={projectName}
+                    effectiveTitle={effectiveTitle}
+                    isWorktree={conv.is_worktree}
+                    isPinned={true}
+                    isUnread={unread}
+                    selected={selected}
+                    keyboardFocused={keyboardFocusedNavId === navId}
+                    highlightIndices={titleIndices}
+                    isChild={false}
+                    nowMs={nowMs}
+                    menuOpen={convMenu?.threadKey === key}
+                    isRenaming={renamingThreadKey === key}
+                    rowRef={(el) => {
+                      if (el) navRowRefs.current.set(navId, el);
+                      else navRowRefs.current.delete(navId);
+                    }}
+                    onOpenMenu={handleOpenConvMenu}
+                    onStartRename={handleStartRename}
+                    onFinishRename={handleFinishRename}
+                  />
+                );
+              },
+            )}
           </div>
         )}
 
@@ -1066,14 +1468,47 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 <Plus className="h-[14px] w-[14px]" /> {t("sidebar.connectHost")}
               </button>
             </div>
-          ) : displayProjects.length === 0 ? (
+          ) : projectRenderModels.length === 0 ? (
             <div className="text-muted-foreground/75 px-2 py-2 text-[13px]">
-              {hasFilterActive ? t("sidebar.noActiveOrUnread") : t("sidebar.noProjectsYet")}
+              {isFilteringThreads ? (
+                <div className="flex items-center justify-between gap-2">
+                  <span>{t("sidebar.noMatchingThreads")}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFilterQuery("");
+                      setKeyboardFocusedNavId(null);
+                    }}
+                    className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer text-[12px] transition-colors"
+                  >
+                    {t("common.reset")}
+                  </button>
+                </div>
+              ) : hasFilterActive ? (
+                t("sidebar.noActiveOrUnread")
+              ) : (
+                t("sidebar.noProjectsYet")
+              )}
             </div>
           ) : (
             <div className="space-y-0.5">
-              {displayProjects.map(({ project: proj, host, visibleConversations }) => {
-                const collapsed = Boolean(collapsedProjectIds[proj.id]);
+              {projectRenderModels.map(
+                ({
+                  project: proj,
+                  host,
+                  visibleConversations,
+                  collapsed,
+                  projThreadScopeKey,
+                  normProjRoot,
+                  curatedWorkspaces,
+                  unclassifiedConversations,
+                  slicedUnclassified,
+                  selectedUnclassifiedIdx,
+                  isExpandedAll,
+                  totalUnclassified,
+                  hiddenCount,
+                  titleIndicesByThreadKey,
+                }) => {
                 const projMenuOpen = projMenu?.project.id === proj.id;
                 const isDraggingThis = draggingProjectId === proj.id;
                 const showDropBefore =
@@ -1191,65 +1626,6 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   !hasCollapsedRunning &&
                   visibleConversations.some((c) => isConvUnread(c));
 
-                const visibleIdSet = new Set(visibleConversations.map((c) => c.agent.agent_id));
-
-                const normProjRoot = normalizeProjectPath(proj.primary_cwd);
-                const projThreadScopeKey = `proj:${proj.host_id}::${normProjRoot}`;
-                const useManualThreadOrder = sidebarProjectSort === "manual";
-
-                // 1. ALL Curated Mission Workspaces (including empty 0-agent & 1-agent curated workspaces!)
-                const curatedWorkspaces = (proj.workspaces ?? [])
-                  .filter((ws) => ws.is_curated !== false)
-                  .map((ws) => {
-                    const wsScopeKey = `ws:${proj.host_id}::${ws.workspace_id}`;
-                    const filteredPeers = ws.conversations.filter((c) =>
-                      visibleIdSet.has(c.agent.agent_id),
-                    );
-                    return {
-                      ...ws,
-                      threadScopeKey: wsScopeKey,
-                      visiblePeers: useManualThreadOrder
-                        ? applyManualThreadOrder(filteredPeers, threadManualOrder[wsScopeKey])
-                        : filteredPeers,
-                    };
-                  });
-                const curatedAgentIdSet = new Set<string>();
-                for (const ws of curatedWorkspaces) {
-                  for (const c of ws.visiblePeers) {
-                    curatedAgentIdSet.add(c.agent.agent_id);
-                  }
-                }
-
-                // 2. Unfiled conversations
-                const rawUnclassified =
-                  proj.unclassified_conversations !== undefined
-                    ? proj.unclassified_conversations.filter((c) =>
-                        visibleIdSet.has(c.agent.agent_id),
-                      )
-                    : visibleConversations.filter((c) => !curatedAgentIdSet.has(c.agent.agent_id));
-                const unclassifiedConversations = useManualThreadOrder
-                  ? applyManualThreadOrder(rawUnclassified, threadManualOrder[projThreadScopeKey])
-                  : rawUnclassified;
-
-                const selectedUnclassifiedIdx = unclassifiedConversations.findIndex(
-                  (c) =>
-                    workspacePanel === "conversation" &&
-                    !isDraftNewSession &&
-                    selectedHostId === proj.host_id &&
-                    selectedAgentId === c.agent.agent_id,
-                );
-                const isExpandedAll =
-                  Boolean(expandedMoreProjects[proj.id]) ||
-                  selectedUnclassifiedIdx >= MAX_VISIBLE_CONVERSATIONS_PER_PROJECT;
-                const totalUnclassified = unclassifiedConversations.length;
-                const hiddenCount = Math.max(
-                  0,
-                  totalUnclassified - MAX_VISIBLE_CONVERSATIONS_PER_PROJECT,
-                );
-                const slicedUnclassified = isExpandedAll
-                  ? unclassifiedConversations
-                  : unclassifiedConversations.slice(0, MAX_VISIBLE_CONVERSATIONS_PER_PROJECT);
-
                 const organizeEvent =
                   hostDetails[proj.host_id]?.workspace_organize_status?.[normProjRoot] ??
                   hostDetails[proj.host_id]?.workspace_organize_status?.[proj.primary_cwd] ??
@@ -1275,11 +1651,13 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   workspaceId: string | null,
                   agentId: string,
                   title: string,
+                  navId: string,
                 ) => {
                   const refKey = `${proj.host_id}::${agentId}`;
                   return {
                     rowRef: (el: HTMLDivElement | null) => {
                       if (el) {
+                        navRowRefs.current.set(navId, el);
                         threadRowRefs.current.set(refKey, {
                           el,
                           hostId: proj.host_id,
@@ -1289,6 +1667,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                           workspaceId,
                         });
                       } else {
+                        navRowRefs.current.delete(navId);
                         const existing = threadRowRefs.current.get(refKey);
                         if (existing && existing.scopeKey === scopeKey) {
                           threadRowRefs.current.delete(refKey);
@@ -1572,7 +1951,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                           <div className="space-y-0.5 py-0.5">
                             {/* 1. Optional Groups (borderless, lightweight collapsible sections — zero chrome when none exist) */}
                             {curatedWorkspaces.map((ws) => {
-                              const wsCollapsed = Boolean(collapsedWorkspaceIds[ws.workspace_id]);
+                              const wsCollapsed = ws.wsCollapsed;
                               const wsHasRunning = ws.visiblePeers.some((c) =>
                                 isAgentForegroundRunning(c.agent),
                               );
@@ -1765,6 +2144,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                         ws.visiblePeers.map((conv) => {
                                           const ag = conv.agent;
                                           const tKey = threadScopeKey(proj.host_id, ag.agent_id);
+                                          const navId = `ws:${ws.workspace_id}:${proj.host_id}:${ag.agent_id}`;
                                           const selected =
                                             workspacePanel === "conversation" &&
                                             !isDraftNewSession &&
@@ -1786,6 +2166,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                               isPinned={false}
                                               isUnread={unread}
                                               selected={selected}
+                                              keyboardFocused={keyboardFocusedNavId === navId}
+                                              highlightIndices={titleIndicesByThreadKey.get(tKey)}
                                               isChild={false}
                                               peerHandle={ag.handle}
                                               nowMs={nowMs}
@@ -1796,6 +2178,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                                 ws.workspace_id,
                                                 ag.agent_id,
                                                 effectiveTitle,
+                                                navId,
                                               )}
                                               onOpenMenu={handleOpenConvMenu}
                                               onStartRename={handleStartRename}
@@ -1841,6 +2224,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                 {slicedUnclassified.map((conv) => {
                                   const ag = conv.agent;
                                   const tKey = threadScopeKey(proj.host_id, ag.agent_id);
+                                  const navId = `proj:${proj.id}:${proj.host_id}:${ag.agent_id}`;
                                   const selected =
                                     workspacePanel === "conversation" &&
                                     !isDraftNewSession &&
@@ -1861,6 +2245,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                       isPinned={false}
                                       isUnread={unread}
                                       selected={selected}
+                                      keyboardFocused={keyboardFocusedNavId === navId}
+                                      highlightIndices={titleIndicesByThreadKey.get(tKey)}
                                       isChild={Boolean(ag.parent_agent_id)}
                                       nowMs={nowMs}
                                       menuOpen={convMenu?.threadKey === tKey}
@@ -1870,6 +2256,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                         null,
                                         ag.agent_id,
                                         effectiveTitle,
+                                        navId,
                                       )}
                                       onOpenMenu={handleOpenConvMenu}
                                       onStartRename={handleStartRename}

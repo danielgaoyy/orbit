@@ -21,6 +21,7 @@ import {
   type SessionMode,
   semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { normalizeProjectPath } from "@/lib/projects";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -42,14 +43,6 @@ function providerShortName(provider: ProviderKind): string {
 
 type PresetSessionMode = "auto" | "accept_edits" | "plan" | "full_access" | "default";
 
-const PEER_MODE_OPTIONS: readonly SelectOption<PresetSessionMode>[] = [
-  { value: "auto", label: "Auto (Guardian)" },
-  { value: "accept_edits", label: "Accept Edits" },
-  { value: "plan", label: "Plan" },
-  { value: "full_access", label: "Full Access" },
-  { value: "default", label: "Ask" },
-];
-
 function pickAlternateProvider(
   current: ProviderKind,
   available: ProviderKind[],
@@ -68,6 +61,7 @@ function pickAlternateProvider(
  * extra toolbars.
  */
 export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
+  const { t } = useI18n();
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
@@ -195,7 +189,7 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
       }
       setOpen(false);
     } catch (err) {
-      orbitActions.showToast(`Failed to add collaborator: ${String(err)}`);
+      orbitActions.showToast(t("peerStrip.failedAddCollaborator", { error: String(err) }));
     } finally {
       setSpawning(false);
     }
@@ -213,11 +207,11 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <SimpleTooltip label="Collaborate or group">
+      <SimpleTooltip label={t("peerStrip.collaborateOrGroup")}>
         <PopoverTrigger asChild>
           <button
             type="button"
-            aria-label="Collaborate or group"
+            aria-label={t("peerStrip.collaborateOrGroup")}
             className={cn(
               "inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",
               open
@@ -238,7 +232,9 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
         className="w-[276px] space-y-2.5 p-2.5 select-none"
       >
         <div className="space-y-1">
-          <div className="text-muted-foreground px-1 text-[11px] font-medium">Collaborate</div>
+          <div className="text-muted-foreground px-1 text-[11px] font-medium">
+            {t("peerStrip.collaborate")}
+          </div>
           <button
             type="button"
             disabled={spawning}
@@ -246,9 +242,11 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
             className="hover:bg-accent flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors disabled:opacity-50"
           >
             <div className="min-w-0">
-              <div className="text-foreground text-[12.5px] font-medium">Add code reviewer</div>
+              <div className="text-foreground text-[12.5px] font-medium">
+                {t("peerStrip.addCodeReviewer")}
+              </div>
               <div className="text-muted-foreground text-[11px]">
-                {providerShortName(altProvider)} · read-only review in split pane
+                {t("peerStrip.reviewerSplitDesc", { provider: providerShortName(altProvider) })}
               </div>
             </div>
             {spawning ? (
@@ -268,10 +266,10 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
               <div className="min-w-0">
                 <div className="text-foreground flex items-center gap-1.5 text-[12.5px] font-medium">
                   <GitBranch className="h-[12px] w-[12px] opacity-75" />
-                  <span>Parallel worker</span>
+                  <span>{t("peerStrip.parallelWorker")}</span>
                 </div>
                 <div className="text-muted-foreground text-[11px]">
-                  Work in an isolated Git worktree branch
+                  {t("peerStrip.parallelWorkerDesc")}
                 </div>
               </div>
               <Plus className="text-muted-foreground h-[13px] w-[13px] shrink-0" />
@@ -279,8 +277,10 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
           )}
         </div>
 
-        <div className="border-border/70 space-y-1.5 border-t pt-2">
-          <div className="text-muted-foreground px-1 text-[11px] font-medium">Move to group</div>
+        <div className="border-border/60 space-y-1.5 border-t pt-2">
+          <div className="text-muted-foreground px-1 text-[11px] font-medium">
+            {t("peerStrip.moveToGroup")}
+          </div>
           {projectGroups.length > 0 && (
             <div className="max-h-36 space-y-0.5 overflow-y-auto">
               {projectGroups.map((ws) => (
@@ -316,7 +316,7 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
                   void handleCreateGroup();
                 }
               }}
-              placeholder="New group name…"
+              placeholder={t("peerStrip.newGroupNamePlaceholder")}
               className="border-border bg-canvas text-foreground h-[26px] min-w-0 flex-1 rounded-md border px-2 text-[12px] outline-none"
             />
             <button
@@ -325,7 +325,7 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
               onClick={() => void handleCreateGroup()}
               className="bg-foreground text-background inline-flex h-[26px] shrink-0 cursor-pointer items-center rounded-md px-2.5 text-[11.5px] font-medium disabled:opacity-35"
             >
-              Create
+              {t("peerStrip.create")}
             </button>
           </div>
         </div>
@@ -339,6 +339,7 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
  * Group or has multiple collaborating agents (0px for standalone threads and subagent threads).
  */
 export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
+  const { t } = useI18n();
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
@@ -364,7 +365,19 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
   const [spawning, setSpawning] = useState(false);
 
   const peerInputRef = useRef<HTMLInputElement | null>(null);
+  const peerTabsRef = useRef<HTMLDivElement | null>(null);
   const ime = useImeCompositionGuard();
+
+  const peerModeOptions = useMemo<readonly SelectOption<PresetSessionMode>[]>(
+    () => [
+      { value: "auto", label: t("composer.modeAuto") },
+      { value: "accept_edits", label: t("composer.modeAcceptEdits") },
+      { value: "plan", label: t("peerStrip.modePlan") },
+      { value: "full_access", label: t("composer.modeFullAccess") },
+      { value: "default", label: t("composer.modeAlwaysAsk") },
+    ],
+    [t],
+  );
 
   const activeAgent = useMemo(() => {
     if (!hostDetail || !selectedAgentId) return null;
@@ -546,7 +559,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
       }
       setSpawnOpen(false);
     } catch (err) {
-      orbitActions.showToast(`Failed to add collaborator: ${String(err)}`);
+      orbitActions.showToast(t("peerStrip.failedAddCollaborator", { error: String(err) }));
     } finally {
       setSpawning(false);
     }
@@ -576,25 +589,41 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
       setCustomHandle("");
       setSpawnOpen(false);
     } catch (err) {
-      orbitActions.showToast(`Failed to add collaborator: ${String(err)}`);
+      orbitActions.showToast(t("peerStrip.failedAddCollaborator", { error: String(err) }));
     } finally {
       setSpawning(false);
     }
   };
 
+  const notesTooltip =
+    boardRev > 0
+      ? t("peerStrip.notesTooltipRev", { rev: boardRev })
+      : t("peerStrip.notes");
+  const latestConflict =
+    recentConflicts.length > 0 ? recentConflicts[recentConflicts.length - 1] : null;
+  const conflictFileSuffix = latestConflict?.file_path
+    ? ` · ${latestConflict.file_path.split("/").pop()}`
+    : "";
+
   return (
-    <div className="bg-canvas/95 z-10 flex h-[32px] shrink-0 items-center justify-between gap-2 border-b border-black/[0.055] px-3 select-none dark:border-white/[0.06]">
-      {/* Left: Quiet Group Switcher + Compact Sibling Thread Tabs */}
-      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="@container bg-canvas z-10 flex h-[30px] min-w-0 shrink-0 items-center justify-between gap-1.5 overflow-hidden px-2.5 shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.05)] select-none dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.055)] @[520px]:gap-2 @[520px]:px-3">
+      {/* Left: Quiet Group Switcher + Scrollable Sibling Thread Tabs + Pinned Add Button */}
+      <div className="flex min-w-0 flex-1 items-center gap-1.5">
         <Popover open={groupSwitcherOpen} onOpenChange={setGroupSwitcherOpen}>
           <PopoverTrigger asChild>
             <button
               type="button"
-              title={workspace?.title ? `Group: ${workspace.title}` : "Manage group"}
-              className="text-foreground/78 hover:text-foreground inline-flex h-[22px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[6px] px-1.5 text-[12px] font-medium transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+              title={
+                workspace?.title
+                  ? t("peerStrip.groupTitleTooltip", { title: workspace.title })
+                  : t("peerStrip.manageGroup")
+              }
+              className="text-foreground/78 hover:text-foreground inline-flex h-[22px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-1.5 text-[12px] font-medium transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06] @[480px]:gap-1.5"
             >
               <Layers className="text-muted-foreground h-[12px] w-[12px] shrink-0 stroke-[1.75]" />
-              <span className="max-w-36 truncate">{workspace?.title || "Group"}</span>
+              <span className="max-w-[72px] truncate @[480px]:max-w-[112px] @[640px]:max-w-[144px]">
+                {workspace?.title || t("peerStrip.group")}
+              </span>
               <ChevronDown className="h-[11px] w-[11px] shrink-0 opacity-50" />
             </button>
           </PopoverTrigger>
@@ -607,9 +636,9 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
             className="w-[280px] space-y-2.5 p-2.5 select-none"
           >
             {workspace && (
-              <div className="border-border/70 space-y-1.5 border-b pb-2.5">
+              <div className="border-border/60 space-y-1.5 border-b pb-2.5">
                 <div className="text-muted-foreground flex items-center justify-between text-[11px] font-medium">
-                  <span>Current group</span>
+                  <span>{t("peerStrip.currentGroup")}</span>
                   <button
                     type="button"
                     onClick={() => {
@@ -623,7 +652,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     className="text-foreground/75 hover:text-foreground inline-flex cursor-pointer items-center gap-1 text-[11px]"
                   >
                     <FileText className="h-[11px] w-[11px]" />
-                    <span>Notes</span>
+                    <span>{t("peerStrip.notes")}</span>
                   </button>
                 </div>
                 <div className="flex items-center gap-1.5">
@@ -638,7 +667,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                         void handleRenameCurrentGroup();
                       }
                     }}
-                    placeholder="Group name"
+                    placeholder={t("peerStrip.groupNameInputPlaceholder")}
                     className="border-border bg-canvas text-foreground h-[26px] min-w-0 flex-1 rounded-md border px-2 text-[12px] outline-none"
                   />
                   <button
@@ -647,7 +676,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     onClick={() => void handleRenameCurrentGroup()}
                     className="bg-foreground text-background inline-flex h-[26px] shrink-0 cursor-pointer items-center rounded-md px-2 text-[11.5px] font-medium disabled:opacity-35"
                   >
-                    Save
+                    {t("peerStrip.save")}
                   </button>
                 </div>
               </div>
@@ -656,7 +685,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
             {projectGroups.length > 1 && (
               <div className="space-y-1">
                 <div className="text-muted-foreground px-0.5 text-[11px] font-medium">
-                  Move thread to
+                  {t("peerStrip.moveThreadTo")}
                 </div>
                 <div className="max-h-36 space-y-0.5 overflow-y-auto">
                   {projectGroups.map((ws) => {
@@ -705,10 +734,10 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
               </div>
             )}
 
-            <div className="border-border/70 space-y-1.5 border-t pt-2">
+            <div className="border-border/60 space-y-1.5 border-t pt-2">
               <div className="text-muted-foreground flex items-center gap-1 text-[11px] font-medium">
                 <FolderPlus className="h-[11.5px] w-[11.5px]" />
-                <span>New group</span>
+                <span>{t("peerStrip.newGroup")}</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <input
@@ -722,7 +751,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       void handleCreateAndMoveGroup();
                     }
                   }}
-                  placeholder="Group name…"
+                  placeholder={t("peerStrip.groupNamePlaceholder")}
                   className="border-border bg-canvas text-foreground h-[26px] min-w-0 flex-1 rounded-md border px-2 text-[12px] outline-none"
                 />
                 <button
@@ -731,13 +760,13 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   onClick={() => void handleCreateAndMoveGroup()}
                   className="bg-foreground text-background inline-flex h-[26px] shrink-0 cursor-pointer items-center rounded-md px-2 text-[11.5px] font-medium disabled:opacity-35"
                 >
-                  Create
+                  {t("peerStrip.create")}
                 </button>
               </div>
             </div>
 
             {isCuratedGroup && (
-              <div className="border-border/70 border-t pt-1.5">
+              <div className="border-border/60 border-t pt-1.5">
                 <button
                   type="button"
                   onClick={() => {
@@ -752,7 +781,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   className="text-muted-foreground hover:text-foreground hover:bg-accent flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-left text-[12px] transition-colors"
                 >
                   <X className="h-[12.5px] w-[12.5px]" />
-                  <span>Remove from group</span>
+                  <span>{t("peerStrip.removeFromGroup")}</span>
                 </button>
               </div>
             )}
@@ -761,8 +790,18 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
 
         <span className="h-3 w-[1px] shrink-0 bg-black/[0.08] dark:bg-white/[0.10]" />
 
-        {/* Segmented Sibling Thread Switcher */}
-        <div className="flex min-w-0 items-center gap-0.5">
+        {/* Segmented Sibling Thread Switcher (horizontally scrollable without clipping `+`) */}
+        <div
+          ref={peerTabsRef}
+          onWheel={(e) => {
+            const el = peerTabsRef.current;
+            if (!el || el.scrollWidth <= el.clientWidth) return;
+            if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+              el.scrollLeft += e.deltaY;
+            }
+          }}
+          className="flex min-w-0 items-center gap-0.5 overflow-x-auto pr-2 [mask-image:linear-gradient(to_right,black_calc(100%-10px),transparent)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        >
           {peers.map((peer) => {
             const isActive = peer.agent_id === activeAgent.agent_id;
             const tKey = threadScopeKey(selectedHostId, peer.agent_id);
@@ -772,17 +811,17 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
               `${label} (${providerShortName(peer.provider)}${peer.model ? ` · ${peer.model}` : ""})`,
               peer.task_summary || peer.title,
               isActive
-                ? "Double-click to rename"
-                : `Click to switch · ${isMacDesktop() ? "⌘" : "Ctrl"}+click to split`,
+                ? t("peerStrip.doubleClickToRename")
+                : t("peerStrip.clickToSwitchOrSplit", { mod: isMacDesktop() ? "⌘" : "Ctrl" }),
             ];
 
             return (
               <div
                 key={peer.agent_id}
                 className={cn(
-                  "group/peer inline-flex h-[22px] shrink-0 items-center gap-1 rounded-[6px] px-2 text-[12px] transition-colors",
+                  "group/peer inline-flex h-[22px] shrink-0 items-center gap-1 rounded-[6px] px-1.5 text-[12px] transition-colors @[520px]:px-2",
                   isActive
-                    ? "bg-black/[0.06] text-foreground font-medium dark:bg-white/[0.09]"
+                    ? "bg-black/[0.055] text-foreground font-medium dark:bg-white/[0.085]"
                     : "text-muted-foreground hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.06]",
                 )}
               >
@@ -843,18 +882,19 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                           className="h-[11.5px] w-[11.5px] shrink-0 opacity-70"
                         />
                       )}
-                      <span className="max-w-32 truncate">{label}</span>
+                      <span className="max-w-[96px] truncate @[520px]:max-w-[132px]">{label}</span>
                       {peer.worktree_branch && (
-                        <span className="text-muted-foreground/70 hidden max-w-20 items-center gap-0.5 truncate font-mono text-[10.5px] sm:inline-flex">
+                        <span className="text-muted-foreground/70 hidden max-w-20 items-center gap-0.5 truncate font-mono text-[10.5px] @[640px]:inline-flex">
                           <GitBranch className="h-[9.5px] w-[9.5px] shrink-0" />
                           <span className="truncate">{peer.worktree_branch}</span>
                         </span>
                       )}
                     </button>
 
-                    <SimpleTooltip label="Rename">
+                    <SimpleTooltip label={t("common.rename")}>
                       <button
                         type="button"
+                        aria-label={t("common.rename")}
                         onClick={(e) => {
                           e.stopPropagation();
                           setPeerHandleDraft(label);
@@ -867,9 +907,10 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     </SimpleTooltip>
 
                     {!isActive && (
-                      <SimpleTooltip label={`Open ${label} side-by-side`}>
+                      <SimpleTooltip label={t("peerStrip.openSideBySide", { label })}>
                         <button
                           type="button"
+                          aria-label={t("peerStrip.openSideBySide", { label })}
                           onClick={(e) => {
                             e.stopPropagation();
                             orbitActions.openPeerSplitTab(selectedHostId, peer.agent_id, label);
@@ -885,151 +926,162 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
               </div>
             );
           })}
+        </div>
 
-          <Popover open={spawnOpen} onOpenChange={setSpawnOpen}>
-            <SimpleTooltip label="Add collaborator">
-              <PopoverTrigger asChild>
-                <button
-                  type="button"
-                  aria-label="Add collaborator"
-                  className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-                >
-                  <Plus className="h-[12.5px] w-[12.5px] stroke-[2]" />
-                </button>
-              </PopoverTrigger>
-            </SimpleTooltip>
-            <PopoverContent
-              align="start"
-              side="bottom"
-              sideOffset={6}
-              finalFocus={false}
-              className="w-[312px] space-y-3 p-3 select-none"
-            >
-              <div className="flex items-center justify-between">
-                <span className="text-foreground flex items-center gap-1.5 text-[12.5px] font-medium">
-                  <Users className="text-muted-foreground h-[13.5px] w-[13.5px]" />
-                  <span>Add collaborator</span>
-                </span>
-                <span className="text-muted-foreground text-[11px]">{peers.length} active</span>
-              </div>
+        {/* Pinned Add Collaborator Button (never clipped by scrolling peer tabs) */}
+        <Popover open={spawnOpen} onOpenChange={setSpawnOpen}>
+          <SimpleTooltip label={t("peerStrip.addCollaborator")}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                aria-label={t("peerStrip.addCollaborator")}
+                className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+              >
+                <Plus className="h-[12.5px] w-[12.5px] stroke-[2]" />
+              </button>
+            </PopoverTrigger>
+          </SimpleTooltip>
+          <PopoverContent
+            align="start"
+            side="bottom"
+            sideOffset={6}
+            finalFocus={false}
+            className="w-[312px] space-y-2.5 p-2.5 select-none"
+          >
+            <div className="flex items-center justify-between px-1">
+              <span className="text-foreground flex items-center gap-1.5 text-[12.5px] font-medium">
+                <Users className="text-muted-foreground h-[13.5px] w-[13.5px]" />
+                <span>{t("peerStrip.addCollaborator")}</span>
+              </span>
+              <span className="text-muted-foreground text-[11px] tabular-nums">
+                {t("peerStrip.activeCount", { count: peers.length })}
+              </span>
+            </div>
 
-              <div className="grid grid-cols-1 gap-1.5">
+            <div className="grid grid-cols-1 gap-0.5">
+              <button
+                type="button"
+                disabled={spawning}
+                onClick={() => void launchPresetPeer("reviewer")}
+                className="hover:bg-accent flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors disabled:opacity-50"
+              >
+                <div className="min-w-0">
+                  <div className="text-foreground text-[12.5px] font-medium">
+                    {t("peerStrip.codeReviewerTitle")}
+                  </div>
+                  <div className="text-muted-foreground text-[11px]">
+                    {t("peerStrip.reviewerNotesDesc", {
+                      provider: providerShortName(
+                        pickAlternateProvider(activeAgent.provider, availableProviders),
+                      ),
+                    })}
+                  </div>
+                </div>
+                <Plus className="text-muted-foreground h-[13px] w-[13px] shrink-0" />
+              </button>
+
+              {canWorktree && (
                 <button
                   type="button"
                   disabled={spawning}
-                  onClick={() => void launchPresetPeer("reviewer")}
-                  className="border-border hover:bg-accent flex cursor-pointer items-center justify-between rounded-lg border px-2.5 py-1.5 text-left transition-colors"
+                  onClick={() => void launchPresetPeer("worktree_worker")}
+                  className="hover:bg-accent flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors disabled:opacity-50"
                 >
                   <div className="min-w-0">
-                    <div className="text-foreground text-[12.5px] font-medium">Code Reviewer</div>
+                    <div className="text-foreground flex items-center gap-1.5 text-[12.5px] font-medium">
+                      <GitBranch className="h-[12px] w-[12px] opacity-75" />
+                      <span>{t("peerStrip.parallelWorkerTitle")}</span>
+                    </div>
                     <div className="text-muted-foreground text-[11px]">
-                      {providerShortName(
-                        pickAlternateProvider(activeAgent.provider, availableProviders),
-                      )}{" "}
-                      · read-only review, writes findings to notes
+                      {t("peerStrip.parallelWorkerGroupDesc")}
                     </div>
                   </div>
+                  <Plus className="text-muted-foreground h-[13px] w-[13px] shrink-0" />
                 </button>
+              )}
+            </div>
 
-                {canWorktree && (
-                  <button
-                    type="button"
-                    disabled={spawning}
-                    onClick={() => void launchPresetPeer("worktree_worker")}
-                    className="border-border hover:bg-accent flex cursor-pointer items-center justify-between rounded-lg border px-2.5 py-1.5 text-left transition-colors"
-                  >
-                    <div className="min-w-0">
-                      <div className="text-foreground flex items-center gap-1.5 text-[12.5px] font-medium">
-                        <GitBranch className="h-[12px] w-[12px]" />
-                        <span>Parallel Worker</span>
-                      </div>
-                      <div className="text-muted-foreground text-[11px]">
-                        Isolated Git worktree branch in the same group
-                      </div>
-                    </div>
-                  </button>
-                )}
+            <div className="border-border/60 space-y-2 border-t pt-2.5">
+              <div className="text-muted-foreground px-0.5 text-[11px] font-medium">
+                {t("peerStrip.customTask")}
               </div>
-
-              <div className="border-border/70 space-y-2 border-t pt-2.5">
-                <div className="text-muted-foreground text-[11px] font-medium">Custom task</div>
-                <div className="grid grid-cols-2 gap-1.5">
-                  <input
-                    value={customHandle}
-                    onChange={(e) => setCustomHandle(e.target.value)}
-                    placeholder="Label (e.g. backend)"
-                    className="border-border bg-canvas text-foreground rounded-md border px-2 py-1 text-[12px] outline-none"
-                  />
-                  <Select<ProviderKind>
-                    size="compact"
-                    align="end"
-                    ariaLabel="Peer provider"
-                    value={effectiveCustomProvider}
-                    options={availableProviders.map((p) => ({
-                      value: p,
-                      label: providerShortName(p),
-                    }))}
-                    triggerClassName="h-[28px] w-full bg-canvas text-[12px]"
-                    menuClassName="min-w-[144px]"
-                    onChange={(provider) => setCustomProvider(provider)}
-                  />
-                </div>
-                <textarea
-                  rows={2}
-                  value={customPrompt}
-                  onChange={(e) => setCustomPrompt(e.target.value)}
-                  placeholder="Describe the task. It will share context and notes with this group…"
-                  className="border-border bg-canvas text-foreground w-full resize-none rounded-md border p-2 text-[12px] outline-none"
+              <div className="grid grid-cols-2 gap-1.5">
+                <input
+                  value={customHandle}
+                  onChange={(e) => setCustomHandle(e.target.value)}
+                  placeholder={t("peerStrip.labelPlaceholder")}
+                  className="border-border bg-canvas text-foreground rounded-md border px-2 py-1 text-[12px] outline-none"
                 />
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <Select<PresetSessionMode>
-                      size="compact"
-                      align="start"
-                      ariaLabel="Peer permission mode"
-                      value={typeof customMode === "string" ? customMode : "accept_edits"}
-                      options={PEER_MODE_OPTIONS}
-                      triggerClassName="h-[25px] bg-canvas"
-                      menuClassName="min-w-[152px]"
-                      onChange={(mode) => setCustomMode(mode)}
-                    />
-                    {canWorktree && (
-                      <label className="text-muted-foreground inline-flex cursor-pointer items-center gap-1.5 text-[11.5px] select-none">
-                        <Checkbox
-                          size="sm"
-                          checked={customWorktree}
-                          onCheckedChange={setCustomWorktree}
-                        />
-                        <span>Worktree</span>
-                      </label>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    disabled={!customPrompt.trim() || spawning}
-                    onClick={() => void launchCustomPeer()}
-                    className="bg-foreground text-background inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2.5 text-[12px] font-medium disabled:opacity-40"
-                  >
-                    {spawning ? (
-                      <Loader2 className="h-[12px] w-[12px] animate-spin" />
-                    ) : (
-                      <Plus className="h-[12px] w-[12px]" />
-                    )}
-                    <span>Start</span>
-                  </button>
-                </div>
+                <Select<ProviderKind>
+                  size="compact"
+                  align="end"
+                  ariaLabel={t("peerStrip.peerProviderAria")}
+                  value={effectiveCustomProvider}
+                  options={availableProviders.map((p) => ({
+                    value: p,
+                    label: providerShortName(p),
+                  }))}
+                  triggerClassName="h-[28px] w-full bg-canvas text-[12px]"
+                  menuClassName="min-w-[144px]"
+                  onChange={(provider) => setCustomProvider(provider)}
+                />
               </div>
-            </PopoverContent>
-          </Popover>
-        </div>
+              <textarea
+                rows={2}
+                value={customPrompt}
+                onChange={(e) => setCustomPrompt(e.target.value)}
+                placeholder={t("peerStrip.customPromptPlaceholder")}
+                className="border-border bg-canvas text-foreground w-full resize-none rounded-md border p-2 text-[12px] outline-none"
+              />
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Select<PresetSessionMode>
+                    size="compact"
+                    align="start"
+                    ariaLabel={t("peerStrip.peerPermissionModeAria")}
+                    value={typeof customMode === "string" ? customMode : "accept_edits"}
+                    options={peerModeOptions}
+                    triggerClassName="h-[25px] bg-canvas"
+                    menuClassName="min-w-[152px]"
+                    onChange={(mode) => setCustomMode(mode)}
+                  />
+                  {canWorktree && (
+                    <label className="text-muted-foreground inline-flex cursor-pointer items-center gap-1.5 text-[11.5px] select-none">
+                      <Checkbox
+                        size="sm"
+                        checked={customWorktree}
+                        onCheckedChange={setCustomWorktree}
+                      />
+                      <span>{t("peerStrip.worktree")}</span>
+                    </label>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  disabled={!customPrompt.trim() || spawning}
+                  onClick={() => void launchCustomPeer()}
+                  className="bg-foreground text-background inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2.5 text-[12px] font-medium disabled:opacity-40"
+                >
+                  {spawning ? (
+                    <Loader2 className="h-[12px] w-[12px] animate-spin" />
+                  ) : (
+                    <Plus className="h-[12px] w-[12px]" />
+                  )}
+                  <span>{t("common.start")}</span>
+                </button>
+              </div>
+            </div>
+          </PopoverContent>
+        </Popover>
       </div>
 
-      {/* Right: Conditional Conflict Pill + Quiet Notes Link */}
+      {/* Right: Conditional Conflict Indicator + Quiet Notes Link */}
       <div className="flex shrink-0 items-center gap-1">
-        {recentConflicts.length > 0 && (
-          <SimpleTooltip label={recentConflicts[recentConflicts.length - 1].summary}>
+        {latestConflict && (
+          <SimpleTooltip label={latestConflict.summary}>
             <button
               type="button"
+              aria-label={latestConflict.summary}
               onClick={() =>
                 orbitActions.openWorkspaceBoardTab(
                   selectedHostId,
@@ -1037,36 +1089,39 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   workspace?.title,
                 )
               }
-              className="inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/[0.08] px-2 text-[11px] font-medium text-amber-700 transition-colors hover:bg-amber-500/15 dark:text-amber-300"
+              className="inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center gap-1 rounded-full bg-amber-500/[0.1] px-0 text-[11px] font-medium text-amber-700 transition-colors hover:bg-amber-500/[0.16] dark:text-amber-300 @[520px]:w-auto @[520px]:px-2"
             >
               <AlertTriangle className="h-[11px] w-[11px] shrink-0" />
-              <span className="max-w-28 truncate">
-                Conflict
-                {recentConflicts[recentConflicts.length - 1].file_path
-                  ? ` · ${recentConflicts[recentConflicts.length - 1].file_path?.split("/").pop()}`
-                  : ""}
+              <span className="hidden max-w-28 truncate @[520px]:inline">
+                {t("peerStrip.conflict")}
+                {conflictFileSuffix}
               </span>
             </button>
           </SimpleTooltip>
         )}
 
-        <button
-          type="button"
-          onClick={() =>
-            orbitActions.openWorkspaceBoardTab(
-              selectedHostId,
-              activeAgent.workspace_id,
-              workspace?.title,
-            )
-          }
-          className="text-muted-foreground hover:text-foreground inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-[6px] px-1.5 text-[11.5px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-        >
-          <FileText className="h-[12px] w-[12px] stroke-[1.75]" />
-          <span>Notes</span>
-          {boardRev > 0 && (
-            <span className="text-muted-foreground/65 font-mono text-[10.5px]">v{boardRev}</span>
-          )}
-        </button>
+        <SimpleTooltip label={notesTooltip}>
+          <button
+            type="button"
+            aria-label={notesTooltip}
+            onClick={() =>
+              orbitActions.openWorkspaceBoardTab(
+                selectedHostId,
+                activeAgent.workspace_id,
+                workspace?.title,
+              )
+            }
+            className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center gap-1 rounded-[6px] px-0 text-[11.5px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06] @[480px]:w-auto @[480px]:px-1.5"
+          >
+            <FileText className="h-[12px] w-[12px] shrink-0 stroke-[1.75]" />
+            <span className="hidden @[480px]:inline">{t("peerStrip.notes")}</span>
+            {boardRev > 0 && (
+              <span className="text-muted-foreground/65 hidden font-mono text-[10.5px] @[560px]:inline">
+                v{boardRev}
+              </span>
+            )}
+          </button>
+        </SimpleTooltip>
       </div>
     </div>
   );

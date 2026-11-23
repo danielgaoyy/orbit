@@ -2,10 +2,27 @@
 # Universal 1-line Orbit CLI / Daemon / Relay installer for Linux & macOS.
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh
+# Optional overrides:
+#   ORBIT_GITHUB_REPO=owner/repo  (default: danielgaoyy/orbit)
+#   ORBIT_VERSION=0.9.5           (default: latest GitHub release)
 
 set -eu
 
-REPO="${ORBIT_REPO:-danielgaoyy/orbit}"
+REPO="${ORBIT_GITHUB_REPO:-${ORBIT_REPO:-danielgaoyy/orbit}}"
+NL='
+'
+CR="$(printf '\r')"
+case "${REPO}" in
+  *"${NL}"*|*"${CR}"*|*..*|./*|*/.|*/*/*)
+    echo "Error: invalid Orbit GitHub repository '${REPO}' (expected owner/repo)" >&2
+    exit 1
+    ;;
+esac
+if ! printf '%s\n' "${REPO}" | LC_ALL=C grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+  echo "Error: invalid Orbit GitHub repository '${REPO}' (expected owner/repo)" >&2
+  exit 1
+fi
+
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
@@ -37,9 +54,6 @@ else
   TAG="${RESOLVED_CLEAN##*/}"
 fi
 
-NL='
-'
-CR="$(printf '\r')"
 case "${TAG}" in
   *"${NL}"*|*"${CR}"*|*..*|*/*)
     echo "Error: invalid Orbit release tag '${TAG}'" >&2

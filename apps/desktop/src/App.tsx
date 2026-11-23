@@ -1,8 +1,12 @@
-import { memo, useEffect, useRef, useState } from "react";
-import { PanelLeft, PanelRight } from "lucide-react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { ExternalLink, PanelLeft, PanelRight } from "lucide-react";
 import { resyncAllAmbientAnimations } from "@/lib/animation-sync";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/command/command-palette";
+import {
+  DetachedTerminalWindow,
+  parseDetachedTerminalParams,
+} from "@/components/detached-terminal-window";
 import { MarkdownThemeProvider } from "@/components/markdown-blocks";
 import { CopyCodeBlocksModal } from "@/components/modals/copy-code-blocks-modal";
 import { ExportTranscriptModal } from "@/components/modals/export-transcript-modal";
@@ -30,15 +34,34 @@ import {
   useGlobalErgonomicKeybindings,
 } from "@/lib/keybindings";
 import { orbitIpc, isMacDesktop } from "@/lib/orbit-ipc";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { type ToastAction, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 export default function App() {
+  const detachedTerminal = useMemo(
+    () =>
+      typeof window !== "undefined" ? parseDetachedTerminalParams(window.location.search) : null,
+    [],
+  );
+
+  if (detachedTerminal) {
+    return (
+      <TooltipProvider>
+        <DetachedTerminalWindow {...detachedTerminal} />
+      </TooltipProvider>
+    );
+  }
+
+  return <MainDesktopApp />;
+}
+
+function MainDesktopApp() {
   const isDarkTheme = useOrbitSelector((s) => s.resolvedTheme === "dark");
   const activeView = useOrbitSelector((s) => s.activeView);
   const settingsSection = useOrbitSelector((s) => s.settingsSection);
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
   const toastNotice = useOrbitSelector((s) => s.toastNotice);
+  const toastAction = useOrbitSelector((s) => s.toastAction);
   const lastArchivedUndo = useOrbitSelector((s) => s.lastArchivedUndo);
 
   // Presence state for smooth Settings modal enter & exit
@@ -48,12 +71,48 @@ export default function App() {
 
   // Presence state for smooth Toast enter & exit
   const [renderedToast, setRenderedToast] = useState<string | null>(toastNotice);
+  const [renderedToastAction, setRenderedToastAction] = useState<ToastAction | null>(toastAction);
   const [toastExiting, setToastExiting] = useState(false);
 
   useGlobalErgonomicKeybindings();
 
   useEffect(() => {
     void orbitActions.init();
+  }, []);
+
+  // Re-attach terminal tab into Side Panel when requested from a floating detached terminal window
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    void orbitIpc
+      .onReattachTerminal(({ host_id, terminal_id, title, cwd, slot }) => {
+        if (!host_id || !terminal_id) return;
+        const snap = orbitActions.getSnapshot();
+        const detail = snap.hostDetails[host_id];
+        const termMeta = detail?.terminals.find((t) => t.terminal_id === terminal_id);
+        const resolvedCwd = cwd || termMeta?.cwd || snap.selectedWorkspaceCwd || "~";
+        const resolvedTitle = title || termMeta?.title || "shell";
+        orbitActions.closeSettings();
+        void orbitActions.attachExistingTerminal(
+          host_id,
+          terminal_id,
+          resolvedCwd,
+          resolvedTitle,
+          slot ?? null,
+        );
+      })
+      .then((fn) => {
+        if (!active) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, []);
 
   // Listen to native menu bar / system tray "New Conversation" action
@@ -190,6 +249,7 @@ export default function App() {
   useEffect(() => {
     if (toastNotice) {
       setRenderedToast(toastNotice);
+      setRenderedToastAction(toastAction);
       setToastExiting(false);
       return;
     }
@@ -197,11 +257,12 @@ export default function App() {
       setToastExiting(true);
       const id = window.setTimeout(() => {
         setRenderedToast(null);
+        setRenderedToastAction(null);
         setToastExiting(false);
       }, 170);
       return () => window.clearTimeout(id);
     }
-  }, [toastNotice, renderedToast]);
+  }, [toastNotice, toastAction, renderedToast]);
 
   return (
     <TooltipProvider>
@@ -232,16 +293,33 @@ export default function App() {
         <OnboardingGuide />
         <MediaPreviewModal />
 
-        {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit & Undo Archive */}
+        {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit, Actions & Undo Archive */}
         {renderedToast && (
           <div
             className={cn(
               "bg-elevated text-foreground floating-surface fixed right-4 bottom-4 z-50 flex items-center gap-2.5 rounded-xl border border-black/[0.08] px-3.5 py-2 text-[13px] dark:border-white/[0.10]",
-              lastArchivedUndo ? "pointer-events-auto" : "pointer-events-none",
+              lastArchivedUndo || renderedToastAction ? "pointer-events-auto" : "pointer-events-none",
               toastExiting ? "orbit-toast-exit" : "orbit-toast-enter",
             )}
           >
             <span>{renderedToast}</span>
+            {renderedToastAction && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (renderedToastAction.url) {
+                    void orbitIpc.openExternalBrowserUrl(renderedToastAction.url);
+                  }
+                  renderedToastAction.onClick?.();
+                }}
+                className="text-primary hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[12px] font-medium transition-colors"
+              >
+                <span>{renderedToastAction.label}</span>
+                {renderedToastAction.url && (
+                  <ExternalLink className="h-[11.5px] w-[11.5px] shrink-0" />
+                )}
+              </button>
+            )}
             {lastArchivedUndo && (
               <button
                 type="button"

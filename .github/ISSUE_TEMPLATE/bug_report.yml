@@ -1,0 +1,90 @@
+name: Bug Report
+description: Report a bug or regression in Orbit CLI, Daemon, Relay, Desktop, or Mobile apps
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue. If this is a **security vulnerability**, please do not open a public issue — report it privately via the Security tab as described in `SECURITY.md`.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Orbit CLI / Daemon
+        - Orbit Relay / E2EE Transport
+        - Desktop App (macOS / Linux / Windows)
+        - iOS App
+        - Android App
+        - HarmonyOS App
+        - Provider Driver / ACP Registry
+        - Installer / Packaging / CI
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Orbit Version
+      description: Output of `orbit --version` or the version shown in Desktop/Mobile Settings.
+      placeholder: "e.g. 0.9.5"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS & Architecture
+      placeholder: "e.g. macOS 15.4 (arm64), Ubuntu 24.04 (x86_64), Windows 11 (x64), iOS 18.3"
+    validations:
+      required: true
+
+  - type: input
+    id: provider
+    attributes:
+      label: AI Provider CLI & Version (if applicable)
+      placeholder: "e.g. claude 1.x, codex 0.x, agy, gemini-cli, custom ACP"
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction Steps
+      description: Exact steps or commands needed to reproduce the issue.
+      placeholder: |
+        1. Run `orbit daemon up`
+        2. Open ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_vs_actual
+    attributes:
+      label: Expected vs. Actual Behavior
+      description: Briefly describe what you expected to happen and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / `orbit doctor` Output
+      description: Paste relevant logs or `orbit doctor` output. Please redact any `pairing_secret`, API keys, tokens, or private hostnames.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checks
+      options:
+        - label: I searched existing issues to verify this is not a duplicate.
+          required: true
+        - label: I confirmed this is not a security vulnerability (security reports go through `SECURITY.md`).
+          required: true

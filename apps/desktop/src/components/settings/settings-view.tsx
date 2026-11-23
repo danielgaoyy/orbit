@@ -1,21 +1,23 @@
-import { type ReactNode, useEffect, useMemo, useState } from "react";
 import {
-  Activity,
+  type ComponentType,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
   Bell,
-  BookOpen,
   Check,
   ChevronsUpDown,
-  Cloud,
   Cpu,
-  Keyboard,
-  MessageSquare,
   Palette,
   Plug,
   Plus,
   Search,
   Server,
   Settings2,
-  ShieldCheck,
   X,
 } from "lucide-react";
 import { AddHostSection } from "@/components/settings/add-host-section";
@@ -23,7 +25,6 @@ import { AppearanceSection } from "@/components/settings/appearance-section";
 import { ArchivedSection } from "@/components/settings/archived-section";
 import { CloudSyncSection } from "@/components/settings/cloud-sync-section";
 import { GeneralSection } from "@/components/settings/general-section";
-import { InstructionsSection } from "@/components/settings/instructions-section";
 import { HostAcpSection } from "@/components/settings/host-acp-section";
 import { HostAgentsSection } from "@/components/settings/host-agents-section";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
@@ -35,12 +36,25 @@ import { HostMcpSection } from "@/components/settings/host-mcp-section";
 import { HostRulesSection } from "@/components/settings/host-rules-section";
 import { HostSkillsSection } from "@/components/settings/host-skills-section";
 import { HostUsageSection } from "@/components/settings/host-usage-section";
+import { InstructionsSection } from "@/components/settings/instructions-section";
 import { NotificationsSection } from "@/components/settings/notifications-section";
+import {
+  SETTINGS_CORE_SECTIONS,
+  type SettingsCoreSectionId,
+  type SettingsSearchResult,
+  type SettingsSubTabId,
+  buildSettingsSectionForTarget,
+  getVisibleSubTabsForSection,
+  parseHostSettingsSection,
+  resolveActiveSettingsLocation,
+  searchSettingsEntries,
+} from "@/components/settings/settings-nav";
 import {
   HostStatusIndicator,
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
 import { ShortcutsSection } from "@/components/settings/shortcuts-section";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/dialog-tabs";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -48,246 +62,30 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
-import { type MessageKey, useI18n } from "@/lib/i18n";
-import type { HostCardView } from "@/lib/orbit-ipc";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { type MessageKey, type TranslationParams, useI18n } from "@/lib/i18n";
+import { modSymbol } from "@/lib/keybindings";
+import { type HostCardView, isMacDesktop } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import {
-  type HostSettingsTab,
-  type SettingsSection,
   orbitActions,
   threadScopeKey,
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-type RailNavId =
-  | "general"
-  | "appearance"
-  | "notifications"
-  | "shortcuts"
-  | "sync_data"
-  | "models_agents"
-  | "context"
-  | "extensions"
-  | "guardian"
-  | "usage"
-  | "channels"
-  | "hosts";
-
-interface RailItemSpec {
-  id: RailNavId;
-  group: "app" | "agents" | "fleet";
-  labelKey: MessageKey;
-  icon: React.ComponentType<{ className?: string }>;
-  keywords: string[];
-  requiresHost?: boolean;
-}
-
-const RAIL_ITEMS: RailItemSpec[] = [
-  // App (5)
-  {
-    id: "general",
-    group: "app",
-    labelKey: "settings.navGeneral",
-    icon: Settings2,
-    keywords: [
-      "general",
-      "enter",
-      "editor",
-      "worktree",
-      "branch",
-      "update",
-      "version",
-      "setup",
-      "guide",
-      "onboarding",
-      "通用",
-      "向导",
-      "一般",
-      "ガイド",
-    ],
-  },
-  {
-    id: "appearance",
-    group: "app",
-    labelKey: "settings.navAppearance",
-    icon: Palette,
-    keywords: [
-      "appearance",
-      "theme",
-      "dark",
-      "light",
-      "language",
-      "locale",
-      "i18n",
-      "font",
-      "diff",
-      "terminal",
-      "cursor",
-      "外观",
-      "语言",
-      "主题",
-      "外観",
-      "言語",
-    ],
-  },
-  {
-    id: "notifications",
-    group: "app",
-    labelKey: "settings.navNotifications",
-    icon: Bell,
-    keywords: ["notifications", "push", "apns", "fcm", "harmony", "quiet hours", "sound", "alert", "通知"],
-  },
-  {
-    id: "shortcuts",
-    group: "app",
-    labelKey: "settings.navShortcuts",
-    icon: Keyboard,
-    keywords: ["shortcuts", "keybindings", "hotkeys", "keyboard", "快捷键", "ショートカット"],
-  },
-  {
-    id: "sync_data",
-    group: "app",
-    labelKey: "settings.navSyncData",
-    icon: Cloud,
-    keywords: ["cloud", "sync", "gist", "backup", "archived", "archive", "history", "data", "同步", "归档", "同期"],
-  },
-  // Agents (4)
-  {
-    id: "models_agents",
-    group: "agents",
-    labelKey: "settings.navModelsAgents",
-    icon: Cpu,
-    requiresHost: true,
-    keywords: [
-      "models",
-      "agents",
-      "providers",
-      "claude",
-      "codex",
-      "antigravity",
-      "acp",
-      "registry",
-      "profiles",
-      "fast",
-      "keep awake",
-      "orchestrator",
-      "模型",
-      "代理",
-    ],
-  },
-  {
-    id: "context",
-    group: "agents",
-    labelKey: "settings.navContext",
-    icon: BookOpen,
-    keywords: ["context", "instructions", "agents.md", "claude.md", "rules", "glob", "skills", "上下文", "规则", "技能"],
-  },
-  {
-    id: "extensions",
-    group: "agents",
-    labelKey: "settings.navExtensions",
-    icon: Plug,
-    requiresHost: true,
-    keywords: ["extensions", "mcp", "servers", "hooks", "lifecycle", "lsp", "language servers", "扩展"],
-  },
-  {
-    id: "guardian",
-    group: "agents",
-    labelKey: "settings.navGuardian",
-    icon: ShieldCheck,
-    requiresHost: true,
-    keywords: ["guardian", "auto", "approval", "safety", "risk", "policy", "security", "blocked"],
-  },
-  // Operations & Fleet (3)
-  {
-    id: "usage",
-    group: "fleet",
-    labelKey: "settings.navUsage",
-    icon: Activity,
-    requiresHost: true,
-    keywords: ["usage", "tokens", "cost", "spend", "quotas", "insights", "analytics", "用量", "使用量"],
-  },
-  {
-    id: "channels",
-    group: "fleet",
-    labelKey: "settings.navChannels",
-    icon: MessageSquare,
-    requiresHost: true,
-    keywords: ["channels", "im", "lark", "feishu", "slack", "telegram", "discord", "bot", "频道", "飞书"],
-  },
-  {
-    id: "hosts",
-    group: "fleet",
-    labelKey: "settings.navHosts",
-    icon: Server,
-    keywords: ["hosts", "connection", "remote", "ssh", "relay", "pair", "pairing", "mobile", "add host", "主机", "ホスト"],
-  },
-];
-
-function parseHostSection(
-  section: SettingsSection,
-): { hostId: string; tab: HostSettingsTab } | null {
-  if (!section.startsWith("host:")) return null;
-  const lastColon = section.lastIndexOf(":");
-  if (lastColon <= 5) return null;
-  const hostId = section.slice(5, lastColon);
-  const tab = section.slice(lastColon + 1) as HostSettingsTab;
-  if (
-    tab !== "agents" &&
-    tab !== "guardian" &&
-    tab !== "im_channels" &&
-    tab !== "skills" &&
-    tab !== "acp" &&
-    tab !== "mcp" &&
-    tab !== "rules" &&
-    tab !== "hooks" &&
-    tab !== "lsp" &&
-    tab !== "usage" &&
-    tab !== "connection"
-  ) {
-    return null;
-  }
-  return { hostId, tab };
-}
-
-function resolveActiveRailId(
-  section: SettingsSection,
-  parsedHost: { hostId: string; tab: HostSettingsTab } | null,
-): RailNavId {
-  if (section === "general") return "general";
-  if (section === "appearance") return "appearance";
-  if (section === "notifications") return "notifications";
-  if (section === "shortcuts") return "shortcuts";
-  if (section === "cloud_sync" || section === "archived") return "sync_data";
-  if (section === "instructions") return "context";
-  if (section === "add_host") return "hosts";
-  if (parsedHost) {
-    switch (parsedHost.tab) {
-      case "agents":
-      case "acp":
-        return "models_agents";
-      case "rules":
-      case "skills":
-        return "context";
-      case "mcp":
-      case "hooks":
-      case "lsp":
-        return "extensions";
-      case "guardian":
-        return "guardian";
-      case "usage":
-        return "usage";
-      case "im_channels":
-        return "channels";
-      case "connection":
-        return "hosts";
-    }
-  }
-  return "general";
-}
+const CORE_SECTION_ICONS: Record<
+  SettingsCoreSectionId,
+  ComponentType<{ className?: string }>
+> = {
+  general: Settings2,
+  appearance: Palette,
+  hosts: Server,
+  agents: Cpu,
+  extensions: Plug,
+  notifications_sync: Bell,
+};
 
 function orderHostsLocalFirst(hosts: HostCardView[]): HostCardView[] {
   const local: HostCardView[] = [];
@@ -302,10 +100,13 @@ function orderHostsLocalFirst(hosts: HostCardView[]): HostCardView[] {
   return [...local, ...remote];
 }
 
-function formatHostTransportSubtitle(host: HostCardView): string {
-  if (isLocalHostCard(host)) return "Local";
-  if (host.ssh_alias) return `SSH · ${host.ssh_alias}`;
-  if (host.connection_state === "online_relay") return "Relay";
+function formatHostTransportSubtitle(
+  host: HostCardView,
+  t: (key: MessageKey, params?: TranslationParams) => string,
+): string {
+  if (isLocalHostCard(host)) return t("common.local");
+  if (host.ssh_alias) return t("settings.sshHostSubtitle", { alias: host.ssh_alias });
+  if (host.connection_state === "online_relay") return t("common.relay");
   return hostConnectionLabel(host.connection_state);
 }
 
@@ -317,7 +118,7 @@ function SettingsRailButton({
   onClick,
 }: {
   label: string;
-  icon: React.ComponentType<{ className?: string }>;
+  icon: ComponentType<{ className?: string }>;
   active: boolean;
   badge?: ReactNode;
   onClick: () => void;
@@ -326,8 +127,9 @@ function SettingsRailButton({
     <button
       type="button"
       onClick={onClick}
+      aria-current={active ? "page" : undefined}
       className={cn(
-        "flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 text-left text-[13px] transition-colors",
+        "flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 text-left text-[13px] transition-colors",
         active
           ? "bg-black/[0.06] text-foreground font-medium dark:bg-white/[0.085]"
           : "text-foreground/76 hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
@@ -343,39 +145,48 @@ function SettingsRailButton({
 }
 
 function SettingsSubTabBar({
+  ariaLabel,
   tabs,
   activeId,
   onSelect,
 }: {
-  tabs: { id: string; label: string; count?: number }[];
-  activeId: string;
-  onSelect: (id: string) => void;
+  ariaLabel: string;
+  tabs: readonly { id: SettingsSubTabId; label: string; count?: number }[];
+  activeId: SettingsSubTabId;
+  onSelect: (id: SettingsSubTabId) => void;
 }) {
+  if (tabs.length <= 1) return null;
+
   return (
-    <div className="mb-5 flex items-center gap-1 border-b border-black/[0.06] pb-2.5 dark:border-white/[0.07]">
-      {tabs.map((tab) => {
-        const selected = tab.id === activeId;
-        return (
-          <button
-            key={tab.id}
-            type="button"
-            onClick={() => onSelect(tab.id)}
-            className={cn(
-              "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] px-2.5 text-[12.5px] transition-colors",
-              selected
-                ? "bg-black/[0.06] text-foreground font-medium dark:bg-white/[0.09]"
-                : "text-muted-foreground hover:bg-black/[0.035] hover:text-foreground dark:hover:bg-white/[0.05]",
-            )}
-          >
-            <span>{tab.label}</span>
-            {tab.count !== undefined && tab.count > 0 && (
-              <span className="text-muted-foreground/75 tabular-nums text-[11px] font-normal">
-                {tab.count}
-              </span>
-            )}
-          </button>
-        );
-      })}
+    <div className="shrink-0 border-b border-black/[0.06] py-3 pr-14 pl-8 dark:border-white/[0.07]">
+      <Tabs
+        value={activeId}
+        onValueChange={(value) => {
+          if (typeof value === "string") {
+            onSelect(value as SettingsSubTabId);
+          }
+        }}
+      >
+        <TabsList
+          aria-label={ariaLabel}
+          className="h-auto min-h-[30px] max-w-full flex-wrap justify-start gap-0.5 rounded-[9px] bg-black/[0.045] p-[3px] dark:bg-white/[0.06]"
+        >
+          {tabs.map((tab) => (
+            <TabsTrigger
+              key={tab.id}
+              value={tab.id}
+              className="text-muted-foreground hover:text-foreground data-[active]:bg-background data-[active]:text-foreground h-[24px] rounded-[6.5px] px-2.5 py-0 text-[12px] font-medium transition-colors data-[active]:shadow-2xs"
+            >
+              <span>{tab.label}</span>
+              {tab.count !== undefined && tab.count > 0 && (
+                <span className="text-muted-foreground/75 text-[10.5px] font-normal tabular-nums">
+                  {tab.count}
+                </span>
+              )}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+      </Tabs>
     </div>
   );
 }
@@ -388,7 +199,37 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
   const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
 
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [filterQuery, setFilterQuery] = useState("");
+  const [searchFocused, setSearchFocused] = useState(false);
+  const [selectedSearchIndex, setSelectedSearchIndex] = useState(0);
+
+  const mod = modSymbol();
+
+  // Scope Cmd/Ctrl+F strictly to Settings search while Settings modal is open
+  useEffect(() => {
+    if (closing) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const hasMod = isMacDesktop() ? e.metaKey : e.ctrlKey;
+      if (!hasMod || e.shiftKey || e.altKey || e.key.toLowerCase() !== "f") {
+        return;
+      }
+      const snap = orbitActions.getSnapshot();
+      if (snap.activeView !== "settings" || snap.commandPaletteOpen) return;
+      if (
+        document.querySelector(
+          '[data-slot="dialog-content"], [data-slot="confirm-dialog"], [role="alertdialog"]',
+        )
+      ) {
+        return;
+      }
+      e.preventDefault();
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [closing]);
 
   const archivedCount = useMemo(() => {
     const seen = new Set<string>();
@@ -403,7 +244,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
     return seen.size;
   }, [hostDetails, archivedThreads]);
 
-  const parsedHost = useMemo(() => parseHostSection(section), [section]);
+  const parsedHost = useMemo(() => parseHostSettingsSection(section), [section]);
   const orderedHosts = useMemo(() => orderHostsLocalFirst(fleet.hosts), [fleet.hosts]);
   const hasRemoteHosts = useMemo(
     () => orderedHosts.some((h) => !isLocalHostCard(h)),
@@ -446,10 +287,68 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
     return fallback ? { hostId: fallback.host_id, tab: parsedHost.tab } : null;
   }, [parsedHost, orderedHosts]);
 
-  const activeRailId = useMemo(
-    () => resolveActiveRailId(section, parsedHost),
-    [section, parsedHost],
+  const effectiveHostId = resolvedHost?.hostId ?? activeHost?.host_id ?? null;
+  const activeLocation = useMemo(() => resolveActiveSettingsLocation(section), [section]);
+  const activeCoreSection = activeLocation.coreSection;
+
+  const activeCoreSpec = useMemo(
+    () =>
+      SETTINGS_CORE_SECTIONS.find((item) => item.id === activeCoreSection) ??
+      SETTINGS_CORE_SECTIONS[0],
+    [activeCoreSection],
   );
+
+  const visibleSubTabs = useMemo(() => {
+    const specs = getVisibleSubTabsForSection(activeCoreSection, Boolean(effectiveHostId));
+    return specs.map((spec) => ({
+      id: spec.id,
+      label: t(spec.labelKey),
+      count: spec.id === "archived" ? archivedCount : undefined,
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCoreSection, effectiveHostId, archivedCount, locale]);
+
+  const activeSubTabId: SettingsSubTabId | null = useMemo(() => {
+    if (visibleSubTabs.length === 0) return null;
+    if (
+      activeLocation.subTab &&
+      visibleSubTabs.some((tab) => tab.id === activeLocation.subTab)
+    ) {
+      return activeLocation.subTab;
+    }
+    return visibleSubTabs[0]?.id ?? null;
+  }, [activeLocation.subTab, visibleSubTabs]);
+
+  const activePanelName = useMemo(() => {
+    if (activeSubTabId) {
+      const tab = visibleSubTabs.find((item) => item.id === activeSubTabId);
+      if (tab) return tab.label;
+    }
+    return t(activeCoreSpec.labelKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSubTabId, visibleSubTabs, activeCoreSpec.labelKey, locale]);
+
+  const normalizedFilter = filterQuery.trim();
+  const isSearching = normalizedFilter.length > 0;
+
+  const searchResults = useMemo(
+    () =>
+      searchSettingsEntries(normalizedFilter, {
+        t: (key) => t(key),
+        hasHost: Boolean(effectiveHostId),
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [normalizedFilter, effectiveHostId, locale],
+  );
+
+  useEffect(() => {
+    setSelectedSearchIndex(0);
+  }, [normalizedFilter]);
+
+  const clampedSearchIndex =
+    searchResults.length > 0
+      ? Math.min(selectedSearchIndex, searchResults.length - 1)
+      : 0;
 
   const handleSelectHost = (hostId: string) => {
     setPickedHostId(hostId);
@@ -460,65 +359,60 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
     }
   };
 
-  const navigateRailItem = (id: RailNavId) => {
-    const hId = activeHost?.host_id ?? null;
-    switch (id) {
-      case "general":
-        orbitActions.setSettingsSection("general");
-        return;
-      case "appearance":
-        orbitActions.setSettingsSection("appearance");
-        return;
-      case "notifications":
-        orbitActions.setSettingsSection("notifications");
-        return;
-      case "shortcuts":
-        orbitActions.setSettingsSection("shortcuts");
-        return;
-      case "sync_data":
-        orbitActions.setSettingsSection("cloud_sync");
-        return;
-      case "models_agents":
-        orbitActions.setSettingsSection(hId ? `host:${hId}:agents` : "add_host");
-        return;
-      case "context":
-        orbitActions.setSettingsSection("instructions");
-        return;
-      case "extensions":
-        orbitActions.setSettingsSection(hId ? `host:${hId}:mcp` : "add_host");
-        return;
-      case "guardian":
-        orbitActions.setSettingsSection(hId ? `host:${hId}:guardian` : "add_host");
-        return;
-      case "usage":
-        orbitActions.setSettingsSection(hId ? `host:${hId}:usage` : "add_host");
-        return;
-      case "channels":
-        orbitActions.setSettingsSection(hId ? `host:${hId}:im_channels` : "add_host");
-        return;
-      case "hosts":
-        orbitActions.setSettingsSection(hId ? `host:${hId}:connection` : "add_host");
-        return;
+  const navigateCoreSection = (coreId: SettingsCoreSectionId) => {
+    orbitActions.setSettingsSection(
+      buildSettingsSectionForTarget(coreId, null, effectiveHostId),
+    );
+  };
+
+  const handleSelectSubTab = (subTabId: SettingsSubTabId) => {
+    orbitActions.setSettingsSection(
+      buildSettingsSectionForTarget(activeCoreSection, subTabId, effectiveHostId),
+    );
+  };
+
+  const handleJumpToSearchResult = (result: SettingsSearchResult) => {
+    orbitActions.setSettingsSection(
+      buildSettingsSectionForTarget(result.coreSection, result.subTab, effectiveHostId),
+    );
+  };
+
+  const handleSearchKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Escape") {
+      if (filterQuery.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        setFilterQuery("");
+      } else {
+        e.currentTarget.blur();
+      }
+      return;
+    }
+    if (!isSearching || searchResults.length === 0) return;
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSelectedSearchIndex((prev) => (prev + 1) % searchResults.length);
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSelectedSearchIndex(
+        (prev) => (prev - 1 + searchResults.length) % searchResults.length,
+      );
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const target = searchResults[clampedSearchIndex];
+      if (target) {
+        handleJumpToSearchResult(target);
+      }
     }
   };
 
-  const normalizedFilter = filterQuery.trim().toLowerCase();
-  const visibleRailItems = useMemo(() => {
-    return RAIL_ITEMS.filter((item) => {
-      if (item.requiresHost && !activeHost) return false;
-      if (!normalizedFilter) return true;
-      if (t(item.labelKey).toLowerCase().includes(normalizedFilter)) return true;
-      return item.keywords.some((k) => k.includes(normalizedFilter));
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeHost, normalizedFilter, locale]);
-
-  const appItems = visibleRailItems.filter((i) => i.group === "app");
-  const agentItems = visibleRailItems.filter((i) => i.group === "agents");
-  const fleetItems = visibleRailItems.filter((i) => i.group === "fleet");
-
-  const renderRailBadge = (id: RailNavId) => {
-    if (id === "sync_data" && archivedCount > 0) {
+  const renderCoreBadge = (id: SettingsCoreSectionId) => {
+    if (id === "notifications_sync" && archivedCount > 0) {
       return (
         <span className="text-muted-foreground/70 shrink-0 text-[11px] tabular-nums">
           {archivedCount}
@@ -528,7 +422,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
     return undefined;
   };
 
-  const effectiveHostId = resolvedHost?.hostId ?? activeHost?.host_id ?? null;
+  const subTabsAriaLabel = t("settings.subTabsAria", {
+    section: t(activeCoreSpec.labelKey),
+  });
 
   return (
     <div
@@ -562,14 +458,14 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
           type="button"
           aria-label={t("settings.closeSettings")}
           onClick={() => orbitActions.closeSettings()}
-          className="text-muted-foreground hover:text-foreground hover:bg-accent absolute top-4 right-4 z-10 inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-[9px] transition-colors"
+          className="text-muted-foreground hover:text-foreground hover:bg-accent absolute top-3 right-4 z-10 inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-[9px] transition-colors"
         >
           <X className="h-[15.5px] w-[15.5px]" />
         </button>
 
-        {/* Left Settings Rail (232px) — Full-bleed ScrollArea so scrollbar hugs border without overlapping items */}
-        <aside className="border-border bg-sidebar/75 flex w-[232px] shrink-0 flex-col border-r py-4">
-          <div className="px-5 pb-2.5 text-[14.5px] font-semibold tracking-[-0.01em]">
+        {/* Left Settings Rail (244px): Restrained 6 Core Sections + Instant Filter Search */}
+        <aside className="border-border bg-sidebar/75 flex w-[244px] shrink-0 flex-col border-r py-4">
+          <div className="px-5 pb-3 text-[14.5px] font-semibold tracking-[-0.01em]">
             {t("settings.title")}
           </div>
 
@@ -577,329 +473,273 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
             <div className="relative px-0.5">
               <Search className="text-muted-foreground/65 pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 stroke-[1.8]" />
               <input
+                ref={searchInputRef}
                 type="text"
                 value={filterQuery}
                 onChange={(e) => setFilterQuery(e.target.value)}
+                onFocus={() => setSearchFocused(true)}
+                onBlur={() => setSearchFocused(false)}
+                onKeyDown={handleSearchKeyDown}
                 placeholder={t("settings.searchPlaceholder")}
                 aria-label={t("settings.searchAria")}
-                className="border-border/75 bg-background/65 text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/25 h-[28px] w-full rounded-[8px] border pr-6 pl-7 text-[12px] outline-none transition-colors"
+                className="border-border/75 bg-background/65 text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/25 h-[30px] w-full rounded-[8px] border pr-8 pl-7.5 text-[12px] outline-none transition-colors"
               />
-              {filterQuery && (
+              {filterQuery ? (
                 <button
                   type="button"
                   aria-label={t("settings.clearSearch")}
-                  onClick={() => setFilterQuery("")}
-                  className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2 cursor-pointer rounded p-0.5"
+                  onClick={() => {
+                    setFilterQuery("");
+                    searchInputRef.current?.focus();
+                  }}
+                  className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2 cursor-pointer rounded p-0.5 transition-colors"
                 >
                   <X className="size-3" />
                 </button>
+              ) : (
+                !searchFocused && (
+                  <span
+                    aria-hidden="true"
+                    className="text-muted-foreground/50 pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 text-[10.5px] font-medium"
+                  >
+                    {mod}F
+                  </span>
+                )
               )}
             </div>
           </div>
 
           <ScrollArea className="min-h-0 flex-1" viewportClassName="px-3 pb-1">
-            <nav className="space-y-3.5">
-              {appItems.length > 0 && (
-                <div className="space-y-0.5">
-                  <div className="text-muted-foreground/75 px-2.5 pb-0.5 text-[11px] font-medium">
-                    {t("settings.groupApp")}
-                  </div>
-                  {appItems.map((item) => (
-                    <SettingsRailButton
-                      key={item.id}
-                      label={t(item.labelKey)}
-                      icon={item.icon}
-                      active={activeRailId === item.id}
-                      badge={renderRailBadge(item.id)}
-                      onClick={() => navigateRailItem(item.id)}
-                    />
-                  ))}
-                </div>
-              )}
+            {isSearching ? (
+              <div className="space-y-1">
+                {searchResults.length > 0 ? (
+                  <>
+                    <div className="text-muted-foreground/70 px-2.5 pb-0.5 text-[11px] font-medium">
+                      {t("settings.searchResultsLabel")}
+                    </div>
+                    <nav className="space-y-0.5">
+                      {searchResults.map((result, idx) => {
+                        const Icon = CORE_SECTION_ICONS[result.coreSection];
+                        const isActiveDest =
+                          activeCoreSection === result.coreSection &&
+                          (result.subTab === null || activeSubTabId === result.subTab);
+                        const isHighlighted = idx === clampedSearchIndex;
 
-              {/* Multi-host selector appears cleanly above Host-scoped groups */}
-              {isMultiOrRemoteMode && activeHost && (agentItems.length > 0 || fleetItems.length > 0) && (
-                <div className="border-border/60 border-t pt-3">
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <button
-                        type="button"
-                        aria-label={t("settings.switchHost")}
-                        className="border-border/80 bg-background/70 hover:bg-accent/70 focus-visible:ring-foreground/20 flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] border px-2.5 text-left transition-colors outline-none focus-visible:ring-1"
-                      >
-                        <span className="flex min-w-0 flex-1 items-center gap-2">
-                          <HostStatusIndicator state={activeHost.connection_state} />
-                          <span className="text-foreground truncate text-[12.5px] font-medium">
-                            {activeHost.display_name}
-                          </span>
-                          {isLocalHostCard(activeHost) && (
-                            <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium">
-                              {t("common.local")}
-                            </span>
-                          )}
-                        </span>
-                        <ChevronsUpDown className="text-muted-foreground/75 h-[13px] w-[13px] shrink-0" />
-                      </button>
-                    </DropdownMenuTrigger>
-
-                    <DropdownMenuContent
-                      align="start"
-                      sideOffset={5}
-                      finalFocus={false}
-                      className="w-[212px] p-1.5"
-                    >
-                      {orderedHosts.map((host) => {
-                        const selected = host.host_id === activeHost.host_id;
                         return (
-                          <DropdownMenuItem
-                            key={host.host_id}
-                            onSelect={() => handleSelectHost(host.host_id)}
-                            className="items-center py-1.5"
+                          <button
+                            key={result.id}
+                            type="button"
+                            onMouseEnter={() => setSelectedSearchIndex(idx)}
+                            onClick={() => handleJumpToSearchResult(result)}
+                            className={cn(
+                              "flex w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 py-1.5 text-left transition-colors",
+                              isHighlighted || isActiveDest
+                                ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
+                                : "text-foreground/80 hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
+                            )}
                           >
-                            <span className="flex min-w-0 flex-1 items-center gap-2.5">
-                              <HostStatusIndicator state={host.connection_state} />
-                              <span className="min-w-0 flex-1">
+                            <span className="flex min-w-0 items-center gap-2.5">
+                              <Icon className="h-[14px] w-[14px] shrink-0 stroke-[1.75] opacity-75" />
+                              <span className="min-w-0">
                                 <span
                                   className={cn(
-                                    "block truncate text-[12.5px]",
-                                    selected
-                                      ? "text-foreground font-medium"
-                                      : "text-foreground/90 font-normal",
+                                    "block truncate text-[12.5px] leading-snug",
+                                    isActiveDest ? "font-medium" : "font-normal",
                                   )}
                                 >
-                                  {host.display_name}
+                                  {t(result.labelKey)}
                                 </span>
-                                <span className="text-muted-foreground block truncate text-[11px]">
-                                  {formatHostTransportSubtitle(host)}
-                                </span>
+                                {result.parentLabelKey && (
+                                  <span className="text-muted-foreground/75 block truncate text-[11px] leading-tight">
+                                    {t(result.parentLabelKey)}
+                                  </span>
+                                )}
                               </span>
                             </span>
-                            {selected && (
-                              <Check className="text-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[2]" />
+                            {result.subTab === "archived" && archivedCount > 0 && (
+                              <span className="text-muted-foreground/70 shrink-0 text-[11px] tabular-nums">
+                                {archivedCount}
+                              </span>
                             )}
-                          </DropdownMenuItem>
+                          </button>
                         );
                       })}
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        onSelect={() => orbitActions.setSettingsSection("add_host")}
+                    </nav>
+                  </>
+                ) : (
+                  <div className="text-muted-foreground/75 px-2.5 py-8 text-center text-[12px]">
+                    {t("settings.noMatches")}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <nav className="space-y-1">
+                {SETTINGS_CORE_SECTIONS.map((item) => (
+                  <SettingsRailButton
+                    key={item.id}
+                    label={t(item.labelKey)}
+                    icon={CORE_SECTION_ICONS[item.id]}
+                    active={activeCoreSection === item.id}
+                    badge={renderCoreBadge(item.id)}
+                    onClick={() => navigateCoreSection(item.id)}
+                  />
+                ))}
+
+                {/* Multi-host selector appears cleanly below the 6 core sections only when multiple/remote hosts exist */}
+                {isMultiOrRemoteMode && activeHost && (
+                  <div className="border-border/60 mt-4 border-t pt-3.5">
+                    <div className="text-muted-foreground/70 px-2.5 pb-1.5 text-[11px] font-medium">
+                      {t("settings.hostScope")}
+                    </div>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <button
+                          type="button"
+                          aria-label={t("settings.switchHost")}
+                          className="border-border/80 bg-background/70 hover:bg-accent/70 focus-visible:ring-foreground/20 flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] border px-2.5 text-left transition-colors outline-none focus-visible:ring-1"
+                        >
+                          <span className="flex min-w-0 flex-1 items-center gap-2">
+                            <HostStatusIndicator state={activeHost.connection_state} />
+                            <span className="text-foreground truncate text-[12.5px] font-medium">
+                              {activeHost.display_name}
+                            </span>
+                            {isLocalHostCard(activeHost) && (
+                              <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium">
+                                {t("common.local")}
+                              </span>
+                            )}
+                          </span>
+                          <ChevronsUpDown className="text-muted-foreground/75 h-[13px] w-[13px] shrink-0" />
+                        </button>
+                      </DropdownMenuTrigger>
+
+                      <DropdownMenuContent
+                        align="start"
+                        sideOffset={5}
+                        finalFocus={false}
+                        className="w-[220px] p-1.5"
                       >
-                        <span className="flex items-center gap-2">
-                          <Plus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.85]" />
-                          <span className="text-[12.5px]">{t("settings.connectHost")}</span>
-                        </span>
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-              )}
-
-              {agentItems.length > 0 && (
-                <div className={cn("space-y-0.5", !isMultiOrRemoteMode && "border-border/60 border-t pt-3")}>
-                  <div className="text-muted-foreground/75 px-2.5 pb-0.5 text-[11px] font-medium">
-                    {t("settings.groupAgents")}
+                        {orderedHosts.map((host) => {
+                          const selected = host.host_id === activeHost.host_id;
+                          return (
+                            <DropdownMenuItem
+                              key={host.host_id}
+                              onSelect={() => handleSelectHost(host.host_id)}
+                              className="items-center py-1.5"
+                            >
+                              <span className="flex min-w-0 flex-1 items-center gap-2.5">
+                                <HostStatusIndicator state={host.connection_state} />
+                                <span className="min-w-0 flex-1">
+                                  <span
+                                    className={cn(
+                                      "block truncate text-[12.5px]",
+                                      selected
+                                        ? "text-foreground font-medium"
+                                        : "text-foreground/90 font-normal",
+                                    )}
+                                  >
+                                    {host.display_name}
+                                  </span>
+                                  <span className="text-muted-foreground block truncate text-[11px]">
+                                    {formatHostTransportSubtitle(host, t)}
+                                  </span>
+                                </span>
+                              </span>
+                              {selected && (
+                                <Check className="text-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[2]" />
+                              )}
+                            </DropdownMenuItem>
+                          );
+                        })}
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onSelect={() => orbitActions.setSettingsSection("add_host")}
+                        >
+                          <span className="flex items-center gap-2">
+                            <Plus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.85]" />
+                            <span className="text-[12.5px]">{t("settings.connectHost")}</span>
+                          </span>
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
-                  {agentItems.map((item) => (
-                    <SettingsRailButton
-                      key={item.id}
-                      label={t(item.labelKey)}
-                      icon={item.icon}
-                      active={activeRailId === item.id}
-                      onClick={() => navigateRailItem(item.id)}
-                    />
-                  ))}
-                </div>
-              )}
-
-              {fleetItems.length > 0 && (
-                <div className="border-border/60 space-y-0.5 border-t pt-3">
-                  <div className="text-muted-foreground/75 px-2.5 pb-0.5 text-[11px] font-medium">
-                    {t("settings.groupFleet")}
-                  </div>
-                  {fleetItems.map((item) => (
-                    <SettingsRailButton
-                      key={item.id}
-                      label={t(item.labelKey)}
-                      icon={item.icon}
-                      active={activeRailId === item.id}
-                      onClick={() => navigateRailItem(item.id)}
-                    />
-                  ))}
-                </div>
-              )}
-
-              {visibleRailItems.length === 0 && (
-                <div className="text-muted-foreground/75 px-2.5 py-6 text-center text-[12px]">
-                  {t("settings.noMatches")}
-                </div>
-              )}
-            </nav>
+                )}
+              </nav>
+            )}
           </ScrollArea>
 
           <div className="text-muted-foreground/65 px-5 pt-2 text-[11.5px]">Orbit</div>
         </aside>
 
         {/* Right Settings Content Area */}
-        {section === "instructions" ? (
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-7 pt-6 pb-5">
-            {effectiveHostId && (
-              <SettingsSubTabBar
-                activeId="instructions"
-                tabs={[
-                  { id: "instructions", label: t("settings.subTabInstructions") },
-                  { id: "rules", label: t("settings.subTabRules") },
-                  { id: "skills", label: t("settings.subTabSkills") },
-                ]}
-                onSelect={(tabId) => {
-                  if (tabId === "instructions") orbitActions.setSettingsSection("instructions");
-                  else if (tabId === "rules")
-                    orbitActions.setSettingsSection(`host:${effectiveHostId}:rules`);
-                  else if (tabId === "skills")
-                    orbitActions.setSettingsSection(`host:${effectiveHostId}:skills`);
-                }}
-              />
-            )}
-            <div key={section} className="orbit-stage-enter min-h-0 flex-1">
-              <PanelErrorBoundary panelName={t("settings.subTabInstructions")}>
-                <InstructionsSection />
-              </PanelErrorBoundary>
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+          {activeSubTabId && visibleSubTabs.length > 1 && (
+            <SettingsSubTabBar
+              ariaLabel={subTabsAriaLabel}
+              activeId={activeSubTabId}
+              tabs={visibleSubTabs}
+              onSelect={handleSelectSubTab}
+            />
+          )}
+
+          {section === "instructions" ? (
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-7 pt-5 pb-5">
+              <div key={section} className="orbit-stage-enter min-h-0 flex-1">
+                <PanelErrorBoundary panelName={activePanelName}>
+                  <InstructionsSection />
+                </PanelErrorBoundary>
+              </div>
             </div>
-          </div>
-        ) : (
-          <ScrollArea className="min-h-0 flex-1" viewportClassName="px-10 py-7">
-            <div key={section} className="orbit-stage-enter mx-auto w-full max-w-[640px] pb-8">
-              {/* In-page sub-tabs for consolidated sections */}
-              {activeRailId === "sync_data" && (
-                <SettingsSubTabBar
-                  activeId={section === "archived" ? "archived" : "cloud_sync"}
-                  tabs={[
-                    { id: "cloud_sync", label: t("settings.subTabCloudSync") },
-                    { id: "archived", label: t("settings.subTabArchived"), count: archivedCount },
-                  ]}
-                  onSelect={(tabId) =>
-                    orbitActions.setSettingsSection(
-                      tabId === "archived" ? "archived" : "cloud_sync",
-                    )
-                  }
-                />
-              )}
-
-              {activeRailId === "models_agents" && effectiveHostId && (
-                <SettingsSubTabBar
-                  activeId={resolvedHost?.tab === "acp" ? "acp" : "agents"}
-                  tabs={[
-                    { id: "agents", label: t("settings.subTabProvidersRuntime") },
-                    { id: "acp", label: t("settings.subTabAcpRegistry") },
-                  ]}
-                  onSelect={(tabId) =>
-                    orbitActions.setSettingsSection(
-                      `host:${effectiveHostId}:${tabId === "acp" ? "acp" : "agents"}`,
-                    )
-                  }
-                />
-              )}
-
-              {activeRailId === "context" && effectiveHostId && (
-                <SettingsSubTabBar
-                  activeId={resolvedHost?.tab === "skills" ? "skills" : "rules"}
-                  tabs={[
-                    { id: "instructions", label: t("settings.subTabInstructions") },
-                    { id: "rules", label: t("settings.subTabRules") },
-                    { id: "skills", label: t("settings.subTabSkills") },
-                  ]}
-                  onSelect={(tabId) => {
-                    if (tabId === "instructions") orbitActions.setSettingsSection("instructions");
-                    else if (tabId === "rules")
-                      orbitActions.setSettingsSection(`host:${effectiveHostId}:rules`);
-                    else if (tabId === "skills")
-                      orbitActions.setSettingsSection(`host:${effectiveHostId}:skills`);
-                  }}
-                />
-              )}
-
-              {activeRailId === "extensions" && effectiveHostId && (
-                <SettingsSubTabBar
-                  activeId={
-                    resolvedHost?.tab === "hooks"
-                      ? "hooks"
-                      : resolvedHost?.tab === "lsp"
-                        ? "lsp"
-                        : "mcp"
-                  }
-                  tabs={[
-                    { id: "mcp", label: t("settings.subTabMcpServers") },
-                    { id: "hooks", label: t("settings.subTabHooks") },
-                    { id: "lsp", label: t("settings.subTabLanguageServers") },
-                  ]}
-                  onSelect={(tabId) =>
-                    orbitActions.setSettingsSection(
-                      `host:${effectiveHostId}:${tabId as "mcp" | "hooks" | "lsp"}`,
-                    )
-                  }
-                />
-              )}
-
-              {activeRailId === "hosts" && effectiveHostId && (
-                <SettingsSubTabBar
-                  activeId={section === "add_host" ? "add_host" : "connection"}
-                  tabs={[
-                    { id: "connection", label: "Host & Pairing" },
-                    { id: "add_host", label: "Connect Remote Host" },
-                  ]}
-                  onSelect={(tabId) =>
-                    orbitActions.setSettingsSection(
-                      tabId === "add_host" ? "add_host" : `host:${effectiveHostId}:connection`,
-                    )
-                  }
-                />
-              )}
-
-              <PanelErrorBoundary panelName="Settings Section">
-                {section === "general" && <GeneralSection />}
-                {section === "cloud_sync" && <CloudSyncSection />}
-                {section === "appearance" && <AppearanceSection />}
-                {section === "shortcuts" && <ShortcutsSection />}
-                {section === "notifications" && <NotificationsSection />}
-                {section === "archived" && <ArchivedSection />}
-                {section === "add_host" && <AddHostSection />}
-                {parsedHost && !resolvedHost && <AddHostSection />}
-                {resolvedHost?.tab === "agents" && (
-                  <HostAgentsSection hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "guardian" && (
-                  <HostGuardianSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "im_channels" && (
-                  <HostImChannelsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "skills" && (
-                  <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "acp" && (
-                  <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "mcp" && (
-                  <HostMcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "rules" && (
-                  <HostRulesSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "hooks" && (
-                  <HostHooksSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "lsp" && (
-                  <HostLspSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "usage" && (
-                  <HostUsageSection hostId={resolvedHost.hostId} />
-                )}
-                {resolvedHost?.tab === "connection" && (
-                  <HostConnectionSection hostId={resolvedHost.hostId} />
-                )}
-              </PanelErrorBoundary>
-            </div>
-          </ScrollArea>
-        )}
+          ) : (
+            <ScrollArea className="min-h-0 flex-1" viewportClassName="px-9 py-6">
+              <div key={section} className="orbit-stage-enter mx-auto w-full max-w-[660px] pb-8">
+                <PanelErrorBoundary panelName={activePanelName}>
+                  {section === "general" && <GeneralSection />}
+                  {section === "shortcuts" && <ShortcutsSection />}
+                  {section === "appearance" && <AppearanceSection />}
+                  {section === "notifications" && <NotificationsSection />}
+                  {section === "cloud_sync" && <CloudSyncSection />}
+                  {section === "archived" && <ArchivedSection />}
+                  {section === "add_host" && <AddHostSection />}
+                  {parsedHost && !resolvedHost && <AddHostSection />}
+                  {resolvedHost?.tab === "connection" && (
+                    <HostConnectionSection hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "im_channels" && (
+                    <HostImChannelsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "agents" && (
+                    <HostAgentsSection hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "acp" && (
+                    <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "guardian" && (
+                    <HostGuardianSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "usage" && (
+                    <HostUsageSection hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "rules" && (
+                    <HostRulesSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "skills" && (
+                    <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "mcp" && (
+                    <HostMcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "hooks" && (
+                    <HostHooksSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "lsp" && (
+                    <HostLspSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                  )}
+                </PanelErrorBoundary>
+              </div>
+            </ScrollArea>
+          )}
+        </div>
       </div>
     </div>
   );

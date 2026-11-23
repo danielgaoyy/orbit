@@ -1,13 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the main Orbit desktop control window",
-  "windows": ["main"],
+  "description": "Default capability for the main Orbit desktop control window and detached terminal windows",
+  "windows": ["main", "orbit-terminal-*"],
   "permissions": [
     "core:default",
     "core:event:default",
     "core:window:default",
     "core:window:allow-start-dragging",
+    "core:window:allow-close",
     "core:app:default"
   ]
 }

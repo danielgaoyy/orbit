@@ -1790,6 +1790,17 @@ impl TerminalGridEmulator {
         self.parser = vt100::Parser::new(rows, cols, 2000);
     }
 
+    /// Render a clean, self-contained ANSI reset + full screen state resync sequence from the
+    /// current emulator grid so consumers recovering from queue overflow never observe mid-UTF-8
+    /// or mid-escape sequence corruption.
+    pub fn render_resync_bytes(&self) -> Vec<u8> {
+        let formatted = self.parser.screen().state_formatted();
+        let mut out = Vec::with_capacity(12 + formatted.len());
+        out.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
+        out.extend_from_slice(formatted.as_bytes());
+        out
+    }
+
     pub fn snapshot(&self) -> TerminalScreenView {
         let screen = self.parser.screen();
         let (rows_nz, cols_nz) = screen.size();

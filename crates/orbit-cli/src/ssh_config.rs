@@ -315,11 +315,12 @@ pub fn provision_relay_via_ssh(
     }
 
     let escaped_key = allow_pubkey.replace('\'', "");
+    let repo = orbit_protocol::configured_github_repo();
     let remote_cmd = format!(
         "set -eu; \
          export PATH=\"$HOME/.local/bin:/usr/local/bin:$PATH\"; \
          if ! command -v orbit >/dev/null 2>&1 || ! orbit relay --help 2>&1 | grep -q 'allow'; then \
-           curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh; \
+           curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/install.sh | ORBIT_GITHUB_REPO='{repo}' sh; \
          fi; \
          orbit relay up --port {relay_port} --allow-pubkey '{escaped_key}'"
     );

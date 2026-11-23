@@ -1,0 +1,52 @@
+name: Feature Request
+description: Propose a new capability, provider integration, or UX improvement for Orbit
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Target Area
+      options:
+        - Orbit CLI / Daemon
+        - Orbit Relay / E2EE Transport
+        - Desktop App (macOS / Linux / Windows)
+        - Mobile Apps (iOS / Android / HarmonyOS)
+        - Provider Driver / ACP Registry
+        - Protocol / Multi-Host Orchestration
+        - Documentation / DevEx
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement & Use Case
+      description: What workflow is missing or painful today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe the behavior, CLI/UI surface, or protocol change you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any workarounds or alternative designs you considered.
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Multi-Host / Security / Platform Notes
+      description: Optional notes on cross-platform parity, shim isolation, or zero-knowledge security impact.
+    validations:
+      required: false

@@ -1,6 +1,6 @@
 //! Built-in 1-click Desktop Self-Updater for macOS (`.dmg`), Windows (`.exe`/`.msi`), and Linux (`.deb`).
 //!
-//! - Queries GitHub Releases (`danielgaoyy/orbit/releases/latest`)
+//! - Queries GitHub Releases (`<ORBIT_GITHUB_REPO>/releases/latest`, defaulting to [`orbit_protocol::DEFAULT_GITHUB_REPO`])
 //! - Streams release artifact with live MB/MB progress to the UI
 //! - On macOS: mounts `.dmg` silently, replaces `/Applications/Orbit.app` (or current `.app` bundle)
 //!   via `ditto`, runs `xattr -cr` automatically so Gatekeeper never blocks launch, unmounts, and relaunches!
@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tokio::io::AsyncWriteExt;
 
-pub const GITHUB_REPO: &str = "danielgaoyy/orbit";
 pub const CURRENT_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +139,7 @@ fn extract_tag_from_release_url(url: &str) -> Option<String> {
 }
 
 fn build_release_info_from_tag(tag_name: &str, current_version: &str) -> ReleaseUpdateInfo {
+    let repo = orbit_protocol::configured_github_repo();
     let clean_tag = tag_name.trim().to_string();
     let latest_version = clean_tag.trim_start_matches(['v', 'V']).to_string();
     ReleaseUpdateInfo {
@@ -147,27 +147,28 @@ fn build_release_info_from_tag(tag_name: &str, current_version: &str) -> Release
         latest_version: latest_version.clone(),
         has_newer_version: compare_semver(&latest_version, current_version) == Ordering::Greater,
         macos_dmg_url: Some(format!(
-            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-macOS-AppleSilicon.dmg"
+            "https://github.com/{repo}/releases/download/{clean_tag}/Orbit-macOS-AppleSilicon.dmg"
         )),
         linux_arm64_deb_url: Some(format!(
-            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-Linux-arm64.deb"
+            "https://github.com/{repo}/releases/download/{clean_tag}/Orbit-Linux-arm64.deb"
         )),
         linux_x64_deb_url: Some(format!(
-            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-Linux-x64.deb"
+            "https://github.com/{repo}/releases/download/{clean_tag}/Orbit-Linux-x64.deb"
         )),
         windows_nsis_url: Some(format!(
-            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-Windows-x64-setup.exe"
+            "https://github.com/{repo}/releases/download/{clean_tag}/Orbit-Windows-x64-setup.exe"
         )),
         windows_msi_url: Some(format!(
-            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-Windows-x64.msi"
+            "https://github.com/{repo}/releases/download/{clean_tag}/Orbit-Windows-x64.msi"
         )),
-        html_url: format!("https://github.com/{GITHUB_REPO}/releases/tag/{clean_tag}"),
+        html_url: format!("https://github.com/{repo}/releases/tag/{clean_tag}"),
         tag_name: clean_tag,
         notes: String::new(),
     }
 }
 
 async fn resolve_latest_tag_via_web_redirect() -> Result<String, String> {
+    let repo = orbit_protocol::configured_github_repo();
     let no_redirect_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .redirect(reqwest::redirect::Policy::none())
@@ -175,7 +176,7 @@ async fn resolve_latest_tag_via_web_redirect() -> Result<String, String> {
         .build()
         .map_err(|e| format!("Failed to initialize redirect client: {e}"))?;
 
-    let latest_web_url = format!("https://github.com/{GITHUB_REPO}/releases/latest");
+    let latest_web_url = format!("https://github.com/{repo}/releases/latest");
 
     // Prefer a lightweight HEAD request (0 body bytes, never consumes api.github.com quota);
     // fall back to GET if a proxy rejects HEAD.
@@ -247,6 +248,7 @@ async fn fetch_release_json(
 }
 
 pub async fn check_latest_release() -> Result<ReleaseUpdateInfo, String> {
+    let repo = orbit_protocol::configured_github_repo();
     // 1. Primary path: resolve latest release tag via `github.com/.../releases/latest` 302 redirect.
     //    This bypasses `api.github.com` completely and never hits the 60 req/hr unauthenticated limit.
     match resolve_latest_tag_via_web_redirect().await {
@@ -258,8 +260,7 @@ pub async fn check_latest_release() -> Result<ReleaseUpdateInfo, String> {
                 .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
                 .build()
             {
-                let api_url =
-                    format!("https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}");
+                let api_url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
                 if let Ok(json) = fetch_release_json(&api_client, &api_url).await {
                     let enriched = parse_github_release_json(&json, CURRENT_APP_VERSION);
                     if !enriched.notes.is_empty() {
@@ -291,7 +292,7 @@ pub async fn check_latest_release() -> Result<ReleaseUpdateInfo, String> {
                 .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
                 .build()
                 .map_err(|e| format!("Failed to initialize update client: {e}"))?;
-            let api_url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+            let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
             match fetch_release_json(&client, &api_url).await {
                 Ok(json) => Ok(parse_github_release_json(&json, CURRENT_APP_VERSION)),
                 Err(api_err) => Err(format!("{web_err}; API fallback also failed: {api_err}")),
@@ -301,6 +302,7 @@ pub async fn check_latest_release() -> Result<ReleaseUpdateInfo, String> {
 }
 
 fn parse_github_release_json(json: &serde_json::Value, current_version: &str) -> ReleaseUpdateInfo {
+    let repo = orbit_protocol::configured_github_repo();
     let tag_name = json
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -312,7 +314,7 @@ fn parse_github_release_json(json: &serde_json::Value, current_version: &str) ->
         .get("html_url")
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("https://github.com/{GITHUB_REPO}/releases/latest"));
+        .unwrap_or_else(|| format!("https://github.com/{repo}/releases/latest"));
     let notes = json
         .get("body")
         .and_then(|v| v.as_str())
@@ -360,27 +362,27 @@ fn parse_github_release_json(json: &serde_json::Value, current_version: &str) ->
         has_newer_version: compare_semver(&latest_version, current_version) == Ordering::Greater,
         macos_dmg_url: dmg_url.or_else(|| {
             Some(format!(
-                "https://github.com/{GITHUB_REPO}/releases/download/{tag_name}/Orbit-macOS-AppleSilicon.dmg"
+                "https://github.com/{repo}/releases/download/{tag_name}/Orbit-macOS-AppleSilicon.dmg"
             ))
         }),
         linux_arm64_deb_url: linux_arm_deb.or_else(|| {
             Some(format!(
-                "https://github.com/{GITHUB_REPO}/releases/download/{tag_name}/Orbit-Linux-arm64.deb"
+                "https://github.com/{repo}/releases/download/{tag_name}/Orbit-Linux-arm64.deb"
             ))
         }),
         linux_x64_deb_url: linux_x64_deb.or_else(|| {
             Some(format!(
-                "https://github.com/{GITHUB_REPO}/releases/download/{tag_name}/Orbit-Linux-x64.deb"
+                "https://github.com/{repo}/releases/download/{tag_name}/Orbit-Linux-x64.deb"
             ))
         }),
         windows_nsis_url: windows_nsis.or_else(|| {
             Some(format!(
-                "https://github.com/{GITHUB_REPO}/releases/download/{tag_name}/Orbit-Windows-x64-setup.exe"
+                "https://github.com/{repo}/releases/download/{tag_name}/Orbit-Windows-x64-setup.exe"
             ))
         }),
         windows_msi_url: windows_msi.or_else(|| {
             Some(format!(
-                "https://github.com/{GITHUB_REPO}/releases/download/{tag_name}/Orbit-Windows-x64.msi"
+                "https://github.com/{repo}/releases/download/{tag_name}/Orbit-Windows-x64.msi"
             ))
         }),
         tag_name,
@@ -518,7 +520,8 @@ fn create_private_subdir(parent: &Path, name: &str) -> Result<PathBuf, String> {
 }
 
 fn fixed_release_download_urls(tag_name: &str, asset_name: &str) -> (String, String) {
-    let base = format!("https://github.com/{GITHUB_REPO}/releases/download/{tag_name}");
+    let repo = orbit_protocol::configured_github_repo();
+    let base = format!("https://github.com/{repo}/releases/download/{tag_name}");
     (
         format!("{base}/{asset_name}"),
         format!("{base}/{}", orbit_crypto::SHA256SUMS_FILENAME),
@@ -560,8 +563,9 @@ pub async fn perform_one_click_update(
     if cfg!(target_os = "windows") {
         return update_windows_installer_and_relaunch(&tag_name, &on_progress).await;
     }
+    let repo = orbit_protocol::configured_github_repo();
     Err(format!(
-        "Automatic updates are not supported on this platform. Download from https://github.com/{GITHUB_REPO}/releases/tag/{tag_name}"
+        "Automatic updates are not supported on this platform. Download from https://github.com/{repo}/releases/tag/{tag_name}"
     ))
 }
 
@@ -1272,9 +1276,10 @@ async fn download_orbit_cli_binary(dst_tmp: &Path) -> Result<(), String> {
         release_tags.push(valid_latest);
     }
 
+    let repo = orbit_protocol::configured_github_repo();
     let mut last_err = String::from("Failed to download Orbit daemon binary");
     for tag in release_tags {
-        let base = format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}");
+        let base = format!("https://github.com/{repo}/releases/download/{tag}");
         let sums_url = format!("{base}/{}", orbit_crypto::SHA256SUMS_FILENAME);
         let asset_url = format!("{base}/{asset}");
 
@@ -1575,6 +1580,7 @@ mod tests {
 
     #[test]
     fn build_release_info_from_tag_populates_platform_urls_without_api() {
+        let repo = orbit_protocol::configured_github_repo();
         let info = build_release_info_from_tag("v0.5.4", "0.5.3");
         assert!(info.has_newer_version);
         assert_eq!(info.tag_name, "v0.5.4");
@@ -1582,20 +1588,34 @@ mod tests {
         assert_eq!(
             info.macos_dmg_url.as_deref(),
             Some(
-                "https://github.com/danielgaoyy/orbit/releases/download/v0.5.4/Orbit-macOS-AppleSilicon.dmg"
+                format!(
+                    "https://github.com/{repo}/releases/download/v0.5.4/Orbit-macOS-AppleSilicon.dmg"
+                )
+                .as_str()
             )
         );
         assert_eq!(
             info.linux_arm64_deb_url.as_deref(),
             Some(
-                "https://github.com/danielgaoyy/orbit/releases/download/v0.5.4/Orbit-Linux-arm64.deb"
+                format!("https://github.com/{repo}/releases/download/v0.5.4/Orbit-Linux-arm64.deb")
+                    .as_str()
             )
         );
         assert_eq!(
             info.linux_x64_deb_url.as_deref(),
             Some(
-                "https://github.com/danielgaoyy/orbit/releases/download/v0.5.4/Orbit-Linux-x64.deb"
+                format!("https://github.com/{repo}/releases/download/v0.5.4/Orbit-Linux-x64.deb")
+                    .as_str()
             )
+        );
+        let (asset_url, sums_url) = fixed_release_download_urls("v0.5.4", "Orbit-Linux-x64.deb");
+        assert_eq!(
+            asset_url,
+            format!("https://github.com/{repo}/releases/download/v0.5.4/Orbit-Linux-x64.deb")
+        );
+        assert_eq!(
+            sums_url,
+            format!("https://github.com/{repo}/releases/download/v0.5.4/SHA256SUMS.txt")
         );
     }
 

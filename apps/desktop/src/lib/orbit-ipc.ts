@@ -987,6 +987,7 @@ export interface WorkspaceScriptInfo {
   terminal_id: string | null;
   port: number | null;
   proxy_url: string | null;
+  last_error?: string | null;
 }
 
 export interface ProviderSubagentDescriptor {
@@ -1822,6 +1823,34 @@ export interface GitReviewView {
   raw_diff: string;
   diff_files: DiffFileView[];
 }
+
+export interface GitCommitResult {
+  commit_sha: string;
+  short_sha: string;
+  summary: string;
+  branch: string | null;
+}
+
+export interface GitPushResult {
+  remote: string;
+  branch: string;
+  output: string;
+}
+
+export interface GitCreatePrResult {
+  url: string;
+  number: number | null;
+  title: string;
+}
+
+export type GitMutationOutcome =
+  | { kind: "files_staged"; paths: string[]; all: boolean }
+  | { kind: "files_unstaged"; paths: string[]; all: boolean }
+  | { kind: "hunk_applied"; reverse: boolean; cached: boolean }
+  | { kind: "files_discarded"; paths: string[]; include_untracked: boolean }
+  | ({ kind: "committed" } & GitCommitResult)
+  | ({ kind: "pushed" } & GitPushResult)
+  | ({ kind: "pr_created" } & GitCreatePrResult);
 
 export interface WorkspaceFileView {
   host_id: string;
@@ -2789,6 +2818,32 @@ export interface UpsertEventTriggerRequest {
   github_token?: string | null;
   keep_existing_token: boolean;
   enabled: boolean;
+}
+
+export interface ReattachTerminalEvent {
+  host_id: string;
+  terminal_id: string;
+  title: string;
+  cwd: string;
+  slot?: number | null;
+}
+
+export function normalizeBinaryChunk(payload: unknown): Uint8Array | null {
+  if (payload instanceof Uint8Array) {
+    return payload.byteLength > 0 ? payload : null;
+  }
+  if (payload instanceof ArrayBuffer) {
+    return payload.byteLength > 0 ? new Uint8Array(payload) : null;
+  }
+  if (ArrayBuffer.isView(payload)) {
+    return payload.byteLength > 0
+      ? new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength)
+      : null;
+  }
+  if (Array.isArray(payload) && payload.length > 0) {
+    return Uint8Array.from(payload as number[]);
+  }
+  return null;
 }
 
 export const orbitIpc = {
@@ -4191,6 +4246,133 @@ export const orbitIpc = {
     await invoke<void>("fetch_git_diff", { hostId, cwd, path, staged });
   },
 
+  gitStageFiles: async (params: {
+    hostId: string;
+    cwd: string;
+    paths?: string[];
+    all?: boolean;
+  }): Promise<GitMutationOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to stage git files.");
+    }
+    return invoke<GitMutationOutcome>("git_stage_files", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      paths: params.paths ?? [],
+      all: params.all ?? false,
+    });
+  },
+
+  gitUnstageFiles: async (params: {
+    hostId: string;
+    cwd: string;
+    paths?: string[];
+    all?: boolean;
+  }): Promise<GitMutationOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to unstage git files.");
+    }
+    return invoke<GitMutationOutcome>("git_unstage_files", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      paths: params.paths ?? [],
+      all: params.all ?? false,
+    });
+  },
+
+  gitApplyHunk: async (params: {
+    hostId: string;
+    cwd: string;
+    patch: string;
+    reverse?: boolean;
+    cached?: boolean;
+  }): Promise<GitMutationOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to apply git hunks.");
+    }
+    return invoke<GitMutationOutcome>("git_apply_hunk", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      patch: params.patch,
+      reverse: params.reverse ?? false,
+      cached: params.cached ?? false,
+    });
+  },
+
+  gitDiscardFiles: async (params: {
+    hostId: string;
+    cwd: string;
+    paths: string[];
+    includeUntracked?: boolean;
+  }): Promise<GitMutationOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to discard git changes.");
+    }
+    return invoke<GitMutationOutcome>("git_discard_files", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      paths: params.paths,
+      includeUntracked: params.includeUntracked ?? false,
+    });
+  },
+
+  gitCommit: async (params: {
+    hostId: string;
+    cwd: string;
+    message: string;
+    amend?: boolean;
+  }): Promise<GitCommitResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to create git commits.");
+    }
+    return invoke<GitCommitResult>("git_commit", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      message: params.message,
+      amend: params.amend ?? false,
+    });
+  },
+
+  gitPush: async (params: {
+    hostId: string;
+    cwd: string;
+    remote?: string | null;
+    branch?: string | null;
+    setUpstream?: boolean;
+  }): Promise<GitPushResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to push git branches.");
+    }
+    return invoke<GitPushResult>("git_push", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      remote: params.remote ?? null,
+      branch: params.branch ?? null,
+      setUpstream: params.setUpstream ?? false,
+    });
+  },
+
+  gitCreatePr: async (params: {
+    hostId: string;
+    cwd: string;
+    title: string;
+    body?: string;
+    base?: string | null;
+    draft?: boolean;
+  }): Promise<GitCreatePrResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to create pull requests.");
+    }
+    return invoke<GitCreatePrResult>("git_create_pr", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      title: params.title,
+      body: params.body ?? "",
+      base: params.base ?? null,
+      draft: params.draft ?? false,
+    });
+  },
+
   startTerminal: async (
     hostId: string,
     cwd: string,
@@ -4215,6 +4397,47 @@ export const orbitIpc = {
     await invoke<void>("kill_terminal", { hostId, terminalId });
   },
 
+  subscribeTerminalBinary: async (
+    hostId: string,
+    terminalId: string,
+    onChunk: (bytes: Uint8Array) => void,
+    slot?: number,
+  ): Promise<string | null> => {
+    if (!isTauriRuntime()) return null;
+    const channel = new Channel<ArrayBuffer | Uint8Array | number[]>();
+    channel.onmessage = (payload) => {
+      const bytes = normalizeBinaryChunk(payload);
+      if (bytes) {
+        onChunk(bytes);
+      }
+    };
+    return invoke<string>("subscribe_terminal_binary", {
+      hostId,
+      terminalId,
+      slot: slot ?? null,
+      onChunk: channel,
+    });
+  },
+
+  unsubscribeTerminalBinary: async (subscriptionId: string): Promise<void> => {
+    if (!isTauriRuntime() || !subscriptionId) return;
+    await invoke<void>("unsubscribe_terminal_binary", { subscriptionId });
+  },
+
+  ensureTerminalSlot: async (hostId: string, terminalId: string): Promise<number | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<number>("ensure_terminal_slot", { hostId, terminalId });
+  },
+
+  writeTerminalInput: async (
+    hostId: string,
+    terminalId: string,
+    data: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("write_terminal_input", { hostId, terminalId, data });
+  },
+
   sendTerminalInputSlot: async (
     hostId: string,
     slot: number,
@@ -4222,6 +4445,21 @@ export const orbitIpc = {
   ): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("send_terminal_input_slot", { hostId, slot, data });
+  },
+
+  resizeTerminal: async (
+    hostId: string,
+    cols: number,
+    rows: number,
+    terminalId?: string | null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("resize_terminal", {
+      hostId,
+      cols,
+      rows,
+      terminalId: terminalId ?? null,
+    });
   },
 
   resizeTerminalSlot: async (
@@ -4232,6 +4470,47 @@ export const orbitIpc = {
   ): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("resize_terminal_slot", { hostId, slot, cols, rows });
+  },
+
+  openDetachedTerminalWindow: async (
+    hostId: string,
+    terminalId: string,
+    title: string,
+    cwd?: string,
+  ): Promise<string | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<string>("open_detached_terminal_window", {
+      hostId,
+      terminalId,
+      title,
+      cwd: cwd ?? null,
+    });
+  },
+
+  reattachDetachedTerminal: async (
+    hostId: string,
+    terminalId: string,
+    title: string,
+    cwd?: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("reattach_detached_terminal", {
+      hostId,
+      terminalId,
+      title,
+      cwd: cwd ?? null,
+    });
+  },
+
+  onReattachTerminal: async (
+    handler: (payload: ReattachTerminalEvent) => void,
+  ): Promise<() => void> => {
+    if (!isTauriRuntime()) return () => {};
+    return listen<ReattachTerminalEvent>("orbit://reattach-terminal", (event) => {
+      if (event.payload) {
+        handler(event.payload);
+      }
+    });
   },
 
   listSshHosts: async (): Promise<SshHostItem[]> => {

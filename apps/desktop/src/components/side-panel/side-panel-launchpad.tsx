@@ -15,9 +15,12 @@ import {
 } from "lucide-react";
 
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
+import {
+  WorkspaceScriptsSection,
+  useWorkspaceScripts,
+} from "@/components/side-panel/scripts-panel";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
-import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { orbitActions, sideQuestionScopeKey, useOrbitSelector } from "@/state/orbit-store";
 import type { DiffFileView, SessionInsightsView } from "@/lib/orbit-ipc";
@@ -310,12 +313,9 @@ export function SidePanelLaunchpad({
         icon: <Blocks className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />,
         trailing:
           artifactCount > 0 ? (
-            <Badge
-              variant="secondary"
-              className="text-muted-foreground h-4 min-w-[18px] justify-center rounded-full px-1.5 text-[10.5px] font-medium tabular-nums"
-            >
+            <span className="text-muted-foreground/75 text-[11.5px] font-medium tabular-nums">
               {artifactCount}
-            </Badge>
+            </span>
           ) : null,
         onSelect: () =>
           orbitActions.openArtifactsTab({
@@ -332,12 +332,9 @@ export function SidePanelLaunchpad({
         ),
         trailing:
           totalTerminalCount > 0 ? (
-            <Badge
-              variant="secondary"
-              className="text-muted-foreground h-4 min-w-[18px] justify-center rounded-full px-1.5 text-[10.5px] font-medium tabular-nums"
-            >
+            <span className="text-muted-foreground/75 text-[11.5px] font-medium tabular-nums">
               {totalTerminalCount}
-            </Badge>
+            </span>
           ) : null,
         onSelect: () => orbitActions.openTerminalTab(),
       },
@@ -347,17 +344,26 @@ export function SidePanelLaunchpad({
         keywords: ["browser", "web", "url", "preview", "http", "localhost"],
         icon: <Globe className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />,
         trailing: primaryLocalUrl ? (
-          <Badge
-            variant="secondary"
+          <span
+            role="button"
+            tabIndex={0}
+            title={primaryLocalUrl}
             onClick={(e) => {
               e.stopPropagation();
               orbitActions.openBrowserTab(primaryLocalUrl);
             }}
-            className="text-muted-foreground hover:text-foreground h-4 max-w-[140px] gap-1 rounded-full px-1.5 text-[10.5px] font-normal transition-colors"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                e.stopPropagation();
+                orbitActions.openBrowserTab(primaryLocalUrl);
+              }
+            }}
+            className="text-muted-foreground hover:text-foreground inline-flex max-w-[110px] items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[11px] transition-colors hover:bg-black/[0.05] dark:hover:bg-white/[0.08] @[360px]:max-w-[152px]"
           >
             <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
             <span className="truncate">{formatCompactHostLabel(primaryLocalUrl)}</span>
-          </Badge>
+          </span>
         ) : null,
         onSelect: () => orbitActions.openBrowserTab(),
       },
@@ -370,12 +376,9 @@ export function SidePanelLaunchpad({
         ),
         trailing:
           sideQuestionCount > 0 ? (
-            <Badge
-              variant="secondary"
-              className="text-muted-foreground h-4 min-w-[18px] justify-center rounded-full px-1.5 text-[10.5px] font-medium tabular-nums"
-            >
+            <span className="text-muted-foreground/75 text-[11.5px] font-medium tabular-nums">
               {sideQuestionCount}
-            </Badge>
+            </span>
           ) : null,
         onSelect: () => orbitActions.openSideQuestionTab(),
       },
@@ -530,16 +533,18 @@ export function SidePanelLaunchpad({
     ? backgroundTasks
     : backgroundTasks.slice(0, 4);
   const recentFiles = insights.touched_files.slice(0, 5);
+  const { scripts: workspaceScripts } = useWorkspaceScripts(selectedHostId);
+  const hasWorkspaceScripts = workspaceScripts.length > 0;
 
   return (
     <ScrollArea className="h-full w-full">
-      <div className="mx-auto flex w-full max-w-[680px] flex-col px-5 pt-5 pb-8">
-        {/* Top Search / URL Pill Input */}
+      <div className="@container mx-auto flex w-full max-w-[680px] min-w-0 flex-col px-3 pt-3.5 pb-6 @[380px]:px-5 @[380px]:pt-5 @[380px]:pb-8">
+        {/* Top Search / URL Input */}
         <div
           className={cn(
-            "bg-background relative flex h-[38px] w-full items-center gap-2.5 rounded-full border border-black/[0.1] px-3.5 shadow-[0_1px_2px_rgba(0,0,0,0.03)] transition-colors",
-            "focus-within:border-primary/50 focus-within:ring-primary/15 focus-within:ring-[3px]",
-            "dark:border-white/[0.12] dark:bg-white/[0.03] dark:focus-within:border-primary/50 dark:focus-within:ring-primary/20",
+            "border-border relative flex h-[36px] w-full items-center gap-2 rounded-[10px] border bg-black/[0.02] px-3 transition-colors",
+            "focus-within:border-primary/45 focus-within:bg-background focus-within:ring-primary/15 focus-within:ring-2",
+            "dark:bg-white/[0.03] dark:focus-within:border-primary/50 dark:focus-within:bg-white/[0.04] dark:focus-within:ring-primary/20",
           )}
         >
           {sideQuestionText ? (
@@ -669,9 +674,19 @@ export function SidePanelLaunchpad({
                   >
                     <span className="flex min-w-0 flex-1 items-center gap-2.5">
                       <FileIcon className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />
-                      <span className="shrink-0 font-medium">{name}</span>
+                      <span
+                        title={entry.filePath}
+                        className={cn(
+                          "min-w-0 truncate font-medium",
+                          dir ? "max-w-[65%] shrink-0" : "flex-1",
+                        )}
+                      >
+                        {name}
+                      </span>
                       {dir && (
-                        <span className="text-muted-foreground/65 truncate text-[12px]">{dir}</span>
+                        <span className="text-muted-foreground/65 min-w-0 flex-1 truncate text-[12px]">
+                          {dir}
+                        </span>
                       )}
                     </span>
                     {isSelected && (
@@ -717,8 +732,10 @@ export function SidePanelLaunchpad({
               })}
             </div>
 
-            {(backgroundTasks.length > 0 || recentFiles.length > 0) && (
-              <div className="mt-6 flex flex-col gap-5">
+            {(hasWorkspaceScripts || backgroundTasks.length > 0 || recentFiles.length > 0) && (
+              <div className="border-border/60 mt-4 flex flex-col gap-5 border-t pt-4">
+                {/* Workspace Services & Scripts (orbit.json / paseo.json — 0px when none configured) */}
+                <WorkspaceScriptsSection hostId={selectedHostId} />
                 {/* Background Tasks */}
                 {backgroundTasks.length > 0 && (
                   <section>
@@ -776,7 +793,7 @@ export function SidePanelLaunchpad({
                               )}
                             </button>
                             {hasDetails && isExpanded && (
-                              <div className="border-border/60 selectable-text mx-2.5 mb-1.5 space-y-1 rounded-md border bg-black/[0.03] px-2.5 py-1.5 font-mono text-[11px] dark:bg-white/[0.04]">
+                              <div className="border-border/75 selectable-text mx-2.5 mb-1.5 space-y-1 rounded-r-md border-l-2 bg-black/[0.025] px-2.5 py-1.5 font-mono text-[11px] dark:bg-white/[0.035]">
                                 {task.command && (
                                   <div className="text-foreground/85 break-all whitespace-pre-wrap">
                                     $ {task.command}
@@ -829,14 +846,22 @@ export function SidePanelLaunchpad({
                           <button
                             key={file.path}
                             type="button"
+                            title={file.path}
                             onClick={() => orbitActions.openFileInSidePanel(file.path)}
                             className="text-foreground/85 flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2.5 text-left text-[12.5px] transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]"
                           >
-                            <span className="flex min-w-0 items-center gap-2.5">
+                            <span className="flex min-w-0 flex-1 items-center gap-2.5">
                               <FileIcon className="text-muted-foreground/80 h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                              <span className="shrink-0 font-medium">{name}</span>
+                              <span
+                                className={cn(
+                                  "min-w-0 truncate font-medium",
+                                  dir ? "max-w-[65%] shrink-0" : "flex-1",
+                                )}
+                              >
+                                {name}
+                              </span>
                               {dir && (
-                                <span className="text-muted-foreground/60 truncate text-[11.5px]">
+                                <span className="text-muted-foreground/60 min-w-0 flex-1 truncate text-[11.5px]">
                                   {dir}
                                 </span>
                               )}

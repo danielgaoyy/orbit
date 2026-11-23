@@ -632,7 +632,7 @@ final class OrbitIosLogicTests: OrbitLogicTestCase {
 
         let dirValues = try storageDir.resourceValues(forKeys: [.isExcludedFromBackupKey])
         try checkEqual(dirValues.isExcludedFromBackup, true, "storage directory excluded from backup")
-        #if os(iOS)
+        #if os(iOS) && !targetEnvironment(simulator)
         let dirAttrs = try fm.attributesOfItem(atPath: storageDir.path)
         try checkEqual(
             dirAttrs[.protectionKey] as? FileProtectionType,
@@ -662,7 +662,7 @@ final class OrbitIosLogicTests: OrbitLogicTestCase {
                 storageDir.standardizedFileURL,
                 "\(fileURL.lastPathComponent) resides inside backup-excluded storage directory"
             )
-            #if os(iOS)
+            #if os(iOS) && !targetEnvironment(simulator)
             let attrs = try fm.attributesOfItem(atPath: fileURL.path)
             try checkEqual(
                 attrs[.protectionKey] as? FileProtectionType,

@@ -1,21 +1,16 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
-  AlertCircle,
-  Archive,
   ArrowUpRight,
   Blocks,
   ChevronRight,
-  CircleCheck,
   Clock,
   File,
   FileDiff,
   FileText,
-  MoreHorizontal,
   Play,
   Square,
   SquareTerminal,
   Timer,
-  Unlink,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -23,19 +18,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
-import { ProviderIcon } from "@/components/ui/provider-icons";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/overlays";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -49,12 +37,10 @@ import {
   isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
-import { type ResolvedSubagentItem, resolveSessionSubagents } from "@/lib/subagents";
 import { normalizeCwdForCompare } from "@/lib/stage-cache";
 import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import {
   type OverviewSectionId,
-  isSubagentArchived,
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
@@ -311,9 +297,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
   cardMaxHeightExpr,
 }: StageOverviewContentProps) {
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
-  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
   const hostDetail = hostDetails[hostId] ?? null;
   const gitReview = useOrbitSelector((s) => {
     if (!cwd) return null;
@@ -332,7 +316,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const [stoppingBg, setStoppingBg] = useState(false);
-  const [openSubagentMenuKey, setOpenSubagentMenuKey] = useState<string | null>(null);
 
   const currentWorkspace = useMemo(() => {
     if (!hostDetail || !currentAgent) return null;
@@ -453,8 +436,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
     const id = window.setInterval(() => setTimerNowMs(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, [hasArmedTimers]);
-
-  const [showAllSubagents, setShowAllSubagents] = useState(false);
   const [showAllTasks, setShowAllTasks] = useState(false);
   const layer1Ref = useRef<HTMLDivElement | null>(null);
   const [layer1HeightPx, setLayer1HeightPx] = useState(176);
@@ -476,68 +457,8 @@ const StageOverviewBody = memo(function StageOverviewBody({
   }, [showGroupNotesRow, cwd, armedTimers.length]);
 
   useEffect(() => {
-    setShowAllSubagents(false);
     setShowAllTasks(false);
   }, [agentId]);
-
-  const orderedSubagents = useMemo(
-    () =>
-      resolveSessionSubagents({
-        hostId,
-        agentId,
-        insightsSubagents: insights.subagents,
-        hostDetails,
-        fleetHosts,
-      }).filter(
-        (sa) =>
-          !isSubagentArchived(archivedSubagents, hostId, agentId, {
-            id: sa.callId,
-            providerSubagentId: sa.providerSubagentId,
-            childAgentId: sa.childAgentId,
-          }),
-      ),
-    [hostId, agentId, insights.subagents, hostDetails, fleetHosts, archivedSubagents],
-  );
-
-  const hasAwaitingSubagent = orderedSubagents.some((s) => s.status === "awaiting_permission");
-  const hasRunningSubagent = orderedSubagents.some((s) => s.status === "running");
-  const activeSubagentCount = orderedSubagents.filter(
-    (s) => s.status === "awaiting_permission" || s.status === "running",
-  ).length;
-  const finishedSubagents = useMemo(
-    () =>
-      orderedSubagents.filter(
-        (s) => s.status !== "running" && s.status !== "awaiting_permission",
-      ),
-    [orderedSubagents],
-  );
-
-  // Show up to 4 subagents when active work exists (filling with latest finished if active < 4),
-  // or up to 3 most recent finished subagents when idle.
-  const defaultVisibleSubagentCount =
-    activeSubagentCount > 0
-      ? Math.min(orderedSubagents.length, 4)
-      : Math.min(orderedSubagents.length, 3);
-  const visibleSubagents = showAllSubagents
-    ? orderedSubagents
-    : orderedSubagents.slice(0, defaultVisibleSubagentCount);
-  const hiddenSubagentCount = Math.max(0, orderedSubagents.length - visibleSubagents.length);
-
-  const handleOpenSubagent = (sa: ResolvedSubagentItem) => {
-    if (sa.status === "awaiting_permission" && sa.isManaged && sa.childAgentId) {
-      orbitActions.selectAgent(sa.childHostId, sa.childAgentId);
-      return;
-    }
-    orbitActions.openSubagentTab({
-      callId: sa.callId,
-      role: sa.title,
-      promptPreview: sa.promptPreview,
-      childAgentId: sa.childAgentId,
-      childHostId: sa.childHostId,
-      providerSubagentId: sa.providerSubagentId,
-      parentAgentId: agentId,
-    });
-  };
 
   const orderedTasks = useMemo(() => {
     const running = backgroundTasks.filter((t) => t.status === "running");
@@ -552,7 +473,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
     ? orderedTasks
     : orderedTasks.slice(0, defaultVisibleTaskCount);
   const hiddenTaskCount = Math.max(0, orderedTasks.length - visibleTasks.length);
-  const hasSecondarySections = orderedSubagents.length > 0 || backgroundTasks.length > 0;
+  const hasSecondarySections = backgroundTasks.length > 0;
 
   return (
     <>
@@ -685,253 +606,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
           style={{ maxHeight: `calc(${cardMaxHeightExpr} - ${layer1HeightPx}px)` }}
           className="min-h-0 flex-1 overflow-y-auto overscroll-contain select-none"
         >
-          {/* Layer 2: Subagents (single unified list: resting minimalist, hover actions for managed & native) */}
-          {orderedSubagents.length > 0 && (
-        <OverviewLayerSection
-          id="subagents"
-          label="Subagents"
-          count={orderedSubagents.length}
-          collapsed={collapsedSections.subagents}
-          isRunning={hasRunningSubagent}
-          hasAlert={hasAwaitingSubagent}
-          headerAction={
-            finishedSubagents.length > 0 ? (
-              <SimpleTooltip
-                label={
-                  finishedSubagents.length > 1
-                    ? `Archive finished (${finishedSubagents.length})`
-                    : "Archive finished"
-                }
-              >
-                <button
-                  type="button"
-                  aria-label="Archive finished subagents"
-                  onClick={() => {
-                    const managed = finishedSubagents.filter(
-                      (item) => item.isManaged && item.childAgentId,
-                    );
-                    for (const item of managed) {
-                      if (item.childAgentId) {
-                        orbitActions.archiveThread(item.childHostId, item.childAgentId);
-                      }
-                    }
-                    const nativeItems = finishedSubagents.filter(
-                      (item) => !(item.isManaged && item.childAgentId),
-                    );
-                    if (nativeItems.length > 0) {
-                      orbitActions.archiveFinishedSubagents(
-                        hostId,
-                        agentId,
-                        nativeItems.map((item) => ({
-                          id: item.callId,
-                          providerSubagentId: item.providerSubagentId,
-                          childAgentId: item.childAgentId,
-                        })),
-                      );
-                    }
-                  }}
-                  className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
-                >
-                  <Archive className="size-[13px] stroke-[1.75]" />
-                </button>
-              </SimpleTooltip>
-            ) : undefined
-          }
-          footer={
-            orderedSubagents.length > defaultVisibleSubagentCount ? (
-              <div
-                className={cn(
-                  showAllSubagents
-                    ? "bg-elevated/95 sticky bottom-0 z-[2] -mx-2.5 pt-0.5 pr-2.5 pb-2 pl-[18px] backdrop-blur-[6px]"
-                    : "pt-0.5 pb-2 pl-2",
-                )}
-              >
-                <button
-                  type="button"
-                  onClick={() => setShowAllSubagents((v) => !v)}
-                  className="text-muted-foreground/75 hover:text-foreground inline-flex cursor-pointer items-center py-0.5 text-[11.5px] leading-[16px] font-medium transition-colors"
-                >
-                  {showAllSubagents ? "Show less" : `Show ${hiddenSubagentCount} more`}
-                </button>
-              </div>
-            ) : undefined
-          }
-        >
-          <div className="space-y-0.5">
-            {visibleSubagents.map((sa) => {
-            const isMenuOpen = openSubagentMenuKey === sa.key;
-            const showCrossProvider = Boolean(
-              sa.isManaged &&
-                sa.childProvider &&
-                currentAgent?.provider &&
-                sa.childProvider !== currentAgent.provider,
-            );
-            const hasRestingMeta = Boolean(
-              sa.status === "awaiting_permission" || sa.remoteHostName || showCrossProvider,
-            );
-            const canManage = Boolean(sa.isManaged && sa.childAgentId);
-
-            return (
-              <div
-                key={sa.key}
-                className={cn(
-                  "group/subrow flex h-[32px] min-w-0 w-full items-center rounded-[8px] transition-colors",
-                  isMenuOpen ? "bg-accent/65" : "hover:bg-accent/65",
-                )}
-              >
-                <button
-                  type="button"
-                  title={sa.promptPreview || sa.title}
-                  onClick={() => handleOpenSubagent(sa)}
-                  className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2.5 pr-1 pl-2 text-left"
-                >
-                  <span className="flex size-[15px] shrink-0 items-center justify-center">
-                    {sa.status === "awaiting_permission" ? (
-                      <span className="size-[6.5px] rounded-full bg-amber-500 shadow-[0_0_0_2.5px_rgba(245,158,11,0.18)]" />
-                    ) : sa.status === "running" ? (
-                      <OrbitSpinner size={13.5} className="text-foreground/70" />
-                    ) : sa.status === "completed" ? (
-                      <CircleCheck className="size-[14px] shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
-                    ) : sa.status === "canceled" ? (
-                      <span className="bg-muted-foreground/45 size-[6.5px] rounded-full" />
-                    ) : (
-                      <AlertCircle className="size-[14px] shrink-0 text-rose-500/85" />
-                    )}
-                  </span>
-                  <span
-                    className={cn(
-                      "text-foreground/86 group-hover/subrow:text-foreground min-w-0 flex-1 truncate text-[13px] leading-[18px] font-normal transition-colors",
-                      sa.status === "running" && "agent-text-shimmer",
-                    )}
-                  >
-                    {sa.title}
-                  </span>
-                </button>
-
-                <div className="flex shrink-0 items-center pr-1.5">
-                  {/* Resting: at most one quiet trailing cue */}
-                  {hasRestingMeta && (
-                    <div
-                      className={cn(
-                        "flex items-center pr-0.5",
-                        isMenuOpen
-                          ? "hidden"
-                          : "group-hover/subrow:hidden group-focus-within/subrow:hidden",
-                      )}
-                    >
-                      {sa.status === "awaiting_permission" ? (
-                        <span className="text-[11px] font-medium text-amber-600/90 dark:text-amber-400/90">
-                          Approval
-                        </span>
-                      ) : sa.remoteHostName ? (
-                        <span className="text-muted-foreground/60 max-w-[76px] truncate text-[11px]">
-                          {sa.remoteHostName}
-                        </span>
-                      ) : showCrossProvider && sa.childProvider ? (
-                        <ProviderIcon
-                          provider={sa.childProvider}
-                          className="size-[12.5px] shrink-0 opacity-60"
-                        />
-                      ) : null}
-                    </div>
-                  )}
-
-                  {/* Hover: managed subagents expose Open thread + More menu; native read-only shows quiet chevron */}
-                  {canManage && sa.childAgentId ? (
-                    <div
-                      className={cn(
-                        "items-center gap-0.5",
-                        isMenuOpen
-                          ? "flex"
-                          : "hidden group-hover/subrow:flex group-focus-within/subrow:flex",
-                      )}
-                    >
-                      <SimpleTooltip label="Open thread">
-                        <button
-                          type="button"
-                          aria-label={`Open ${sa.title} thread`}
-                          onClick={() => orbitActions.selectAgent(sa.childHostId, sa.childAgentId!)}
-                          className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
-                        >
-                          <ArrowUpRight className="size-[13px] stroke-[1.8]" />
-                        </button>
-                      </SimpleTooltip>
-
-                      <DropdownMenu
-                        open={isMenuOpen}
-                        onOpenChange={(next) => setOpenSubagentMenuKey(next ? sa.key : null)}
-                      >
-                        <DropdownMenuTrigger asChild>
-                          <button
-                            type="button"
-                            aria-label={`More actions for ${sa.title}`}
-                            className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
-                          >
-                            <MoreHorizontal className="size-[13.5px] stroke-[1.8]" />
-                          </button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent
-                          align="end"
-                          side="bottom"
-                          sideOffset={4}
-                          className="min-w-[164px]"
-                        >
-                          <DropdownMenuItem
-                            onSelect={() => {
-                              setOpenSubagentMenuKey(null);
-                              void orbitActions.detachAgent(sa.childHostId, sa.childAgentId!);
-                            }}
-                          >
-                            <span className="flex items-center gap-2">
-                              <Unlink className="text-muted-foreground size-[13.5px]" />
-                              <span>Detach to thread</span>
-                            </span>
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            onSelect={() => {
-                              setOpenSubagentMenuKey(null);
-                              orbitActions.archiveThread(sa.childHostId, sa.childAgentId!);
-                            }}
-                          >
-                            <span className="flex items-center gap-2">
-                              <Archive className="text-muted-foreground size-[13.5px]" />
-                              <span>Archive</span>
-                            </span>
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </div>
-                  ) : (
-                    <div className="hidden items-center gap-0.5 group-focus-within/subrow:flex group-hover/subrow:flex">
-                      <SimpleTooltip label="Archive">
-                        <button
-                          type="button"
-                          aria-label={`Archive ${sa.title}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            orbitActions.archiveSubagent(hostId, agentId, {
-                              id: sa.callId,
-                              providerSubagentId: sa.providerSubagentId,
-                              childAgentId: sa.childAgentId,
-                              role: sa.title,
-                            });
-                          }}
-                          className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
-                        >
-                          <Archive className="size-[12.5px] stroke-[1.75]" />
-                        </button>
-                      </SimpleTooltip>
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-          </div>
-        </OverviewLayerSection>
-      )}
-
-      {/* Layer 3: Background Tasks (minimal single-line rows; actions appear quietly on hover) */}
+          {/* Layer 2: Background Tasks (minimal single-line rows; actions appear quietly on hover) */}
       {backgroundTasks.length > 0 && (
         <OverviewLayerSection
           id="tasks"

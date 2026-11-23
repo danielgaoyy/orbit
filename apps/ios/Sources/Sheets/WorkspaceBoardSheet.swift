@@ -393,7 +393,7 @@ struct WorkspaceBoardPanel: View {
                             HStack(spacing: 10) {
                                 if peer.isAwaitingPermission {
                                     Circle().fill(palette.warning).frame(width: 7, height: 7)
-                                } else if peer.isRunning {
+                                } else if peer.isForegroundRunning {
                                     OrbitSpinnerRingView(color: palette.primary, size: 12)
                                 } else {
                                     OrbitProviderIcon(provider: peer.provider, size: 14)

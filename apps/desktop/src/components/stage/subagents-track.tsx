@@ -1,19 +1,29 @@
 import { memo, useMemo, useState } from "react";
 import {
   AlertTriangle,
+  Archive,
   ArrowLeft,
   ArrowUpRight,
   Check,
   ChevronRight,
+  ChevronUp,
   HeartPulse,
+  Layers,
   Server,
   Sparkles,
   Unlink,
   X,
 } from "lucide-react";
-import { type AgentCardView, type TimelineItemView, orbitIpc } from "@/lib/orbit-ipc";
+import {
+  type AgentCardView,
+  type TimelineItemView,
+  orbitIpc,
+} from "@/lib/orbit-ipc";
+import { resolveSessionSubagents } from "@/lib/subagents";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/overlays";
+import { isSubagentArchived, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 /**
@@ -149,6 +159,266 @@ export const SubagentApprovalBanner = memo(function SubagentApprovalBanner({
           <ArrowUpRight className="size-[12.5px]" />
         </button>
       </div>
+    </div>
+  );
+});
+
+/**
+ * Compact docked Subagents pill above the composer (matching iOS `SubagentsTrackPill`).
+ * Single unified hub for viewing, inspecting, jumping to, detaching, and archiving
+ * both Orbit managed subagents and Provider native subagents.
+ */
+export const SubagentsTrack = memo(function SubagentsTrack({
+  hostId,
+  agentId,
+}: {
+  hostId: string | null;
+  agentId: string | null;
+}) {
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
+  const insightsSubagents = useOrbitSelector((s) =>
+    hostId && agentId
+      ? (s.stages[`${hostId}::${agentId}`]?.insights.subagents ?? [])
+      : [],
+  );
+  const [open, setOpen] = useState(false);
+
+  const orderedSubagents = useMemo(() => {
+    if (!hostId || !agentId) return [];
+    return resolveSessionSubagents({
+      hostId,
+      agentId,
+      insightsSubagents,
+      hostDetails,
+      fleetHosts,
+    }).filter(
+      (sa) =>
+        !isSubagentArchived(archivedSubagents, hostId, agentId, {
+          id: sa.callId,
+          providerSubagentId: sa.providerSubagentId,
+          childAgentId: sa.childAgentId,
+        }),
+    );
+  }, [hostId, agentId, insightsSubagents, hostDetails, fleetHosts, archivedSubagents]);
+
+  const totalCount = orderedSubagents.length;
+  if (!hostId || !agentId || totalCount === 0) return null;
+
+  const awaitingPermCount = orderedSubagents.filter(
+    (s) => s.status === "awaiting_permission",
+  ).length;
+  const runningCount = orderedSubagents.filter((s) => s.status === "running").length;
+  const finishedSubagents = orderedSubagents.filter(
+    (s) => s.status !== "running" && s.status !== "awaiting_permission",
+  );
+
+  return (
+    <div className="mx-auto mb-1.5 flex w-full max-w-[780px] justify-start px-4">
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className={cn(
+              "border-border/80 bg-elevated/90 hover:bg-accent/70 inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-full border px-2.5 text-[12px] shadow-xs backdrop-blur-sm transition-colors",
+              awaitingPermCount > 0 && "border-amber-500/40 bg-amber-500/[0.07]",
+            )}
+          >
+            {awaitingPermCount > 0 ? (
+              <span className="size-[6.5px] shrink-0 rounded-full bg-amber-500" />
+            ) : runningCount > 0 ? (
+              <OrbitSpinner size={12} className="text-foreground/75" />
+            ) : (
+              <Layers className="text-muted-foreground size-[12.5px] shrink-0" />
+            )}
+
+            <span className="text-foreground/90 font-medium">
+              Subagents · {totalCount}
+            </span>
+
+            {awaitingPermCount > 0 ? (
+              <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                {awaitingPermCount} waiting
+              </span>
+            ) : runningCount > 0 ? (
+              <span className="text-muted-foreground text-[11px]">
+                {runningCount} running
+              </span>
+            ) : null}
+
+            <ChevronUp
+              className={cn(
+                "text-muted-foreground/70 size-[12px] transition-transform",
+                open && "rotate-180",
+              )}
+            />
+          </button>
+        </PopoverTrigger>
+
+        <PopoverContent
+          align="start"
+          side="top"
+          sideOffset={6}
+          className="border-border bg-popover w-[360px] max-w-[calc(100vw-32px)] rounded-xl border p-1.5 shadow-lg"
+        >
+          <div className="flex items-center justify-between px-2 py-1">
+            <span className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
+              Subagents ({totalCount})
+            </span>
+            {finishedSubagents.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  const managed = finishedSubagents.filter(
+                    (item) => item.isManaged && item.childAgentId,
+                  );
+                  for (const item of managed) {
+                    if (item.childAgentId) {
+                      orbitActions.archiveThread(item.childHostId, item.childAgentId);
+                    }
+                  }
+                  const nativeItems = finishedSubagents.filter(
+                    (item) => !(item.isManaged && item.childAgentId),
+                  );
+                  if (nativeItems.length > 0) {
+                    orbitActions.archiveFinishedSubagents(
+                      hostId,
+                      agentId,
+                      nativeItems.map((item) => ({
+                        id: item.callId,
+                        providerSubagentId: item.providerSubagentId,
+                        childAgentId: item.childAgentId,
+                      })),
+                    );
+                  }
+                }}
+                className="text-muted-foreground hover:text-foreground cursor-pointer text-[11px] transition-colors"
+              >
+                Archive finished
+              </button>
+            )}
+          </div>
+
+          <div className="max-h-[280px] space-y-0.5 overflow-y-auto">
+            {orderedSubagents.map((sa) => {
+              const isAwaiting = sa.status === "awaiting_permission";
+              const isRunning = sa.status === "running";
+              const isFailed = sa.status === "failed";
+              const isCanceled = sa.status === "canceled";
+              const canManage = Boolean(sa.isManaged && sa.childAgentId);
+
+              return (
+                <div
+                  key={sa.key}
+                  className="hover:bg-accent/60 flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-[12.5px] transition-colors"
+                >
+                  <button
+                    type="button"
+                    title={sa.promptPreview || sa.title}
+                    onClick={() => {
+                      setOpen(false);
+                      if (isAwaiting && canManage && sa.childAgentId) {
+                        orbitActions.selectAgent(sa.childHostId, sa.childAgentId);
+                        return;
+                      }
+                      orbitActions.openSubagentTab({
+                        callId: sa.callId,
+                        role: sa.title,
+                        promptPreview: sa.promptPreview,
+                        childAgentId: sa.childAgentId,
+                        childHostId: sa.childHostId,
+                        providerSubagentId: sa.providerSubagentId,
+                        parentAgentId: agentId,
+                      });
+                    }}
+                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+                  >
+                    {isAwaiting ? (
+                      <span className="size-[6.5px] shrink-0 rounded-full bg-amber-500 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]" />
+                    ) : isRunning ? (
+                      <OrbitSpinner size={12} className="text-foreground/75 shrink-0" />
+                    ) : isFailed ? (
+                      <AlertTriangle className="text-rose-500 size-[12px] shrink-0" />
+                    ) : isCanceled ? (
+                      <span className="bg-muted-foreground/45 size-[6.5px] shrink-0 rounded-full" />
+                    ) : (
+                      <Check className="text-emerald-500 size-[12px] shrink-0" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <div className="text-foreground truncate font-medium">{sa.title}</div>
+                      <div className="text-muted-foreground flex items-center gap-1.5 truncate text-[11px]">
+                        <span>
+                          {isAwaiting
+                            ? "Approval required"
+                            : isRunning
+                              ? "Running"
+                              : isFailed
+                                ? "Failed"
+                                : isCanceled
+                                  ? "Canceled"
+                                  : "Completed"}
+                        </span>
+                        {sa.remoteHostName && <span>· {sa.remoteHostName}</span>}
+                      </div>
+                    </div>
+                  </button>
+
+                  <div className="flex shrink-0 items-center gap-0.5">
+                    {canManage && sa.childAgentId && (
+                      <>
+                        <button
+                          type="button"
+                          title="Open thread"
+                          onClick={() => {
+                            setOpen(false);
+                            orbitActions.selectAgent(sa.childHostId, sa.childAgentId!);
+                          }}
+                          className="text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer rounded p-1 transition-colors"
+                        >
+                          <ArrowUpRight className="size-[13px]" />
+                        </button>
+                        <button
+                          type="button"
+                          title="Detach to thread"
+                          onClick={() => {
+                            setOpen(false);
+                            void orbitActions.detachAgent(sa.childHostId, sa.childAgentId!);
+                          }}
+                          className="text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer rounded p-1 transition-colors"
+                        >
+                          <Unlink className="size-[12.5px]" />
+                        </button>
+                      </>
+                    )}
+                    {!isRunning && !isAwaiting && (
+                      <button
+                        type="button"
+                        title="Archive subagent"
+                        onClick={() => {
+                          if (canManage && sa.childAgentId) {
+                            orbitActions.archiveThread(sa.childHostId, sa.childAgentId);
+                          } else {
+                            orbitActions.archiveSubagent(hostId, agentId, {
+                              id: sa.callId,
+                              providerSubagentId: sa.providerSubagentId,
+                              childAgentId: sa.childAgentId,
+                              role: sa.title,
+                            });
+                          }
+                        }}
+                        className="text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer rounded p-1 transition-colors"
+                      >
+                        <Archive className="size-[12.5px]" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </PopoverContent>
+      </Popover>
     </div>
   );
 });

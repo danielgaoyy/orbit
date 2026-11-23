@@ -4606,12 +4606,22 @@ impl AgentOrchestrator {
         );
 
         let shim_after_seq = if reattach_existing_shim {
-            self.store.get_agent_shim_cursor(&summary.agent_id)
+            match self.store.get_agent_shim_cursor(&summary.agent_id) {
+                Some(seq) => Some(seq),
+                // If we are reattaching to an existing shim whose cursor was never persisted
+                // (e.g. daemon crashed/SIGKILLed before flushing or agent predated cursor tracking),
+                // and this agent already has persisted timeline history, tail from the shim's
+                // latest seq (`u64::MAX`) instead of replaying the entire 512-frame ring buffer.
+                None if summary.latest_seq > 0 => Some(u64::MAX),
+                None => None,
+            }
         } else {
             let _ = self.store.clear_agent_shim_cursor(&summary.agent_id);
             None
         };
-        let shim_seq_tracker = Arc::new(AtomicU64::new(shim_after_seq.unwrap_or(0)));
+        let shim_seq_tracker = Arc::new(AtomicU64::new(
+            shim_after_seq.filter(|&seq| seq < u64::MAX).unwrap_or(0),
+        ));
         let persisted_active_turn_id = if reattach_existing_shim {
             match &summary.status {
                 AgentStatus::Running { turn_id } => Some(turn_id.clone()),

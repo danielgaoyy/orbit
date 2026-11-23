@@ -1,5 +1,5 @@
 import { memo, useEffect, useState } from "react";
-import { FolderPlus, GitBranch, ShieldCheck } from "lucide-react";
+import { FolderPlus, GitBranch, ShieldCheck, Timer } from "lucide-react";
 import {
   type AgentCardView,
   type HostCardView,
@@ -88,7 +88,7 @@ export const HostStateDot = memo(function HostStateDot({
  * - Blocked / awaiting input -> `6.5px` amber dot
  * - Unread completed -> `6px` sky-blue dot
  * - Error -> `6px` rose dot
- * - Background task running -> `6px` calm emerald dot
+ * - Background task / timer running -> `12.5px` calm `Timer` glyph (never a colored dot, so it cannot be confused with unread)
  * - Idle & read inside isolated Git worktree -> `12.5px` muted branch glyph
  * - Normal local idle & read -> completely blank (zero gray bullet clutter)
  */
@@ -114,8 +114,10 @@ export const ConversationStatusGlyph = memo(function ConversationStatusGlyph({
     return (
       <span
         title={agent.status_label || "Background task running"}
-        className="h-[6px] w-[6px] shrink-0 rounded-full bg-emerald-500/85"
-      />
+        className="inline-flex shrink-0 items-center justify-center"
+      >
+        <Timer className="text-muted-foreground/75 h-[12.5px] w-[12.5px] shrink-0 stroke-[1.75]" />
+      </span>
     );
   }
   if (isWorktree) {

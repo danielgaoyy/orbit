@@ -3089,6 +3089,16 @@ impl OrbitAppCore {
     }
 
     pub fn mark_agent_seen(&self, host_id: &str, agent_id: &str, seq: u64) {
+        self.mark_agent_seen_internal(host_id, agent_id, seq, false);
+    }
+
+    fn mark_agent_seen_internal(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        seq: u64,
+        authoritative_read_all: bool,
+    ) {
         if agent_id.is_empty() || agent_id.starts_with("opt_") {
             return;
         }
@@ -3118,7 +3128,7 @@ impl OrbitAppCore {
             host_attention,
             AttentionState::Finished | AttentionState::Error | AttentionState::ManualUnread
         );
-        if effective_seq == 0 && !has_clearable_attention {
+        if effective_seq == 0 && !has_clearable_attention && !authoritative_read_all {
             return;
         }
 
@@ -3153,7 +3163,8 @@ impl OrbitAppCore {
                 entry.updated_at_ms = entry.updated_at_ms.max(now_ms);
             }
         }
-        let needs_wire = effective_seq > host_read_seq || has_clearable_attention;
+        let needs_wire =
+            authoritative_read_all || effective_seq > host_read_seq || has_clearable_attention;
         let mut cleared_attention = false;
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
@@ -3168,18 +3179,29 @@ impl OrbitAppCore {
             }
         }
         if needs_wire {
+            // When `authoritative_read_all` (explicit `mark_agent_read` / thread open with seq == 0),
+            // pass `seen_seq: None` so the daemon authoritatively advances `read_seq` to its true
+            // `latest_seq` and clears `attention_state` even if our cached `host_latest` was behind.
+            let wire_seen_seq = if authoritative_read_all || seq == 0 {
+                None
+            } else {
+                (effective_seq > 0).then_some(effective_seq)
+            };
             self.dispatch_wire_or_queue(
                 host_id,
                 WireMessage::MarkAgentRead {
                     request_id: Uuid::new_v4(),
                     agent_id: agent_id.to_string(),
-                    seen_seq: (effective_seq > 0).then_some(effective_seq),
+                    seen_seq: wire_seen_seq,
                 },
             );
         }
         // Only broadcast FleetChanged/HostChanged when a visible unread/attention badge actually cleared.
         // Quiet cursor advances while streaming an already-viewed active session don't need full sidebar/host reloads.
-        if cleared_attention || (had_unread_badge && (pref_changed || needs_wire)) {
+        if cleared_attention
+            || (had_unread_badge && (pref_changed || needs_wire))
+            || (!host_is_running && pref_changed)
+        {
             self.emit(|revision| CoreNotification::FleetChanged { revision });
             self.emit(|revision| CoreNotification::HostChanged {
                 revision,
@@ -7490,7 +7512,7 @@ impl OrbitAppCore {
     }
 
     pub fn mark_agent_read(self: &Arc<Self>, host_id: &str, agent_id: &str) {
-        self.mark_agent_seen(host_id, agent_id, 0);
+        self.mark_agent_seen_internal(host_id, agent_id, 0, true);
     }
 
     #[allow(clippy::too_many_arguments)]

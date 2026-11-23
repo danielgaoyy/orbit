@@ -64,7 +64,7 @@ struct OmniComposerView: View {
     }
 
     private var showPrimaryStopButton: Bool {
-        store.isActiveAgentRunning && !store.canSubmitComposer
+        store.isActiveAgentTurnBusy && !store.canSubmitComposer
     }
 
     private var placeholderText: String {

@@ -3065,6 +3065,10 @@ export const orbitIpc = {
     return invoke<HostCardView>("pair_host", { pairingUri });
   },
 
+  exportHostPairingUri: async (hostId: string): Promise<string> => {
+    return invoke<string>("export_host_pairing_uri", { hostId });
+  },
+
   pairSshHost: async (sshAlias: string, remotePort?: number | null): Promise<HostCardView> => {
     return invoke<HostCardView>("pair_ssh_host", {
       sshAlias,

@@ -16,7 +16,6 @@ import {
   SettingGroupLabel,
   SettingRow,
   SettingSectionHeader,
-  encodeHostPairingUri,
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -167,7 +166,12 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           >
             <button
               type="button"
-              onClick={() => void copyValue("uri", encodeHostPairingUri(host))}
+              onClick={() => {
+                void orbitIpc
+                  .exportHostPairingUri(host.host_id)
+                  .then((uri) => copyValue("uri", uri))
+                  .catch((err) => orbitActions.showToast(String(err)));
+              }}
               className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
             >
               {copiedField === "uri" ? (

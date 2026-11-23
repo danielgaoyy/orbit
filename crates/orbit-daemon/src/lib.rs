@@ -58,9 +58,11 @@ use axum::{
     body::Body,
     extract::{
         DefaultBodyLimit, State,
-        ws::{Message as AxumWsMsg, WebSocket, WebSocketUpgrade},
+        ws::{
+            Message as AxumWsMsg, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection,
+        },
     },
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -76,13 +78,11 @@ use orbit_providers::{
     SideQuestionSpec, catalogs_to_model_map, discover_installed_providers,
     probe_all_provider_models, probe_all_provider_quotas, run_side_question,
 };
-use orbit_relay_transport::{
-    MAX_RELAY_CONTROL_WS_FRAME_BYTES, RelayConnector, is_ssh_relay_url, redact_relay_url,
-};
+use orbit_relay_transport::{MAX_RELAY_CONTROL_WS_FRAME_BYTES, RelayConnector, redact_relay_url};
 use orbit_store::{OrbitStore, ReceiptOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -127,6 +127,204 @@ use crate::workspace_runtime::WorkspaceScriptRegistry;
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
 const E2EE_FRAME_WIRE: u8 = 0x00;
 const E2EE_FRAME_TERMINAL: u8 = 0x01;
+
+/// Filename inside `$ORBIT_HOME` storing the host's persisted 256-bit WS pairing secret (`0600`).
+pub const PAIRING_SECRET_FILENAME: &str = "pairing-secret";
+const MIN_PAIRING_SECRET_LEN: usize = 32;
+
+/// Explicit browser/webview origins allowed to connect to local daemon `/ws` and `/mcp/agents`
+/// (native Rust/CLI/mobile clients omit `Origin` and are allowed; any other `Origin` is rejected
+/// with `403 Forbidden` to prevent Cross-Site WebSocket Hijacking / CSRF).
+const ALLOWED_WEB_ORIGINS: &[&str] = &[
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+];
+
+fn is_valid_pairing_secret(raw: &str) -> bool {
+    raw.len() >= MIN_PAIRING_SECRET_LEN
+        && !raw
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+}
+
+pub const DAEMON_ADDR_FILENAME: &str = "daemon.addr";
+
+#[cfg(unix)]
+fn enforce_unix_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+fn write_temp_secret_file_0600(home_dir: &Path, secret: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    std::fs::create_dir_all(home_dir)?;
+    #[cfg(unix)]
+    enforce_unix_permissions(home_dir, 0o700)?;
+    let tmp_path = home_dir.join(format!(
+        ".{PAIRING_SECRET_FILENAME}.tmp.{}",
+        Uuid::new_v4().simple()
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path)?;
+    if let Err(err) = file
+        .write_all(secret.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    drop(file);
+    #[cfg(unix)]
+    if let Err(err) = enforce_unix_permissions(&tmp_path, 0o600) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(tmp_path)
+}
+
+fn read_pairing_secret_strict(home_dir: &Path) -> anyhow::Result<String> {
+    let secret_path = home_dir.join(PAIRING_SECRET_FILENAME);
+    let raw = std::fs::read_to_string(&secret_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read persisted pairing secret at {}: {e}",
+            secret_path.display()
+        )
+    })?;
+    let trimmed = raw.trim();
+    if is_valid_pairing_secret(trimmed) {
+        Ok(trimmed.to_string())
+    } else {
+        anyhow::bail!(
+            "persisted pairing secret at {} is malformed (fail-closed)",
+            secret_path.display()
+        )
+    }
+}
+
+/// Read the persisted pairing secret from `$ORBIT_HOME/pairing-secret` without creating it.
+pub fn read_pairing_secret(home_dir: &Path) -> Option<String> {
+    let secret_path = home_dir.join(PAIRING_SECRET_FILENAME);
+    if !secret_path.is_file() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&secret_path).ok()?;
+    let trimmed = raw.trim();
+    if is_valid_pairing_secret(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Load or atomically initialize the 256-bit host pairing secret (`$ORBIT_HOME/pairing-secret`, mode `0600`).
+///
+/// Always writes the complete secret to a `0600` temp file (`create_new` + `write_all` + `sync_all`)
+/// and publishes atomically via `hard_link` so concurrent first-time boots converge on a single
+/// secret with zero partial-write or world-readable window. Fails closed on corrupt/unreadable
+/// files or permission-hardening failures.
+pub fn load_or_create_pairing_secret(home_dir: &Path) -> anyhow::Result<String> {
+    let secret_path = home_dir.join(PAIRING_SECRET_FILENAME);
+    if secret_path.exists() {
+        let existing = read_pairing_secret_strict(home_dir)?;
+        #[cfg(unix)]
+        {
+            enforce_unix_permissions(home_dir, 0o700)?;
+            enforce_unix_permissions(&secret_path, 0o600)?;
+        }
+        return Ok(existing);
+    }
+
+    let generated = orbit_crypto::generate_pairing_secret();
+    let tmp_path = write_temp_secret_file_0600(home_dir, &generated)?;
+    let link_res = std::fs::hard_link(&tmp_path, &secret_path);
+    let _ = std::fs::remove_file(&tmp_path);
+    match link_res {
+        Ok(()) => Ok(generated),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            #[cfg(unix)]
+            enforce_unix_permissions(&secret_path, 0o600)?;
+            read_pairing_secret_strict(home_dir)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Generate a fresh 32-byte CSPRNG URL-safe base64 pairing secret and atomically replace
+/// `$ORBIT_HOME/pairing-secret` (`0600`) via temp-file + rename (never truncating in place).
+pub fn rotate_pairing_secret(home_dir: &Path) -> anyhow::Result<String> {
+    let generated = orbit_crypto::generate_pairing_secret();
+    let tmp_path = write_temp_secret_file_0600(home_dir, &generated)?;
+    let target = home_dir.join(PAIRING_SECRET_FILENAME);
+    if let Err(err) = std::fs::rename(&tmp_path, &target) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(generated)
+}
+
+/// Enforce anti-CSWSH `Origin` validation:
+/// - Missing `Origin` header -> allowed (native Rust/CLI/mobile clients).
+/// - Explicit Tauri/dev `Origin` in [`ALLOWED_WEB_ORIGINS`] -> allowed.
+/// - Multiple `Origin` headers or any other `Origin` -> `403 Forbidden`.
+pub(crate) fn validate_request_origin(headers: &HeaderMap) -> Result<(), StatusCode> {
+    let mut origins = headers.get_all(axum::http::header::ORIGIN).iter();
+    let Some(first) = origins.next() else {
+        return Ok(());
+    };
+    if origins.next().is_some() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let Ok(raw) = first.to_str() else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    let origin = raw.trim();
+    if ALLOWED_WEB_ORIGINS
+        .iter()
+        .any(|allowed| origin.eq_ignore_ascii_case(allowed))
+    {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+/// Validate `Authorization: Bearer <token>` in constant time (fail-closed on empty secret or duplicate headers).
+pub(crate) fn verify_bearer_token(headers: &HeaderMap, expected_secret: &str) -> bool {
+    if expected_secret.is_empty() {
+        return false;
+    }
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let Some(first) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(raw) = first.to_str() else {
+        return false;
+    };
+    let Some((scheme, rest)) = raw.trim().split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    let provided = rest.trim();
+    if provided.is_empty() {
+        return false;
+    }
+    orbit_crypto::constant_time_eq(expected_secret.as_bytes(), provided.as_bytes())
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonPersistedConfig {
@@ -235,6 +433,8 @@ pub struct DaemonRuntime {
     pub orchestrator: Arc<AgentOrchestrator>,
     pub attachments: Arc<AttachmentStagingManager>,
     pub home_dir: PathBuf,
+    pub pairing_secret: String,
+    pub pairing_secret_rotated_tx: broadcast::Sender<()>,
     pub mcp_token: String,
     pub listen_port: Arc<RwLock<u16>>,
     pub orch_config: Arc<RwLock<OrchestrationConfig>>,
@@ -267,27 +467,28 @@ impl DaemonRuntime {
     /// shim recovery, connected hosts, finish subscriptions, scheduler, and idle cleanup.
     pub async fn bootstrap(home_dir: &Path) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(home_dir)?;
+        #[cfg(unix)]
+        enforce_unix_permissions(home_dir, 0o700)?;
         std::fs::create_dir_all(home_dir.join("shims"))?;
         orbit_providers::set_snapshot_orbit_home(home_dir);
 
         let keypair_path = home_dir.join("host-keypair.json");
         let keypair = if keypair_path.exists() {
             let raw = std::fs::read_to_string(&keypair_path)?;
+            #[cfg(unix)]
+            enforce_unix_permissions(&keypair_path, 0o600)?;
             serde_json::from_str::<HostIdentityKeypair>(&raw)?
         } else {
             let generated = HostIdentityKeypair::generate()?;
             let raw = serde_json::to_string_pretty(&generated)?;
             std::fs::write(&keypair_path, raw)?;
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&keypair_path, std::fs::Permissions::from_mode(0o600));
-            }
+            enforce_unix_permissions(&keypair_path, 0o600)?;
             generated
         };
 
         let persisted = DaemonPersistedConfig::load(home_dir);
+        let pairing_secret = load_or_create_pairing_secret(home_dir)?;
         let mcp_token = crate::mcp::load_or_create_mcp_token(home_dir)?;
         let listen_port = Arc::new(RwLock::new(
             persisted.listen_addr.map(|a| a.port()).unwrap_or(0),
@@ -416,6 +617,8 @@ impl DaemonRuntime {
             available_providers,
         };
 
+        let (pairing_secret_rotated_tx, _) = broadcast::channel(16);
+
         Ok(Arc::new(Self {
             host_info,
             keypair,
@@ -423,6 +626,8 @@ impl DaemonRuntime {
             orchestrator,
             attachments,
             home_dir: home_dir.to_path_buf(),
+            pairing_secret,
+            pairing_secret_rotated_tx,
             mcp_token,
             listen_port,
             orch_config,
@@ -452,10 +657,10 @@ impl DaemonRuntime {
         }))
     }
 
-    /// Record the active bound TCP port and activate all background orchestration loops.
-    pub async fn activate_server(self: &Arc<Self>, bound_port: u16) {
-        *self.listen_port.write().await = bound_port;
-        write_live_port_file(&self.home_dir, bound_port);
+    /// Record the active bound TCP socket address and activate all background orchestration loops.
+    pub async fn activate_server(self: &Arc<Self>, bound_addr: SocketAddr) {
+        *self.listen_port.write().await = bound_addr.port();
+        write_live_addr_files(&self.home_dir, bound_addr);
 
         // 1. Reattach surviving shims now that the MCP server port is known
         self.orchestrator.activate_runtime().await;
@@ -522,34 +727,62 @@ impl DaemonRuntime {
         probed
     }
 
+    /// Read the currently active persisted pairing secret from `$ORBIT_HOME/pairing-secret`.
+    /// Fails closed (`None`) if the file is missing, unreadable, or malformed so a deleted or
+    /// rotated secret can never fall back to a stale in-memory bootstrap value.
+    pub fn active_pairing_secret(&self) -> Option<String> {
+        read_pairing_secret(&self.home_dir)
+    }
+
+    /// Atomically rotate `$ORBIT_HOME/pairing-secret` and immediately notify active direct `/ws`
+    /// sessions to terminate if their authenticated secret is no longer current.
+    pub fn rotate_pairing_secret(&self) -> anyhow::Result<String> {
+        let rotated = rotate_pairing_secret(&self.home_dir)?;
+        let _ = self.pairing_secret_rotated_tx.send(());
+        Ok(rotated)
+    }
+
     pub fn build_pairing_offer(
         &self,
         direct_endpoints: Vec<String>,
         relay_url: Option<String>,
-    ) -> PairingOffer {
-        PairingOffer {
+    ) -> anyhow::Result<PairingOffer> {
+        let pairing_secret = read_pairing_secret_strict(&self.home_dir)?;
+        Ok(PairingOffer {
             host_id: self.host_info.host_id.clone(),
             hostname: self.host_info.hostname.clone(),
             daemon_pubkey_b64: self.keypair.public_key_b64.clone(),
             direct_endpoints,
             relay_url,
-            pairing_secret: uuid::Uuid::new_v4().to_string(),
-        }
+            pairing_secret,
+        })
     }
 }
 
-fn write_live_port_file(home_dir: &Path, port: u16) {
+fn write_live_addr_files(home_dir: &Path, bound_addr: SocketAddr) {
+    let addr_file = home_dir.join(DAEMON_ADDR_FILENAME);
+    let _ = std::fs::write(&addr_file, format!("{bound_addr}\n"));
     let port_file = home_dir.join("daemon-port");
-    let _ = std::fs::write(&port_file, format!("{port}\n"));
+    let _ = std::fs::write(&port_file, format!("{}\n", bound_addr.port()));
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&port_file, std::fs::Permissions::from_mode(0o600));
+        let _ = enforce_unix_permissions(&addr_file, 0o600);
+        let _ = enforce_unix_permissions(&port_file, 0o600);
     }
 }
 
-/// Read the active local Daemon port (prefers `$ORBIT_HOME/daemon-port`, falling back to `config.json` or `6868`).
+/// Read the active bound local Daemon `SocketAddr` from `$ORBIT_HOME/daemon.addr`.
+pub fn read_live_daemon_addr(home_dir: &Path) -> Option<SocketAddr> {
+    let raw = std::fs::read_to_string(home_dir.join(DAEMON_ADDR_FILENAME)).ok()?;
+    let addr = raw.trim().parse::<SocketAddr>().ok()?;
+    (addr.port() > 0).then_some(addr)
+}
+
+/// Read the active local Daemon port (prefers `$ORBIT_HOME/daemon.addr`, then `daemon-port`, `config.json`, or `6868`).
 pub fn read_live_daemon_port(home_dir: &Path) -> u16 {
+    if let Some(addr) = read_live_daemon_addr(home_dir) {
+        return addr.port();
+    }
     if let Ok(raw) = std::fs::read_to_string(home_dir.join("daemon-port"))
         && let Ok(port) = raw.trim().parse::<u16>()
         && port > 0
@@ -668,14 +901,8 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
     let bound_addr = listener.local_addr()?;
-    runtime.activate_server(bound_addr.port()).await;
+    runtime.activate_server(bound_addr).await;
 
-    let direct_eps = if bound_addr.ip().is_unspecified() {
-        discover_lan_ws_endpoints(bound_addr.port())
-    } else {
-        vec![format!("ws://{bound_addr}/ws")]
-    };
-    let offer = runtime.build_pairing_offer(direct_eps, effective_relay.clone());
     let redacted_relay = effective_relay.as_deref().map(redact_relay_url);
 
     info!(
@@ -687,11 +914,10 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         relay = ?redacted_relay,
         "Orbit Daemon ready"
     );
-    if effective_relay.as_deref().is_some_and(is_ssh_relay_url) {
-        info!("Run 'orbit pair' to print Multi-Host pairing URI");
-    } else if let Ok(uri) = offer.to_qr_uri() {
-        info!(pairing_uri = %uri, "Scan or import this Multi-Host pairing URI on Orbit Mobile");
-    }
+    info!(
+        host_id = %runtime.host_info.host_id,
+        "Run `orbit pair` to print this host's Multi-Host pairing URI"
+    );
 
     if let Some(relay_url) = effective_relay {
         let rt_relay = runtime.clone();
@@ -759,7 +985,7 @@ pub async fn spawn_embedded_daemon(
     let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    runtime.activate_server(addr.port()).await;
+    runtime.activate_server(addr).await;
 
     if let Some(r_url) = relay_url {
         let rt_relay = runtime.clone();
@@ -1140,27 +1366,52 @@ async fn serve_e2ee_relay_tunnel(
         }
     });
 
-    run_client_session_loop(runtime, in_rx, out_tx).await;
+    run_client_session_loop(runtime, in_rx, out_tx, None).await;
     Ok(())
 }
 
 // --- Direct Axum WebSocket Handler ---
 
 async fn ws_handler(
-    ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(runtime): State<Arc<DaemonRuntime>>,
-) -> impl IntoResponse {
-    ws.max_frame_size(orbit_protocol::MAX_WS_FRAME_BYTES)
-        .max_message_size(orbit_protocol::MAX_WS_FRAME_BYTES)
-        .on_upgrade(move |socket| handle_direct_socket(socket, runtime))
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    if let Err(status) = validate_request_origin(&headers) {
+        warn!(
+            origin = ?headers.get(axum::http::header::ORIGIN),
+            "Rejected /ws request due to disallowed Origin header"
+        );
+        return (status, "Forbidden Origin").into_response();
+    }
+
+    let Some(expected_secret) = runtime.active_pairing_secret() else {
+        warn!(
+            "Rejected /ws upgrade request: persisted pairing-secret is missing or malformed (fail-closed)"
+        );
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    };
+    if !verify_bearer_token(&headers, &expected_secret) {
+        warn!("Rejected unauthenticated /ws upgrade request");
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    match ws {
+        Ok(upgrade) => upgrade
+            .max_frame_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+            .max_message_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+            .on_upgrade(move |socket| handle_direct_socket(socket, runtime, expected_secret))
+            .into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
 }
 
-async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
+async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>, auth_secret: String) {
     let (mut sink, mut stream) = socket.split();
     let (in_tx, in_rx) = mpsc::channel::<SessionFrame>(256);
     let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(256);
 
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let ws_msg = match frame {
                 SessionFrame::Wire { msg, zstd: true } => match msg.encode_zstd(3) {
@@ -1182,9 +1433,10 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
                 break;
             }
         }
+        let _ = sink.close().await;
     });
 
-    tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
             match msg {
                 AxumWsMsg::Text(txt) => {
@@ -1232,7 +1484,9 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
         }
     });
 
-    run_client_session_loop(runtime, in_rx, out_tx).await;
+    run_client_session_loop(runtime, in_rx, out_tx, Some(auth_secret)).await;
+    reader_task.abort();
+    writer_task.abort();
 }
 
 // --- Unified Transport-Neutral Session Controller (shared by Direct WS & Relay E2EE) ---
@@ -1262,10 +1516,18 @@ enum SessionFrame {
     Terminal(TerminalBinaryFrame),
 }
 
+fn is_direct_secret_still_valid(runtime: &DaemonRuntime, auth_secret: &str) -> bool {
+    runtime
+        .active_pairing_secret()
+        .as_deref()
+        .is_some_and(|cur| orbit_crypto::constant_time_eq(cur.as_bytes(), auth_secret.as_bytes()))
+}
+
 async fn run_client_session_loop(
     runtime: Arc<DaemonRuntime>,
     mut in_rx: mpsc::Receiver<SessionFrame>,
     out_tx: mpsc::Sender<SessionFrame>,
+    direct_auth_secret: Option<String>,
 ) {
     let session_id = Uuid::new_v4();
     let mut use_zstd = false;
@@ -1275,11 +1537,38 @@ async fn run_client_session_loop(
     let mut active_side_questions: Vec<tokio::task::AbortHandle> = Vec::new();
     let mut bcast_rx = runtime.orchestrator.broadcast_tx.subscribe();
     let mut host_status_rx = runtime.connected_hosts.status_updates_tx.subscribe();
+    let mut secret_rot_rx = runtime.pairing_secret_rotated_tx.subscribe();
+    let mut secret_check_interval = tokio::time::interval(Duration::from_secs(1));
+    secret_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            _ = secret_rot_rx.recv(), if direct_auth_secret.is_some() => {
+                if let Some(ref secret) = direct_auth_secret
+                    && !is_direct_secret_still_valid(&runtime, secret)
+                {
+                    warn!(session_id = %session_id, "Closing direct /ws session after pairing_secret rotation");
+                    break;
+                }
+            }
+
+            _ = secret_check_interval.tick(), if direct_auth_secret.is_some() => {
+                if let Some(ref secret) = direct_auth_secret
+                    && !is_direct_secret_still_valid(&runtime, secret)
+                {
+                    warn!(session_id = %session_id, "Closing direct /ws session: pairing_secret rotated or revoked");
+                    break;
+                }
+            }
+
             maybe_in = in_rx.recv() => {
                 let Some(frame) = maybe_in else { break; };
+                if let Some(ref secret) = direct_auth_secret
+                    && !is_direct_secret_still_valid(&runtime, secret)
+                {
+                    warn!(session_id = %session_id, "Closing direct /ws session on frame arrival: pairing_secret rotated or revoked");
+                    break;
+                }
                 match frame {
                     SessionFrame::Terminal(tframe) => {
                         match tframe {
@@ -6754,5 +7043,300 @@ mod self_upgrade_tests {
         assert!(full_script.contains(r"'--home', 'C:\Orbit''s Home', 'daemon', 'up'"));
         assert!(!full_script.contains("'--port'"));
         assert!(full_script.contains(r"'--home', 'C:\Orbit''s Home', 'relay', 'up'"));
+    }
+
+    #[tokio::test]
+    async fn pairing_secret_persists_across_bootstrap_rotates_atomically_and_fails_closed() {
+        let home = std::env::temp_dir().join(format!("orbit_secret_persist_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+
+        // Concurrent first-time init must converge on a single identical secret
+        let mut init_tasks = Vec::new();
+        for _ in 0..8 {
+            let h = home.clone();
+            init_tasks.push(tokio::task::spawn_blocking(move || {
+                load_or_create_pairing_secret(&h).expect("concurrent init")
+            }));
+        }
+        let mut init_results = Vec::new();
+        for t in init_tasks {
+            init_results.push(t.await.expect("join"));
+        }
+        let first_secret = init_results[0].clone();
+        assert_eq!(first_secret.len(), 43);
+        for s in &init_results {
+            assert_eq!(s, &first_secret, "concurrent init must not diverge");
+        }
+
+        let rt1 = DaemonRuntime::bootstrap(&home).await.expect("bootstrap 1");
+        let secret1 = rt1.pairing_secret.clone();
+        assert_eq!(secret1, first_secret);
+        let offer1 = rt1
+            .build_pairing_offer(vec!["ws://127.0.0.1:6868/ws".into()], None)
+            .expect("offer 1");
+        assert_eq!(offer1.pairing_secret, secret1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(home.join(PAIRING_SECRET_FILENAME)).expect("stat secret");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+        drop(rt1);
+
+        let rt2 = DaemonRuntime::bootstrap(&home).await.expect("bootstrap 2");
+        assert_eq!(
+            rt2.pairing_secret, secret1,
+            "pairing_secret must persist identically across daemon restarts"
+        );
+        assert_eq!(
+            rt2.build_pairing_offer(vec![], None)
+                .expect("offer 2")
+                .pairing_secret,
+            secret1
+        );
+
+        let rotated = rt2.rotate_pairing_secret().expect("rotate secret");
+        assert_eq!(rotated.len(), 43);
+        assert_ne!(rotated, secret1);
+        assert_eq!(
+            rt2.active_pairing_secret().as_deref(),
+            Some(rotated.as_str())
+        );
+        assert_eq!(
+            rt2.build_pairing_offer(vec![], None)
+                .expect("offer rotated")
+                .pairing_secret,
+            rotated
+        );
+        drop(rt2);
+
+        let rt3 = DaemonRuntime::bootstrap(&home).await.expect("bootstrap 3");
+        assert_eq!(rt3.pairing_secret, rotated);
+
+        // Corrupting the persisted secret must fail closed (never overwrite or fall back)
+        std::fs::write(home.join(PAIRING_SECRET_FILENAME), "short").expect("corrupt");
+        assert_eq!(rt3.active_pairing_secret(), None);
+        assert!(rt3.build_pairing_offer(vec![], None).is_err());
+        assert!(load_or_create_pairing_secret(&home).is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn ws_endpoint_enforces_bearer_auth_origin_cswsh_live_rotation_and_fail_closed() {
+        use tokio_tungstenite::{
+            connect_async,
+            tungstenite::{
+                Error as WsError,
+                client::IntoClientRequest,
+                http::{
+                    HeaderValue,
+                    header::{AUTHORIZATION, ORIGIN},
+                },
+            },
+        };
+
+        let home = std::env::temp_dir().join(format!("orbit_ws_auth_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let (addr, runtime) = spawn_embedded_daemon(home.clone(), None)
+            .await
+            .expect("spawn daemon");
+        let ws_url = format!("ws://{addr}/ws");
+        let valid_secret = runtime.pairing_secret.clone();
+
+        // 1. Missing Authorization header -> 401 Unauthorized
+        let err = connect_async(&ws_url)
+            .await
+            .expect_err("missing token must fail");
+        match err {
+            WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 401),
+            other => panic!("expected HTTP 401 for missing token, got {other:?}"),
+        }
+
+        // 2. Wrong Bearer token -> 401 Unauthorized
+        let mut wrong_req = ws_url.as_str().into_client_request().expect("req");
+        wrong_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-secret-token-00000000000000000000"),
+        );
+        let err = connect_async(wrong_req)
+            .await
+            .expect_err("wrong token must fail");
+        match err {
+            WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 401),
+            other => panic!("expected HTTP 401 for wrong token, got {other:?}"),
+        }
+
+        // 3. Malicious browser Origin -> 403 Forbidden (even with valid Bearer token!)
+        let mut evil_req = ws_url.as_str().into_client_request().expect("req");
+        evil_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {valid_secret}")).expect("hdr"),
+        );
+        evil_req
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("https://evil.example"));
+        let err = connect_async(evil_req)
+            .await
+            .expect_err("malicious origin must fail");
+        match err {
+            WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 403),
+            other => panic!("expected HTTP 403 for malicious origin, got {other:?}"),
+        }
+
+        // 4. Valid Bearer token with no Origin (native CLI/mobile) -> keep open to test rotation revocation!
+        let mut native_req = ws_url.as_str().into_client_request().expect("req");
+        native_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {valid_secret}")).expect("hdr"),
+        );
+        let (mut active_ws, _) = connect_async(native_req)
+            .await
+            .expect("valid native client must connect");
+
+        // 5. Valid Bearer token with explicit allowed Tauri Origin -> succeeds
+        let mut tauri_req = ws_url.as_str().into_client_request().expect("req");
+        tauri_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {valid_secret}")).expect("hdr"),
+        );
+        tauri_req
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("tauri://localhost"));
+        let (mut ws_tauri, _) = connect_async(tauri_req)
+            .await
+            .expect("allowed tauri origin with valid token must connect");
+        let _ = ws_tauri.close(None).await;
+
+        // 6. Secret rotation invalidates old secret immediately AND closes already-active sessions!
+        let rotated = runtime.rotate_pairing_secret().expect("rotate");
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(msg) = active_ws.next().await {
+                if matches!(msg, Ok(TungMsg::Close(_)) | Err(_)) {
+                    return true;
+                }
+            }
+            true
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            closed,
+            "already-connected direct /ws session must close when pairing_secret is rotated"
+        );
+
+        let mut stale_req = ws_url.as_str().into_client_request().expect("req");
+        stale_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {valid_secret}")).expect("hdr"),
+        );
+        match connect_async(stale_req)
+            .await
+            .expect_err("rotated secret must reject old token")
+        {
+            WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 401),
+            other => panic!("expected HTTP 401 for stale token, got {other:?}"),
+        }
+
+        let mut fresh_req = ws_url.as_str().into_client_request().expect("req");
+        fresh_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {rotated}")).expect("hdr"),
+        );
+        let (mut ws_fresh, _) = connect_async(fresh_req)
+            .await
+            .expect("rotated secret must connect");
+        let _ = ws_fresh.close(None).await;
+
+        // 7. Missing/deleted pairing-secret file must fail closed (NEVER fall back to bootstrap secret!)
+        std::fs::remove_file(home.join(PAIRING_SECRET_FILENAME)).expect("remove secret");
+        for tok in [&valid_secret, &rotated] {
+            let mut req = ws_url.as_str().into_client_request().expect("req");
+            req.headers_mut().insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {tok}")).expect("hdr"),
+            );
+            match connect_async(req)
+                .await
+                .expect_err("deleted secret must fail closed")
+            {
+                WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 401),
+                other => panic!("expected HTTP 401 when secret file deleted, got {other:?}"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn mcp_agents_endpoint_enforces_origin_and_constant_time_bearer_auth() {
+        let home = std::env::temp_dir().join(format!("orbit_mcp_auth_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let (addr, runtime) = spawn_embedded_daemon(home.clone(), None)
+            .await
+            .expect("spawn daemon");
+        let url = format!("http://{addr}/mcp/agents");
+        let http = reqwest::Client::new();
+        let ping_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        });
+
+        // 1. Malicious Origin -> 403 Forbidden (even with valid MCP token)
+        let resp = http
+            .post(&url)
+            .header("Origin", "https://evil.example")
+            .header("Authorization", format!("Bearer {}", runtime.mcp_token))
+            .json(&ping_body)
+            .send()
+            .await
+            .expect("send evil origin");
+        assert_eq!(resp.status().as_u16(), 403);
+
+        // 2. Missing token -> 401 Unauthorized
+        let resp = http
+            .post(&url)
+            .json(&ping_body)
+            .send()
+            .await
+            .expect("send missing auth");
+        assert_eq!(resp.status().as_u16(), 401);
+
+        // 3. Wrong token -> 401 Unauthorized
+        let resp = http
+            .post(&url)
+            .header("Authorization", "Bearer wrong-mcp-token")
+            .json(&ping_body)
+            .send()
+            .await
+            .expect("send wrong auth");
+        assert_eq!(resp.status().as_u16(), 401);
+
+        // 4. Valid token without Origin -> 200 OK
+        let resp = http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", runtime.mcp_token))
+            .json(&ping_body)
+            .send()
+            .await
+            .expect("send valid auth");
+        assert_eq!(resp.status().as_u16(), 200);
+
+        // 5. Actual bound SocketAddr is recorded in `$ORBIT_HOME/daemon.addr`
+        assert_eq!(read_live_daemon_addr(&home), Some(addr));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(home.join(DAEMON_ADDR_FILENAME))
+                .expect("daemon.addr metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

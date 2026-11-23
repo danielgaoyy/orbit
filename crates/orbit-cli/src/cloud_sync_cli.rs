@@ -18,13 +18,39 @@ use orbit_client_core::cloud_sync::{
 };
 use orbit_client_core::desktop_ops::open_external_url;
 use orbit_crypto::PairingOffer;
-use orbit_daemon::{DaemonPersistedConfig, DaemonRuntime, discover_lan_ws_endpoints};
+use orbit_daemon::{DaemonPersistedConfig, DaemonRuntime};
 use orbit_protocol::WireMessage;
 use orbit_relay_transport::redact_relay_url;
 use orbit_store::{OrbitStore, StoredHostMeta, StoredHostProfile};
 use uuid::Uuid;
 
-use crate::service::{default_daemon_listen, find_live_daemon_port_for_host};
+use crate::service::{
+    PortOwnership, default_daemon_listen, find_live_daemon_port_for_host, probe_daemon_port,
+};
+
+/// Secret-free JSON summary emitted by `orbit login --json` and `orbit sync --json`.
+/// Never serializes `pairing_secret` or raw SSH relay credentials to routine stdout.
+fn hosts_to_cli_json_views(hosts: &[SyncedHostEntry]) -> Vec<serde_json::Value> {
+    hosts
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "host_id": h.host_id,
+                "hostname": h.hostname,
+                "daemon_pubkey_b64": h.daemon_pubkey_b64,
+                "direct_endpoints": h.direct_endpoints,
+                "relay_url": h.relay_url.as_deref().map(redact_relay_url),
+                "custom_name": h.custom_name,
+                "ssh_alias": h.ssh_alias,
+                "route_mode": h.route_mode,
+                "remote_daemon_port": h.remote_daemon_port,
+                "custom_direct_endpoint": h.custom_direct_endpoint,
+                "os_arch": h.os_arch,
+                "updated_at_ms": h.updated_at_ms,
+            })
+        })
+        .collect()
+}
 
 pub struct LoginOptions {
     pub token: Option<String>,
@@ -201,7 +227,7 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
                 "recovery_passphrase": generated_recovery,
                 "registered_this_host": summary.registered_host_id,
                 "vault_revision": summary.vault_revision,
-                "hosts": summary.active_hosts,
+                "hosts": hosts_to_cli_json_views(&summary.active_hosts),
                 "projects_count": summary.active_projects_count,
                 "mesh_registered": summary.mesh_registered,
             }))?
@@ -273,7 +299,7 @@ pub async fn cmd_sync(home_dir: &Path, opts: SyncOptions) -> anyhow::Result<()> 
                 "registered_this_host": summary.registered_host_id,
                 "pushed_remote": summary.pushed_remote,
                 "vault_revision": summary.vault_revision,
-                "hosts": summary.active_hosts,
+                "hosts": hosts_to_cli_json_views(&summary.active_hosts),
                 "projects_count": summary.active_projects_count,
                 "mesh_registered": summary.mesh_registered,
             }))?
@@ -367,11 +393,42 @@ async fn execute_cli_sync(
 
     // Optionally snapshot this machine's Orbit Daemon identity & active endpoints into the sync payload!
     let mut registered_host_id = None;
+    let local_identity = crate::read_local_host_identity(home_dir);
+    let local_daemon_secret = orbit_daemon::read_pairing_secret(home_dir);
     if register_this_host {
-        let local_rec = build_this_machine_sync_record(home_dir, now_ms).await?;
+        let local_rec =
+            build_this_machine_sync_record(home_dir, now_ms, &local_hosts_map, remote_payload)
+                .await?;
         registered_host_id = Some(local_rec.profile.host_id.clone());
         local_meta.record_host_mutated(&local_rec.profile.host_id, now_ms);
         local_hosts_map.insert(local_rec.profile.host_id.clone(), local_rec);
+    } else if let (Some((local_hid, local_pub)), Some(local_secret)) =
+        (local_identity.as_ref(), local_daemon_secret.as_ref())
+        && let Some(existing) = local_hosts_map.get_mut(local_hid)
+        && existing.profile.daemon_pubkey_b64 == *local_pub
+    {
+        let remote_secret_ts = remote_payload
+            .and_then(|r| r.hosts.get(local_hid))
+            .map(|r| r.pairing_secret_updated_at_ms)
+            .unwrap_or(0);
+        let remote_secret_differs = remote_payload
+            .and_then(|r| r.hosts.get(local_hid))
+            .is_some_and(|r| r.pairing_secret != *local_secret);
+        if existing.profile.pairing_secret != *local_secret
+            || (remote_secret_differs
+                && existing.profile.meta.pairing_secret_updated_at_ms <= remote_secret_ts)
+        {
+            existing.profile.pairing_secret = local_secret.clone();
+            existing.profile.meta.pairing_secret_updated_at_ms = now_ms
+                .max(
+                    existing
+                        .profile
+                        .meta
+                        .pairing_secret_updated_at_ms
+                        .saturating_add(1),
+                )
+                .max(remote_secret_ts.saturating_add(1));
+        }
     }
 
     let local_hosts: Vec<LocalHostSyncRecord> = local_hosts_map.into_values().collect();
@@ -384,7 +441,7 @@ async fn execute_cli_sync(
         .unwrap_or_default();
     let mut local_prefs = orbit_client_core::cloud_sync::load_sync_prefs_from_store(&store);
 
-    let outcome = merge_cloud_vault(
+    let mut outcome = merge_cloud_vault(
         remote_payload,
         &local_hosts,
         &local_projects,
@@ -394,6 +451,21 @@ async fn execute_cli_sync(
         now_ms,
     );
 
+    // Authoritatively prefer this machine's persisted `$ORBIT_HOME/pairing-secret` over any
+    // stale remote synced value even when pulling this host into a fresh local store.
+    if let (Some((local_hid, local_pub)), Some(local_secret)) =
+        (local_identity.as_ref(), local_daemon_secret.as_ref())
+        && let Some(entry) = outcome.merged.hosts.get_mut(local_hid)
+        && entry.deleted_at_ms.is_none()
+        && entry.daemon_pubkey_b64 == *local_pub
+        && entry.pairing_secret != *local_secret
+    {
+        entry.pairing_secret = local_secret.clone();
+        entry.pairing_secret_updated_at_ms =
+            now_ms.max(entry.pairing_secret_updated_at_ms.saturating_add(1));
+        outcome.needs_push = true;
+    }
+
     // Persist merged hosts/projects/order/prefs into `~/.orbit/desktop-client.sqlite` so Desktop sees them instantly!
     for host in outcome.merged.hosts.values() {
         if let Some(del_ts) = host.deleted_at_ms {
@@ -401,7 +473,11 @@ async fn execute_cli_sync(
             local_meta.record_host_deleted(&host.host_id, del_ts);
         } else {
             let mut stored = orbit_client_core::cloud_sync::stored_host_from_synced(host);
-            if registered_host_id.as_deref() == Some(host.host_id.as_str()) {
+            let is_this_machine = registered_host_id.as_deref() == Some(host.host_id.as_str())
+                || local_identity.as_ref().is_some_and(|(lid, lpub)| {
+                    *lid == host.host_id && *lpub == host.daemon_pubkey_b64
+                });
+            if is_this_machine {
                 let port = stored.meta.remote_daemon_port.unwrap_or(6868);
                 let loopback = format!("ws://127.0.0.1:{port}/ws");
                 if !stored.direct_endpoints.contains(&loopback) {
@@ -503,16 +579,58 @@ async fn execute_cli_sync(
 async fn build_this_machine_sync_record(
     home_dir: &Path,
     now_ms: i64,
+    existing_local_hosts: &std::collections::HashMap<String, LocalHostSyncRecord>,
+    remote_payload: Option<&CloudVaultPayload>,
 ) -> anyhow::Result<LocalHostSyncRecord> {
     let runtime = DaemonRuntime::bootstrap(home_dir).await?;
     let persisted = DaemonPersistedConfig::load(home_dir);
-    let fallback_port = persisted
-        .listen_addr
-        .unwrap_or_else(default_daemon_listen)
-        .port();
-    let port = find_live_daemon_port_for_host(&runtime.host_info.host_id, fallback_port).await;
-    let endpoints = filter_shareable_endpoints(&discover_lan_ws_endpoints(port));
+    let configured_listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+    let live_addr = orbit_daemon::read_live_daemon_addr(home_dir);
+    let preferred_port = live_addr
+        .map(|a| a.port())
+        .unwrap_or_else(|| configured_listen.port());
+    let port = find_live_daemon_port_for_host(&runtime.host_info.host_id, preferred_port).await;
+    let bind_ip = if let Some(la) = live_addr
+        && la.port() == port
+        && probe_daemon_port(port, &runtime.host_info.host_id).await == PortOwnership::Mine
+    {
+        la.ip()
+    } else {
+        configured_listen.ip()
+    };
+    let raw_endpoints = crate::advertised_direct_endpoints(bind_ip, port);
+    let endpoints = filter_shareable_endpoints(&raw_endpoints);
     let os_arch = format!("{}/{}", runtime.host_info.os, runtime.host_info.arch);
+    let pairing_secret = runtime.active_pairing_secret().ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing or invalid pairing secret at {}",
+            home_dir
+                .join(orbit_daemon::PAIRING_SECRET_FILENAME)
+                .display()
+        )
+    })?;
+
+    let existing = existing_local_hosts.get(&runtime.host_info.host_id);
+    let remote_host = remote_payload.and_then(|r| r.hosts.get(&runtime.host_info.host_id));
+    let existing_ts = existing
+        .map(|e| e.profile.meta.pairing_secret_updated_at_ms)
+        .unwrap_or(0);
+    let remote_ts = remote_host
+        .map(|r| r.pairing_secret_updated_at_ms)
+        .unwrap_or(0);
+    let remote_differs = remote_host.is_some_and(|r| r.pairing_secret != pairing_secret);
+    let pairing_secret_updated_at_ms = match existing {
+        Some(e)
+            if e.profile.pairing_secret == pairing_secret
+                && existing_ts > 0
+                && (!remote_differs || existing_ts > remote_ts) =>
+        {
+            existing_ts
+        }
+        _ => now_ms
+            .max(existing_ts.saturating_add(1))
+            .max(remote_ts.saturating_add(1)),
+    };
 
     Ok(LocalHostSyncRecord {
         profile: StoredHostProfile {
@@ -521,9 +639,11 @@ async fn build_this_machine_sync_record(
             daemon_pubkey_b64: runtime.keypair.public_key_b64.clone(),
             direct_endpoints: endpoints,
             relay_url: persisted.relay_url,
+            pairing_secret,
             meta: StoredHostMeta {
                 remote_daemon_port: Some(port),
                 route_mode: Some("auto".to_string()),
+                pairing_secret_updated_at_ms,
                 ..StoredHostMeta::default()
             },
         },
@@ -537,14 +657,33 @@ async fn register_synced_hosts_into_local_daemon_mesh(
     self_host_id: Option<&str>,
     hosts: &[SyncedHostEntry],
 ) -> usize {
-    let port = orbit_daemon::read_live_daemon_port(home_dir);
+    let owned_local_id = self_host_id
+        .map(ToOwned::to_owned)
+        .or_else(|| crate::read_local_host_identity(home_dir).map(|(hid, _)| hid));
+    let Some(local_host_id) = owned_local_id else {
+        return 0;
+    };
+    let port = find_live_daemon_port_for_host(
+        &local_host_id,
+        orbit_daemon::read_live_daemon_port(home_dir),
+    )
+    .await;
+    if probe_daemon_port(port, &local_host_id).await != PortOwnership::Mine {
+        return 0;
+    }
+    let Some(local_secret) = orbit_daemon::read_pairing_secret(home_dir) else {
+        return 0;
+    };
     let ws_url = format!("ws://127.0.0.1:{port}/ws");
-    let Ok(conn) = orbit_client_core::connect_direct(&ws_url, None).await else {
+    let Ok(conn) =
+        orbit_client_core::connect_direct_verified(&local_host_id, &ws_url, &local_secret, None)
+            .await
+    else {
         return 0;
     };
     let mut registered = 0usize;
     for host in hosts {
-        if self_host_id == Some(host.host_id.as_str()) {
+        if host.host_id == local_host_id {
             continue;
         }
         let offer = PairingOffer {
@@ -553,7 +692,7 @@ async fn register_synced_hosts_into_local_daemon_mesh(
             daemon_pubkey_b64: host.daemon_pubkey_b64.clone(),
             direct_endpoints: host.direct_endpoints.clone(),
             relay_url: host.relay_url.clone(),
-            pairing_secret: "cloud-sync".to_string(),
+            pairing_secret: host.pairing_secret.clone(),
         };
         let Ok(uri) = offer.to_qr_uri() else {
             continue;
@@ -733,4 +872,47 @@ fn print_sync_summary(cfg: &PersistedCloudSyncConfig, summary: &CliSyncSummary) 
     println!(
         "\nNext: Sign in with GitHub in Orbit Desktop / iOS / Android to sync all hosts automatically."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_sync_json_view_omits_pairing_secret_and_redacts_relay() {
+        let secret = "super-sensitive-pairing-secret-0123456789abcdef";
+        let host = SyncedHostEntry {
+            host_id: "host-abc".into(),
+            hostname: "workstation".into(),
+            daemon_pubkey_b64: "pk-abc".into(),
+            direct_endpoints: vec!["ws://10.0.0.5:6868/ws".into()],
+            relay_url: Some("ssh+relay://user@relay.example:22/7878?key=RAW_SSH_SECRET_KEY".into()),
+            pairing_secret: secret.into(),
+            pairing_secret_updated_at_ms: 12345,
+            custom_name: Some("Lab Box".into()),
+            ssh_alias: None,
+            route_mode: Some("auto".into()),
+            remote_daemon_port: Some(6868),
+            custom_direct_endpoint: None,
+            os_arch: Some("linux/x86_64".into()),
+            updated_at_ms: 99999,
+            deleted_at_ms: None,
+        };
+        let views = hosts_to_cli_json_views(&[host]);
+        let json = serde_json::to_string(&views).expect("serialize cli host views");
+        assert!(json.contains("host-abc"));
+        assert!(json.contains("Lab Box"));
+        assert!(
+            !json.contains("pairing_secret"),
+            "CLI JSON must never include pairing_secret field: {json}"
+        );
+        assert!(
+            !json.contains(secret),
+            "CLI JSON must never contain raw pairing secret value: {json}"
+        );
+        assert!(
+            !json.contains("RAW_SSH_SECRET_KEY"),
+            "CLI JSON must redact embedded SSH relay credentials: {json}"
+        );
+    }
 }

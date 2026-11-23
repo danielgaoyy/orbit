@@ -154,6 +154,65 @@ pub fn extract_ws_port(endpoints: &[String]) -> Option<u16> {
     None
 }
 
+/// Resolve the local Orbit state directory (`$ORBIT_HOME`, falling back to `<user_home>/.orbit`).
+pub fn resolve_orbit_home_dir() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("ORBIT_HOME") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    Some(resolve_user_home()?.join(".orbit"))
+}
+
+/// Read the local daemon's persisted pairing secret from `<orbit_dir>/pairing-secret`.
+pub fn read_local_daemon_pairing_secret_in(orbit_dir: &Path) -> Option<String> {
+    let secret_path = orbit_dir.join("pairing-secret");
+    if !secret_path.is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(&secret_path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.len() >= 32
+        && !trimmed
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Read the local daemon's persisted pairing secret from `$ORBIT_HOME/pairing-secret`.
+pub fn read_local_daemon_pairing_secret() -> Option<String> {
+    let orbit_dir = resolve_orbit_home_dir()?;
+    read_local_daemon_pairing_secret_in(&orbit_dir)
+}
+
+fn read_local_daemon_port(orbit_dir: &Path) -> u16 {
+    if let Ok(raw) = fs::read_to_string(orbit_dir.join("daemon.addr"))
+        && let Ok(addr) = raw.trim().parse::<std::net::SocketAddr>()
+        && addr.port() > 0
+    {
+        return addr.port();
+    }
+    if let Ok(raw) = fs::read_to_string(orbit_dir.join("daemon-port"))
+        && let Ok(port) = raw.trim().parse::<u16>()
+        && port > 0
+    {
+        return port;
+    }
+    fs::read_to_string(orbit_dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("listen_addr")?.as_str().map(ToOwned::to_owned))
+        .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+        .map(|a| a.port())
+        .filter(|&p| p > 0)
+        .unwrap_or(6868)
+}
+
 /// Automatically discover and ensure the current user's isolated local Orbit Daemon on Desktop (or Xcode iOS Simulator).
 pub fn discover_local_daemon_pairing_uri() -> Option<String> {
     let is_desktop = cfg!(any(
@@ -201,10 +260,12 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
     }
 
     // Pure-Rust direct fallback when running from source without a globally installed `orbit` binary
-    let keypair_path = home.join(".orbit").join("host-keypair.json");
+    let orbit_dir = resolve_orbit_home_dir()?;
+    let keypair_path = orbit_dir.join("host-keypair.json");
     if !keypair_path.is_file() {
         return None;
     }
+    let pairing_secret = read_local_daemon_pairing_secret()?;
     let raw = fs::read_to_string(&keypair_path).ok()?;
     let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
     let host_id = kp.host_id().ok()?;
@@ -212,7 +273,8 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "localhost".to_string());
-    let relay_url = fs::read_to_string(home.join(".orbit").join("config.json"))
+    let port = read_local_daemon_port(&orbit_dir);
+    let relay_url = fs::read_to_string(orbit_dir.join("config.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| {
@@ -225,9 +287,9 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         host_id,
         hostname,
         daemon_pubkey_b64: kp.public_key_b64,
-        direct_endpoints: vec!["ws://127.0.0.1:6868/ws".to_string()],
+        direct_endpoints: vec![format!("ws://127.0.0.1:{port}/ws")],
         relay_url,
-        pairing_secret: "local".to_string(),
+        pairing_secret,
     };
     offer.to_qr_uri().ok()
 }

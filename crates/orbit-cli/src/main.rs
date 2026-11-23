@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use orbit_client_core::{
     ClientInboundEvent, HostConnectionState, HostRouteMode, HostSessionHandle, SavedHostProfile,
-    connect_direct, connect_smart,
+    connect_direct, connect_direct_verified, connect_smart,
 };
 use orbit_crypto::PairingOffer;
 use orbit_daemon::{
@@ -249,6 +249,9 @@ enum Commands {
         endpoints: Vec<String>,
         #[arg(long)]
         relay: Option<String>,
+        /// Rotate the host's persisted pairing secret (`$ORBIT_HOME/pairing-secret`) before printing the URI.
+        #[arg(long)]
+        rotate_secret: bool,
     },
 
     /// Sign in with GitHub (zero-server E2EE Secret Gist) to sync hosts, projects & settings across all devices.
@@ -764,7 +767,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 )
                 .await?;
                 println!("[✓] Detached Relay configuration and restarted daemon via {mgr}.");
-                print_pairing_summary(&home_dir, Some(listen.port()), Vec::new(), None).await?;
+                println!("    Run `orbit pair` to display an updated pairing URI.");
                 return Ok(());
             }
 
@@ -899,19 +902,16 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
             println!("[✓] Orbit Daemon active via {mgr} -> attached to {display_relay}");
-            println!(
-                "\nCopy & import this updated Pairing Code in Orbit App (Mac / iOS / Android):"
-            );
-            print_pairing_summary(&home_dir, Some(listen.port()), Vec::new(), Some(normalized))
-                .await?;
+            println!("\nRun `orbit pair` to display a pairing URI.");
         }
 
         Commands::Pair {
             port,
             endpoints,
             relay,
+            rotate_secret,
         } => {
-            print_pairing_summary(&home_dir, port, endpoints, relay).await?;
+            print_pairing_summary(&home_dir, port, endpoints, relay, rotate_secret).await?;
         }
 
         Commands::Login {
@@ -985,7 +985,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let preferred = if let Some(l) = sub_listen.or(listen) {
                     l
                 } else if let Some(p) = port {
-                    SocketAddr::from(([0, 0, 0, 0], p))
+                    SocketAddr::from(([127, 0, 0, 1], p))
                 } else {
                     persisted.listen_addr.unwrap_or_else(default_daemon_listen)
                 };
@@ -1013,14 +1013,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         .map(redact_relay_url)
                         .unwrap_or_else(|| "(none — LAN/Tailscale direct)".to_string())
                 );
-                println!("\nPairing Code for Orbit App:");
-                print_pairing_summary(
-                    &home_dir,
-                    Some(addr.port()),
-                    Vec::new(),
-                    persisted.relay_url,
-                )
-                .await?;
+                println!("\nRun `orbit pair` to display a pairing URI.");
             }
             Some(DaemonAction::Restart { port }) => {
                 let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
@@ -1029,7 +1022,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
                 let mut persisted = DaemonPersistedConfig::load(&home_dir);
                 let preferred = if let Some(p) = port {
-                    SocketAddr::from(([0, 0, 0, 0], p))
+                    SocketAddr::new(
+                        persisted
+                            .listen_addr
+                            .map(|a| a.ip())
+                            .unwrap_or_else(|| default_daemon_listen().ip()),
+                        p,
+                    )
                 } else {
                     persisted.listen_addr.unwrap_or_else(default_daemon_listen)
                 };
@@ -1050,18 +1049,28 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
                 let persisted = DaemonPersistedConfig::load(&home_dir);
                 let base_addr = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+                let live_addr = orbit_daemon::read_live_daemon_addr(&home_dir);
+                let preferred_port = live_addr.map(|a| a.port()).unwrap_or(base_addr.port());
                 let live_port =
-                    find_live_daemon_port_for_host(&runtime.host_info.host_id, base_addr.port())
+                    find_live_daemon_port_for_host(&runtime.host_info.host_id, preferred_port)
                         .await;
                 let healthy = probe_daemon_port(live_port, &runtime.host_info.host_id).await
                     == PortOwnership::Mine;
+                let effective_ip = if healthy
+                    && let Some(la) = live_addr
+                    && la.port() == live_port
+                {
+                    la.ip()
+                } else {
+                    base_addr.ip()
+                };
                 println!(
                     "Orbit Daemon : {}",
                     if healthy { "RUNNING" } else { "STOPPED" }
                 );
                 println!(
                     "Listen Addr  : {}",
-                    SocketAddr::new(base_addr.ip(), live_port)
+                    SocketAddr::new(effective_ip, live_port)
                 );
                 println!(
                     "Relay URL    : {}",
@@ -1206,7 +1215,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             parent,
             include_background,
         } => {
-            let client = connect_cli_server(&server, via_relay).await?;
+            let client = connect_cli_server(&home_dir, &server, via_relay).await?;
             let req_id = Uuid::new_v4();
             let resp = client
                 .request(
@@ -1278,7 +1287,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 provider.into()
             };
 
-            let client = connect_cli_server(&server, via_relay).await?;
+            let client = connect_cli_server(&home_dir, &server, via_relay).await?;
             let mut sub_rx = client.subscribe();
 
             let req_id = Uuid::new_v4();
@@ -1377,7 +1386,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let env_caller = std::env::var("ORBIT_AGENT_ID")
                 .ok()
                 .filter(|s| !s.trim().is_empty());
-            let client = connect_cli_server(&server, via_relay).await?;
+            let client = connect_cli_server(&home_dir, &server, via_relay).await?;
             let mut sub_rx = client.subscribe();
             let req_id = Uuid::new_v4();
             let resp = client
@@ -1425,11 +1434,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Wait { agent_id, timeout } => {
-            cmd_wait(&server, via_relay, json_mode, &agent_id, timeout).await?;
+            cmd_wait(&home_dir, &server, via_relay, json_mode, &agent_id, timeout).await?;
         }
         Commands::Stop { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1443,11 +1453,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
         Commands::Inspect { agent_id } => {
-            cmd_inspect(&server, via_relay, json_mode, &agent_id).await?;
+            cmd_inspect(&home_dir, &server, via_relay, json_mode, &agent_id).await?;
         }
         Commands::Archive { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1463,6 +1474,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Unarchive { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1478,6 +1490,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Detach { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1493,6 +1506,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Delete { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1509,6 +1523,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let req_id = Uuid::new_v4();
             let sm: SessionMode = mode.into();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1524,7 +1539,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Logs { agent_id } => {
-            let client = connect_cli_server(&server, via_relay).await?;
+            let client = connect_cli_server(&home_dir, &server, via_relay).await?;
             let req_id = Uuid::new_v4();
             let resp = client
                 .request(
@@ -1558,43 +1573,43 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             prompt,
         } => {
             cmd_fork_agent(
-                &server, via_relay, json_mode, agent_id, at_seq, worktree, branch, base_ref, title,
-                prompt,
+                &home_dir, &server, via_relay, json_mode, agent_id, at_seq, worktree, branch,
+                base_ref, title, prompt,
             )
             .await?;
         }
         Commands::Agent { action } => {
-            cmd_agent(&server, via_relay, json_mode, action).await?;
+            cmd_agent(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Workspace { action } => {
-            cmd_workspace(&server, via_relay, json_mode, action).await?;
+            cmd_workspace(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Script { action } => {
-            cmd_script(&server, via_relay, json_mode, action).await?;
+            cmd_script(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Terminal { action } => {
-            cmd_terminal(&server, via_relay, json_mode, action).await?;
+            cmd_terminal(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Schedule { action } => {
-            cmd_schedule(&server, via_relay, json_mode, action).await?;
+            cmd_schedule(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Heartbeat { action } => {
-            cmd_heartbeat(&server, via_relay, json_mode, action).await?;
+            cmd_heartbeat(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Profile { action } => {
-            cmd_profile(&server, via_relay, json_mode, action).await?;
+            cmd_profile(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Host { action } => {
-            cmd_host(&server, via_relay, json_mode, action).await?;
+            cmd_host(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Permit { action } => {
-            cmd_permit(&server, via_relay, json_mode, action).await?;
+            cmd_permit(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Config { action } => {
-            cmd_config(&server, via_relay, json_mode, action).await?;
+            cmd_config(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Skill { action } => {
-            cmd_skill(&server, via_relay, json_mode, action).await?;
+            cmd_skill(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Acp { action } => {
             cmd_acp(
@@ -1631,7 +1646,104 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn read_local_host_identity(home_dir: &std::path::Path) -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(home_dir.join("host-keypair.json")).ok()?;
+    let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
+    let host_id = kp.host_id().ok()?;
+    Some((host_id, kp.public_key_b64))
+}
+
+pub(crate) fn advertised_direct_endpoints(bind_ip: std::net::IpAddr, port: u16) -> Vec<String> {
+    if bind_ip.is_unspecified() {
+        discover_lan_ws_endpoints(port)
+    } else if bind_ip.is_ipv6() {
+        vec![format!("ws://[{bind_ip}]:{port}/ws")]
+    } else {
+        vec![format!("ws://{bind_ip}:{port}/ws")]
+    }
+}
+
+/// Extract the TCP port if `raw_url` is a plain `ws://` URL targeting a local loopback host
+/// (`127.0.0.0/8`, `localhost`, or `[::1]`). Rejects remote hosts, TLS URLs, userinfo (`@`), and
+/// parser-differential characters so local daemon credentials are never sent to remote targets.
+fn parse_loopback_ws_port(raw_url: &str) -> Option<u16> {
+    let trimmed = raw_url.trim();
+    if trimmed.len() < 5 || !trimmed[..5].eq_ignore_ascii_case("ws://") {
+        return None;
+    }
+    let rest = &trimmed[5..];
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+        return None;
+    }
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, after) = bracketed.split_once(']')?;
+        let ip: std::net::Ipv6Addr = host.parse().ok()?;
+        if !ip.is_loopback() {
+            return None;
+        }
+        if after.is_empty() {
+            return Some(80);
+        }
+        let port_str = after.strip_prefix(':')?;
+        let port: u16 = port_str.parse().ok()?;
+        return (port > 0).then_some(port);
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => {
+            if h.contains(':') {
+                return None;
+            }
+            let parsed: u16 = p.parse().ok()?;
+            if parsed == 0 {
+                return None;
+            }
+            (h, parsed)
+        }
+        None => (authority, 80),
+    };
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    is_loopback.then_some(port)
+}
+
+async fn resolve_cli_direct_secret(
+    home_dir: &std::path::Path,
+    server_url: &str,
+    explicit_secret: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
+    if let Some(secret) = explicit_secret.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok((secret.to_string(), None));
+    }
+    let Some(port) = parse_loopback_ws_port(server_url) else {
+        anyhow::bail!(
+            "refusing to send local daemon pairing secret to remote server `{server_url}`; pass `--server orbit://pair/...` or set `ORBIT_PAIRING_SECRET` for this remote target"
+        );
+    };
+    let Some((local_host_id, _)) = read_local_host_identity(home_dir) else {
+        anyhow::bail!(
+            "missing local host identity at {} (start the local daemon or pass `--server orbit://pair/...` / set `ORBIT_PAIRING_SECRET`)",
+            home_dir.join("host-keypair.json").display()
+        );
+    };
+    if probe_daemon_port(port, &local_host_id).await != PortOwnership::Mine {
+        anyhow::bail!(
+            "refusing to send local daemon pairing secret to `{server_url}`: 127.0.0.1:{port} is not owned by local daemon `{local_host_id}` (pass `--server orbit://pair/...` or set `ORBIT_PAIRING_SECRET`)"
+        );
+    }
+    let secret = orbit_daemon::read_pairing_secret(home_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing pairing secret at {} (start the local daemon or pass `--server orbit://pair/...`)",
+            home_dir.join(orbit_daemon::PAIRING_SECRET_FILENAME).display()
+        )
+    })?;
+    Ok((secret, Some(local_host_id)))
+}
+
 pub(crate) async fn connect_cli_server(
+    home_dir: &std::path::Path,
     server: &str,
     via_relay: bool,
 ) -> anyhow::Result<HostSessionHandle> {
@@ -1653,11 +1765,20 @@ pub(crate) async fn connect_cli_server(
             daemon_pubkey_b64: offer.daemon_pubkey_b64,
             direct_endpoints: offer.direct_endpoints,
             relay_url: offer.relay_url,
+            pairing_secret: offer.pairing_secret,
+            pairing_secret_updated_at_ms: 0,
             state: HostConnectionState::Disconnected,
         };
         Ok(connect_smart(&profile, None).await?)
     } else {
-        Ok(connect_direct(trimmed, None).await?)
+        let env_secret = std::env::var("ORBIT_PAIRING_SECRET").ok();
+        let (secret, expected_host_id) =
+            resolve_cli_direct_secret(home_dir, trimmed, env_secret.as_deref()).await?;
+        if let Some(host_id) = expected_host_id {
+            Ok(connect_direct_verified(&host_id, trimmed, &secret, None).await?)
+        } else {
+            Ok(connect_direct(trimmed, &secret, None).await?)
+        }
     }
 }
 
@@ -1666,19 +1787,38 @@ async fn print_pairing_summary(
     port_override: Option<u16>,
     explicit_endpoints: Vec<String>,
     explicit_relay: Option<String>,
+    rotate_secret: bool,
 ) -> anyhow::Result<()> {
+    if rotate_secret {
+        let _ = orbit_daemon::rotate_pairing_secret(home_dir)?;
+        eprintln!(
+            "[✓] Rotated host pairing secret at {} (active immediately for new connections).",
+            home_dir
+                .join(orbit_daemon::PAIRING_SECRET_FILENAME)
+                .display()
+        );
+    }
     let runtime = DaemonRuntime::bootstrap(home_dir).await?;
     let persisted = DaemonPersistedConfig::load(home_dir);
-    let fallback_port = persisted
-        .listen_addr
-        .unwrap_or_else(default_daemon_listen)
-        .port();
+    let configured_listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+    let live_addr = orbit_daemon::read_live_daemon_addr(home_dir);
+    let preferred_port = live_addr
+        .map(|a| a.port())
+        .unwrap_or_else(|| configured_listen.port());
     let port = match port_override {
         Some(p) => p,
-        None => find_live_daemon_port_for_host(&runtime.host_info.host_id, fallback_port).await,
+        None => find_live_daemon_port_for_host(&runtime.host_info.host_id, preferred_port).await,
+    };
+    let bind_ip = if let Some(la) = live_addr
+        && la.port() == port
+        && probe_daemon_port(port, &runtime.host_info.host_id).await == PortOwnership::Mine
+    {
+        la.ip()
+    } else {
+        configured_listen.ip()
     };
     let endpoints = if explicit_endpoints.is_empty() {
-        discover_lan_ws_endpoints(port)
+        advertised_direct_endpoints(bind_ip, port)
     } else {
         explicit_endpoints
     };
@@ -1687,7 +1827,7 @@ async fn print_pairing_summary(
         None => persisted.relay_url,
     };
 
-    let offer = runtime.build_pairing_offer(endpoints.clone(), relay.clone());
+    let offer = runtime.build_pairing_offer(endpoints.clone(), relay.clone())?;
     let relay_summary = relay
         .as_deref()
         .map(redact_relay_url)
@@ -3001,5 +3141,99 @@ mod tests {
         assert!(send_err.to_string().contains("ws broken"));
         let err2_text = String::from_utf8(err2).expect("utf8 err2");
         assert!(err2_text.contains("failed to send resolution for `perm_fail`"));
+    }
+
+    #[test]
+    fn cli_parses_pair_rotate_secret_flag() {
+        let parsed = Cli::try_parse_from(["orbit", "pair", "--rotate-secret"])
+            .expect("parse orbit pair --rotate-secret");
+        match parsed.command {
+            Commands::Pair { rotate_secret, .. } => assert!(rotate_secret),
+            _ => panic!("expected Commands::Pair"),
+        }
+
+        let default_pair = Cli::try_parse_from(["orbit", "pair"]).expect("parse orbit pair");
+        match default_pair.command {
+            Commands::Pair { rotate_secret, .. } => assert!(!rotate_secret),
+            _ => panic!("expected Commands::Pair"),
+        }
+    }
+
+    #[test]
+    fn parse_loopback_ws_port_accepts_only_plain_loopback() {
+        assert_eq!(parse_loopback_ws_port("ws://127.0.0.1:6868/ws"), Some(6868));
+        assert_eq!(
+            parse_loopback_ws_port("WS://LOCALHOST:6870/ws?x=1"),
+            Some(6870)
+        );
+        assert_eq!(parse_loopback_ws_port("ws://[::1]:6868/ws"), Some(6868));
+        assert_eq!(parse_loopback_ws_port("ws://127.0.0.2:6868/ws"), Some(6868));
+
+        // Remote hosts, TLS, userinfo spoofs, and parser differentials must be rejected
+        assert_eq!(parse_loopback_ws_port("ws://192.168.1.10:6868/ws"), None);
+        assert_eq!(parse_loopback_ws_port("ws://evil.example:6868/ws"), None);
+        assert_eq!(parse_loopback_ws_port("wss://127.0.0.1:6868/ws"), None);
+        assert_eq!(
+            parse_loopback_ws_port("ws://127.0.0.1@evil.example:6868/ws"),
+            None
+        );
+        assert_eq!(
+            parse_loopback_ws_port("ws://127.0.0.1.evil.example:6868/ws"),
+            None
+        );
+        assert_eq!(
+            parse_loopback_ws_port("ws://127.0.0.1\\@evil.example:6868/ws"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_cli_direct_secret_refuses_sending_local_secret_to_remote_server() {
+        let tmp = std::env::temp_dir().join(format!("orbit_cli_sec_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let _rt = DaemonRuntime::bootstrap(&tmp).await.expect("bootstrap");
+
+        // Even with a valid local pairing-secret on disk, targeting a remote server without
+        // explicit credential MUST fail closed instead of leaking the local secret.
+        let err = resolve_cli_direct_secret(&tmp, "ws://remote.example:6868/ws", None)
+            .await
+            .expect_err("must refuse sending local secret to remote URL");
+        assert!(
+            err.to_string()
+                .contains("refusing to send local daemon pairing secret"),
+            "unexpected error: {err}"
+        );
+
+        // Explicit secret is still honored for intentional remote targets.
+        let (sec, expected_hid) = resolve_cli_direct_secret(
+            &tmp,
+            "ws://remote.example:6868/ws",
+            Some("explicit-remote-secret"),
+        )
+        .await
+        .expect("explicit secret allowed");
+        assert_eq!(sec, "explicit-remote-secret");
+        assert!(expected_hid.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn advertised_direct_endpoints_respects_bind_address() {
+        assert_eq!(
+            advertised_direct_endpoints(std::net::IpAddr::from([127, 0, 0, 1]), 6868),
+            vec!["ws://127.0.0.1:6868/ws".to_string()]
+        );
+        assert_eq!(
+            advertised_direct_endpoints(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 6868),
+            vec!["ws://[::1]:6868/ws".to_string()]
+        );
+        assert_eq!(
+            advertised_direct_endpoints(std::net::IpAddr::from([10, 20, 30, 40]), 6900),
+            vec!["ws://10.20.30.40:6900/ws".to_string()]
+        );
+        // Wildcard bind enumerates LAN endpoints (at least one endpoint returned).
+        let wildcard = advertised_direct_endpoints(std::net::IpAddr::from([0, 0, 0, 0]), 6868);
+        assert!(!wildcard.is_empty());
     }
 }

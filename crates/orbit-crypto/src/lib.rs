@@ -14,6 +14,7 @@ pub use vault::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use snow::params::{CipherChoice, DHChoice, HashChoice};
@@ -217,11 +218,26 @@ pub fn verify_tunnel_attach_mac(
         return false;
     }
     let expected = compute_tunnel_attach_mac(attach_secret, attach_nonce, tunnel_id);
-    let mut diff = 0u8;
-    for (a, b) in expected.iter().zip(candidate_mac.iter()) {
-        diff |= a ^ b;
+    constant_time_eq(&expected, candidate_mac)
+}
+
+/// Generate a 256-bit (32-byte CSPRNG) URL-safe base64 pairing secret (`43` chars, no padding).
+pub fn generate_pairing_secret() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Constant-time byte-slice comparison (fixed-time XOR fold with no early exit on mismatch).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u8 = if a.len() == b.len() { 0 } else { 1 };
+    let max_len = a.len().max(b.len());
+    for i in 0..max_len {
+        let ba = a.get(i).copied().unwrap_or(0);
+        let bb = b.get(i).copied().unwrap_or(0);
+        diff |= std::hint::black_box(ba ^ bb);
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 /// Pairing payload encoded into QR codes for instant mobile onboarding across multiple hosts.
@@ -623,5 +639,25 @@ mod tests {
         let parsed = PairingOffer::from_qr_uri(&uri).expect("decode uri");
         assert_eq!(parsed.hostname, "mac-mini.local");
         assert_eq!(parsed.relay_url, offer.relay_url);
+    }
+
+    #[test]
+    fn generate_pairing_secret_is_32_byte_url_safe_base64_and_unique() {
+        let s1 = generate_pairing_secret();
+        let s2 = generate_pairing_secret();
+        assert_eq!(s1.len(), 43);
+        assert_eq!(s2.len(), 43);
+        assert_ne!(s1, s2);
+        let decoded = URL_SAFE_NO_PAD.decode(&s1).expect("valid base64url");
+        assert_eq!(decoded.len(), 32);
+    }
+
+    #[test]
+    fn constant_time_eq_handles_equal_differing_and_mismatched_lengths() {
+        assert!(constant_time_eq(b"secret-token-123", b"secret-token-123"));
+        assert!(!constant_time_eq(b"secret-token-123", b"secret-token-124"));
+        assert!(!constant_time_eq(b"secret-token-123", b"secret-token-12"));
+        assert!(!constant_time_eq(b"short", b"longer-value"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

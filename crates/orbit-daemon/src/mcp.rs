@@ -48,16 +48,21 @@ pub async fn mcp_agents_handler(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    // 1. Validate Bearer token
-    let provided_token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| {
-            s.strip_prefix("Bearer ")
-                .or_else(|| s.strip_prefix("bearer "))
-        })
-        .map(str::trim);
-    if provided_token != Some(runtime.mcp_token.as_str()) {
+    // 1. Enforce anti-CSWSH / CSRF Origin validation
+    if let Err(status) = crate::validate_request_origin(&headers) {
+        return (
+            status,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": body.get("id").cloned().unwrap_or(Value::Null),
+                "error": { "code": -32003, "message": "Forbidden Origin" }
+            })),
+        )
+            .into_response();
+    }
+
+    // 2. Validate Bearer token in constant time
+    if !crate::verify_bearer_token(&headers, &runtime.mcp_token) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({

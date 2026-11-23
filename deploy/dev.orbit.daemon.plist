@@ -9,7 +9,7 @@
         <string>/usr/local/bin/orbit</string>
         <string>daemon</string>
         <string>--listen</string>
-        <string>0.0.0.0:6868</string>
+        <string>127.0.0.1:6868</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

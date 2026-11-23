@@ -27,13 +27,16 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
     let rt_a = DaemonRuntime::bootstrap(&home_a).await.expect("rt a");
     let host_id_a = rt_a.host_info.host_id.clone();
     let pubkey_a = rt_a.keypair.public_key_b64.clone();
+    let secret_a = rt_a.pairing_secret.clone();
     drop(rt_a);
 
     let rt_b = DaemonRuntime::bootstrap(&home_b).await.expect("rt b");
     let host_id_b = rt_b.host_info.host_id.clone();
     let pubkey_b = rt_b.keypair.public_key_b64.clone();
+    let secret_b = rt_b.pairing_secret.clone();
     drop(rt_b);
     assert_ne!(host_id_a, host_id_b);
+    assert_ne!(secret_a, secret_b);
 
     // 1. Start user A's daemon on `shared_addr`
     let home_a_bg = home_a.clone();
@@ -117,8 +120,34 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
     assert_eq!(hz_a["host_id"].as_str(), Some(host_id_a.as_str()));
     assert_eq!(hz_b["host_id"].as_str(), Some(host_id_b.as_str()));
 
-    // 3. Strict Identity Enforcement: if user B's profile accidentally points at user A's port,
-    //    `connect_smart` MUST reject immediately with `HostIdentityMismatch`!
+    // 3. Strict Auth + Identity Enforcement:
+    //    (a) With user B's own pairing_secret pointing at user A's port, user A's `/ws` rejects at HTTP 401!
+    let misconfigured_b_own_secret = SavedHostProfile {
+        host_id: host_id_b.clone(),
+        hostname: "same-ec2-host".into(),
+        custom_name: Some("gj".into()),
+        ssh_alias: None,
+        route_mode: HostRouteMode::DirectOnly,
+        remote_daemon_port: shared_addr.port(),
+        custom_direct_endpoint: None,
+        daemon_pubkey_b64: pubkey_b.clone(),
+        direct_endpoints: vec![format!("ws://{shared_addr}/ws")],
+        relay_url: None,
+        pairing_secret: secret_b.clone(),
+        pairing_secret_updated_at_ms: 0,
+        state: HostConnectionState::Disconnected,
+    };
+    let auth_err = connect_smart(&misconfigured_b_own_secret, None)
+        .await
+        .err()
+        .expect("must reject cross-user pairing secret");
+    assert!(
+        matches!(auth_err, ClientCoreError::Ws(_)),
+        "expected WS 401 auth rejection, got {auth_err:?}"
+    );
+
+    //    (b) Defense-in-depth: even if given user A's secret, `connect_smart` MUST reject
+    //        immediately on `Welcome` with `HostIdentityMismatch`!
     let misconfigured_b = SavedHostProfile {
         host_id: host_id_b.clone(),
         hostname: "same-ec2-host".into(),
@@ -130,6 +159,8 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
         daemon_pubkey_b64: pubkey_b.clone(),
         direct_endpoints: vec![format!("ws://{shared_addr}/ws")],
         relay_url: None,
+        pairing_secret: secret_a.clone(),
+        pairing_secret_updated_at_ms: 0,
         state: HostConnectionState::Disconnected,
     };
     let err = connect_smart(&misconfigured_b, None)
@@ -143,9 +174,10 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
 
     // 4. Simultaneous Multi-User Operation in a single OrbitAppCore:
     //    Create a workspace on user A and verify user B has 0 leaked workspaces!
-    let client_a = orbit_client_core::connect_direct(&format!("ws://{shared_addr}/ws"), None)
-        .await
-        .expect("connect a");
+    let client_a =
+        orbit_client_core::connect_direct(&format!("ws://{shared_addr}/ws"), &secret_a, None)
+            .await
+            .expect("connect a");
     let ws_req = Uuid::new_v4();
     let _ = client_a
         .request(
@@ -177,7 +209,7 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
         daemon_pubkey_b64: pubkey_a,
         direct_endpoints: vec![format!("ws://{shared_addr}/ws")],
         relay_url: None,
-        pairing_secret: "sec-a".into(),
+        pairing_secret: secret_a,
     };
     let offer_b = orbit_crypto::PairingOffer {
         host_id: host_id_b.clone(),
@@ -185,7 +217,7 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
         daemon_pubkey_b64: pubkey_b,
         direct_endpoints: vec![format!("ws://{isolated_addr_b}/ws")],
         relay_url: None,
-        pairing_secret: "sec-b".into(),
+        pairing_secret: secret_b,
     };
 
     let core = OrbitAppCore::open_in_memory().expect("core");

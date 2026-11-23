@@ -80,8 +80,9 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // 5. Build pairing QR URI with an unreachable LAN IP so Happy-Eyeballs falls back to E2EE Relay!
-    let offer =
-        runtime.build_pairing_offer(vec!["ws://127.0.0.1:1/ws".into()], Some(relay_url.clone()));
+    let offer = runtime
+        .build_pairing_offer(vec!["ws://127.0.0.1:1/ws".into()], Some(relay_url.clone()))
+        .expect("pairing offer");
     let qr_uri = offer.to_qr_uri().expect("qr uri");
 
     let fleet = MultiHostFleet::open_in_memory().expect("fleet");
@@ -433,8 +434,9 @@ async fn ssh_tunneled_e2ee_relay_integration() {
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     // 6. Client imports PairingOffer with unreachable LAN endpoint -> connects via SSH Relay + Noise NK E2EE
-    let offer =
-        runtime.build_pairing_offer(vec!["ws://127.0.0.1:1/ws".into()], Some(ssh_relay_uri));
+    let offer = runtime
+        .build_pairing_offer(vec!["ws://127.0.0.1:1/ws".into()], Some(ssh_relay_uri))
+        .expect("pairing offer");
     let qr_uri = offer.to_qr_uri().expect("qr uri");
 
     let fleet = MultiHostFleet::open_in_memory().expect("fleet");
@@ -506,7 +508,9 @@ async fn e2ee_relay_chunked_attachment_staging_integration() {
         .expect("spawn daemon");
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let offer = runtime.build_pairing_offer(vec!["ws://127.0.0.1:1/ws".into()], Some(relay_url));
+    let offer = runtime
+        .build_pairing_offer(vec!["ws://127.0.0.1:1/ws".into()], Some(relay_url))
+        .expect("pairing offer");
     let qr_uri = offer.to_qr_uri().expect("qr uri");
     let host_id = offer.host_id.clone();
 

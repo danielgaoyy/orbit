@@ -4,10 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use orbit_protocol::{PROTOCOL_VERSION, WireMessage};
-use tokio_tungstenite::tungstenite::Message as TungMsg;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRole {
     Daemon,
@@ -176,31 +172,25 @@ pub async fn check_local_health(port: u16) -> bool {
 }
 
 /// Verify whether `127.0.0.1:{port}` is free, owned by `expected_host_id` (`Mine`), or held by another user/process (`OccupiedByOther`).
-/// Works seamlessly across both `0.2.3+` JSON `/healthz` and `<= 0.2.2` legacy WebSocket `Welcome` handshakes.
 pub async fn probe_daemon_port(port: u16, expected_host_id: &str) -> PortOwnership {
     if let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_millis(350))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         let url = format!("http://127.0.0.1:{port}/healthz");
-        if let Ok(resp) = client.get(url).send().await
-            && resp.status().is_success()
-            && let Ok(body) = resp.text().await
-        {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+        if let Ok(resp) = client.get(url).send().await {
+            if resp.status().is_success()
+                && let Ok(body) = resp.text().await
+                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
                 && let Some(hid) = json.get("host_id").and_then(|v| v.as_str())
+                && hid == expected_host_id
             {
-                return if hid == expected_host_id {
-                    PortOwnership::Mine
-                } else {
-                    PortOwnership::OccupiedByOther
-                };
+                return PortOwnership::Mine;
             }
-            // Legacy <= 0.2.2 daemon returning plain `"ok"`: verify `host_id` via local WS `Welcome`
-            return match probe_ws_welcome_host_id(port).await {
-                Some(hid) if hid == expected_host_id => PortOwnership::Mine,
-                _ => PortOwnership::OccupiedByOther,
-            };
+            // Any other HTTP response on this port belongs to another service or daemon;
+            // never fall back to sending a bearer token over WebSocket to an unverified service.
+            return PortOwnership::OccupiedByOther;
         }
     }
 
@@ -210,38 +200,6 @@ pub async fn probe_daemon_port(port: u16, expected_host_id: &str) -> PortOwnersh
         PortOwnership::Free
     } else {
         PortOwnership::OccupiedByOther
-    }
-}
-
-async fn probe_ws_welcome_host_id(port: u16) -> Option<String> {
-    let url = format!("ws://127.0.0.1:{port}/ws");
-    let (ws, _) = tokio::time::timeout(
-        Duration::from_millis(450),
-        tokio_tungstenite::connect_async(&url),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let (mut sink, mut stream) = ws.split();
-    let hello = WireMessage::Hello {
-        client_id: "health-probe".into(),
-        client_name: "orbit-cli-probe".into(),
-        protocol_version: PROTOCOL_VERSION,
-        supports_zstd: false,
-    };
-    let txt = serde_json::to_string(&hello).ok()?;
-    sink.send(TungMsg::Text(txt.into())).await.ok()?;
-
-    let msg = tokio::time::timeout(Duration::from_millis(450), stream.next())
-        .await
-        .ok()??
-        .ok()?;
-    match msg {
-        TungMsg::Text(t) => match serde_json::from_str::<WireMessage>(&t).ok()? {
-            WireMessage::Welcome { host } => Some(host.host_id),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -756,7 +714,7 @@ fn replace_executable_safely(tmp: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 pub fn default_daemon_listen() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], 6868))
+    SocketAddr::from(([127, 0, 0, 1], 6868))
 }
 
 fn resolve_github_token() -> Option<String> {
@@ -1124,6 +1082,58 @@ mod tests {
         assert_eq!(
             extract_tag_from_release_url("https://github.com/danielgaoyy/orbit/releases/tag/"),
             None
+        );
+    }
+
+    #[test]
+    fn default_daemon_listen_binds_loopback_only() {
+        assert_eq!(
+            default_daemon_listen(),
+            SocketAddr::from(([127, 0, 0, 1], 6868))
+        );
+        assert!(default_daemon_listen().ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn probe_daemon_port_never_falls_back_to_ws_for_unidentified_http_service() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let ws_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ws_seen_bg = ws_seen.clone();
+
+        let srv = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) =
+                    tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                        .await
+                        .unwrap_or(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "timeout",
+                        )))
+                else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.contains("GET /ws") || req.to_ascii_lowercase().contains("authorization:") {
+                    ws_seen_bg.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let ownership = probe_daemon_port(port, "orbit-expected-host").await;
+        assert_eq!(ownership, PortOwnership::OccupiedByOther);
+        let _ = srv.await;
+        assert!(
+            !ws_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "probe_daemon_port must never send a credentialed WS probe to an unidentified HTTP service"
         );
     }
 }

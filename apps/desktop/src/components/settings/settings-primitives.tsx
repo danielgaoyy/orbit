@@ -1,26 +1,8 @@
 import type { ReactNode } from "react";
 import { Loader2, ShieldCheck } from "lucide-react";
 import { Select, type SelectOption, type SelectProps } from "@/components/ui/select";
-import type { HostCardView, HostConnectionState } from "@/lib/orbit-ipc";
+import type { HostConnectionState } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
-
-export function encodeHostPairingUri(host: HostCardView): string {
-  const offer = {
-    host_id: host.host_id,
-    hostname: host.display_name,
-    daemon_pubkey_b64: host.daemon_pubkey_b64,
-    direct_endpoints: host.direct_endpoints,
-    relay_url: host.relay_url,
-    pairing_secret: "orbit-desktop-export",
-  };
-  const bytes = new TextEncoder().encode(JSON.stringify(offer));
-  let bin = "";
-  bytes.forEach((b) => {
-    bin += String.fromCharCode(b);
-  });
-  const b64Url = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  return `orbit://pair/${b64Url}`;
-}
 
 export function ToggleSwitch({
   checked,

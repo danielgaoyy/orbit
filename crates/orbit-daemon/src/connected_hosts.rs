@@ -22,7 +22,12 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{Message as TungMsg, protocol::WebSocketConfig},
+    tungstenite::{
+        Message as TungMsg,
+        client::IntoClientRequest,
+        http::{HeaderValue, header::AUTHORIZATION},
+        protocol::WebSocketConfig,
+    },
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -124,6 +129,7 @@ impl ConnectedHostsManager {
             }
             ex.direct_endpoints = offer.direct_endpoints;
             ex.relay_url = offer.relay_url;
+            ex.pairing_secret = offer.pairing_secret;
             ex.enabled = true;
             ex.updated_at = now;
             ex
@@ -137,6 +143,7 @@ impl ConnectedHostsManager {
                 daemon_pubkey_b64: offer.daemon_pubkey_b64,
                 direct_endpoints: offer.direct_endpoints,
                 relay_url: offer.relay_url,
+                pairing_secret: offer.pairing_secret,
                 enabled: true,
                 created_at: now,
                 updated_at: now,
@@ -611,9 +618,9 @@ async fn connect_to_peer_daemon(
 )> {
     let mut last_err = anyhow::anyhow!("no reachable endpoints");
 
-    // 1. Direct WebSocket endpoints
+    // 1. Direct WebSocket endpoints (only explicitly registered endpoints with stored Bearer secret)
     for ep in &row.direct_endpoints {
-        match connect_direct_peer(ep, self_host_id).await {
+        match connect_direct_peer(ep, &row.pairing_secret, self_host_id).await {
             Ok((info, tx, rx)) => {
                 if let Some(ref pinned) = row.host_id
                     && pinned != &info.host_id
@@ -643,18 +650,29 @@ async fn connect_to_peer_daemon(
 
 async fn connect_direct_peer(
     ws_url: &str,
+    pairing_secret: &str,
     self_host_id: &str,
 ) -> anyhow::Result<(
     HostInfo,
     mpsc::Sender<WireMessage>,
     mpsc::Receiver<WireMessage>,
 )> {
+    let secret = pairing_secret.trim();
+    if secret.is_empty() {
+        anyhow::bail!("missing pairing_secret for direct peer WebSocket authentication");
+    }
+
+    let mut req = ws_url.into_client_request()?;
+    let auth_header = HeaderValue::from_str(&format!("Bearer {secret}"))
+        .map_err(|e| anyhow::anyhow!("invalid pairing_secret header value: {e}"))?;
+    req.headers_mut().insert(AUTHORIZATION, auth_header);
+
     let mut ws_cfg = WebSocketConfig::default();
     ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
     ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
     let (ws, _) = tokio::time::timeout(
         Duration::from_secs(2),
-        connect_async_with_config(ws_url, Some(ws_cfg), false),
+        connect_async_with_config(req, Some(ws_cfg), false),
     )
     .await??;
     let (mut sink, mut stream) = ws.split();

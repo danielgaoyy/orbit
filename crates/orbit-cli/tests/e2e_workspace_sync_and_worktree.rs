@@ -357,7 +357,9 @@ async fn test_01_non_git_worktree_guard_and_nested_git_repo_folding() {
     let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("daemon");
-    let offer = rt.build_pairing_offer(vec![format!("ws://{addr}/ws")], None);
+    let offer = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("pairing offer");
     let uri = offer.to_qr_uri().expect("pair uri");
 
     let (core, host_id) = open_and_connect_core(home.join("client1.db"), uri).await;
@@ -374,7 +376,7 @@ async fn test_01_non_git_worktree_guard_and_nested_git_repo_folding() {
     );
 
     // 2. Defense-in-depth: daemon rejects worktree=true on pure non-git directory with structured error
-    let raw_client = connect_direct(&format!("ws://{addr}/ws"), None)
+    let raw_client = connect_direct(&format!("ws://{addr}/ws"), &rt.pairing_secret, None)
         .await
         .expect("raw ws");
     let req_id = Uuid::new_v4();
@@ -523,7 +525,9 @@ async fn test_02_dual_client_realtime_multi_device_sync() {
     let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("daemon");
-    let offer = rt.build_pairing_offer(vec![format!("ws://{addr}/ws")], None);
+    let offer = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("pairing offer");
     let uri = offer.to_qr_uri().expect("pair uri");
 
     // Two completely independent client devices (separate SQLite DBs) connected to the same daemon
@@ -812,7 +816,9 @@ async fn test_03_mission_workspace_peers_board_mentions_and_conflict_radar() {
     let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("daemon");
-    let offer = rt.build_pairing_offer(vec![format!("ws://{addr}/ws")], None);
+    let offer = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("pairing offer");
     let uri = offer.to_qr_uri().expect("pair uri");
     let (core, host_id) = open_and_connect_core(home.join("mw_client.db"), uri).await;
 
@@ -1073,7 +1079,9 @@ async fn test_04_auto_clustering_high_medium_unrelated_and_reversible_undo() {
     let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("daemon");
-    let offer = rt.build_pairing_offer(vec![format!("ws://{addr}/ws")], None);
+    let offer = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("pairing offer");
     let uri = offer.to_qr_uri().expect("pair uri");
     let (core, host_id) = open_and_connect_core(home.join("ac_client.db"), uri).await;
 
@@ -1319,6 +1327,7 @@ async fn test_05_workspace_management_unclassified_inbox_ai_triage_and_tab_renam
         .expect("daemon");
     let uri = rt
         .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("pairing offer")
         .to_qr_uri()
         .expect("pair uri");
 

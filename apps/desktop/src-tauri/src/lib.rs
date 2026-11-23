@@ -406,6 +406,17 @@ fn pair_host(
 }
 
 #[tauri::command]
+fn export_host_pairing_uri(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<String, String> {
+    state
+        .core
+        .export_host_pairing_uri(&host_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn pair_ssh_host(
     state: State<'_, DesktopAppState>,
     ssh_alias: String,
@@ -3486,6 +3497,7 @@ pub fn run() {
             update_connected_host,
             remove_connected_host,
             sync_fleet_connected_hosts,
+            export_host_pairing_uri,
             update_orchestration_config,
             sync_orchestration_skills,
             list_managed_skills,

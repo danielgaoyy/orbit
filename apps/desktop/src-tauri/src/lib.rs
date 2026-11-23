@@ -76,8 +76,9 @@ use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnVie
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
     ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
-    EventTriggerDelivery, ExternalMcpServerRecord, GuardianPolicyConfig, HookExecutionRecord,
-    HookScope, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult, GitCreatePrResult,
+    GitMutationOutcome, GitPushResult, GuardianPolicyConfig, HookExecutionRecord, HookScope,
+    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
     ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
     ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
@@ -1660,6 +1661,128 @@ fn fetch_git_diff(
     state
         .core
         .fetch_git_diff(&host_id, &cwd, path.as_deref(), staged);
+}
+
+#[tauri::command]
+async fn git_stage_files(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    paths: Vec<String>,
+    all: Option<bool>,
+) -> Result<GitMutationOutcome, String> {
+    state
+        .core
+        .git_stage_files_on_host(&host_id, &cwd, paths, all.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_unstage_files(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    paths: Vec<String>,
+    all: Option<bool>,
+) -> Result<GitMutationOutcome, String> {
+    state
+        .core
+        .git_unstage_files_on_host(&host_id, &cwd, paths, all.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_apply_hunk(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    patch: String,
+    reverse: Option<bool>,
+    cached: Option<bool>,
+) -> Result<GitMutationOutcome, String> {
+    state
+        .core
+        .git_apply_hunk_on_host(
+            &host_id,
+            &cwd,
+            patch,
+            reverse.unwrap_or(false),
+            cached.unwrap_or(false),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn git_discard_files(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    paths: Vec<String>,
+    include_untracked: Option<bool>,
+) -> Result<GitMutationOutcome, String> {
+    state
+        .core
+        .git_discard_files_on_host(&host_id, &cwd, paths, include_untracked.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_commit(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    message: String,
+    amend: Option<bool>,
+) -> Result<GitCommitResult, String> {
+    state
+        .core
+        .git_commit_on_host(&host_id, &cwd, message, amend.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_push(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    remote: Option<String>,
+    branch: Option<String>,
+    set_upstream: Option<bool>,
+) -> Result<GitPushResult, String> {
+    state
+        .core
+        .git_push_on_host(
+            &host_id,
+            &cwd,
+            remote,
+            branch,
+            set_upstream.unwrap_or(false),
+        )
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn git_create_pr(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    title: String,
+    body: Option<String>,
+    base: Option<String>,
+    draft: Option<bool>,
+) -> Result<GitCreatePrResult, String> {
+    state
+        .core
+        .git_create_pr_on_host(
+            &host_id,
+            &cwd,
+            title,
+            body.unwrap_or_default(),
+            base,
+            draft.unwrap_or(false),
+        )
+        .await
 }
 
 #[tauri::command]
@@ -3543,6 +3666,13 @@ pub fn run() {
             answer_question,
             fetch_git_status,
             fetch_git_diff,
+            git_stage_files,
+            git_unstage_files,
+            git_apply_hunk,
+            git_discard_files,
+            git_commit,
+            git_push,
+            git_create_pr,
             start_terminal,
             attach_terminal,
             kill_terminal,

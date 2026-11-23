@@ -1823,6 +1823,34 @@ export interface GitReviewView {
   diff_files: DiffFileView[];
 }
 
+export interface GitCommitResult {
+  commit_sha: string;
+  short_sha: string;
+  summary: string;
+  branch: string | null;
+}
+
+export interface GitPushResult {
+  remote: string;
+  branch: string;
+  output: string;
+}
+
+export interface GitCreatePrResult {
+  url: string;
+  number: number | null;
+  title: string;
+}
+
+export type GitMutationOutcome =
+  | { kind: "files_staged"; paths: string[]; all: boolean }
+  | { kind: "files_unstaged"; paths: string[]; all: boolean }
+  | { kind: "hunk_applied"; reverse: boolean; cached: boolean }
+  | { kind: "files_discarded"; paths: string[]; include_untracked: boolean }
+  | ({ kind: "committed" } & GitCommitResult)
+  | ({ kind: "pushed" } & GitPushResult)
+  | ({ kind: "pr_created" } & GitCreatePrResult);
+
 export interface WorkspaceFileView {
   host_id: string;
   cwd: string;
@@ -4189,6 +4217,133 @@ export const orbitIpc = {
   ): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("fetch_git_diff", { hostId, cwd, path, staged });
+  },
+
+  gitStageFiles: async (params: {
+    hostId: string;
+    cwd: string;
+    paths?: string[];
+    all?: boolean;
+  }): Promise<GitMutationOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to stage git files.");
+    }
+    return invoke<GitMutationOutcome>("git_stage_files", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      paths: params.paths ?? [],
+      all: params.all ?? false,
+    });
+  },
+
+  gitUnstageFiles: async (params: {
+    hostId: string;
+    cwd: string;
+    paths?: string[];
+    all?: boolean;
+  }): Promise<GitMutationOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to unstage git files.");
+    }
+    return invoke<GitMutationOutcome>("git_unstage_files", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      paths: params.paths ?? [],
+      all: params.all ?? false,
+    });
+  },
+
+  gitApplyHunk: async (params: {
+    hostId: string;
+    cwd: string;
+    patch: string;
+    reverse?: boolean;
+    cached?: boolean;
+  }): Promise<GitMutationOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to apply git hunks.");
+    }
+    return invoke<GitMutationOutcome>("git_apply_hunk", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      patch: params.patch,
+      reverse: params.reverse ?? false,
+      cached: params.cached ?? false,
+    });
+  },
+
+  gitDiscardFiles: async (params: {
+    hostId: string;
+    cwd: string;
+    paths: string[];
+    includeUntracked?: boolean;
+  }): Promise<GitMutationOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to discard git changes.");
+    }
+    return invoke<GitMutationOutcome>("git_discard_files", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      paths: params.paths,
+      includeUntracked: params.includeUntracked ?? false,
+    });
+  },
+
+  gitCommit: async (params: {
+    hostId: string;
+    cwd: string;
+    message: string;
+    amend?: boolean;
+  }): Promise<GitCommitResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to create git commits.");
+    }
+    return invoke<GitCommitResult>("git_commit", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      message: params.message,
+      amend: params.amend ?? false,
+    });
+  },
+
+  gitPush: async (params: {
+    hostId: string;
+    cwd: string;
+    remote?: string | null;
+    branch?: string | null;
+    setUpstream?: boolean;
+  }): Promise<GitPushResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to push git branches.");
+    }
+    return invoke<GitPushResult>("git_push", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      remote: params.remote ?? null,
+      branch: params.branch ?? null,
+      setUpstream: params.setUpstream ?? false,
+    });
+  },
+
+  gitCreatePr: async (params: {
+    hostId: string;
+    cwd: string;
+    title: string;
+    body?: string;
+    base?: string | null;
+    draft?: boolean;
+  }): Promise<GitCreatePrResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to create pull requests.");
+    }
+    return invoke<GitCreatePrResult>("git_create_pr", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      title: params.title,
+      body: params.body ?? "",
+      base: params.base ?? null,
+      draft: params.draft ?? false,
+    });
   },
 
   startTerminal: async (

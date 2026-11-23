@@ -18,21 +18,22 @@ use orbit_protocol::{
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
     BackgroundTaskInfo, BrowserPolicyConfig, BrowserSessionSummary, ConditionalTimerRecord,
     ConditionalTimerState, ConnectedHostSummary, ContextOccupancyBreakdown, DirectoryEntry,
-    DiscoveredProject, EventTriggerDelivery, ExternalMcpServerRecord, GitStatusSnapshot,
-    GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
-    HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform,
-    ImThreadBinding, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation,
-    LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption,
-    MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
-    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem, QueuedPromptView,
-    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
-    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload,
-    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
-    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
-    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
-    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    DiscoveredProject, EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult,
+    GitCreatePrResult, GitMutationOutcome, GitPushResult, GitStatusSnapshot, GoalRunRecord,
+    GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig, HookExecutionRecord, HookScope,
+    HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform, ImThreadBinding, KeepAwakeStatus,
+    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord, OrchestrationConfig,
+    OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef,
+    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord, PushPlatform,
+    PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode,
+    ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope,
+    TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload, TimerCondition,
+    ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage, WorkflowRunRecord,
+    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
+    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
+    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -751,6 +752,9 @@ type PendingManagedSkillsListEntry = (
 type PendingSymbolSearchTx =
     tokio::sync::oneshot::Sender<Result<(Vec<orbit_protocol::WorkspaceSymbolEntry>, bool), String>>;
 
+type PendingGitMutationTx =
+    tokio::sync::oneshot::Sender<Result<(GitMutationOutcome, bool), String>>;
+
 struct HostMemoryState {
     profile: SavedHostProfile,
     is_local: bool,
@@ -801,6 +805,7 @@ struct HostMemoryState {
     pending_upgrade_terminals: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     pending_git_repo_inspections:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GitReposInspectionView, String>>>,
+    pending_git_mutations: HashMap<Uuid, PendingGitMutationTx>,
     pending_acp_probes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AcpProbeResult, String>>>,
     pending_acp_snapshots: HashMap<
         Uuid,
@@ -910,6 +915,7 @@ struct HostMemoryState {
     terminal_emulators: HashMap<u8, TerminalGridEmulator>,
     git_statuses: HashMap<String, GitStatusSnapshot>,
     git_diffs: HashMap<String, String>,
+    last_git_diff_staged: HashMap<String, bool>,
     git_repos_by_cwd: HashMap<String, GitReposInspectionView>,
     workspace_files: HashMap<String, Vec<String>>,
     workspace_boards: HashMap<String, WorkspaceBoardSnapshot>,
@@ -982,6 +988,7 @@ impl HostMemoryState {
             pending_daemon_upgrades: HashMap::new(),
             pending_upgrade_terminals: HashMap::new(),
             pending_git_repo_inspections: HashMap::new(),
+            pending_git_mutations: HashMap::new(),
             pending_acp_probes: HashMap::new(),
             pending_acp_snapshots: HashMap::new(),
             pending_mcp_snapshots: HashMap::new(),
@@ -1055,6 +1062,7 @@ impl HostMemoryState {
             terminal_emulators,
             git_statuses: HashMap::new(),
             git_diffs: HashMap::new(),
+            last_git_diff_staged: HashMap::new(),
             git_repos_by_cwd: HashMap::new(),
             workspace_files: HashMap::new(),
             workspace_boards: HashMap::new(),
@@ -5300,6 +5308,47 @@ impl OrbitAppCore {
                     state.git_diffs.insert(key, unified_diff);
                     notify_git_cwd = Some(cwd);
                 }
+                WireMessage::GitMutationResult {
+                    request_id,
+                    cwd,
+                    result,
+                    status,
+                } => {
+                    let status_refreshed = if let Some(status_snap) = status {
+                        let norm_cwd = crate::sidebar::normalize_project_path(&cwd);
+                        state.git_repos_by_cwd.insert(
+                            norm_cwd.clone(),
+                            GitReposInspectionView {
+                                path: norm_cwd,
+                                is_git_repo: status_snap.is_git_repo,
+                                git_branch: status_snap.branch.clone(),
+                                nested_git_repos: status_snap.nested_git_repos.clone(),
+                            },
+                        );
+                        let remaining_paths: HashSet<&str> =
+                            status_snap.files.iter().map(|f| f.path.as_str()).collect();
+                        state.git_diffs.retain(|key, _| {
+                            let Some((stored_cwd, suffix)) = key.rsplit_once("::") else {
+                                return true;
+                            };
+                            if !cwd_paths_equivalent(stored_cwd, &cwd) {
+                                return true;
+                            }
+                            if remaining_paths.is_empty() {
+                                return false;
+                            }
+                            suffix == "__all__" || remaining_paths.contains(suffix)
+                        });
+                        state.git_statuses.insert(cwd.clone(), status_snap);
+                        notify_git_cwd = Some(cwd);
+                        true
+                    } else {
+                        false
+                    };
+                    if let Some(tx) = state.pending_git_mutations.remove(&request_id) {
+                        let _ = tx.send(Ok((result, status_refreshed)));
+                    }
+                }
                 WireMessage::WorkspaceFilesResponse { cwd, files, .. } => {
                     state.workspace_files.insert(cwd.clone(), files);
                     notify_git_cwd = Some(cwd);
@@ -5914,6 +5963,10 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_git_repo_inspections.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_git_mutations.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -10011,6 +10064,11 @@ impl OrbitAppCore {
         path: Option<&str>,
         staged: bool,
     ) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            h.last_git_diff_staged.insert(cwd.to_string(), staged);
+        }
         self.dispatch_wire_queued(
             host_id,
             WireMessage::GetGitDiff {
@@ -10020,6 +10078,331 @@ impl OrbitAppCore {
                 staged,
             },
         );
+    }
+
+    async fn dispatch_git_mutation_on_host(
+        self: &Arc<Self>,
+        host_id: String,
+        cwd: String,
+        timeout_secs: u64,
+        op_label: &'static str,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+    ) -> Result<GitMutationOutcome, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        struct PendingGitMutationGuard {
+            core: Arc<OrbitAppCore>,
+            host_id: String,
+            req_id: Uuid,
+            armed: bool,
+        }
+
+        impl PendingGitMutationGuard {
+            fn disarm(&mut self) {
+                self.armed = false;
+            }
+        }
+
+        impl Drop for PendingGitMutationGuard {
+            fn drop(&mut self) {
+                if self.armed
+                    && let Ok(mut guard) = self.core.hosts.write()
+                    && let Some(h) = guard.get_mut(&self.host_id)
+                {
+                    h.pending_git_mutations.remove(&self.req_id);
+                }
+            }
+        }
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_git_mutations.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let mut cleanup = PendingGitMutationGuard {
+                core: Arc::clone(&core),
+                host_id: owned_host_id,
+                req_id,
+                armed: true,
+            };
+
+            // Enforce ONE unified deadline covering BOTH wire enqueue and awaiting the RPC ack;
+            // `cleanup` guarantees `pending_git_mutations` is always pruned on error, timeout, or
+            // task cancellation.
+            let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+                session
+                    .send_wire(build_wire(req_id))
+                    .await
+                    .map_err(|e| format!("failed to {op_label}: {e}"))?;
+                match ack_rx.await {
+                    Ok(res) => {
+                        cleanup.disarm();
+                        res
+                    }
+                    Err(_) => Err(format!("Host disconnected while trying to {op_label}")),
+                }
+            })
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => Err(format!(
+                    "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                )),
+            };
+            let _ = res_tx.send(out);
+        });
+
+        let (outcome, status_refreshed) = res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))??;
+
+        // Automatically refresh cached git review data (status fallback + unified diff) for both
+        // local and remote fleet hosts after the mutation succeeds.
+        if !status_refreshed {
+            self.fetch_git_status(&host_id, &cwd);
+        }
+        let refresh_staged = self
+            .hosts
+            .read()
+            .ok()
+            .and_then(|guard| {
+                let h = guard.get(&host_id)?;
+                h.last_git_diff_staged.get(&cwd).copied().or_else(|| {
+                    h.last_git_diff_staged
+                        .iter()
+                        .find_map(|(k, v)| cwd_paths_equivalent(k, &cwd).then_some(*v))
+                })
+            })
+            .unwrap_or(false);
+        self.fetch_git_diff(&host_id, &cwd, None, refresh_staged);
+
+        Ok(outcome)
+    }
+
+    pub async fn git_stage_files_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        paths: Vec<String>,
+        all: bool,
+    ) -> Result<GitMutationOutcome, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        self.dispatch_git_mutation_on_host(
+            host_id.to_string(),
+            cwd_owned,
+            25,
+            "stage git files",
+            move |request_id| WireMessage::GitStageFiles {
+                request_id,
+                cwd: cwd_wire,
+                paths,
+                all,
+            },
+        )
+        .await
+    }
+
+    pub async fn git_unstage_files_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        paths: Vec<String>,
+        all: bool,
+    ) -> Result<GitMutationOutcome, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        self.dispatch_git_mutation_on_host(
+            host_id.to_string(),
+            cwd_owned,
+            25,
+            "unstage git files",
+            move |request_id| WireMessage::GitUnstageFiles {
+                request_id,
+                cwd: cwd_wire,
+                paths,
+                all,
+            },
+        )
+        .await
+    }
+
+    pub async fn git_apply_hunk_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        patch: String,
+        reverse: bool,
+        cached: bool,
+    ) -> Result<GitMutationOutcome, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        self.dispatch_git_mutation_on_host(
+            host_id.to_string(),
+            cwd_owned,
+            25,
+            "apply git hunk",
+            move |request_id| WireMessage::GitApplyHunk {
+                request_id,
+                cwd: cwd_wire,
+                patch,
+                reverse,
+                cached,
+            },
+        )
+        .await
+    }
+
+    pub async fn git_discard_files_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        paths: Vec<String>,
+        include_untracked: bool,
+    ) -> Result<GitMutationOutcome, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        self.dispatch_git_mutation_on_host(
+            host_id.to_string(),
+            cwd_owned,
+            25,
+            "discard git changes",
+            move |request_id| WireMessage::GitDiscardFiles {
+                request_id,
+                cwd: cwd_wire,
+                paths,
+                include_untracked,
+            },
+        )
+        .await
+    }
+
+    pub async fn git_commit_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        message: String,
+        amend: bool,
+    ) -> Result<GitCommitResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                30,
+                "commit git changes",
+                move |request_id| WireMessage::GitCommit {
+                    request_id,
+                    cwd: cwd_wire,
+                    message,
+                    amend,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::Committed(res) => Ok(res),
+            other => Err(format!("Unexpected git commit outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_push_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        remote: Option<String>,
+        branch: Option<String>,
+        set_upstream: bool,
+    ) -> Result<GitPushResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                75,
+                "push git branch",
+                move |request_id| WireMessage::GitPush {
+                    request_id,
+                    cwd: cwd_wire,
+                    remote,
+                    branch,
+                    set_upstream,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::Pushed(res) => Ok(res),
+            other => Err(format!("Unexpected git push outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_create_pr_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        title: String,
+        body: String,
+        base: Option<String>,
+        draft: bool,
+    ) -> Result<GitCreatePrResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                75,
+                "create pull request",
+                move |request_id| WireMessage::GitCreatePr {
+                    request_id,
+                    cwd: cwd_wire,
+                    title,
+                    body,
+                    base,
+                    draft,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::PrCreated(res) => Ok(res),
+            other => Err(format!("Unexpected git create PR outcome: {other:?}")),
+        }
     }
 
     pub fn fetch_workspace_files(self: &Arc<Self>, host_id: &str, cwd: &str) {
@@ -16225,6 +16608,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_git_repo_inspections.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_git_mutations.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_acp_probes.drain() {

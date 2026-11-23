@@ -19,6 +19,7 @@ orbit/
 │   ├── orbit-relay-transport/  # Shared relay & ssh+relay tunnel client transport
 │   ├── orbit-client-core/      # Shared pure-Rust client MVU core, routing, Markdown/syntect/diff/VT100
 │   ├── orbit-ffi-uniffi/       # UniFFI bindings for native iOS (SwiftUI) and Android (Compose)
+│   ├── orbit-uniffi-bindgen/   # Lightweight standalone UniFFI CLI bindgen helper
 │   ├── orbit-ffi-ohos/         # ohos-rs (N-API) bindings for HarmonyOS 7+ (ArkUI V2)
 │   └── orbit-cli/              # Single static binary bundling daemon, shim, relay, and CLI
 ├── apps/

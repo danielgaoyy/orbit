@@ -14,6 +14,7 @@ permissions:
 
 env:
   ORBIT_GITHUB_CLIENT_ID: ${{ vars.ORBIT_GITHUB_CLIENT_ID }}
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
   rust-quality-and-unit:
@@ -25,6 +26,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "orbit-rust-unit"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --lib --bins
@@ -54,6 +58,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "orbit-rust-e2e"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run ${{ matrix.label }}
         shell: bash
         run: |
@@ -83,7 +88,6 @@ jobs:
 
   build-host-binaries:
     name: Build CLI & Daemon (${{ matrix.artifact }})
-    needs: [rust-quality-and-unit, e2e-regression-matrix]
     strategy:
       fail-fast: false
       matrix:
@@ -94,12 +98,6 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact: orbit-cli-linux-arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: orbit-cli-macos-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: orbit-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -112,16 +110,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "orbit-rust-cli-${{ matrix.target }}"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release static-linked single binary
         shell: bash
         run: |
           cargo build --release -p orbit-cli --target ${{ matrix.target }}
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp target/${{ matrix.target }}/release/orbit.exe ${{ matrix.artifact }}
-          else
-            cp target/${{ matrix.target }}/release/orbit ${{ matrix.artifact }}
-            chmod +x ${{ matrix.artifact }}
-          fi
+          cp target/${{ matrix.target }}/release/orbit ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -129,7 +126,6 @@ jobs:
 
   build-macos-desktop:
     name: Build macOS Tauri v2 Desktop App (Orbit.dmg)
-    needs: [rust-quality-and-unit, e2e-regression-matrix, desktop-frontend-quality]
     runs-on: macos-latest
     outputs:
       notarized: ${{ steps.macos-signing.outputs.notarized }}
@@ -145,7 +141,14 @@ jobs:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "apps/desktop/src-tauri -> target"
+          shared-key: "orbit-rust-macos-desktop"
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.20.0"
       - name: Prepare macOS Signing & Notarization
         id: macos-signing
         env:
@@ -192,6 +195,10 @@ jobs:
       - name: Build Tauri v2 macOS Bundle
         working-directory: apps/desktop
         env:
+          RUSTC_WRAPPER: sccache
+          CARGO_INCREMENTAL: "0"
+          SCCACHE_DIR: ${{ runner.temp }}/sccache
+          SCCACHE_CACHE_SIZE: "4G"
           CERT_B64: ${{ secrets.APPLE_CERTIFICATE }}
           CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           SIGNING_IDENTITY_OVERRIDE: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -234,6 +241,8 @@ jobs:
           mkdir -p src-tauri/binaries
           cp ../../target/aarch64-apple-darwin/release/orbit src-tauri/binaries/orbit-aarch64-apple-darwin
           chmod +x src-tauri/binaries/orbit-aarch64-apple-darwin
+          cp ../../target/aarch64-apple-darwin/release/orbit orbit-cli-macos-arm64
+          chmod +x orbit-cli-macos-arm64
 
           npm ci
           npx tauri build --target aarch64-apple-darwin --bundles app,dmg "${TAURI_EXTRA_ARGS[@]}"
@@ -283,10 +292,13 @@ jobs:
         with:
           name: Orbit-macOS-AppleSilicon.dmg
           path: apps/desktop/Orbit-macOS-AppleSilicon.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbit-cli-macos-arm64
+          path: apps/desktop/orbit-cli-macos-arm64
 
   build-linux-desktop:
     name: Build Linux Tauri v2 Desktop App (${{ matrix.artifact }})
-    needs: [rust-quality-and-unit, e2e-regression-matrix, desktop-frontend-quality]
     strategy:
       fail-fast: false
       matrix:
@@ -314,9 +326,21 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "apps/desktop/src-tauri -> target"
+          shared-key: "orbit-rust-linux-desktop-${{ matrix.target }}"
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.20.0"
       - name: Build Tauri v2 Linux .deb Package
         working-directory: apps/desktop
+        env:
+          RUSTC_WRAPPER: sccache
+          CARGO_INCREMENTAL: "0"
+          SCCACHE_DIR: ${{ runner.temp }}/sccache
+          SCCACHE_CACHE_SIZE: "4G"
         run: |
           cargo build --release -p orbit-cli --target ${{ matrix.target }} --manifest-path ../../Cargo.toml
           mkdir -p src-tauri/binaries
@@ -332,7 +356,6 @@ jobs:
 
   build-windows-desktop:
     name: Build Windows Tauri v2 Desktop App (.msi & NSIS .exe)
-    needs: [rust-quality-and-unit, e2e-regression-matrix, desktop-frontend-quality]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -346,15 +369,28 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "apps/desktop/src-tauri -> target"
+          shared-key: "orbit-rust-windows-desktop"
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.20.0"
       - name: Build Tauri v2 Windows .msi & NSIS .exe Packages
         working-directory: apps/desktop
         shell: bash
+        env:
+          RUSTC_WRAPPER: sccache
+          CARGO_INCREMENTAL: "0"
+          SCCACHE_DIR: ${{ runner.temp }}/sccache
+          SCCACHE_CACHE_SIZE: "4G"
         run: |
           set -euo pipefail
           cargo build --release -p orbit-cli --target x86_64-pc-windows-msvc --manifest-path ../../Cargo.toml
           mkdir -p src-tauri/binaries
           cp ../../target/x86_64-pc-windows-msvc/release/orbit.exe src-tauri/binaries/orbit-x86_64-pc-windows-msvc.exe
+          cp ../../target/x86_64-pc-windows-msvc/release/orbit.exe orbit-windows-x86_64.exe
           npm ci
           npx tauri build --target x86_64-pc-windows-msvc --bundles msi,nsis --config '{"bundle":{"externalBin":["binaries/orbit"]}}'
           MSI_FILE="$(find src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi -maxdepth 2 -type f -name '*.msi' | head -n 1)"
@@ -373,10 +409,13 @@ jobs:
         with:
           name: Orbit-Windows-x64-setup.exe
           path: apps/desktop/Orbit-Windows-x64-setup.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbit-windows-x86_64.exe
+          path: apps/desktop/orbit-windows-x86_64.exe
 
   build-android-apk:
     name: Build Native Android APK (Jetpack Compose + UniFFI, minSdk 29)
-    needs: [rust-quality-and-unit, e2e-regression-matrix]
     runs-on: ubuntu-latest
     outputs:
       signed: ${{ steps.android-signing.outputs.signed }}
@@ -391,10 +430,13 @@ jobs:
           gradle-version: "8.13"
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "orbit-rust-android"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build Rust UniFFI JNI Libraries (API 29+)
-        run: ./apps/android/scripts/build-rust-android.sh
+        run: ./apps/android/scripts/build-rust-android.sh --arm64-only
       - name: Probe Android Release Signing Secrets
         id: android-signing
         env:
@@ -427,7 +469,7 @@ jobs:
             umask 077
             printf '%s' "$ORBIT_ANDROID_KEYSTORE_B64" | base64 -d > "$SIGN_DIR/release.jks"
             export ORBIT_ANDROID_KEYSTORE_PATH="$SIGN_DIR/release.jks"
-            gradle assembleRelease --no-daemon
+            gradle assembleRelease --no-daemon -PorbitAndroidAbis=arm64-v8a
             APK_PATH="app/build/outputs/apk/release/app-release.apk"
             APKSIGNER="$(find "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
             if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
@@ -437,7 +479,7 @@ jobs:
             "$APKSIGNER" verify --verbose "$APK_PATH"
             cp "$APK_PATH" Orbit-Android-arm64.apk
           else
-            gradle assembleRelease --no-daemon
+            gradle assembleRelease --no-daemon -PorbitAndroidAbis=arm64-v8a
             cp app/build/outputs/apk/release/app-release-unsigned.apk Orbit-Android-unsigned.apk
           fi
       - name: Cleanup Temporary Android Signing Materials
@@ -450,18 +492,20 @@ jobs:
 
   build-ios-ipa:
     name: Build Native iOS App (SwiftUI iOS 16.4+ + UniFFI XCFramework)
-    needs: [rust-quality-and-unit, e2e-regression-matrix]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+          targets: aarch64-apple-ios
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "orbit-rust-ios"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build OrbitCoreFFI.xcframework & Generate Xcode Project
         run: |
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
-          ./apps/ios/scripts/build-rust-xcframework.sh
+          ./apps/ios/scripts/build-rust-xcframework.sh --device-only
           cd apps/ios && xcodegen generate
       - name: Build Unsigned Native iOS IPA
         working-directory: apps/ios
@@ -484,7 +528,6 @@ jobs:
 
   build-harmony-hap:
     name: Build Native HarmonyOS HAP (ArkUI V2 + N-API, API 26)
-    needs: [rust-quality-and-unit, e2e-regression-matrix]
     runs-on: ubuntu-latest
     outputs:
       signed: ${{ steps.harmony-signing.outputs.signed }}
@@ -518,6 +561,9 @@ jobs:
         with:
           targets: aarch64-unknown-linux-ohos,x86_64-unknown-linux-ohos
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "orbit-rust-harmony"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build Rust N-API Libraries (arm64-v8a + x86_64)
         run: ./apps/harmony/scripts/build-rust-ohos.sh
       - name: Probe HarmonyOS Signing Secrets
@@ -604,6 +650,9 @@ jobs:
     name: Publish GitHub Release Assets
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
+      - rust-quality-and-unit
+      - e2e-regression-matrix
+      - desktop-frontend-quality
       - build-host-binaries
       - build-macos-desktop
       - build-linux-desktop

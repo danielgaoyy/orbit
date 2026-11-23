@@ -14,6 +14,7 @@ permissions:
 
 env:
   ORBIT_GITHUB_CLIENT_ID: ${{ vars.ORBIT_GITHUB_CLIENT_ID }}
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
   rust-quality-and-unit:
@@ -33,6 +34,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "orbit-rust-unit"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Rust formatting checks (workspace & Tauri desktop crate)
         run: |
           cargo fmt --all -- --check
@@ -65,6 +69,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "orbit-rust-e2e"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run ${{ matrix.label }}
         shell: bash
         run: |
@@ -84,7 +89,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "apps/desktop/src-tauri -> target"
+          shared-key: "orbit-rust-macos-desktop"
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format, Clippy & Test Tauri Desktop Rust crate
         env:
           CARGO_INCREMENTAL: "0"
@@ -104,9 +113,14 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: "orbit-rust-windows-desktop"
           workspaces: |
             . -> target
             apps/desktop/src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.20.0"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -115,6 +129,9 @@ jobs:
       - name: Cargo check & tests on Windows
         env:
           CARGO_INCREMENTAL: "0"
+          RUSTC_WRAPPER: sccache
+          SCCACHE_DIR: ${{ runner.temp }}/sccache
+          SCCACHE_CACHE_SIZE: "4G"
         run: |
           cargo check --workspace --all-targets
           cargo build -p orbit-cli --bin orbit
@@ -122,6 +139,9 @@ jobs:
       - name: Build Desktop frontend & check Tauri Windows crate
         env:
           CARGO_INCREMENTAL: "0"
+          RUSTC_WRAPPER: sccache
+          SCCACHE_DIR: ${{ runner.temp }}/sccache
+          SCCACHE_CACHE_SIZE: "4G"
         run: |
           npm --prefix apps/desktop ci
           npm --prefix apps/desktop test
@@ -155,6 +175,9 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "orbit-rust-ios"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build OrbitCoreFFI.xcframework & Generate Xcode Project
         run: |
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
@@ -271,6 +294,9 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "orbit-rust-android"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build Rust UniFFI JNI Libraries (API 29+)
         run: ./apps/android/scripts/build-rust-android.sh
       - name: Assemble Debug APK

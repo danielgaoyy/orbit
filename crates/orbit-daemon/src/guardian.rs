@@ -3245,13 +3245,22 @@ mod tests {
             "cat ${HOME}/.ssh/config",
             "(ls src)",
             "{ ls src; }",
-            "cat src/link",
         ] {
             let res = eval_shell(&mgr, cmd, &ws, &cfg).await;
             assert_eq!(
                 res.decision,
                 GuardianDecision::RequireHuman,
                 "expected RequireHuman for bypass `{cmd}`, got {res:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let res = eval_shell(&mgr, "cat src/link", &ws, &cfg).await;
+            assert_eq!(
+                res.decision,
+                GuardianDecision::RequireHuman,
+                "expected RequireHuman for bypass `cat src/link`, got {res:?}"
             );
         }
     }

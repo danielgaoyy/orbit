@@ -757,7 +757,17 @@ fn rename_workspace_entry_sync(
             #[cfg(not(unix))]
             {
                 let _ = new_meta;
-                return Err(format!("Destination `{new_rel}` already exists"));
+                let same_case_path = old_rel.eq_ignore_ascii_case(&new_rel)
+                    && old_rel != new_rel
+                    && crate::platform::canonicalize_clean(&old_target)
+                        .ok()
+                        .zip(crate::platform::canonicalize_clean(&new_target).ok())
+                        .is_some_and(|(a, b)| a == b);
+                if same_case_path {
+                    is_same_inode_case_rename = true;
+                } else {
+                    return Err(format!("Destination `{new_rel}` already exists"));
+                }
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1045,6 +1055,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&ro_file, fs::Permissions::from_mode(0o444)).expect("chmod 444");
         }
+        #[cfg(not(unix))]
+        {
+            let mut perms = fs::metadata(&ro_file).expect("ro meta").permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&ro_file, perms).expect("set readonly");
+        }
         assert!(
             write_workspace_file(&ws, "locked.txt", "hacked", None, true)
                 .await
@@ -1061,6 +1077,12 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&ro_file, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        }
+        #[cfg(not(unix))]
+        {
+            let mut perms = fs::metadata(&ro_file).expect("ro meta").permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(&ro_file, perms).expect("clear readonly");
         }
 
         // 2. SUID/SGID bits must be stripped on atomic replace; 0o600 must be preserved

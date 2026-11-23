@@ -2330,6 +2330,7 @@ mod tests {
         let main_dir = root.join("main-repo");
         tokio::fs::create_dir_all(&main_dir).await.expect("mkdir");
         git_ok(&main_dir, &["init", "-q", "-b", "main"]).await;
+        git_ok(&main_dir, &["config", "core.autocrlf", "false"]).await;
         git_ok(&main_dir, &["config", "user.email", "test@orbit.local"]).await;
         git_ok(&main_dir, &["config", "user.name", "Orbit Test"]).await;
 

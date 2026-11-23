@@ -6703,7 +6703,9 @@ mod fast_mode_orchestrator_tests {
     fn ensure_mock_provider_binaries() {
         static INIT: OnceLock<()> = OnceLock::new();
         INIT.get_or_init(|| {
-            let exe = if Path::new("/usr/bin/true").exists() {
+            let exe = if cfg!(windows) {
+                std::env::current_exe().expect("current test exe")
+            } else if Path::new("/usr/bin/true").exists() {
                 PathBuf::from("/usr/bin/true")
             } else {
                 PathBuf::from("/bin/true")
@@ -7130,6 +7132,7 @@ mod fast_mode_orchestrator_tests {
 
         for args in [
             vec!["init", "-q", "-b", "main"],
+            vec!["config", "core.autocrlf", "false"],
             vec!["config", "user.email", "test@orbit.local"],
             vec!["config", "user.name", "Orbit Test"],
         ] {
@@ -7253,6 +7256,7 @@ mod fast_mode_orchestrator_tests {
 
         for args in [
             vec!["init", "-q", "-b", "main"],
+            vec!["config", "core.autocrlf", "false"],
             vec!["config", "user.email", "test@orbit.local"],
             vec!["config", "user.name", "Orbit Test"],
         ] {

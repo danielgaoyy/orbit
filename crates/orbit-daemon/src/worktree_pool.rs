@@ -833,6 +833,7 @@ mod tests {
     async fn init_temp_git_repo(repo_dir: &Path) {
         std::fs::create_dir_all(repo_dir).expect("mkdir repo");
         run_git(repo_dir, &["init", "-b", "main"]).await;
+        run_git(repo_dir, &["config", "core.autocrlf", "false"]).await;
         run_git(
             repo_dir,
             &["config", "user.email", "orbit-test@example.com"],

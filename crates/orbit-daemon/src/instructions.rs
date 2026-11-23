@@ -970,6 +970,7 @@ fn resolve_allowlisted_instruction_path(
             "Instruction file path contains invalid control characters".to_string(),
         ));
     }
+    #[cfg(unix)]
     if trimmed.contains('\\') {
         return Err(InstructionError::PathRejected(
             "Instruction file path must use forward slashes".to_string(),

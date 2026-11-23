@@ -2862,13 +2862,13 @@ class SocketManager {
         let _ = index.search(&ws, "alpha", 10).await.expect("search 1");
         let ptr1 = {
             let guard = index.cache.read().expect("read cache");
-            let canon = fs::canonicalize(&ws).expect("canon");
+            let canon = crate::platform::canonicalize_clean(&ws).expect("canon");
             Arc::as_ptr(&guard.get(&canon).expect("cached").symbols)
         };
         let _ = index.search(&ws, "alpha", 10).await.expect("search 2");
         let ptr2 = {
             let guard = index.cache.read().expect("read cache");
-            let canon = fs::canonicalize(&ws).expect("canon");
+            let canon = crate::platform::canonicalize_clean(&ws).expect("canon");
             Arc::as_ptr(&guard.get(&canon).expect("cached").symbols)
         };
         assert_eq!(ptr1, ptr2, "cache hit must reuse Arc without deep cloning");
@@ -2940,7 +2940,7 @@ class SocketManager {
         );
         assert_eq!(res.symbols.len(), 1);
         assert_eq!(res.symbols[0].name, "local_fast_fn");
-        let canon = fs::canonicalize(&ws).expect("canon");
+        let canon = crate::platform::canonicalize_clean(&ws).expect("canon");
         assert_eq!(observed.read().expect("read").as_ref(), Some(&canon));
 
         let _ = fs::remove_dir_all(&ws);

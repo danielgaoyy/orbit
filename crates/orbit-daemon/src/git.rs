@@ -1214,6 +1214,7 @@ mod tests {
         // Initialize minimal repo with one committed file and one dirty uncommitted edit
         for args in [
             vec!["init", "-q"],
+            vec!["config", "core.autocrlf", "false"],
             vec!["config", "user.email", "test@orbit.local"],
             vec!["config", "user.name", "Orbit Test"],
         ] {

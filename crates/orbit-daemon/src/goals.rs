@@ -3329,7 +3329,14 @@ mod tests {
                 agent_id: "ag_goal_2".into(),
                 objective: "Fix persistent error".into(),
                 criteria: Vec::new(),
-                verify_command: Some("echo 'same compile error' >&2; exit 2".into()),
+                verify_command: Some(
+                    if cfg!(windows) {
+                        "echo same compile error 1>&2 & exit /b 2"
+                    } else {
+                        "echo 'same compile error' >&2; exit 2"
+                    }
+                    .into(),
+                ),
                 max_iterations: Some(10),
                 max_duration_secs: Some(300),
                 dispatch_initial_prompt: false,

@@ -4949,7 +4949,7 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Fleet Daemon Version & One-Click Over-the-Wire Update
 
     public var appShortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.9.8"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.9.9"
     }
 
     public func isHostProtocolBehind(_ host: FfiHostCard) -> Bool {

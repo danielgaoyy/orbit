@@ -19,7 +19,13 @@
 
 ---
 
-## 2. 常用研发与验证命令
+## 2. UI 与界面改动约定
+
+- 凡涉及 `apps/` 下任何界面设计、布局、样式或交互的改动，动手前**必须**先读取并遵循 `.agents/skills/interface-design/SKILL.md`（若仓库中已生成 `.interface-design/system.md`，需一并读取）。
+
+---
+
+## 3. 常用研发与验证命令
 
 ```bash
 # 代码格式检查与 Clippy 静态检查

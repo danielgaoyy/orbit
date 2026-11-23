@@ -271,6 +271,69 @@ export interface GuardianConfigSnapshotView {
 export type ImPlatform = "lark" | "telegram" | "slack" | "discord";
 export type ImConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
 
+export type ImRoutingMode = "per_thread_agent" | "personal_router";
+export type RouterScope = "global_fleet" | "local_host_only";
+export type RouterPreReviewMode = "disabled" | "medium_risk_only" | "assist_only";
+export type RouterImMirrorPolicy = "reply_origin_only" | "milestones_and_approvals" | "mirror_all";
+
+export interface PersonalRouterConfig {
+  enabled: boolean;
+  router_agent_id?: string | null;
+  provider: ProviderKind;
+  acp_agent_id?: string | null;
+  model?: string | null;
+  effort?: ReasoningEffort | null;
+  cwd?: string | null;
+  scope: RouterScope;
+  pre_review_mode: RouterPreReviewMode;
+  share_host_hermes_memory: boolean;
+  soul_prompt_override?: string | null;
+  external_webhook_url?: string | null;
+  has_external_webhook_secret: boolean;
+}
+
+export interface RouterHostCapabilities {
+  host_id: string;
+  host_name: string;
+  is_local: boolean;
+  online: boolean;
+  hermes_installed: boolean;
+  hermes_version?: string | null;
+  hermes_has_existing_memory: boolean;
+  hermes_acp_ready: boolean;
+  hermes_gateway_running: boolean;
+  available_providers: ProviderKind[];
+  active_router_agent_id?: string | null;
+  active_router_status?: unknown;
+  router_enabled: boolean;
+  recommended_score: number;
+  recommendation_reason?: string | null;
+}
+
+export interface RouterStatusSnapshot {
+  config: PersonalRouterConfig;
+  host_capabilities: RouterHostCapabilities;
+  router_agent?: AgentCardView | null;
+  managed_workers_count: number;
+  pending_approvals_count: number;
+}
+
+export interface HermesBridgeBundle {
+  host_id: string;
+  host_name: string;
+  mcp_http_url: string;
+  mcp_yaml_snippet: string;
+  acp_toolset_yaml_snippet: string;
+  soul_md_template: string;
+  skill_md_template: string;
+}
+
+export interface PrimaryRouterSelection {
+  host_id: string;
+  agent_id?: string | null;
+  updated_at_ms: number;
+}
+
 export interface ImChannelRecord {
   channel_id: string;
   name: string;
@@ -290,6 +353,8 @@ export interface ImChannelRecord {
   default_provider: ProviderKind;
   default_mode: SessionMode;
   forward_approvals: boolean;
+  routing_mode?: ImRoutingMode;
+  router_mirror_policy?: RouterImMirrorPolicy;
   message_count: number;
   last_activity_at_ms?: number | null;
   created_at_ms: number;
@@ -392,6 +457,8 @@ export interface UpsertImChannelRequest {
   default_provider: ProviderKind;
   default_mode: SessionMode;
   forward_approvals: boolean;
+  routing_mode?: ImRoutingMode;
+  router_mirror_policy?: RouterImMirrorPolicy;
 }
 
 export type HostConnectionState =
@@ -5091,6 +5158,60 @@ export const orbitIpc = {
       targetChatId,
       message,
     });
+  },
+
+  getPersonalRouterStatus: async (hostId: string): Promise<RouterStatusSnapshot> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Not running in Tauri runtime");
+    }
+    return invoke<RouterStatusSnapshot>("get_personal_router_status", { hostId });
+  },
+
+  configurePersonalRouter: async (
+    hostId: string,
+    config: PersonalRouterConfig,
+    activate = true,
+    externalWebhookSecret?: string | null,
+  ): Promise<RouterStatusSnapshot> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Not running in Tauri runtime");
+    }
+    return invoke<RouterStatusSnapshot>("configure_personal_router", {
+      hostId,
+      config,
+      externalWebhookSecret: externalWebhookSecret ?? null,
+      activate,
+    });
+  },
+
+  discoverFleetRouterHosts: async (): Promise<RouterHostCapabilities[]> => {
+    if (!isTauriRuntime()) {
+      return [];
+    }
+    return invoke<RouterHostCapabilities[]>("discover_fleet_router_hosts");
+  },
+
+  exportHermesBridgeConfig: async (hostId: string): Promise<HermesBridgeBundle> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Not running in Tauri runtime");
+    }
+    return invoke<HermesBridgeBundle>("export_hermes_bridge_config", { hostId });
+  },
+
+  getPrimaryRouterSelection: async (): Promise<PrimaryRouterSelection | null> => {
+    if (!isTauriRuntime()) {
+      return null;
+    }
+    return invoke<PrimaryRouterSelection | null>("get_primary_router_selection");
+  },
+
+  setPrimaryRouterSelection: async (
+    selection: PrimaryRouterSelection | null,
+  ): Promise<PrimaryRouterSelection | null> => {
+    if (!isTauriRuntime()) {
+      return selection;
+    }
+    return invoke<PrimaryRouterSelection | null>("set_primary_router_selection", { selection });
   },
   highlightWorkspaceCode: async (
     language: string,

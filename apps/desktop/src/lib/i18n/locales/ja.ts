@@ -141,6 +141,7 @@ export const ja: MessageDictionary = {
   // Sidebar
   "sidebar.newConversation": "新しい会話",
   "sidebar.automations": "オートメーション",
+  "sidebar.personalRouter": "パーソナルルーター",
   "sidebar.needsAttention": "要確認",
   "sidebar.pinned": "ピン留め",
   "sidebar.projects": "プロジェクト",
@@ -465,6 +466,7 @@ export const ja: MessageDictionary = {
   "settings.subTabImChannels": "IM チャンネル",
   "settings.subTabProvidersRuntime": "プロバイダとランタイム",
   "settings.subTabAcpRegistry": "ACP レジストリ",
+  "settings.subTabPersonalRouter": "パーソナルルーター",
   "settings.subTabGuardian": "Guardian",
   "settings.subTabUsage": "使用量",
   "settings.subTabInstructions": "指示",

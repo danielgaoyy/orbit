@@ -13,6 +13,7 @@ import {
   Plus,
   Search,
   Settings,
+  Sparkles,
   X,
 } from "lucide-react";
 import { modSymbol } from "@/lib/keybindings";
@@ -23,6 +24,7 @@ import {
   compareSemver,
   isMacDesktop,
   normalizeSemver,
+  orbitIpc,
 } from "@/lib/orbit-ipc";
 import { normalizeProjectPath } from "@/lib/projects";
 import { useImeCompositionGuard } from "@/lib/ime";
@@ -178,6 +180,22 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
   const isFleetUpdating =
     fleetUpdate.phase === "upgrading_hosts" || fleetUpdate.phase === "upgrading_desktop";
+
+  const [primaryRouterHostId, setPrimaryRouterHostId] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    void orbitIpc
+      .getPrimaryRouterSelection()
+      .then((sel) => {
+        if (active && sel?.host_id) {
+          setPrimaryRouterHostId(sel.host_id);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [fleet.hosts.length]);
 
   // O(N) lookup of parent threads with active subagents — zero `s.stages` topic subscription!
   const runningParentThreadKeys = useMemo(
@@ -539,6 +557,77 @@ export const FleetSidebar = memo(function FleetSidebar() {
           </span>
           <span className="truncate">{t("sidebar.automations")}</span>
         </button>
+
+        {(() => {
+          const orderedHosts = primaryRouterHostId
+            ? [
+                ...fleet.hosts.filter((h) => h.host_id === primaryRouterHostId),
+                ...fleet.hosts.filter((h) => h.host_id !== primaryRouterHostId),
+              ]
+            : fleet.hosts;
+          let activeRouter: { hostId: string; hostName: string; agent: AgentCardView } | null = null;
+          for (const h of orderedHosts) {
+            const detail = hostDetails[h.host_id];
+            if (!detail) continue;
+            const found = detail.agents.find(
+              (a) =>
+                !archivedThreads[threadScopeKey(h.host_id, a.agent_id)] &&
+                (a.handle === "router" || a.title.includes("Personal Router")),
+            );
+            if (found) {
+              activeRouter = {
+                hostId: h.host_id,
+                hostName: h.display_name,
+                agent: found,
+              };
+              break;
+            }
+          }
+          const isRouterActive =
+            activeRouter !== null &&
+            workspacePanel === "conversation" &&
+            !isDraftNewSession &&
+            selectedHostId === activeRouter.hostId &&
+            selectedAgentId === activeRouter.agent.agent_id;
+          const targetHostId =
+            primaryRouterHostId ?? selectedHostId ?? fleet.hosts[0]?.host_id ?? null;
+
+          return (
+            <button
+              type="button"
+              onClick={() => {
+                if (activeRouter) {
+                  orbitActions.selectAgent(activeRouter.hostId, activeRouter.agent.agent_id);
+                } else if (targetHostId) {
+                  orbitActions.openSettings(`host:${targetHostId}:router`);
+                }
+              }}
+              className={cn(
+                "flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left text-[13px] transition-colors",
+                isRouterActive
+                  ? "bg-accent text-ink-primary font-medium"
+                  : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
+              )}
+            >
+              <span className="flex min-w-0 flex-1 items-center gap-2.5">
+                <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+                  <Sparkles
+                    className={cn(
+                      "size-[14.5px] stroke-[1.75]",
+                      isRouterActive ? "text-ink-primary" : "text-ink-muted",
+                    )}
+                  />
+                </span>
+                <span className="truncate">{t("sidebar.personalRouter")}</span>
+              </span>
+              {activeRouter && (
+                <span className="text-ink-faint max-w-20 shrink-0 truncate text-[11px]">
+                  {activeRouter.hostName}
+                </span>
+              )}
+            </button>
+          );
+        })()}
       </div>
 
       {/* 2B. On-Demand Sidebar Filter Bar (0px at rest; expands above ALL list sections via Titlebar `🔍` or `⌘F`) */}

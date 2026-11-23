@@ -117,6 +117,10 @@ impl IdleRuntimeCleanup {
                 continue;
             }
             if let Some(ag) = by_id.get(&cur_id) {
+                // Canonical Personal Router sessions stay warm and are never idle-reclaimed.
+                if ag.is_personal_router() {
+                    return false;
+                }
                 match ag.status {
                     AgentStatus::Idle | AgentStatus::Error { .. } | AgentStatus::Closed => {}
                     AgentStatus::Initializing

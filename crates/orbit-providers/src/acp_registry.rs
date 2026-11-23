@@ -413,6 +413,15 @@ pub fn builtin_acp_catalog() -> Vec<AcpAgentSpec> {
             "brew install stakpak/tap/stakpak",
             "https://stakpak.dev",
         ),
+        builtin_entry(
+            "hermes",
+            "Hermes Agent",
+            "Nous Research self-improving personal AI agent with persistent memory & Router-Worker orchestration over ACP.",
+            "hermes",
+            &["acp"],
+            "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+            "https://github.com/NousResearch/hermes-agent",
+        ),
     ]
 }
 

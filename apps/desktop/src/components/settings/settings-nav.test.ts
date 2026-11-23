@@ -44,7 +44,7 @@ describe("Settings IA (3 Domain Groups · 8 Core Sections · 19 Leaf Views)", ()
       (sum, section) => sum + Math.max(1, section.subTabs.length),
       0,
     );
-    assert.equal(totalLeafViews, 19);
+    assert.equal(totalLeafViews, 20);
 
     assert.deepEqual(
       getVisibleSubTabsForSection("general", true).map((t) => t.id),
@@ -61,7 +61,7 @@ describe("Settings IA (3 Domain Groups · 8 Core Sections · 19 Leaf Views)", ()
     );
     assert.deepEqual(
       getVisibleSubTabsForSection("agents", true).map((t) => t.id),
-      ["agents", "acp", "guardian"],
+      ["agents", "router", "acp", "guardian"],
     );
     assert.deepEqual(getVisibleSubTabsForSection("usage", true), []);
     assert.deepEqual(
@@ -105,6 +105,7 @@ describe("Settings IA (3 Domain Groups · 8 Core Sections · 19 Leaf Views)", ()
       { target: "providers", expectedSection: `host:${hostId}:agents`, expectedCore: "agents", expectedSubTab: "agents" },
       { target: "models_agents", expectedSection: `host:${hostId}:agents`, expectedCore: "agents", expectedSubTab: "agents" },
       { target: "agents", expectedSection: `host:${hostId}:agents`, expectedCore: "agents", expectedSubTab: "agents" },
+      { target: "router", expectedSection: `host:${hostId}:router`, expectedCore: "agents", expectedSubTab: "router" },
       { target: "acp", expectedSection: `host:${hostId}:acp`, expectedCore: "agents", expectedSubTab: "acp" },
       { target: "guardian", expectedSection: `host:${hostId}:guardian`, expectedCore: "agents", expectedSubTab: "guardian" },
       { target: "usage", expectedSection: `host:${hostId}:usage`, expectedCore: "usage", expectedSubTab: null },

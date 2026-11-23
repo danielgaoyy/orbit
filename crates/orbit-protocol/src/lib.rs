@@ -14,6 +14,7 @@ pub mod mcp_servers;
 pub mod media;
 pub mod orchestration;
 pub mod push;
+pub mod router;
 pub mod rules;
 pub mod skills;
 pub mod timers;
@@ -34,6 +35,7 @@ pub use mcp_servers::*;
 pub use media::*;
 pub use orchestration::*;
 pub use push::*;
+pub use router::*;
 pub use rules::*;
 pub use skills::*;
 pub use timers::*;
@@ -1837,6 +1839,55 @@ pub enum WireMessage {
         request_id: Uuid,
         config: OrchestrationConfig,
     },
+
+    // Personal Router ("Chief-of-Staff / 分工师") & Multi-Host Fleet Router Discovery
+    GetPersonalRouterStatus {
+        request_id: Uuid,
+    },
+    PersonalRouterStatusSnapshot {
+        request_id: Uuid,
+        status: RouterStatusSnapshot,
+    },
+    ConfigurePersonalRouter {
+        request_id: Uuid,
+        config: PersonalRouterConfig,
+        /// Optional secret for outbound external Hermes webhook (never returned in snapshots).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_webhook_secret: Option<String>,
+        /// When `true` and `config.enabled == true`, immediately create/resume the canonical Router agent.
+        #[serde(default)]
+        activate: bool,
+    },
+    ProbeRouterCapabilities {
+        request_id: Uuid,
+    },
+    RouterCapabilitiesResponse {
+        request_id: Uuid,
+        capabilities: RouterHostCapabilities,
+    },
+    DiscoverFleetRouterHosts {
+        request_id: Uuid,
+    },
+    FleetRouterHostsSnapshot {
+        request_id: Uuid,
+        hosts: Vec<RouterHostCapabilities>,
+    },
+    ExportHermesBridgeConfig {
+        request_id: Uuid,
+    },
+    HermesBridgeConfigResponse {
+        request_id: Uuid,
+        bundle: HermesBridgeBundle,
+    },
+    InspectProjectContext {
+        request_id: Uuid,
+        cwd: String,
+    },
+    ProjectContextResponse {
+        request_id: Uuid,
+        context: ProjectContextPacket,
+    },
+
     ListOrchestrationSkills {
         request_id: Uuid,
     },
@@ -2836,6 +2887,10 @@ pub enum WireMessage {
         default_mode: SessionMode,
         #[serde(default = "wire_default_true")]
         forward_approvals: bool,
+        #[serde(default)]
+        routing_mode: ImRoutingMode,
+        #[serde(default)]
+        router_mirror_policy: RouterImMirrorPolicy,
     },
     DeleteImChannel {
         request_id: Uuid,
@@ -4742,6 +4797,8 @@ mod tests {
             default_provider: ProviderKind::ClaudeCode,
             default_mode: SessionMode::Default,
             forward_approvals: true,
+            routing_mode: ImRoutingMode::PerThreadAgent,
+            router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
             message_count: 5,
             last_activity_at_ms: Some(1_760_000_005_000),
             created_at_ms: 1_760_000_000_000,
@@ -4778,6 +4835,8 @@ mod tests {
                 default_provider: ProviderKind::ClaudeCode,
                 default_mode: SessionMode::Default,
                 forward_approvals: true,
+                routing_mode: ImRoutingMode::PersonalRouter,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
             },
             WireMessage::DeleteImChannel {
                 request_id: req_id,

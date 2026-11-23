@@ -2884,6 +2884,64 @@ async fn test_im_channel(
 }
 
 #[tauri::command]
+async fn get_personal_router_status(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<orbit_protocol::RouterStatusSnapshot, String> {
+    state
+        .core
+        .get_personal_router_status_on_host(&host_id)
+        .await
+}
+
+#[tauri::command]
+async fn configure_personal_router(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    config: orbit_protocol::PersonalRouterConfig,
+    external_webhook_secret: Option<String>,
+    activate: bool,
+) -> Result<orbit_protocol::RouterStatusSnapshot, String> {
+    state
+        .core
+        .configure_personal_router_on_host(&host_id, config, external_webhook_secret, activate)
+        .await
+}
+
+#[tauri::command]
+async fn discover_fleet_router_hosts(
+    state: State<'_, DesktopAppState>,
+) -> Result<Vec<orbit_protocol::RouterHostCapabilities>, String> {
+    state.core.discover_fleet_router_hosts().await
+}
+
+#[tauri::command]
+async fn export_hermes_bridge_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<orbit_protocol::HermesBridgeBundle, String> {
+    state
+        .core
+        .export_hermes_bridge_config_on_host(&host_id)
+        .await
+}
+
+#[tauri::command]
+fn get_primary_router_selection(
+    state: State<'_, DesktopAppState>,
+) -> Option<orbit_protocol::PrimaryRouterSelection> {
+    state.core.get_primary_router_selection()
+}
+
+#[tauri::command]
+fn set_primary_router_selection(
+    state: State<'_, DesktopAppState>,
+    selection: Option<orbit_protocol::PrimaryRouterSelection>,
+) -> Result<Option<orbit_protocol::PrimaryRouterSelection>, String> {
+    state.core.set_primary_router_selection(selection)
+}
+
+#[tauri::command]
 fn focus_main_window(app: AppHandle) -> Result<(), String> {
     tray::focus_main_window_impl(&app)
 }
@@ -4193,6 +4251,12 @@ pub fn run() {
             upsert_im_channel,
             delete_im_channel,
             test_im_channel,
+            get_personal_router_status,
+            configure_personal_router,
+            discover_fleet_router_hosts,
+            export_hermes_bridge_config,
+            get_primary_router_selection,
+            set_primary_router_selection,
             focus_main_window,
             update_tray_status,
             probe_local_provider_readiness,

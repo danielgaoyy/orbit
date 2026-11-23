@@ -35,6 +35,7 @@ import { HostHooksSection } from "@/components/settings/host-hooks-section";
 import { HostImChannelsSection } from "@/components/settings/host-im-channels-section";
 import { HostLspSection } from "@/components/settings/host-lsp-section";
 import { HostMcpSection } from "@/components/settings/host-mcp-section";
+import { HostPersonalRouterSection } from "@/components/settings/host-personal-router-section";
 import { HostRulesSection } from "@/components/settings/host-rules-section";
 import { HostSkillsSection } from "@/components/settings/host-skills-section";
 import { HostUsageSection } from "@/components/settings/host-usage-section";
@@ -748,6 +749,12 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                   )}
                   {resolvedHost?.tab === "agents" && (
                     <HostAgentsSection hostId={resolvedHost.hostId} />
+                  )}
+                  {resolvedHost?.tab === "router" && (
+                    <HostPersonalRouterSection
+                      key={resolvedHost.hostId}
+                      hostId={resolvedHost.hostId}
+                    />
                   )}
                   {resolvedHost?.tab === "acp" && (
                     <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />

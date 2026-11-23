@@ -192,6 +192,10 @@ pub struct SyncedHostEntry {
     #[serde(default)]
     pub relay_url: Option<String>,
     #[serde(default)]
+    pub pairing_secret: String,
+    #[serde(default)]
+    pub pairing_secret_updated_at_ms: i64,
+    #[serde(default)]
     pub custom_name: Option<String>,
     #[serde(default)]
     pub ssh_alias: Option<String>,
@@ -513,6 +517,8 @@ pub fn synced_host_from_local(rec: &LocalHostSyncRecord) -> SyncedHostEntry {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned),
+        pairing_secret: rec.profile.pairing_secret.clone(),
+        pairing_secret_updated_at_ms: rec.profile.meta.pairing_secret_updated_at_ms,
         custom_name: rec.profile.meta.custom_name.clone(),
         ssh_alias: rec.profile.meta.ssh_alias.clone(),
         route_mode: rec.profile.meta.route_mode.clone(),
@@ -531,12 +537,14 @@ pub fn stored_host_from_synced(entry: &SyncedHostEntry) -> StoredHostProfile {
         daemon_pubkey_b64: entry.daemon_pubkey_b64.clone(),
         direct_endpoints: entry.direct_endpoints.clone(),
         relay_url: entry.relay_url.clone(),
+        pairing_secret: entry.pairing_secret.clone(),
         meta: StoredHostMeta {
             custom_name: entry.custom_name.clone(),
             ssh_alias: entry.ssh_alias.clone(),
             route_mode: entry.route_mode.clone(),
             remote_daemon_port: entry.remote_daemon_port,
             custom_direct_endpoint: entry.custom_direct_endpoint.clone(),
+            pairing_secret_updated_at_ms: entry.pairing_secret_updated_at_ms,
         },
     }
 }
@@ -549,11 +557,50 @@ fn project_effective_ts(entry: &SyncedProjectEntry) -> i64 {
     entry.deleted_at_ms.unwrap_or(entry.updated_at_ms)
 }
 
+/// Resolve the winning `(pairing_secret, pairing_secret_updated_at_ms)` independently of host
+/// metadata timestamps so renaming or editing host metadata on a stale device can never roll back
+/// a rotated pairing secret. Empty secrets are ignored completely so they can never stamp an older
+/// non-empty secret with a newer timestamp.
+fn merge_host_pairing_secret(
+    remote: &SyncedHostEntry,
+    local: &SyncedHostEntry,
+    prefer_remote_on_tie: bool,
+) -> (String, i64) {
+    let r_empty = remote.pairing_secret.trim().is_empty();
+    let l_empty = local.pairing_secret.trim().is_empty();
+    match (r_empty, l_empty) {
+        (true, true) => (String::new(), 0),
+        (true, false) => (
+            local.pairing_secret.clone(),
+            local.pairing_secret_updated_at_ms,
+        ),
+        (false, true) => (
+            remote.pairing_secret.clone(),
+            remote.pairing_secret_updated_at_ms,
+        ),
+        (false, false) => {
+            let r_ts = remote.pairing_secret_updated_at_ms;
+            let l_ts = local.pairing_secret_updated_at_ms;
+            if r_ts > l_ts {
+                (remote.pairing_secret.clone(), r_ts)
+            } else if l_ts > r_ts {
+                (local.pairing_secret.clone(), l_ts)
+            } else if prefer_remote_on_tie {
+                (remote.pairing_secret.clone(), r_ts)
+            } else {
+                (local.pairing_secret.clone(), l_ts)
+            }
+        }
+    }
+}
+
 fn hosts_content_equal(a: &SyncedHostEntry, b: &SyncedHostEntry) -> bool {
     a.hostname == b.hostname
         && a.daemon_pubkey_b64 == b.daemon_pubkey_b64
         && a.direct_endpoints == b.direct_endpoints
         && a.relay_url == b.relay_url
+        && a.pairing_secret == b.pairing_secret
+        && a.pairing_secret_updated_at_ms == b.pairing_secret_updated_at_ms
         && a.custom_name == b.custom_name
         && a.ssh_alias == b.ssh_alias
         && a.route_mode == b.route_mode
@@ -625,6 +672,8 @@ pub fn merge_cloud_vault(
                 daemon_pubkey_b64: rec.profile.daemon_pubkey_b64.clone(),
                 direct_endpoints: Vec::new(),
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 custom_name: None,
                 ssh_alias: None,
                 route_mode: None,
@@ -643,6 +692,8 @@ pub fn merge_cloud_vault(
                     .unwrap_or_default(),
                 direct_endpoints: Vec::new(),
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 custom_name: None,
                 ssh_alias: None,
                 route_mode: None,
@@ -660,28 +711,58 @@ pub fn merge_cloud_vault(
                 let r_ts = host_effective_ts(r);
                 let l_ts = host_effective_ts(&l);
                 if r_ts > l_ts {
-                    // Remote wins
+                    // Remote metadata wins; if both sides are active, resolve pairing_secret independently by its own timestamp!
                     if r.deleted_at_ms.is_some() {
                         if local_rec.is_some() {
                             hosts_to_remove.push(host_id.clone());
                             hosts_removed_count += 1;
                         }
-                    } else if local_rec.is_none() {
-                        hosts_to_upsert.push(r.clone());
-                        hosts_added_count += 1;
-                    } else if !hosts_content_equal(r, &l) {
-                        hosts_to_upsert.push(r.clone());
-                        hosts_updated_count += 1;
+                        r.clone()
+                    } else {
+                        let mut combined = r.clone();
+                        if l.deleted_at_ms.is_none() {
+                            let (sec, sec_ts) = merge_host_pairing_secret(r, &l, true);
+                            combined.pairing_secret = sec;
+                            combined.pairing_secret_updated_at_ms = sec_ts;
+                        }
+                        if !hosts_content_equal(&combined, r) {
+                            needs_push = true;
+                        }
+                        if local_rec.is_none() {
+                            hosts_to_upsert.push(combined.clone());
+                            hosts_added_count += 1;
+                        } else if !hosts_content_equal(&combined, &l) {
+                            hosts_to_upsert.push(combined.clone());
+                            hosts_updated_count += 1;
+                        }
+                        combined
                     }
-                    r.clone()
                 } else if l_ts > r_ts {
-                    // Local wins
-                    if !hosts_content_equal(r, &l) {
-                        needs_push = true;
+                    // Local metadata wins; if both sides are active, preserve a newer remote rotated pairing_secret!
+                    if l.deleted_at_ms.is_some() {
+                        if !hosts_content_equal(r, &l) {
+                            needs_push = true;
+                        }
+                        l
+                    } else {
+                        let mut combined = l.clone();
+                        if r.deleted_at_ms.is_none() {
+                            let (sec, sec_ts) = merge_host_pairing_secret(r, &l, false);
+                            combined.pairing_secret = sec;
+                            combined.pairing_secret_updated_at_ms = sec_ts;
+                        }
+                        if !hosts_content_equal(&combined, r) {
+                            needs_push = true;
+                        }
+                        if !hosts_content_equal(&combined, &l) {
+                            hosts_to_upsert.push(combined.clone());
+                            hosts_updated_count += 1;
+                        }
+                        combined
                     }
-                    l
                 } else {
-                    // Equal timestamp: if both active and content differs, union endpoints & prefer richer metadata
+                    // Equal timestamp: if both active and content differs, union endpoints, prefer richer metadata,
+                    // and resolve pairing_secret independently by `pairing_secret_updated_at_ms`.
                     if r.deleted_at_ms.is_none() && l.deleted_at_ms.is_none() {
                         let mut combined = r.clone();
                         let mut eps = filter_shareable_endpoints(&combined.direct_endpoints);
@@ -700,6 +781,9 @@ pub fn merge_cloud_vault(
                         if combined.ssh_alias.is_none() {
                             combined.ssh_alias = l.ssh_alias.clone();
                         }
+                        let (sec, sec_ts) = merge_host_pairing_secret(r, &l, true);
+                        combined.pairing_secret = sec;
+                        combined.pairing_secret_updated_at_ms = sec_ts;
                         if !hosts_content_equal(&combined, r) {
                             needs_push = true;
                         }
@@ -1613,6 +1697,7 @@ mod tests {
                 daemon_pubkey_b64: format!("pub_{host_id}"),
                 direct_endpoints: eps.into_iter().map(ToOwned::to_owned).collect(),
                 relay_url: relay.map(ToOwned::to_owned),
+                pairing_secret: format!("sec_{host_id}"),
                 meta: StoredHostMeta::default(),
             },
             os_arch: Some("linux/aarch64".into()),
@@ -1668,6 +1753,8 @@ mod tests {
                 daemon_pubkey_b64: "pub_a".into(),
                 direct_endpoints: vec!["ws://192.168.1.10:6868/ws".into()],
                 relay_url: Some("wss://relay.example.com:7878".into()),
+                pairing_secret: "sec_host_a_remote_secret_value_00000000".into(),
+                pairing_secret_updated_at_ms: 2000,
                 custom_name: Some("Studio".into()),
                 ssh_alias: None,
                 route_mode: Some("auto".into()),
@@ -1686,6 +1773,8 @@ mod tests {
                 daemon_pubkey_b64: "pub_b".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: "sec_host_b_remote_secret_value_00000000".into(),
+                pairing_secret_updated_at_ms: 1500,
                 custom_name: None,
                 ssh_alias: None,
                 route_mode: None,
@@ -1704,6 +1793,8 @@ mod tests {
                 daemon_pubkey_b64: "pub_c".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 custom_name: None,
                 ssh_alias: None,
                 route_mode: None,
@@ -1749,12 +1840,140 @@ mod tests {
         assert_eq!(outcome.hosts_removed_count, 1);
         assert_eq!(outcome.hosts_to_remove, vec!["host_c".to_string()]);
 
-        // host_b is now tombstoned in merged payload
+        // host_b is now tombstoned in merged payload (with secret scrubbed)
         assert_eq!(outcome.merged.hosts["host_b"].deleted_at_ms, Some(2600));
+        assert!(outcome.merged.hosts["host_b"].pairing_secret.is_empty());
+        // host_a and host_d preserve their pairing_secret through sync merge
+        assert_eq!(
+            outcome.hosts_to_upsert[0].pairing_secret,
+            "sec_host_a_remote_secret_value_00000000"
+        );
+        assert_eq!(outcome.merged.hosts["host_d"].pairing_secret, "sec_host_d");
         // host_d has loopback stripped!
         assert_eq!(
             outcome.merged.hosts["host_d"].direct_endpoints,
             vec!["ws://10.0.0.9:6868/ws".to_string()]
+        );
+    }
+
+    #[test]
+    fn metadata_rename_on_stale_device_never_rolls_back_rotated_pairing_secret() {
+        // Case 1: Remote has rotated secret at t=2000; stale local device renamed host at t=3000 with old secret (secret_ts=1000).
+        let mut remote = CloudVaultPayload {
+            schema_version: CLOUD_VAULT_SCHEMA_VERSION,
+            revision: 5,
+            updated_at_ms: 2000,
+            ..Default::default()
+        };
+        remote.hosts.insert(
+            "host_x".into(),
+            SyncedHostEntry {
+                host_id: "host_x".into(),
+                hostname: "workstation".into(),
+                daemon_pubkey_b64: "pub_x".into(),
+                direct_endpoints: vec!["ws://10.0.0.5:6868/ws".into()],
+                relay_url: None,
+                pairing_secret: "secret_v2_rotated".into(),
+                pairing_secret_updated_at_ms: 2000,
+                custom_name: Some("Old Name".into()),
+                ssh_alias: None,
+                route_mode: None,
+                remote_daemon_port: Some(6868),
+                custom_direct_endpoint: None,
+                os_arch: None,
+                updated_at_ms: 2000,
+                deleted_at_ms: None,
+            },
+        );
+        let mut local_rec = sample_local_host(
+            "host_x",
+            "workstation",
+            vec!["ws://10.0.0.5:6868/ws"],
+            None,
+            3000,
+        );
+        local_rec.profile.daemon_pubkey_b64 = "pub_x".into();
+        local_rec.profile.pairing_secret = "secret_v1_stale".into();
+        local_rec.profile.meta.pairing_secret_updated_at_ms = 1000;
+        local_rec.profile.meta.custom_name = Some("Renamed Locally".into());
+
+        let outcome = merge_cloud_vault(
+            Some(&remote),
+            &[local_rec],
+            &[],
+            &[],
+            &HashMap::new(),
+            &CloudSyncLocalMeta::default(),
+            3000,
+        );
+        assert!(outcome.needs_push);
+        let merged_x = &outcome.merged.hosts["host_x"];
+        assert_eq!(merged_x.custom_name.as_deref(), Some("Renamed Locally"));
+        assert_eq!(merged_x.pairing_secret, "secret_v2_rotated");
+        assert_eq!(merged_x.pairing_secret_updated_at_ms, 2000);
+        assert_eq!(outcome.hosts_to_upsert.len(), 1);
+        assert_eq!(
+            outcome.hosts_to_upsert[0].pairing_secret,
+            "secret_v2_rotated"
+        );
+
+        // Case 2: Remote renamed host at t=4000 with stale secret (secret_ts=1000); local rotated secret at t=3500.
+        let mut remote2 = CloudVaultPayload {
+            schema_version: CLOUD_VAULT_SCHEMA_VERSION,
+            revision: 6,
+            updated_at_ms: 4000,
+            ..Default::default()
+        };
+        remote2.hosts.insert(
+            "host_y".into(),
+            SyncedHostEntry {
+                host_id: "host_y".into(),
+                hostname: "mac-mini".into(),
+                daemon_pubkey_b64: "pub_y".into(),
+                direct_endpoints: vec!["ws://10.0.0.6:6868/ws".into()],
+                relay_url: None,
+                pairing_secret: "secret_v1_stale".into(),
+                pairing_secret_updated_at_ms: 1000,
+                custom_name: Some("Renamed Remotely".into()),
+                ssh_alias: None,
+                route_mode: None,
+                remote_daemon_port: Some(6868),
+                custom_direct_endpoint: None,
+                os_arch: None,
+                updated_at_ms: 4000,
+                deleted_at_ms: None,
+            },
+        );
+        let mut local_y = sample_local_host(
+            "host_y",
+            "mac-mini",
+            vec!["ws://10.0.0.6:6868/ws"],
+            None,
+            3500,
+        );
+        local_y.profile.daemon_pubkey_b64 = "pub_y".into();
+        local_y.profile.pairing_secret = "secret_v3_local_rotated".into();
+        local_y.profile.meta.pairing_secret_updated_at_ms = 3500;
+        local_y.profile.meta.custom_name = Some("Old Local Name".into());
+
+        let outcome2 = merge_cloud_vault(
+            Some(&remote2),
+            &[local_y],
+            &[],
+            &[],
+            &HashMap::new(),
+            &CloudSyncLocalMeta::default(),
+            4000,
+        );
+        assert!(outcome2.needs_push);
+        let merged_y = &outcome2.merged.hosts["host_y"];
+        assert_eq!(merged_y.custom_name.as_deref(), Some("Renamed Remotely"));
+        assert_eq!(merged_y.pairing_secret, "secret_v3_local_rotated");
+        assert_eq!(merged_y.pairing_secret_updated_at_ms, 3500);
+        assert_eq!(outcome2.hosts_to_upsert.len(), 1);
+        assert_eq!(
+            outcome2.hosts_to_upsert[0].pairing_secret,
+            "secret_v3_local_rotated"
         );
     }
 
@@ -1827,6 +2046,77 @@ mod tests {
         assert_eq!(
             outcome.merged.preferences["enterToSend"].value,
             serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn empty_pairing_secret_with_newer_timestamp_never_bumps_older_secret_timestamp() {
+        let mut remote_hosts = HashMap::new();
+        remote_hosts.insert(
+            "h_empty_ts".into(),
+            SyncedHostEntry {
+                host_id: "h_empty_ts".into(),
+                hostname: "box".into(),
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 9000,
+                custom_name: Some("Renamed".into()),
+                ssh_alias: None,
+                route_mode: None,
+                remote_daemon_port: Some(6868),
+                custom_direct_endpoint: None,
+                os_arch: None,
+                updated_at_ms: 9000,
+                deleted_at_ms: None,
+            },
+        );
+        let remote = CloudVaultPayload {
+            schema_version: CLOUD_VAULT_SCHEMA_VERSION,
+            revision: 2,
+            updated_at_ms: 9000,
+            hosts: remote_hosts,
+            projects: HashMap::new(),
+            project_order: vec![],
+            project_order_updated_at_ms: 0,
+            preferences: HashMap::new(),
+        };
+
+        let local = LocalHostSyncRecord {
+            profile: StoredHostProfile {
+                host_id: "h_empty_ts".into(),
+                display_name: "box".into(),
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: "old-secret-0123456789abcdef0123456789abcdef".into(),
+                meta: StoredHostMeta {
+                    pairing_secret_updated_at_ms: 1000,
+                    ..Default::default()
+                },
+            },
+            os_arch: None,
+            updated_at_ms: 1000,
+        };
+
+        let outcome = merge_cloud_vault(
+            Some(&remote),
+            &[local],
+            &[],
+            &[],
+            &HashMap::new(),
+            &CloudSyncLocalMeta::default(),
+            9500,
+        );
+        let merged = outcome.merged.hosts.get("h_empty_ts").expect("merged host");
+        assert_eq!(
+            merged.pairing_secret,
+            "old-secret-0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            merged.pairing_secret_updated_at_ms, 1000,
+            "empty remote entry must NEVER stamp older non-empty secret with newer timestamp 9000"
         );
     }
 }

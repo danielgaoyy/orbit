@@ -769,7 +769,16 @@ async function main() {
       });
     }
     await new Promise((resolve) => server.close(() => resolve()));
-    fs.rmSync(userDataDir, { recursive: true, force: true });
+    try {
+      fs.rmSync(userDataDir, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      });
+    } catch {
+      // Best-effort temp profile cleanup; Chrome helper processes may still flush briefly on exit.
+    }
   }
 }
 

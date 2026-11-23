@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { FoldVertical } from "lucide-react";
 import type { ContextOccupancyBreakdown } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 function formatTokenShort(tokens: number): string {
@@ -61,6 +62,7 @@ const CLOSE_DELAY_MS = 150;
  * - Also supports direct click/keyboard toggle for quick access to `/compact`.
  */
 export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
+  const { t } = useI18n();
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const hostId = useOrbitSelector((s) => s.selectedHostId);
   const agentId = useOrbitSelector((s) => s.selectedAgentId);
@@ -243,7 +245,7 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
       <button
         type="button"
         aria-expanded={open}
-        aria-label={`Context window ${roundedPct}% used`}
+        aria-label={t("composer.contextWindowAria", { percent: roundedPct })}
         onClick={() => {
           clearTimers();
           setOpen((prev) => {
@@ -307,14 +309,14 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
         >
           <div
             role="dialog"
-            aria-label="Context window usage"
+            aria-label={t("composer.contextWindowUsage")}
             className="bg-popover text-popover-foreground floating-surface orbit-inline-menu-up w-[244px] rounded-[12px] border border-black/[0.08] p-3 dark:border-white/[0.10]"
           >
             <div className="space-y-2">
               {/* Header: quiet label + crisp percentage */}
               <div className="flex items-baseline justify-between gap-2">
                 <span className="text-foreground/90 text-[12px] font-medium tracking-[-0.01em]">
-                  Context window
+                  {t("composer.contextWindow")}
                 </span>
                 <span
                   className={cn(
@@ -346,7 +348,9 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
                     {formatTokenShort(breakdown.total_used_tokens)} /{" "}
                     {formatTokenShort(breakdown.context_window_tokens)}
                   </span>
-                  <span>{formatTokenShort(remainingTokens)} left</span>
+                  <span>
+                    {t("composer.contextLeft", { remaining: formatTokenShort(remainingTokens) })}
+                  </span>
                 </div>
               </div>
 
@@ -388,7 +392,7 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
                     className="border-border hover:bg-accent text-foreground inline-flex h-[28px] w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg border px-2.5 text-[11.5px] font-medium transition-colors"
                   >
                     <FoldVertical className="size-3.5 stroke-[1.8]" />
-                    <span>Compact context (/compact)</span>
+                    <span>{t("composer.compactContext")}</span>
                   </button>
                 </div>
               )}

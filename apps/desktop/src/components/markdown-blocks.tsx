@@ -11,7 +11,7 @@ import {
 import { ArrowUpRight, Check, Copy } from "lucide-react";
 import { DiagramBlock } from "@/components/diagram-block";
 import { InlineMathSpan, MathBlockView } from "@/components/math-block";
-import { adaptTokenColor } from "@/lib/code-highlight";
+import { resolveTokenColor } from "@/lib/code-highlight";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   type InlineSpanView,
@@ -355,7 +355,7 @@ export const HighlightedCodeBlock = memo(
                 <span
                   key={idx}
                   style={{
-                    color: adaptTokenColor(tok.fg_hex, isDark),
+                    color: resolveTokenColor(tok, isDark),
                     fontWeight: tok.bold ? 600 : undefined,
                     fontStyle: tok.italic ? "italic" : undefined,
                   }}

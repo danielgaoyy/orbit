@@ -35,7 +35,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{Message, protocol::WebSocketConfig},
+    tungstenite::{
+        Error as WsError, Message,
+        client::IntoClientRequest,
+        handshake::client::Request as WsClientRequest,
+        http::{HeaderValue, header::AUTHORIZATION},
+        protocol::{WebSocketConfig, frame::coding::CloseCode},
+    },
 };
 use uuid::Uuid;
 
@@ -102,6 +108,10 @@ pub struct SavedHostProfile {
     pub daemon_pubkey_b64: String,
     pub direct_endpoints: Vec<String>,
     pub relay_url: Option<String>,
+    #[serde(default)]
+    pub pairing_secret: String,
+    #[serde(default)]
+    pub pairing_secret_updated_at_ms: i64,
     pub state: HostConnectionState,
 }
 
@@ -152,6 +162,8 @@ pub enum ClientCoreError {
     RelayTransport(#[from] orbit_relay_transport::RelayTransportError),
     #[error("connection handshake failed: {0}")]
     Handshake(String),
+    #[error("authentication failed: {0}")]
+    Unauthorized(String),
     #[error("host identity mismatch (expected {expected}, got {actual})")]
     HostIdentityMismatch { expected: String, actual: String },
     #[error("no reachable direct endpoint, SSH tunnel, or relay configured")]
@@ -162,6 +174,25 @@ pub enum ClientCoreError {
     LockPoisoned,
     #[error("{0}")]
     Transport(String),
+}
+
+impl ClientCoreError {
+    /// Returns `true` when the connection failed due to missing, invalid, or rejected
+    /// `pairing_secret` authentication (Direct WS 401/403 or Relay E2EE `Noise_NKpsk0`).
+    pub fn is_auth_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Unauthorized(_)
+                | Self::Crypto(
+                    orbit_crypto::CryptoError::InvalidPairingSecret
+                        | orbit_crypto::CryptoError::AuthenticationFailed
+                )
+        ) || matches!(
+            self,
+            Self::Ws(ws_err)
+                if matches!(ws_err.as_ref(), WsError::Http(resp) if matches!(resp.status().as_u16(), 401 | 403))
+        )
+    }
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ClientCoreError {
@@ -247,24 +278,56 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Connect directly to an Orbit Daemon WebSocket endpoint with Zstd compression & 10s Ping keepalive.
+/// Build an authenticated WebSocket upgrade request carrying `Authorization: Bearer <pairing_secret>`.
+pub fn build_authenticated_ws_request(
+    ws_url: &str,
+    pairing_secret: &str,
+) -> Result<WsClientRequest, ClientCoreError> {
+    let secret = pairing_secret.trim();
+    if secret.is_empty() {
+        return Err(ClientCoreError::Unauthorized(
+            "missing pairing_secret for direct WebSocket authentication".into(),
+        ));
+    }
+    let mut req = ws_url.into_client_request()?;
+    let header_val = HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|e| {
+        ClientCoreError::Unauthorized(format!("invalid pairing_secret header: {e}"))
+    })?;
+    req.headers_mut().insert(AUTHORIZATION, header_val);
+    Ok(req)
+}
+
+/// Connect directly to an Orbit Daemon WebSocket endpoint with Bearer auth, Zstd compression & 10s Ping keepalive.
 pub async fn connect_direct(
     ws_url: &str,
+    pairing_secret: &str,
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
-    connect_direct_with_host_id("", ws_url, replica, None).await
+    connect_direct_with_host_id("", ws_url, pairing_secret, replica, None).await
+}
+
+/// Connect directly to an Orbit Daemon WebSocket endpoint and verify `Welcome.host_id` matches `expected_host_id`.
+pub async fn connect_direct_verified(
+    expected_host_id: &str,
+    ws_url: &str,
+    pairing_secret: &str,
+    replica: Option<Arc<OrbitStore>>,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    connect_direct_with_host_id(expected_host_id, ws_url, pairing_secret, replica, None).await
 }
 
 async fn connect_direct_with_host_id(
     host_id: &str,
     ws_url: &str,
+    pairing_secret: &str,
     replica: Option<Arc<OrbitStore>>,
     ssh_tunnel: Option<Arc<SshTunnelGuard>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
+    let req = build_authenticated_ws_request(ws_url, pairing_secret)?;
     let mut ws_cfg = WebSocketConfig::default();
     ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
     ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
-    let (ws_stream, _) = connect_async_with_config(ws_url, Some(ws_cfg), false).await?;
+    let (ws_stream, _) = connect_async_with_config(req, Some(ws_cfg), false).await?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let hello = WireMessage::Hello {
@@ -420,43 +483,95 @@ async fn connect_direct_with_host_id(
     })
 }
 
-/// Connect through an untrusted/self-hosted Relay using `Noise_NK_25519_ChaChaPoly_SHA256` E2EE.
+/// Connect through an untrusted/self-hosted Relay using mutually authenticated
+/// `Noise_NKpsk0_25519_ChaChaPoly_SHA256` E2EE with the host's `pairing_secret`.
 pub async fn connect_via_relay(
     relay_base_url: &str,
     daemon_pubkey_b64: &str,
+    pairing_secret: &str,
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
-    connect_via_relay_with_host_id("", relay_base_url, daemon_pubkey_b64, replica).await
+    connect_via_relay_with_host_id(
+        "",
+        relay_base_url,
+        daemon_pubkey_b64,
+        pairing_secret,
+        replica,
+    )
+    .await
 }
 
 async fn connect_via_relay_with_host_id(
     host_id: &str,
     relay_base_url: &str,
     daemon_pubkey_b64: &str,
+    pairing_secret: &str,
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
+    // Reject empty or malformed pairing_secret fail-closed BEFORE dialing the relay.
+    let _ = orbit_crypto::derive_e2ee_psk(pairing_secret).map_err(|_| {
+        ClientCoreError::Unauthorized(
+            "missing or invalid pairing_secret for relay E2EE authentication".into(),
+        )
+    })?;
     let pubkey_bytes = decode_key_32(daemon_pubkey_b64)?;
+    let (hs, msg1) = ClientHandshake::new(&pubkey_bytes, pairing_secret).map_err(|e| match e {
+        orbit_crypto::CryptoError::InvalidPairingSecret
+        | orbit_crypto::CryptoError::AuthenticationFailed => {
+            ClientCoreError::Unauthorized(e.to_string())
+        }
+        other => ClientCoreError::Crypto(other),
+    })?;
     let path_and_query = format!("/v1/client/{daemon_pubkey_b64}");
 
     let ws_stream = connect_relay_ws(relay_base_url, &path_and_query).await?;
     let (mut sink, mut stream) = ws_stream.split();
 
-    let (hs, msg1) = ClientHandshake::new(&pubkey_bytes)?;
     sink.send(Message::Binary(msg1.into())).await?;
 
     let msg2 = tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(Ok(frame)) = stream.next().await {
-            if let Message::Binary(b) = frame {
-                return Some(b);
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(Message::Binary(b)) => return Ok(b),
+                Ok(Message::Ping(p)) => {
+                    sink.send(Message::Pong(p)).await?;
+                }
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(frame)) => {
+                    let is_unauthorized = frame.as_ref().is_some_and(|f| {
+                        f.code == CloseCode::Policy || f.reason.eq_ignore_ascii_case("unauthorized")
+                    });
+                    if is_unauthorized {
+                        return Err(ClientCoreError::Unauthorized(
+                            "relay E2EE authentication rejected by daemon".into(),
+                        ));
+                    }
+                    return Err(ClientCoreError::Handshake(
+                        "relay closed during E2EE handshake".into(),
+                    ));
+                }
+                Ok(_) => {
+                    return Err(ClientCoreError::Handshake(
+                        "unexpected frame during relay E2EE handshake".into(),
+                    ));
+                }
+                Err(e) => return Err(e.into()),
             }
         }
-        None
+        Err(ClientCoreError::Handshake(
+            "relay closed during E2EE handshake".into(),
+        ))
     })
     .await
-    .map_err(|_| ClientCoreError::Handshake("relay E2EE handshake timed out".into()))?
-    .ok_or_else(|| ClientCoreError::Handshake("relay closed during E2EE handshake".into()))?;
+    .map_err(|_| ClientCoreError::Handshake("relay E2EE handshake timed out".into()))??;
 
-    let write_chan: SecureChannel = hs.finalize(&msg2)?;
+    let write_chan: SecureChannel = hs.finalize(&msg2).map_err(|e| match e {
+        orbit_crypto::CryptoError::InvalidPairingSecret
+        | orbit_crypto::CryptoError::AuthenticationFailed => {
+            ClientCoreError::Unauthorized(e.to_string())
+        }
+        other => ClientCoreError::Crypto(other),
+    })?;
     let shared_chan = Arc::new(tokio::sync::Mutex::new(write_chan));
 
     {
@@ -613,6 +728,7 @@ async fn try_connect_ssh_tunnel(
             connect_direct_with_host_id(
                 &profile.host_id,
                 &shared_guard.ws_url,
+                &profile.pairing_secret,
                 replica.clone(),
                 Some(shared_guard.clone()),
             ),
@@ -621,6 +737,7 @@ async fn try_connect_ssh_tunnel(
         {
             Ok(Ok(handle)) => return Ok(handle),
             Ok(Err(e @ ClientCoreError::HostIdentityMismatch { .. })) => return Err(e),
+            Ok(Err(e)) if e.is_auth_error() => return Err(e),
             Ok(Err(e)) => last_err = Some(e),
             Err(_) => {}
         }
@@ -665,47 +782,25 @@ async fn try_connect_direct_endpoints(
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
     let has_custom = has_custom_direct_endpoint(profile);
-    // Tuple of (endpoint_url, is_configured_in_profile)
-    let mut raw_endpoints: Vec<(String, bool)> = Vec::new();
+    // Only dial explicitly paired/configured direct endpoints for this host — never speculatively
+    // probe unconfigured local/emulator addresses with this host's Bearer credential!
+    let mut raw_endpoints: Vec<String> = Vec::new();
     if let Some(ref custom) = profile.custom_direct_endpoint
         && !custom.trim().is_empty()
     {
-        raw_endpoints.push((custom.trim().to_string(), true));
+        raw_endpoints.push(custom.trim().to_string());
     }
-    if (cfg!(target_os = "ios") && std::env::var_os("SIMULATOR_HOST_HOME").is_some())
-        || cfg!(target_env = "ohos")
-        || cfg!(target_os = "android")
-    {
-        raw_endpoints.push((
-            format!("ws://127.0.0.1:{}/ws", profile.remote_daemon_port),
-            false,
-        ));
-    }
-    if cfg!(target_os = "android") {
-        raw_endpoints.push((
-            format!("ws://10.0.2.2:{}/ws", profile.remote_daemon_port),
-            false,
-        ));
-    }
-    raw_endpoints.extend(
-        profile
-            .direct_endpoints
-            .iter()
-            .cloned()
-            .map(|ep| (ep, true)),
-    );
+    raw_endpoints.extend(profile.direct_endpoints.iter().cloned());
 
-    // Deduplicate while preserving order and promoting configured flag if present in profile
-    let mut endpoints: Vec<(String, bool)> = Vec::with_capacity(raw_endpoints.len());
-    for (ep, configured) in raw_endpoints {
-        if let Some(existing) = endpoints.iter_mut().find(|(e, _)| *e == ep) {
-            existing.1 |= configured;
-        } else {
-            endpoints.push((ep, configured));
+    // Deduplicate while preserving order
+    let mut endpoints: Vec<String> = Vec::with_capacity(raw_endpoints.len());
+    for ep in raw_endpoints {
+        if !endpoints.contains(&ep) {
+            endpoints.push(ep);
         }
     }
     if !has_custom {
-        endpoints.sort_by_key(|(ep, _)| endpoint_priority_tier(ep));
+        endpoints.sort_by_key(|ep| endpoint_priority_tier(ep));
     }
     if endpoints.is_empty() {
         return Err(ClientCoreError::Unreachable);
@@ -713,37 +808,43 @@ async fn try_connect_direct_endpoints(
 
     // Happy-Eyeballs concurrent racing (60ms stagger) so dead TUN/VM adapters never block LAN Wi-Fi
     let mut set = tokio::task::JoinSet::new();
-    for (idx, (ep, configured)) in endpoints.into_iter().enumerate() {
+    for (idx, ep) in endpoints.into_iter().enumerate() {
         let host_id = profile.host_id.clone();
+        let pairing_secret = profile.pairing_secret.clone();
         let rep = replica.clone();
         let stagger_ms = (idx as u64) * 60;
         set.spawn(async move {
             if stagger_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
             }
-            let res = tokio::time::timeout(
+            tokio::time::timeout(
                 Duration::from_millis(1500),
-                connect_direct_with_host_id(&host_id, &ep, rep, None),
+                connect_direct_with_host_id(&host_id, &ep, &pairing_secret, rep, None),
             )
-            .await;
-            (configured, res)
+            .await
         });
     }
 
     let mut mismatch_err = None;
+    let mut auth_err = None;
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok((_, Ok(Ok(handle)))) => {
+            Ok(Ok(Ok(handle))) => {
                 set.abort_all();
                 return Ok(handle);
             }
-            Ok((true, Ok(Err(e @ ClientCoreError::HostIdentityMismatch { .. })))) => {
+            Ok(Ok(Err(e @ ClientCoreError::HostIdentityMismatch { .. }))) => {
                 mismatch_err = Some(e);
+            }
+            Ok(Ok(Err(e))) if e.is_auth_error() => {
+                auth_err = Some(e);
             }
             _ => {}
         }
     }
-    Err(mismatch_err.unwrap_or(ClientCoreError::Unreachable))
+    Err(mismatch_err
+        .or(auth_err)
+        .unwrap_or(ClientCoreError::Unreachable))
 }
 
 /// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`):
@@ -769,6 +870,7 @@ pub async fn connect_smart(
                     &profile.host_id,
                     relay_url,
                     &profile.daemon_pubkey_b64,
+                    &profile.pairing_secret,
                     replica,
                 )
                 .await
@@ -780,37 +882,66 @@ pub async fn connect_smart(
         }
         HostRouteMode::Auto => {
             let mut last_ssh_err = None;
+            let mut auth_err = None;
+            let mut mismatch_err = None;
             if has_ssh && !has_custom_direct_endpoint(profile) {
                 match try_connect_ssh_tunnel(profile, replica.clone()).await {
                     Ok(h) => return Ok(h),
+                    Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
+                        mismatch_err = Some(e);
+                    }
+                    Err(e) if e.is_auth_error() => auth_err = Some(e),
                     Err(e) => last_ssh_err = Some(e),
                 }
-                if let Ok(h) = try_connect_direct_endpoints(profile, replica.clone()).await {
-                    return Ok(h);
+                match try_connect_direct_endpoints(profile, replica.clone()).await {
+                    Ok(h) => return Ok(h),
+                    Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
+                        mismatch_err = Some(e);
+                    }
+                    Err(e) if e.is_auth_error() => auth_err = Some(e),
+                    Err(_) => {}
                 }
             } else {
-                if let Ok(h) = try_connect_direct_endpoints(profile, replica.clone()).await {
-                    return Ok(h);
+                match try_connect_direct_endpoints(profile, replica.clone()).await {
+                    Ok(h) => return Ok(h),
+                    Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
+                        mismatch_err = Some(e);
+                    }
+                    Err(e) if e.is_auth_error() => auth_err = Some(e),
+                    Err(_) => {}
                 }
                 if has_ssh {
                     match try_connect_ssh_tunnel(profile, replica.clone()).await {
                         Ok(h) => return Ok(h),
+                        Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
+                            mismatch_err = Some(e);
+                        }
+                        Err(e) if e.is_auth_error() => auth_err = Some(e),
                         Err(e) => last_ssh_err = Some(e),
                     }
                 }
             }
 
             if let Some(ref relay_url) = profile.relay_url {
-                return connect_via_relay_with_host_id(
+                match connect_via_relay_with_host_id(
                     &profile.host_id,
                     relay_url,
                     &profile.daemon_pubkey_b64,
+                    &profile.pairing_secret,
                     replica,
                 )
-                .await;
+                .await
+                {
+                    Ok(h) => return Ok(h),
+                    Err(e) if e.is_auth_error() => return Err(e),
+                    Err(e) => return Err(mismatch_err.or(auth_err).unwrap_or(e)),
+                }
             }
 
-            Err(last_ssh_err.unwrap_or(ClientCoreError::Unreachable))
+            Err(mismatch_err
+                .or(auth_err)
+                .or(last_ssh_err)
+                .unwrap_or(ClientCoreError::Unreachable))
         }
     }
 }
@@ -961,6 +1092,8 @@ impl MultiHostFleet {
             daemon_pubkey_b64: offer.daemon_pubkey_b64,
             direct_endpoints: offer.direct_endpoints,
             relay_url: offer.relay_url,
+            pairing_secret: offer.pairing_secret,
+            pairing_secret_updated_at_ms: unix_ms_now() as i64,
             state: HostConnectionState::Disconnected,
         };
         self.hosts
@@ -1008,5 +1141,123 @@ impl MultiHostFleet {
 
     pub fn replica_store(&self) -> &Arc<OrbitStore> {
         &self.replica_store
+    }
+}
+
+#[cfg(test)]
+mod direct_auth_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn connect_smart_never_probes_unconfigured_speculative_loopback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind decoy listener");
+        let addr = listener.local_addr().expect("addr");
+        let saw_any_request = Arc::new(AtomicBool::new(false));
+        let saw_bg = Arc::clone(&saw_any_request);
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                saw_bg.store(true, Ordering::SeqCst);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        // Profile points at NO direct endpoints even though `remote_daemon_port` matches our decoy
+        // loopback listener: `connect_smart` MUST NOT speculatively dial `127.0.0.1:<port>` with the bearer token!
+        let profile = SavedHostProfile {
+            host_id: "host_expected_real".into(),
+            hostname: "real-box".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::DirectOnly,
+            remote_daemon_port: addr.port(),
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk".into(),
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "super-secret-bearer-token-must-never-leak".into(),
+            pairing_secret_updated_at_ms: 1,
+            state: HostConnectionState::Disconnected,
+        };
+
+        let err = connect_smart(&profile, None)
+            .await
+            .err()
+            .expect("empty direct endpoints must fail unreachable");
+        assert!(
+            matches!(err, ClientCoreError::Unreachable),
+            "expected Unreachable, got {err:?}"
+        );
+        assert!(
+            !saw_any_request.load(Ordering::SeqCst),
+            "connect_smart must NEVER speculatively dial unconfigured loopback addresses with bearer credentials"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_via_relay_rejects_empty_secret_before_dialing_and_auto_preserves_auth_error() {
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keygen");
+
+        // 1. Empty/whitespace pairing_secret must fail closed with Unauthorized BEFORE dialing relay
+        for bad_secret in ["", "   ", "bad\nsecret"] {
+            let err = connect_via_relay("ws://127.0.0.1:1", &kp.public_key_b64, bad_secret, None)
+                .await
+                .err()
+                .expect("empty/invalid secret must fail");
+            assert!(
+                matches!(err, ClientCoreError::Unauthorized(_)) && err.is_auth_error(),
+                "expected Unauthorized auth error for {bad_secret:?}, got {err:?}"
+            );
+        }
+
+        // 2. Auto mode preserves Direct WS 401 auth error instead of swallowing it as Unreachable
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let profile = SavedHostProfile {
+            host_id: kp.host_id().expect("host_id"),
+            hostname: "auto-auth-box".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: addr.port(),
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: vec![format!("ws://{addr}/ws")],
+            relay_url: None,
+            pairing_secret: "wrong-secret".into(),
+            pairing_secret_updated_at_ms: 1,
+            state: HostConnectionState::Disconnected,
+        };
+
+        let err = connect_smart(&profile, None)
+            .await
+            .err()
+            .expect("Auto mode must surface direct 401 auth rejection");
+        assert!(
+            err.is_auth_error(),
+            "Auto mode must preserve auth error rather than returning Unreachable, got {err:?}"
+        );
+        server.abort();
     }
 }

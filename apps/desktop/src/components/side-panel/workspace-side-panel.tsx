@@ -27,6 +27,8 @@ import { TerminalTab } from "@/components/side-panel/terminal-tab";
 import { WorkspaceBoardTab } from "@/components/side-panel/workspace-board-tab";
 import { SidePanelLaunchpad } from "@/components/side-panel/side-panel-launchpad";
 import { SimpleTooltip } from "@/components/ui/overlays";
+import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
+import { type MessageKey, useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type SidePanelTab,
@@ -64,6 +66,28 @@ function SidePanelTabIcon({ tab }: { tab: SidePanelTab }) {
   }
 }
 
+function resolveSidePanelTabTitle(
+  tab: SidePanelTab,
+  t: (key: MessageKey) => string,
+): string {
+  switch (tab.kind) {
+    case "review":
+      return tab.title === "Review" ? t("sidePanel.actionReview") : tab.title;
+    case "files":
+      return tab.title === "Files" ? t("composer.files") : tab.title;
+    case "artifacts":
+      return tab.title === "Artifacts" ? t("sidePanel.actionArtifacts") : tab.title;
+    case "terminal":
+      return tab.title === "Terminal" ? t("sidePanel.actionTerminal") : tab.title;
+    case "browser":
+      return tab.title === "Browser" ? t("sidePanel.actionBrowser") : tab.title;
+    case "side_question":
+      return tab.title === "Side Question" ? t("sidePanel.actionSideQuestion") : tab.title;
+    default:
+      return tab.title;
+  }
+}
+
 export function WorkspaceSidePanel() {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const hasTerminalTab = useOrbitSelector((s) =>
@@ -88,6 +112,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   selectedHostId: string;
   shouldRenderBody: boolean;
 }) {
+  const { t } = useI18n();
   const {
     shouldRightOpen: shouldOpen,
     panelWidthCss,
@@ -216,6 +241,8 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   return (
     <aside
       ref={panelElRef}
+      tabIndex={-1}
+      data-orbit-side-panel="true"
       inert={!shouldOpen}
       data-open={shouldOpen ? "true" : "false"}
       data-animating={isAnimating ? "true" : "false"}
@@ -228,7 +255,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         visibility: panelVisible ? "visible" : "hidden",
       }}
       className={cn(
-        "orbit-panel-right border-border bg-canvas absolute inset-y-0 right-0 z-20 flex h-full shrink-0 flex-col overflow-hidden border-l [contain:layout_style] select-none",
+        "orbit-panel-right border-border bg-canvas absolute inset-y-0 right-0 z-20 flex h-full shrink-0 flex-col overflow-hidden border-l outline-none [contain:layout_style] select-none",
         !shouldOpen && "pointer-events-none",
       )}
     >
@@ -237,7 +264,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         <div
           role="separator"
           aria-orientation="vertical"
-          aria-label="Resize side panel (double-click to split evenly)"
+          aria-label={t("sidePanel.resizeAria")}
           onMouseDown={startResize}
           onDoubleClick={handleEqualizeSidePanel}
           className="group/sash absolute top-0 left-0 z-20 flex h-full w-[6px] cursor-col-resize justify-start"
@@ -279,12 +306,13 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                 (tab.kind === "side_question" && hasStreamingSideQuestion) ||
                 (tab.kind === "terminal" && activeTerminalCount > 0 && !isActive);
 
+              const displayTitle = resolveSidePanelTabTitle(tab, t);
               return (
                 <div
                   key={tab.id}
                   role="tab"
                   aria-selected={isActive}
-                  title={tab.filePath || tab.url || tab.title}
+                  title={tab.filePath || tab.url || displayTitle}
                   onClick={() => orbitActions.focusSidePanelTab(tab.id)}
                   onMouseDown={(e) => {
                     if (e.button === 1) {
@@ -300,10 +328,10 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                   )}
                 >
                   <SidePanelTabIcon tab={tab} />
-                  <span className="truncate">{tab.title}</span>
+                  <span className="truncate">{displayTitle}</span>
                   {isDirtyFile && (
                     <span
-                      title="Unsaved changes"
+                      title={t("sidePanel.unsavedChanges")}
                       className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
                     />
                   )}
@@ -324,7 +352,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                   )}
                   <button
                     type="button"
-                    aria-label={`Close ${tab.title}`}
+                    aria-label={t("sidePanel.closeTab", { title: displayTitle })}
                     onMouseDown={(e) => e.stopPropagation()}
                     onClick={(e) => {
                       e.stopPropagation();
@@ -343,10 +371,10 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
               );
             })}
 
-            <SimpleTooltip label="New Tab" shortcut={`${mod}T`}>
+            <SimpleTooltip label={t("sidePanel.newTab")} shortcut={`${mod}T`}>
               <button
                 type="button"
-                aria-label="New Tab"
+                aria-label={t("sidePanel.newTab")}
                 onClick={() => orbitActions.openSidePanelNewTab()}
                 className={cn(
                   "ml-0.5 inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors",
@@ -370,39 +398,93 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
         {/* Persistent WebGL Terminal Pool (mounted whenever terminal tab or live PTY exists) */}
         {(hasTerminalTabInBar || hasAnyPtySession) && (
-          <TerminalTab selectedHostId={selectedHostId} visible={isTerminalVisible} />
+          <PanelErrorBoundary
+            panelName="Terminal"
+            resetKey={selectedHostId}
+            className={!isTerminalVisible ? "hidden" : undefined}
+          >
+            <TerminalTab selectedHostId={selectedHostId} visible={isTerminalVisible} />
+          </PanelErrorBoundary>
         )}
 
         {/* Persistent Browser Preview Pool (kept alive across Side Panel tab switches) */}
         {tabs
           .filter((t) => t.kind === "browser")
-          .map((browserTab) => (
-            <BrowserTab
-              key={browserTab.id}
-              tab={browserTab}
-              visible={panelVisible && activeTab?.id === browserTab.id}
-            />
-          ))}
+          .map((browserTab) => {
+            const browserVisible = panelVisible && activeTab?.id === browserTab.id;
+            return (
+              <PanelErrorBoundary
+                key={browserTab.id}
+                panelName="Browser"
+                resetKey={browserTab.url ?? ""}
+                className={!browserVisible ? "hidden" : undefined}
+              >
+                <BrowserTab tab={browserTab} visible={browserVisible} />
+              </PanelErrorBoundary>
+            );
+          })}
 
-        {activeTab?.kind === "review" && <ReviewTab selectedHostId={selectedHostId} />}
-        {activeTab?.kind === "files" && <FilesExplorerTab />}
-        {activeTab?.kind === "file" && <FileViewerTab key={activeTab.id} tab={activeTab} />}
-        {activeTab?.kind === "side_question" && <SideQuestionTab />}
-        {activeTab?.kind === "subagent" && <SubagentTab key={activeTab.id} tab={activeTab} />}
-        {activeTab?.kind === "board" && (
-          <WorkspaceBoardTab key={activeTab.id} tab={activeTab} />
+        {activeTab?.kind === "review" && (
+          <PanelErrorBoundary
+            panelName="Review"
+            resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+          >
+            <ReviewTab selectedHostId={selectedHostId} />
+          </PanelErrorBoundary>
         )}
-        {activeTab?.kind === "peer" && <PeerSplitTab key={activeTab.id} tab={activeTab} />}
+        {activeTab?.kind === "files" && (
+          <PanelErrorBoundary
+            panelName="Files"
+            resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+          >
+            <FilesExplorerTab />
+          </PanelErrorBoundary>
+        )}
+        {activeTab?.kind === "file" && (
+          <PanelErrorBoundary
+            key={`${activeTab.id}:${activeTab.filePath ?? ""}`}
+            panelName="File Viewer"
+          >
+            <FileViewerTab tab={activeTab} />
+          </PanelErrorBoundary>
+        )}
+        {activeTab?.kind === "side_question" && (
+          <PanelErrorBoundary
+            panelName="Side Question"
+            resetKey={`${selectedHostId}:${activeTab.id}`}
+          >
+            <SideQuestionTab />
+          </PanelErrorBoundary>
+        )}
+        {activeTab?.kind === "subagent" && (
+          <PanelErrorBoundary key={activeTab.id} panelName="Subagent">
+            <SubagentTab tab={activeTab} />
+          </PanelErrorBoundary>
+        )}
+        {activeTab?.kind === "board" && (
+          <PanelErrorBoundary key={activeTab.id} panelName="Workspace Notes">
+            <WorkspaceBoardTab tab={activeTab} />
+          </PanelErrorBoundary>
+        )}
+        {activeTab?.kind === "peer" && (
+          <PanelErrorBoundary key={activeTab.id} panelName="Peer Split">
+            <PeerSplitTab tab={activeTab} />
+          </PanelErrorBoundary>
+        )}
         {activeTab?.kind === "artifacts" && (
-          <ArtifactsTab key={activeTab.id} tab={activeTab} />
+          <PanelErrorBoundary key={activeTab.id} panelName="Artifacts">
+            <ArtifactsTab tab={activeTab} />
+          </PanelErrorBoundary>
         )}
 
         {!activeTab && (
-          <SidePanelLaunchpad
-            selectedHostId={selectedHostId}
-            isPanelOpen={shouldOpen}
-            isPanelSettled={isSettledOpen}
-          />
+          <PanelErrorBoundary panelName="Side Panel" resetKey={selectedHostId}>
+            <SidePanelLaunchpad
+              selectedHostId={selectedHostId}
+              isPanelOpen={shouldOpen}
+              isPanelSettled={isSettledOpen}
+            />
+          </PanelErrorBoundary>
         )}
       </div>
           </>

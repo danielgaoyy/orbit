@@ -995,6 +995,7 @@ export interface TerminalScreenDto {
   rows: number;
   cursor_row: number;
   cursor_col: number;
+  cursor_visible?: boolean;
   rows_data: TerminalRowDto[];
 }
 

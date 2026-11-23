@@ -4,7 +4,7 @@
 //! supervises detached Shims, serves direct WebSocket clients, exposes the built-in Streamable
 //! HTTP MCP orchestration server (`/mcp/agents`), runs the Cron/Heartbeat scheduler, maintains
 //! Daemon-to-Daemon Connected Host links, and optionally registers outbound to Relay with full
-//! `Noise_NK_25519_ChaChaPoly_SHA256` end-to-end encryption.
+//! `Noise_NKpsk0_25519_ChaChaPoly_SHA256` mutually authenticated end-to-end encryption.
 
 pub mod artifacts;
 pub mod attachments;
@@ -58,14 +58,18 @@ use axum::{
     body::Body,
     extract::{
         DefaultBodyLimit, State,
-        ws::{Message as AxumWsMsg, WebSocket, WebSocketUpgrade},
+        ws::{
+            Message as AxumWsMsg, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection,
+        },
     },
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
-use orbit_crypto::{DaemonHandshake, HostIdentityKeypair, PairingOffer};
+use orbit_crypto::{
+    DaemonHandshake, HostIdentityKeypair, PairingOffer, RelayPopResponder, SecureChannel,
+};
 use orbit_protocol::{
     AgentMessageKind, HostInfo, OrchestrationConfig, PROTOCOL_VERSION, ProviderModelCatalog,
     ScheduleStatus, TerminalBinaryFrame, WireMessage,
@@ -74,12 +78,15 @@ use orbit_providers::{
     SideQuestionSpec, catalogs_to_model_map, discover_installed_providers,
     probe_all_provider_models, probe_all_provider_quotas, run_side_question,
 };
-use orbit_relay_transport::{RelayConnector, is_ssh_relay_url, redact_relay_url};
+use orbit_relay_transport::{MAX_RELAY_CONTROL_WS_FRAME_BYTES, RelayConnector, redact_relay_url};
 use orbit_store::{OrbitStore, ReceiptOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
-use tokio_tungstenite::tungstenite::Message as TungMsg;
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
+use tokio_tungstenite::tungstenite::{
+    Message as TungMsg,
+    protocol::{CloseFrame as TungCloseFrame, frame::coding::CloseCode as TungCloseCode},
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -124,12 +131,214 @@ const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
 const E2EE_FRAME_WIRE: u8 = 0x00;
 const E2EE_FRAME_TERMINAL: u8 = 0x01;
 
+/// Filename inside `$ORBIT_HOME` storing the host's persisted 256-bit WS pairing secret (`0600`).
+pub const PAIRING_SECRET_FILENAME: &str = "pairing-secret";
+const MIN_PAIRING_SECRET_LEN: usize = 32;
+
+/// Explicit browser/webview origins allowed to connect to local daemon `/ws` and `/mcp/agents`
+/// (native Rust/CLI/mobile clients omit `Origin` and are allowed; any other `Origin` is rejected
+/// with `403 Forbidden` to prevent Cross-Site WebSocket Hijacking / CSRF).
+const ALLOWED_WEB_ORIGINS: &[&str] = &[
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+];
+
+fn is_valid_pairing_secret(raw: &str) -> bool {
+    raw.len() >= MIN_PAIRING_SECRET_LEN
+        && !raw
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+}
+
+pub const DAEMON_ADDR_FILENAME: &str = "daemon.addr";
+
+#[cfg(unix)]
+fn enforce_unix_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+fn write_temp_secret_file_0600(home_dir: &Path, secret: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    std::fs::create_dir_all(home_dir)?;
+    #[cfg(unix)]
+    enforce_unix_permissions(home_dir, 0o700)?;
+    let tmp_path = home_dir.join(format!(
+        ".{PAIRING_SECRET_FILENAME}.tmp.{}",
+        Uuid::new_v4().simple()
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path)?;
+    if let Err(err) = file
+        .write_all(secret.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    drop(file);
+    #[cfg(unix)]
+    if let Err(err) = enforce_unix_permissions(&tmp_path, 0o600) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(tmp_path)
+}
+
+fn read_pairing_secret_strict(home_dir: &Path) -> anyhow::Result<String> {
+    let secret_path = home_dir.join(PAIRING_SECRET_FILENAME);
+    let raw = std::fs::read_to_string(&secret_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read persisted pairing secret at {}: {e}",
+            secret_path.display()
+        )
+    })?;
+    let trimmed = raw.trim();
+    if is_valid_pairing_secret(trimmed) {
+        Ok(trimmed.to_string())
+    } else {
+        anyhow::bail!(
+            "persisted pairing secret at {} is malformed (fail-closed)",
+            secret_path.display()
+        )
+    }
+}
+
+/// Read the persisted pairing secret from `$ORBIT_HOME/pairing-secret` without creating it.
+pub fn read_pairing_secret(home_dir: &Path) -> Option<String> {
+    let secret_path = home_dir.join(PAIRING_SECRET_FILENAME);
+    if !secret_path.is_file() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&secret_path).ok()?;
+    let trimmed = raw.trim();
+    if is_valid_pairing_secret(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Load or atomically initialize the 256-bit host pairing secret (`$ORBIT_HOME/pairing-secret`, mode `0600`).
+///
+/// Always writes the complete secret to a `0600` temp file (`create_new` + `write_all` + `sync_all`)
+/// and publishes atomically via `hard_link` so concurrent first-time boots converge on a single
+/// secret with zero partial-write or world-readable window. Fails closed on corrupt/unreadable
+/// files or permission-hardening failures.
+pub fn load_or_create_pairing_secret(home_dir: &Path) -> anyhow::Result<String> {
+    let secret_path = home_dir.join(PAIRING_SECRET_FILENAME);
+    if secret_path.exists() {
+        let existing = read_pairing_secret_strict(home_dir)?;
+        #[cfg(unix)]
+        {
+            enforce_unix_permissions(home_dir, 0o700)?;
+            enforce_unix_permissions(&secret_path, 0o600)?;
+        }
+        return Ok(existing);
+    }
+
+    let generated = orbit_crypto::generate_pairing_secret();
+    let tmp_path = write_temp_secret_file_0600(home_dir, &generated)?;
+    let link_res = std::fs::hard_link(&tmp_path, &secret_path);
+    let _ = std::fs::remove_file(&tmp_path);
+    match link_res {
+        Ok(()) => Ok(generated),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            #[cfg(unix)]
+            enforce_unix_permissions(&secret_path, 0o600)?;
+            read_pairing_secret_strict(home_dir)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Generate a fresh 32-byte CSPRNG URL-safe base64 pairing secret and atomically replace
+/// `$ORBIT_HOME/pairing-secret` (`0600`) via temp-file + rename (never truncating in place).
+pub fn rotate_pairing_secret(home_dir: &Path) -> anyhow::Result<String> {
+    let generated = orbit_crypto::generate_pairing_secret();
+    let tmp_path = write_temp_secret_file_0600(home_dir, &generated)?;
+    let target = home_dir.join(PAIRING_SECRET_FILENAME);
+    if let Err(err) = std::fs::rename(&tmp_path, &target) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(generated)
+}
+
+/// Enforce anti-CSWSH `Origin` validation:
+/// - Missing `Origin` header -> allowed (native Rust/CLI/mobile clients).
+/// - Explicit Tauri/dev `Origin` in [`ALLOWED_WEB_ORIGINS`] -> allowed.
+/// - Multiple `Origin` headers or any other `Origin` -> `403 Forbidden`.
+pub(crate) fn validate_request_origin(headers: &HeaderMap) -> Result<(), StatusCode> {
+    let mut origins = headers.get_all(axum::http::header::ORIGIN).iter();
+    let Some(first) = origins.next() else {
+        return Ok(());
+    };
+    if origins.next().is_some() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let Ok(raw) = first.to_str() else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    let origin = raw.trim();
+    if ALLOWED_WEB_ORIGINS
+        .iter()
+        .any(|allowed| origin.eq_ignore_ascii_case(allowed))
+    {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+/// Validate `Authorization: Bearer <token>` in constant time (fail-closed on empty secret or duplicate headers).
+pub(crate) fn verify_bearer_token(headers: &HeaderMap, expected_secret: &str) -> bool {
+    if expected_secret.is_empty() {
+        return false;
+    }
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let Some(first) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(raw) = first.to_str() else {
+        return false;
+    };
+    let Some((scheme, rest)) = raw.trim().split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    let provided = rest.trim();
+    if provided.is_empty() {
+        return false;
+    }
+    orbit_crypto::constant_time_eq(expected_secret.as_bytes(), provided.as_bytes())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonPersistedConfig {
     pub listen_addr: Option<SocketAddr>,
     pub relay_url: Option<String>,
     #[serde(default)]
     pub orchestration: OrchestrationConfig,
+}
+
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    orbit_shim::ensure_private_dir(dir)
 }
 
 impl DaemonPersistedConfig {
@@ -141,7 +350,7 @@ impl DaemonPersistedConfig {
     }
 
     pub fn save(&self, home_dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(home_dir)?;
+        ensure_private_dir(home_dir)?;
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         let config_path = home_dir.join("config.json");
         std::fs::write(&config_path, raw)?;
@@ -231,6 +440,8 @@ pub struct DaemonRuntime {
     pub orchestrator: Arc<AgentOrchestrator>,
     pub attachments: Arc<AttachmentStagingManager>,
     pub home_dir: PathBuf,
+    pub pairing_secret: String,
+    pub pairing_secret_rotated_tx: broadcast::Sender<()>,
     pub mcp_token: String,
     pub listen_port: Arc<RwLock<u16>>,
     pub orch_config: Arc<RwLock<OrchestrationConfig>>,
@@ -262,28 +473,28 @@ impl DaemonRuntime {
     /// and tests). Call [`DaemonRuntime::activate_server`] after binding the TCP listener to start
     /// shim recovery, connected hosts, finish subscriptions, scheduler, and idle cleanup.
     pub async fn bootstrap(home_dir: &Path) -> anyhow::Result<Arc<Self>> {
-        std::fs::create_dir_all(home_dir)?;
-        std::fs::create_dir_all(home_dir.join("shims"))?;
+        ensure_private_dir(home_dir)?;
+        ensure_private_dir(&home_dir.join("shims"))?;
+        ensure_private_dir(&home_dir.join("runtime"))?;
         orbit_providers::set_snapshot_orbit_home(home_dir);
 
         let keypair_path = home_dir.join("host-keypair.json");
         let keypair = if keypair_path.exists() {
             let raw = std::fs::read_to_string(&keypair_path)?;
+            #[cfg(unix)]
+            enforce_unix_permissions(&keypair_path, 0o600)?;
             serde_json::from_str::<HostIdentityKeypair>(&raw)?
         } else {
             let generated = HostIdentityKeypair::generate()?;
             let raw = serde_json::to_string_pretty(&generated)?;
             std::fs::write(&keypair_path, raw)?;
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&keypair_path, std::fs::Permissions::from_mode(0o600));
-            }
+            enforce_unix_permissions(&keypair_path, 0o600)?;
             generated
         };
 
         let persisted = DaemonPersistedConfig::load(home_dir);
+        let pairing_secret = load_or_create_pairing_secret(home_dir)?;
         let mcp_token = crate::mcp::load_or_create_mcp_token(home_dir)?;
         let listen_port = Arc::new(RwLock::new(
             persisted.listen_addr.map(|a| a.port()).unwrap_or(0),
@@ -413,6 +624,8 @@ impl DaemonRuntime {
             available_providers,
         };
 
+        let (pairing_secret_rotated_tx, _) = broadcast::channel(16);
+
         Ok(Arc::new(Self {
             host_info,
             keypair,
@@ -420,6 +633,8 @@ impl DaemonRuntime {
             orchestrator,
             attachments,
             home_dir: home_dir.to_path_buf(),
+            pairing_secret,
+            pairing_secret_rotated_tx,
             mcp_token,
             listen_port,
             orch_config,
@@ -449,10 +664,10 @@ impl DaemonRuntime {
         }))
     }
 
-    /// Record the active bound TCP port and activate all background orchestration loops.
-    pub async fn activate_server(self: &Arc<Self>, bound_port: u16) {
-        *self.listen_port.write().await = bound_port;
-        write_live_port_file(&self.home_dir, bound_port);
+    /// Record the active bound TCP socket address and activate all background orchestration loops.
+    pub async fn activate_server(self: &Arc<Self>, bound_addr: SocketAddr) {
+        *self.listen_port.write().await = bound_addr.port();
+        write_live_addr_files(&self.home_dir, bound_addr);
 
         // 1. Reattach surviving shims now that the MCP server port is known
         self.orchestrator.activate_runtime().await;
@@ -519,34 +734,62 @@ impl DaemonRuntime {
         probed
     }
 
+    /// Read the currently active persisted pairing secret from `$ORBIT_HOME/pairing-secret`.
+    /// Fails closed (`None`) if the file is missing, unreadable, or malformed so a deleted or
+    /// rotated secret can never fall back to a stale in-memory bootstrap value.
+    pub fn active_pairing_secret(&self) -> Option<String> {
+        read_pairing_secret(&self.home_dir)
+    }
+
+    /// Atomically rotate `$ORBIT_HOME/pairing-secret` and immediately notify active client sessions
+    /// (direct `/ws` and Relay E2EE) to terminate if their authenticated secret is no longer current.
+    pub fn rotate_pairing_secret(&self) -> anyhow::Result<String> {
+        let rotated = rotate_pairing_secret(&self.home_dir)?;
+        let _ = self.pairing_secret_rotated_tx.send(());
+        Ok(rotated)
+    }
+
     pub fn build_pairing_offer(
         &self,
         direct_endpoints: Vec<String>,
         relay_url: Option<String>,
-    ) -> PairingOffer {
-        PairingOffer {
+    ) -> anyhow::Result<PairingOffer> {
+        let pairing_secret = read_pairing_secret_strict(&self.home_dir)?;
+        Ok(PairingOffer {
             host_id: self.host_info.host_id.clone(),
             hostname: self.host_info.hostname.clone(),
             daemon_pubkey_b64: self.keypair.public_key_b64.clone(),
             direct_endpoints,
             relay_url,
-            pairing_secret: uuid::Uuid::new_v4().to_string(),
-        }
+            pairing_secret,
+        })
     }
 }
 
-fn write_live_port_file(home_dir: &Path, port: u16) {
+fn write_live_addr_files(home_dir: &Path, bound_addr: SocketAddr) {
+    let addr_file = home_dir.join(DAEMON_ADDR_FILENAME);
+    let _ = std::fs::write(&addr_file, format!("{bound_addr}\n"));
     let port_file = home_dir.join("daemon-port");
-    let _ = std::fs::write(&port_file, format!("{port}\n"));
+    let _ = std::fs::write(&port_file, format!("{}\n", bound_addr.port()));
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&port_file, std::fs::Permissions::from_mode(0o600));
+        let _ = enforce_unix_permissions(&addr_file, 0o600);
+        let _ = enforce_unix_permissions(&port_file, 0o600);
     }
 }
 
-/// Read the active local Daemon port (prefers `$ORBIT_HOME/daemon-port`, falling back to `config.json` or `6868`).
+/// Read the active bound local Daemon `SocketAddr` from `$ORBIT_HOME/daemon.addr`.
+pub fn read_live_daemon_addr(home_dir: &Path) -> Option<SocketAddr> {
+    let raw = std::fs::read_to_string(home_dir.join(DAEMON_ADDR_FILENAME)).ok()?;
+    let addr = raw.trim().parse::<SocketAddr>().ok()?;
+    (addr.port() > 0).then_some(addr)
+}
+
+/// Read the active local Daemon port (prefers `$ORBIT_HOME/daemon.addr`, then `daemon-port`, `config.json`, or `6868`).
 pub fn read_live_daemon_port(home_dir: &Path) -> u16 {
+    if let Some(addr) = read_live_daemon_addr(home_dir) {
+        return addr.port();
+    }
     if let Ok(raw) = std::fs::read_to_string(home_dir.join("daemon-port"))
         && let Ok(port) = raw.trim().parse::<u16>()
         && port > 0
@@ -665,14 +908,8 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
     let bound_addr = listener.local_addr()?;
-    runtime.activate_server(bound_addr.port()).await;
+    runtime.activate_server(bound_addr).await;
 
-    let direct_eps = if bound_addr.ip().is_unspecified() {
-        discover_lan_ws_endpoints(bound_addr.port())
-    } else {
-        vec![format!("ws://{bound_addr}/ws")]
-    };
-    let offer = runtime.build_pairing_offer(direct_eps, effective_relay.clone());
     let redacted_relay = effective_relay.as_deref().map(redact_relay_url);
 
     info!(
@@ -684,11 +921,10 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         relay = ?redacted_relay,
         "Orbit Daemon ready"
     );
-    if effective_relay.as_deref().is_some_and(is_ssh_relay_url) {
-        info!("Run 'orbit pair' to print Multi-Host pairing URI");
-    } else if let Ok(uri) = offer.to_qr_uri() {
-        info!(pairing_uri = %uri, "Scan or import this Multi-Host pairing URI on Orbit Mobile");
-    }
+    info!(
+        host_id = %runtime.host_info.host_id,
+        "Run `orbit pair` to print this host's Multi-Host pairing URI"
+    );
 
     if let Some(relay_url) = effective_relay {
         let rt_relay = runtime.clone();
@@ -756,7 +992,7 @@ pub async fn spawn_embedded_daemon(
     let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    runtime.activate_server(addr.port()).await;
+    runtime.activate_server(addr).await;
 
     if let Some(r_url) = relay_url {
         let rt_relay = runtime.clone();
@@ -783,47 +1019,196 @@ async fn healthz_handler(State(runtime): State<Arc<DaemonRuntime>>) -> impl Into
 
 // --- Outbound Relay Control & Noise NK E2EE Tunnel Spawner ---
 
+const RELAY_CONTROL_POP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn describe_tung_frame(msg: &TungMsg) -> (&'static str, usize) {
+    match msg {
+        TungMsg::Text(t) => ("text", t.len()),
+        TungMsg::Binary(b) => ("binary", b.len()),
+        TungMsg::Ping(p) => ("ping", p.len()),
+        TungMsg::Pong(p) => ("pong", p.len()),
+        TungMsg::Close(frame) => ("close", frame.as_ref().map_or(0, |f| f.reason.len())),
+        TungMsg::Frame(_) => ("frame", 0),
+    }
+}
+
+async fn complete_relay_control_pop<S, R>(
+    sink: &mut S,
+    stream: &mut R,
+    priv_bytes: &[u8; 32],
+) -> anyhow::Result<SecureChannel>
+where
+    S: futures_util::Sink<TungMsg, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    R: futures_util::Stream<Item = Result<TungMsg, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let msg1 = tokio::time::timeout(RELAY_CONTROL_POP_TIMEOUT, async {
+        while let Some(item) = stream.next().await {
+            match item? {
+                TungMsg::Binary(b) => return Ok::<_, anyhow::Error>(b),
+                TungMsg::Ping(p) => {
+                    sink.send(TungMsg::Pong(p)).await?;
+                }
+                TungMsg::Pong(_) => {}
+                TungMsg::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    anyhow::bail!(
+                        "relay closed control socket before PoP challenge (code={code:?})"
+                    );
+                }
+                other => {
+                    let (kind, bytes) = describe_tung_frame(&other);
+                    anyhow::bail!(
+                        "unexpected relay control frame before PoP challenge (kind={kind}, bytes={bytes})"
+                    );
+                }
+            }
+        }
+        anyhow::bail!("relay control stream closed before PoP challenge")
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for relay PoP challenge"))??;
+
+    let (mut control_chan, msg2) = RelayPopResponder::accept(priv_bytes, &msg1)?;
+    tokio::time::timeout(
+        RELAY_CONTROL_POP_TIMEOUT,
+        sink.send(TungMsg::Binary(msg2.into())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out sending relay PoP response"))??;
+
+    tokio::time::timeout(RELAY_CONTROL_POP_TIMEOUT, async {
+        while let Some(item) = stream.next().await {
+            match item? {
+                TungMsg::Binary(ct) => {
+                    let plain = control_chan.open_record(&ct)?;
+                    let v: serde_json::Value = serde_json::from_slice(&plain)?;
+                    if v.get("op").and_then(|x| x.as_str()) == Some("registered") {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    anyhow::bail!(
+                        "unexpected decrypted relay control message during PoP ack (bytes={})",
+                        plain.len()
+                    );
+                }
+                TungMsg::Ping(p) => {
+                    sink.send(TungMsg::Pong(p)).await?;
+                }
+                TungMsg::Pong(_) => {}
+                TungMsg::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    anyhow::bail!(
+                        "relay rejected daemon PoP and closed control socket (code={code:?})"
+                    );
+                }
+                other => {
+                    let (kind, bytes) = describe_tung_frame(&other);
+                    anyhow::bail!(
+                        "unexpected relay control frame waiting for PoP confirmation (kind={kind}, bytes={bytes})"
+                    );
+                }
+            }
+        }
+        anyhow::bail!("relay control stream closed before PoP confirmation")
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for relay PoP confirmation"))??;
+
+    Ok(control_chan)
+}
+
 async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
     let display_relay = redact_relay_url(&relay_base);
     let pubkey = runtime.keypair.public_key_b64.clone();
+    let priv_bytes = match runtime.keypair.private_bytes() {
+        Ok(b) => zeroize::Zeroizing::new(b),
+        Err(e) => {
+            warn!(relay = %display_relay, error = %e, "Invalid daemon host private key; cannot register with Relay");
+            return;
+        }
+    };
     let ctrl_path = format!("/v1/daemon/control?pubkey={pubkey}");
 
     loop {
         match RelayConnector::connect(&relay_base).await {
             Ok(connector) => {
                 let connector = Arc::new(connector);
-                match connector.open_ws(&ctrl_path).await {
+                match connector
+                    .open_ws_with_limit(&ctrl_path, MAX_RELAY_CONTROL_WS_FRAME_BYTES)
+                    .await
+                {
                     Ok(ws) => {
-                        info!(relay = %display_relay, "Connected outbound to Orbit Relay");
                         let (mut sink, mut stream) = ws.split();
-                        while let Some(Ok(msg)) = stream.next().await {
-                            match msg {
-                                TungMsg::Text(txt) => {
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
-                                        && v.get("op").and_then(|x| x.as_str())
-                                            == Some("open_tunnel")
-                                        && let Some(tid) =
-                                            v.get("tunnel_id").and_then(|x| x.as_str())
-                                    {
-                                        let rt_tun = runtime.clone();
-                                        let conn_tun = Arc::clone(&connector);
-                                        let tid_owned = tid.to_string();
-                                        tokio::spawn(async move {
-                                            let _ = serve_e2ee_relay_tunnel(
-                                                rt_tun, &conn_tun, &tid_owned,
-                                            )
-                                            .await;
-                                        });
+                        match complete_relay_control_pop(&mut sink, &mut stream, &priv_bytes).await
+                        {
+                            Ok(mut control_chan) => {
+                                info!(
+                                    relay = %display_relay,
+                                    "Authenticated (PoP) and connected outbound to Orbit Relay"
+                                );
+                                while let Some(Ok(msg)) = stream.next().await {
+                                    match msg {
+                                        TungMsg::Binary(ct) => {
+                                            let Ok(plain) = control_chan.open_record(&ct) else {
+                                                warn!(
+                                                    relay = %display_relay,
+                                                    bytes = ct.len(),
+                                                    "Failed to decrypt Relay control frame; reconnecting"
+                                                );
+                                                break;
+                                            };
+                                            if let Ok(v) =
+                                                serde_json::from_slice::<serde_json::Value>(&plain)
+                                                && v.get("op").and_then(|x| x.as_str())
+                                                    == Some("open_tunnel")
+                                                && let Some(tid) =
+                                                    v.get("tunnel_id").and_then(|x| x.as_str())
+                                                && let Some(secret_b64) =
+                                                    v.get("attach_secret").and_then(|x| x.as_str())
+                                                && let Ok(attach_secret) =
+                                                    orbit_crypto::decode_key_32(secret_b64)
+                                            {
+                                                let rt_tun = runtime.clone();
+                                                let conn_tun = Arc::clone(&connector);
+                                                let tid_owned = tid.to_string();
+                                                let secret_owned =
+                                                    zeroize::Zeroizing::new(attach_secret);
+                                                tokio::spawn(async move {
+                                                    let _ = serve_e2ee_relay_tunnel(
+                                                        rt_tun,
+                                                        &conn_tun,
+                                                        &tid_owned,
+                                                        secret_owned,
+                                                    )
+                                                    .await;
+                                                });
+                                            }
+                                        }
+                                        TungMsg::Ping(p) => {
+                                            let _ = sink.send(TungMsg::Pong(p)).await;
+                                        }
+                                        TungMsg::Pong(_) => {}
+                                        TungMsg::Close(_) => break,
+                                        other => {
+                                            let (kind, bytes) = describe_tung_frame(&other);
+                                            warn!(
+                                                relay = %display_relay,
+                                                frame_kind = kind,
+                                                bytes,
+                                                "Ignored unexpected unencrypted Relay control frame"
+                                            );
+                                        }
                                     }
                                 }
-                                TungMsg::Ping(p) => {
-                                    let _ = sink.send(TungMsg::Pong(p)).await;
-                                }
-                                TungMsg::Close(_) => break,
-                                _ => {}
+                                warn!(relay = %display_relay, "Disconnected from Relay, reconnecting in 2s...");
+                            }
+                            Err(e) => {
+                                warn!(
+                                    relay = %display_relay,
+                                    error = %e,
+                                    "Relay control Proof-of-Possession handshake failed, retrying in 2s..."
+                                );
                             }
                         }
-                        warn!(relay = %display_relay, "Disconnected from Relay, reconnecting in 2s...");
                     }
                     Err(e) => {
                         warn!(relay = %display_relay, error = %e, "Relay control stream failed, retrying in 2s...");
@@ -838,10 +1223,107 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
     }
 }
 
+/// Bounded deadline for a Relay E2EE client to prove fresh session key possession by sending
+/// its first authenticated encrypted `WireMessage` after receiving Noise `msg2`.
+const E2EE_FIRST_RECORD_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn close_tung_sink_bounded<S, E>(sink: &mut S, frame: Option<TungCloseFrame>)
+where
+    S: futures_util::Sink<TungMsg, Error = E> + Unpin,
+{
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let _ = sink.send(TungMsg::Close(frame)).await;
+        let _ = sink.close().await;
+    })
+    .await;
+}
+
+/// Wait for the client's first encrypted `WireMessage` under a strict bounded deadline BEFORE
+/// subscribing to daemon broadcasts or spawning session tasks. This blocks untrusted relays from
+/// holding half-open sessions or receiving broadcasts by replaying a captured Noise `msg1`.
+async fn receive_first_e2ee_wire_message<Si, St, E>(
+    chan: &mut SecureChannel,
+    sink: &mut Si,
+    stream: &mut St,
+    timeout: Duration,
+) -> anyhow::Result<WireMessage>
+where
+    Si: futures_util::Sink<TungMsg, Error = E> + Unpin,
+    St: futures_util::Stream<Item = Result<TungMsg, E>> + Unpin,
+    E: Into<anyhow::Error>,
+{
+    let first_wire = tokio::time::timeout(timeout, async {
+        while let Some(item) = stream.next().await {
+            match item.map_err(Into::into)? {
+                TungMsg::Binary(ct) => {
+                    let plain = chan
+                        .open_record(&ct)
+                        .map_err(|_| anyhow::anyhow!("invalid first E2EE transport ciphertext"))?;
+                    if plain.is_empty() || plain[0] != E2EE_FRAME_WIRE {
+                        anyhow::bail!("unexpected first E2EE frame discriminator");
+                    }
+                    let wire = WireMessage::decode_zstd(&plain[1..]).map_err(|err| {
+                        anyhow::anyhow!(
+                            "failed to decode first E2EE wire message: {}",
+                            format_concise_wire_decode_error(&err)
+                        )
+                    })?;
+                    return Ok::<_, anyhow::Error>(wire);
+                }
+                TungMsg::Ping(p) => {
+                    sink.send(TungMsg::Pong(p)).await.map_err(Into::into)?;
+                }
+                TungMsg::Pong(_) => {}
+                TungMsg::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    anyhow::bail!(
+                        "tunnel closed before first authenticated E2EE frame (code={code:?})"
+                    );
+                }
+                other => {
+                    let (kind, bytes) = describe_tung_frame(&other);
+                    anyhow::bail!(
+                        "unexpected frame waiting for first E2EE record (kind={kind}, bytes={bytes})"
+                    );
+                }
+            }
+        }
+        anyhow::bail!("tunnel closed before first authenticated E2EE frame")
+    })
+    .await;
+
+    match first_wire {
+        Ok(Ok(wire)) => Ok(wire),
+        Ok(Err(err)) => {
+            close_tung_sink_bounded(
+                sink,
+                Some(TungCloseFrame {
+                    code: TungCloseCode::Policy,
+                    reason: "unauthorized".into(),
+                }),
+            )
+            .await;
+            Err(err)
+        }
+        Err(_) => {
+            close_tung_sink_bounded(
+                sink,
+                Some(TungCloseFrame {
+                    code: TungCloseCode::Policy,
+                    reason: "handshake timeout".into(),
+                }),
+            )
+            .await;
+            anyhow::bail!("timed out waiting for first authenticated E2EE frame")
+        }
+    }
+}
+
 async fn serve_e2ee_relay_tunnel(
     runtime: Arc<DaemonRuntime>,
     connector: &Arc<RelayConnector>,
     tunnel_id: &str,
+    attach_secret: zeroize::Zeroizing<[u8; 32]>,
 ) -> anyhow::Result<()> {
     let pubkey = &runtime.keypair.public_key_b64;
     let priv_bytes = runtime.keypair.private_bytes()?;
@@ -850,27 +1332,186 @@ async fn serve_e2ee_relay_tunnel(
     let ws = connector.open_ws(&tun_path).await?;
     let (mut sink, mut stream) = ws.split();
 
-    // Receive Noise NK Message 1 from Client
+    // Authenticate /v1/daemon/tunnel: receive 16-byte attach_nonce from Relay and reply with
+    // HMAC-SHA256(attach_secret, attach_nonce || tunnel_id) before bridging client ciphertext.
+    let attach_nonce: [u8; orbit_crypto::TUNNEL_ATTACH_NONCE_LEN] =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(item) = stream.next().await {
+                match item? {
+                    TungMsg::Binary(b) => {
+                        let arr: [u8; orbit_crypto::TUNNEL_ATTACH_NONCE_LEN] =
+                            b.as_ref().try_into().map_err(|_| {
+                                anyhow::anyhow!(
+                                    "invalid relay tunnel attach nonce length (bytes={})",
+                                    b.len()
+                                )
+                            })?;
+                        return Ok::<_, anyhow::Error>(arr);
+                    }
+                    TungMsg::Ping(p) => {
+                        sink.send(TungMsg::Pong(p)).await?;
+                    }
+                    TungMsg::Pong(_) => {}
+                    TungMsg::Close(frame) => {
+                        let code = frame.as_ref().map(|f| u16::from(f.code));
+                        anyhow::bail!("relay closed tunnel before attach nonce (code={code:?})");
+                    }
+                    other => {
+                        let (kind, bytes) = describe_tung_frame(&other);
+                        anyhow::bail!(
+                            "unexpected frame waiting for tunnel attach nonce (kind={kind}, bytes={bytes})"
+                        );
+                    }
+                }
+            }
+            anyhow::bail!("tunnel closed before attach nonce")
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for tunnel attach nonce"))??;
+
+    let attach_mac =
+        orbit_crypto::compute_tunnel_attach_mac(&attach_secret, &attach_nonce, tunnel_id);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sink.send(TungMsg::Binary(attach_mac.to_vec().into())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out sending tunnel attach MAC"))??;
+
+    // Fail closed before accepting client Noise handshake if persisted pairing-secret is unavailable.
+    if runtime.active_pairing_secret().is_none() {
+        warn!(
+            tunnel_id = %tunnel_id,
+            "Rejected Relay E2EE tunnel: persisted pairing-secret is missing or malformed (fail-closed)"
+        );
+        close_tung_sink_bounded(
+            &mut sink,
+            Some(TungCloseFrame {
+                code: TungCloseCode::Policy,
+                reason: "unauthorized".into(),
+            }),
+        )
+        .await;
+        anyhow::bail!("persisted pairing-secret missing or malformed");
+    }
+
+    // Receive Noise NKpsk0 Message 1 from Client
     let msg1 = tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(Ok(m)) = stream.next().await {
-            if let TungMsg::Binary(b) = m {
-                return Some(b);
+        while let Some(item) = stream.next().await {
+            match item? {
+                TungMsg::Binary(b) => return Ok::<_, anyhow::Error>(b),
+                TungMsg::Ping(p) => {
+                    sink.send(TungMsg::Pong(p)).await?;
+                }
+                TungMsg::Pong(_) => {}
+                TungMsg::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    anyhow::bail!("tunnel closed before Noise msg1 (code={code:?})");
+                }
+                other => {
+                    let (kind, bytes) = describe_tung_frame(&other);
+                    anyhow::bail!(
+                        "unexpected frame waiting for Noise msg1 (kind={kind}, bytes={bytes})"
+                    );
+                }
             }
         }
-        None
+        anyhow::bail!("tunnel closed before Noise msg1")
     })
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("tunnel closed before Noise msg1"))?;
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for Noise msg1"))??;
 
-    let (chan, msg2) = DaemonHandshake::accept(&priv_bytes, &msg1)?;
-    sink.send(TungMsg::Binary(msg2.into())).await?;
+    // Re-read the active persisted pairing secret right before authenticating msg1 so rotations
+    // take effect immediately with zero race window.
+    let Some(expected_secret) = runtime.active_pairing_secret() else {
+        warn!(
+            tunnel_id = %tunnel_id,
+            "Rejected Relay E2EE tunnel: persisted pairing-secret is missing or malformed (fail-closed)"
+        );
+        close_tung_sink_bounded(
+            &mut sink,
+            Some(TungCloseFrame {
+                code: TungCloseCode::Policy,
+                reason: "unauthorized".into(),
+            }),
+        )
+        .await;
+        anyhow::bail!("persisted pairing-secret missing or malformed");
+    };
+
+    let (chan, msg2) = match DaemonHandshake::accept(&priv_bytes, &expected_secret, &msg1) {
+        Ok(accepted) => accepted,
+        Err(err) => {
+            warn!(
+                tunnel_id = %tunnel_id,
+                error = %err,
+                "Rejected unauthorized Relay E2EE client handshake"
+            );
+            close_tung_sink_bounded(
+                &mut sink,
+                Some(TungCloseFrame {
+                    code: TungCloseCode::Policy,
+                    reason: "unauthorized".into(),
+                }),
+            )
+            .await;
+            return Err(err.into());
+        }
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sink.send(TungMsg::Binary(msg2.into())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out sending Noise msg2"))??;
+
+    // Require client key confirmation (first valid encrypted WireMessage) under a bounded timeout
+    // BEFORE subscribing to daemon broadcasts or spawning full session tasks.
+    let mut chan = chan;
+    let initial_wire = tokio::select! {
+        biased;
+        () = wait_for_session_revocation(Arc::clone(&runtime), expected_secret.clone()) => {
+            warn!(
+                tunnel_id = %tunnel_id,
+                "Closing Relay E2EE tunnel before first frame: pairing_secret rotated or revoked"
+            );
+            close_tung_sink_bounded(
+                &mut sink,
+                Some(TungCloseFrame {
+                    code: TungCloseCode::Policy,
+                    reason: "unauthorized".into(),
+                }),
+            )
+            .await;
+            anyhow::bail!("pairing_secret rotated before first E2EE frame");
+        }
+        res = receive_first_e2ee_wire_message(
+            &mut chan,
+            &mut sink,
+            &mut stream,
+            E2EE_FIRST_RECORD_TIMEOUT,
+        ) => {
+            match res {
+                Ok(wire) => wire,
+                Err(err) => {
+                    warn!(
+                        tunnel_id = %tunnel_id,
+                        error = %err,
+                        "Rejected Relay E2EE tunnel before session start"
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    };
 
     let shared_chan = Arc::new(tokio::sync::Mutex::new(chan));
     let (in_tx, in_rx) = mpsc::channel::<SessionFrame>(256);
     let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(256);
 
     let chan_writer = shared_chan.clone();
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let plain = match frame {
                 SessionFrame::Wire { msg, .. } => match msg.encode_zstd(3) {
@@ -897,71 +1538,120 @@ async fn serve_e2ee_relay_tunnel(
                 break;
             }
         }
+        let _ = tokio::time::timeout(Duration::from_millis(250), sink.close()).await;
     });
 
     let chan_reader = shared_chan;
-    tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         while let Some(Ok(m)) = stream.next().await {
-            if let TungMsg::Binary(ct) = m {
-                let Ok(plain) = chan_reader.lock().await.open_record(&ct) else {
-                    break;
-                };
-                if plain.is_empty() {
-                    continue;
-                }
-                match plain[0] {
-                    E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
-                        Ok(wire) => {
-                            if in_tx
-                                .send(SessionFrame::Wire {
-                                    msg: wire,
-                                    zstd: true,
-                                })
-                                .await
-                                .is_err()
+            match m {
+                TungMsg::Binary(ct) => {
+                    let Ok(plain) = chan_reader.lock().await.open_record(&ct) else {
+                        break;
+                    };
+                    if plain.is_empty() {
+                        continue;
+                    }
+                    match plain[0] {
+                        E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
+                            Ok(wire) => {
+                                if in_tx
+                                    .send(SessionFrame::Wire {
+                                        msg: wire,
+                                        zstd: true,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                let summary = format_concise_wire_decode_error(&err);
+                                tracing::warn!(error = %summary, bytes = plain.len(), "failed to decode E2EE zstd wire message");
+                            }
+                        },
+                        E2EE_FRAME_TERMINAL => {
+                            if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..])
+                                && in_tx.send(SessionFrame::Terminal(term)).await.is_err()
                             {
                                 break;
                             }
                         }
-                        Err(err) => {
-                            let summary = format_concise_wire_decode_error(&err);
-                            tracing::warn!(error = %summary, bytes = plain.len(), "failed to decode E2EE zstd wire message");
-                        }
-                    },
-                    E2EE_FRAME_TERMINAL => {
-                        if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..])
-                            && in_tx.send(SessionFrame::Terminal(term)).await.is_err()
-                        {
-                            break;
-                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                TungMsg::Close(_) => break,
+                _ => {}
             }
         }
     });
 
-    run_client_session_loop(runtime, in_rx, out_tx).await;
+    let exit_reason =
+        run_supervised_client_session(runtime, in_rx, out_tx, expected_secret, Some(initial_wire))
+            .await;
+    reader_task.abort();
+    match exit_reason {
+        SessionExitReason::Revoked => {
+            // Immediately abort writer_task to discard all queued outbound PTY/wire frames
+            // and drop the tunnel without draining stale buffers.
+            writer_task.abort();
+        }
+        SessionExitReason::Normal => {
+            let writer_abort = writer_task.abort_handle();
+            if tokio::time::timeout(Duration::from_millis(300), writer_task)
+                .await
+                .is_err()
+            {
+                writer_abort.abort();
+            }
+        }
+    }
     Ok(())
 }
 
 // --- Direct Axum WebSocket Handler ---
 
 async fn ws_handler(
-    ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(runtime): State<Arc<DaemonRuntime>>,
-) -> impl IntoResponse {
-    ws.max_frame_size(orbit_protocol::MAX_WS_FRAME_BYTES)
-        .max_message_size(orbit_protocol::MAX_WS_FRAME_BYTES)
-        .on_upgrade(move |socket| handle_direct_socket(socket, runtime))
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    if let Err(status) = validate_request_origin(&headers) {
+        warn!(
+            origin = ?headers.get(axum::http::header::ORIGIN),
+            "Rejected /ws request due to disallowed Origin header"
+        );
+        return (status, "Forbidden Origin").into_response();
+    }
+
+    let Some(expected_secret) = runtime.active_pairing_secret() else {
+        warn!(
+            "Rejected /ws upgrade request: persisted pairing-secret is missing or malformed (fail-closed)"
+        );
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    };
+    if !verify_bearer_token(&headers, &expected_secret) {
+        warn!("Rejected unauthenticated /ws upgrade request");
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    match ws {
+        Ok(upgrade) => upgrade
+            .max_frame_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+            .max_message_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+            .on_upgrade(move |socket| handle_direct_socket(socket, runtime, expected_secret))
+            .into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
 }
 
-async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
+async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>, auth_secret: String) {
     let (mut sink, mut stream) = socket.split();
     let (in_tx, in_rx) = mpsc::channel::<SessionFrame>(256);
     let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(256);
 
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let ws_msg = match frame {
                 SessionFrame::Wire { msg, zstd: true } => match msg.encode_zstd(3) {
@@ -983,9 +1673,10 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
                 break;
             }
         }
+        let _ = sink.close().await;
     });
 
-    tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
             match msg {
                 AxumWsMsg::Text(txt) => {
@@ -1033,7 +1724,23 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
         }
     });
 
-    run_client_session_loop(runtime, in_rx, out_tx).await;
+    let exit_reason =
+        run_supervised_client_session(runtime, in_rx, out_tx, auth_secret, None).await;
+    reader_task.abort();
+    match exit_reason {
+        SessionExitReason::Revoked => {
+            writer_task.abort();
+        }
+        SessionExitReason::Normal => {
+            let writer_abort = writer_task.abort_handle();
+            if tokio::time::timeout(Duration::from_millis(300), writer_task)
+                .await
+                .is_err()
+            {
+                writer_abort.abort();
+            }
+        }
+    }
 }
 
 // --- Unified Transport-Neutral Session Controller (shared by Direct WS & Relay E2EE) ---
@@ -1063,34 +1770,165 @@ enum SessionFrame {
     Terminal(TerminalBinaryFrame),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionExitReason {
+    Normal,
+    Revoked,
+}
+
+/// Ensures terminal streaming tasks and side-question tasks are always aborted immediately even
+/// when `run_client_session_loop` is dropped mid-await on secret revocation.
+struct SessionCleanupGuard {
+    slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)>,
+    active_side_questions: Vec<tokio::task::AbortHandle>,
+}
+
+impl SessionCleanupGuard {
+    fn new() -> Self {
+        Self {
+            slot_to_terminal: HashMap::new(),
+            active_side_questions: Vec::new(),
+        }
+    }
+}
+
+impl Drop for SessionCleanupGuard {
+    fn drop(&mut self) {
+        for (_, (_, abort_handle)) in self.slot_to_terminal.drain() {
+            abort_handle.abort();
+        }
+        for abort_handle in self.active_side_questions.drain(..) {
+            abort_handle.abort();
+        }
+    }
+}
+
+fn is_session_secret_still_valid(runtime: &DaemonRuntime, auth_secret: &str) -> bool {
+    runtime
+        .active_pairing_secret()
+        .as_deref()
+        .is_some_and(|cur| orbit_crypto::constant_time_eq(cur.as_bytes(), auth_secret.as_bytes()))
+}
+
+/// Independently watches for `pairing_secret` rotation/revocation without being blocked by
+/// in-flight RPC handlers or outbound channel backpressure.
+async fn wait_for_session_revocation(runtime: Arc<DaemonRuntime>, auth_secret: String) {
+    let mut secret_rot_rx = runtime.pairing_secret_rotated_tx.subscribe();
+    let mut secret_check_interval = tokio::time::interval(Duration::from_secs(1));
+    secret_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    if !is_session_secret_still_valid(&runtime, &auth_secret) {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            res = secret_rot_rx.recv() => {
+                match res {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if !is_session_secret_still_valid(&runtime, &auth_secret) {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            _ = secret_check_interval.tick() => {
+                if !is_session_secret_still_valid(&runtime, &auth_secret) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Supervise `run_client_session_loop` alongside an independent revocation watcher so rotating or
+/// deleting `pairing_secret` cancels in-flight RPCs, drops broadcast subscriptions, and terminates
+/// the session immediately even under a blocked RPC or saturated outbound queue.
+async fn run_supervised_client_session(
+    runtime: Arc<DaemonRuntime>,
+    in_rx: mpsc::Receiver<SessionFrame>,
+    out_tx: mpsc::Sender<SessionFrame>,
+    auth_secret: String,
+    initial_msg: Option<WireMessage>,
+) -> SessionExitReason {
+    let session_id = Uuid::new_v4();
+    let revoke_rt = Arc::clone(&runtime);
+    let revoke_secret = auth_secret.clone();
+    tokio::select! {
+        biased;
+        () = wait_for_session_revocation(revoke_rt, revoke_secret) => {
+            warn!(session_id = %session_id, "Closing client session: pairing_secret rotated or revoked");
+            SessionExitReason::Revoked
+        }
+        () = run_client_session_loop(runtime, session_id, in_rx, out_tx, auth_secret, initial_msg) => {
+            SessionExitReason::Normal
+        }
+    }
+}
+
 async fn run_client_session_loop(
     runtime: Arc<DaemonRuntime>,
+    session_id: Uuid,
     mut in_rx: mpsc::Receiver<SessionFrame>,
     out_tx: mpsc::Sender<SessionFrame>,
+    auth_secret: String,
+    initial_msg: Option<WireMessage>,
 ) {
-    let session_id = Uuid::new_v4();
     let mut use_zstd = false;
     let mut subscribed_agents: HashSet<String> = HashSet::new();
     let mut subscribed_provider_subagents: HashSet<(String, String)> = HashSet::new();
-    let mut slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)> = HashMap::new();
-    let mut active_side_questions: Vec<tokio::task::AbortHandle> = Vec::new();
+    let mut cleanup = SessionCleanupGuard::new();
     let mut bcast_rx = runtime.orchestrator.broadcast_tx.subscribe();
     let mut host_status_rx = runtime.connected_hosts.status_updates_tx.subscribe();
+
+    if let Some(msg) = initial_msg {
+        if !is_session_secret_still_valid(&runtime, &auth_secret) {
+            return;
+        }
+        use_zstd = true;
+        if let Some(reply) = handle_wire_rpc(
+            &runtime,
+            session_id,
+            msg,
+            &mut use_zstd,
+            &mut subscribed_agents,
+            &mut subscribed_provider_subagents,
+            &mut cleanup.slot_to_terminal,
+            &mut cleanup.active_side_questions,
+            &out_tx,
+        )
+        .await
+            && out_tx
+                .send(SessionFrame::Wire {
+                    msg: reply,
+                    zstd: use_zstd,
+                })
+                .await
+                .is_err()
+        {
+            return;
+        }
+    }
 
     loop {
         tokio::select! {
             maybe_in = in_rx.recv() => {
                 let Some(frame) = maybe_in else { break; };
+                if !is_session_secret_still_valid(&runtime, &auth_secret) {
+                    warn!(session_id = %session_id, "Closing client session on frame arrival: pairing_secret rotated or revoked");
+                    break;
+                }
                 match frame {
                     SessionFrame::Terminal(tframe) => {
                         match tframe {
                             TerminalBinaryFrame::Input { slot, data } => {
-                                if let Some((tid, _)) = slot_to_terminal.get(&slot) {
+                                if let Some((tid, _)) = cleanup.slot_to_terminal.get(&slot) {
                                     runtime.orchestrator.write_terminal_input(tid, data).await;
                                 }
                             }
                             TerminalBinaryFrame::Resize { slot, cols, rows } => {
-                                if let Some((tid, _)) = slot_to_terminal.get(&slot) {
+                                if let Some((tid, _)) = cleanup.slot_to_terminal.get(&slot) {
                                     runtime.orchestrator.resize_terminal(tid, cols, rows).await;
                                 }
                             }
@@ -1101,7 +1939,7 @@ async fn run_client_session_loop(
                         if zstd {
                             use_zstd = true;
                         }
-                        active_side_questions.retain(|h| !h.is_finished());
+                        cleanup.active_side_questions.retain(|h| !h.is_finished());
                         if let Some(reply) = handle_wire_rpc(
                             &runtime,
                             session_id,
@@ -1109,8 +1947,8 @@ async fn run_client_session_loop(
                             &mut use_zstd,
                             &mut subscribed_agents,
                             &mut subscribed_provider_subagents,
-                            &mut slot_to_terminal,
-                            &mut active_side_questions,
+                            &mut cleanup.slot_to_terminal,
+                            &mut cleanup.active_side_questions,
                             &out_tx,
                         )
                         .await
@@ -1275,13 +2113,6 @@ async fn run_client_session_loop(
                 }
             }
         }
-    }
-
-    for (_, (_, abort_handle)) in slot_to_terminal.drain() {
-        abort_handle.abort();
-    }
-    for abort_handle in active_side_questions.drain(..) {
-        abort_handle.abort();
     }
 }
 
@@ -4686,6 +5517,7 @@ async fn handle_wire_rpc(
             schedule_id,
             name,
             cron_expr,
+            timezone,
             prompt,
             max_runs,
             expires_at,
@@ -4694,6 +5526,7 @@ async fn handle_wire_rpc(
             &schedule_id,
             name,
             cron_expr.as_deref(),
+            timezone.as_deref(),
             prompt,
             max_runs,
             expires_at,
@@ -5682,15 +6515,14 @@ fn daemon_release_asset_name() -> anyhow::Result<&'static str> {
 }
 
 impl DaemonRuntime {
-    /// Download the matching Orbit release binary, verify `--version`, atomically install to
+    /// Download the matching Orbit release binary, verify its SHA-256 against `SHA256SUMS.txt`
+    /// from the exact same GitHub Release, verify `--version`, atomically install to
     /// `~/.local/bin/orbit` (or `%USERPROFILE%\.local\bin\orbit.exe` on Windows), and trigger a
     /// detached `orbit daemon up` hot-restart so all `orbit shim` agent & PTY sessions stay alive.
     pub async fn self_upgrade_and_restart(
         &self,
         target_version: Option<String>,
     ) -> anyhow::Result<()> {
-        use tokio::io::AsyncWriteExt;
-
         let _upgrade_guard = self.upgrade_lock.lock().await;
 
         let asset = daemon_release_asset_name()?;
@@ -5720,88 +6552,30 @@ impl DaemonRuntime {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "danielgaoyy/orbit".to_string());
 
-        let mut urls: Vec<String> = Vec::new();
-        if let Some(raw_ver) = target_version
+        let release_tag = match target_version
             .as_deref()
             .map(str::trim)
             .map(|s| s.trim_start_matches(['v', 'V']))
             .filter(|s| !s.is_empty())
         {
-            if !is_valid_release_semver(raw_ver) {
-                anyhow::bail!("Invalid target version format: {raw_ver}");
+            Some(raw_ver) => {
+                if !is_valid_release_semver(raw_ver) {
+                    anyhow::bail!("Invalid target version format: {raw_ver}");
+                }
+                format!("v{raw_ver}")
             }
-            urls.push(format!(
-                "https://github.com/{repo}/releases/download/v{raw_ver}/{asset}"
-            ));
-        }
-        urls.push(format!(
-            "https://github.com/{repo}/releases/latest/download/{asset}"
-        ));
+            None => resolve_latest_github_release_tag(&repo).await?,
+        };
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(90))
             .user_agent(format!("orbit-daemon/{}", env!("CARGO_PKG_VERSION")))
             .build()?;
 
-        let mut downloaded = false;
-        let mut last_err = anyhow::anyhow!("Failed to download Orbit binary");
-        for url in &urls {
-            match client.get(url).send().await {
-                Ok(mut resp) if resp.status().is_success() => {
-                    let mut file = tokio::fs::File::create(&tmp_path).await?;
-                    let mut stream_err: Option<anyhow::Error> = None;
-                    loop {
-                        match resp.chunk().await {
-                            Ok(Some(bytes)) => {
-                                if let Err(e) = file.write_all(&bytes).await {
-                                    stream_err = Some(e.into());
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                stream_err = Some(e.into());
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(err) = stream_err {
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                        last_err = err;
-                        continue;
-                    }
-                    if let Err(e) = file.flush().await {
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                        return Err(e.into());
-                    }
-                    drop(file);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Err(e) = std::fs::set_permissions(
-                            &tmp_path,
-                            std::fs::Permissions::from_mode(0o755),
-                        ) {
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err(e.into());
-                        }
-                    }
-                    downloaded = true;
-                    break;
-                }
-                Ok(resp) => {
-                    last_err = anyhow::anyhow!("HTTP {} downloading {url}", resp.status());
-                }
-                Err(e) => {
-                    last_err = anyhow::anyhow!("Network error downloading {url}: {e}");
-                }
-            }
-        }
-
-        if !downloaded {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(last_err);
-        }
+        let release_base_url = format!("https://github.com/{repo}/releases/download/{release_tag}");
+        let verified_sha256 =
+            download_and_verify_release_binary(&client, &release_base_url, asset, &tmp_path)
+                .await?;
 
         let check = tokio::process::Command::new(&tmp_path)
             .arg("--version")
@@ -5896,6 +6670,8 @@ impl DaemonRuntime {
 
         tracing::info!(
             install_path = %install_path.display(),
+            release_tag = %release_tag,
+            sha256 = %verified_sha256,
             port,
             restart_relay,
             "Scheduled self-upgrade hot-restart via `orbit daemon up`"
@@ -5904,10 +6680,192 @@ impl DaemonRuntime {
     }
 }
 
-fn parse_relay_port_from_json(raw: &str) -> Option<u16> {
+fn extract_tag_from_github_release_url(url: &str) -> Option<String> {
+    let clean = url.split(['?', '#']).next()?.trim().trim_end_matches('/');
+    let (_, after_tag) = clean.rsplit_once("/releases/tag/")?;
+    let tag = after_tag.split('/').next()?.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    Some(tag.to_string())
+}
+
+async fn resolve_latest_github_release_tag(repo: &str) -> anyhow::Result<String> {
+    let latest_web_url = format!("https://github.com/{repo}/releases/latest");
+    let no_redirect = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(format!("orbit-daemon/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let mut web_err: Option<String> = None;
+    for use_head in [true, false] {
+        let req = if use_head {
+            no_redirect.head(&latest_web_url)
+        } else {
+            no_redirect.get(&latest_web_url)
+        };
+        match req.send().await {
+            Ok(resp) => {
+                if resp.status().is_redirection()
+                    && let Some(loc) = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                    && let Some(tag) = extract_tag_from_github_release_url(loc)
+                {
+                    return Ok(tag);
+                }
+                if let Some(tag) = extract_tag_from_github_release_url(resp.url().as_str()) {
+                    return Ok(tag);
+                }
+                if !use_head {
+                    web_err = Some(format!(
+                        "HTTP {} without release tag redirect",
+                        resp.status()
+                    ));
+                }
+            }
+            Err(e) if !use_head => {
+                web_err = Some(e.to_string());
+            }
+            Err(_) => {}
+        }
+    }
+
+    let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let api_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(format!("orbit-daemon/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let resp = api_client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to resolve latest Orbit release tag (web redirect: {}; API: {e})",
+                web_err.as_deref().unwrap_or("unknown")
+            )
+        })?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "Failed to resolve latest Orbit release tag (web redirect: {}; API HTTP {})",
+            web_err.as_deref().unwrap_or("unknown"),
+            resp.status()
+        );
+    }
+    let meta: serde_json::Value = resp.json().await?;
+    meta.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Missing tag_name in GitHub release metadata"))
+}
+
+/// Fetch `SHA256SUMS.txt` and `asset` from the exact same release base URL, streaming the binary
+/// to `tmp_path` while hashing, and verifying SHA-256 BEFORE marking executable or executing.
+async fn download_and_verify_release_binary(
+    client: &reqwest::Client,
+    release_base_url: &str,
+    asset: &str,
+    tmp_path: &Path,
+) -> anyhow::Result<String> {
+    use tokio::io::AsyncWriteExt;
+
+    let base = release_base_url.trim_end_matches('/');
+    let sums_url = format!("{base}/{}", orbit_crypto::SHA256SUMS_FILENAME);
+    let asset_url = format!("{base}/{asset}");
+
+    let sums_resp = client
+        .get(&sums_url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Network error downloading checksums {sums_url}: {e}"))?;
+    if !sums_resp.status().is_success() {
+        anyhow::bail!(
+            "Failed to fetch release checksums {sums_url} (HTTP {}); refusing unverified upgrade",
+            sums_resp.status()
+        );
+    }
+    let sums_text = sums_resp
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read {sums_url}: {e}"))?;
+    let expected_sha256 = orbit_crypto::find_expected_sha256(&sums_text, asset).map_err(|e| {
+        anyhow::anyhow!("Release checksum manifest {sums_url} rejected `{asset}`: {e}")
+    })?;
+
+    let mut resp = client
+        .get(&asset_url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Network error downloading {asset_url}: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HTTP {} downloading {asset_url}", resp.status());
+    }
+
+    let mut file = tokio::fs::File::create(tmp_path).await?;
+    let mut hasher = orbit_crypto::Sha256Hasher::new();
+    let mut stream_err: Option<anyhow::Error> = None;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(bytes)) => {
+                hasher.update(&bytes);
+                if let Err(e) = file.write_all(&bytes).await {
+                    stream_err = Some(e.into());
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                stream_err = Some(e.into());
+                break;
+            }
+        }
+    }
+    if let Some(err) = stream_err {
+        let _ = tokio::fs::remove_file(tmp_path).await;
+        return Err(err);
+    }
+    if let Err(e) = file.flush().await {
+        let _ = tokio::fs::remove_file(tmp_path).await;
+        return Err(e.into());
+    }
+    drop(file);
+
+    let actual_sha256 = hasher.finalize_hex();
+    if let Err(err) = orbit_crypto::verify_sha256_hex(asset, &expected_sha256, &actual_sha256) {
+        let _ = tokio::fs::remove_file(tmp_path).await;
+        anyhow::bail!("SHA-256 verification failed for {asset_url}: {err}");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(tmp_path, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(e.into());
+        }
+    }
+
+    Ok(actual_sha256)
+}
+
+fn parse_relay_probe_addr_from_json(raw: &str) -> Option<SocketAddr> {
     let val: serde_json::Value = serde_json::from_str(raw).ok()?;
     let addr_str = val.get("listen_addr")?.as_str()?;
-    addr_str.parse::<SocketAddr>().ok().map(|a| a.port())
+    let addr = addr_str.parse::<SocketAddr>().ok()?;
+    Some(match addr {
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+            SocketAddr::from(([127, 0, 0, 1], v4.port()))
+        }
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, v6.port()))
+        }
+        explicit => explicit,
+    })
 }
 
 async fn detect_running_local_relay(home_dir: &Path) -> bool {
@@ -5915,18 +6873,32 @@ async fn detect_running_local_relay(home_dir: &Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(&relay_cfg_path) else {
         return false;
     };
-    let port = parse_relay_port_from_json(&raw).unwrap_or(7878);
+    let probe_addr = parse_relay_probe_addr_from_json(&raw)
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7878)));
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     else {
         return false;
     };
-    client
-        .get(format!("http://127.0.0.1:{port}/health"))
+    let Ok(resp) = client
+        .get(format!("http://{probe_addr}/healthz"))
         .send()
         .await
-        .map(|r| r.status().is_success())
+    else {
+        return false;
+    };
+    if resp.status() != reqwest::StatusCode::OK {
+        return false;
+    }
+    if resp.content_length().is_some_and(|len| len > 64) {
+        return false;
+    }
+    resp.text()
+        .await
+        .map(|body| body.trim() == "ok")
         .unwrap_or(false)
 }
 
@@ -6309,16 +7281,26 @@ mod self_upgrade_tests {
     }
 
     #[test]
-    fn parse_relay_port_from_json_reads_listen_addr() {
+    fn parse_relay_probe_addr_from_json_reads_listen_addr() {
         assert_eq!(
-            parse_relay_port_from_json(r#"{"listen_addr":"0.0.0.0:7878","allowed_pubkeys":[]}"#),
-            Some(7878)
+            parse_relay_probe_addr_from_json(
+                r#"{"listen_addr":"0.0.0.0:7878","allowed_pubkeys":[]}"#
+            ),
+            Some(SocketAddr::from(([127, 0, 0, 1], 7878)))
         );
         assert_eq!(
-            parse_relay_port_from_json(r#"{"listen_addr":"127.0.0.1:9001"}"#),
-            Some(9001)
+            parse_relay_probe_addr_from_json(r#"{"listen_addr":"[::]:7879"}"#),
+            Some(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 7879)))
         );
-        assert_eq!(parse_relay_port_from_json("not json"), None);
+        assert_eq!(
+            parse_relay_probe_addr_from_json(r#"{"listen_addr":"[::1]:9001"}"#),
+            Some(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 9001)))
+        );
+        assert_eq!(
+            parse_relay_probe_addr_from_json(r#"{"listen_addr":"127.0.0.2:7880"}"#),
+            Some(SocketAddr::from(([127, 0, 0, 2], 7880)))
+        );
+        assert_eq!(parse_relay_probe_addr_from_json("not json"), None);
     }
 
     #[test]
@@ -6554,5 +7536,845 @@ mod self_upgrade_tests {
         assert!(full_script.contains(r"'--home', 'C:\Orbit''s Home', 'daemon', 'up'"));
         assert!(!full_script.contains("'--port'"));
         assert!(full_script.contains(r"'--home', 'C:\Orbit''s Home', 'relay', 'up'"));
+    }
+
+    #[tokio::test]
+    async fn pairing_secret_persists_across_bootstrap_rotates_atomically_and_fails_closed() {
+        let home = std::env::temp_dir().join(format!("orbit_secret_persist_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+
+        // Concurrent first-time init must converge on a single identical secret
+        let mut init_tasks = Vec::new();
+        for _ in 0..8 {
+            let h = home.clone();
+            init_tasks.push(tokio::task::spawn_blocking(move || {
+                load_or_create_pairing_secret(&h).expect("concurrent init")
+            }));
+        }
+        let mut init_results = Vec::new();
+        for t in init_tasks {
+            init_results.push(t.await.expect("join"));
+        }
+        let first_secret = init_results[0].clone();
+        assert_eq!(first_secret.len(), 43);
+        for s in &init_results {
+            assert_eq!(s, &first_secret, "concurrent init must not diverge");
+        }
+
+        let rt1 = DaemonRuntime::bootstrap(&home).await.expect("bootstrap 1");
+        let secret1 = rt1.pairing_secret.clone();
+        assert_eq!(secret1, first_secret);
+        let offer1 = rt1
+            .build_pairing_offer(vec!["ws://127.0.0.1:6868/ws".into()], None)
+            .expect("offer 1");
+        assert_eq!(offer1.pairing_secret, secret1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(home.join(PAIRING_SECRET_FILENAME)).expect("stat secret");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+        drop(rt1);
+
+        let rt2 = DaemonRuntime::bootstrap(&home).await.expect("bootstrap 2");
+        assert_eq!(
+            rt2.pairing_secret, secret1,
+            "pairing_secret must persist identically across daemon restarts"
+        );
+        assert_eq!(
+            rt2.build_pairing_offer(vec![], None)
+                .expect("offer 2")
+                .pairing_secret,
+            secret1
+        );
+
+        let rotated = rt2.rotate_pairing_secret().expect("rotate secret");
+        assert_eq!(rotated.len(), 43);
+        assert_ne!(rotated, secret1);
+        assert_eq!(
+            rt2.active_pairing_secret().as_deref(),
+            Some(rotated.as_str())
+        );
+        assert_eq!(
+            rt2.build_pairing_offer(vec![], None)
+                .expect("offer rotated")
+                .pairing_secret,
+            rotated
+        );
+        drop(rt2);
+
+        let rt3 = DaemonRuntime::bootstrap(&home).await.expect("bootstrap 3");
+        assert_eq!(rt3.pairing_secret, rotated);
+
+        // Corrupting the persisted secret must fail closed (never overwrite or fall back)
+        std::fs::write(home.join(PAIRING_SECRET_FILENAME), "short").expect("corrupt");
+        assert_eq!(rt3.active_pairing_secret(), None);
+        assert!(rt3.build_pairing_offer(vec![], None).is_err());
+        assert!(load_or_create_pairing_secret(&home).is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn ws_endpoint_enforces_bearer_auth_origin_cswsh_live_rotation_and_fail_closed() {
+        use tokio_tungstenite::{
+            connect_async,
+            tungstenite::{
+                Error as WsError,
+                client::IntoClientRequest,
+                http::{
+                    HeaderValue,
+                    header::{AUTHORIZATION, ORIGIN},
+                },
+            },
+        };
+
+        let home = std::env::temp_dir().join(format!("orbit_ws_auth_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let (addr, runtime) = spawn_embedded_daemon(home.clone(), None)
+            .await
+            .expect("spawn daemon");
+        let ws_url = format!("ws://{addr}/ws");
+        let valid_secret = runtime.pairing_secret.clone();
+
+        // 1. Missing Authorization header -> 401 Unauthorized
+        let err = connect_async(&ws_url)
+            .await
+            .expect_err("missing token must fail");
+        match err {
+            WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 401),
+            other => panic!("expected HTTP 401 for missing token, got {other:?}"),
+        }
+
+        // 2. Wrong Bearer token -> 401 Unauthorized
+        let mut wrong_req = ws_url.as_str().into_client_request().expect("req");
+        wrong_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-secret-token-00000000000000000000"),
+        );
+        let err = connect_async(wrong_req)
+            .await
+            .expect_err("wrong token must fail");
+        match err {
+            WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 401),
+            other => panic!("expected HTTP 401 for wrong token, got {other:?}"),
+        }
+
+        // 3. Malicious browser Origin -> 403 Forbidden (even with valid Bearer token!)
+        let mut evil_req = ws_url.as_str().into_client_request().expect("req");
+        evil_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {valid_secret}")).expect("hdr"),
+        );
+        evil_req
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("https://evil.example"));
+        let err = connect_async(evil_req)
+            .await
+            .expect_err("malicious origin must fail");
+        match err {
+            WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 403),
+            other => panic!("expected HTTP 403 for malicious origin, got {other:?}"),
+        }
+
+        // 4. Valid Bearer token with no Origin (native CLI/mobile) -> keep open to test rotation revocation!
+        let mut native_req = ws_url.as_str().into_client_request().expect("req");
+        native_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {valid_secret}")).expect("hdr"),
+        );
+        let (mut active_ws, _) = connect_async(native_req)
+            .await
+            .expect("valid native client must connect");
+
+        // 5. Valid Bearer token with explicit allowed Tauri Origin -> succeeds
+        let mut tauri_req = ws_url.as_str().into_client_request().expect("req");
+        tauri_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {valid_secret}")).expect("hdr"),
+        );
+        tauri_req
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("tauri://localhost"));
+        let (mut ws_tauri, _) = connect_async(tauri_req)
+            .await
+            .expect("allowed tauri origin with valid token must connect");
+        let _ = ws_tauri.close(None).await;
+
+        // 6. Secret rotation invalidates old secret immediately AND closes already-active sessions!
+        let rotated = runtime.rotate_pairing_secret().expect("rotate");
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(msg) = active_ws.next().await {
+                if matches!(msg, Ok(TungMsg::Close(_)) | Err(_)) {
+                    return true;
+                }
+            }
+            true
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            closed,
+            "already-connected direct /ws session must close when pairing_secret is rotated"
+        );
+
+        let mut stale_req = ws_url.as_str().into_client_request().expect("req");
+        stale_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {valid_secret}")).expect("hdr"),
+        );
+        match connect_async(stale_req)
+            .await
+            .expect_err("rotated secret must reject old token")
+        {
+            WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 401),
+            other => panic!("expected HTTP 401 for stale token, got {other:?}"),
+        }
+
+        let mut fresh_req = ws_url.as_str().into_client_request().expect("req");
+        fresh_req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {rotated}")).expect("hdr"),
+        );
+        let (mut ws_fresh, _) = connect_async(fresh_req)
+            .await
+            .expect("rotated secret must connect");
+        let _ = ws_fresh.close(None).await;
+
+        // 7. Missing/deleted pairing-secret file must fail closed (NEVER fall back to bootstrap secret!)
+        std::fs::remove_file(home.join(PAIRING_SECRET_FILENAME)).expect("remove secret");
+        for tok in [&valid_secret, &rotated] {
+            let mut req = ws_url.as_str().into_client_request().expect("req");
+            req.headers_mut().insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {tok}")).expect("hdr"),
+            );
+            match connect_async(req)
+                .await
+                .expect_err("deleted secret must fail closed")
+            {
+                WsError::Http(resp) => assert_eq!(resp.status().as_u16(), 401),
+                other => panic!("expected HTTP 401 when secret file deleted, got {other:?}"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn mcp_agents_endpoint_enforces_origin_and_constant_time_bearer_auth() {
+        let home = std::env::temp_dir().join(format!("orbit_mcp_auth_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let (addr, runtime) = spawn_embedded_daemon(home.clone(), None)
+            .await
+            .expect("spawn daemon");
+        let url = format!("http://{addr}/mcp/agents");
+        let http = reqwest::Client::new();
+        let ping_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        });
+
+        // 1. Malicious Origin -> 403 Forbidden (even with valid MCP token)
+        let resp = http
+            .post(&url)
+            .header("Origin", "https://evil.example")
+            .header("Authorization", format!("Bearer {}", runtime.mcp_token))
+            .json(&ping_body)
+            .send()
+            .await
+            .expect("send evil origin");
+        assert_eq!(resp.status().as_u16(), 403);
+
+        // 2. Missing token -> 401 Unauthorized
+        let resp = http
+            .post(&url)
+            .json(&ping_body)
+            .send()
+            .await
+            .expect("send missing auth");
+        assert_eq!(resp.status().as_u16(), 401);
+
+        // 3. Wrong token -> 401 Unauthorized
+        let resp = http
+            .post(&url)
+            .header("Authorization", "Bearer wrong-mcp-token")
+            .json(&ping_body)
+            .send()
+            .await
+            .expect("send wrong auth");
+        assert_eq!(resp.status().as_u16(), 401);
+
+        // 4. Valid token without Origin -> 200 OK
+        let resp = http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", runtime.mcp_token))
+            .json(&ping_body)
+            .send()
+            .await
+            .expect("send valid auth");
+        assert_eq!(resp.status().as_u16(), 200);
+
+        // 5. Actual bound SocketAddr is recorded in `$ORBIT_HOME/daemon.addr`
+        assert_eq!(read_live_daemon_addr(&home), Some(addr));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(home.join(DAEMON_ADDR_FILENAME))
+                .expect("daemon.addr metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bootstrap_hardens_orbit_home_shims_and_runtime_dirs_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::temp_dir().join(format!("orbit-home-perm-test-{}", Uuid::new_v4()));
+        let shims = home.join("shims");
+        let runtime_dir = home.join("runtime");
+        std::fs::create_dir_all(&shims).expect("create shims");
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime");
+        for dir in [&home, &shims, &runtime_dir] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .expect("set initial 0755 perms");
+        }
+
+        let _rt = DaemonRuntime::bootstrap(&home)
+            .await
+            .expect("bootstrap daemon");
+
+        for (label, dir) in [
+            ("ORBIT_HOME", &home),
+            ("shims", &shims),
+            ("runtime", &runtime_dir),
+        ] {
+            let mode = std::fs::metadata(dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "{label} directory must be hardened to 0700, got {:o}",
+                mode
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn revocation_terminates_session_immediately_even_when_outbound_queue_is_saturated() {
+        let home = std::env::temp_dir().join(format!("orbit_rev_sat_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let runtime = DaemonRuntime::bootstrap(&home).await.expect("bootstrap");
+        let secret = runtime.pairing_secret.clone();
+
+        let (in_tx, in_rx) = mpsc::channel::<SessionFrame>(4);
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(1);
+
+        // Saturate the outbound queue with a pending terminal frame so `out_tx.send(...)` blocks.
+        out_tx
+            .try_send(SessionFrame::Terminal(TerminalBinaryFrame::Output {
+                slot: 0,
+                data: b"queued-pty-bytes".to_vec(),
+            }))
+            .expect("fill outbound queue");
+
+        let rt_session = Arc::clone(&runtime);
+        let session_task = tokio::spawn(async move {
+            run_supervised_client_session(rt_session, in_rx, out_tx, secret, None).await
+        });
+
+        // Trigger a Ping RPC whose Pong reply blocks on the saturated `out_tx` channel.
+        in_tx
+            .send(SessionFrame::Wire {
+                msg: WireMessage::Ping { ts_ms: 42 },
+                zstd: false,
+            })
+            .await
+            .expect("send ping");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !session_task.is_finished(),
+            "session should still be running while blocked on saturated out_tx"
+        );
+
+        // Rotate pairing_secret: independent revocation supervisor MUST exit with Revoked
+        // immediately without waiting for `out_tx` to drain.
+        let _rotated = runtime.rotate_pairing_secret().expect("rotate");
+        let exit = tokio::time::timeout(Duration::from_millis(500), session_task)
+            .await
+            .expect("revocation must not block on saturated outbound queue")
+            .expect("session task join");
+        assert_eq!(exit, SessionExitReason::Revoked);
+
+        // Only the pre-queued frame should exist; the Pong must not have been enqueued after revocation.
+        assert!(out_rx.try_recv().is_ok());
+        assert!(out_rx.try_recv().is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn detect_running_local_relay_probes_healthz_endpoint() {
+        let base = std::env::temp_dir().join(format!(
+            "orbit_relay_healthz_test_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).expect("mkdir");
+
+        // 1. Missing relay.json -> false
+        assert!(!detect_running_local_relay(&base).await);
+
+        // 2. Local server serving `/healthz` (matching `orbit-relay`, wildcard 0.0.0.0 -> 127.0.0.1) -> true
+        let healthz_app = Router::new().route("/healthz", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind healthz");
+        let healthz_addr = listener.local_addr().expect("addr");
+        let healthz_srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, healthz_app).await;
+        });
+
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": format!("0.0.0.0:{}", healthz_addr.port()),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write relay.json");
+        assert!(
+            detect_running_local_relay(&base).await,
+            "expected local relay serving /healthz to be detected"
+        );
+        healthz_srv.abort();
+
+        // 3. IPv6 loopback listener (`[::1]`) -> true
+        if let Ok(v6_listener) = tokio::net::TcpListener::bind("[::1]:0").await {
+            let v6_addr = v6_listener.local_addr().expect("v6 addr");
+            let v6_app = Router::new().route("/healthz", get(|| async { "ok" }));
+            let v6_srv = tokio::spawn(async move {
+                let _ = axum::serve(v6_listener, v6_app).await;
+            });
+            std::fs::write(
+                base.join("relay.json"),
+                serde_json::json!({
+                    "listen_addr": v6_addr.to_string(),
+                    "allowed_pubkeys": []
+                })
+                .to_string(),
+            )
+            .expect("write v6 relay.json");
+            assert!(
+                detect_running_local_relay(&base).await,
+                "expected IPv6 loopback relay serving /healthz to be detected"
+            );
+            v6_srv.abort();
+        }
+
+        // 4. Redirect on `/healthz` must NOT be followed -> false
+        let redirect_app = Router::new()
+            .route(
+                "/healthz",
+                get(|| async { axum::response::Redirect::temporary("/ok") }),
+            )
+            .route("/ok", get(|| async { "ok" }));
+        let redir_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect");
+        let redir_addr = redir_listener.local_addr().expect("redir addr");
+        let redir_srv = tokio::spawn(async move {
+            let _ = axum::serve(redir_listener, redirect_app).await;
+        });
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": redir_addr.to_string(),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write redirect relay.json");
+        assert!(
+            !detect_running_local_relay(&base).await,
+            "redirecting /healthz response must not pass health probe"
+        );
+        redir_srv.abort();
+
+        // 5. Server serving only legacy `/health` (404 on `/healthz`) -> false
+        let legacy_app = Router::new().route("/health", get(|| async { "ok" }));
+        let legacy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind legacy");
+        let legacy_addr = legacy_listener.local_addr().expect("legacy addr");
+        let legacy_srv = tokio::spawn(async move {
+            let _ = axum::serve(legacy_listener, legacy_app).await;
+        });
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": legacy_addr.to_string(),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write legacy relay.json");
+        assert!(
+            !detect_running_local_relay(&base).await,
+            "server without /healthz must not be treated as healthy orbit-relay"
+        );
+        legacy_srv.abort();
+
+        // 6. Server returning HTTP 200 JSON on `/healthz` (e.g. daemon or unrelated service) -> false
+        let json_app = Router::new().route(
+            "/healthz",
+            get(|| async { axum::Json(serde_json::json!({ "status": "ok" })) }),
+        );
+        let json_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind json healthz");
+        let json_addr = json_listener.local_addr().expect("json addr");
+        let json_srv = tokio::spawn(async move {
+            let _ = axum::serve(json_listener, json_app).await;
+        });
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": json_addr.to_string(),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write json relay.json");
+        assert!(
+            !detect_running_local_relay(&base).await,
+            "200 JSON /healthz body must not be treated as healthy orbit-relay"
+        );
+        json_srv.abort();
+
+        // 7. Server returning HTTP 204 No Content on `/healthz` -> false
+        let no_content_app = Router::new().route(
+            "/healthz",
+            get(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let nc_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 204 healthz");
+        let nc_addr = nc_listener.local_addr().expect("204 addr");
+        let nc_srv = tokio::spawn(async move {
+            let _ = axum::serve(nc_listener, no_content_app).await;
+        });
+        std::fs::write(
+            base.join("relay.json"),
+            serde_json::json!({
+                "listen_addr": nc_addr.to_string(),
+                "allowed_pubkeys": []
+            })
+            .to_string(),
+        )
+        .expect("write 204 relay.json");
+        assert!(
+            !detect_running_local_relay(&base).await,
+            "204 /healthz must not be treated as healthy orbit-relay"
+        );
+        nc_srv.abort();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_release_binary_enforces_sha256sums() {
+        const GENUINE_BYTES: &[u8] = b"genuine-orbit-daemon-release-binary-v0.9.2";
+        const TAMPERED_BYTES: &[u8] = b"tampered-orbit-daemon-release-binary-v0.9.2";
+        let genuine_sha = orbit_crypto::sha256_hex_bytes(GENUINE_BYTES);
+        let valid_sums = format!("{genuine_sha}  orbit-cli-linux-x64\n");
+        let missing_asset_sums = format!("{genuine_sha}  other-asset\n");
+
+        let app = Router::new()
+            .route(
+                "/ok/SHA256SUMS.txt",
+                get({
+                    let s = valid_sums.clone();
+                    move || async move { s }
+                }),
+            )
+            .route("/ok/orbit-cli-linux-x64", get(|| async { GENUINE_BYTES }))
+            .route(
+                "/tampered/SHA256SUMS.txt",
+                get({
+                    let s = valid_sums.clone();
+                    move || async move { s }
+                }),
+            )
+            .route(
+                "/tampered/orbit-cli-linux-x64",
+                get(|| async { TAMPERED_BYTES }),
+            )
+            .route(
+                "/missing-entry/SHA256SUMS.txt",
+                get({
+                    let s = missing_asset_sums.clone();
+                    move || async move { s }
+                }),
+            )
+            .route(
+                "/missing-entry/orbit-cli-linux-x64",
+                get(|| async { GENUINE_BYTES }),
+            )
+            .route(
+                "/no-sums/orbit-cli-linux-x64",
+                get(|| async { GENUINE_BYTES }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock release server");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "orbit_daemon_sha256_test_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+
+        // 1. Valid SHA256SUMS.txt + matching binary -> succeeds
+        let ok_path = tmp_dir.join("orbit.ok");
+        let verified = download_and_verify_release_binary(
+            &client,
+            &format!("http://{addr}/ok"),
+            "orbit-cli-linux-x64",
+            &ok_path,
+        )
+        .await
+        .expect("matching sha256 must succeed");
+        assert_eq!(verified, genuine_sha);
+        assert_eq!(std::fs::read(&ok_path).expect("read ok"), GENUINE_BYTES);
+
+        // 2. Tampered binary -> aborts with mismatch error & deletes temp file
+        let bad_path = tmp_dir.join("orbit.tampered");
+        let err = download_and_verify_release_binary(
+            &client,
+            &format!("http://{addr}/tampered"),
+            "orbit-cli-linux-x64",
+            &bad_path,
+        )
+        .await
+        .expect_err("tampered binary must be rejected");
+        assert!(err.to_string().contains("SHA-256"), "unexpected err: {err}");
+        assert!(
+            !bad_path.exists(),
+            "tampered temp file must be removed immediately"
+        );
+
+        // 3. Missing SHA256SUMS.txt -> aborts cleanly
+        let no_sums_path = tmp_dir.join("orbit.nosums");
+        let err = download_and_verify_release_binary(
+            &client,
+            &format!("http://{addr}/no-sums"),
+            "orbit-cli-linux-x64",
+            &no_sums_path,
+        )
+        .await
+        .expect_err("missing SHA256SUMS.txt must fail");
+        assert!(
+            err.to_string().contains("refusing unverified upgrade"),
+            "unexpected err: {err}"
+        );
+        assert!(!no_sums_path.exists());
+
+        // 4. Missing asset entry in SHA256SUMS.txt -> aborts cleanly
+        let missing_path = tmp_dir.join("orbit.missing");
+        let err = download_and_verify_release_binary(
+            &client,
+            &format!("http://{addr}/missing-entry"),
+            "orbit-cli-linux-x64",
+            &missing_path,
+        )
+        .await
+        .expect_err("missing asset entry must fail");
+        assert!(
+            err.to_string().contains("not found in SHA256SUMS.txt"),
+            "unexpected err: {err}"
+        );
+        assert!(!missing_path.exists());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn first_e2ee_transport_record_rejects_silent_replay_and_forged_ciphertext_before_session()
+     {
+        use orbit_crypto::ClientHandshake;
+        use tokio_tungstenite::{accept_async, connect_async};
+
+        let kp = HostIdentityKeypair::generate().expect("keygen");
+        let pub_bytes = kp.public_bytes().expect("pub");
+        let priv_bytes = kp.private_bytes().expect("priv");
+        let secret = orbit_crypto::generate_pairing_secret();
+
+        let (client_hs1, msg1) = ClientHandshake::new(&pub_bytes, &secret).expect("client init");
+        let (_daemon_chan1, msg2_1) =
+            DaemonHandshake::accept(&priv_bytes, &secret, &msg1).expect("daemon accept 1");
+        let mut client_chan1 = client_hs1.finalize(&msg2_1).expect("finalize 1");
+        let hello = WireMessage::Hello {
+            client_id: "c1".into(),
+            client_name: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            supports_zstd: true,
+        };
+        let hello_z = hello.encode_zstd(3).expect("zstd");
+        let mut plain = Vec::with_capacity(1 + hello_z.len());
+        plain.push(E2EE_FRAME_WIRE);
+        plain.extend_from_slice(&hello_z);
+        let legit_ct1 = client_chan1.seal_record(&plain).expect("seal hello");
+
+        // Case 1: Replayed msg1 with silence (+ Ping keepalives) times out and closes with Policy.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (mut daemon_replayed, _msg2_replay) =
+                DaemonHandshake::accept(&priv_bytes, &secret, &msg1).expect("replayed accept");
+
+            let srv = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let ws = accept_async(tcp).await.expect("ws accept");
+                let (mut sink, mut stream) = ws.split();
+                receive_first_e2ee_wire_message(
+                    &mut daemon_replayed,
+                    &mut sink,
+                    &mut stream,
+                    Duration::from_millis(120),
+                )
+                .await
+            });
+
+            let (mut cli_ws, _) = connect_async(format!("ws://{addr}"))
+                .await
+                .expect("connect");
+            // Send a Ping; daemon must reply Pong but still enforce the overall timeout.
+            cli_ws
+                .send(TungMsg::Ping(b"keepalive".to_vec().into()))
+                .await
+                .expect("send ping");
+            let mut saw_close_policy = false;
+            while let Ok(Some(Ok(frame))) =
+                tokio::time::timeout(Duration::from_secs(2), cli_ws.next()).await
+            {
+                if let TungMsg::Close(Some(cf)) = frame
+                    && cf.code == TungCloseCode::Policy
+                {
+                    saw_close_policy = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_close_policy,
+                "silent replayed msg1 must receive Policy close"
+            );
+            assert!(srv.await.expect("join").is_err());
+        }
+
+        // Case 2: Replayed msg1 followed by captured ciphertext from session 1 fails immediately.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (mut daemon_replayed, _msg2_replay) =
+                DaemonHandshake::accept(&priv_bytes, &secret, &msg1).expect("replayed accept");
+
+            let srv = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let ws = accept_async(tcp).await.expect("ws accept");
+                let (mut sink, mut stream) = ws.split();
+                receive_first_e2ee_wire_message(
+                    &mut daemon_replayed,
+                    &mut sink,
+                    &mut stream,
+                    Duration::from_secs(5),
+                )
+                .await
+            });
+
+            let (mut cli_ws, _) = connect_async(format!("ws://{addr}"))
+                .await
+                .expect("connect");
+            cli_ws
+                .send(TungMsg::Binary(legit_ct1.clone().into()))
+                .await
+                .expect("send replayed ct");
+            let close_frame = tokio::time::timeout(Duration::from_secs(2), cli_ws.next())
+                .await
+                .expect("close timeout")
+                .expect("frame")
+                .expect("ok");
+            assert!(
+                matches!(close_frame, TungMsg::Close(Some(ref cf)) if cf.code == TungCloseCode::Policy),
+                "replayed ciphertext must close with Policy, got {close_frame:?}"
+            );
+            assert!(srv.await.expect("join").is_err());
+        }
+
+        // Case 3: Legitimate client completing handshake & sending encrypted Hello succeeds.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (client_hs_ok, msg1_ok) =
+                ClientHandshake::new(&pub_bytes, &secret).expect("client init ok");
+            let (mut daemon_ok, msg2_ok) =
+                DaemonHandshake::accept(&priv_bytes, &secret, &msg1_ok).expect("daemon accept ok");
+            let mut client_ok = client_hs_ok.finalize(&msg2_ok).expect("finalize ok");
+            let ct_ok = client_ok.seal_record(&plain).expect("seal ok");
+
+            let srv = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let ws = accept_async(tcp).await.expect("ws accept");
+                let (mut sink, mut stream) = ws.split();
+                receive_first_e2ee_wire_message(
+                    &mut daemon_ok,
+                    &mut sink,
+                    &mut stream,
+                    Duration::from_secs(5),
+                )
+                .await
+            });
+
+            let (mut cli_ws, _) = connect_async(format!("ws://{addr}"))
+                .await
+                .expect("connect");
+            cli_ws
+                .send(TungMsg::Binary(ct_ok.into()))
+                .await
+                .expect("send valid hello");
+            let decoded = srv
+                .await
+                .expect("join")
+                .expect("valid encrypted Hello must succeed");
+            assert!(matches!(decoded, WireMessage::Hello { client_id, .. } if client_id == "c1"));
+        }
     }
 }

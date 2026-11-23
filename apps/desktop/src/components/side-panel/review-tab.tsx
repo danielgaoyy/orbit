@@ -13,6 +13,7 @@ import {
   WrapText,
 } from "lucide-react";
 import { normalizeProjectPath } from "@/lib/projects";
+import { useI18n } from "@/lib/i18n";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { DiffFilesViewer, type ReviewCommentDraft } from "@/components/diff-viewer";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -35,6 +36,7 @@ export const ReviewTab = memo(function ReviewTab({
 }: {
   selectedHostId: string;
 }) {
+  const { t } = useI18n();
   const reviewScope = useOrbitSelector((s) => s.reviewScope);
   const diffStaged = useOrbitSelector((s) => s.diffStaged);
   const diffLayout = useOrbitSelector((s) => s.diffLayout);
@@ -216,9 +218,9 @@ export const ReviewTab = memo(function ReviewTab({
     orbitActions.promoteSideQuestionToComposer(sections.join("\n"));
     setDraftComments([]);
     orbitActions.showToast(
-      `Inserted ${draftComments.length} review ${draftComments.length === 1 ? "comment" : "comments"} into Composer`,
+      t("sidePanel.insertedCommentsToast", { count: draftComments.length }),
     );
-  }, [draftComments]);
+  }, [draftComments, t]);
 
   const handleRefresh = useCallback(async () => {
     if (isRefreshing) return;
@@ -240,10 +242,10 @@ export const ReviewTab = memo(function ReviewTab({
 
   const emptyMessage =
     reviewScope === "session_turns"
-      ? "No file edits recorded in this session yet."
+      ? t("sidePanel.emptySessionDiffs")
       : diffStaged
-        ? "No staged changes in the Git index."
-        : "Working tree clean — no changes to review.";
+        ? t("sidePanel.emptyStagedDiffs")
+        : t("sidePanel.emptyWorkingTree");
 
   return (
     <div className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -260,7 +262,7 @@ export const ReviewTab = memo(function ReviewTab({
                 : "text-muted-foreground hover:text-foreground",
             )}
           >
-            Working Tree
+            {t("sidePanel.workingTree")}
           </button>
           <button
             type="button"
@@ -272,7 +274,7 @@ export const ReviewTab = memo(function ReviewTab({
                 : "text-muted-foreground hover:text-foreground",
             )}
           >
-            Session ({sessionTurnDiffs.length})
+            {t("sidePanel.sessionCount", { count: sessionTurnDiffs.length })}
           </button>
         </div>
 
@@ -281,17 +283,17 @@ export const ReviewTab = memo(function ReviewTab({
             <button
               type="button"
               onClick={handleSubmitReviewComments}
-              title="Send accumulated review comments to Composer"
+              title={t("sidePanel.sendReviewCommentsTitle")}
               className="bg-foreground text-background inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11px] font-medium transition-opacity hover:opacity-90"
             >
               <Send className="h-[11px] w-[11px]" />
-              <span>Review ({draftComments.length})</span>
+              <span>{t("sidePanel.reviewCount", { count: draftComments.length })}</span>
             </button>
           )}
 
           <button
             type="button"
-            title={wrapLines ? "Disable line wrapping" : "Wrap long diff lines"}
+            title={wrapLines ? t("sidePanel.disableWrap") : t("sidePanel.wrapLines")}
             onClick={() => setWrapLines((v) => !v)}
             className={cn(
               "inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-lg transition-colors",
@@ -306,7 +308,7 @@ export const ReviewTab = memo(function ReviewTab({
           {displayedDiffFiles.length > 1 && (
             <button
               type="button"
-              title={allCollapsed ? "Expand all files" : "Collapse all files"}
+              title={allCollapsed ? t("sidePanel.expandAllFiles") : t("sidePanel.collapseAllFiles")}
               onClick={handleToggleAllCollapse}
               className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-lg transition-colors"
             >

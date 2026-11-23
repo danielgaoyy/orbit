@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 
 #if !ORBIT_CLI_TEST_RUNNER
 import XCTest
@@ -618,6 +619,60 @@ final class OrbitIosLogicTests: OrbitLogicTestCase {
         try checkEqual(decoded, prefs)
     }
 
+    func testStorageProtectionExcludesDatabaseAndSidecarsFromBackup() throws {
+        let fm = FileManager.default
+        let tempBase = fm.temporaryDirectory.appendingPathComponent("orbit-storage-test-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempBase) }
+
+        let dbURL = try OrbitStorageProtection.prepareProtectedDatabaseURL(in: tempBase)
+        let storageDir = dbURL.deletingLastPathComponent()
+        try checkEqual(storageDir.lastPathComponent, "Orbit")
+        try checkEqual(dbURL.lastPathComponent, "orbit_ios_v3.sqlite")
+
+        let dirValues = try storageDir.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        try checkEqual(dirValues.isExcludedFromBackup, true, "storage directory excluded from backup")
+        #if os(iOS) && !targetEnvironment(simulator)
+        let dirAttrs = try fm.attributesOfItem(atPath: storageDir.path)
+        try checkEqual(
+            dirAttrs[.protectionKey] as? FileProtectionType,
+            .completeUntilFirstUserAuthentication,
+            "storage directory file protection"
+        )
+        #endif
+
+        // Open a real SQLite database in WAL mode inside the protected directory and verify
+        // the DB and its -wal/-shm sidecars live under the excluded/protected directory.
+        var db: OpaquePointer?
+        try checkEqual(sqlite3_open(dbURL.path, &db), SQLITE_OK, "sqlite3_open")
+        defer { sqlite3_close(db) }
+        try checkEqual(sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil), SQLITE_OK, "enable WAL")
+        try checkEqual(sqlite3_exec(db, "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT);", nil, nil, nil), SQLITE_OK, "create table")
+        try checkEqual(sqlite3_exec(db, "INSERT INTO kv VALUES ('host', 'devbox');", nil, nil, nil), SQLITE_OK, "insert row")
+
+        let walURL = URL(fileURLWithPath: dbURL.path + "-wal")
+        let shmURL = URL(fileURLWithPath: dbURL.path + "-shm")
+        try checkTrue(fm.fileExists(atPath: dbURL.path), "sqlite db file created")
+        try checkTrue(fm.fileExists(atPath: walURL.path), "sqlite -wal sidecar created")
+        try checkTrue(fm.fileExists(atPath: shmURL.path), "sqlite -shm sidecar created")
+
+        for fileURL in [dbURL, walURL, shmURL] {
+            try checkEqual(
+                fileURL.deletingLastPathComponent().standardizedFileURL,
+                storageDir.standardizedFileURL,
+                "\(fileURL.lastPathComponent) resides inside backup-excluded storage directory"
+            )
+            #if os(iOS) && !targetEnvironment(simulator)
+            let attrs = try fm.attributesOfItem(atPath: fileURL.path)
+            try checkEqual(
+                attrs[.protectionKey] as? FileProtectionType,
+                .completeUntilFirstUserAuthentication,
+                "\(fileURL.lastPathComponent) inherited file protection"
+            )
+            #endif
+        }
+    }
+
     func testMarkAgentSeenDeduplicationAndForceClearOnUnread() throws {
         // First time viewing a thread always dispatches
         try checkTrue(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: nil, nextSeq: 0, force: false))
@@ -674,6 +729,7 @@ enum OrbitLogicCliMain {
             ("testBoardEnglishSectionTitlesNormalization", suite.testBoardEnglishSectionTitlesNormalization),
             ("testTimeDurationCompactAndHexColorParsing", suite.testTimeDurationCompactAndHexColorParsing),
             ("testStoreSharedValueTypesScopeUploadUndoAndCloudPrefs", suite.testStoreSharedValueTypesScopeUploadUndoAndCloudPrefs),
+            ("testStorageProtectionExcludesDatabaseAndSidecarsFromBackup", suite.testStorageProtectionExcludesDatabaseAndSidecarsFromBackup),
         ]
 
         var passed = 0

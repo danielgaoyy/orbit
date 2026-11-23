@@ -41,6 +41,7 @@ import {
   projectPathScopeKey,
 } from "@/lib/projects";
 import { useImeCompositionGuard } from "@/lib/ime";
+import { useI18n } from "@/lib/i18n";
 import { SidebarConversationRow } from "@/components/sidebar/sidebar-conversation-row";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import {
@@ -716,6 +717,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
   const isAutomationsActive = workspacePanel === "automations";
   const hasFilterActive = sidebarThreadFilter === "active_unread";
+  const { t } = useI18n();
 
   return (
     <aside className="bg-sidebar border-border flex h-full w-full flex-col border-r select-none">
@@ -733,7 +735,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
             <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
               <Plus className="h-[15.5px] w-[15.5px] stroke-[1.8] opacity-80" />
             </span>
-            <span className="truncate">New Conversation</span>
+            <span className="truncate">{t("sidebar.newConversation")}</span>
           </span>
           <span className="text-muted-foreground/55 shrink-0 text-[11.5px] opacity-0 transition-opacity group-hover/new:opacity-100">
             {mod}N
@@ -753,7 +755,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
           <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
             <Clock className="h-[15px] w-[15px] stroke-[1.75] opacity-80" />
           </span>
-          <span className="truncate">Automations</span>
+          <span className="truncate">{t("sidebar.automations")}</span>
         </button>
       </div>
 
@@ -765,7 +767,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
           <div className="orbit-stage-enter space-y-0.5">
             <div className="flex h-[22px] items-center justify-between px-2">
               <span className="text-[11.5px] font-medium text-amber-600 dark:text-amber-400">
-                Needs Attention
+                {t("sidebar.needsAttention")}
               </span>
               <span className="tabular-nums text-[11.5px] font-medium text-amber-600/80 dark:text-amber-400/80">
                 {attentionItems.length}
@@ -809,7 +811,9 @@ export const FleetSidebar = memo(function FleetSidebar() {
         {pinnedEntries.length > 0 && (
           <div className="orbit-stage-enter space-y-0.5">
             <div className="flex h-[22px] items-center px-2">
-              <span className="text-muted-foreground text-[12px] font-medium">Pinned</span>
+              <span className="text-muted-foreground text-[12px] font-medium">
+                {t("sidebar.pinned")}
+              </span>
             </div>
 
             {pinnedEntries.map(({ key, host, projectName, conv }) => {
@@ -849,15 +853,17 @@ export const FleetSidebar = memo(function FleetSidebar() {
         {/* 3C. `Projects` Section (`[⇅]` Sort/Filter + `[📁+]` Add Project) */}
         <div className="space-y-0.5">
           <div className="flex h-[24px] items-center justify-between px-2">
-            <span className="text-muted-foreground text-[12px] font-medium">Projects</span>
+            <span className="text-muted-foreground text-[12px] font-medium">
+              {t("sidebar.projects")}
+            </span>
 
             <div className="flex items-center gap-0.5">
               <DropdownMenu>
-                <SimpleTooltip label="Sort & filter">
+                <SimpleTooltip label={t("sidebar.sortAndFilter")}>
                   <DropdownMenuTrigger asChild>
                     <button
                       type="button"
-                      aria-label="Sort and filter projects"
+                      aria-label={t("sidebar.sortAndFilterAria")}
                       className={cn(
                         "relative inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
                         hasFilterActive
@@ -880,7 +886,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   className="w-[200px] rounded-[12px] p-1"
                 >
                   <DropdownMenuLabel className="text-muted-foreground/70 px-2 pt-1 pb-0.5 text-[11px] font-medium">
-                    Sort by
+                    {t("sidebar.sortBy")}
                   </DropdownMenuLabel>
                   <DropdownMenuItem
                     onSelect={() => orbitActions.setSidebarViewPrefs({ projectSort: "recent" })}
@@ -895,7 +901,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             : "text-muted-foreground",
                         )}
                       />
-                      <span className="truncate">Recent</span>
+                      <span className="truncate">{t("sidebar.sortRecent")}</span>
                     </span>
                     {sidebarProjectSort === "recent" && (
                       <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
@@ -916,7 +922,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             : "text-muted-foreground",
                         )}
                       />
-                      <span className="truncate">Name</span>
+                      <span className="truncate">{t("sidebar.sortName")}</span>
                     </span>
                     {sidebarProjectSort === "alphabetical" && (
                       <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
@@ -935,7 +941,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             : "text-muted-foreground",
                         )}
                       />
-                      <span className="truncate">Custom</span>
+                      <span className="truncate">{t("sidebar.sortCustom")}</span>
                     </span>
                     {sidebarProjectSort === "manual" && (
                       <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
@@ -945,7 +951,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   <DropdownMenuSeparator className="my-1" />
 
                   <DropdownMenuLabel className="text-muted-foreground/70 px-2 pt-0.5 pb-0.5 text-[11px] font-medium">
-                    Show
+                    {t("sidebar.show")}
                   </DropdownMenuLabel>
                   <DropdownMenuItem
                     onSelect={() => orbitActions.setSidebarViewPrefs({ threadFilter: "all" })}
@@ -960,7 +966,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             : "text-muted-foreground",
                         )}
                       />
-                      <span className="truncate">All</span>
+                      <span className="truncate">{t("sidebar.filterAll")}</span>
                     </span>
                     {sidebarThreadFilter === "all" && (
                       <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
@@ -981,7 +987,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             : "text-muted-foreground",
                         )}
                       />
-                      <span className="truncate">Active &amp; unread</span>
+                      <span className="truncate">{t("sidebar.filterActiveUnread")}</span>
                     </span>
                     {sidebarThreadFilter === "active_unread" && (
                       <Check className="text-foreground h-[13px] w-[13px] shrink-0 stroke-[2]" />
@@ -1007,7 +1013,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                           <ChevronsUpDown className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
                         )}
                         <span className="truncate">
-                          {anyProjectExpanded ? "Collapse all" : "Expand all"}
+                          {anyProjectExpanded ? t("sidebar.collapseAll") : t("sidebar.expandAll")}
                         </span>
                       </span>
                     </DropdownMenuItem>
@@ -1019,7 +1025,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   >
                     <span className="flex min-w-0 items-center gap-2">
                       <Archive className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                      <span className="truncate">Archived</span>
+                      <span className="truncate">{t("sidebar.archived")}</span>
                     </span>
                     {archivedCount > 0 && (
                       <span className="text-muted-foreground/70 shrink-0 text-[11px] tabular-nums">
@@ -1037,32 +1043,32 @@ export const FleetSidebar = memo(function FleetSidebar() {
           {hasFilterActive && (
             <div className="flex h-[24px] items-center justify-between gap-2 px-2 text-[11.5px]">
               <span className="text-sky-600 dark:text-sky-400 truncate font-medium">
-                Showing active &amp; unread
+                {t("sidebar.showingActiveUnread")}
               </span>
               <button
                 type="button"
                 onClick={() => orbitActions.setSidebarViewPrefs({ threadFilter: "all" })}
                 className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer transition-colors"
               >
-                Reset
+                {t("common.reset")}
               </button>
             </div>
           )}
 
           {!fleetHydrated && fleet.hosts.length === 0 ? null : fleet.hosts.length === 0 ? (
             <div className="text-muted-foreground mx-1 mt-1 space-y-2.5 rounded-xl border border-dashed p-4 text-center text-[13px]">
-              <p>No host connected</p>
+              <p>{t("sidebar.noHostConnected")}</p>
               <button
                 type="button"
                 onClick={() => orbitActions.openSettings("hosts")}
                 className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium hover:opacity-90"
               >
-                <Plus className="h-[14px] w-[14px]" /> Connect Host
+                <Plus className="h-[14px] w-[14px]" /> {t("sidebar.connectHost")}
               </button>
             </div>
           ) : displayProjects.length === 0 ? (
             <div className="text-muted-foreground/75 px-2 py-2 text-[13px]">
-              {hasFilterActive ? "No active or unread conversations" : "No projects yet"}
+              {hasFilterActive ? t("sidebar.noActiveOrUnread") : t("sidebar.noProjectsYet")}
             </div>
           ) : (
             <div className="space-y-0.5">
@@ -1214,7 +1220,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   }
                 }
 
-                // 2. Unclassified (`待归类`) conversations
+                // 2. Unfiled conversations
                 const rawUnclassified =
                   proj.unclassified_conversations !== undefined
                     ? proj.unclassified_conversations.filter((c) =>
@@ -1346,7 +1352,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                       };
                       const projTooltip = [
                         !singleHostMode ? `${host.display_name} · ${proj.primary_cwd}` : proj.primary_cwd,
-                        displayProjects.length > 1 ? "Drag to reorder" : null,
+                        displayProjects.length > 1 ? t("sidebar.dragToReorder") : null,
                       ]
                         .filter(Boolean)
                         .join(" · ");
@@ -1445,7 +1451,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                 <button
                                   type="button"
                                   data-proj-action="true"
-                                  title={`Offline · Reconnect ${host.display_name}`}
+                                  title={t("sidebar.offlineReconnect", { host: host.display_name })}
                                   onClick={() => {
                                     void orbitIpc.connectHost(host.host_id);
                                     void orbitIpc.refreshHost(host.host_id);
@@ -1494,7 +1500,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                 <button
                                   type="button"
                                   data-proj-action="true"
-                                  aria-label={`Project options for ${proj.name}`}
+                                  aria-label={t("sidebar.projectOptions", { project: proj.name })}
                                   onClick={(e) => {
                                     const r = e.currentTarget.getBoundingClientRect();
                                     setProjMenu({
@@ -1886,7 +1892,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                   className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
                                 >
                                   <span className="inline-flex h-[16px] w-[16px] shrink-0" />
-                                  <span>Show {hiddenCount} more…</span>
+                                  <span>{t("common.showMore", { count: hiddenCount })}</span>
                                 </button>
                               )}
 
@@ -1905,7 +1911,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                   className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
                                 >
                                   <span className="inline-flex h-[16px] w-[16px] shrink-0" />
-                                  <span>Show less</span>
+                                  <span>{t("common.showLess")}</span>
                                 </button>
                               )}
                           </div>
@@ -1943,17 +1949,17 @@ export const FleetSidebar = memo(function FleetSidebar() {
               )}
               {!isFleetUpdating && hasFleetUpdatesAvailable && (
                 <span
-                  aria-label="Update available"
+                  aria-label={t("sidebar.updateAvailable")}
                   className="absolute -top-0.5 -right-0.5 h-[6px] w-[6px] rounded-full bg-sky-500"
                 />
               )}
             </span>
-            <span className="truncate">Settings</span>
+            <span className="truncate">{t("sidebar.settings")}</span>
           </span>
 
           {!isFleetUpdating && hasFleetUpdatesAvailable ? (
             <span className="shrink-0 rounded-full bg-sky-500/12 px-1.5 py-0.5 text-[10px] font-medium text-sky-600 dark:text-sky-400">
-              Update
+              {t("sidebar.updateBadge")}
             </span>
           ) : (
             <span className="text-muted-foreground/55 shrink-0 text-[11.5px] opacity-0 transition-opacity group-hover/settings:opacity-100">
@@ -1966,15 +1972,18 @@ export const FleetSidebar = memo(function FleetSidebar() {
           <SimpleTooltip
             label={
               fleetHealth.total > 1
-                ? `${fleetHealth.online} of ${fleetHealth.total} hosts online · Manage hosts`
+                ? t("sidebar.hostsOnline", {
+                    online: fleetHealth.online,
+                    total: fleetHealth.total,
+                  })
                 : fleetHealth.connecting > 0
-                  ? "Connecting to host… · Manage hosts"
-                  : "Host offline · Manage hosts"
+                  ? t("sidebar.connectingToHost")
+                  : t("sidebar.hostOffline")
             }
           >
             <button
               type="button"
-              aria-label="Manage hosts"
+              aria-label={t("sidebar.manageHosts")}
               onClick={() => orbitActions.openSettings("hosts")}
               className="text-muted-foreground hover:text-foreground inline-flex h-[28px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] px-2 text-[11.5px] tabular-nums transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.055]"
             >
@@ -1996,8 +2005,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 {fleetHealth.total > 1
                   ? `${fleetHealth.online}/${fleetHealth.total}`
                   : fleetHealth.connecting > 0
-                    ? "Sync"
-                    : "Offline"}
+                    ? t("common.sync")
+                    : t("common.offline")}
               </span>
             </button>
           </SimpleTooltip>

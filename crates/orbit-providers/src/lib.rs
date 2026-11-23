@@ -11,6 +11,7 @@ pub mod claude;
 pub mod codex;
 pub mod driver;
 pub mod pi;
+pub mod readiness;
 pub mod shell_snapshot;
 pub mod side_question;
 
@@ -359,9 +360,14 @@ pub use acp_registry::{
     save_persisted_acp_registry, upsert_custom_acp_agent, validate_acp_agent_spec,
     validate_remote_registry_url,
 };
+pub use claude::{reap_snapshotted_claude_mcp_configs, snapshot_claude_mcp_config_files};
 pub use driver::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, ProviderSessionHandle,
     SessionLaunchConfig,
+};
+pub use readiness::{
+    PRIMARY_READINESS_PROVIDERS, ProviderAuthStatus, ProviderReadinessInfo,
+    probe_local_provider_readiness,
 };
 pub use shell_snapshot::{
     ShellSnapshotCache, ShellSnapshotStats, apply_cached_shell_env, apply_cached_std_shell_env,

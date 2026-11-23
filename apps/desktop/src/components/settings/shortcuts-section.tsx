@@ -5,6 +5,7 @@ import {
   SettingGroupLabel,
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
+import { useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import { isMacDesktop } from "@/lib/orbit-ipc";
 import { ShortcutKbd } from "@/components/ui/overlays";
@@ -17,6 +18,7 @@ interface ShortcutItem {
 }
 
 export function ShortcutsSection() {
+  const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const [query, setQuery] = useState("");
   const isMac = isMacDesktop();
@@ -27,40 +29,45 @@ export function ShortcutsSection() {
   const backspace = isMac ? "⌫" : "Backspace";
 
   const groups = useMemo(() => {
-    const all: ShortcutItem[] = [
-      { group: "Navigation", action: "Command Palette", keys: `${mod}K` },
-      { group: "Navigation", action: "Settings", keys: `${mod},` },
-      { group: "Navigation", action: "New Conversation", keys: `${mod}N` },
-      { group: "Navigation", action: "Next Pending Approval", keys: `${mod}${shift}A` },
-      { group: "Navigation", action: "Switch Conversation 1–9", keys: `${mod}1 .. ${mod}9` },
+    const navGroup = t("settings.groupNavigation");
+    const panelsGroup = t("settings.groupPanels");
+    const composerGroup = t("settings.groupComposer");
+    const approvalsGroup = t("settings.groupApprovals");
 
-      { group: "Panels", action: "Toggle Sidebar", keys: `${mod}B` },
-      { group: "Panels", action: "Toggle Right Side Panel", keys: `${mod}\\` },
-      { group: "Panels", action: "New Side Panel Tab", keys: `${mod}T` },
-      { group: "Panels", action: "Toggle Stage Overview", keys: `${mod}${alt}O` },
-      { group: "Panels", action: "Quick Open File", keys: `${mod}P` },
-      { group: "Panels", action: "Toggle Diff Review", keys: `${mod}D` },
-      { group: "Panels", action: "Toggle Terminal", keys: `${mod}J / ${ctrl}\`` },
-      { group: "Panels", action: "Side Question (/btw)", keys: `${mod};` },
-      { group: "Panels", action: "Open in External Editor", keys: `${mod}O` },
+    const all: ShortcutItem[] = [
+      { group: navGroup, action: t("settings.scCommandPalette"), keys: `${mod}K` },
+      { group: navGroup, action: t("settings.scSettings"), keys: `${mod},` },
+      { group: navGroup, action: t("settings.scNewConversation"), keys: `${mod}N` },
+      { group: navGroup, action: t("settings.scNextApproval"), keys: `${mod}${shift}A` },
+      { group: navGroup, action: t("settings.scSwitchConversation"), keys: `${mod}1 .. ${mod}9` },
+
+      { group: panelsGroup, action: t("settings.scToggleSidebar"), keys: `${mod}B` },
+      { group: panelsGroup, action: t("settings.scToggleSidePanel"), keys: `${mod}\\` },
+      { group: panelsGroup, action: t("settings.scNewSideTab"), keys: `${mod}T` },
+      { group: panelsGroup, action: t("settings.scToggleOverview"), keys: `${mod}${alt}O` },
+      { group: panelsGroup, action: t("settings.scQuickOpenFile"), keys: `${mod}P` },
+      { group: panelsGroup, action: t("settings.scToggleDiff"), keys: `${mod}D` },
+      { group: panelsGroup, action: t("settings.scToggleTerminal"), keys: `${mod}J / ${ctrl}\`` },
+      { group: panelsGroup, action: t("settings.scSideQuestion"), keys: `${mod};` },
+      { group: panelsGroup, action: t("settings.scExternalEditor"), keys: `${mod}O` },
 
       {
-        group: "Composer",
-        action: "Send or Queue Prompt",
+        group: composerGroup,
+        action: t("settings.scSendPrompt"),
         keys: enterToSend ? "Enter" : `${mod}Enter`,
       },
       {
-        group: "Composer",
-        action: "Insert New Line",
+        group: composerGroup,
+        action: t("settings.scNewLine"),
         keys: enterToSend ? `${shift}Enter` : "Enter",
       },
-      { group: "Composer", action: "Cycle Access Permissions", keys: `${shift}Tab` },
-      { group: "Composer", action: "Steer Running Agent", keys: `${mod}Enter` },
-      { group: "Composer", action: "Stop Generation", keys: "Esc Esc" },
+      { group: composerGroup, action: t("settings.scCyclePermissions"), keys: `${shift}Tab` },
+      { group: composerGroup, action: t("settings.scSteerAgent"), keys: `${mod}Enter` },
+      { group: composerGroup, action: t("settings.scStopGeneration"), keys: "Esc Esc" },
 
-      { group: "Approvals", action: "Allow Request", keys: `${mod}Y` },
-      { group: "Approvals", action: "Always Allow in Session", keys: `${mod}${shift}Y` },
-      { group: "Approvals", action: "Deny Request", keys: `${mod}${backspace}` },
+      { group: approvalsGroup, action: t("settings.scAllow"), keys: `${mod}Y` },
+      { group: approvalsGroup, action: t("settings.scAlwaysAllow"), keys: `${mod}${shift}Y` },
+      { group: approvalsGroup, action: t("settings.scDeny"), keys: `${mod}${backspace}` },
     ];
 
     const q = query.trim().toLowerCase();
@@ -80,13 +87,14 @@ export function ShortcutsSection() {
       map.set(item.group, list);
     }
     return Array.from(map.entries());
-  }, [mod, shift, alt, ctrl, backspace, query, enterToSend]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locale, mod, shift, alt, ctrl, backspace, query, enterToSend]);
 
   return (
     <div className="space-y-5">
       <SettingSectionHeader
-        title="Shortcuts"
-        description="Keyboard shortcuts across the workspace."
+        title={t("settings.shortcutsTitle")}
+        description={t("settings.shortcutsDesc")}
       />
 
       <div className="border-border bg-background/60 flex h-[34px] items-center gap-2 rounded-[10px] border px-3">
@@ -95,14 +103,14 @@ export function ShortcutsSection() {
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search shortcuts…"
+          placeholder={t("settings.searchShortcutsPlaceholder")}
           className="text-foreground placeholder:text-muted-foreground w-full bg-transparent text-[13px] outline-none"
         />
       </div>
 
       {groups.length === 0 ? (
         <div className="text-muted-foreground py-8 text-center text-[13px]">
-          No matching shortcuts.
+          {t("settings.noMatchingShortcuts")}
         </div>
       ) : (
         <div className="space-y-5">

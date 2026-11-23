@@ -3193,8 +3193,10 @@ dependencies = [
  "gdk",
  "gtk",
  "orbit-client-core",
+ "orbit-crypto",
  "orbit-protocol",
  "orbit-providers",
+ "qrcode",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3242,7 +3244,9 @@ version = "0.9.4"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
+ "hmac",
  "russh",
+ "sha1 0.11.0",
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
@@ -3825,6 +3829,12 @@ dependencies = [
  "memchr",
  "unicase",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-xml"

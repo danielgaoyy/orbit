@@ -96,7 +96,7 @@ async fn try_connect_daemon(
     if explicit_server.is_none() && !home_dir.join("identity.key").exists() {
         return Ok(None);
     }
-    match connect_cli_server(resolved_server, via_relay).await {
+    match connect_cli_server(home_dir, resolved_server, via_relay).await {
         Ok(client) => Ok(Some(client)),
         Err(err) => {
             if explicit_server.is_some() {

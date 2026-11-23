@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::highlighting::{
+    FontStyle, HighlightIterator, HighlightState, Highlighter, Style, Theme, ThemeSet,
+};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,10 +47,26 @@ pub struct TableRowView {
     pub cells: Vec<TableCellView>,
 }
 
+pub const DARK_PLAIN_FG_HEX: &str = "#E2E8F0";
+pub const LIGHT_PLAIN_FG_HEX: &str = "#24292F";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntaxThemeKind {
+    Dark,
+    Light,
+}
+
+fn default_light_fg_hex_string() -> String {
+    LIGHT_PLAIN_FG_HEX.to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HighlightedTokenView {
     pub text: String,
     pub fg_hex: String,
+    #[serde(default = "default_light_fg_hex_string")]
+    pub light_fg_hex: String,
     pub bold: bool,
     pub italic: bool,
 }
@@ -101,12 +118,40 @@ fn syntax_set() -> &'static SyntaxSet {
     PS.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
-fn default_dark_theme() -> Option<&'static Theme> {
+fn bundled_theme_set() -> &'static ThemeSet {
     static TS: OnceLock<ThemeSet> = OnceLock::new();
-    let ts = TS.get_or_init(ThemeSet::load_defaults);
+    TS.get_or_init(ThemeSet::load_defaults)
+}
+
+fn default_dark_theme() -> Option<&'static Theme> {
+    let ts = bundled_theme_set();
     ts.themes
         .get("base16-ocean.dark")
         .or_else(|| ts.themes.values().next())
+}
+
+fn default_light_theme() -> Option<&'static Theme> {
+    let ts = bundled_theme_set();
+    ts.themes
+        .get("InspiredGitHub")
+        .or_else(|| ts.themes.get("Solarized (light)"))
+        .or_else(|| ts.themes.values().next())
+}
+
+/// Resolve the bundled `syntect` theme for the given appearance mode.
+pub fn syntax_theme(kind: SyntaxThemeKind) -> Option<&'static Theme> {
+    match kind {
+        SyntaxThemeKind::Dark => default_dark_theme(),
+        SyntaxThemeKind::Light => default_light_theme(),
+    }
+}
+
+/// Default plain-text token foreground color for the given appearance mode.
+pub fn default_plain_fg_hex(kind: SyntaxThemeKind) -> &'static str {
+    match kind {
+        SyntaxThemeKind::Dark => DARK_PLAIN_FG_HEX,
+        SyntaxThemeKind::Light => LIGHT_PLAIN_FG_HEX,
+    }
 }
 
 /// Heal an unclosed fenced code block or trailing unclosed display math block (`$$` / `\[`)
@@ -186,7 +231,8 @@ fn plain_code_lines(code: &str) -> Vec<HighlightedLineView> {
             line_number: (idx + 1) as u32,
             tokens: vec![HighlightedTokenView {
                 text: line.trim_end_matches(&['\r', '\n'][..]).to_string(),
-                fg_hex: "#E2E8F0".to_string(),
+                fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
                 bold: false,
                 italic: false,
             }],
@@ -197,7 +243,8 @@ fn plain_code_lines(code: &str) -> Vec<HighlightedLineView> {
             line_number: 1,
             tokens: vec![HighlightedTokenView {
                 text: code.to_string(),
-                fg_hex: "#E2E8F0".to_string(),
+                fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
                 bold: false,
                 italic: false,
             }],
@@ -418,7 +465,8 @@ pub fn highlight_code_lines_capped(
             .unwrap_or_else(|| ps.find_syntax_plain_text())
     };
 
-    let Some(theme) = default_dark_theme() else {
+    let (Some(dark_theme), Some(light_theme)) = (default_dark_theme(), default_light_theme())
+    else {
         return code
             .lines()
             .enumerate()
@@ -426,7 +474,8 @@ pub fn highlight_code_lines_capped(
                 line_number: (idx + 1) as u32,
                 tokens: vec![HighlightedTokenView {
                     text: line.to_string(),
-                    fg_hex: "#E2E8F0".to_string(),
+                    fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                    light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
                     bold: false,
                     italic: false,
                 }],
@@ -434,7 +483,11 @@ pub fn highlight_code_lines_capped(
             .collect();
     };
 
-    let mut highlighter = HighlightLines::new(syntax, theme);
+    let dark_highlighter = Highlighter::new(dark_theme);
+    let light_highlighter = Highlighter::new(light_theme);
+    let mut parse_state = ParseState::new(syntax);
+    let mut dark_state = HighlightState::new(&dark_highlighter, ScopeStack::new());
+    let mut light_state = HighlightState::new(&light_highlighter, ScopeStack::new());
     let mut out = Vec::with_capacity(
         code.bytes()
             .filter(|&b| b == b'\n')
@@ -444,7 +497,7 @@ pub fn highlight_code_lines_capped(
 
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     #[inline]
-    fn rgb_to_hex(r: u8, g: u8, b: u8) -> String {
+    fn rgb_to_hex(r: u8, g: u8, b: u8, fallback: &str) -> String {
         let bytes = [
             b'#',
             HEX[(r >> 4) as usize],
@@ -454,46 +507,106 @@ pub fn highlight_code_lines_capped(
             HEX[(b >> 4) as usize],
             HEX[(b & 0x0F) as usize],
         ];
-        String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| "#E2E8F0".to_string())
+        String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| fallback.to_string())
+    }
+
+    fn merge_dual_theme_spans(
+        dark_ranges: &[(Style, &str)],
+        light_ranges: &[(Style, &str)],
+    ) -> Vec<HighlightedTokenView> {
+        let mut coalesced: Vec<HighlightedTokenView> =
+            Vec::with_capacity(dark_ranges.len().max(light_ranges.len()));
+        let mut di = 0usize;
+        let mut doff = 0usize;
+        let mut li = 0usize;
+        let mut loff = 0usize;
+
+        while di < dark_ranges.len() && li < light_ranges.len() {
+            let (d_style, d_str) = dark_ranges[di];
+            let (l_style, l_str) = light_ranges[li];
+            let d_rem = d_str.get(doff..).unwrap_or("");
+            let l_rem = l_str.get(loff..).unwrap_or("");
+
+            if d_rem.is_empty() {
+                di += 1;
+                doff = 0;
+                continue;
+            }
+            if l_rem.is_empty() {
+                li += 1;
+                loff = 0;
+                continue;
+            }
+
+            let take = d_rem.len().min(l_rem.len());
+            if let Some(piece) = d_rem.get(..take) {
+                let clean = piece.trim_end_matches(&['\r', '\n'][..]);
+                if !clean.is_empty() {
+                    let fg_hex = rgb_to_hex(
+                        d_style.foreground.r,
+                        d_style.foreground.g,
+                        d_style.foreground.b,
+                        DARK_PLAIN_FG_HEX,
+                    );
+                    let light_fg_hex = rgb_to_hex(
+                        l_style.foreground.r,
+                        l_style.foreground.g,
+                        l_style.foreground.b,
+                        LIGHT_PLAIN_FG_HEX,
+                    );
+                    let bold = d_style.font_style.contains(FontStyle::BOLD);
+                    let italic = d_style.font_style.contains(FontStyle::ITALIC);
+                    if let Some(prev) = coalesced.last_mut()
+                        && prev.fg_hex == fg_hex
+                        && prev.light_fg_hex == light_fg_hex
+                        && prev.bold == bold
+                        && prev.italic == italic
+                    {
+                        prev.text.push_str(clean);
+                    } else {
+                        coalesced.push(HighlightedTokenView {
+                            text: clean.to_string(),
+                            fg_hex,
+                            light_fg_hex,
+                            bold,
+                            italic,
+                        });
+                    }
+                }
+            }
+
+            doff += take;
+            if doff >= d_str.len() {
+                di += 1;
+                doff = 0;
+            }
+            loff += take;
+            if loff >= l_str.len() {
+                li += 1;
+                loff = 0;
+            }
+        }
+        coalesced
     }
 
     for (idx, line) in LinesWithEndings::from(code).enumerate() {
         let tokens = if idx < max_highlighted_lines {
-            match highlighter.highlight_line(line, ps) {
-                Ok(ranges) => {
-                    // Coalesce adjacent tokens that share identical `(fg_hex, bold, italic)`
-                    // styles; this reduces IPC JSON payload & DOM spans by ~45-60% with zero
-                    // visual difference.
-                    let mut coalesced: Vec<HighlightedTokenView> = Vec::with_capacity(ranges.len());
-                    for (style, slice) in ranges {
-                        let clean = slice.trim_end_matches(&['\r', '\n'][..]);
-                        if clean.is_empty() {
-                            continue;
-                        }
-                        let fg_hex =
-                            rgb_to_hex(style.foreground.r, style.foreground.g, style.foreground.b);
-                        let bold = style.font_style.contains(FontStyle::BOLD);
-                        let italic = style.font_style.contains(FontStyle::ITALIC);
-                        if let Some(prev) = coalesced.last_mut()
-                            && prev.fg_hex == fg_hex
-                            && prev.bold == bold
-                            && prev.italic == italic
-                        {
-                            prev.text.push_str(clean);
-                        } else {
-                            coalesced.push(HighlightedTokenView {
-                                text: clean.to_string(),
-                                fg_hex,
-                                bold,
-                                italic,
-                            });
-                        }
-                    }
-                    coalesced
+            match parse_state.parse_line(line, ps) {
+                Ok(ops) => {
+                    // Single grammar parse pass feeds both native dark (`base16-ocean.dark`) and
+                    // native light (`InspiredGitHub`) themes, then coalesces adjacent identical tokens.
+                    let dark_ranges: Vec<(Style, &str)> =
+                        HighlightIterator::new(&mut dark_state, &ops, line, &dark_highlighter)
+                            .collect();
+                    let light_ranges: Vec<(Style, &str)> =
+                        HighlightIterator::new(&mut light_state, &ops, line, &light_highlighter)
+                            .collect();
+                    merge_dual_theme_spans(&dark_ranges, &light_ranges)
                 }
                 Err(_) => vec![HighlightedTokenView {
                     text: line.trim_end_matches(&['\r', '\n'][..]).to_string(),
-                    fg_hex: "#E2E8F0".to_string(),
+                    fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                    light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
                     bold: false,
                     italic: false,
                 }],
@@ -501,7 +614,8 @@ pub fn highlight_code_lines_capped(
         } else {
             vec![HighlightedTokenView {
                 text: line.trim_end_matches(&['\r', '\n'][..]).to_string(),
-                fg_hex: "#E2E8F0".to_string(),
+                fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
                 bold: false,
                 italic: false,
             }]
@@ -518,7 +632,8 @@ pub fn highlight_code_lines_capped(
             line_number: 1,
             tokens: vec![HighlightedTokenView {
                 text: code.to_string(),
-                fg_hex: "#E2E8F0".to_string(),
+                fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
                 bold: false,
                 italic: false,
             }],
@@ -2048,7 +2163,8 @@ diff --git a/src/lib.rs b/src/lib.rs
                 assert!(raw_code.contains("unique_streaming_prefix_9911"));
                 assert_eq!(lines.len(), 2);
                 assert_eq!(lines[0].tokens.len(), 1);
-                assert_eq!(lines[0].tokens[0].fg_hex, "#E2E8F0");
+                assert_eq!(lines[0].tokens[0].fg_hex, DARK_PLAIN_FG_HEX);
+                assert_eq!(lines[0].tokens[0].light_fg_hex, LIGHT_PLAIN_FG_HEX);
                 assert!(
                     !code_highlight_cache_contains("rust", raw_code),
                     "streaming unclosed code prefix must not pollute global highlight cache"
@@ -2158,5 +2274,54 @@ diff --git a/src/lib.rs b/src/lib.rs
         let blocks2 = parse_markdown_blocks(streaming_bracket, true);
         assert_eq!(blocks2.len(), 2, "blocks2: {blocks2:#?}");
         assert!(matches!(blocks2[1], RichBlockView::MathBlock { .. }));
+    }
+
+    fn hex_relative_luminance(hex: &str) -> f64 {
+        let clean = hex.trim_start_matches('#');
+        assert_eq!(clean.len(), 6, "expected #RRGGBB hex, got {hex}");
+        let r = u8::from_str_radix(&clean[0..2], 16).expect("red") as f64 / 255.0;
+        let g = u8::from_str_radix(&clean[2..4], 16).expect("green") as f64 / 255.0;
+        let b = u8::from_str_radix(&clean[4..6], 16).expect("blue") as f64 / 255.0;
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    #[test]
+    fn native_light_syntect_theme_emits_inspired_github_colors_alongside_dark() {
+        assert!(syntax_theme(SyntaxThemeKind::Dark).is_some());
+        assert!(syntax_theme(SyntaxThemeKind::Light).is_some());
+
+        let rust_code = "/// Doc comment\npub fn greet(name: &str) -> String {\n    format!(\"hello {name}\")\n}\n";
+        let lines = highlight_code_lines("rs", rust_code);
+        assert_eq!(lines.len(), 4);
+
+        let all_tokens: Vec<&HighlightedTokenView> =
+            lines.iter().flat_map(|l| l.tokens.iter()).collect();
+        assert!(
+            all_tokens.len() > 6,
+            "expected multiple highlighted tokens, got {}",
+            all_tokens.len()
+        );
+
+        let mut distinct_light_colors = std::collections::HashSet::new();
+        let mut dark_lum_sum = 0.0;
+        let mut light_lum_sum = 0.0;
+        for tok in &all_tokens {
+            assert!(tok.fg_hex.starts_with('#') && tok.fg_hex.len() == 7);
+            assert!(tok.light_fg_hex.starts_with('#') && tok.light_fg_hex.len() == 7);
+            distinct_light_colors.insert(tok.light_fg_hex.as_str());
+            dark_lum_sum += hex_relative_luminance(&tok.fg_hex);
+            light_lum_sum += hex_relative_luminance(&tok.light_fg_hex);
+        }
+
+        assert!(
+            distinct_light_colors.len() >= 3,
+            "InspiredGitHub light theme should produce distinct syntax colors, got {distinct_light_colors:?}"
+        );
+        let avg_dark = dark_lum_sum / all_tokens.len() as f64;
+        let avg_light = light_lum_sum / all_tokens.len() as f64;
+        assert!(
+            avg_light < avg_dark,
+            "light-theme ink luminance ({avg_light:.3}) must be darker than dark-theme ink ({avg_dark:.3})"
+        );
     }
 }

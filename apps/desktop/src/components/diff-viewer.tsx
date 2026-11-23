@@ -10,7 +10,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { adaptTokenColor } from "@/lib/code-highlight";
+import { resolveTokenColor } from "@/lib/code-highlight";
 import { useImeCompositionGuard } from "@/lib/ime";
 import type {
   DiffFileView,
@@ -195,7 +195,7 @@ function renderTokensWithInlineSpans(
       <span
         key={idx}
         style={{
-          color: adaptTokenColor(tok.fg_hex, isDark),
+          color: resolveTokenColor(tok, isDark),
           fontWeight: tok.bold ? 600 : undefined,
           fontStyle: tok.italic ? "italic" : undefined,
         }}
@@ -217,7 +217,7 @@ function renderTokensWithInlineSpans(
     offset = tokEnd;
 
     const style: React.CSSProperties = {
-      color: adaptTokenColor(tok.fg_hex, isDark),
+      color: resolveTokenColor(tok, isDark),
       fontWeight: tok.bold ? 600 : undefined,
       fontStyle: tok.italic ? "italic" : undefined,
     };

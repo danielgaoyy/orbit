@@ -19,6 +19,8 @@ import {
   Tablet,
   X,
 } from "lucide-react";
+import { Select } from "@/components/ui/select";
+import { useI18n } from "@/lib/i18n";
 import { orbitIpc } from "@/lib/orbit-ipc";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -115,6 +117,7 @@ export const BrowserTab = memo(function BrowserTab({
   visible?: boolean;
   overlayState?: BrowserTabOverlayState;
 }) {
+  const { t } = useI18n();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const detectedUrls = useOrbitSelector((s) =>
@@ -496,7 +499,11 @@ export const BrowserTab = memo(function BrowserTab({
                 ? setCdpAddressInput(e.target.value)
                 : setPreviewAddressInput(e.target.value)
             }
-            placeholder={isCdpMode ? "Navigate CDP session (http/https)…" : "localhost:5173 or https://…"}
+            placeholder={
+              isCdpMode
+                ? t("sidePanel.addressPlaceholderCdp")
+                : t("sidePanel.addressPlaceholderPreview")
+            }
             className="text-foreground placeholder:text-muted-foreground min-w-0 flex-1 bg-transparent font-mono text-[11.5px] outline-none"
           />
         </form>
@@ -513,7 +520,7 @@ export const BrowserTab = memo(function BrowserTab({
                 : "text-muted-foreground hover:text-foreground",
             )}
           >
-            Preview
+            {t("sidePanel.preview")}
           </button>
           <button
             type="button"
@@ -526,7 +533,7 @@ export const BrowserTab = memo(function BrowserTab({
             )}
           >
             {hasCdpSessions && <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />}
-            <span>CDP</span>
+            <span>{t("sidePanel.cdp")}</span>
           </button>
         </div>
 
@@ -535,10 +542,10 @@ export const BrowserTab = memo(function BrowserTab({
           <div className="bg-muted hidden h-[26px] shrink-0 items-center rounded-lg p-0.5 sm:inline-flex">
             {(
               [
-                { id: "fluid", icon: Maximize2, label: "Fluid width" },
-                { id: "desktop", icon: Monitor, label: "Desktop (1280px)" },
-                { id: "tablet", icon: Tablet, label: "Tablet (768px)" },
-                { id: "mobile", icon: Smartphone, label: "Mobile (390px)" },
+                { id: "fluid", icon: Maximize2, label: t("sidePanel.fluidWidth") },
+                { id: "desktop", icon: Monitor, label: t("sidePanel.desktopViewport") },
+                { id: "tablet", icon: Tablet, label: t("sidePanel.tabletViewport") },
+                { id: "mobile", icon: Smartphone, label: t("sidePanel.mobileViewport") },
               ] as const
             ).map((preset) => {
               const Icon = preset.icon;
@@ -564,7 +571,7 @@ export const BrowserTab = memo(function BrowserTab({
           <div className="flex shrink-0 items-center gap-0.5">
             <button
               type="button"
-              title="Refresh snapshot & screenshot"
+              title={t("sidePanel.refreshSnapshot")}
               disabled={!activeCdpSession || cdpBusy}
               onClick={captureCdpScreenshot}
               className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
@@ -573,7 +580,7 @@ export const BrowserTab = memo(function BrowserTab({
             </button>
             <button
               type="button"
-              title="Close CDP session"
+              title={t("sidePanel.closeCdpSession")}
               disabled={!activeCdpSession || cdpBusy || !selectedHostId}
               onClick={() => {
                 if (selectedHostId && activeCdpSession) {
@@ -594,7 +601,7 @@ export const BrowserTab = memo(function BrowserTab({
         <div className="flex shrink-0 items-center gap-0.5">
           <button
             type="button"
-            title="Open in native Orbit window"
+            title={t("sidePanel.openNativeWindow")}
             disabled={!effectiveExternalUrl}
             onClick={openPopout}
             className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
@@ -603,7 +610,7 @@ export const BrowserTab = memo(function BrowserTab({
           </button>
           <button
             type="button"
-            title="Open in system browser"
+            title={t("sidePanel.openSystemBrowser")}
             disabled={!effectiveExternalUrl}
             onClick={openExternal}
             className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35"
@@ -618,19 +625,23 @@ export const BrowserTab = memo(function BrowserTab({
         <div className="border-border bg-sidebar/60 flex shrink-0 items-center justify-between gap-2 border-b px-2.5 py-1 text-[11px]">
           <div className="flex min-w-0 items-center gap-2">
             {cdpSessions.length > 1 && selectedHostId ? (
-              <select
+              <Select<string>
+                size="compact"
+                align="start"
+                ariaLabel="Active CDP browser session"
                 value={activeCdpSession.session_id}
-                onChange={(e) =>
-                  orbitActions.selectBrowserSession(selectedHostId, e.target.value)
+                options={cdpSessions.map((s) => ({
+                  value: s.session_id,
+                  label: s.session_id,
+                  description: s.title || s.url || undefined,
+                  mono: true,
+                }))}
+                triggerClassName="h-[22px] max-w-[164px] bg-canvas"
+                menuClassName="min-w-[200px] max-w-[280px]"
+                onChange={(sessionId) =>
+                  orbitActions.selectBrowserSession(selectedHostId, sessionId)
                 }
-                className="border-border bg-canvas text-foreground h-[22px] rounded-md border px-1.5 font-mono text-[11px] outline-none"
-              >
-                {cdpSessions.map((s) => (
-                  <option key={s.session_id} value={s.session_id}>
-                    {s.session_id}
-                  </option>
-                ))}
-              </select>
+              />
             ) : (
               <span className="text-muted-foreground font-mono text-[10.5px]">
                 {activeCdpSession.session_id}

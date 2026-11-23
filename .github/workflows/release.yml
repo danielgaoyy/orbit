@@ -344,6 +344,8 @@ jobs:
     name: Build Native Android APK (Jetpack Compose + UniFFI, minSdk 29)
     needs: rust-quality-and-e2e
     runs-on: ubuntu-latest
+    outputs:
+      signed: ${{ steps.android-signing.outputs.signed }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -359,15 +361,58 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build Rust UniFFI JNI Libraries (API 29+)
         run: ./apps/android/scripts/build-rust-android.sh
+      - name: Probe Android Release Signing Secrets
+        id: android-signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ORBIT_ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PWD: ${{ secrets.ORBIT_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ORBIT_ANDROID_KEY_ALIAS }}
+          KEY_PWD: ${{ secrets.ORBIT_ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PWD" ] && \
+             [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PWD" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Android release signing secrets are not configured; building an unsigned APK (Orbit-Android-unsigned.apk)."
+          fi
       - name: Assemble Release APK (Jetpack Compose Material 3)
         working-directory: apps/android
+        env:
+          SHOULD_SIGN: ${{ steps.android-signing.outputs.signed }}
+          ORBIT_ANDROID_KEYSTORE_B64: ${{ secrets.ORBIT_ANDROID_KEYSTORE_B64 }}
+          ORBIT_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ORBIT_ANDROID_KEYSTORE_PASSWORD }}
+          ORBIT_ANDROID_KEY_ALIAS: ${{ secrets.ORBIT_ANDROID_KEY_ALIAS }}
+          ORBIT_ANDROID_KEY_PASSWORD: ${{ secrets.ORBIT_ANDROID_KEY_PASSWORD }}
         run: |
-          gradle assembleRelease --no-daemon
-          cp app/build/outputs/apk/release/app-release.apk Orbit-Android-arm64.apk
+          set -euo pipefail
+          if [ "$SHOULD_SIGN" = "true" ]; then
+            SIGN_DIR="$RUNNER_TEMP/android-sign"
+            mkdir -p "$SIGN_DIR"
+            chmod 700 "$SIGN_DIR"
+            umask 077
+            printf '%s' "$ORBIT_ANDROID_KEYSTORE_B64" | base64 -d > "$SIGN_DIR/release.jks"
+            export ORBIT_ANDROID_KEYSTORE_PATH="$SIGN_DIR/release.jks"
+            gradle assembleRelease --no-daemon
+            APK_PATH="app/build/outputs/apk/release/app-release.apk"
+            APKSIGNER="$(find "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
+            if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
+              echo "::error::Failed to locate apksigner in Android build-tools"
+              exit 1
+            fi
+            "$APKSIGNER" verify --verbose "$APK_PATH"
+            cp "$APK_PATH" Orbit-Android-arm64.apk
+          else
+            gradle assembleRelease --no-daemon
+            cp app/build/outputs/apk/release/app-release-unsigned.apk Orbit-Android-unsigned.apk
+          fi
+      - name: Cleanup Temporary Android Signing Materials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/android-sign"
       - uses: actions/upload-artifact@v4
         with:
-          name: Orbit-Android-arm64.apk
-          path: apps/android/Orbit-Android-arm64.apk
+          name: Orbit-Android-apk
+          path: apps/android/Orbit-Android-*.apk
 
   build-ios-ipa:
     name: Build Native iOS App (SwiftUI iOS 16.4+ + UniFFI XCFramework)
@@ -551,6 +596,7 @@ jobs:
         id: release-notes
         env:
           NOTARIZED: ${{ needs.build-macos-desktop.outputs.notarized }}
+          ANDROID_SIGNED: ${{ needs.build-android-apk.outputs.signed }}
           HARMONY_SIGNED: ${{ needs.build-harmony-hap.outputs.signed }}
         run: |
           {
@@ -563,6 +609,12 @@ jobs:
           > ```
 
           NOTE
+            fi
+            if [ "$ANDROID_SIGNED" != "true" ]; then
+              cat <<'ANOTE'
+          > **Android Sideload Note**: `Orbit-Android-unsigned.apk` is unsigned because Android release signing secrets (`ORBIT_ANDROID_KEYSTORE_*`) are not configured. Sign it with your release keystore via `apksigner` before installing on a device.
+
+          ANOTE
             fi
             if [ "$HARMONY_SIGNED" != "true" ]; then
               cat <<'HNOTE'
@@ -586,7 +638,7 @@ jobs:
             release-dist/orbit-cli-linux-arm64
             release-dist/orbit-cli-linux-x64
             release-dist/orbit-windows-x86_64.exe
-            release-dist/Orbit-Android-arm64.apk
+            release-dist/Orbit-Android-*.apk
             release-dist/Orbit-iOS-sideload.ipa
             release-dist/Orbit-HarmonyOS.hap
             release-dist/SHA256SUMS.txt

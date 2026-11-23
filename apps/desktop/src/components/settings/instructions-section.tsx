@@ -12,6 +12,7 @@ import {
   Save,
 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { SettingSelect, type SettingSelectOption } from "@/components/settings/settings-primitives";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
@@ -230,6 +231,8 @@ export function InstructionsSection() {
   const [etagConflict, setEtagConflict] = useState(false);
   const [copiedMerged, setCopiedMerged] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
+  const [discardDialogOpen, setDiscardDialogOpen] = useState(false);
+  const pendingDiscardActionRef = useRef<(() => void) | null>(null);
 
   const listSeqRef = useRef(0);
   const readSeqRef = useRef(0);
@@ -249,10 +252,17 @@ export function InstructionsSection() {
 
   const dirty = draftContent !== loadedContent || (!loadedExists && draftContent.length > 0);
 
-  const confirmDiscardIfDirty = useCallback((): boolean => {
-    if (!dirty) return true;
-    return window.confirm("Discard unsaved changes to this instruction file?");
-  }, [dirty]);
+  const runWithDiscardGuard = useCallback(
+    (action: () => void) => {
+      if (!dirty) {
+        action();
+        return;
+      }
+      pendingDiscardActionRef.current = action;
+      setDiscardDialogOpen(true);
+    },
+    [dirty],
+  );
 
   const selectedEntry: InstructionFileEntry | null = useMemo(() => {
     if (!snapshot || !selectedPath) return null;
@@ -474,16 +484,22 @@ export function InstructionsSection() {
   const handleQuickCreate = useCallback(
     (entry: InstructionFileEntry) => {
       if (!activeHostId || !activeCwd) return;
-      if (entry.path !== selectedPath && !confirmDiscardIfDirty()) return;
-      void loadFile(activeHostId, activeCwd, entry, { prefillTemplate: true }).then(() => {
-        if (focusTimerRef.current !== null) window.clearTimeout(focusTimerRef.current);
-        focusTimerRef.current = window.setTimeout(() => {
-          focusTimerRef.current = null;
-          textareaRef.current?.focus();
-        }, 30);
-      });
+      const openTemplate = () => {
+        void loadFile(activeHostId, activeCwd, entry, { prefillTemplate: true }).then(() => {
+          if (focusTimerRef.current !== null) window.clearTimeout(focusTimerRef.current);
+          focusTimerRef.current = window.setTimeout(() => {
+            focusTimerRef.current = null;
+            textareaRef.current?.focus();
+          }, 30);
+        });
+      };
+      if (entry.path !== selectedPath) {
+        runWithDiscardGuard(openTemplate);
+        return;
+      }
+      openTemplate();
     },
-    [activeHostId, activeCwd, selectedPath, confirmDiscardIfDirty, loadFile],
+    [activeHostId, activeCwd, selectedPath, runWithDiscardGuard, loadFile],
   );
 
   // Cmd+S / Ctrl+S shortcut strictly scoped to active Settings > Instructions view
@@ -495,6 +511,7 @@ export function InstructionsSection() {
           e.isComposing ||
           activeView !== "settings" ||
           commandPaletteOpen ||
+          discardDialogOpen ||
           !selectedPath ||
           fileLoading ||
           saving ||
@@ -511,6 +528,7 @@ export function InstructionsSection() {
   }, [
     activeView,
     commandPaletteOpen,
+    discardDialogOpen,
     selectedPath,
     fileLoading,
     saving,
@@ -621,8 +639,9 @@ export function InstructionsSection() {
             disabled={!activeHostId || !activeCwd || listLoading}
             onClick={() => {
               if (!activeHostId || !activeCwd) return;
-              if (!confirmDiscardIfDirty()) return;
-              void loadHierarchy(activeHostId, activeCwd, selectedPath);
+              runWithDiscardGuard(() => {
+                void loadHierarchy(activeHostId, activeCwd, selectedPath);
+              });
             }}
             className="border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-lg border transition-colors disabled:cursor-not-allowed disabled:opacity-45"
           >
@@ -639,9 +658,10 @@ export function InstructionsSection() {
             options={hostSelectOptions}
             onChange={(hostId) => {
               if (hostId === activeHostId) return;
-              if (!confirmDiscardIfDirty()) return;
-              setActiveHostId(hostId);
-              orbitActions.setInstructionsTarget(null);
+              runWithDiscardGuard(() => {
+                setActiveHostId(hostId);
+                orbitActions.setInstructionsTarget(null);
+              });
             }}
             placeholder="Select host…"
             triggerClassName="min-w-[140px] max-w-[190px]"
@@ -652,11 +672,12 @@ export function InstructionsSection() {
           options={cwdSelectOptions}
           onChange={(cwd) => {
             if (cwd === activeCwd) return;
-            if (!confirmDiscardIfDirty()) return;
-            setActiveCwd(cwd);
-            if (activeHostId) {
-              orbitActions.setInstructionsTarget({ hostId: activeHostId, cwd });
-            }
+            runWithDiscardGuard(() => {
+              setActiveCwd(cwd);
+              if (activeHostId) {
+                orbitActions.setInstructionsTarget({ hostId: activeHostId, cwd });
+              }
+            });
           }}
           placeholder="Select workspace…"
           disabled={cwdSelectOptions.length === 0}
@@ -709,9 +730,10 @@ export function InstructionsSection() {
                         type="button"
                         onClick={() => {
                           if (!activeHostId || !activeCwd || entry.path === selectedPath) return;
-                          if (!confirmDiscardIfDirty()) return;
-                          void loadFile(activeHostId, activeCwd, entry, {
-                            prefillTemplate: !entry.exists,
+                          runWithDiscardGuard(() => {
+                            void loadFile(activeHostId, activeCwd, entry, {
+                              prefillTemplate: !entry.exists,
+                            });
                           });
                         }}
                         className={cn(
@@ -981,6 +1003,27 @@ export function InstructionsSection() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={discardDialogOpen}
+        onOpenChange={(open) => {
+          setDiscardDialogOpen(open);
+          if (!open) pendingDiscardActionRef.current = null;
+        }}
+        title="Discard unsaved changes?"
+        description={
+          selectedEntry
+            ? `Unsaved changes to ${selectedEntry.filename} will be lost.`
+            : "Unsaved changes to this instruction file will be lost."
+        }
+        confirmLabel="Discard"
+        tone="danger"
+        onConfirm={() => {
+          const action = pendingDiscardActionRef.current;
+          pendingDiscardActionRef.current = null;
+          action?.();
+        }}
+      />
     </div>
   );
 }

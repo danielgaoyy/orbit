@@ -4,10 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use orbit_protocol::{PROTOCOL_VERSION, WireMessage};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message as TungMsg};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRole {
     Daemon,
@@ -67,36 +63,72 @@ pub fn normalize_relay_url(raw: &str) -> anyhow::Result<String> {
     orbit_relay_transport::normalize_relay_url(raw).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Perform a fast 6-second preflight WebSocket check against the Relay control endpoint
+/// Perform a fast 6-second read-only HTTP preflight check against `/v1/daemon/probe`
 /// (supports both direct `ws(s)://` and tunneled `ssh+relay://`).
+///
+/// Never opens `/v1/daemon/control` and never mutates host registrations, ensuring a probe
+/// can never displace an active daemon session.
 pub async fn preflight_probe_relay(relay_base: &str, pubkey: &str) -> RelayProbeOutcome {
-    let path_and_query = format!("/v1/daemon/control?pubkey={pubkey}");
+    let endpoint = match orbit_relay_transport::parse_relay_endpoint(relay_base) {
+        Ok(ep) => ep,
+        Err(e) => return RelayProbeOutcome::Unreachable(e.to_string()),
+    };
+    let path_and_query = format!("/v1/daemon/probe?pubkey={pubkey}");
 
-    let res = tokio::time::timeout(
-        Duration::from_secs(6),
-        orbit_relay_transport::connect_relay_ws(relay_base, &path_and_query),
-    )
-    .await;
-
-    match res {
-        Ok(Ok(mut ws)) => {
-            let _ = SinkExt::close(&mut ws).await;
-            RelayProbeOutcome::Authorized
-        }
-        Ok(Err(orbit_relay_transport::RelayTransportError::WebSocket(err))) if matches!(err.as_ref(), WsError::Http(resp) if resp.status().as_u16() == 403) => {
-            RelayProbeOutcome::Forbidden403
-        }
-        Ok(Err(e)) => {
-            let msg = e.to_string();
-            if msg.contains("403") {
-                RelayProbeOutcome::Forbidden403
+    let probe_res: Result<(u16, String), String> = match endpoint {
+        orbit_relay_transport::RelayEndpoint::DirectWs(base_url) => {
+            let http_base = if let Some(rest) = base_url.strip_prefix("wss://") {
+                format!("https://{rest}")
+            } else if let Some(rest) = base_url.strip_prefix("ws://") {
+                format!("http://{rest}")
             } else {
-                RelayProbeOutcome::Unreachable(msg)
+                base_url
+            };
+            let url = format!("{}{}", http_base.trim_end_matches('/'), path_and_query);
+            match reqwest::Client::builder()
+                .timeout(Duration::from_secs(6))
+                .build()
+            {
+                Ok(client) => match client.get(&url).send().await {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let body = resp.text().await.unwrap_or_default();
+                        Ok((status, body))
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
             }
         }
-        Err(_) => RelayProbeOutcome::Unreachable(
-            "connection timed out after 6s (check SSH connectivity / relay port)".to_string(),
+        orbit_relay_transport::RelayEndpoint::SshTunnel(spec) => {
+            match tokio::time::timeout(
+                Duration::from_secs(6),
+                orbit_relay_transport::http_get_over_ssh_relay(&spec, &path_and_query),
+            )
+            .await
+            {
+                Ok(Ok(res)) => Ok(res),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err(
+                    "connection timed out after 6s (check SSH connectivity / relay port)"
+                        .to_string(),
+                ),
+            }
+        }
+    };
+
+    match probe_res {
+        Ok((200, body)) if body.trim() == orbit_relay::RELAY_PROBE_OK_BODY => {
+            RelayProbeOutcome::Authorized
+        }
+        Ok((403, _)) => RelayProbeOutcome::Forbidden403,
+        Ok((400, _)) => RelayProbeOutcome::Unreachable(
+            "relay rejected malformed host public key (HTTP 400)".to_string(),
         ),
+        Ok((status, _)) => RelayProbeOutcome::Unreachable(format!(
+            "unexpected response from Orbit Relay probe endpoint (HTTP {status})"
+        )),
+        Err(msg) => RelayProbeOutcome::Unreachable(msg),
     }
 }
 
@@ -140,31 +172,25 @@ pub async fn check_local_health(port: u16) -> bool {
 }
 
 /// Verify whether `127.0.0.1:{port}` is free, owned by `expected_host_id` (`Mine`), or held by another user/process (`OccupiedByOther`).
-/// Works seamlessly across both `0.2.3+` JSON `/healthz` and `<= 0.2.2` legacy WebSocket `Welcome` handshakes.
 pub async fn probe_daemon_port(port: u16, expected_host_id: &str) -> PortOwnership {
     if let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_millis(350))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         let url = format!("http://127.0.0.1:{port}/healthz");
-        if let Ok(resp) = client.get(url).send().await
-            && resp.status().is_success()
-            && let Ok(body) = resp.text().await
-        {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+        if let Ok(resp) = client.get(url).send().await {
+            if resp.status().is_success()
+                && let Ok(body) = resp.text().await
+                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
                 && let Some(hid) = json.get("host_id").and_then(|v| v.as_str())
+                && hid == expected_host_id
             {
-                return if hid == expected_host_id {
-                    PortOwnership::Mine
-                } else {
-                    PortOwnership::OccupiedByOther
-                };
+                return PortOwnership::Mine;
             }
-            // Legacy <= 0.2.2 daemon returning plain `"ok"`: verify `host_id` via local WS `Welcome`
-            return match probe_ws_welcome_host_id(port).await {
-                Some(hid) if hid == expected_host_id => PortOwnership::Mine,
-                _ => PortOwnership::OccupiedByOther,
-            };
+            // Any other HTTP response on this port belongs to another service or daemon;
+            // never fall back to sending a bearer token over WebSocket to an unverified service.
+            return PortOwnership::OccupiedByOther;
         }
     }
 
@@ -174,38 +200,6 @@ pub async fn probe_daemon_port(port: u16, expected_host_id: &str) -> PortOwnersh
         PortOwnership::Free
     } else {
         PortOwnership::OccupiedByOther
-    }
-}
-
-async fn probe_ws_welcome_host_id(port: u16) -> Option<String> {
-    let url = format!("ws://127.0.0.1:{port}/ws");
-    let (ws, _) = tokio::time::timeout(
-        Duration::from_millis(450),
-        tokio_tungstenite::connect_async(&url),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let (mut sink, mut stream) = ws.split();
-    let hello = WireMessage::Hello {
-        client_id: "health-probe".into(),
-        client_name: "orbit-cli-probe".into(),
-        protocol_version: PROTOCOL_VERSION,
-        supports_zstd: false,
-    };
-    let txt = serde_json::to_string(&hello).ok()?;
-    sink.send(TungMsg::Text(txt.into())).await.ok()?;
-
-    let msg = tokio::time::timeout(Duration::from_millis(450), stream.next())
-        .await
-        .ok()??
-        .ok()?;
-    match msg {
-        TungMsg::Text(t) => match serde_json::from_str::<WireMessage>(&t).ok()? {
-            WireMessage::Welcome { host } => Some(host.host_id),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -464,19 +458,12 @@ fn ensure_linux_user_linger_best_effort() {
     }
 }
 
-fn install_systemd_user_service(
+fn render_systemd_user_unit(
     role: ServiceRole,
     exe: &Path,
     home_dir: &Path,
     path_env: &str,
-) -> anyhow::Result<()> {
-    let user_home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    let systemd_dir = user_home.join(".config/systemd/user");
-    fs::create_dir_all(&systemd_dir)?;
-
-    let unit_file = systemd_dir.join(format!("{}.service", role.unit_name()));
+) -> String {
     let log_file = role.log_file(home_dir);
     // Keep detached `orbit shim` agent sessions alive across `orbit-daemon` restarts/upgrades.
     let kill_mode_line = if role == ServiceRole::Daemon {
@@ -484,7 +471,7 @@ fn install_systemd_user_service(
     } else {
         ""
     };
-    let content = format!(
+    format!(
         "[Unit]\n\
          Description={desc}\n\
          After=network-online.target\n\
@@ -507,7 +494,23 @@ fn install_systemd_user_service(
         home = home_dir.display(),
         sub = role.subcommand_arg(),
         log = log_file.display(),
-    );
+    )
+}
+
+fn install_systemd_user_service(
+    role: ServiceRole,
+    exe: &Path,
+    home_dir: &Path,
+    path_env: &str,
+) -> anyhow::Result<()> {
+    let user_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let systemd_dir = user_home.join(".config/systemd/user");
+    fs::create_dir_all(&systemd_dir)?;
+
+    let unit_file = systemd_dir.join(format!("{}.service", role.unit_name()));
+    let content = render_systemd_user_unit(role, exe, home_dir, path_env);
     fs::write(&unit_file, content)?;
 
     let unit_name = format!("{}.service", role.unit_name());
@@ -545,19 +548,17 @@ fn macos_plist_path(role: ServiceRole) -> Option<PathBuf> {
     })
 }
 
-fn install_macos_launch_agent(
+fn render_macos_launch_agent_plist(
     role: ServiceRole,
     exe: &Path,
     home_dir: &Path,
     path_env: &str,
-) -> anyhow::Result<()> {
-    let plist_path =
-        macos_plist_path(role).ok_or_else(|| anyhow::anyhow!("HOME is not set for LaunchAgent"))?;
-    if let Some(parent) = plist_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+) -> String {
     let log_file = role.log_file(home_dir);
-    let plist = format!(
+    // Detached `orbit shim` processes already run in their own process group (`process_group(0)`),
+    // so launchd must NOT set `AbandonProcessGroup` (which would disable cleanup of unrelated
+    // daemon children sharing the job's process group).
+    format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\">\n\
@@ -593,7 +594,21 @@ fn install_macos_launch_agent(
         home = home_dir.display(),
         sub = role.subcommand_arg(),
         log = log_file.display(),
-    );
+    )
+}
+
+fn install_macos_launch_agent(
+    role: ServiceRole,
+    exe: &Path,
+    home_dir: &Path,
+    path_env: &str,
+) -> anyhow::Result<()> {
+    let plist_path =
+        macos_plist_path(role).ok_or_else(|| anyhow::anyhow!("HOME is not set for LaunchAgent"))?;
+    if let Some(parent) = plist_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let plist = render_macos_launch_agent_plist(role, exe, home_dir, path_env);
     fs::write(&plist_path, plist)?;
 
     let _ = Command::new("launchctl")
@@ -720,7 +735,7 @@ fn replace_executable_safely(tmp: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 pub fn default_daemon_listen() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], 6868))
+    SocketAddr::from(([127, 0, 0, 1], 6868))
 }
 
 fn resolve_github_token() -> Option<String> {
@@ -824,6 +839,47 @@ async fn resolve_latest_release_tag(current_ver: &str) -> anyhow::Result<String>
         .ok_or_else(|| anyhow::anyhow!("missing tag_name in GitHub release metadata"))
 }
 
+async fn download_and_verify_release_asset(
+    client: &reqwest::Client,
+    release_base_url: &str,
+    asset_name: &str,
+) -> anyhow::Result<(impl AsRef<[u8]> + std::fmt::Debug + use<>, String)> {
+    let base = release_base_url.trim_end_matches('/');
+    let sums_url = format!("{base}/{}", orbit_crypto::SHA256SUMS_FILENAME);
+    let download_url = format!("{base}/{asset_name}");
+
+    let sums_resp = client
+        .get(&sums_url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch release checksums {sums_url}: {e}"))?;
+    if !sums_resp.status().is_success() {
+        anyhow::bail!(
+            "failed to fetch release checksums {sums_url} (HTTP {}); refusing unverified upgrade",
+            sums_resp.status()
+        );
+    }
+    let sums_text = sums_resp.text().await?;
+    let expected_sha256 =
+        orbit_crypto::find_expected_sha256(&sums_text, asset_name).map_err(|e| {
+            anyhow::anyhow!("release checksum manifest {sums_url} rejected `{asset_name}`: {e}")
+        })?;
+
+    let bytes = client
+        .get(&download_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let actual_sha256 = orbit_crypto::sha256_hex_bytes(bytes.as_ref());
+    orbit_crypto::verify_sha256_hex(asset_name, &expected_sha256, &actual_sha256)
+        .map_err(|e| anyhow::anyhow!("SHA-256 verification failed for {download_url}: {e}"))?;
+
+    Ok((bytes, actual_sha256))
+}
+
 pub async fn self_upgrade_cli(
     home_dir: &Path,
     force: bool,
@@ -899,16 +955,11 @@ pub async fn self_upgrade_cli(
         (os, arch) => anyhow::bail!("unsupported auto-upgrade platform: {os}/{arch}"),
     };
 
-    let download_url =
-        format!("https://github.com/danielgaoyy/orbit/releases/download/{tag}/{asset_name}");
-    println!("Downloading Orbit {tag} ({asset_name}) from GitHub Releases...");
-    let bytes = client
-        .get(&download_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let release_base_url = format!("https://github.com/danielgaoyy/orbit/releases/download/{tag}");
+    println!("Downloading & verifying Orbit {tag} ({asset_name}) from GitHub Releases...");
+    let (bytes, verified_sha256) =
+        download_and_verify_release_asset(&client, &release_base_url, asset_name).await?;
+    println!("[✓] Verified SHA-256 checksum for {asset_name} ({verified_sha256})");
 
     let target_exe = fs::canonicalize(std::env::current_exe()?)?;
     let parent_dir = target_exe
@@ -1011,6 +1062,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_preflight_probe_authorized_vs_forbidden() {
+        use orbit_crypto::HostIdentityKeypair;
         use orbit_relay::{RelayConfig, run_relay};
         use std::collections::HashSet;
         use std::sync::Arc;
@@ -1021,8 +1073,10 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         drop(listener);
 
+        let allowed_kp = HostIdentityKeypair::generate().expect("allowed keygen");
+        let stranger_kp = HostIdentityKeypair::generate().expect("stranger keygen");
         let mut allowed = HashSet::new();
-        allowed.insert("my_allowed_pubkey".to_string());
+        allowed.insert(allowed_kp.public_key_b64.clone());
         let cfg = RelayConfig {
             listen_addr: addr,
             allowed_pubkeys: Arc::new(allowed),
@@ -1034,13 +1088,34 @@ mod tests {
 
         let url = format!("ws://{addr}");
         assert_eq!(
-            preflight_probe_relay(&url, "my_allowed_pubkey").await,
+            preflight_probe_relay(&url, &allowed_kp.public_key_b64).await,
             RelayProbeOutcome::Authorized
         );
         assert_eq!(
-            preflight_probe_relay(&url, "stranger_pubkey").await,
+            preflight_probe_relay(&url, &stranger_kp.public_key_b64).await,
             RelayProbeOutcome::Forbidden403
         );
+
+        // A non-Orbit HTTP server returning 200 without Orbit's probe marker must NOT report Authorized
+        let fake_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake");
+        let fake_addr = fake_listener.local_addr().expect("fake addr");
+        let fake_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut stream, _)) = fake_listener.accept().await {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot-orbit")
+                    .await;
+            }
+        });
+        assert!(matches!(
+            preflight_probe_relay(&format!("ws://{fake_addr}"), &allowed_kp.public_key_b64).await,
+            RelayProbeOutcome::Unreachable(_)
+        ));
+        fake_task.abort();
     }
 
     #[test]
@@ -1065,5 +1140,189 @@ mod tests {
             extract_tag_from_release_url("https://github.com/danielgaoyy/orbit/releases/tag/"),
             None
         );
+    }
+
+    #[test]
+    fn default_daemon_listen_binds_loopback_only() {
+        assert_eq!(
+            default_daemon_listen(),
+            SocketAddr::from(([127, 0, 0, 1], 6868))
+        );
+        assert!(default_daemon_listen().ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn probe_daemon_port_never_falls_back_to_ws_for_unidentified_http_service() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let ws_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ws_seen_bg = ws_seen.clone();
+
+        let srv = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) =
+                    tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                        .await
+                        .unwrap_or(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "timeout",
+                        )))
+                else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.contains("GET /ws") || req.to_ascii_lowercase().contains("authorization:") {
+                    ws_seen_bg.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let ownership = probe_daemon_port(port, "orbit-expected-host").await;
+        assert_eq!(ownership, PortOwnership::OccupiedByOther);
+        let _ = srv.await;
+        assert!(
+            !ws_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "probe_daemon_port must never send a credentialed WS probe to an unidentified HTTP service"
+        );
+    }
+
+    #[test]
+    fn test_service_templates_systemd_kill_mode_and_clean_launchd_plist() {
+        let exe = Path::new("/usr/local/bin/orbit");
+        let home = Path::new("/Users/tester/.orbit");
+        let path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+
+        let daemon_plist =
+            render_macos_launch_agent_plist(ServiceRole::Daemon, exe, home, path_env);
+        assert!(
+            !daemon_plist.contains("AbandonProcessGroup"),
+            "daemon launchd plist must NOT set AbandonProcessGroup (shims already detach via process_group(0)):\n{daemon_plist}"
+        );
+
+        let daemon_unit = render_systemd_user_unit(ServiceRole::Daemon, exe, home, path_env);
+        assert!(
+            daemon_unit.contains("KillMode=process\n"),
+            "daemon systemd unit must set KillMode=process:\n{daemon_unit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_and_verify_release_asset_enforces_sha256sums() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let genuine: &'static [u8] = b"genuine-orbit-cli-binary-payload";
+        let tampered: &'static [u8] = b"tampered-orbit-cli-binary-payload";
+        let genuine_sha = orbit_crypto::sha256_hex_bytes(genuine);
+        let valid_sums = format!("{genuine_sha}  orbit-cli-macos-arm64\n");
+        let missing_entry_sums = format!("{genuine_sha}  other-binary\n");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let sums_ok = valid_sums.clone();
+                let sums_missing = missing_entry_sums.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, body): (&str, Vec<u8>) = match path {
+                        "/ok/SHA256SUMS.txt" | "/tampered/SHA256SUMS.txt" => {
+                            ("200 OK", sums_ok.into_bytes())
+                        }
+                        "/ok/orbit-cli-macos-arm64"
+                        | "/no-sums/orbit-cli-macos-arm64"
+                        | "/missing/orbit-cli-macos-arm64" => ("200 OK", genuine.to_vec()),
+                        "/tampered/orbit-cli-macos-arm64" => ("200 OK", tampered.to_vec()),
+                        "/missing/SHA256SUMS.txt" => ("200 OK", sums_missing.into_bytes()),
+                        _ => ("404 Not Found", b"not found".to_vec()),
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+
+        // 1. Valid SHA256SUMS.txt + matching binary -> succeeds
+        let (bytes, sha) = download_and_verify_release_asset(
+            &client,
+            &format!("http://{addr}/ok"),
+            "orbit-cli-macos-arm64",
+        )
+        .await
+        .expect("valid sha256 must pass");
+        assert_eq!(bytes.as_ref(), genuine);
+        assert_eq!(sha, genuine_sha);
+
+        // 2. Tampered binary -> fails with SHA-256 mismatch
+        let err = download_and_verify_release_asset(
+            &client,
+            &format!("http://{addr}/tampered"),
+            "orbit-cli-macos-arm64",
+        )
+        .await
+        .expect_err("tampered binary must be rejected");
+        assert!(
+            err.to_string().contains("SHA-256"),
+            "unexpected error: {err}"
+        );
+
+        // 3. Missing SHA256SUMS.txt -> fails cleanly
+        let err = download_and_verify_release_asset(
+            &client,
+            &format!("http://{addr}/no-sums"),
+            "orbit-cli-macos-arm64",
+        )
+        .await
+        .expect_err("missing SHA256SUMS.txt must be rejected");
+        assert!(
+            err.to_string().contains("refusing unverified upgrade"),
+            "unexpected error: {err}"
+        );
+
+        // 4. Missing asset entry in SHA256SUMS.txt -> fails cleanly
+        let err = download_and_verify_release_asset(
+            &client,
+            &format!("http://{addr}/missing"),
+            "orbit-cli-macos-arm64",
+        )
+        .await
+        .expect_err("missing asset entry must be rejected");
+        assert!(
+            err.to_string().contains("not found in SHA256SUMS.txt"),
+            "unexpected error: {err}"
+        );
+
+        server.abort();
     }
 }

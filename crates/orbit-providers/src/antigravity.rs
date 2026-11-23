@@ -87,6 +87,7 @@ pub async fn spawn_antigravity_session(
             args,
             cwd: cfg.cwd.clone(),
             env,
+            cleanup_paths: Vec::new(),
         };
 
         let fresh = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
@@ -9110,6 +9111,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             executable: PathBuf::from("/bin/true"),
             orbit_exe: PathBuf::from("/bin/true"),
             shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
             cwd: std::env::temp_dir(),
             extra_dirs: vec![],
             attachments_dir: None,
@@ -9292,6 +9294,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             executable: PathBuf::from("/bin/true"),
             orbit_exe: PathBuf::from("/bin/true"),
             shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
             cwd: std::env::temp_dir(),
             extra_dirs: vec![],
             attachments_dir: None,
@@ -9367,6 +9370,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             executable: PathBuf::from("/bin/true"),
             orbit_exe: PathBuf::from("/bin/true"),
             shim_socket: PathBuf::from("/tmp/agy_fast.sock"),
+            runtime_dir: std::env::temp_dir(),
             cwd: std::env::temp_dir(),
             extra_dirs: vec![],
             attachments_dir: None,
@@ -9611,6 +9615,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             executable: PathBuf::from("/bin/true"),
             orbit_exe: PathBuf::from("/bin/true"),
             shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
             cwd: std::env::temp_dir(),
             extra_dirs: vec![],
             attachments_dir: None,
@@ -9825,6 +9830,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             executable: PathBuf::from("/bin/true"),
             orbit_exe: PathBuf::from("/bin/true"),
             shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
             cwd: std::env::temp_dir(),
             extra_dirs: vec![],
             attachments_dir: None,

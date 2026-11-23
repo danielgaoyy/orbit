@@ -1,6 +1,13 @@
 import { useSyncExternalStore } from "react";
 import { PROVIDERS } from "@/components/composer/composer-constants";
 import {
+  type OrbitLocale,
+  getLocale,
+  resolveLocale,
+  setLocale as setI18nLocale,
+  t,
+} from "@/lib/i18n";
+import {
   createDraftPersistenceController,
   hasNonEmptyScopeDraft,
 } from "@/lib/draft-persistence";
@@ -23,6 +30,10 @@ import {
   seedPromptImagePreview,
   type SentImagePreviewMeta,
 } from "@/lib/prompt-image-cache";
+import {
+  type NotificationSoundTone,
+  playSoftNotificationChime,
+} from "@/lib/notification-sound";
 import {
   getCatalogForProvider,
   modelSupportsFastMode,
@@ -628,6 +639,7 @@ export interface OrbitUiState {
   workspacePanel: WorkspacePanelMode;
   settingsSection: SettingsSection;
   commandPaletteOpen: boolean;
+  onboardingOpen: boolean;
   pairDialogOpen: boolean;
   relayDialogOpen: boolean;
   remoteFolderPickerHostId: string | null;
@@ -747,6 +759,7 @@ export interface OrbitUiState {
   >;
 
   // User ergonomic & ADE preferences
+  locale: OrbitLocale;
   theme: ThemeMode;
   resolvedTheme: ResolvedTheme;
   enterToSend: boolean;
@@ -769,6 +782,7 @@ export interface OrbitUiState {
 const PREFS_STORAGE_KEY = "orbit.desktop.prefs.v3";
 
 interface PersistedPrefs {
+  locale?: OrbitLocale;
   theme?: ThemeMode;
   enterToSend?: boolean;
   notifyOnApproval?: boolean;
@@ -836,6 +850,7 @@ function writePrefsNow(snap: OrbitUiState): void {
   }
   try {
     const payload: PersistedPrefs = {
+      locale: snap.locale,
       theme: snap.theme,
       enterToSend: snap.enterToSend,
       notifyOnApproval: snap.notifyOnApproval,
@@ -1138,6 +1153,7 @@ const defaultInitialState: OrbitUiState = {
   workspacePanel: "conversation",
   settingsSection: "general",
   commandPaletteOpen: false,
+  onboardingOpen: false,
   pairDialogOpen: false,
   relayDialogOpen: false,
   remoteFolderPickerHostId: null,
@@ -1175,6 +1191,7 @@ const defaultInitialState: OrbitUiState = {
   cloudSyncDeviceFlow: null,
   cloudSyncLastResult: null,
 
+  locale: initialPrefs.locale ? resolveLocale(initialPrefs.locale) : getLocale(),
   theme: initialTheme,
   resolvedTheme: initialResolvedTheme,
   enterToSend: initialPrefs.enterToSend ?? true,
@@ -1584,6 +1601,9 @@ interface TerminalStreamChannel {
   subs: Set<(bytes: Uint8Array) => void>;
 }
 const terminalChannels = hmrData?.terminalChannels ?? new Map<string, TerminalStreamChannel>();
+// Explicitly detached PTY terminal keys (`hostId::terminalId`) so `host_detail` snapshots
+// never resurrect a tab the user intentionally detached into the background.
+const detachedTerminalIds = new Set<string>();
 
 let disposed = false;
 
@@ -1859,12 +1879,52 @@ function isAgentErrorState(
   );
 }
 
+const ONBOARDING_COMPLETED_STORAGE_KEY = "orbit:onboarding_completed_v1";
+let onboardingAutoPromptChecked = false;
+
+function hasCompletedOnboarding(): boolean {
+  if (typeof window === "undefined") return true;
+  try {
+    const val = window.localStorage.getItem(ONBOARDING_COMPLETED_STORAGE_KEY);
+    return val === "true" || val === "1";
+  } catch {
+    return true;
+  }
+}
+
+function markOnboardingCompleted(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(ONBOARDING_COMPLETED_STORAGE_KEY, "true");
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+let lastTrayStatusKey: string | null = null;
+let trayStatusSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleTrayStatusSync(runningCount: number, pendingApprovals: number): void {
+  const nextKey = `${runningCount}:${pendingApprovals}`;
+  if (nextKey === lastTrayStatusKey) return;
+  if (trayStatusSyncTimer !== null) {
+    clearTimeout(trayStatusSyncTimer);
+  }
+  trayStatusSyncTimer = setTimeout(() => {
+    trayStatusSyncTimer = null;
+    if (disposed) return;
+    lastTrayStatusKey = nextKey;
+    void orbitIpc.updateTrayStatus(runningCount, pendingApprovals).catch(() => undefined);
+  }, 140);
+}
+
 function dispatchDesktopNotification(opts: {
   title: string;
   body: string;
   hostId: string;
   agentId?: string | null;
   tag?: string;
+  tone?: NotificationSoundTone;
   forceEvenIfVisible?: boolean;
 }): boolean {
   if (typeof window === "undefined" || !("Notification" in window)) return false;
@@ -1874,10 +1934,16 @@ function dispatchDesktopNotification(opts: {
     if (isInDesktopQuietHours()) return false;
   }
 
+  const shouldPlaySound =
+    state.notifySoundEnabled && (opts.forceEvenIfVisible || !isInDesktopQuietHours());
+  const chimePlayed = shouldPlaySound
+    ? playSoftNotificationChime(opts.tone ?? "default")
+    : false;
+
   try {
     const notif = new Notification(opts.title, {
       body: opts.body,
-      silent: !state.notifySoundEnabled,
+      silent: chimePlayed || !state.notifySoundEnabled,
       tag: opts.tag,
     });
     notif.onclick = () => {
@@ -1886,6 +1952,7 @@ function dispatchDesktopNotification(opts: {
         window.focus();
       }
       orbitActions.closeSettings();
+      orbitActions.closeOnboardingGuide(false);
       if (opts.hostId && opts.agentId) {
         orbitActions.selectAgent(opts.hostId, opts.agentId);
       } else if (opts.hostId) {
@@ -1935,6 +2002,16 @@ function syncAttentionIndicators(overview: FleetOverviewView, details: Record<st
         : "Orbit";
   }
 
+  let runningCount = 0;
+  for (const detail of Object.values(details)) {
+    for (const ag of detail.agents) {
+      if (!ag.archived_at_rfc3339 && isAgentForegroundRunning(ag)) {
+        runningCount += 1;
+      }
+    }
+  }
+  scheduleTrayStatusSync(runningCount, overview.total_pending_approvals);
+
   if (!state.notifyOnApproval) return;
 
   for (const detail of Object.values(details)) {
@@ -1949,6 +2026,7 @@ function syncAttentionIndicators(overview: FleetOverviewView, details: Record<st
             hostId: detail.host.host_id,
             agentId: ag.agent_id,
             tag: `orbit-approval-${detail.host.host_id}-${ag.agent_id}`,
+            tone: "approval",
           });
         }
       } else {
@@ -2472,8 +2550,8 @@ export const orbitActions = {
       const detail =
         err instanceof Error ? err.message : typeof err === "string" ? err.trim() : "";
       const errMsg = detail
-        ? `检查更新失败: ${detail}`
-        : "暂时无法检查更新，请稍后重试。";
+        ? t("store.checkUpdateFailed", { detail })
+        : t("store.checkUpdateFallback");
       setState((s) => ({
         ...s,
         checkingReleaseUpdate: false,
@@ -2497,7 +2575,7 @@ export const orbitActions = {
         ...s.fleetUpdate,
         phase: "upgrading_desktop",
         targetVersion: normalizeSemver(release.latest_version) ?? s.fleetUpdate.targetVersion,
-        desktopStatus: `正在下载 Orbit v${release.latest_version} 安装包…`,
+        desktopStatus: t("store.downloadingDesktop", { version: release.latest_version }),
         desktopProgress: 0.02,
         desktopError: null,
         pendingDesktopUpdate: false,
@@ -2505,7 +2583,7 @@ export const orbitActions = {
       },
     }));
     try {
-      await orbitIpc.performAppSelfUpdate(release, (ev) => {
+      await orbitIpc.performAppSelfUpdate(release.tag_name, (ev) => {
         const rawProgress = Number.isFinite(ev.progress) ? ev.progress : 0;
         const normalized = rawProgress > 1 ? Math.min(1, rawProgress / 100) : Math.max(0, rawProgress);
         const pct = Math.round(normalized * 100);
@@ -2513,7 +2591,7 @@ export const orbitActions = {
           ? pct > 0 && pct < 100
             ? `${ev.status} (${pct}%)`
             : ev.status
-          : `正在更新桌面端 (${pct}%)…`;
+          : t("store.updatingDesktopPct", { percent: pct });
         setState((s) => ({
           ...s,
           fleetUpdate: {
@@ -2530,8 +2608,8 @@ export const orbitActions = {
       const detail =
         err instanceof Error ? err.message : typeof err === "string" ? err.trim() : "";
       const errMsg = detail
-        ? `桌面端更新失败: ${detail}`
-        : "桌面端更新失败，请稍后重试或手动下载。";
+        ? t("store.desktopUpdateFailed", { detail })
+        : t("store.desktopUpdateFallback");
       setState((s) => ({
         ...s,
         fleetUpdate: {
@@ -2575,7 +2653,7 @@ export const orbitActions = {
 
     // Unreachable remote host without SSH fallback cannot be upgraded while offline.
     if (!isLocal && !isOnline && !host.ssh_alias) {
-      const reason = "主机离线，已跳过";
+      const reason = t("store.hostOfflineSkipped");
       setState((s) => ({
         ...s,
         hostUpgradeStates: {
@@ -2697,8 +2775,10 @@ export const orbitActions = {
         if (!opts?.silent) {
           notifyToast(
             res.status === "updated"
-              ? `已更新本机服务${resolvedVer ? `至 v${resolvedVer}` : ""}`
-              : "已重启本机 Orbit 服务",
+              ? t("store.localServiceUpdated", {
+                  version: resolvedVer ? ` (v${resolvedVer})` : "",
+                })
+              : t("store.localServiceRestarted"),
           );
         }
         return { ok: true, version: resolvedVer };
@@ -2746,7 +2826,10 @@ export const orbitActions = {
       }));
       if (!opts?.silent) {
         notifyToast(
-          `已更新 ${host.display_name}${resolvedVer ? ` 至 v${resolvedVer}` : ""}`,
+          t("store.hostUpdated", {
+            host: host.display_name,
+            version: resolvedVer ? ` (v${resolvedVer})` : "",
+          }),
         );
       }
       return { ok: true, version: resolvedVer };
@@ -2768,7 +2851,7 @@ export const orbitActions = {
         },
       }));
       if (!opts?.silent) {
-        notifyToast(`${host.display_name} 更新失败: ${msg}`);
+        notifyToast(t("store.hostUpdateFailed", { host: host.display_name, detail: msg }));
       }
       return { ok: false, error: msg, version: fromVersion };
     }
@@ -2800,7 +2883,7 @@ export const orbitActions = {
         desktopProgress: null,
         desktopError: null,
         startedAt: Date.now(),
-        summaryMessage: "正在检查最新版本并同步全部主机状态…",
+        summaryMessage: t("store.checkingFleetStatus"),
         pendingDesktopUpdate: false,
       },
     }));
@@ -2856,7 +2939,7 @@ export const orbitActions = {
               mode: "wire",
               fromVersion: normDaemon,
               toVersion: normDaemon,
-              error: "主机离线，已跳过",
+              error: t("store.hostOfflineSkipped"),
               startedAt: Date.now(),
               finishedAt: Date.now(),
             },
@@ -2893,10 +2976,14 @@ export const orbitActions = {
 
     // Nothing to update anywhere
     if (hostsToUpgrade.length === 0 && !desktopNeedsUpdate) {
+      const versionTag = targetVersion ? ` (v${targetVersion})` : "";
       const msg =
         skippedOffline > 0
-          ? `在线主机均已是最新${targetVersion ? ` v${targetVersion}` : ""}，${skippedOffline} 台离线主机已跳过。`
-          : `本机与全部已联通机器均已是最新版本${targetVersion ? ` (v${targetVersion})` : ""}。`;
+          ? t("store.fleetOnlineUpToDateOfflineSkipped", {
+              version: versionTag,
+              count: skippedOffline,
+            })
+          : t("store.fleetAllUpToDate", { version: versionTag });
       setState((s) => ({
         ...s,
         fleetUpdate: {
@@ -2921,7 +3008,10 @@ export const orbitActions = {
           ...s.fleetUpdate,
           phase: "upgrading_hosts",
           targetVersion,
-          summaryMessage: `正在并行更新 ${hostsToUpgrade.length} 台主机${targetVersion ? `至 v${targetVersion}` : ""}（运行中的会话不受影响）…`,
+          summaryMessage: t("store.fleetUpgradingHosts", {
+            count: hostsToUpgrade.length,
+            version: targetVersion ? ` (v${targetVersion})` : "",
+          }),
           pendingDesktopUpdate: desktopNeedsUpdate,
         },
       }));
@@ -2953,7 +3043,15 @@ export const orbitActions = {
     // Phase 2: Desktop self-update (exits & relaunches Desktop + syncs bundled local daemon)
     if (desktopNeedsUpdate && releaseInfo) {
       if (failed > 0) {
-        const pausedMsg = `已完成 ${succeeded} 台主机更新，${failed} 台失败${skippedOffline > 0 ? `，${skippedOffline} 台离线跳过` : ""}。可先重试失败主机，或直接继续更新本机桌面端。`;
+        const offlineSuffix =
+          skippedOffline > 0
+            ? t("store.fleetPausedOfflineSuffix", { count: skippedOffline })
+            : "";
+        const pausedMsg = t("store.fleetPausedWithFailures", {
+          succeeded,
+          failed,
+          offline: offlineSuffix,
+        });
         setState((s) => ({
           ...s,
           fleetUpdate: {
@@ -2964,7 +3062,7 @@ export const orbitActions = {
             pendingDesktopUpdate: true,
           },
         }));
-        notifyToast(`有 ${failed} 台主机更新失败，已暂停桌面端重启`);
+        notifyToast(t("store.fleetPausedToast", { count: failed }));
         return;
       }
 
@@ -2973,14 +3071,17 @@ export const orbitActions = {
     }
 
     const parts: string[] = [];
-    if (succeeded > 0) parts.push(`成功更新 ${succeeded} 台`);
-    if (alreadyUpToDate > 0) parts.push(`${alreadyUpToDate} 台已是最新`);
-    if (skippedOffline > 0) parts.push(`${skippedOffline} 台离线跳过`);
-    if (failed > 0) parts.push(`${failed} 台失败`);
+    if (succeeded > 0) parts.push(t("store.fleetPartSucceeded", { count: succeeded }));
+    if (alreadyUpToDate > 0) parts.push(t("store.fleetPartCurrent", { count: alreadyUpToDate }));
+    if (skippedOffline > 0) parts.push(t("store.fleetPartOffline", { count: skippedOffline }));
+    if (failed > 0) parts.push(t("store.fleetPartFailed", { count: failed }));
     const summary =
       parts.length > 0
-        ? `全集群更新完成：${parts.join("，")}${targetVersion ? `（目标 v${targetVersion}）` : ""}。`
-        : "全集群更新完成。";
+        ? t("store.fleetUpdateCompleteParts", {
+            parts: parts.join(", "),
+            version: targetVersion ? ` (v${targetVersion})` : "",
+          })
+        : t("store.fleetUpdateComplete");
 
     setState((s) => ({
       ...s,
@@ -3107,6 +3208,20 @@ export const orbitActions = {
     syncAttentionIndicators(state.fleet, state.hostDetails);
     orbitActions.refreshSidebarView();
 
+    if (initialBootstrap && !onboardingAutoPromptChecked) {
+      onboardingAutoPromptChecked = true;
+      if (!hasCompletedOnboarding() && state.activeView === "workspace") {
+        const hasAnyActiveConversation =
+          state.fleet.hosts.some((h) => h.agent_count > 0) ||
+          Object.values(state.hostDetails).some((detail) =>
+            detail.agents.some((ag) => !ag.archived_at_rfc3339),
+          );
+        if (!hasAnyActiveConversation) {
+          setState((s) => ({ ...s, onboardingOpen: true }));
+        }
+      }
+    }
+
     if (state.selectedHostId) {
       if (initialBootstrap) {
         void orbitIpc.refreshQuotas(state.selectedHostId);
@@ -3228,6 +3343,7 @@ export const orbitActions = {
           hostId,
           agentId: nextAg.agent_id,
           tag: `orbit-error-${hostId}-${nextAg.agent_id}`,
+          tone: "error",
         });
       }
     }
@@ -3339,27 +3455,44 @@ export const orbitActions = {
         }
       }
 
-      // Sync attached terminal tab metadata if server assigned/attached a terminal
+      // Prune exited terminals from the detached suppression set for this host
+      const livePrefix = `${hostId}::`;
+      const liveTermIds = new Set(detail.terminals.map((t) => t.terminal_id));
+      for (const detachedKey of detachedTerminalIds) {
+        if (detachedKey.startsWith(livePrefix)) {
+          const tid = detachedKey.slice(livePrefix.length);
+          if (!liveTermIds.has(tid)) {
+            detachedTerminalIds.delete(detachedKey);
+          }
+        }
+      }
+
+      // Sync attached terminal tab metadata only when the server terminal is still live
       let nextTabs = s.terminalTabs;
       let nextActiveTab = s.activeTerminalTabKey;
-      if (detail.active_terminal_id) {
+      if (
+        detail.active_terminal_id &&
+        !detachedTerminalIds.has(`${hostId}::${detail.active_terminal_id}`)
+      ) {
         const termMeta = detail.terminals.find((t) => t.terminal_id === detail.active_terminal_id);
-        const tabKey = `${hostId}::slot-${detail.active_terminal_slot}`;
-        const existingIdx = nextTabs.findIndex((t) => t.key === tabKey);
-        const entry: TerminalTabSession = {
-          key: tabKey,
-          hostId,
-          terminalId: detail.active_terminal_id,
-          slot: detail.active_terminal_slot,
-          cwd: termMeta?.cwd ?? nextCwd,
-          title: termMeta?.title ?? "shell",
-        };
-        if (existingIdx >= 0) {
-          nextTabs = [...nextTabs];
-          nextTabs[existingIdx] = entry;
-        } else {
-          nextTabs = [...nextTabs, entry];
-          nextActiveTab = tabKey;
+        if (termMeta) {
+          const tabKey = `${hostId}::slot-${detail.active_terminal_slot}`;
+          const existingIdx = nextTabs.findIndex((t) => t.key === tabKey);
+          const entry: TerminalTabSession = {
+            key: tabKey,
+            hostId,
+            terminalId: detail.active_terminal_id,
+            slot: detail.active_terminal_slot,
+            cwd: termMeta.cwd || nextCwd,
+            title: termMeta.title || "shell",
+          };
+          if (existingIdx >= 0) {
+            nextTabs = [...nextTabs];
+            nextTabs[existingIdx] = entry;
+          } else {
+            nextTabs = [...nextTabs, entry];
+            nextActiveTab = tabKey;
+          }
         }
       }
 
@@ -10227,6 +10360,7 @@ export const orbitActions = {
   },
 
   attachExistingTerminal(hostId: string, terminalId: string, cwd: string, title: string): void {
+    detachedTerminalIds.delete(`${hostId}::${terminalId}`);
     const existing = state.terminalTabs.find(
       (t) => t.hostId === hostId && t.terminalId === terminalId,
     );
@@ -10255,14 +10389,30 @@ export const orbitActions = {
     void orbitIpc.attachTerminal(hostId, terminalId, slot);
   },
 
-  closeTerminalTab(tabKey: string, killRemoteShim: boolean): void {
+  async closeTerminalTab(
+    tabKey: string,
+    killRemoteShim: boolean,
+    expectedTerminalId?: string | null,
+  ): Promise<boolean> {
     const target = state.terminalTabs.find((t) => t.key === tabKey);
-    if (target) {
-      if (killRemoteShim && target.terminalId) {
-        void orbitIpc.killTerminal(target.hostId, target.terminalId);
-      }
-      terminalChannels.delete(`${target.hostId}::${target.slot}`);
+    if (!target) return false;
+    if (expectedTerminalId !== undefined && target.terminalId !== expectedTerminalId) {
+      return false;
     }
+    if (target.terminalId) {
+      const detachedKey = `${target.hostId}::${target.terminalId}`;
+      if (killRemoteShim) {
+        await orbitIpc.killTerminal(target.hostId, target.terminalId);
+        detachedTerminalIds.delete(detachedKey);
+        const latest = state.terminalTabs.find((t) => t.key === tabKey);
+        if (!latest || latest.terminalId !== target.terminalId) {
+          return false;
+        }
+      } else {
+        detachedTerminalIds.add(detachedKey);
+      }
+    }
+    terminalChannels.delete(`${target.hostId}::${target.slot}`);
     setState((s) => {
       const remaining = s.terminalTabs.filter((t) => t.key !== tabKey);
       const nextActive =
@@ -10286,6 +10436,7 @@ export const orbitActions = {
         terminalFocused: nextTerminalFocused,
       };
     });
+    return true;
   },
 
   setActiveTerminalTab(tabKey: string): void {
@@ -10563,6 +10714,22 @@ export const orbitActions = {
     setState((s) => ({ ...s, commandPaletteOpen: open }));
   },
 
+  openOnboardingGuide(): void {
+    setState((s) => ({
+      ...s,
+      activeView: "workspace",
+      commandPaletteOpen: false,
+      onboardingOpen: true,
+    }));
+  },
+
+  closeOnboardingGuide(markCompleted = true): void {
+    if (markCompleted) {
+      markOnboardingCompleted();
+    }
+    setState((s) => (s.onboardingOpen ? { ...s, onboardingOpen: false } : s));
+  },
+
   setPairDialogOpen(open: boolean): void {
     if (open) {
       orbitActions.openSettings("add_host");
@@ -10577,6 +10744,13 @@ export const orbitActions = {
 
   setRelayDialogOpen(open: boolean): void {
     setState((s) => ({ ...s, relayDialogOpen: open }));
+  },
+
+  setLocale(locale: OrbitLocale): void {
+    const resolved = resolveLocale(locale);
+    setI18nLocale(resolved);
+    setState((s) => ({ ...s, locale: resolved }), true);
+    void pushCloudPrefPatch({ locale: resolved });
   },
 
   setTheme(theme: ThemeMode): void {
@@ -10789,7 +10963,11 @@ export const orbitActions = {
       true,
     );
     if (!target.childAgentId) {
-      notifyToast(`已归档子代理${target.role ? `「${target.role}」` : ""}`);
+      notifyToast(
+        t("store.archivedSubagent", {
+          role: target.role ? ` "${target.role}"` : "",
+        }),
+      );
     }
   },
 
@@ -10833,7 +11011,7 @@ export const orbitActions = {
       },
       true,
     );
-    notifyToast(`已归档 ${targets.length} 个已完成子代理`);
+    notifyToast(t("store.archivedFinishedSubagents", { count: targets.length }));
   },
 
   openArtifactsTab(opts?: {
@@ -10994,7 +11172,7 @@ export const orbitActions = {
     if (!trimmed) return;
     await orbitIpc.renameWorkspace(hostId, workspaceId, trimmed);
     orbitActions.refreshSidebarView();
-    notifyToast(`Workspace 已重命名为 "${trimmed}"`);
+    notifyToast(t("store.workspaceRenamed", { title: trimmed }));
   },
 
   async createMissionWorkspace(params: {
@@ -11016,7 +11194,7 @@ export const orbitActions = {
       worktreeBranch: params.worktreeBranch ?? null,
     });
     orbitActions.refreshSidebarView();
-    notifyToast(`已创建 Workspace「${trimmed}」`);
+    notifyToast(t("store.workspaceCreated", { title: trimmed }));
   },
 
   async archiveWorkspace(
@@ -11028,8 +11206,8 @@ export const orbitActions = {
     orbitActions.refreshSidebarView();
     notifyToast(
       keepAgentsUnclassified
-        ? "已解散 Workspace，会话已移回「待归类」"
-        : "已归档 Workspace",
+        ? t("store.workspaceDisbanded")
+        : t("store.workspaceArchived"),
     );
   },
 
@@ -11043,12 +11221,12 @@ export const orbitActions = {
     orbitActions.refreshSidebarView();
     notifyToast(
       opts?.makeUnclassified
-        ? "已移回「待归类」"
+        ? t("store.movedToUnfiled")
         : targetWorkspaceId
-          ? "已切换会话到目标 Workspace"
+          ? t("store.movedToWorkspace")
           : opts?.newWorkspaceTitle
-            ? `已新建并移入「${opts.newWorkspaceTitle}」`
-            : "已移入独立 Workspace",
+            ? t("store.movedToNewWorkspace", { title: opts.newWorkspaceTitle })
+            : t("store.movedToStandaloneWorkspace"),
     );
   },
 
@@ -11060,13 +11238,15 @@ export const orbitActions = {
   ): Promise<void> {
     await orbitIpc.organizeProjectWorkspaces(hostId, projectRoot, agentIds, autoApply);
     notifyToast(
-      agentIds.length === 1 ? "AI 正在理解会话并归类…" : "AI 正在自动归类待归类会话…",
+      agentIds.length === 1
+        ? t("store.organizingSingleSession")
+        : t("store.organizingUnfiledSessions"),
     );
   },
 
   async summarizeAgent(hostId: string, agentId: string): Promise<void> {
     await orbitIpc.summarizeAgent(hostId, agentId);
-    notifyToast("AI 正在生成会话标签与摘要…");
+    notifyToast(t("store.summarizingSession"));
   },
 
   async updateAgentIdentity(params: {
@@ -11081,9 +11261,11 @@ export const orbitActions = {
     await orbitIpc.updateAgentIdentity(params);
     orbitActions.refreshSidebarView();
     if (params.handle) {
-      notifyToast(`已更新会话标签为「${params.handle.trim().replace(/^@+/, "")}」`);
+      notifyToast(
+        t("store.updatedSessionTag", { handle: params.handle.trim().replace(/^@+/, "") }),
+      );
     } else if (params.taskSummary !== undefined) {
-      notifyToast("已更新会话摘要");
+      notifyToast(t("store.updatedSessionSummary"));
     }
   },
 
@@ -11137,6 +11319,13 @@ export const orbitActions = {
     try {
       const prefs = await orbitIpc.cloudSyncGetPreferences();
       if (!prefs || Object.keys(prefs).length === 0) return;
+      let nextLocale: OrbitLocale | null = null;
+      if (prefs.locale === "en" || prefs.locale === "zh-CN" || prefs.locale === "ja") {
+        nextLocale = prefs.locale;
+      }
+      if (nextLocale) {
+        setI18nLocale(nextLocale);
+      }
       let nextTheme: ThemeMode | null = null;
       if (prefs.theme === "system" || prefs.theme === "light" || prefs.theme === "dark") {
         nextTheme = prefs.theme;
@@ -11147,6 +11336,7 @@ export const orbitActions = {
       setState(
         (s) => ({
           ...s,
+          locale: nextLocale ?? s.locale,
           theme: nextTheme ?? s.theme,
           resolvedTheme: nextTheme ? resolveTheme(nextTheme) : s.resolvedTheme,
           enterToSend: typeof prefs.enterToSend === "boolean" ? prefs.enterToSend : s.enterToSend,
@@ -11334,6 +11524,7 @@ export const orbitActions = {
     try {
       // Seed current local syncable prefs before first unlock so a brand-new vault captures them
       await orbitIpc.cloudSyncUpdatePreferences({
+        locale: state.locale,
         theme: state.theme,
         enterToSend: state.enterToSend,
         notifyOnApproval: state.notifyOnApproval,

@@ -5,7 +5,8 @@ mod orchestration_cli;
 mod service;
 mod ssh_config;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,15 +16,15 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use orbit_client_core::{
     ClientInboundEvent, HostConnectionState, HostRouteMode, HostSessionHandle, SavedHostProfile,
-    connect_direct, connect_smart,
+    connect_direct, connect_direct_verified, connect_smart,
 };
 use orbit_crypto::PairingOffer;
 use orbit_daemon::{
     DaemonConfig, DaemonPersistedConfig, DaemonRuntime, discover_lan_ws_endpoints, run_daemon,
 };
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, ProviderKind, SessionMode, TimelinePayload, ToolCallDetail,
-    WireMessage, WorktreeCreateMode,
+    ActiveTurnBehavior, AgentStatus, GuardianAssessment, ProviderKind, SessionMode,
+    TimelinePayload, ToolCallDetail, WireMessage, WorktreeCreateMode,
 };
 use orbit_providers::{
     discover_installed_providers, probe_all_provider_quotas, resolve_login_shell_env,
@@ -31,7 +32,7 @@ use orbit_providers::{
 };
 use orbit_relay::{RelayConfig, RelayPersistedConfig, run_relay};
 use orbit_relay_transport::{is_ssh_relay_url, redact_relay_url};
-use orbit_shim::{ShimSpawnSpec, run_shim};
+use orbit_shim::{read_spawn_spec_from_stdin, run_shim};
 use uuid::Uuid;
 
 use crate::acp_cli::{AcpAction, cmd_acp};
@@ -248,6 +249,9 @@ enum Commands {
         endpoints: Vec<String>,
         #[arg(long)]
         relay: Option<String>,
+        /// Rotate the host's persisted pairing secret (`$ORBIT_HOME/pairing-secret`) before printing the URI.
+        #[arg(long)]
+        rotate_secret: bool,
     },
 
     /// Sign in with GitHub (zero-server E2EE Secret Gist) to sync hosts, projects & settings across all devices.
@@ -364,6 +368,9 @@ enum Commands {
         /// Notify parent agent automatically when the child finishes (defaults on if `ORBIT_AGENT_ID` is set).
         #[arg(long)]
         notify_on_finish: Option<bool>,
+        /// Automatically approve tool permission requests during streaming execution.
+        #[arg(short = 'y', long = "auto-approve")]
+        auto_approve: bool,
         /// Initial prompt to send to the agent.
         prompt: String,
     },
@@ -378,6 +385,9 @@ enum Commands {
         no_wait: bool,
         #[arg(long)]
         notify_on_finish: Option<bool>,
+        /// Automatically approve tool permission requests during streaming execution.
+        #[arg(short = 'y', long = "auto-approve")]
+        auto_approve: bool,
     },
 
     /// Block until an agent reaches Idle / AwaitingPermission / Error / Closed and print its final reply.
@@ -512,13 +522,11 @@ enum Commands {
         url: Option<String>,
     },
 
-    /// Internal detached process supervisor invoked by `orbit daemon`.
+    /// Internal detached process supervisor invoked by `orbit daemon` (reads `ShimSpawnSpec` JSON from stdin).
     #[command(hide = true)]
     Shim {
         #[arg(long)]
         socket: PathBuf,
-        #[arg(long)]
-        spec_json: String,
     },
 }
 
@@ -757,7 +765,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 )
                 .await?;
                 println!("[✓] Detached Relay configuration and restarted daemon via {mgr}.");
-                print_pairing_summary(&home_dir, Some(listen.port()), Vec::new(), None).await?;
+                println!("    Run `orbit pair` to display an updated pairing URI.");
                 return Ok(());
             }
 
@@ -892,19 +900,16 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
             println!("[✓] Orbit Daemon active via {mgr} -> attached to {display_relay}");
-            println!(
-                "\nCopy & import this updated Pairing Code in Orbit App (Mac / iOS / Android):"
-            );
-            print_pairing_summary(&home_dir, Some(listen.port()), Vec::new(), Some(normalized))
-                .await?;
+            println!("\nRun `orbit pair` to display a pairing URI.");
         }
 
         Commands::Pair {
             port,
             endpoints,
             relay,
+            rotate_secret,
         } => {
-            print_pairing_summary(&home_dir, port, endpoints, relay).await?;
+            print_pairing_summary(&home_dir, port, endpoints, relay, rotate_secret).await?;
         }
 
         Commands::Login {
@@ -978,7 +983,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let preferred = if let Some(l) = sub_listen.or(listen) {
                     l
                 } else if let Some(p) = port {
-                    SocketAddr::from(([0, 0, 0, 0], p))
+                    SocketAddr::from(([127, 0, 0, 1], p))
                 } else {
                     persisted.listen_addr.unwrap_or_else(default_daemon_listen)
                 };
@@ -1006,14 +1011,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         .map(redact_relay_url)
                         .unwrap_or_else(|| "(none — LAN/Tailscale direct)".to_string())
                 );
-                println!("\nPairing Code for Orbit App:");
-                print_pairing_summary(
-                    &home_dir,
-                    Some(addr.port()),
-                    Vec::new(),
-                    persisted.relay_url,
-                )
-                .await?;
+                println!("\nRun `orbit pair` to display a pairing URI.");
             }
             Some(DaemonAction::Restart { port }) => {
                 let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
@@ -1022,7 +1020,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
                 let mut persisted = DaemonPersistedConfig::load(&home_dir);
                 let preferred = if let Some(p) = port {
-                    SocketAddr::from(([0, 0, 0, 0], p))
+                    SocketAddr::new(
+                        persisted
+                            .listen_addr
+                            .map(|a| a.ip())
+                            .unwrap_or_else(|| default_daemon_listen().ip()),
+                        p,
+                    )
                 } else {
                     persisted.listen_addr.unwrap_or_else(default_daemon_listen)
                 };
@@ -1043,18 +1047,28 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
                 let persisted = DaemonPersistedConfig::load(&home_dir);
                 let base_addr = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+                let live_addr = orbit_daemon::read_live_daemon_addr(&home_dir);
+                let preferred_port = live_addr.map(|a| a.port()).unwrap_or(base_addr.port());
                 let live_port =
-                    find_live_daemon_port_for_host(&runtime.host_info.host_id, base_addr.port())
+                    find_live_daemon_port_for_host(&runtime.host_info.host_id, preferred_port)
                         .await;
                 let healthy = probe_daemon_port(live_port, &runtime.host_info.host_id).await
                     == PortOwnership::Mine;
+                let effective_ip = if healthy
+                    && let Some(la) = live_addr
+                    && la.port() == live_port
+                {
+                    la.ip()
+                } else {
+                    base_addr.ip()
+                };
                 println!(
                     "Orbit Daemon : {}",
                     if healthy { "RUNNING" } else { "STOPPED" }
                 );
                 println!(
                     "Listen Addr  : {}",
-                    SocketAddr::new(base_addr.ip(), live_port)
+                    SocketAddr::new(effective_ip, live_port)
                 );
                 println!(
                     "Relay URL    : {}",
@@ -1199,7 +1213,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             parent,
             include_background,
         } => {
-            let client = connect_cli_server(&server, via_relay).await?;
+            let client = connect_cli_server(&home_dir, &server, via_relay).await?;
             let req_id = Uuid::new_v4();
             let resp = client
                 .request(
@@ -1252,6 +1266,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             background,
             auto_archive,
             notify_on_finish,
+            auto_approve,
             prompt,
         } => {
             let target_cwd = cwd
@@ -1270,7 +1285,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 provider.into()
             };
 
-            let client = connect_cli_server(&server, via_relay).await?;
+            let client = connect_cli_server(&home_dir, &server, via_relay).await?;
             let mut sub_rx = client.subscribe();
 
             let req_id = Uuid::new_v4();
@@ -1351,7 +1366,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         agent.cwd
                     );
                 }
-                stream_turn_to_stdout(&client, &mut sub_rx, &agent.agent_id).await?;
+                stream_turn_to_stdout(&client, &mut sub_rx, &agent.agent_id, auto_approve).await?;
                 if json_mode {
                     println!("{}", serde_json::to_string_pretty(&agent)?);
                 }
@@ -1364,11 +1379,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             behavior,
             no_wait,
             notify_on_finish,
+            auto_approve,
         } => {
             let env_caller = std::env::var("ORBIT_AGENT_ID")
                 .ok()
                 .filter(|s| !s.trim().is_empty());
-            let client = connect_cli_server(&server, via_relay).await?;
+            let client = connect_cli_server(&home_dir, &server, via_relay).await?;
             let mut sub_rx = client.subscribe();
             let req_id = Uuid::new_v4();
             let resp = client
@@ -1411,16 +1427,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     println!("[✓] Dispatched prompt to `{agent_id}`");
                 }
             } else {
-                stream_turn_to_stdout(&client, &mut sub_rx, &agent_id).await?;
+                stream_turn_to_stdout(&client, &mut sub_rx, &agent_id, auto_approve).await?;
             }
         }
 
         Commands::Wait { agent_id, timeout } => {
-            cmd_wait(&server, via_relay, json_mode, &agent_id, timeout).await?;
+            cmd_wait(&home_dir, &server, via_relay, json_mode, &agent_id, timeout).await?;
         }
         Commands::Stop { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1434,11 +1451,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
         Commands::Inspect { agent_id } => {
-            cmd_inspect(&server, via_relay, json_mode, &agent_id).await?;
+            cmd_inspect(&home_dir, &server, via_relay, json_mode, &agent_id).await?;
         }
         Commands::Archive { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1454,6 +1472,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Unarchive { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1469,6 +1488,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Detach { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1484,6 +1504,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Delete { agent_id } => {
             let req_id = Uuid::new_v4();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1500,6 +1521,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let req_id = Uuid::new_v4();
             let sm: SessionMode = mode.into();
             cmd_simple_agent_op(
+                &home_dir,
                 &server,
                 via_relay,
                 json_mode,
@@ -1515,7 +1537,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Logs { agent_id } => {
-            let client = connect_cli_server(&server, via_relay).await?;
+            let client = connect_cli_server(&home_dir, &server, via_relay).await?;
             let req_id = Uuid::new_v4();
             let resp = client
                 .request(
@@ -1549,43 +1571,43 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             prompt,
         } => {
             cmd_fork_agent(
-                &server, via_relay, json_mode, agent_id, at_seq, worktree, branch, base_ref, title,
-                prompt,
+                &home_dir, &server, via_relay, json_mode, agent_id, at_seq, worktree, branch,
+                base_ref, title, prompt,
             )
             .await?;
         }
         Commands::Agent { action } => {
-            cmd_agent(&server, via_relay, json_mode, action).await?;
+            cmd_agent(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Workspace { action } => {
-            cmd_workspace(&server, via_relay, json_mode, action).await?;
+            cmd_workspace(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Script { action } => {
-            cmd_script(&server, via_relay, json_mode, action).await?;
+            cmd_script(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Terminal { action } => {
-            cmd_terminal(&server, via_relay, json_mode, action).await?;
+            cmd_terminal(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Schedule { action } => {
-            cmd_schedule(&server, via_relay, json_mode, action).await?;
+            cmd_schedule(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Heartbeat { action } => {
-            cmd_heartbeat(&server, via_relay, json_mode, action).await?;
+            cmd_heartbeat(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Profile { action } => {
-            cmd_profile(&server, via_relay, json_mode, action).await?;
+            cmd_profile(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Host { action } => {
-            cmd_host(&server, via_relay, json_mode, action).await?;
+            cmd_host(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Permit { action } => {
-            cmd_permit(&server, via_relay, json_mode, action).await?;
+            cmd_permit(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Config { action } => {
-            cmd_config(&server, via_relay, json_mode, action).await?;
+            cmd_config(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Skill { action } => {
-            cmd_skill(&server, via_relay, json_mode, action).await?;
+            cmd_skill(&home_dir, &server, via_relay, json_mode, action).await?;
         }
         Commands::Acp { action } => {
             cmd_acp(
@@ -1605,10 +1627,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             mcp_bridge::run_mcp_stdio_bridge(&home_dir, caller_agent_id, url).await?;
         }
 
-        Commands::Shim { socket, spec_json } => {
+        Commands::Shim { socket } => {
             let err_sidecar = socket.with_extension("err");
-            let parsed = serde_json::from_str::<ShimSpawnSpec>(&spec_json);
-            let res: anyhow::Result<()> = match parsed {
+            let res: anyhow::Result<()> = match read_spawn_spec_from_stdin() {
                 Ok(spec) => run_shim(&socket, spec).await.map_err(Into::into),
                 Err(e) => Err(e.into()),
             };
@@ -1622,7 +1643,104 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn read_local_host_identity(home_dir: &std::path::Path) -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(home_dir.join("host-keypair.json")).ok()?;
+    let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
+    let host_id = kp.host_id().ok()?;
+    Some((host_id, kp.public_key_b64))
+}
+
+pub(crate) fn advertised_direct_endpoints(bind_ip: std::net::IpAddr, port: u16) -> Vec<String> {
+    if bind_ip.is_unspecified() {
+        discover_lan_ws_endpoints(port)
+    } else if bind_ip.is_ipv6() {
+        vec![format!("ws://[{bind_ip}]:{port}/ws")]
+    } else {
+        vec![format!("ws://{bind_ip}:{port}/ws")]
+    }
+}
+
+/// Extract the TCP port if `raw_url` is a plain `ws://` URL targeting a local loopback host
+/// (`127.0.0.0/8`, `localhost`, or `[::1]`). Rejects remote hosts, TLS URLs, userinfo (`@`), and
+/// parser-differential characters so local daemon credentials are never sent to remote targets.
+fn parse_loopback_ws_port(raw_url: &str) -> Option<u16> {
+    let trimmed = raw_url.trim();
+    if trimmed.len() < 5 || !trimmed[..5].eq_ignore_ascii_case("ws://") {
+        return None;
+    }
+    let rest = &trimmed[5..];
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+        return None;
+    }
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, after) = bracketed.split_once(']')?;
+        let ip: std::net::Ipv6Addr = host.parse().ok()?;
+        if !ip.is_loopback() {
+            return None;
+        }
+        if after.is_empty() {
+            return Some(80);
+        }
+        let port_str = after.strip_prefix(':')?;
+        let port: u16 = port_str.parse().ok()?;
+        return (port > 0).then_some(port);
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => {
+            if h.contains(':') {
+                return None;
+            }
+            let parsed: u16 = p.parse().ok()?;
+            if parsed == 0 {
+                return None;
+            }
+            (h, parsed)
+        }
+        None => (authority, 80),
+    };
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    is_loopback.then_some(port)
+}
+
+async fn resolve_cli_direct_secret(
+    home_dir: &std::path::Path,
+    server_url: &str,
+    explicit_secret: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
+    if let Some(secret) = explicit_secret.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok((secret.to_string(), None));
+    }
+    let Some(port) = parse_loopback_ws_port(server_url) else {
+        anyhow::bail!(
+            "refusing to send local daemon pairing secret to remote server `{server_url}`; pass `--server orbit://pair/...` or set `ORBIT_PAIRING_SECRET` for this remote target"
+        );
+    };
+    let Some((local_host_id, _)) = read_local_host_identity(home_dir) else {
+        anyhow::bail!(
+            "missing local host identity at {} (start the local daemon or pass `--server orbit://pair/...` / set `ORBIT_PAIRING_SECRET`)",
+            home_dir.join("host-keypair.json").display()
+        );
+    };
+    if probe_daemon_port(port, &local_host_id).await != PortOwnership::Mine {
+        anyhow::bail!(
+            "refusing to send local daemon pairing secret to `{server_url}`: 127.0.0.1:{port} is not owned by local daemon `{local_host_id}` (pass `--server orbit://pair/...` or set `ORBIT_PAIRING_SECRET`)"
+        );
+    }
+    let secret = orbit_daemon::read_pairing_secret(home_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing pairing secret at {} (start the local daemon or pass `--server orbit://pair/...`)",
+            home_dir.join(orbit_daemon::PAIRING_SECRET_FILENAME).display()
+        )
+    })?;
+    Ok((secret, Some(local_host_id)))
+}
+
 pub(crate) async fn connect_cli_server(
+    home_dir: &std::path::Path,
     server: &str,
     via_relay: bool,
 ) -> anyhow::Result<HostSessionHandle> {
@@ -1644,11 +1762,20 @@ pub(crate) async fn connect_cli_server(
             daemon_pubkey_b64: offer.daemon_pubkey_b64,
             direct_endpoints: offer.direct_endpoints,
             relay_url: offer.relay_url,
+            pairing_secret: offer.pairing_secret,
+            pairing_secret_updated_at_ms: 0,
             state: HostConnectionState::Disconnected,
         };
         Ok(connect_smart(&profile, None).await?)
     } else {
-        Ok(connect_direct(trimmed, None).await?)
+        let env_secret = std::env::var("ORBIT_PAIRING_SECRET").ok();
+        let (secret, expected_host_id) =
+            resolve_cli_direct_secret(home_dir, trimmed, env_secret.as_deref()).await?;
+        if let Some(host_id) = expected_host_id {
+            Ok(connect_direct_verified(&host_id, trimmed, &secret, None).await?)
+        } else {
+            Ok(connect_direct(trimmed, &secret, None).await?)
+        }
     }
 }
 
@@ -1657,19 +1784,38 @@ async fn print_pairing_summary(
     port_override: Option<u16>,
     explicit_endpoints: Vec<String>,
     explicit_relay: Option<String>,
+    rotate_secret: bool,
 ) -> anyhow::Result<()> {
+    if rotate_secret {
+        let _ = orbit_daemon::rotate_pairing_secret(home_dir)?;
+        eprintln!(
+            "[✓] Rotated host pairing secret at {} (active immediately for new connections).",
+            home_dir
+                .join(orbit_daemon::PAIRING_SECRET_FILENAME)
+                .display()
+        );
+    }
     let runtime = DaemonRuntime::bootstrap(home_dir).await?;
     let persisted = DaemonPersistedConfig::load(home_dir);
-    let fallback_port = persisted
-        .listen_addr
-        .unwrap_or_else(default_daemon_listen)
-        .port();
+    let configured_listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+    let live_addr = orbit_daemon::read_live_daemon_addr(home_dir);
+    let preferred_port = live_addr
+        .map(|a| a.port())
+        .unwrap_or_else(|| configured_listen.port());
     let port = match port_override {
         Some(p) => p,
-        None => find_live_daemon_port_for_host(&runtime.host_info.host_id, fallback_port).await,
+        None => find_live_daemon_port_for_host(&runtime.host_info.host_id, preferred_port).await,
+    };
+    let bind_ip = if let Some(la) = live_addr
+        && la.port() == port
+        && probe_daemon_port(port, &runtime.host_info.host_id).await == PortOwnership::Mine
+    {
+        la.ip()
+    } else {
+        configured_listen.ip()
     };
     let endpoints = if explicit_endpoints.is_empty() {
-        discover_lan_ws_endpoints(port)
+        advertised_direct_endpoints(bind_ip, port)
     } else {
         explicit_endpoints
     };
@@ -1678,7 +1824,7 @@ async fn print_pairing_summary(
         None => persisted.relay_url,
     };
 
-    let offer = runtime.build_pairing_offer(endpoints.clone(), relay.clone());
+    let offer = runtime.build_pairing_offer(endpoints.clone(), relay.clone())?;
     let relay_summary = relay
         .as_deref()
         .map(redact_relay_url)
@@ -1694,63 +1840,705 @@ async fn print_pairing_summary(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AllowedPermissionChoices {
+    allow: bool,
+    allow_always: bool,
+    deny: bool,
+}
+
+impl AllowedPermissionChoices {
+    fn from_wire(allowed_decisions: &[String]) -> Self {
+        Self {
+            allow: allowed_decisions.iter().any(|d| d == "allow"),
+            allow_always: allowed_decisions.iter().any(|d| d == "allow_always"),
+            deny: allowed_decisions.iter().any(|d| d == "deny"),
+        }
+    }
+
+    fn prompt_line(self) -> String {
+        let mut opts = Vec::new();
+        if self.allow {
+            opts.push("[a] allow");
+        }
+        if self.allow_always {
+            opts.push("[A] allow always");
+        }
+        if self.deny || opts.is_empty() {
+            opts.push("[d] deny");
+        }
+        format!("  {} (default: deny): ", opts.join(" / "))
+    }
+
+    fn parse_input(self, raw: &str) -> &'static str {
+        match raw.trim() {
+            "a" if self.allow => "allow",
+            "A" if self.allow_always => "allow_always",
+            _ => "deny",
+        }
+    }
+}
+
+/// Render text safely on a single terminal line without truncating security-relevant content:
+/// backslashes, newlines, tabs, and all control characters are visibly escaped so literal `\n`
+/// cannot be confused with an actual newline.
+fn escape_terminal_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let code = c as u32;
+                if code <= 0xFF {
+                    let _ = write!(out, "\\x{code:02x}");
+                } else {
+                    let _ = write!(out, "\\u{{{code:x}}}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn format_permission_summary(title: &str, detail: &ToolCallDetail) -> String {
+    let (tool_label, detail_summary) = match detail {
+        ToolCallDetail::Shell { command, .. } => (
+            "shell".to_string(),
+            format!("$ {}", escape_terminal_text(command)),
+        ),
+        ToolCallDetail::FileRead { path, .. } => (
+            "file_read".to_string(),
+            format!("read {}", escape_terminal_text(path)),
+        ),
+        ToolCallDetail::FileEdit { path, .. } => (
+            "file_edit".to_string(),
+            format!("edit {}", escape_terminal_text(path)),
+        ),
+        ToolCallDetail::Search { query, .. } => (
+            "search".to_string(),
+            format!("search `{}`", escape_terminal_text(query)),
+        ),
+        ToolCallDetail::Subagent {
+            role,
+            prompt_preview,
+            ..
+        } => {
+            let role_esc = escape_terminal_text(role.trim());
+            let preview_esc = escape_terminal_text(prompt_preview.trim());
+            if preview_esc.is_empty() {
+                ("subagent".to_string(), format!("subagent ({role_esc})"))
+            } else {
+                (
+                    "subagent".to_string(),
+                    format!("subagent ({role_esc}): {preview_esc}"),
+                )
+            }
+        }
+        ToolCallDetail::Generic {
+            tool_name,
+            arguments_json,
+        } => {
+            let name = escape_terminal_text(tool_name.trim());
+            let args = escape_terminal_text(arguments_json.trim());
+            if args.is_empty() || args == "{}" || args == "null" {
+                (name, String::new())
+            } else {
+                (name, args)
+            }
+        }
+    };
+    let title_clean = escape_terminal_text(title.trim());
+    let mut parts = Vec::new();
+    if !tool_label.is_empty() {
+        parts.push(tool_label.clone());
+    }
+    if !title_clean.is_empty() && !title_clean.eq_ignore_ascii_case(&tool_label) {
+        parts.push(title_clean);
+    }
+    if !detail_summary.is_empty() && !parts.iter().any(|p| p == &detail_summary) {
+        parts.push(detail_summary);
+    }
+    if parts.is_empty() {
+        "tool permission".to_string()
+    } else {
+        parts.join(" — ")
+    }
+}
+
+fn write_guardian_notice(guardian: Option<&GuardianAssessment>, err_writer: &mut impl Write) {
+    let Some(g) = guardian else {
+        return;
+    };
+    let reason = escape_terminal_text(g.reason.trim());
+    if reason.is_empty() {
+        let _ = writeln!(
+            err_writer,
+            "  [guardian] {} ({})",
+            g.risk_level.display_label(),
+            g.decision.as_str()
+        );
+    } else {
+        let _ = writeln!(
+            err_writer,
+            "  [guardian] {} ({}): {reason}",
+            g.risk_level.display_label(),
+            g.decision.as_str()
+        );
+    }
+}
+
+struct PendingPermission {
+    request_id: String,
+    summary: String,
+    choices: AllowedPermissionChoices,
+    guardian: Option<GuardianAssessment>,
+}
+
+struct StdinPromptReply {
+    request_id: String,
+    line: Option<String>,
+}
+
+type StdinWorkerChannels = (
+    tokio::sync::mpsc::UnboundedSender<String>,
+    tokio::sync::mpsc::UnboundedReceiver<StdinPromptReply>,
+);
+
+struct StdinLineSource {
+    ask_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    resp_rx: Option<tokio::sync::mpsc::UnboundedReceiver<StdinPromptReply>>,
+    starter: Option<Box<dyn FnOnce() -> StdinWorkerChannels + Send>>,
+    in_flight: usize,
+    eof: bool,
+}
+
+impl StdinLineSource {
+    fn lazy_os_stdin() -> Self {
+        Self {
+            ask_tx: None,
+            resp_rx: None,
+            starter: Some(Box::new(|| {
+                let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<StdinPromptReply>();
+                let _ = std::thread::Builder::new()
+                    .name("orbit-cli-perm-stdin".into())
+                    .spawn(move || {
+                        let stdin = std::io::stdin();
+                        let mut locked = stdin.lock();
+                        while let Some(request_id) = ask_rx.blocking_recv() {
+                            let mut line = String::new();
+                            match std::io::BufRead::read_line(&mut locked, &mut line) {
+                                Ok(0) | Err(_) => {
+                                    let _ = resp_tx.send(StdinPromptReply {
+                                        request_id,
+                                        line: None,
+                                    });
+                                    break;
+                                }
+                                Ok(_) => {
+                                    if resp_tx
+                                        .send(StdinPromptReply {
+                                            request_id,
+                                            line: Some(line),
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                (ask_tx, resp_rx)
+            })),
+            in_flight: 0,
+            eof: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_channels(
+        ask_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        resp_rx: tokio::sync::mpsc::UnboundedReceiver<StdinPromptReply>,
+    ) -> Self {
+        Self {
+            ask_tx: Some(ask_tx),
+            resp_rx: Some(resp_rx),
+            starter: None,
+            in_flight: 0,
+            eof: false,
+        }
+    }
+
+    fn request_line_for(&mut self, request_id: &str) {
+        if self.resp_rx.is_none()
+            && let Some(starter) = self.starter.take()
+        {
+            let (tx, rx) = starter();
+            self.ask_tx = Some(tx);
+            self.resp_rx = Some(rx);
+        }
+        if let Some(tx) = self.ask_tx.as_ref()
+            && tx.send(request_id.to_string()).is_ok()
+        {
+            self.in_flight += 1;
+        }
+    }
+
+    fn drain_stale_replies(&mut self) {
+        if let Some(rx) = self.resp_rx.as_mut() {
+            while let Ok(reply) = rx.try_recv() {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if reply.line.is_none() {
+                    self.eof = true;
+                }
+            }
+        }
+    }
+
+    fn has_in_flight(&self) -> bool {
+        self.in_flight > 0
+    }
+
+    async fn next_reply(&mut self) -> Option<StdinPromptReply> {
+        match self.resp_rx.as_mut() {
+            Some(rx) => match rx.recv().await {
+                Some(reply) => {
+                    self.in_flight = self.in_flight.saturating_sub(1);
+                    if reply.line.is_none() {
+                        self.eof = true;
+                    }
+                    Some(reply)
+                }
+                None => {
+                    self.in_flight = 0;
+                    self.eof = true;
+                    None
+                }
+            },
+            None => std::future::pending().await,
+        }
+    }
+}
+
+fn display_interactive_prompt(prompt: &PendingPermission, err_writer: &mut impl Write) {
+    let _ = writeln!(err_writer, "\n  [permission] {}", prompt.summary);
+    write_guardian_notice(prompt.guardian.as_ref(), err_writer);
+    let _ = write!(err_writer, "{}", prompt.choices.prompt_line());
+    let _ = err_writer.flush();
+}
+
+async fn send_permission_resolution<F, Fut, WErr>(
+    send_wire: &mut F,
+    agent_id: &str,
+    permission_request_id: &str,
+    decision: &str,
+    in_flight_resolves: &mut HashMap<Uuid, String>,
+    err_writer: &mut WErr,
+) -> anyhow::Result<()>
+where
+    F: FnMut(WireMessage) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+    WErr: Write,
+{
+    let rpc_req_id = Uuid::new_v4();
+    let msg = WireMessage::ResolvePermission {
+        request_id: rpc_req_id,
+        agent_id: agent_id.to_string(),
+        permission_request_id: permission_request_id.to_string(),
+        decision: decision.to_string(),
+    };
+    if let Err(e) = send_wire(msg).await {
+        let _ = writeln!(
+            err_writer,
+            "  [permission error] failed to send resolution for `{permission_request_id}`: {e}"
+        );
+        let _ = err_writer.flush();
+        return Err(anyhow::anyhow!(
+            "failed to send permission resolution for `{permission_request_id}`: {e}"
+        ));
+    }
+    in_flight_resolves.insert(rpc_req_id, permission_request_id.to_string());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_turn_loop<F, Fut, WOut, WErr>(
+    sub_rx: &mut tokio::sync::broadcast::Receiver<ClientInboundEvent>,
+    agent_id: &str,
+    auto_approve: bool,
+    is_interactive_tty: bool,
+    stdin: &mut StdinLineSource,
+    send_wire: &mut F,
+    out_writer: &mut WOut,
+    err_writer: &mut WErr,
+) -> anyhow::Result<()>
+where
+    F: FnMut(WireMessage) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+    WOut: Write,
+    WErr: Write,
+{
+    let mut saw_running = false;
+    let mut terminal_seen = false;
+    let mut pending_ack_deadline: Option<tokio::time::Instant> = None;
+    let mut pending_permissions: VecDeque<PendingPermission> = VecDeque::new();
+    let mut active_prompt: Option<PendingPermission> = None;
+    let mut in_flight_resolves: HashMap<Uuid, String> = HashMap::new();
+
+    loop {
+        if terminal_seen && in_flight_resolves.is_empty() {
+            break;
+        }
+        let ack_sleep = async {
+            match pending_ack_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            recv_res = sub_rx.recv() => {
+                match recv_res {
+                    Ok(ClientInboundEvent::Wire(WireMessage::Ack { request_id })) => {
+                        in_flight_resolves.remove(&request_id);
+                    }
+                    Ok(ClientInboundEvent::Wire(WireMessage::RpcError {
+                        request_id: Some(req_id),
+                        code,
+                        message,
+                    })) => {
+                        if let Some(perm_id) = in_flight_resolves.remove(&req_id) {
+                            let _ = writeln!(
+                                err_writer,
+                                "  [permission error] daemon rejected resolution for `{perm_id}`: [{code}] {message}"
+                            );
+                            let _ = err_writer.flush();
+                            anyhow::bail!(
+                                "daemon rejected permission resolution for `{perm_id}`: [{code}] {message}"
+                            );
+                        }
+                    }
+                    Ok(ClientInboundEvent::Wire(WireMessage::TimelineLive { event }))
+                        if event.agent_id == agent_id && !terminal_seen =>
+                    {
+                        match event.payload {
+                            TimelinePayload::AssistantMessage {
+                                ref text,
+                                streaming: false,
+                                ..
+                            } => {
+                                let _ = writeln!(out_writer, "\n{text}");
+                                let _ = out_writer.flush();
+                            }
+                            TimelinePayload::ToolCall { status, detail, .. } => {
+                                let _ = writeln!(
+                                    out_writer,
+                                    "  [tool:{status:?}] {}",
+                                    summarize_tool(&detail)
+                                );
+                                let _ = out_writer.flush();
+                            }
+                            TimelinePayload::PermissionRequest {
+                                request_id,
+                                title,
+                                detail,
+                                allowed_decisions,
+                                guardian_assessment,
+                            } => {
+                                let summary = format_permission_summary(&title, &detail);
+                                let choices = AllowedPermissionChoices::from_wire(&allowed_decisions);
+                                if auto_approve {
+                                    let decision = if choices.allow {
+                                        let _ = writeln!(
+                                            err_writer,
+                                            "  [permission] {summary} -> approved (--auto-approve)"
+                                        );
+                                        write_guardian_notice(
+                                            guardian_assessment.as_ref(),
+                                            err_writer,
+                                        );
+                                        "allow"
+                                    } else {
+                                        let _ = writeln!(
+                                            err_writer,
+                                            "  [permission] {summary} -> denied (provider does not permit `allow`)"
+                                        );
+                                        write_guardian_notice(
+                                            guardian_assessment.as_ref(),
+                                            err_writer,
+                                        );
+                                        "deny"
+                                    };
+                                    let _ = err_writer.flush();
+                                    send_permission_resolution(
+                                        send_wire,
+                                        agent_id,
+                                        &request_id,
+                                        decision,
+                                        &mut in_flight_resolves,
+                                        err_writer,
+                                    )
+                                    .await?;
+                                } else if !is_interactive_tty {
+                                    let _ = writeln!(err_writer, "  [permission] {summary}");
+                                    write_guardian_notice(
+                                        guardian_assessment.as_ref(),
+                                        err_writer,
+                                    );
+                                    let _ = writeln!(
+                                        err_writer,
+                                        "  Permission denied in non-interactive mode. Pass --auto-approve (-y) to allow unattended execution."
+                                    );
+                                    let _ = err_writer.flush();
+                                    send_permission_resolution(
+                                        send_wire,
+                                        agent_id,
+                                        &request_id,
+                                        "deny",
+                                        &mut in_flight_resolves,
+                                        err_writer,
+                                    )
+                                    .await?;
+                                } else if stdin.eof {
+                                    let _ = writeln!(
+                                        err_writer,
+                                        "  [permission] {summary} -> denied (stdin EOF)"
+                                    );
+                                    write_guardian_notice(
+                                        guardian_assessment.as_ref(),
+                                        err_writer,
+                                    );
+                                    let _ = err_writer.flush();
+                                    send_permission_resolution(
+                                        send_wire,
+                                        agent_id,
+                                        &request_id,
+                                        "deny",
+                                        &mut in_flight_resolves,
+                                        err_writer,
+                                    )
+                                    .await?;
+                                } else {
+                                    let pending = PendingPermission {
+                                        request_id,
+                                        summary,
+                                        choices,
+                                        guardian: guardian_assessment,
+                                    };
+                                    if active_prompt.is_none() {
+                                        stdin.request_line_for(&pending.request_id);
+                                        display_interactive_prompt(&pending, err_writer);
+                                        active_prompt = Some(pending);
+                                    } else {
+                                        pending_permissions.push_back(pending);
+                                    }
+                                }
+                            }
+                            TimelinePayload::PermissionResolved {
+                                request_id,
+                                decision,
+                            } => {
+                                if active_prompt
+                                    .as_ref()
+                                    .is_some_and(|p| p.request_id == request_id)
+                                {
+                                    active_prompt = None;
+                                    stdin.drain_stale_replies();
+                                    let _ = writeln!(
+                                        err_writer,
+                                        "\n  [permission] `{request_id}` resolved ({decision})"
+                                    );
+                                    let _ = err_writer.flush();
+                                    if let Some(next) = pending_permissions.pop_front() {
+                                        if stdin.eof {
+                                            let _ = writeln!(
+                                                err_writer,
+                                                "  [permission] {} -> denied (stdin EOF)",
+                                                next.summary
+                                            );
+                                            let _ = err_writer.flush();
+                                            send_permission_resolution(
+                                                send_wire,
+                                                agent_id,
+                                                &next.request_id,
+                                                "deny",
+                                                &mut in_flight_resolves,
+                                                err_writer,
+                                            )
+                                            .await?;
+                                        } else {
+                                            stdin.request_line_for(&next.request_id);
+                                            display_interactive_prompt(&next, err_writer);
+                                            active_prompt = Some(next);
+                                        }
+                                    }
+                                } else {
+                                    pending_permissions.retain(|p| p.request_id != request_id);
+                                }
+                            }
+                            TimelinePayload::StatusChanged { status } => match status {
+                                AgentStatus::Running { .. }
+                                | AgentStatus::AutonomousWakeup { .. } => {
+                                    saw_running = true;
+                                }
+                                AgentStatus::Idle if saw_running => {
+                                    terminal_seen = true;
+                                    active_prompt = None;
+                                    if !in_flight_resolves.is_empty() {
+                                        pending_ack_deadline =
+                                            Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                                    }
+                                }
+                                AgentStatus::Error { message, .. } => {
+                                    let _ = writeln!(err_writer, "\n[Agent Error] {message}");
+                                    let _ = err_writer.flush();
+                                    terminal_seen = true;
+                                    active_prompt = None;
+                                    if !in_flight_resolves.is_empty() {
+                                        pending_ack_deadline =
+                                            Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                                    }
+                                }
+                                AgentStatus::Closed => {
+                                    terminal_seen = true;
+                                    active_prompt = None;
+                                    if !in_flight_resolves.is_empty() {
+                                        pending_ack_deadline =
+                                            Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                                    }
+                                }
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                    }
+                    Ok(ClientInboundEvent::Disconnected) => {
+                        anyhow::bail!("disconnected from Orbit daemon while streaming `{agent_id}`");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        anyhow::bail!(
+                            "timeline event stream lagged by {skipped} event(s) while streaming `{agent_id}`"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!(
+                            "daemon event stream closed unexpectedly while streaming `{agent_id}`"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            reply_opt = stdin.next_reply(), if !terminal_seen && (active_prompt.is_some() || stdin.has_in_flight()) => {
+                match reply_opt {
+                    Some(StdinPromptReply { request_id, line: Some(line) }) => {
+                        if active_prompt
+                            .as_ref()
+                            .is_some_and(|p| p.request_id == request_id)
+                            && let Some(prompt) = active_prompt.take()
+                        {
+                            let decision = prompt.choices.parse_input(&line);
+                            send_permission_resolution(
+                                send_wire,
+                                agent_id,
+                                &prompt.request_id,
+                                decision,
+                                &mut in_flight_resolves,
+                                err_writer,
+                            )
+                            .await?;
+                            if let Some(next) = pending_permissions.pop_front() {
+                                stdin.request_line_for(&next.request_id);
+                                display_interactive_prompt(&next, err_writer);
+                                active_prompt = Some(next);
+                            }
+                        } else if let Some(ref current) = active_prompt {
+                            // Stale line typed for a previously dismissed request_id: never apply to `current`.
+                            let _ = writeln!(
+                                err_writer,
+                                "\n  [permission] ignored stale input for `{request_id}`; awaiting `{}`",
+                                current.request_id
+                            );
+                            let _ = write!(err_writer, "{}", current.choices.prompt_line());
+                            let _ = err_writer.flush();
+                        }
+                    }
+                    Some(StdinPromptReply { line: None, .. }) | None => {
+                        if let Some(prompt) = active_prompt.take() {
+                            let _ = writeln!(err_writer);
+                            let _ = err_writer.flush();
+                            send_permission_resolution(
+                                send_wire,
+                                agent_id,
+                                &prompt.request_id,
+                                "deny",
+                                &mut in_flight_resolves,
+                                err_writer,
+                            )
+                            .await?;
+                        }
+                        while let Some(queued) = pending_permissions.pop_front() {
+                            let _ = writeln!(
+                                err_writer,
+                                "  [permission] {} -> denied (stdin EOF)",
+                                queued.summary
+                            );
+                            let _ = err_writer.flush();
+                            send_permission_resolution(
+                                send_wire,
+                                agent_id,
+                                &queued.request_id,
+                                "deny",
+                                &mut in_flight_resolves,
+                                err_writer,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            () = ack_sleep, if terminal_seen && !in_flight_resolves.is_empty() => {
+                anyhow::bail!(
+                    "timed out waiting for daemon acknowledgement of {} permission resolution(s)",
+                    in_flight_resolves.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn stream_turn_to_stdout(
     client: &orbit_client_core::HostSessionHandle,
     sub_rx: &mut tokio::sync::broadcast::Receiver<ClientInboundEvent>,
     agent_id: &str,
+    auto_approve: bool,
 ) -> anyhow::Result<()> {
-    let mut saw_running = false;
-    while let Ok(ev) = sub_rx.recv().await {
-        match ev {
-            ClientInboundEvent::Wire(WireMessage::TimelineLive { event })
-                if event.agent_id == agent_id =>
-            {
-                match event.payload {
-                    TimelinePayload::AssistantMessage {
-                        ref text,
-                        streaming: false,
-                        ..
-                    } => {
-                        println!("\n{text}");
-                    }
-                    TimelinePayload::ToolCall { status, detail, .. } => {
-                        println!("  [tool:{status:?}] {}", summarize_tool(&detail));
-                    }
-                    TimelinePayload::PermissionRequest {
-                        request_id, title, ..
-                    } => {
-                        println!("  [permission requested] {title} -> auto-allowing from CLI");
-                        let _ = client
-                            .send_wire(WireMessage::ResolvePermission {
-                                request_id: Uuid::new_v4(),
-                                agent_id: agent_id.to_string(),
-                                permission_request_id: request_id,
-                                decision: "allow".into(),
-                            })
-                            .await;
-                    }
-                    TimelinePayload::StatusChanged { status } => match status {
-                        AgentStatus::Running { .. } | AgentStatus::AutonomousWakeup { .. } => {
-                            saw_running = true;
-                        }
-                        AgentStatus::Idle if saw_running => {
-                            break;
-                        }
-                        AgentStatus::Error { message, .. } => {
-                            eprintln!("\n[Agent Error] {message}");
-                            break;
-                        }
-                        AgentStatus::Closed => break,
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }
-            ClientInboundEvent::Disconnected => break,
-            _ => {}
-        }
-    }
-    Ok(())
+    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let mut stdin = StdinLineSource::lazy_os_stdin();
+    let mut stdout = std::io::stdout();
+    let mut stderr = std::io::stderr();
+    let mut send_wire = |msg: WireMessage| async move {
+        client
+            .send_wire(msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    stream_turn_loop(
+        sub_rx,
+        agent_id,
+        auto_approve,
+        is_tty,
+        &mut stdin,
+        &mut send_wire,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
 }
 
 pub(crate) fn print_timeline_payload(seq: u64, payload: &TimelinePayload) {
@@ -1800,5 +2588,668 @@ pub(crate) fn format_status(s: &AgentStatus) -> &'static str {
         AgentStatus::AwaitingPermission { .. } => "awaiting_perm",
         AgentStatus::Error { .. } => "error",
         AgentStatus::Closed => "closed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orbit_protocol::{GuardianDecision, GuardianRiskLevel, TimelineEvent};
+
+    fn sample_shell_detail() -> ToolCallDetail {
+        ToolCallDetail::Shell {
+            command: "cargo test --workspace".into(),
+            cwd: None,
+            exit_code: None,
+            output_preview: None,
+        }
+    }
+
+    fn timeline_event(agent_id: &str, payload: TimelinePayload) -> ClientInboundEvent {
+        ClientInboundEvent::Wire(WireMessage::TimelineLive {
+            event: TimelineEvent {
+                seq: 1,
+                epoch: 0,
+                agent_id: agent_id.to_string(),
+                turn_id: Some("t1".into()),
+                timestamp: chrono::Utc::now(),
+                payload,
+            },
+        })
+    }
+
+    #[test]
+    fn cli_parses_auto_approve_flags_on_run_and_send() {
+        let run_default = Cli::try_parse_from(["orbit", "run", "hello"]).expect("run default");
+        assert!(matches!(
+            run_default.command,
+            Commands::Run {
+                auto_approve: false,
+                ..
+            }
+        ));
+
+        let run_long =
+            Cli::try_parse_from(["orbit", "run", "--auto-approve", "hello"]).expect("run long");
+        assert!(matches!(
+            run_long.command,
+            Commands::Run {
+                auto_approve: true,
+                ..
+            }
+        ));
+
+        let run_short = Cli::try_parse_from(["orbit", "run", "-y", "hello"]).expect("run short");
+        assert!(matches!(
+            run_short.command,
+            Commands::Run {
+                auto_approve: true,
+                ..
+            }
+        ));
+
+        let send_default =
+            Cli::try_parse_from(["orbit", "send", "ag_1", "continue"]).expect("send default");
+        assert!(matches!(
+            send_default.command,
+            Commands::Send {
+                auto_approve: false,
+                ..
+            }
+        ));
+
+        let send_long =
+            Cli::try_parse_from(["orbit", "send", "--auto-approve", "ag_1", "continue"])
+                .expect("send long");
+        assert!(matches!(
+            send_long.command,
+            Commands::Send {
+                auto_approve: true,
+                ..
+            }
+        ));
+
+        let send_short =
+            Cli::try_parse_from(["orbit", "send", "-y", "ag_1", "continue"]).expect("send short");
+        assert!(matches!(
+            send_short.command,
+            Commands::Send {
+                auto_approve: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_choices_enforces_strict_grammar_and_provider_advertised_options() {
+        let all = AllowedPermissionChoices::from_wire(&[
+            "allow".into(),
+            "allow_always".into(),
+            "deny".into(),
+        ]);
+        assert_eq!(
+            all.prompt_line(),
+            "  [a] allow / [A] allow always / [d] deny (default: deny): "
+        );
+        assert_eq!(all.parse_input("a\n"), "allow");
+        assert_eq!(all.parse_input(" a \r\n"), "allow");
+        assert_eq!(all.parse_input("A\n"), "allow_always");
+        assert_eq!(all.parse_input("d\n"), "deny");
+        assert_eq!(all.parse_input("\n"), "deny");
+        assert_eq!(all.parse_input("allow\n"), "deny");
+        assert_eq!(all.parse_input("always\n"), "deny");
+
+        // Codex-style provider: only `allow` and `deny` advertised -> `[A]` omitted & rejected.
+        let codex = AllowedPermissionChoices::from_wire(&["allow".into(), "deny".into()]);
+        assert_eq!(
+            codex.prompt_line(),
+            "  [a] allow / [d] deny (default: deny): "
+        );
+        assert_eq!(codex.parse_input("a\n"), "allow");
+        assert_eq!(codex.parse_input("A\n"), "deny");
+        assert_eq!(codex.parse_input("\n"), "deny");
+
+        // Deny-only permission -> both `a` and `A` fail closed to `deny`.
+        let deny_only = AllowedPermissionChoices::from_wire(&["deny".into()]);
+        assert_eq!(deny_only.prompt_line(), "  [d] deny (default: deny): ");
+        assert_eq!(deny_only.parse_input("a\n"), "deny");
+        assert_eq!(deny_only.parse_input("A\n"), "deny");
+    }
+
+    #[test]
+    fn permission_summary_preserves_full_command_and_escapes_backslashes_control_chars_and_tool_names()
+     {
+        // Literal `\n` must escape to `\\n`, distinct from an actual newline (`\n`).
+        assert_eq!(escape_terminal_text(r"lit\nreal"), r"lit\\nreal");
+        assert_eq!(escape_terminal_text("lit\nreal"), r"lit\nreal");
+
+        let long_prefix = "echo ".to_string() + &"x".repeat(200);
+        let full_cmd = format!("{long_prefix}\\nliteral\n\x1b[31mrm -rf /tmp/evil_suffix\r");
+        let shell_summary = format_permission_summary(
+            "Run\x07Cmd",
+            &ToolCallDetail::Shell {
+                command: full_cmd,
+                cwd: None,
+                exit_code: None,
+                output_preview: None,
+            },
+        );
+        assert!(
+            shell_summary.contains("evil_suffix"),
+            "must never truncate command suffix"
+        );
+        assert!(shell_summary.contains(r"\\nliteral\n"));
+        assert!(shell_summary.contains("\\r"));
+        assert!(shell_summary.contains("\\x1b[31m"));
+        assert!(shell_summary.contains("\\x07"));
+        assert!(!shell_summary.contains('\x1b'));
+        assert!(!shell_summary.contains('\n'));
+
+        let generic_summary = format_permission_summary(
+            "Generic",
+            &ToolCallDetail::Generic {
+                tool_name: "mcp\x1b[2J_tool\n".into(),
+                arguments_json: r#"{"cmd":"a\nb"}"#.into(),
+            },
+        );
+        assert!(generic_summary.contains("mcp\\x1b[2J_tool"));
+        assert!(generic_summary.contains(r"a\\nb"));
+        assert!(!generic_summary.contains('\x1b'));
+    }
+
+    #[tokio::test]
+    async fn stream_auto_approve_respects_allowed_decisions_and_displays_guardian_reason() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let tx_for_ack = tx.clone();
+        let sent = Arc::new(tokio::sync::Mutex::new(Vec::<WireMessage>::new()));
+        let sent_ref = Arc::clone(&sent);
+        let (ask_tx, _ask_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stdin = StdinLineSource::from_channels(ask_tx, resp_rx);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        tx.send(timeline_event(
+            "ag_1",
+            TimelinePayload::StatusChanged {
+                status: AgentStatus::Running {
+                    turn_id: "t1".into(),
+                },
+            },
+        ))
+        .expect("send running");
+        tx.send(timeline_event(
+            "ag_1",
+            TimelinePayload::PermissionRequest {
+                request_id: "perm_allow".into(),
+                title: "Run tests".into(),
+                detail: sample_shell_detail(),
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                guardian_assessment: Some(GuardianAssessment {
+                    risk_level: GuardianRiskLevel::Medium,
+                    decision: GuardianDecision::RequireHuman,
+                    confidence: 0.8,
+                    classifier_tier: "deterministic".into(),
+                    reason: "writes outside repo\ncheck target".into(),
+                    signals: Vec::new(),
+                    latency_ms: 4,
+                }),
+            },
+        ))
+        .expect("send perm_allow");
+        tx.send(timeline_event(
+            "ag_1",
+            TimelinePayload::PermissionRequest {
+                request_id: "perm_deny_only".into(),
+                title: "Blocked op".into(),
+                detail: sample_shell_detail(),
+                allowed_decisions: vec!["deny".into()],
+                guardian_assessment: None,
+            },
+        ))
+        .expect("send perm_deny_only");
+        tx.send(timeline_event(
+            "ag_1",
+            TimelinePayload::StatusChanged {
+                status: AgentStatus::Idle,
+            },
+        ))
+        .expect("send idle");
+
+        let mut send_wire = |msg: WireMessage| {
+            let sent = Arc::clone(&sent_ref);
+            let tx = tx_for_ack.clone();
+            async move {
+                if let WireMessage::ResolvePermission { request_id, .. } = &msg {
+                    let _ = tx.send(ClientInboundEvent::Wire(WireMessage::Ack {
+                        request_id: *request_id,
+                    }));
+                }
+                sent.lock().await.push(msg);
+                Ok(())
+            }
+        };
+        stream_turn_loop(
+            &mut rx,
+            "ag_1",
+            true,
+            false,
+            &mut stdin,
+            &mut send_wire,
+            &mut out,
+            &mut err,
+        )
+        .await
+        .expect("stream loop");
+
+        let recorded = sent.lock().await;
+        assert_eq!(recorded.len(), 2);
+        assert!(matches!(
+            &recorded[0],
+            WireMessage::ResolvePermission {
+                permission_request_id,
+                decision,
+                ..
+            } if permission_request_id == "perm_allow" && decision == "allow"
+        ));
+        assert!(matches!(
+            &recorded[1],
+            WireMessage::ResolvePermission {
+                permission_request_id,
+                decision,
+                ..
+            } if permission_request_id == "perm_deny_only" && decision == "deny"
+        ));
+
+        let err_text = String::from_utf8(err).expect("utf8 err");
+        assert!(err_text.contains("--auto-approve"));
+        assert!(err_text.contains("writes outside repo\\ncheck target"));
+        assert!(err_text.contains("provider does not permit `allow`"));
+    }
+
+    #[tokio::test]
+    async fn stream_non_tty_fails_closed_and_errors_on_correlated_rpc_error_even_after_idle() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let tx_for_send = tx.clone();
+        let (ask_tx, _ask_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stdin = StdinLineSource::from_channels(ask_tx, resp_rx);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        tx.send(timeline_event(
+            "ag_1",
+            TimelinePayload::StatusChanged {
+                status: AgentStatus::Running {
+                    turn_id: "t1".into(),
+                },
+            },
+        ))
+        .expect("send running");
+        tx.send(timeline_event(
+            "ag_1",
+            TimelinePayload::PermissionRequest {
+                request_id: "perm_1".into(),
+                title: "Run shell".into(),
+                detail: sample_shell_detail(),
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                guardian_assessment: None,
+            },
+        ))
+        .expect("send perm");
+
+        let mut send_wire = |msg: WireMessage| {
+            let tx = tx_for_send.clone();
+            async move {
+                if let WireMessage::ResolvePermission {
+                    request_id,
+                    decision,
+                    ..
+                } = msg
+                {
+                    assert_eq!(decision, "deny");
+                    // Send terminal Idle BEFORE RpcError to prove we await pending resolution
+                    // and still fail on correlated RpcError instead of prematurely returning Ok(()).
+                    let _ = tx.send(timeline_event(
+                        "ag_1",
+                        TimelinePayload::StatusChanged {
+                            status: AgentStatus::Idle,
+                        },
+                    ));
+                    let _ = tx.send(ClientInboundEvent::Wire(WireMessage::RpcError {
+                        request_id: Some(request_id),
+                        code: "resolve_permission_failed".into(),
+                        message: "already resolved".into(),
+                    }));
+                }
+                Ok(())
+            }
+        };
+
+        let res = stream_turn_loop(
+            &mut rx,
+            "ag_1",
+            false,
+            false,
+            &mut stdin,
+            &mut send_wire,
+            &mut out,
+            &mut err,
+        )
+        .await;
+        let rpc_err = res.expect_err("correlated RpcError must return Err");
+        assert!(rpc_err.to_string().contains("already resolved"));
+
+        let err_text = String::from_utf8(err).expect("utf8 err");
+        assert!(err_text.contains(
+            "Permission denied in non-interactive mode. Pass --auto-approve (-y) to allow unattended execution."
+        ));
+        assert!(err_text.contains("daemon rejected resolution for `perm_1`"));
+        assert!(err_text.contains("already resolved"));
+    }
+
+    #[tokio::test]
+    async fn interactive_loop_binds_stdin_to_request_id_and_never_applies_stale_input_to_next_prompt()
+     {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let tx_for_ack = tx.clone();
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stdin = StdinLineSource::from_channels(ask_tx, resp_rx);
+        let sent = Arc::new(tokio::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let sent_ref = Arc::clone(&sent);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        // Driver reproduces the exact race:
+        // 1. P1 (`perm_ext`) and P2 (`perm_local`) arrive.
+        // 2. While P1 is active, another client resolves P1 AND a stale `"a\n"` reply bound to
+        //    `perm_ext` arrives AFTER P2 has been activated -> MUST NOT approve P2!
+        // 3. Operator then explicitly answers `"d\n"` for P2 -> P2 resolves as `"deny"`.
+        let driver = tokio::spawn(async move {
+            let _ = tx.send(timeline_event(
+                "ag_1",
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                },
+            ));
+            let _ = tx.send(timeline_event(
+                "ag_1",
+                TimelinePayload::PermissionRequest {
+                    request_id: "perm_ext".into(),
+                    title: "First".into(),
+                    detail: sample_shell_detail(),
+                    allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+                    guardian_assessment: None,
+                },
+            ));
+            let _ = tx.send(timeline_event(
+                "ag_1",
+                TimelinePayload::PermissionRequest {
+                    request_id: "perm_local".into(),
+                    title: "Second".into(),
+                    detail: sample_shell_detail(),
+                    allowed_decisions: vec!["allow".into(), "deny".into()],
+                    guardian_assessment: None,
+                },
+            ));
+            assert_eq!(ask_rx.recv().await.as_deref(), Some("perm_ext"));
+
+            // Externally resolve P1 -> activates P2 and requests stdin for `perm_local`.
+            let _ = tx.send(timeline_event(
+                "ag_1",
+                TimelinePayload::PermissionResolved {
+                    request_id: "perm_ext".into(),
+                    decision: "allow".into(),
+                },
+            ));
+            assert_eq!(ask_rx.recv().await.as_deref(), Some("perm_local"));
+
+            // Late stale `"a\n"` arrives tagged for dismissed `perm_ext` -> MUST be ignored!
+            let _ = resp_tx.send(StdinPromptReply {
+                request_id: "perm_ext".into(),
+                line: Some("a\n".into()),
+            });
+            // Now actual decision for `perm_local` arrives -> `"deny"`.
+            let _ = resp_tx.send(StdinPromptReply {
+                request_id: "perm_local".into(),
+                line: Some("d\n".into()),
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(timeline_event(
+                "ag_1",
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::Idle,
+                },
+            ));
+        });
+
+        let mut send_wire = |msg: WireMessage| {
+            let sent = Arc::clone(&sent_ref);
+            let tx = tx_for_ack.clone();
+            async move {
+                if let WireMessage::ResolvePermission {
+                    request_id,
+                    permission_request_id,
+                    decision,
+                    ..
+                } = msg
+                {
+                    sent.lock().await.push((permission_request_id, decision));
+                    let _ = tx.send(ClientInboundEvent::Wire(WireMessage::Ack { request_id }));
+                }
+                Ok(())
+            }
+        };
+
+        stream_turn_loop(
+            &mut rx,
+            "ag_1",
+            false,
+            true,
+            &mut stdin,
+            &mut send_wire,
+            &mut out,
+            &mut err,
+        )
+        .await
+        .expect("interactive loop");
+        driver.await.expect("driver");
+
+        let recorded = sent.lock().await;
+        assert_eq!(
+            *recorded,
+            vec![("perm_local".to_string(), "deny".to_string())]
+        );
+        let err_text = String::from_utf8(err).expect("utf8 err");
+        assert!(err_text.contains("`perm_ext` resolved (allow)"));
+        assert!(err_text.contains("ignored stale input for `perm_ext`"));
+        assert!(err_text.contains("[a] allow / [d] deny (default: deny): "));
+    }
+
+    #[tokio::test]
+    async fn stream_errors_explicitly_on_lagged_broadcast_and_transport_failure() {
+        // 1. Lagged broadcast channel MUST return Err instead of silent Ok(()).
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let (ask_tx, _ask_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stdin = StdinLineSource::from_channels(ask_tx, resp_rx);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = tx.send(timeline_event(
+            "ag_1",
+            TimelinePayload::StatusChanged {
+                status: AgentStatus::Idle,
+            },
+        ));
+        let _ = tx.send(timeline_event(
+            "ag_1",
+            TimelinePayload::StatusChanged {
+                status: AgentStatus::Idle,
+            },
+        ));
+        let mut noop_send = |_msg: WireMessage| async { Ok(()) };
+        let lag_err = stream_turn_loop(
+            &mut rx,
+            "ag_1",
+            false,
+            false,
+            &mut stdin,
+            &mut noop_send,
+            &mut out,
+            &mut err,
+        )
+        .await
+        .expect_err("lagged stream must error");
+        assert!(lag_err.to_string().contains("lagged"));
+
+        // 2. Transport send error on ResolvePermission MUST propagate and report to stderr.
+        let (tx2, mut rx2) = tokio::sync::broadcast::channel(4);
+        let (ask_tx2, _ask_rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (_resp_tx2, resp_rx2) = tokio::sync::mpsc::unbounded_channel();
+        let mut stdin2 = StdinLineSource::from_channels(ask_tx2, resp_rx2);
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        let _ = tx2.send(timeline_event(
+            "ag_1",
+            TimelinePayload::PermissionRequest {
+                request_id: "perm_fail".into(),
+                title: "Run".into(),
+                detail: sample_shell_detail(),
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                guardian_assessment: None,
+            },
+        ));
+        let mut failing_send = |_msg: WireMessage| async { Err(anyhow::anyhow!("ws broken")) };
+        let send_err = stream_turn_loop(
+            &mut rx2,
+            "ag_1",
+            true,
+            false,
+            &mut stdin2,
+            &mut failing_send,
+            &mut out2,
+            &mut err2,
+        )
+        .await
+        .expect_err("send failure must error");
+        assert!(send_err.to_string().contains("ws broken"));
+        let err2_text = String::from_utf8(err2).expect("utf8 err2");
+        assert!(err2_text.contains("failed to send resolution for `perm_fail`"));
+    }
+
+    #[test]
+    fn cli_parses_pair_rotate_secret_flag() {
+        let parsed = Cli::try_parse_from(["orbit", "pair", "--rotate-secret"])
+            .expect("parse orbit pair --rotate-secret");
+        match parsed.command {
+            Commands::Pair { rotate_secret, .. } => assert!(rotate_secret),
+            _ => panic!("expected Commands::Pair"),
+        }
+
+        let default_pair = Cli::try_parse_from(["orbit", "pair"]).expect("parse orbit pair");
+        match default_pair.command {
+            Commands::Pair { rotate_secret, .. } => assert!(!rotate_secret),
+            _ => panic!("expected Commands::Pair"),
+        }
+    }
+
+    #[test]
+    fn parse_loopback_ws_port_accepts_only_plain_loopback() {
+        assert_eq!(parse_loopback_ws_port("ws://127.0.0.1:6868/ws"), Some(6868));
+        assert_eq!(
+            parse_loopback_ws_port("WS://LOCALHOST:6870/ws?x=1"),
+            Some(6870)
+        );
+        assert_eq!(parse_loopback_ws_port("ws://[::1]:6868/ws"), Some(6868));
+        assert_eq!(parse_loopback_ws_port("ws://127.0.0.2:6868/ws"), Some(6868));
+
+        // Remote hosts, TLS, userinfo spoofs, and parser differentials must be rejected
+        assert_eq!(parse_loopback_ws_port("ws://192.168.1.10:6868/ws"), None);
+        assert_eq!(parse_loopback_ws_port("ws://evil.example:6868/ws"), None);
+        assert_eq!(parse_loopback_ws_port("wss://127.0.0.1:6868/ws"), None);
+        assert_eq!(
+            parse_loopback_ws_port("ws://127.0.0.1@evil.example:6868/ws"),
+            None
+        );
+        assert_eq!(
+            parse_loopback_ws_port("ws://127.0.0.1.evil.example:6868/ws"),
+            None
+        );
+        assert_eq!(
+            parse_loopback_ws_port("ws://127.0.0.1\\@evil.example:6868/ws"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_cli_direct_secret_refuses_sending_local_secret_to_remote_server() {
+        let tmp = std::env::temp_dir().join(format!("orbit_cli_sec_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let _rt = DaemonRuntime::bootstrap(&tmp).await.expect("bootstrap");
+
+        // Even with a valid local pairing-secret on disk, targeting a remote server without
+        // explicit credential MUST fail closed instead of leaking the local secret.
+        let err = resolve_cli_direct_secret(&tmp, "ws://remote.example:6868/ws", None)
+            .await
+            .expect_err("must refuse sending local secret to remote URL");
+        assert!(
+            err.to_string()
+                .contains("refusing to send local daemon pairing secret"),
+            "unexpected error: {err}"
+        );
+
+        // Explicit secret is still honored for intentional remote targets.
+        let (sec, expected_hid) = resolve_cli_direct_secret(
+            &tmp,
+            "ws://remote.example:6868/ws",
+            Some("explicit-remote-secret"),
+        )
+        .await
+        .expect("explicit secret allowed");
+        assert_eq!(sec, "explicit-remote-secret");
+        assert!(expected_hid.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn advertised_direct_endpoints_respects_bind_address() {
+        assert_eq!(
+            advertised_direct_endpoints(std::net::IpAddr::from([127, 0, 0, 1]), 6868),
+            vec!["ws://127.0.0.1:6868/ws".to_string()]
+        );
+        assert_eq!(
+            advertised_direct_endpoints(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 6868),
+            vec!["ws://[::1]:6868/ws".to_string()]
+        );
+        assert_eq!(
+            advertised_direct_endpoints(std::net::IpAddr::from([10, 20, 30, 40]), 6900),
+            vec!["ws://10.20.30.40:6900/ws".to_string()]
+        );
+        // Wildcard bind enumerates LAN endpoints (at least one endpoint returned).
+        let wildcard = advertised_direct_endpoints(std::net::IpAddr::from([0, 0, 0, 0]), 6868);
+        assert!(!wildcard.is_empty());
+    }
+
+    #[test]
+    fn shim_subcommand_accepts_socket_and_rejects_legacy_spec_json_argv() {
+        let ok = Cli::try_parse_from(["orbit", "shim", "--socket", "/tmp/test.sock"]);
+        assert!(ok.is_ok(), "orbit shim --socket <path> must parse cleanly");
+
+        let rejected = Cli::try_parse_from([
+            "orbit",
+            "shim",
+            "--socket",
+            "/tmp/test.sock",
+            "--spec-json",
+            "{}",
+        ]);
+        assert!(
+            rejected.is_err(),
+            "legacy insecure --spec-json CLI flag must be removed"
+        );
     }
 }

@@ -1283,12 +1283,14 @@ impl HostMemoryState {
             daemon_pubkey_b64: self.profile.daemon_pubkey_b64.clone(),
             direct_endpoints: self.profile.direct_endpoints.clone(),
             relay_url: self.profile.relay_url.clone(),
+            pairing_secret: self.profile.pairing_secret.clone(),
             meta: StoredHostMeta {
                 custom_name: self.profile.custom_name.clone(),
                 ssh_alias: self.profile.ssh_alias.clone(),
                 route_mode: Some(self.profile.route_mode.as_str().to_string()),
                 remote_daemon_port: Some(self.profile.remote_daemon_port),
                 custom_direct_endpoint: self.profile.custom_direct_endpoint.clone(),
+                pairing_secret_updated_at_ms: self.profile.pairing_secret_updated_at_ms,
             },
         }
     }
@@ -1421,6 +1423,8 @@ impl OrbitAppCore {
                     daemon_pubkey_b64: h.daemon_pubkey_b64,
                     direct_endpoints: h.direct_endpoints,
                     relay_url: h.relay_url,
+                    pairing_secret: h.pairing_secret,
+                    pairing_secret_updated_at_ms: h.meta.pairing_secret_updated_at_ms,
                     state: HostConnectionState::Disconnected,
                 };
                 let mut mem = HostMemoryState::new(profile);
@@ -1464,6 +1468,12 @@ impl OrbitAppCore {
                     existing.is_local = true;
                     existing.profile.direct_endpoints = endpoints;
                     existing.profile.remote_daemon_port = local_port;
+                    if existing.profile.pairing_secret != offer.pairing_secret {
+                        existing.profile.pairing_secret = offer.pairing_secret;
+                        existing.profile.pairing_secret_updated_at_ms = now_unix_ms();
+                    } else if existing.profile.pairing_secret_updated_at_ms == 0 {
+                        existing.profile.pairing_secret_updated_at_ms = now_unix_ms();
+                    }
                     if offer.relay_url.is_some() {
                         existing.profile.relay_url = offer.relay_url;
                     }
@@ -1481,6 +1491,8 @@ impl OrbitAppCore {
                     daemon_pubkey_b64: offer.daemon_pubkey_b64,
                     direct_endpoints: endpoints,
                     relay_url: offer.relay_url,
+                    pairing_secret: offer.pairing_secret,
+                    pairing_secret_updated_at_ms: now_unix_ms(),
                     state: HostConnectionState::Disconnected,
                 });
                 mem.is_local = true;
@@ -3608,6 +3620,16 @@ impl OrbitAppCore {
             let custom_direct_endpoint =
                 prev.and_then(|h| h.profile.custom_direct_endpoint.clone());
 
+            let pairing_secret_updated_at_ms = match prev {
+                Some(h)
+                    if h.profile.pairing_secret == offer.pairing_secret
+                        && h.profile.pairing_secret_updated_at_ms > 0 =>
+                {
+                    h.profile.pairing_secret_updated_at_ms
+                }
+                _ => now_unix_ms(),
+            };
+
             let profile = SavedHostProfile {
                 host_id: offer.host_id.clone(),
                 hostname: offer.hostname,
@@ -3619,6 +3641,8 @@ impl OrbitAppCore {
                 daemon_pubkey_b64: offer.daemon_pubkey_b64,
                 direct_endpoints: offer.direct_endpoints,
                 relay_url: offer.relay_url,
+                pairing_secret: offer.pairing_secret,
+                pairing_secret_updated_at_ms,
                 state: HostConnectionState::Disconnected,
             };
             let entry = guard
@@ -3636,6 +3660,37 @@ impl OrbitAppCore {
         self.connect_host_async(offer.host_id);
         self.schedule_cloud_auto_sync(false);
         Ok(card)
+    }
+
+    /// Export a valid `orbit://pair/...` URI for a paired host using its real persisted `pairing_secret`.
+    pub fn export_host_pairing_uri(&self, host_id: &str) -> Result<String, ClientCoreError> {
+        let guard = self
+            .hosts
+            .read()
+            .map_err(|_| ClientCoreError::LockPoisoned)?;
+        let h = guard.get(host_id).ok_or(ClientCoreError::Unreachable)?;
+        let pairing_secret = if h.is_local {
+            crate::desktop_ops::read_local_daemon_pairing_secret()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| h.profile.pairing_secret.clone())
+        } else {
+            h.profile.pairing_secret.clone()
+        };
+        if pairing_secret.trim().is_empty() {
+            return Err(ClientCoreError::Handshake(
+                "host has no persisted pairing secret — run `orbit pair` on the host and re-pair"
+                    .into(),
+            ));
+        }
+        let offer = PairingOffer {
+            host_id: h.profile.host_id.clone(),
+            hostname: h.profile.effective_display_name(),
+            daemon_pubkey_b64: h.profile.daemon_pubkey_b64.clone(),
+            direct_endpoints: h.profile.direct_endpoints.clone(),
+            relay_url: h.profile.relay_url.clone(),
+            pairing_secret,
+        };
+        Ok(offer.to_qr_uri()?)
     }
 
     pub fn remove_host(&self, host_id: &str) -> Result<(), ClientCoreError> {
@@ -4126,6 +4181,12 @@ impl OrbitAppCore {
                                 h.profile.remote_daemon_port = new_port;
                                 h.profile.direct_endpoints = offer.direct_endpoints;
                                 h.profile.daemon_pubkey_b64 = offer.daemon_pubkey_b64;
+                                if !offer.pairing_secret.trim().is_empty()
+                                    && h.profile.pairing_secret != offer.pairing_secret
+                                {
+                                    h.profile.pairing_secret = offer.pairing_secret;
+                                    h.profile.pairing_secret_updated_at_ms = now_unix_ms();
+                                }
                                 maybe_stored = Some(h.to_stored_host());
                             }
                             if let Some(stored) = maybe_stored {
@@ -7958,7 +8019,7 @@ impl OrbitAppCore {
             request_id: Some(req_id),
             project_root: project_root.to_string(),
             phase: orbit_protocol::WorkspaceOrganizePhase::Running,
-            message: "正在触发 AI 上下文理解与 Workspace 归类…".into(),
+            message: "Analyzing conversation context and organizing workspaces…".into(),
             created_workspaces: 0,
             grouped_agents: 0,
             summarized_agents: 0,
@@ -9203,6 +9264,7 @@ impl OrbitAppCore {
         schedule_id: &str,
         name: Option<String>,
         cron_expr: Option<String>,
+        timezone: Option<String>,
         prompt: Option<String>,
         max_runs: Option<u32>,
         archive_on_finish: Option<bool>,
@@ -9214,6 +9276,7 @@ impl OrbitAppCore {
                 schedule_id: schedule_id.to_string(),
                 name,
                 cron_expr,
+                timezone,
                 prompt,
                 max_runs,
                 expires_at: None,
@@ -9371,13 +9434,20 @@ impl OrbitAppCore {
                     if !non_loopback.is_empty() || h.profile.relay_url.is_some() {
                         endpoints = non_loopback;
                     }
+                    let pairing_secret = if h.is_local {
+                        crate::desktop_ops::read_local_daemon_pairing_secret()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| h.profile.pairing_secret.clone())
+                    } else {
+                        h.profile.pairing_secret.clone()
+                    };
                     let offer = PairingOffer {
                         host_id: h.profile.host_id.clone(),
                         hostname: h.profile.hostname.clone(),
                         daemon_pubkey_b64: h.profile.daemon_pubkey_b64.clone(),
                         direct_endpoints: endpoints,
                         relay_url: h.profile.relay_url.clone(),
-                        pairing_secret: Uuid::new_v4().to_string(),
+                        pairing_secret,
                     };
                     let uri = offer.to_qr_uri().ok()?;
                     Some((h.profile.effective_display_name(), uri))
@@ -15541,6 +15611,41 @@ impl OrbitAppCore {
         let mut local_meta = load_sync_meta_from_store(&self.store);
         let mut local_prefs = load_sync_prefs_from_store(&self.store);
 
+        // Authoritatively prefer this machine's persisted `$ORBIT_HOME/pairing-secret` over any
+        // cached or remote synced value before merging so rotated secrets never roll back.
+        // Resolve identity and pairing-secret from the EXACT same Orbit home directory.
+        let (local_daemon_id, local_daemon_secret) = read_local_host_identity_and_secret();
+        let mut refreshed_local_stored: Option<StoredHostProfile> = None;
+        if let (Some((local_hid, local_pub)), Some(local_secret)) =
+            (local_daemon_id.as_ref(), local_daemon_secret.as_ref())
+            && let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(local_hid)
+            && h.profile.daemon_pubkey_b64 == *local_pub
+        {
+            let remote_secret_ts = remote_payload
+                .and_then(|r| r.hosts.get(local_hid))
+                .map(|r| r.pairing_secret_updated_at_ms)
+                .unwrap_or(0);
+            let remote_secret_differs = remote_payload
+                .and_then(|r| r.hosts.get(local_hid))
+                .is_some_and(|r| r.pairing_secret != *local_secret);
+            if h.profile.pairing_secret != *local_secret
+                || (remote_secret_differs
+                    && h.profile.pairing_secret_updated_at_ms <= remote_secret_ts)
+            {
+                let fresh_ts = now_ms
+                    .max(h.profile.pairing_secret_updated_at_ms.saturating_add(1))
+                    .max(remote_secret_ts.saturating_add(1));
+                h.profile.pairing_secret = local_secret.clone();
+                h.profile.pairing_secret_updated_at_ms = fresh_ts;
+                h.is_local = true;
+                refreshed_local_stored = Some(h.to_stored_host());
+            }
+        }
+        if let Some(ref stored) = refreshed_local_stored {
+            let _ = self.store.upsert_client_host(stored);
+        }
+
         // Snapshot local hosts, projects, and project order without holding locks across `.await`
         let fallback_host_ts = if remote_payload.is_none() { now_ms } else { 1 };
         let local_hosts: Vec<LocalHostSyncRecord> = self
@@ -15584,7 +15689,7 @@ impl OrbitAppCore {
 
         let local_project_order = self.project_order();
 
-        let outcome = merge_cloud_vault(
+        let mut outcome = merge_cloud_vault(
             remote_payload,
             &local_hosts,
             &local_projects,
@@ -15595,7 +15700,6 @@ impl OrbitAppCore {
         );
 
         // Apply remote host changes locally
-        let local_daemon_id = read_local_host_identity_pair();
         let mut hosts_to_connect: Vec<String> = Vec::new();
         for synced in &outcome.hosts_to_upsert {
             let mut stored = stored_host_from_synced(synced);
@@ -15611,6 +15715,19 @@ impl OrbitAppCore {
                 let loopback = format!("ws://127.0.0.1:{remote_port}/ws");
                 if !stored.direct_endpoints.contains(&loopback) {
                     stored.direct_endpoints.insert(0, loopback);
+                }
+                if let Some(ref local_secret) = local_daemon_secret
+                    && stored.pairing_secret != *local_secret
+                {
+                    let fresh_ts =
+                        now_ms.max(stored.meta.pairing_secret_updated_at_ms.saturating_add(1));
+                    stored.pairing_secret = local_secret.clone();
+                    stored.meta.pairing_secret_updated_at_ms = fresh_ts;
+                    if let Some(merged_entry) = outcome.merged.hosts.get_mut(&stored.host_id) {
+                        merged_entry.pairing_secret = local_secret.clone();
+                        merged_entry.pairing_secret_updated_at_ms = fresh_ts;
+                        outcome.needs_push = true;
+                    }
                 }
             }
             let _ = self.store.upsert_client_host(&stored);
@@ -15628,6 +15745,8 @@ impl OrbitAppCore {
                     daemon_pubkey_b64: stored.daemon_pubkey_b64.clone(),
                     direct_endpoints: stored.direct_endpoints.clone(),
                     relay_url: stored.relay_url.clone(),
+                    pairing_secret: stored.pairing_secret.clone(),
+                    pairing_secret_updated_at_ms: stored.meta.pairing_secret_updated_at_ms,
                     state: HostConnectionState::Disconnected,
                 };
                 if let Some(existing) = guard.get_mut(&stored.host_id) {
@@ -15790,12 +15909,20 @@ impl OrbitAppCore {
     }
 }
 
-fn read_local_host_identity_pair() -> Option<(String, String)> {
-    let home = crate::desktop_ops::resolve_user_home()?;
-    let raw = std::fs::read_to_string(home.join(".orbit").join("host-keypair.json")).ok()?;
+fn read_local_host_identity_pair_in(orbit_dir: &Path) -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(orbit_dir.join("host-keypair.json")).ok()?;
     let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
     let host_id = kp.host_id().ok()?;
     Some((host_id, kp.public_key_b64))
+}
+
+fn read_local_host_identity_and_secret() -> (Option<(String, String)>, Option<String>) {
+    let Some(orbit_dir) = crate::desktop_ops::resolve_orbit_home_dir() else {
+        return (None, None);
+    };
+    let identity = read_local_host_identity_pair_in(&orbit_dir);
+    let secret = crate::desktop_ops::read_local_daemon_pairing_secret_in(&orbit_dir);
+    (identity, secret)
 }
 
 fn build_workspace_file_view(
@@ -18350,6 +18477,8 @@ mod tests {
                 daemon_pubkey_b64: "pk".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.agents.insert(
@@ -18496,6 +18625,8 @@ mod tests {
                 daemon_pubkey_b64: "pk".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.agents.insert(
@@ -18758,6 +18889,8 @@ mod tests {
                 daemon_pubkey_b64: "pk".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.workspaces.push(WorkspaceSummary {
@@ -19008,6 +19141,8 @@ mod tests {
             daemon_pubkey_b64: "pk".into(),
             direct_endpoints: vec![],
             relay_url: None,
+            pairing_secret: String::new(),
+            pairing_secret_updated_at_ms: 0,
             state: HostConnectionState::OnlineDirect,
         });
 
@@ -19238,6 +19373,8 @@ mod tests {
                 daemon_pubkey_b64: "pk".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.agents.insert(
@@ -19472,6 +19609,8 @@ mod tests {
                 daemon_pubkey_b64: "pk".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.provider_subagent_timelines.insert(
@@ -19552,6 +19691,8 @@ mod tests {
                 daemon_pubkey_b64: "pk".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.provider_subagents.insert(
@@ -19641,6 +19782,8 @@ mod tests {
             daemon_pubkey_b64: "pk".into(),
             direct_endpoints: vec![],
             relay_url: None,
+            pairing_secret: String::new(),
+            pairing_secret_updated_at_ms: 0,
             state: HostConnectionState::OnlineDirect,
         });
 
@@ -19726,6 +19869,8 @@ mod tests {
                 daemon_pubkey_b64: "pk".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.provider_subagents.insert(
@@ -19827,6 +19972,8 @@ mod tests {
                 daemon_pubkey_b64: "pk".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.provider_subagents.insert(
@@ -19947,6 +20094,8 @@ mod tests {
                 daemon_pubkey_b64: String::new(),
                 direct_endpoints: Vec::new(),
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.agents.insert(
@@ -20086,6 +20235,8 @@ mod tests {
                 daemon_pubkey_b64: String::new(),
                 direct_endpoints: Vec::new(),
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.agents.insert("ag_echo".into(), make_ag(5));
@@ -20136,6 +20287,8 @@ mod tests {
                 daemon_pubkey_b64: String::new(),
                 direct_endpoints: Vec::new(),
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             for idx in 0..12 {
@@ -20534,6 +20687,8 @@ mod tests {
             daemon_pubkey_b64: "pk".into(),
             direct_endpoints: vec![],
             relay_url: None,
+            pairing_secret: String::new(),
+            pairing_secret_updated_at_ms: 0,
             state: HostConnectionState::OnlineDirect,
         });
         mem.agents.insert(
@@ -20744,6 +20899,8 @@ mod tests {
             daemon_pubkey_b64: "pk_a".into(),
             direct_endpoints: vec![],
             relay_url: None,
+            pairing_secret: String::new(),
+            pairing_secret_updated_at_ms: 0,
             state: HostConnectionState::OnlineDirect,
         });
         mem_a.initial_agents_hydrated = true;
@@ -20796,6 +20953,8 @@ mod tests {
             daemon_pubkey_b64: "pk_b".into(),
             direct_endpoints: vec![],
             relay_url: None,
+            pairing_secret: String::new(),
+            pairing_secret_updated_at_ms: 0,
             state: HostConnectionState::OnlineDirect,
         });
         mem_b.initial_agents_hydrated = true;
@@ -21013,6 +21172,8 @@ mod tests {
                     daemon_pubkey_b64: String::new(),
                     direct_endpoints: vec![],
                     relay_url: None,
+                    pairing_secret: String::new(),
+                    pairing_secret_updated_at_ms: 0,
                     state: HostConnectionState::OnlineDirect,
                 }),
             );
@@ -21424,6 +21585,8 @@ mod tests {
                 daemon_pubkey_b64: "pk".into(),
                 direct_endpoints: vec![],
                 relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
                 state: HostConnectionState::OnlineDirect,
             });
             mem.agents.insert(
@@ -21708,5 +21871,42 @@ mod tests {
             assert!(!h.caught_up_agents.contains("ag_p1"));
             assert!(!h.rewound_agents.contains("ag_p1"));
         }
+    }
+
+    #[test]
+    fn export_host_pairing_uri_preserves_secret_and_rejects_empty() {
+        let core = OrbitAppCore::open_in_memory().expect("core");
+        let secret = orbit_crypto::generate_pairing_secret();
+        let offer = PairingOffer {
+            host_id: "host_export_1".into(),
+            hostname: "workstation".into(),
+            daemon_pubkey_b64: "pk_export_1".into(),
+            direct_endpoints: vec!["ws://192.168.1.99:6868/ws".into()],
+            relay_url: Some("wss://relay.example.com:7878".into()),
+            pairing_secret: secret.clone(),
+        };
+        let uri = offer.to_qr_uri().expect("qr");
+        core.pair_host(&uri).expect("pair host");
+
+        let exported_uri = core
+            .export_host_pairing_uri("host_export_1")
+            .expect("export pairing uri");
+        let decoded = PairingOffer::from_qr_uri(&exported_uri).expect("decode exported");
+        assert_eq!(decoded.host_id, "host_export_1");
+        assert_eq!(decoded.pairing_secret, secret);
+        assert_eq!(decoded.direct_endpoints, offer.direct_endpoints);
+        assert_eq!(decoded.relay_url, offer.relay_url);
+
+        // Clearing the secret must fail closed rather than emitting a dummy secret
+        {
+            let mut guard = core.hosts.write().expect("hosts");
+            guard
+                .get_mut("host_export_1")
+                .expect("host")
+                .profile
+                .pairing_secret
+                .clear();
+        }
+        assert!(core.export_host_pairing_uri("host_export_1").is_err());
     }
 }

@@ -1,5 +1,6 @@
-import { Suspense, lazy, memo, useMemo } from "react";
+import { Suspense, lazy, memo, useEffect, useMemo, useState } from "react";
 import { ChevronDown, Plus, X } from "lucide-react";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -8,6 +9,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
 import type { TerminalSummary } from "@/lib/orbit-ipc";
+import { useI18n } from "@/lib/i18n";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -32,12 +34,30 @@ export const TerminalTab = memo(function TerminalTab({
   selectedHostId: string;
   visible: boolean;
 }) {
+  const { t } = useI18n();
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
   const activeTerminalTabKey = useOrbitSelector((s) => s.activeTerminalTabKey);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const hostTerminals = useOrbitSelector((s) =>
     selectedHostId ? (s.hostDetails[selectedHostId]?.terminals ?? EMPTY_TERMINALS) : EMPTY_TERMINALS,
   );
+
+  const [pendingCloseTab, setPendingCloseTab] = useState<{
+    key: string;
+    terminalId: string | null;
+    title: string;
+    cwd: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!pendingCloseTab) return;
+    const stillMatches = terminalTabs.some(
+      (t) => t.key === pendingCloseTab.key && t.terminalId === pendingCloseTab.terminalId,
+    );
+    if (!stillMatches) {
+      setPendingCloseTab(null);
+    }
+  }, [pendingCloseTab, terminalTabs]);
 
   const hostTabs = useMemo(
     () => terminalTabs.filter((t) => t.hostId === selectedHostId),
@@ -85,10 +105,16 @@ export const TerminalTab = memo(function TerminalTab({
                 </span>
                 <button
                   type="button"
-                  title="Kill shell"
+                  title="Close shell"
+                  aria-label={`Close ${tab.title}`}
                   onClick={(e) => {
                     e.stopPropagation();
-                    orbitActions.closeTerminalTab(tab.key, true);
+                    setPendingCloseTab({
+                      key: tab.key,
+                      terminalId: tab.terminalId,
+                      title: tab.title,
+                      cwd: tab.cwd,
+                    });
                   }}
                   className="rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/15"
                 >
@@ -149,7 +175,7 @@ export const TerminalTab = memo(function TerminalTab({
           <Suspense
             fallback={
               <div className="text-muted-foreground flex h-full items-center justify-center text-[12.5px]">
-                Initializing WebGL terminal…
+                {t("sidePanel.initializingTerminal")}
               </div>
             }
           >
@@ -166,17 +192,65 @@ export const TerminalTab = memo(function TerminalTab({
         )}
         {hostTabs.length === 0 && (
           <div className="bg-sidebar text-muted-foreground absolute inset-0 z-10 flex h-full flex-col items-center justify-center gap-2 text-[12.5px]">
-            <span>No active shell on this host.</span>
+            <span>{t("sidePanel.noActiveShell")}</span>
             <button
               type="button"
               onClick={() => orbitActions.spawnNewTerminalTab(selectedHostId, selectedCwd || "~")}
               className="border-border bg-elevated text-foreground hover:bg-accent orbit-press cursor-pointer rounded-lg border px-3 py-1.5 text-[12px] font-medium"
             >
-              Launch Shell
+              {t("sidePanel.launchShell")}
             </button>
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={pendingCloseTab !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingCloseTab(null);
+        }}
+        title={
+          pendingCloseTab
+            ? t("sidePanel.closeShellTitle", { title: pendingCloseTab.title })
+            : t("sidePanel.closeShellFallbackTitle")
+        }
+        description={t("sidePanel.closeShellDesc")}
+        detail={
+          pendingCloseTab ? (
+            <span className="font-mono text-[11.5px]">
+              {pendingCloseTab.title} · {shortDir(pendingCloseTab.cwd)}
+            </span>
+          ) : undefined
+        }
+        secondaryAction={{
+          label: t("sidePanel.detach"),
+          variant: "default",
+          onClick: async () => {
+            if (!pendingCloseTab) return;
+            const detached = await orbitActions.closeTerminalTab(
+              pendingCloseTab.key,
+              false,
+              pendingCloseTab.terminalId,
+            );
+            if (detached) {
+              orbitActions.showToast(
+                t("sidePanel.detachedToast", { title: pendingCloseTab.title }),
+              );
+            }
+          },
+        }}
+        confirmLabel={t("sidePanel.killShell")}
+        tone="danger"
+        defaultAction="secondary"
+        onConfirm={async () => {
+          if (!pendingCloseTab) return;
+          await orbitActions.closeTerminalTab(
+            pendingCloseTab.key,
+            true,
+            pendingCloseTab.terminalId,
+          );
+        }}
+      />
     </div>
   );
 });

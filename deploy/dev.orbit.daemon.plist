@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Recommended: run `orbit daemon up` to auto-generate ~/Library/LaunchAgents/dev.orbit.daemon.plist
+     pointing directly at ~/.local/bin/orbit.
+     Manual install: deploy/install.sh installs to ~/.local/bin/orbit and symlinks /usr/local/bin/orbit
+     when writable; otherwise replace /usr/local/bin/orbit below with /Users/<you>/.local/bin/orbit. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -9,7 +13,7 @@
         <string>/usr/local/bin/orbit</string>
         <string>daemon</string>
         <string>--listen</string>
-        <string>0.0.0.0:6868</string>
+        <string>127.0.0.1:6868</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

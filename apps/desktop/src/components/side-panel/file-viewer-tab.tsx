@@ -31,6 +31,11 @@ import { WorkspaceCodeEditor } from "@/components/side-panel/workspace-code-edit
 import { MediaPlayer } from "@/components/viewers/media-player";
 import { PdfViewer } from "@/components/viewers/pdf-viewer";
 import { formatLineRangeLabel, normalizeLineRange } from "@/lib/file-links";
+import {
+  isFocusInsideFileViewerPane,
+  isFocusInsideModalDialog,
+  resolveFileViewerShortcut,
+} from "@/lib/file-viewer-shortcuts";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -42,7 +47,8 @@ import {
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
-import { adaptTokenColor } from "@/lib/code-highlight";
+import { DARK_PLAIN_TOKEN_FG, LIGHT_PLAIN_TOKEN_FG, resolveTokenColor } from "@/lib/code-highlight";
+import { useI18n } from "@/lib/i18n";
 import { parseAnsiLogLines, resolveAnsiColor } from "@/lib/ansi";
 import { cn } from "@/lib/utils";
 
@@ -55,6 +61,7 @@ export const FileViewerTab = memo(function FileViewerTab({
   const fallbackCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme);
   const isDark = resolvedTheme === "dark";
+  const { t } = useI18n();
 
   const hostId = tab.hostId ?? fallbackHostId ?? "";
   const cwd = tab.cwd ?? fallbackCwd ?? "~";
@@ -107,6 +114,7 @@ export const FileViewerTab = memo(function FileViewerTab({
     nonce: number;
   } | null>(null);
 
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const logViewportRef = useRef<HTMLDivElement | null>(null);
   const codeViewportRef = useRef<HTMLDivElement | null>(null);
@@ -317,7 +325,18 @@ export const FileViewerTab = memo(function FileViewerTab({
     const raw = data.content.split(/\r?\n/);
     return raw.map((text, idx) => ({
       line_number: idx + 1,
-      tokens: text.length > 0 ? [{ text, fg_hex: "#E2E8F0", bold: false, italic: false }] : [],
+      tokens:
+        text.length > 0
+          ? [
+              {
+                text,
+                fg_hex: DARK_PLAIN_TOKEN_FG,
+                light_fg_hex: LIGHT_PLAIN_TOKEN_FG,
+                bold: false,
+                italic: false,
+              },
+            ]
+          : [],
     }));
   }, [isCodeViewActive, data]);
 
@@ -475,6 +494,12 @@ export const FileViewerTab = memo(function FileViewerTab({
     }
   };
 
+  const closeFindBar = useCallback(() => {
+    setFindOpen(false);
+    setFindQuery("");
+    requestAnimationFrame(() => containerRef.current?.focus({ preventScroll: true }));
+  }, []);
+
   const openFind = () => {
     setFindOpen(true);
     if (isMarkdown) setMarkdownMode("source");
@@ -486,35 +511,37 @@ export const FileViewerTab = memo(function FileViewerTab({
   useEffect(() => {
     const onWindowKeyDown = (e: KeyboardEvent) => {
       const snap = orbitActions.getSnapshot();
-      if (
-        !snap.sidePanelOpen ||
-        snap.activeSidePanelTabId !== tab.id ||
-        snap.terminalFocused ||
-        snap.commandPaletteOpen ||
-        snap.quickOpenFilesOpen ||
-        snap.mediaPreviewTarget !== null
-      ) {
-        return;
-      }
-      if (
-        canFindInFile &&
-        !isEditMode &&
-        (e.metaKey || e.ctrlKey) &&
-        !e.shiftKey &&
-        !e.altKey &&
-        e.key.toLowerCase() === "f"
-      ) {
+      const action = resolveFileViewerShortcut(
+        {
+          activeView: snap.activeView,
+          sidePanelOpen: snap.sidePanelOpen,
+          activeSidePanelTabId: snap.activeSidePanelTabId,
+          tabId: tab.id,
+          terminalFocused: snap.terminalFocused,
+          commandPaletteOpen: snap.commandPaletteOpen,
+          quickOpenFilesOpen: snap.quickOpenFilesOpen,
+          mediaPreviewOpen: snap.mediaPreviewTarget !== null,
+          focusInsideSidePanel: isFocusInsideFileViewerPane(
+            containerRef.current,
+            e.target,
+            document.activeElement,
+          ),
+          targetInsideModalDialog: isFocusInsideModalDialog(e.target, document.activeElement),
+          canFindInFile,
+          isEditable,
+          isEditMode,
+          findOpen,
+        },
+        e,
+      );
+      if (!action) return;
+
+      if (action === "find") {
         e.preventDefault();
         setFindOpen(true);
         if (isMarkdown) setMarkdownMode("source");
         requestAnimationFrame(() => findInputRef.current?.focus());
-      } else if (
-        (e.metaKey || e.ctrlKey) &&
-        !e.shiftKey &&
-        !e.altKey &&
-        e.key.toLowerCase() === "e" &&
-        isEditable
-      ) {
+      } else if (action === "toggle_edit") {
         e.preventDefault();
         if (isEditMode) {
           orbitActions.requestFileViewMode(hostId, cwd, path);
@@ -522,26 +549,31 @@ export const FileViewerTab = memo(function FileViewerTab({
           setFindOpen(false);
           orbitActions.enterFileEditMode(hostId, cwd, path);
         }
-      } else if (
-        (e.metaKey || e.ctrlKey) &&
-        !e.shiftKey &&
-        !e.altKey &&
-        e.key.toLowerCase() === "s" &&
-        isEditMode
-      ) {
+      } else if (action === "save") {
         e.preventDefault();
         if (!orbitActions.getSnapshot().fileEditorDrafts[cKey]?.saving) {
           void orbitActions.saveWorkspaceFile(hostId, cwd, path, false);
         }
-      } else if (e.key === "Escape" && findOpen) {
+      } else if (action === "close_find") {
         e.preventDefault();
-        setFindOpen(false);
-        setFindQuery("");
+        closeFindBar();
       }
     };
     window.addEventListener("keydown", onWindowKeyDown);
     return () => window.removeEventListener("keydown", onWindowKeyDown);
-  }, [findOpen, isMarkdown, canFindInFile, isEditable, isEditMode, cKey, hostId, cwd, path, tab.id]);
+  }, [
+    findOpen,
+    isMarkdown,
+    canFindInFile,
+    isEditable,
+    isEditMode,
+    cKey,
+    hostId,
+    cwd,
+    path,
+    tab.id,
+    closeFindBar,
+  ]);
 
   const stepMatch = (delta: number) => {
     if (matchLineNumbers.length === 0) return;
@@ -550,18 +582,9 @@ export const FileViewerTab = memo(function FileViewerTab({
 
   return (
     <div
+      ref={containerRef}
       tabIndex={-1}
       className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden outline-none"
-      onKeyDown={(e) => {
-        if (canFindInFile && !isEditMode && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
-          e.preventDefault();
-          openFind();
-        } else if (e.key === "Escape" && findOpen) {
-          e.preventDefault();
-          setFindOpen(false);
-          setFindQuery("");
-        }
-      }}
     >
       {/* Slim File Breadcrumb & Actions Sub-Bar */}
       <div className="border-border flex h-[36px] shrink-0 items-center justify-between gap-2 border-b px-3">
@@ -982,10 +1005,7 @@ export const FileViewerTab = memo(function FileViewerTab({
           </button>
           <button
             type="button"
-            onClick={() => {
-              setFindOpen(false);
-              setFindQuery("");
-            }}
+            onClick={closeFindBar}
             className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded"
           >
             <X className="h-[13px] w-[13px]" />
@@ -1362,7 +1382,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                     </span>
                     <button
                       type="button"
-                      title="Quote line into Composer"
+                      title={t("sidePanel.quoteLineTooltip")}
                       onClick={() => {
                         const rawLineText = line.tokens.map((t) => t.text).join("");
                         orbitActions.quoteDiffLineToComposer(relPath, line.line_number, rawLineText);
@@ -1383,7 +1403,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                                 data-tok-line={isLspEligible ? line.line_number : undefined}
                                 data-tok-col={isLspEligible ? tokStartCol : undefined}
                                 style={{
-                                  color: adaptTokenColor(tok.fg_hex, isDark),
+                                  color: resolveTokenColor(tok, isDark),
                                   fontWeight: tok.bold ? 600 : undefined,
                                   fontStyle: tok.italic ? "italic" : undefined,
                                 }}
@@ -1401,7 +1421,7 @@ export const FileViewerTab = memo(function FileViewerTab({
 
           {/* Subtle bottom metadata strip (keeps top 36px breadcrumb bar airy & restrained) */}
           <div className="border-border/60 text-muted-foreground/70 tabular-nums flex h-[22px] shrink-0 items-center justify-between gap-2 border-t px-3 font-mono text-[10.5px] select-none">
-            <span>{baseCodeLines.length.toLocaleString()} lines</span>
+            <span>{t("common.linesCount", { count: baseCodeLines.length.toLocaleString() })}</span>
             <div className="flex items-center gap-2.5">
               <span>{data.language.toUpperCase()}</span>
               <span>{formatFileSizeCompact(data.size_bytes)}</span>

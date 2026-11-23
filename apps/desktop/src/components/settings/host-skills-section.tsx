@@ -21,6 +21,7 @@ import {
   SettingSectionHeader,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { isImeKeyEvent } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import {
@@ -178,6 +179,7 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
   const [saving, setSaving] = useState(false);
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [pendingSkillSwitch, setPendingSkillSwitch] = useState<ManagedSkillRecord | null>(null);
   const [forking, setForking] = useState(false);
   const [togglingId, setTogglingId] = useState<string | null>(null);
 
@@ -279,17 +281,25 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
       editorContent !== loadedContent,
   );
 
+  const applySelectSkill = useCallback(
+    (skill: ManagedSkillRecord) => {
+      if (selectedSkillId === skill.id) {
+        clearEditorState();
+        return;
+      }
+      setSelectedSkillId(skill.id);
+      selectedSkillIdRef.current = skill.id;
+      void loadSkillContent(skill.id);
+    },
+    [selectedSkillId, clearEditorState, loadSkillContent],
+  );
+
   const handleSelectSkill = (skill: ManagedSkillRecord) => {
-    if (isDirty && !window.confirm("Discard unsaved changes?")) {
+    if (isDirty) {
+      setPendingSkillSwitch(skill);
       return;
     }
-    if (selectedSkillId === skill.id) {
-      clearEditorState();
-      return;
-    }
-    setSelectedSkillId(skill.id);
-    selectedSkillIdRef.current = skill.id;
-    void loadSkillContent(skill.id);
+    applySelectSkill(skill);
   };
 
   const handleSaveEditor = useCallback(async () => {
@@ -1083,6 +1093,26 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
           })
         )}
       </SettingCard>
+
+      <ConfirmDialog
+        open={pendingSkillSwitch !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingSkillSwitch(null);
+        }}
+        title="Discard unsaved changes?"
+        description={
+          selectedSkill
+            ? `Your unsaved edits to /${selectedSkill.slug} will be lost.`
+            : "Your unsaved changes to this skill will be lost."
+        }
+        confirmLabel="Discard"
+        tone="danger"
+        onConfirm={() => {
+          const target = pendingSkillSwitch;
+          setPendingSkillSwitch(null);
+          if (target) applySelectSkill(target);
+        }}
+      />
     </div>
   );
 }

@@ -1,3 +1,5 @@
+mod qr;
+mod tray;
 mod updater;
 
 use std::collections::HashMap;
@@ -82,8 +84,11 @@ use orbit_protocol::{
     WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
     WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
-use orbit_providers::{SideQuestionSpec, run_side_question};
-use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
+use orbit_providers::{
+    ProviderReadinessInfo, SideQuestionSpec,
+    probe_local_provider_readiness as run_local_provider_readiness_probe, run_side_question,
+};
+use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
 
 struct DesktopAppState {
     core: Arc<OrbitAppCore>,
@@ -402,6 +407,17 @@ fn pair_host(
     state
         .core
         .pair_host(&pairing_uri)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn export_host_pairing_uri(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<String, String> {
+    state
+        .core
+        .export_host_pairing_uri(&host_id)
         .map_err(|e| e.to_string())
 }
 
@@ -1295,6 +1311,7 @@ fn update_schedule(
     schedule_id: String,
     name: Option<String>,
     cron_expr: Option<String>,
+    timezone: Option<String>,
     prompt: Option<String>,
     max_runs: Option<u32>,
     archive_on_finish: Option<bool>,
@@ -1304,6 +1321,7 @@ fn update_schedule(
         &schedule_id,
         name,
         cron_expr,
+        timezone,
         prompt,
         max_runs,
         archive_on_finish,
@@ -2301,15 +2319,29 @@ async fn test_im_channel(
 
 #[tauri::command]
 fn focus_main_window(app: AppHandle) -> Result<(), String> {
-    let win = app
-        .get_webview_window("main")
-        .or_else(|| app.webview_windows().into_values().next())
-        .ok_or_else(|| "main window not found".to_string())?;
-    let _ = win.unminimize();
-    let _ = win.show();
-    win.set_focus()
-        .map_err(|e| format!("failed to focus window: {e}"))?;
-    Ok(())
+    tray::focus_main_window_impl(&app)
+}
+
+#[tauri::command]
+fn update_tray_status(
+    app: AppHandle,
+    tray_state: State<'_, tray::TrayMenuState>,
+    running_count: u32,
+    pending_approvals: u32,
+) -> Result<(), String> {
+    tray::update_tray_status_impl(&app, &tray_state, running_count, pending_approvals)
+}
+
+#[tauri::command]
+async fn probe_local_provider_readiness() -> Result<Vec<ProviderReadinessInfo>, String> {
+    tauri::async_runtime::spawn_blocking(run_local_provider_readiness_probe)
+        .await
+        .map_err(|e| format!("provider readiness probe task error: {e}"))
+}
+
+#[tauri::command]
+fn render_qr_svg(content: String) -> Result<String, String> {
+    qr::render_qr_svg_string(&content)
 }
 
 #[tauri::command]
@@ -3146,10 +3178,10 @@ async fn check_app_update() -> Result<ReleaseUpdateInfo, String> {
 
 #[tauri::command]
 async fn perform_app_self_update(
-    release: ReleaseUpdateInfo,
+    target_tag: Option<String>,
     on_progress: Channel<AppUpdateProgress>,
 ) -> Result<(), String> {
-    perform_one_click_update(release, on_progress).await
+    perform_one_click_update(target_tag, on_progress).await
 }
 
 #[tauri::command]
@@ -3370,6 +3402,11 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(DesktopAppState { core })
+        .manage(tray::TrayMenuState::default())
+        .setup(|app| {
+            tray::setup_system_tray(app);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             subscribe_core_events,
             get_bridge_info,
@@ -3484,6 +3521,7 @@ pub fn run() {
             update_connected_host,
             remove_connected_host,
             sync_fleet_connected_hosts,
+            export_host_pairing_uri,
             update_orchestration_config,
             sync_orchestration_skills,
             list_managed_skills,
@@ -3556,6 +3594,9 @@ pub fn run() {
             delete_im_channel,
             test_im_channel,
             focus_main_window,
+            update_tray_status,
+            probe_local_provider_readiness,
+            render_qr_svg,
             list_push_devices,
             register_push_device,
             unregister_push_device,

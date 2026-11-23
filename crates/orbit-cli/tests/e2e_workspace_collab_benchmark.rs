@@ -518,6 +518,7 @@ async fn live_00_normal_chat_unblocked_and_cached() {
         .expect("spawn embedded daemon");
     let uri = rt
         .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("build pairing offer")
         .to_qr_uri()
         .expect("pair uri");
     let (core, host_id) = open_and_connect(home.join("client.db"), uri).await;
@@ -664,6 +665,7 @@ async fn live_01_three_agent_contract_pipeline() {
         .expect("spawn daemon");
     let uri = rt
         .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("build pairing offer")
         .to_qr_uri()
         .expect("pair uri");
     let (core, host_id) = open_and_connect(home.join("client.db"), uri).await;
@@ -885,6 +887,7 @@ if __name__ == "__main__":
         .expect("spawn daemon");
     let uri = rt
         .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("build pairing offer")
         .to_qr_uri()
         .expect("pair uri");
     let (core, host_id) = open_and_connect(home.join("client.db"), uri).await;
@@ -1125,6 +1128,7 @@ if __name__ == "__main__":
         .expect("spawn daemon");
     let uri = rt
         .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("build pairing offer")
         .to_qr_uri()
         .expect("pair uri");
     let (core, host_id) = open_and_connect(home.join("client.db"), uri).await;

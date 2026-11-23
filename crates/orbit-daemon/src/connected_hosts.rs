@@ -22,7 +22,12 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{Message as TungMsg, protocol::WebSocketConfig},
+    tungstenite::{
+        Message as TungMsg,
+        client::IntoClientRequest,
+        http::{HeaderValue, header::AUTHORIZATION},
+        protocol::{WebSocketConfig, frame::coding::CloseCode},
+    },
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -124,6 +129,7 @@ impl ConnectedHostsManager {
             }
             ex.direct_endpoints = offer.direct_endpoints;
             ex.relay_url = offer.relay_url;
+            ex.pairing_secret = offer.pairing_secret;
             ex.enabled = true;
             ex.updated_at = now;
             ex
@@ -137,6 +143,7 @@ impl ConnectedHostsManager {
                 daemon_pubkey_b64: offer.daemon_pubkey_b64,
                 direct_endpoints: offer.direct_endpoints,
                 relay_url: offer.relay_url,
+                pairing_secret: offer.pairing_secret,
                 enabled: true,
                 created_at: now,
                 updated_at: now,
@@ -611,9 +618,9 @@ async fn connect_to_peer_daemon(
 )> {
     let mut last_err = anyhow::anyhow!("no reachable endpoints");
 
-    // 1. Direct WebSocket endpoints
+    // 1. Direct WebSocket endpoints (only explicitly registered endpoints with stored Bearer secret)
     for ep in &row.direct_endpoints {
-        match connect_direct_peer(ep, self_host_id).await {
+        match connect_direct_peer(ep, &row.pairing_secret, self_host_id).await {
             Ok((info, tx, rx)) => {
                 if let Some(ref pinned) = row.host_id
                     && pinned != &info.host_id
@@ -630,9 +637,16 @@ async fn connect_to_peer_daemon(
         }
     }
 
-    // 2. Noise NK E2EE Relay fallback (supports `ws://`, `wss://`, and zero-port `ssh+relay://`)
+    // 2. Noise NKpsk0 E2EE Relay fallback (supports `ws://`, `wss://`, and zero-port `ssh+relay://`)
     if let Some(ref relay_url) = row.relay_url {
-        match connect_relay_peer(relay_url, &row.daemon_pubkey_b64, self_host_id).await {
+        match connect_relay_peer(
+            relay_url,
+            &row.daemon_pubkey_b64,
+            &row.pairing_secret,
+            self_host_id,
+        )
+        .await
+        {
             Ok(conn) => return Ok(conn),
             Err(e) => last_err = e,
         }
@@ -643,18 +657,29 @@ async fn connect_to_peer_daemon(
 
 async fn connect_direct_peer(
     ws_url: &str,
+    pairing_secret: &str,
     self_host_id: &str,
 ) -> anyhow::Result<(
     HostInfo,
     mpsc::Sender<WireMessage>,
     mpsc::Receiver<WireMessage>,
 )> {
+    let secret = pairing_secret.trim();
+    if secret.is_empty() {
+        anyhow::bail!("missing pairing_secret for direct peer WebSocket authentication");
+    }
+
+    let mut req = ws_url.into_client_request()?;
+    let auth_header = HeaderValue::from_str(&format!("Bearer {secret}"))
+        .map_err(|e| anyhow::anyhow!("invalid pairing_secret header value: {e}"))?;
+    req.headers_mut().insert(AUTHORIZATION, auth_header);
+
     let mut ws_cfg = WebSocketConfig::default();
     ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
     ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
     let (ws, _) = tokio::time::timeout(
         Duration::from_secs(2),
-        connect_async_with_config(ws_url, Some(ws_cfg), false),
+        connect_async_with_config(req, Some(ws_cfg), false),
     )
     .await??;
     let (mut sink, mut stream) = ws.split();
@@ -726,31 +751,50 @@ async fn connect_direct_peer(
 async fn connect_relay_peer(
     relay_base: &str,
     daemon_pubkey_b64: &str,
+    pairing_secret: &str,
     self_host_id: &str,
 ) -> anyhow::Result<(
     HostInfo,
     mpsc::Sender<WireMessage>,
     mpsc::Receiver<WireMessage>,
 )> {
+    if pairing_secret.trim().is_empty() {
+        anyhow::bail!("missing pairing_secret for relay peer E2EE authentication");
+    }
+    let pubkey_bytes = orbit_crypto::decode_key_32(daemon_pubkey_b64)?;
+    let (hs, msg1) = ClientHandshake::new(&pubkey_bytes, pairing_secret)?;
+
     let connector = RelayConnector::connect(relay_base).await?;
     let path = format!("/v1/client/{daemon_pubkey_b64}");
     let ws = connector.open_ws(&path).await?;
     let (mut sink, mut stream) = ws.split();
 
-    let pubkey_bytes = orbit_crypto::decode_key_32(daemon_pubkey_b64)?;
-    let (hs, msg1) = ClientHandshake::new(&pubkey_bytes)?;
     sink.send(TungMsg::Binary(msg1.into())).await?;
 
     let msg2 = tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(Ok(m)) = stream.next().await {
-            if let TungMsg::Binary(b) = m {
-                return Some(b);
+        while let Some(item) = stream.next().await {
+            match item? {
+                TungMsg::Binary(b) => return Ok::<_, anyhow::Error>(b),
+                TungMsg::Ping(p) => {
+                    sink.send(TungMsg::Pong(p)).await?;
+                }
+                TungMsg::Pong(_) => {}
+                TungMsg::Close(frame) => {
+                    let is_unauth = frame.as_ref().is_some_and(|f| {
+                        f.code == CloseCode::Policy || f.reason.eq_ignore_ascii_case("unauthorized")
+                    });
+                    if is_unauth {
+                        anyhow::bail!("relay peer E2EE authentication rejected (unauthorized)");
+                    }
+                    anyhow::bail!("relay closed before Noise msg2");
+                }
+                _ => anyhow::bail!("unexpected frame before Noise msg2"),
             }
         }
-        None
+        anyhow::bail!("relay closed before Noise msg2")
     })
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("relay closed before Noise msg2"))?;
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for Noise msg2"))??;
 
     let chan = Arc::new(Mutex::new(hs.finalize(&msg2)?));
 

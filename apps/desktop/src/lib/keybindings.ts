@@ -15,6 +15,13 @@ export function modSymbol(): string {
   return isMacDesktop() ? "⌘" : "Ctrl+";
 }
 
+export function isConfirmDialogOpen(): boolean {
+  return (
+    typeof document !== "undefined" &&
+    Boolean(document.querySelector('[data-slot="confirm-dialog"], [role="alertdialog"]'))
+  );
+}
+
 export function useGlobalErgonomicKeybindings(): void {
   const lastEscTimeRef = useRef<number>(0);
 
@@ -23,6 +30,11 @@ export function useGlobalErgonomicKeybindings(): void {
       const snap = orbitActions.getSnapshot();
       const mod = isMacDesktop() ? e.metaKey : e.ctrlKey;
       const keyLower = e.key.toLowerCase();
+
+      // Guard: confirmation alertdialogs own keyboard focus (Enter / Esc / Tab) and must block all global chords
+      if (isConfirmDialogOpen()) {
+        return;
+      }
 
       // 1. Command Palette (`⌘K` / `Ctrl+K`) — yield to terminal clear/kill-line when terminal is focused
       if (mod && !e.shiftKey && !e.altKey && keyLower === "k" && !snap.terminalFocused) {

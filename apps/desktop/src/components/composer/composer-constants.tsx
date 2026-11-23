@@ -1,4 +1,5 @@
 import { FilePenLine, Shield, ShieldCheck, ShieldOff } from "lucide-react";
+import { t as translateGlobal, type MessageKey } from "@/lib/i18n";
 import { defaultEffortDescription, formatEffortLabel } from "@/lib/model-catalog";
 import {
   PROVIDER_LIST,
@@ -28,30 +29,30 @@ export function conciseThinkingDescription(opt: ThinkingOptionSpec): string {
 export const PROVIDERS: readonly { id: ProviderKind; label: string; shortLabel: string }[] =
   PROVIDER_LIST;
 
-export const PERMISSION_MODES: {
+export const PERMISSION_MODE_KEYS: {
   id: Exclude<SessionMode, "plan" | { custom: string }>;
-  label: string;
-  desc: string;
+  labelKey: MessageKey;
+  descKey: MessageKey;
 }[] = [
   {
     id: "default",
-    label: "Always Ask",
-    desc: "Require approval before file edits and commands",
+    labelKey: "composer.modeAlwaysAsk",
+    descKey: "composer.modeAlwaysAskDesc",
   },
   {
     id: "auto",
-    label: "Auto",
-    desc: "Auto-approve safe reads & tests, ask on risky actions",
+    labelKey: "composer.modeAuto",
+    descKey: "composer.modeAutoDesc",
   },
   {
     id: "accept_edits",
-    label: "Accept Edits",
-    desc: "Auto-approve file edits, ask before commands",
+    labelKey: "composer.modeAcceptEdits",
+    descKey: "composer.modeAcceptEditsDesc",
   },
   {
     id: "full_access",
-    label: "Full Access",
-    desc: "Edit files and run commands without prompts",
+    labelKey: "composer.modeFullAccess",
+    descKey: "composer.modeFullAccessDesc",
   },
 ];
 
@@ -59,19 +60,22 @@ export function normalizePermissionMode(mode: SessionMode): SessionMode {
   return mode === "plan" ? "default" : mode;
 }
 
-export function modeLabel(mode: SessionMode): string {
+export function modeLabel(
+  mode: SessionMode,
+  translate: (key: MessageKey) => string = translateGlobal,
+): string {
   const normalized = normalizePermissionMode(mode);
   if (typeof normalized === "object") return normalized.custom;
   switch (normalized) {
     case "plan":
     case "default":
-      return "Always Ask";
+      return translate("composer.modeAlwaysAsk");
     case "auto":
-      return "Auto";
+      return translate("composer.modeAuto");
     case "accept_edits":
-      return "Accept Edits";
+      return translate("composer.modeAcceptEdits");
     case "full_access":
-      return "Full Access";
+      return translate("composer.modeFullAccess");
   }
 }
 

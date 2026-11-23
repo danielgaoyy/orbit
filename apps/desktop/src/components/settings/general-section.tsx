@@ -3,6 +3,7 @@ import {
   AlertCircle,
   ArrowUpCircle,
   Check,
+  Compass,
   Download,
   Laptop,
   Loader2,
@@ -20,6 +21,7 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type ExternalEditorKind,
@@ -37,37 +39,6 @@ import { cn } from "@/lib/utils";
 
 type PresetPermissionMode = "default" | "auto" | "accept_edits" | "full_access";
 
-const PREFIX_OPTIONS: SettingSelectOption<string>[] = [
-  { value: "auto", label: "Auto", description: "Infer from thread topic" },
-  { value: "orbit/", label: "orbit/", mono: true },
-  { value: "feat/", label: "feat/", mono: true },
-  { value: "fix/", label: "fix/", mono: true },
-  { value: "chore/", label: "chore/", mono: true },
-];
-
-const PERMISSION_OPTIONS: SettingSelectOption<PresetPermissionMode>[] = [
-  {
-    value: "default",
-    label: "Always Ask",
-    description: "Confirm file edits and shell commands",
-  },
-  {
-    value: "auto",
-    label: "Auto",
-    description: "Guardian risk filter",
-  },
-  {
-    value: "accept_edits",
-    label: "Accept Edits",
-    description: "Auto-approve edits, ask for commands",
-  },
-  {
-    value: "full_access",
-    label: "Full Access",
-    description: "Run edits and commands without prompting",
-  },
-];
-
 function orderHostsLocalFirst(hosts: HostCardView[]): HostCardView[] {
   const local: HostCardView[] = [];
   const remote: HostCardView[] = [];
@@ -78,15 +49,8 @@ function orderHostsLocalFirst(hosts: HostCardView[]): HostCardView[] {
   return [...local, ...remote];
 }
 
-function hostTransportBadge(host: HostCardView): string {
-  if (isLocalHostCard(host)) return "本机服务";
-  if (host.ssh_alias) return `SSH · ${host.ssh_alias}`;
-  if (host.connection_state === "online_relay") return "Relay";
-  if (host.connection_state === "online_direct") return "直连";
-  return "离线";
-}
-
 export function GeneralSection() {
+  const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const draftMode = useOrbitSelector((s) => s.draftMode);
   const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
@@ -104,6 +68,53 @@ export function GeneralSection() {
   const isBrowserOffline = useOrbitSelector((s) => s.isBrowserOffline);
   const mod = modSymbol();
 
+  const prefixOptions = useMemo<SettingSelectOption<string>[]>(
+    () => [
+      { value: "auto", label: t("composer.modeAuto"), description: t("settings.branchPrefixAutoDesc") },
+      { value: "orbit/", label: "orbit/", mono: true },
+      { value: "feat/", label: "feat/", mono: true },
+      { value: "fix/", label: "fix/", mono: true },
+      { value: "chore/", label: "chore/", mono: true },
+    ],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [locale],
+  );
+
+  const permissionOptions = useMemo<SettingSelectOption<PresetPermissionMode>[]>(
+    () => [
+      {
+        value: "default",
+        label: t("composer.modeAlwaysAsk"),
+        description: t("composer.modeAlwaysAskShortDesc"),
+      },
+      {
+        value: "auto",
+        label: t("composer.modeAuto"),
+        description: t("composer.modeAutoShortDesc"),
+      },
+      {
+        value: "accept_edits",
+        label: t("composer.modeAcceptEdits"),
+        description: t("composer.modeAcceptEditsShortDesc"),
+      },
+      {
+        value: "full_access",
+        label: t("composer.modeFullAccess"),
+        description: t("composer.modeFullAccessShortDesc"),
+      },
+    ],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [locale],
+  );
+
+  const hostTransportBadge = (host: HostCardView): string => {
+    if (isLocalHostCard(host)) return t("common.localService");
+    if (host.ssh_alias) return `SSH · ${host.ssh_alias}`;
+    if (host.connection_state === "online_relay") return t("common.relay");
+    if (host.connection_state === "online_direct") return t("common.direct");
+    return t("common.offline");
+  };
+
   const appVersion = normalizeSemver(storeAppVersion) ?? "0.9.4";
   const autoCheckedRef = useRef(false);
 
@@ -119,7 +130,7 @@ export function GeneralSection() {
       ? draftMode
       : "default";
 
-  const activePrefix = PREFIX_OPTIONS.some((o) => o.value === worktreeBranchPrefix)
+  const activePrefix = prefixOptions.some((o) => o.value === worktreeBranchPrefix)
     ? worktreeBranchPrefix
     : "auto";
 
@@ -223,12 +234,27 @@ export function GeneralSection() {
     }
     if (releaseUpdateInfo) {
       if (fleetSummary.totalPendingUpdates > 0 && targetVersion) {
-        return `发现 ${fleetSummary.totalPendingUpdates} 项可更新至 v${targetVersion}（含本机与已联通主机），运行中的会话不受影响。`;
+        return t("settings.updatesAvailableDesc", {
+          count: fleetSummary.totalPendingUpdates,
+          version: targetVersion,
+        });
       }
-      return `本机桌面端与全部 ${fleetSummary.reachableHosts} 台在线主机均已是最新 v${targetVersion ?? appVersion}${fleetSummary.offlineHosts > 0 ? `（${fleetSummary.offlineHosts} 台离线）` : ""}。`;
+      const ver = targetVersion ?? appVersion;
+      return fleetSummary.offlineHosts > 0
+        ? t("settings.allUpToDateWithOfflineDesc", {
+            reachable: fleetSummary.reachableHosts,
+            version: ver,
+            offline: fleetSummary.offlineHosts,
+          })
+        : t("settings.allUpToDateDesc", {
+            reachable: fleetSummary.reachableHosts,
+            version: ver,
+          });
     }
-    return `统一检查并一键更新本机桌面端及全部 ${orderedHosts.length} 台已联通机器的 Orbit 版本。`;
+    return t("settings.updatesDefaultDesc", { count: orderedHosts.length });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
+    locale,
     fleetUpdate,
     isFleetBusy,
     releaseCheckError,
@@ -242,20 +268,20 @@ export function GeneralSection() {
   return (
     <div className="space-y-6">
       <SettingSectionHeader
-        title="General"
-        description="Composer behavior, permissions, Git worktrees, and editor handoff."
+        title={t("settings.generalTitle")}
+        description={t("settings.generalDesc")}
       />
 
       {/* Workspace */}
       <div className="space-y-2">
-        <SettingGroupLabel>Workspace</SettingGroupLabel>
+        <SettingGroupLabel>{t("settings.groupWorkspace")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
-            title="Send with Enter"
+            title={t("settings.sendWithEnter")}
             description={
               enterToSend
-                ? "Press Enter to send, Shift+Enter for a new line."
-                : `Press ${mod}Enter to send, Enter for a new line.`
+                ? t("settings.sendWithEnterOnDesc")
+                : t("settings.sendWithEnterOffDesc", { mod })
             }
           >
             <ToggleSwitch
@@ -265,20 +291,20 @@ export function GeneralSection() {
           </SettingRow>
 
           <SettingRow
-            title="Default access permissions"
-            description="Initial approval level for new conversations."
+            title={t("settings.defaultPermissions")}
+            description={t("settings.defaultPermissionsDesc")}
           >
             <SettingSelect
               value={activePermissionMode}
-              options={PERMISSION_OPTIONS}
+              options={permissionOptions}
               onChange={(mode) => orbitActions.setDraftConfig({ mode })}
               menuClassName="w-[260px]"
             />
           </SettingRow>
 
           <SettingRow
-            title="Collapse thinking and tool calls"
-            description="Fold all thinking and tool calls into a single live summary row; click anytime to expand all."
+            title={t("settings.collapseExploration")}
+            description={t("settings.collapseExplorationDesc")}
           >
             <ToggleSwitch
               checked={coalesceExploration}
@@ -287,14 +313,14 @@ export function GeneralSection() {
           </SettingRow>
 
           <SettingRow
-            title="External editor"
-            description={`Default editor opened with ${mod}O.`}
+            title={t("settings.externalEditor")}
+            description={t("settings.externalEditorDesc", { mod })}
           >
             <SettingSelect
               value={effectivePreferred}
               options={editorOptions}
               onChange={(kind) => orbitActions.setPreferredEditor(kind)}
-              placeholder="No editors found"
+              placeholder={t("settings.noEditorsFound")}
               disabled={editorOptions.length === 0}
             />
           </SettingRow>
@@ -303,11 +329,11 @@ export function GeneralSection() {
 
       {/* Git & Worktrees */}
       <div className="space-y-2">
-        <SettingGroupLabel>Git & Worktrees</SettingGroupLabel>
+        <SettingGroupLabel>{t("settings.groupGitWorktrees")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
-            title="Isolate threads in worktrees"
-            description="Start new conversations in an isolated Git worktree by default."
+            title={t("settings.isolateWorktrees")}
+            description={t("settings.isolateWorktreesDesc")}
           >
             <ToggleSwitch
               checked={draftUseWorktree}
@@ -317,12 +343,12 @@ export function GeneralSection() {
 
           <div className={cn(!draftUseWorktree && "opacity-55 transition-opacity")}>
             <SettingRow
-              title="Branch prefix"
-              description="Prefix for auto-generated worktree branches."
+              title={t("settings.branchPrefix")}
+              description={t("settings.branchPrefixDesc")}
             >
               <SettingSelect
                 value={activePrefix}
-                options={PREFIX_OPTIONS}
+                options={prefixOptions}
                 disabled={!draftUseWorktree}
                 onChange={(pfx) => orbitActions.setWorktreePrefs({ worktreeBranchPrefix: pfx })}
                 menuClassName="w-[200px]"
@@ -334,7 +360,7 @@ export function GeneralSection() {
 
       {/* Fleet Software Updates (Local Desktop + All Connected Hosts) */}
       <div className="space-y-2">
-        <SettingGroupLabel>Updates & Fleet Sync</SettingGroupLabel>
+        <SettingGroupLabel>{t("settings.groupUpdatesFleet")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
             title={
@@ -350,8 +376,8 @@ export function GeneralSection() {
                     )}
                   >
                     {fleetSummary.totalPendingUpdates > 0
-                      ? `最新 v${targetVersion}`
-                      : `全部最新 v${targetVersion}`}
+                      ? t("settings.latestBadge", { version: targetVersion })
+                      : t("settings.allCurrentBadge", { version: targetVersion })}
                   </span>
                 )}
               </span>
@@ -367,7 +393,7 @@ export function GeneralSection() {
                     className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
                   >
                     <RotateCcw className="h-[13px] w-[13px]" />
-                    <span>重试失败主机</span>
+                    <span>{t("settings.retryFailedHosts")}</span>
                   </button>
                   {fleetUpdate.pendingDesktopUpdate && releaseUpdateInfo && (
                     <button
@@ -378,7 +404,7 @@ export function GeneralSection() {
                       className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12px] font-medium transition-opacity hover:opacity-90"
                     >
                       <Download className="h-[13px] w-[13px]" />
-                      <span>继续更新桌面端</span>
+                      <span>{t("settings.continueDesktopUpdate")}</span>
                     </button>
                   )}
                 </>
@@ -395,7 +421,9 @@ export function GeneralSection() {
                     ) : (
                       <RefreshCw className="h-[13px] w-[13px]" />
                     )}
-                    <span>{checkingUpdate ? "检查中…" : "检查更新"}</span>
+                    <span>
+                      {checkingUpdate ? t("settings.checking") : t("settings.checkForUpdates")}
+                    </span>
                   </button>
 
                   {fleetSummary.totalPendingUpdates > 0 || !releaseUpdateInfo ? (
@@ -412,10 +440,12 @@ export function GeneralSection() {
                       )}
                       <span>
                         {isFleetBusy
-                          ? "更新中…"
+                          ? t("common.updating")
                           : fleetSummary.totalPendingUpdates > 0
-                            ? `一键更新全部 (${fleetSummary.totalPendingUpdates})`
-                            : "一键更新全部"}
+                            ? t("settings.updateAllCount", {
+                                count: fleetSummary.totalPendingUpdates,
+                              })
+                            : t("settings.updateAll")}
                       </span>
                     </button>
                   ) : (
@@ -425,7 +455,7 @@ export function GeneralSection() {
                       onClick={() =>
                         void orbitActions.upgradeAllConnectedHosts({ force: true })
                       }
-                      title="强制将全部在线机器重新同步到最新版本（并重启服务）"
+                      title={t("settings.resyncAllTitle")}
                       className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
                     >
                       {isFleetBusy ? (
@@ -433,7 +463,9 @@ export function GeneralSection() {
                       ) : (
                         <ArrowUpCircle className="h-[13px] w-[13px]" />
                       )}
-                      <span>{isFleetBusy ? "同步中…" : "全部重新同步"}</span>
+                      <span>
+                        {isFleetBusy ? t("common.syncing") : t("settings.resyncAll")}
+                      </span>
                     </button>
                   )}
                 </>
@@ -453,7 +485,7 @@ export function GeneralSection() {
                       Orbit Desktop
                     </span>
                     <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10.5px]">
-                      本机客户端
+                      {t("settings.localClient")}
                     </span>
                   </div>
                   {fleetUpdate.phase === "upgrading_desktop" &&
@@ -480,7 +512,7 @@ export function GeneralSection() {
                 {fleetUpdate.phase === "upgrading_desktop" ? (
                   <span className="inline-flex items-center gap-1 text-sky-600 dark:text-sky-400">
                     <Loader2 className="h-[12px] w-[12px] animate-spin" />
-                    <span>安装中</span>
+                    <span>{t("settings.installing")}</span>
                   </span>
                 ) : fleetSummary.desktopOutdated && targetVersion ? (
                   <span className="rounded bg-sky-500/12 px-1.5 py-0.5 font-mono text-[11px] font-medium text-sky-600 dark:text-sky-400">
@@ -489,7 +521,7 @@ export function GeneralSection() {
                 ) : releaseUpdateInfo ? (
                   <span className="inline-flex items-center gap-1 text-[11.5px] text-emerald-600 dark:text-emerald-400">
                     <Check className="h-[12.5px] w-[12.5px]" />
-                    <span>最新</span>
+                    <span>{t("common.upToDate")}</span>
                   </span>
                 ) : null}
               </div>
@@ -539,13 +571,13 @@ export function GeneralSection() {
 
                   <div className="flex shrink-0 items-center gap-2 text-[12px]">
                     <span className="text-muted-foreground font-mono">
-                      {normDaemon ? `v${normDaemon}` : "未知版本"}
+                      {normDaemon ? `v${normDaemon}` : t("common.unknownVersion")}
                     </span>
 
                     {isUpgrading ? (
                       <span className="inline-flex items-center gap-1 text-[11.5px] text-sky-600 dark:text-sky-400">
                         <Loader2 className="h-[12px] w-[12px] animate-spin" />
-                        <span>更新中…</span>
+                        <span>{t("common.updating")}</span>
                       </span>
                     ) : isFailed ? (
                       <button
@@ -559,11 +591,11 @@ export function GeneralSection() {
                         className="inline-flex cursor-pointer items-center gap-1 rounded-md bg-rose-500/12 px-2 py-0.5 text-[11.5px] font-medium text-rose-600 transition-colors hover:bg-rose-500/20 dark:text-rose-400"
                       >
                         <AlertCircle className="h-[12px] w-[12px]" />
-                        <span>重试</span>
+                        <span>{t("common.retry")}</span>
                       </button>
                     ) : !reachable || isSkipped ? (
                       <span className="text-muted-foreground/80 rounded bg-muted px-1.5 py-0.5 text-[11px]">
-                        离线跳过
+                        {t("settings.offlineSkipped")}
                       </span>
                     ) : isOutdated && targetVersion ? (
                       <button
@@ -583,12 +615,12 @@ export function GeneralSection() {
                       <div className="flex items-center gap-1.5">
                         <span className="inline-flex items-center gap-1 text-[11.5px] text-emerald-600 dark:text-emerald-400">
                           <Check className="h-[12.5px] w-[12.5px]" />
-                          <span>{isDone ? "已更新" : "最新"}</span>
+                          <span>{isDone ? t("common.updated") : t("common.upToDate")}</span>
                         </span>
                         <button
                           type="button"
                           disabled={isFleetBusy}
-                          title={`强制更新 / 重启 ${host.display_name}`}
+                          title={t("settings.forceRestartHost", { host: host.display_name })}
                           onClick={() =>
                             void orbitActions.upgradeHostDaemon(host.host_id, {
                               force: true,
@@ -606,6 +638,26 @@ export function GeneralSection() {
               );
             })}
           </div>
+        </SettingCard>
+      </div>
+
+      {/* Getting Started / Onboarding Guide */}
+      <div className="space-y-2">
+        <SettingGroupLabel>{t("settings.groupGettingStarted")}</SettingGroupLabel>
+        <SettingCard>
+          <SettingRow
+            title={t("settings.setupGuide")}
+            description={t("settings.setupGuideDesc")}
+          >
+            <button
+              type="button"
+              onClick={() => orbitActions.openOnboardingGuide()}
+              className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+            >
+              <Compass className="text-muted-foreground h-[13px] w-[13px]" />
+              <span>{t("settings.openSetupGuide")}</span>
+            </button>
+          </SettingRow>
         </SettingCard>
       </div>
     </div>

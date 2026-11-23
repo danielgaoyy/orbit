@@ -77,6 +77,8 @@ pub struct StoredHostMeta {
     pub remote_daemon_port: Option<u16>,
     #[serde(default)]
     pub custom_direct_endpoint: Option<String>,
+    #[serde(default)]
+    pub pairing_secret_updated_at_ms: i64,
 }
 
 /// Persisted remote/local host profile stored in the client's local SQLite replica.
@@ -87,6 +89,8 @@ pub struct StoredHostProfile {
     pub daemon_pubkey_b64: String,
     pub direct_endpoints: Vec<String>,
     pub relay_url: Option<String>,
+    #[serde(default)]
+    pub pairing_secret: String,
     #[serde(default)]
     pub meta: StoredHostMeta,
 }
@@ -134,6 +138,8 @@ pub struct StoredQueuedPrompt {
 pub enum StoreError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("json serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid argument: {0}")]
@@ -163,10 +169,77 @@ pub struct OrbitStore {
     conn: Mutex<Connection>,
 }
 
+#[cfg(unix)]
+fn is_under_orbit_home(dir: &Path) -> bool {
+    if let Ok(explicit) = std::env::var("ORBIT_HOME") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() && dir.starts_with(Path::new(trimmed)) {
+            return true;
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        && dir.starts_with(home.join(".orbit"))
+    {
+        return true;
+    }
+    dir.file_name().is_some_and(|n| n == ".orbit")
+}
+
+#[cfg(unix)]
+fn harden_sqlite_parent_and_precreate(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+        if is_under_orbit_home(parent) {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    if !path.exists() {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true).mode(0o600);
+        match opts.open(path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(unix)]
+fn harden_sqlite_db_and_sidecars(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let perms = std::fs::Permissions::from_mode(0o600);
+    if path.exists() {
+        std::fs::set_permissions(path, perms.clone())?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar_path = std::path::PathBuf::from(sidecar);
+        if sidecar_path.exists() {
+            std::fs::set_permissions(&sidecar_path, perms.clone())?;
+        }
+    }
+    Ok(())
+}
+
 impl OrbitStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        #[cfg(unix)]
+        harden_sqlite_parent_and_precreate(path)?;
         let conn = Connection::open(path)?;
-        Self::init_connection(conn)
+        let store = Self::init_connection(conn)?;
+        #[cfg(unix)]
+        harden_sqlite_db_and_sidecars(path)?;
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
@@ -251,6 +324,7 @@ impl OrbitStore {
                 daemon_pubkey_b64     TEXT NOT NULL,
                 direct_endpoints_json TEXT NOT NULL,
                 relay_url             TEXT,
+                pairing_secret        TEXT NOT NULL DEFAULT '',
                 meta_json             TEXT,
                 updated_at            TEXT NOT NULL
             );
@@ -449,6 +523,7 @@ impl OrbitStore {
             ("client_replica_agents", "acp_agent_id", "TEXT"),
             ("agent_profiles", "fast_mode", "INTEGER NOT NULL DEFAULT 0"),
             ("agent_profiles", "acp_agent_id", "TEXT"),
+            ("client_hosts", "pairing_secret", "TEXT NOT NULL DEFAULT ''"),
         ] {
             ensure_table_column(&conn, table, col, col_type)?;
         }
@@ -2542,13 +2617,14 @@ impl OrbitStore {
         let meta_json = serde_json::to_string(&host.meta)?;
         conn.execute(
             "INSERT INTO client_hosts (
-                host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url, meta_json, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url, pairing_secret, meta_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(host_id) DO UPDATE SET
                 display_name = excluded.display_name,
                 daemon_pubkey_b64 = excluded.daemon_pubkey_b64,
                 direct_endpoints_json = excluded.direct_endpoints_json,
                 relay_url = excluded.relay_url,
+                pairing_secret = excluded.pairing_secret,
                 meta_json = excluded.meta_json,
                 updated_at = excluded.updated_at",
             params![
@@ -2557,6 +2633,7 @@ impl OrbitStore {
                 host.daemon_pubkey_b64,
                 endpoints_json,
                 host.relay_url,
+                host.pairing_secret,
                 meta_json,
                 Utc::now().to_rfc3339(),
             ],
@@ -2567,7 +2644,7 @@ impl OrbitStore {
     pub fn list_client_hosts(&self) -> Result<Vec<StoredHostProfile>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
-            "SELECT host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url, meta_json
+            "SELECT host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url, meta_json, pairing_secret
              FROM client_hosts ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -2585,6 +2662,7 @@ impl OrbitStore {
                 daemon_pubkey_b64: row.get(2)?,
                 direct_endpoints,
                 relay_url: row.get(4)?,
+                pairing_secret: row.get(6)?,
                 meta,
             })
         })?;
@@ -5967,5 +6045,148 @@ mod tests {
             .latest_assistant_message("ag_long")
             .expect("query latest assistant message");
         assert_eq!(latest.as_deref(), Some("Final summary past 500 events"));
+    }
+
+    #[test]
+    fn client_and_connected_hosts_persist_pairing_secret_and_migrate_legacy_dbs() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orbit_store_pairing_mig_{}.db",
+            uuid::Uuid::new_v4()
+        ));
+
+        // Simulate a pre-auth database lacking `pairing_secret` columns
+        {
+            let raw = Connection::open(&tmp).expect("open raw db");
+            raw.execute_batch(
+                "
+                CREATE TABLE client_hosts (
+                    host_id               TEXT PRIMARY KEY,
+                    display_name          TEXT NOT NULL,
+                    daemon_pubkey_b64     TEXT NOT NULL,
+                    direct_endpoints_json TEXT NOT NULL,
+                    relay_url             TEXT,
+                    meta_json             TEXT,
+                    updated_at            TEXT NOT NULL
+                );
+                INSERT INTO client_hosts (
+                    host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url, meta_json, updated_at
+                ) VALUES ('host_legacy', 'legacy-box', 'pk_legacy', '[]', NULL, NULL, '2026-01-01T00:00:00Z');
+
+                CREATE TABLE connected_hosts (
+                    registration_id       TEXT PRIMARY KEY,
+                    host_id               TEXT,
+                    label                 TEXT NOT NULL,
+                    daemon_pubkey_b64     TEXT NOT NULL,
+                    direct_endpoints_json TEXT NOT NULL DEFAULT '[]',
+                    relay_url             TEXT,
+                    enabled               INTEGER NOT NULL DEFAULT 1,
+                    created_at            TEXT NOT NULL,
+                    updated_at            TEXT NOT NULL
+                );
+                INSERT INTO connected_hosts (
+                    registration_id, host_id, label, daemon_pubkey_b64, direct_endpoints_json, relay_url, enabled, created_at, updated_at
+                ) VALUES ('ch_legacy', 'host_peer_legacy', 'peer', 'pk_peer', '[]', NULL, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                ",
+            )
+            .expect("seed legacy schema");
+        }
+
+        // Opening through `OrbitStore::open` must migrate cleanly without data loss
+        let store = OrbitStore::open(&tmp).expect("migrate legacy db");
+        let legacy_clients = store.list_client_hosts().expect("list legacy clients");
+        assert_eq!(legacy_clients.len(), 1);
+        assert_eq!(legacy_clients[0].host_id, "host_legacy");
+        assert_eq!(legacy_clients[0].pairing_secret, "");
+
+        let legacy_connected = store.list_connected_hosts().expect("list legacy connected");
+        assert_eq!(legacy_connected.len(), 1);
+        assert_eq!(legacy_connected[0].registration_id, "ch_legacy");
+        assert_eq!(legacy_connected[0].pairing_secret, "");
+
+        // Upserting with a real secret persists and updates it directly
+        let mut updated = legacy_clients[0].clone();
+        updated.pairing_secret = "persisted-secret-value-0123456789abcdef0123".into();
+        updated.meta.pairing_secret_updated_at_ms = 12345;
+        store.upsert_client_host(&updated).expect("upsert secret");
+        let loaded = &store.list_client_hosts().expect("list")[0];
+        assert_eq!(
+            loaded.pairing_secret,
+            "persisted-secret-value-0123456789abcdef0123"
+        );
+        assert_eq!(loaded.meta.pairing_secret_updated_at_ms, 12345);
+        updated.pairing_secret = "rotated-secret-value-9876543210fedcba98765".into();
+        store.upsert_client_host(&updated).expect("rotate secret");
+        assert_eq!(
+            store.list_client_hosts().expect("list")[0].pairing_secret,
+            "rotated-secret-value-9876543210fedcba98765"
+        );
+
+        let mut peer = legacy_connected[0].clone();
+        peer.pairing_secret = "peer-secret-value-0123456789abcdef01234567".into();
+        store
+            .upsert_connected_host(&peer)
+            .expect("upsert connected secret");
+        assert_eq!(
+            store
+                .get_connected_host("ch_legacy")
+                .expect("get")
+                .expect("some")
+                .pairing_secret,
+            "peer-secret-value-0123456789abcdef01234567"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_open_enforces_0600_permissions_on_db_and_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("orbit_store_perm_{}", uuid::Uuid::new_v4()));
+        let orbit_dir = base.join(".orbit");
+        std::fs::create_dir_all(&orbit_dir).expect("mkdir .orbit");
+        std::fs::set_permissions(&orbit_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("set 0755");
+        let db_path = orbit_dir.join("desktop-client.sqlite");
+
+        // 1. Fresh DB is born 0600 and `.orbit` parent dir is hardened to 0700
+        let store = OrbitStore::open(&db_path).expect("open fresh store");
+        let dir_mode = std::fs::metadata(&orbit_dir)
+            .expect("dir meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let db_mode = std::fs::metadata(&db_path)
+            .expect("db meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(db_mode, 0o600);
+        drop(store);
+
+        // 2. Pre-existing lax permissions (0644) on DB and `-wal` / `-shm` sidecars are hardened to 0600 on reopen
+        let mut wal_os = db_path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal_path = std::path::PathBuf::from(wal_os);
+        let mut shm_os = db_path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        let shm_path = std::path::PathBuf::from(shm_os);
+        std::fs::write(&wal_path, b"").expect("touch wal");
+        std::fs::write(&shm_path, b"").expect("touch shm");
+        for p in [&db_path, &wal_path, &shm_path] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).expect("set 0644");
+        }
+
+        let _reopened = OrbitStore::open(&db_path).expect("reopen store");
+        for p in [&db_path, &wal_path, &shm_path] {
+            if p.exists() {
+                let mode = std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "expected 0600 on {}", p.display());
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

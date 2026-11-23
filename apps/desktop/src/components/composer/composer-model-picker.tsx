@@ -31,6 +31,7 @@ import {
   SimpleTooltip,
 } from "@/components/ui/overlays";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 const EMPTY_PROVIDERS: readonly ProviderKind[] = [];
@@ -50,6 +51,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
   disabled?: boolean;
   disabledTitle?: string;
 } = {}) {
+  const { t } = useI18n();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
@@ -392,10 +394,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
       parts.push(formatEffortLabel(effectiveActiveEffort));
     }
     if (isFastActive) {
-      parts.push("Fast");
+      parts.push(t("composer.fast"));
     }
     return parts.length > 0 ? parts.join(" · ") : null;
-  }, [activeDraftProfile, effectiveActiveEffort, isFastActive]);
+  }, [activeDraftProfile, effectiveActiveEffort, isFastActive, t]);
 
   if (disabled) {
     return (
@@ -438,7 +440,9 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
           type="button"
           title={
             isFastActive
-              ? `${activeTriggerLabel}${effectiveActiveEffort ? ` · ${formatEffortLabel(effectiveActiveEffort)}` : ""} · Fast mode (higher quota usage)`
+              ? t("composer.fastModeTooltip", {
+                  label: `${activeTriggerLabel}${effectiveActiveEffort ? ` · ${formatEffortLabel(effectiveActiveEffort)}` : ""}`,
+                })
               : undefined
           }
           className="hover:text-foreground inline-flex h-8.5 max-w-76 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13.5px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
@@ -507,10 +511,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                   {detectedProviders.length > 0 && (
                     <div className="bg-border/70 my-0.5 h-px w-5 shrink-0" />
                   )}
-                  <SimpleTooltip label="ACP Agents" side="left">
+                  <SimpleTooltip label={t("composer.acpAgents")} side="left">
                     <button
                       type="button"
-                      aria-label="ACP Agents"
+                      aria-label={t("composer.acpAgents")}
                       onClick={() => {
                         setBrowsedProvider("acp");
                         setHoveredModelKey(null);
@@ -553,7 +557,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
               )}
               <span className="truncate">
                 {effectiveBrowsedProvider === "acp"
-                  ? "ACP Agents"
+                  ? t("composer.acpAgents")
                   : (PROVIDERS.find((p) => p.id === effectiveBrowsedProvider)?.label ??
                     effectiveBrowsedProvider)}
               </span>
@@ -569,7 +573,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                 <div className="border-border mb-1.5 space-y-0.5 border-b pb-1.5">
                   <div className="text-muted-foreground/75 flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-medium uppercase">
                     <Sparkles className="size-3" />
-                    <span>Profiles</span>
+                    <span>{t("composer.profiles")}</span>
                   </div>
                   {profiles.map((prof) => {
                     const isActiveProf = draftProfileId === prof.profile_id;
@@ -648,7 +652,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                               </span>
                               {item.spec.source === "custom" && (
                                 <span className="text-muted-foreground/75 shrink-0 text-[10.5px]">
-                                  Custom
+                                  {t("common.custom")}
                                 </span>
                               )}
                             </div>
@@ -668,7 +672,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                             }}
                             className="text-muted-foreground hover:text-foreground hover:bg-accent/65 flex h-[28px] w-full cursor-pointer items-center rounded-[8px] px-2.5 text-left text-[12px] transition-colors"
                           >
-                            Manage ACP agents…
+                            {t("composer.manageAcpAgents")}
                           </button>
                         </div>
                       )}
@@ -696,7 +700,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                     : null;
                 const rowSecondary = [
                   rowEffort ? formatEffortLabel(rowEffort) : null,
-                  isModelActive && isFastActive ? "Fast" : null,
+                  isModelActive && isFastActive ? t("composer.fast") : null,
                 ]
                   .filter(Boolean)
                   .join(" · ");
@@ -877,7 +881,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                                   : "text-foreground/84 font-normal",
                               )}
                             >
-                              Fast
+                              {t("composer.fast")}
                             </span>
                             <span
                               aria-hidden="true"

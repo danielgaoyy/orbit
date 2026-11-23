@@ -56,10 +56,12 @@ def parse_args():
     i = 0
     while i < len(args):
         if args[i] == "--mcp-config" and i + 1 < len(args):
-            try:
-                mcp_cfg = json.loads(args[i + 1])
-            except Exception:
-                mcp_cfg = None
+            raw_mcp = args[i + 1]
+            if not os.path.isfile(raw_mcp):
+                sys.stderr.write(f"expected --mcp-config to be a readable file path, got: {raw_mcp}\n")
+                sys.exit(2)
+            with open(raw_mcp, "r", encoding="utf-8") as fh:
+                mcp_cfg = json.load(fh)
             i += 2
         elif args[i].startswith("--session-id="):
             session_id = args[i].split("=", 1)[1]
@@ -467,7 +469,7 @@ async fn scenario_01_single_host_delegation_worktree_and_auto_finish_wakeup() {
     let (addr, runtime) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("spawn daemon");
-    let client = connect_direct(&format!("ws://{addr}/ws"), None)
+    let client = connect_direct(&format!("ws://{addr}/ws"), &runtime.pairing_secret, None)
         .await
         .expect("connect ws");
 
@@ -581,7 +583,7 @@ async fn scenario_02_permission_checkpoint_forwarding_and_continued_watch() {
     let (addr, runtime) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("spawn daemon");
-    let client = connect_direct(&format!("ws://{addr}/ws"), None)
+    let client = connect_direct(&format!("ws://{addr}/ws"), &runtime.pairing_secret, None)
         .await
         .expect("connect ws");
 
@@ -669,7 +671,7 @@ async fn scenario_03_quiet_window_coalescing_single_parent_wakeup() {
     let (addr, runtime) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("spawn daemon");
-    let client = connect_direct(&format!("ws://{addr}/ws"), None)
+    let client = connect_direct(&format!("ws://{addr}/ws"), &runtime.pairing_secret, None)
         .await
         .expect("connect ws");
 
@@ -741,7 +743,7 @@ async fn scenario_04_soft_archive_cascade_detach_and_unarchive() {
     let (addr, runtime) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("spawn daemon");
-    let client = connect_direct(&format!("ws://{addr}/ws"), None)
+    let client = connect_direct(&format!("ws://{addr}/ws"), &runtime.pairing_secret, None)
         .await
         .expect("connect ws");
 
@@ -865,7 +867,7 @@ async fn scenario_05_daemon_restart_shim_reattach_and_durable_finish_subscriptio
     let (addr1, rt1) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("daemon 1");
-    let client1 = connect_direct(&format!("ws://{addr1}/ws"), None)
+    let client1 = connect_direct(&format!("ws://{addr1}/ws"), &rt1.pairing_secret, None)
         .await
         .expect("connect 1");
 
@@ -964,7 +966,7 @@ async fn scenario_06_idle_runtime_cleanup_veto_and_transparent_resume() {
         cfg.idle_timeout_secs = 1;
     }
 
-    let client = connect_direct(&format!("ws://{addr}/ws"), None)
+    let client = connect_direct(&format!("ws://{addr}/ws"), &runtime.pairing_secret, None)
         .await
         .expect("ws");
     let agent = create_agent_rpc(
@@ -1195,7 +1197,7 @@ async fn scenario_08_cron_schedules_auto_archive_and_heartbeat_busy_skip() {
     let (addr, runtime) = spawn_embedded_daemon(home.to_path_buf(), None)
         .await
         .expect("daemon");
-    let client = connect_direct(&format!("ws://{addr}/ws"), None)
+    let client = connect_direct(&format!("ws://{addr}/ws"), &runtime.pairing_secret, None)
         .await
         .expect("ws");
 
@@ -1363,7 +1365,9 @@ async fn scenario_09_cross_host_fleet_mesh_delegation_and_idempotency() {
         .expect("daemon B");
 
     // Register Daemon B onto Daemon A via `orbit://pair/...` URI
-    let offer_b = rt_b.build_pairing_offer(vec![format!("ws://{addr_b}/ws")], None);
+    let offer_b = rt_b
+        .build_pairing_offer(vec![format!("ws://{addr_b}/ws")], None)
+        .expect("pairing offer b");
     let uri_b = offer_b.to_qr_uri().expect("pair uri b");
     rt_a.connected_hosts
         .add_from_pairing_uri(Some("Worker-B".into()), &uri_b)
@@ -1384,7 +1388,7 @@ async fn scenario_09_cross_host_fleet_mesh_delegation_and_idempotency() {
     );
 
     // Spawn Parent on Daemon A that delegates a Child to Daemon B via MCP `create_agent(host_id=B)`
-    let client_a = connect_direct(&format!("ws://{addr_a}/ws"), None)
+    let client_a = connect_direct(&format!("ws://{addr_a}/ws"), &rt_a.pairing_secret, None)
         .await
         .expect("ws A");
     let prompt = format!(
@@ -1797,7 +1801,9 @@ async fn scenario_11_relay_routed_fleet_mesh_and_direct_mismatch_fallback() {
     // 4. Register Daemon B onto Daemon A with Decoy C's direct endpoint + real Relay URL.
     //    Daemon A must reject the mismatched direct host_id on Decoy C and fall back over
     //    `/v1/client/{pubkey}` Noise NK E2EE Relay to reach Daemon B cleanly.
-    let offer_b = rt_b.build_pairing_offer(vec![format!("ws://{addr_decoy}/ws")], Some(relay_url));
+    let offer_b = rt_b
+        .build_pairing_offer(vec![format!("ws://{addr_decoy}/ws")], Some(relay_url))
+        .expect("pairing offer b");
     let uri_b = offer_b.to_qr_uri().expect("pair uri b");
     rt_a.connected_hosts
         .add_from_pairing_uri(Some("Relay-Worker-B".into()), &uri_b)

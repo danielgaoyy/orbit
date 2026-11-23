@@ -305,6 +305,7 @@ fn build_acp_spawn_spec(
         args,
         cwd: cfg.cwd.clone(),
         env,
+        cleanup_paths: Vec::new(),
     }
 }
 
@@ -2623,6 +2624,7 @@ mod tests {
             executable: script.to_path_buf(),
             orbit_exe: PathBuf::from("/bin/true"),
             shim_socket: sock_path.to_path_buf(),
+            runtime_dir: cwd.to_path_buf(),
             cwd: cwd.to_path_buf(),
             extra_dirs: vec![],
             attachments_dir: None,

@@ -258,6 +258,8 @@ pub enum ScheduleAction {
         #[arg(long)]
         cron: String,
         #[arg(long)]
+        timezone: Option<String>,
+        #[arg(long)]
         cwd: String,
         #[arg(long)]
         prompt: String,
@@ -285,6 +287,8 @@ pub enum ScheduleAction {
         name: Option<String>,
         #[arg(long)]
         cron: Option<String>,
+        #[arg(long)]
+        timezone: Option<String>,
         #[arg(long)]
         prompt: Option<String>,
         #[arg(long)]
@@ -504,13 +508,14 @@ fn print_out(json_mode: bool, value: &serde_json::Value, human: &str) {
 }
 
 pub async fn cmd_wait(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     agent_id: &str,
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     let mut rx = client.subscribe();
 
     // Check current status first
@@ -669,12 +674,13 @@ pub async fn cmd_wait(
 }
 
 pub async fn cmd_inspect(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     agent_id: &str,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     let req_id = Uuid::new_v4();
     let resp = send_rpc(
         &client,
@@ -796,7 +802,9 @@ pub async fn cmd_inspect(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_simple_agent_op(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
@@ -804,7 +812,7 @@ pub async fn cmd_simple_agent_op(
     req_id: Uuid,
     label: &str,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     let _ = send_rpc(&client, req_id, msg, 20).await?;
     print_out(
         json_mode,
@@ -815,12 +823,13 @@ pub async fn cmd_simple_agent_op(
 }
 
 pub async fn cmd_workspace(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: WorkspaceAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         WorkspaceAction::Ls {
             all,
@@ -1094,12 +1103,13 @@ pub async fn cmd_workspace(
 }
 
 pub async fn cmd_script(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: ScriptAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         ScriptAction::Ls { workspace_id } => {
             let req_id = Uuid::new_v4();
@@ -1175,12 +1185,13 @@ pub async fn cmd_script(
 }
 
 pub async fn cmd_terminal(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: TerminalAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         TerminalAction::Ls => {
             let req_id = Uuid::new_v4();
@@ -1303,12 +1314,13 @@ pub async fn cmd_terminal(
 }
 
 pub async fn cmd_schedule(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: ScheduleAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         ScheduleAction::Ls { all } => {
             let req_id = Uuid::new_v4();
@@ -1348,6 +1360,7 @@ pub async fn cmd_schedule(
         ScheduleAction::Create {
             name,
             cron,
+            timezone,
             cwd,
             prompt,
             provider,
@@ -1381,7 +1394,7 @@ pub async fn cmd_schedule(
                     request_id: req_id,
                     name,
                     cron_expr: cron,
-                    timezone: None,
+                    timezone,
                     prompt,
                     target,
                     max_runs,
@@ -1451,6 +1464,7 @@ pub async fn cmd_schedule(
             schedule_id,
             name,
             cron,
+            timezone,
             prompt,
             max_runs,
         } => {
@@ -1463,6 +1477,7 @@ pub async fn cmd_schedule(
                     schedule_id: schedule_id.clone(),
                     name,
                     cron_expr: cron,
+                    timezone,
                     prompt,
                     max_runs,
                     expires_at: None,
@@ -1585,12 +1600,13 @@ pub async fn cmd_schedule(
 }
 
 pub async fn cmd_heartbeat(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: HeartbeatAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         HeartbeatAction::Ls { all } => {
             let req_id = Uuid::new_v4();
@@ -1685,12 +1701,13 @@ pub async fn cmd_heartbeat(
 }
 
 pub async fn cmd_profile(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: ProfileAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         ProfileAction::Ls => {
             let req_id = Uuid::new_v4();
@@ -1800,12 +1817,13 @@ pub async fn cmd_profile(
 }
 
 pub async fn cmd_host(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: HostAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         HostAction::Ls => {
             let req_id = Uuid::new_v4();
@@ -1922,12 +1940,13 @@ pub async fn cmd_host(
 }
 
 pub async fn cmd_permit(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: PermitAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         PermitAction::Ls { agent } => {
             let req_id = Uuid::new_v4();
@@ -2005,12 +2024,13 @@ pub async fn cmd_permit(
 }
 
 pub async fn cmd_config(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: ConfigAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         ConfigAction::Get => {
             let req_id = Uuid::new_v4();
@@ -2091,6 +2111,7 @@ pub async fn cmd_config(
 }
 
 pub async fn cmd_agent(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
@@ -2106,6 +2127,7 @@ pub async fn cmd_agent(
             output,
         } => {
             cmd_export_agent(
+                home_dir,
                 server,
                 via_relay,
                 agent_id,
@@ -2127,8 +2149,8 @@ pub async fn cmd_agent(
             prompt,
         } => {
             cmd_fork_agent(
-                server, via_relay, json_mode, agent_id, at_seq, worktree, branch, base_ref, title,
-                prompt,
+                home_dir, server, via_relay, json_mode, agent_id, at_seq, worktree, branch,
+                base_ref, title, prompt,
             )
             .await
         }
@@ -2137,6 +2159,7 @@ pub async fn cmd_agent(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_fork_agent(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
@@ -2148,7 +2171,7 @@ pub async fn cmd_fork_agent(
     title: Option<String>,
     initial_prompt: Option<String>,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     let req_id = Uuid::new_v4();
     let target = if worktree || branch.is_some() || base_ref.is_some() {
         ForkTarget::NewWorktree { branch, base_ref }
@@ -2203,12 +2226,13 @@ pub async fn cmd_fork_agent(
 }
 
 pub async fn cmd_skill(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     json_mode: bool,
     action: SkillAction,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     match action {
         SkillAction::Ls => {
             let req_id = Uuid::new_v4();
@@ -2261,6 +2285,7 @@ pub async fn cmd_skill(
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_export_agent(
+    home_dir: &Path,
     server: &str,
     via_relay: bool,
     agent_id: String,
@@ -2270,7 +2295,7 @@ async fn cmd_export_agent(
     no_timestamps: bool,
     output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let client = connect_cli_server(server, via_relay).await?;
+    let client = connect_cli_server(home_dir, server, via_relay).await?;
     let agents_req = Uuid::new_v4();
     let agents_resp = send_rpc(
         &client,

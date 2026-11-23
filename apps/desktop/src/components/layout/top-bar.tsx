@@ -12,6 +12,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { isAgentBackgroundWaiting, isMacDesktop } from "@/lib/orbit-ipc";
+import { useI18n } from "@/lib/i18n";
 import { isAgentInGitRepo } from "@/lib/projects";
 import { modSymbol } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
@@ -28,6 +29,7 @@ import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-st
 import { cn } from "@/lib/utils";
 
 export const TopBar = memo(function TopBar() {
+  const { t } = useI18n();
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
   const overviewVisible = useOrbitSelector((s) =>
     s.stageCanDockOverview ? s.overviewDesktopOpenPref : s.overviewPopoverOpen,
@@ -130,10 +132,10 @@ export const TopBar = memo(function TopBar() {
   } = useWorkspaceMotion();
 
   // Primitive selector prevents `TopBar` from re-rendering on streaming tokens or background host ticks
-  const headerTitle = useOrbitSelector((s) => {
-    if (s.workspacePanel === "automations") return "Automations";
+  const rawHeaderTitle = useOrbitSelector((s) => {
+    if (s.workspacePanel === "automations") return "__AUTOMATIONS__";
     if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) {
-      return "New Conversation";
+      return "__NEW_CONVERSATION__";
     }
     const custom =
       s.threadCustomTitles[threadScopeKey(s.selectedHostId, s.selectedAgentId)];
@@ -142,8 +144,14 @@ export const TopBar = memo(function TopBar() {
     const ag =
       detail?.agents.find((a) => a.agent_id === s.selectedAgentId) ??
       s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.agent;
-    return ag?.title || "New Conversation";
+    return ag?.title || "__NEW_CONVERSATION__";
   });
+  const headerTitle =
+    rawHeaderTitle === "__AUTOMATIONS__"
+      ? t("common.automations")
+      : rawHeaderTitle === "__NEW_CONVERSATION__"
+        ? t("common.newConversation")
+        : rawHeaderTitle;
 
   const workspaceArtifactCount = useOrbitSelector((s) => {
     if (!s.selectedHostId) return 0;
@@ -223,10 +231,10 @@ export const TopBar = memo(function TopBar() {
         {hasActiveSession && selectedHostId && selectedAgentId && (
           <>
             {workspaceArtifactCount > 0 && (
-              <SimpleTooltip label="Artifacts">
+              <SimpleTooltip label={t("topbar.artifacts")}>
                 <button
                   type="button"
-                  aria-label={`Artifacts (${workspaceArtifactCount})`}
+                  aria-label={t("topbar.artifactsCount", { count: workspaceArtifactCount })}
                   onClick={() => orbitActions.openArtifactsTab({ hostId: selectedHostId })}
                   className="text-foreground/70 hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-[7px] px-2 text-[12px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
                 >
@@ -242,7 +250,7 @@ export const TopBar = memo(function TopBar() {
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  aria-label="Conversation actions"
+                  aria-label={t("topbar.conversationActions")}
                   className="text-foreground/65 hover:text-foreground inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
                 >
                   <MoreHorizontal className="h-[15.5px] w-[15.5px] stroke-[1.75]" />
@@ -259,7 +267,7 @@ export const TopBar = memo(function TopBar() {
                 >
                   <span className="flex items-center gap-2">
                     <GitFork className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>Fork conversation</span>
+                    <span>{t("topbar.forkConversation")}</span>
                   </span>
                 </DropdownMenuItem>
                 {canForkWorktree && (
@@ -274,7 +282,7 @@ export const TopBar = memo(function TopBar() {
                   >
                     <span className="flex items-center gap-2">
                       <GitBranch className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                      <span>Fork in worktree</span>
+                      <span>{t("topbar.forkInWorktree")}</span>
                     </span>
                   </DropdownMenuItem>
                 )}
@@ -292,7 +300,7 @@ export const TopBar = memo(function TopBar() {
                   >
                     <span className="flex items-center gap-2">
                       <ArrowLeftRight className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                      <span>Apply to Local…</span>
+                      <span>{t("topbar.applyToLocal")}</span>
                     </span>
                   </DropdownMenuItem>
                 )}
@@ -302,7 +310,7 @@ export const TopBar = memo(function TopBar() {
                 >
                   <span className="flex items-center gap-2">
                     <Download className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>Export…</span>
+                    <span>{t("topbar.export")}</span>
                   </span>
                 </DropdownMenuItem>
                 <DropdownMenuItem
@@ -312,7 +320,7 @@ export const TopBar = memo(function TopBar() {
                 >
                   <span className="flex items-center gap-2">
                     <Code2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>Copy code block…</span>
+                    <span>{t("topbar.copyCodeBlock")}</span>
                   </span>
                 </DropdownMenuItem>
                 <DropdownMenuItem
@@ -322,7 +330,7 @@ export const TopBar = memo(function TopBar() {
                 >
                   <span className="flex items-center gap-2">
                     <Copy className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>Copy transcript</span>
+                    <span>{t("topbar.copyTranscript")}</span>
                   </span>
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
@@ -333,7 +341,7 @@ export const TopBar = memo(function TopBar() {
                 >
                   <span className="flex items-center gap-2">
                     <Sparkles className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                    <span>Summarize</span>
+                    <span>{t("topbar.summarize")}</span>
                   </span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -341,21 +349,21 @@ export const TopBar = memo(function TopBar() {
             <SimpleTooltip
             label={
               overviewVisible
-                ? "Hide overview"
+                ? t("topbar.hideOverview")
                 : overviewBadgeTone === "approval"
-                  ? "Show overview (subagent needs approval)"
+                  ? t("topbar.showOverviewApproval")
                   : overviewBadgeTone === "subagent_running"
-                    ? "Show overview (subagent running)"
+                    ? t("topbar.showOverviewSubagent")
                     : overviewBadgeTone === "bg_running"
-                      ? "Show overview (background task running)"
-                      : "Show overview"
+                      ? t("topbar.showOverviewBackground")
+                      : t("topbar.showOverview")
             }
             shortcut={`${mod}⌥O`}
           >
             <button
               type="button"
               data-overview-trigger
-              aria-label={overviewVisible ? "Hide overview" : "Show overview"}
+              aria-label={overviewVisible ? t("topbar.hideOverview") : t("topbar.showOverview")}
               onClick={() => orbitActions.toggleOverviewPanel()}
               className={cn(
                 "relative inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",

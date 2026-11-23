@@ -16,6 +16,7 @@ import {
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useImeCompositionGuard } from "@/lib/ime";
+import { useI18n } from "@/lib/i18n";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -122,6 +123,7 @@ interface DeleteConfirmTarget {
 }
 
 export const FilesExplorerTab = memo(function FilesExplorerTab() {
+  const { t } = useI18n();
   const hostId = useOrbitSelector((s) => s.selectedHostId);
   const cwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const cacheKey = hostId && cwd ? `${hostId}::${cwd}` : "";
@@ -225,7 +227,9 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
     if (!canMutate || !hostId || !cwd || !createMode || createBusy) return;
     const rawPath = createValue.trim().replace(/^\/+|\/+$/g, "");
     if (!rawPath) {
-      setActionError(createMode === "dir" ? "Enter a folder path" : "Enter a file path");
+      setActionError(
+        createMode === "dir" ? t("sidePanel.enterFolderPath") : t("sidePanel.enterFilePath"),
+      );
       return;
     }
     setCreateBusy(true);
@@ -338,7 +342,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
         allowDirty: true,
       });
       setConfirmDeleteTarget(null);
-      orbitActions.showToast(`Deleted ${target.name}`);
+      orbitActions.showToast(t("sidePanel.deletedToast", { name: target.name }));
     } catch (err) {
       setActionError(String(err));
     } finally {
@@ -469,7 +473,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                         </button>
                         <button
                           type="button"
-                          title="Delete folder"
+                          title={t("sidePanel.deleteFolder")}
                           aria-label={`Delete ${node.name}`}
                           onClick={(e) => {
                             e.stopPropagation();
@@ -492,7 +496,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                     )}
                     {isDirty && !isOpen && (
                       <span
-                        title="Contains modified files"
+                        title={t("sidePanel.containsModified")}
                         className="ml-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/80"
                       />
                     )}
@@ -555,7 +559,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
               <div className="flex shrink-0 items-center gap-0.5">
                 <button
                   type="button"
-                  title="Mention in Composer (@)"
+                  title={t("sidePanel.mentionInComposer")}
                   aria-label={`Mention ${node.name} in Composer`}
                   onClick={() => {
                     orbitActions.addContextMention({
@@ -563,7 +567,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                       kind: "file",
                       path: node.path,
                     });
-                    orbitActions.showToast(`Attached ${node.name} to Composer`);
+                    orbitActions.showToast(t("sidePanel.attachedToast", { name: node.name }));
                   }}
                   className="text-muted-foreground hover:text-foreground pointer-events-none inline-flex h-[18px] cursor-pointer items-center rounded px-1 font-mono text-[10.5px] opacity-0 transition-opacity hover:bg-black/10 focus-visible:pointer-events-auto focus-visible:opacity-100 group-focus-within/frow:pointer-events-auto group-focus-within/frow:opacity-100 group-hover/frow:pointer-events-auto group-hover/frow:opacity-100 dark:hover:bg-white/10"
                 >
@@ -571,21 +575,21 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                 </button>
                 <button
                   type="button"
-                  title="Copy relative path"
+                  title={t("sidePanel.copyRelativePath")}
                   aria-label={`Copy path of ${node.name}`}
                   onClick={() => {
                     void navigator.clipboard.writeText(node.path);
-                    orbitActions.showToast("Copied relative path");
+                    orbitActions.showToast(t("sidePanel.copiedRelativePath"));
                   }}
                   className="text-muted-foreground hover:text-foreground pointer-events-none inline-flex h-[18px] cursor-pointer items-center rounded px-1 text-[10.5px] opacity-0 transition-opacity hover:bg-black/10 focus-visible:pointer-events-auto focus-visible:opacity-100 group-focus-within/frow:pointer-events-auto group-focus-within/frow:opacity-100 group-hover/frow:pointer-events-auto group-hover/frow:opacity-100 dark:hover:bg-white/10"
                 >
-                  Copy
+                  {t("common.copy")}
                 </button>
                 {canMutate && hostId && cwd && (
                   <>
                     <button
                       type="button"
-                      title="Rename file"
+                      title={t("sidePanel.renameFile")}
                       aria-label={`Rename ${node.name}`}
                       onClick={(e) => {
                         e.stopPropagation();
@@ -597,7 +601,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                     </button>
                     <button
                       type="button"
-                      title="Delete file"
+                      title={t("sidePanel.deleteFile")}
                       aria-label={`Delete ${node.name}`}
                       onClick={(e) => {
                         e.stopPropagation();
@@ -779,7 +783,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                 className="inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md border border-rose-500/35 bg-rose-500/15 px-2 text-[11.5px] font-medium text-rose-700 transition-colors hover:bg-rose-500/25 disabled:opacity-50 dark:text-rose-300"
               >
                 {deleteBusy && <Loader2 className="h-[11px] w-[11px] animate-spin" />}
-                Delete
+                {t("common.delete")}
               </button>
               <button
                 type="button"
@@ -787,7 +791,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                 onClick={() => setConfirmDeleteTarget(null)}
                 className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[22px] cursor-pointer items-center rounded-md px-2 text-[11.5px] transition-colors"
               >
-                Cancel
+                {t("common.cancel")}
               </button>
             </div>
           </div>

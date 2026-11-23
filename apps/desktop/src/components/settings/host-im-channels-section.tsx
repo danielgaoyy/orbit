@@ -20,6 +20,7 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   type ImChannelRecord,
   type ImConnectionStatus,
@@ -429,16 +430,15 @@ function ChannelModal({
             <div className="flex items-center justify-between gap-2">
               <span className="text-foreground text-[12px] font-medium">Credentials</span>
               {isEditing && (form.hasExistingPrimary || form.hasExistingSigning) && (
-                <label className="text-muted-foreground flex cursor-pointer items-center gap-1.5 text-[11px]">
-                  <input
-                    type="checkbox"
+                <label className="text-muted-foreground flex cursor-pointer items-center gap-1.5 text-[11px] select-none">
+                  <Checkbox
+                    size="sm"
                     checked={form.clearExistingSecrets}
-                    onChange={(e) =>
-                      setForm((f) => ({ ...f, clearExistingSecrets: e.target.checked }))
+                    onCheckedChange={(checked) =>
+                      setForm((f) => ({ ...f, clearExistingSecrets: checked }))
                     }
-                    className="rounded"
                   />
-                  Overwrite / clear saved secrets
+                  <span>Overwrite / clear saved secrets</span>
                 </label>
               )}
             </div>

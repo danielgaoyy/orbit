@@ -1,4 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { t } from "@/lib/i18n";
 
 export type ProviderKind =
   | "antigravity"
@@ -412,6 +414,18 @@ export interface ExternalEditorInfo {
   installed: boolean;
 }
 
+export type ProviderAuthStatus = "authenticated" | "unauthenticated" | "unknown";
+
+export interface ProviderReadinessInfo {
+  kind: ProviderKind;
+  display_name: string;
+  installed: boolean;
+  executable_path: string | null;
+  auth_status: ProviderAuthStatus;
+  install_hint: string;
+  login_hint: string;
+}
+
 export type HostRouteMode = "auto" | "ssh_tunnel" | "direct_only" | "relay_only";
 
 export interface ReleaseUpdateInfo {
@@ -776,7 +790,7 @@ export function semanticAgentTabLabel(
   if (titleSource && !isGenericHarnessHandle(titleSource)) {
     return titleSource.length > 18 ? `${titleSource.slice(0, 17)}…` : titleSource;
   }
-  return "新会话";
+  return t("common.newSession");
 }
 
 export interface SpawnWorkspacePeerRequest {
@@ -1535,6 +1549,7 @@ export interface InlineSpanView {
 export interface HighlightedTokenView {
   text: string;
   fg_hex: string;
+  light_fg_hex?: string;
   bold: boolean;
   italic: boolean;
 }
@@ -3070,6 +3085,10 @@ export const orbitIpc = {
     return invoke<HostCardView>("pair_host", { pairingUri });
   },
 
+  exportHostPairingUri: async (hostId: string): Promise<string> => {
+    return invoke<string>("export_host_pairing_uri", { hostId });
+  },
+
   pairSshHost: async (sshAlias: string, remotePort?: number | null): Promise<HostCardView> => {
     return invoke<HostCardView>("pair_ssh_host", {
       sshAlias,
@@ -4282,6 +4301,7 @@ export const orbitIpc = {
               {
                 text: "// Desktop runtime required to read host files.",
                 fg_hex: "#94A3B8",
+                light_fg_hex: "#6E7781",
                 bold: false,
                 italic: false,
               },
@@ -4715,7 +4735,15 @@ export const orbitIpc = {
     if (!isTauriRuntime()) {
       return content.split(/\r?\n/).map((line, i) => ({
         line_number: i + 1,
-        tokens: [{ text: line, fg_hex: "#E2E8F0", bold: false, italic: false }],
+        tokens: [
+          {
+            text: line,
+            fg_hex: "#E2E8F0",
+            light_fg_hex: "#24292F",
+            bold: false,
+            italic: false,
+          },
+        ],
       }));
     }
     return invoke<HighlightedLineView[]>("highlight_workspace_code", {
@@ -4857,13 +4885,13 @@ export const orbitIpc = {
   },
 
   performAppSelfUpdate: async (
-    release: ReleaseUpdateInfo,
+    targetTag: string | null | undefined,
     onProgress: (ev: AppUpdateProgress) => void,
   ): Promise<void> => {
     const ch = new Channel<AppUpdateProgress>();
     ch.onmessage = onProgress;
     return invoke<void>("perform_app_self_update", {
-      release,
+      targetTag: targetTag ?? null,
       onProgress: ch,
     });
   },
@@ -5472,6 +5500,33 @@ export const orbitIpc = {
       return;
     }
     await invoke<void>("focus_main_window");
+  },
+
+  updateTrayStatus: async (runningCount: number, pendingApprovals: number): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_tray_status", {
+      runningCount: Math.max(0, Math.floor(runningCount)),
+      pendingApprovals: Math.max(0, Math.floor(pendingApprovals)),
+    });
+  },
+
+  onTrayNewConversation: async (handler: () => void): Promise<() => void> => {
+    if (!isTauriRuntime()) return () => {};
+    return listen("orbit://tray-new-conversation", () => {
+      handler();
+    });
+  },
+
+  probeLocalProviderReadiness: async (): Promise<ProviderReadinessInfo[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ProviderReadinessInfo[]>("probe_local_provider_readiness");
+  },
+
+  renderQrSvg: async (content: string): Promise<string> => {
+    if (!isTauriRuntime()) {
+      throw new Error("QR rendering requires the Orbit Desktop runtime");
+    }
+    return invoke<string>("render_qr_svg", { content });
   },
 
   listPushDevices: async (hostId: string): Promise<PushDevicesSnapshotView> => {

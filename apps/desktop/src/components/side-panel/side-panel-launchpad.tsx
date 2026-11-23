@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -185,6 +186,7 @@ export function SidePanelLaunchpad({
   isPanelOpen: boolean;
   isPanelSettled: boolean;
 }) {
+  const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
   const [showAllTasks, setShowAllTasks] = useState(false);
@@ -270,7 +272,7 @@ export function SidePanelLaunchpad({
     () => [
       {
         id: "review",
-        label: "Review",
+        label: t("sidePanel.actionReview"),
         keywords: ["review", "diff", "git", "changes"],
         icon: <FileDiff className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />,
         trailing:
@@ -286,7 +288,9 @@ export function SidePanelLaunchpad({
               </span>
             ) : (
               <span className="text-muted-foreground/75 text-[11.5px] tabular-nums">
-                {reviewSummary.count} {reviewSummary.count === 1 ? "file" : "files"}
+                {reviewSummary.count === 1
+                  ? t("sidePanel.fileSingular", { count: reviewSummary.count })
+                  : t("sidePanel.filePlural", { count: reviewSummary.count })}
               </span>
             )
           ) : null,
@@ -294,14 +298,14 @@ export function SidePanelLaunchpad({
       },
       {
         id: "files",
-        label: "Open File",
+        label: t("sidePanel.actionOpenFile"),
         keywords: ["open file", "files", "explorer", "tree", "folder"],
         icon: <File className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />,
         onSelect: () => orbitActions.openFilesExplorerTab(),
       },
       {
         id: "artifacts",
-        label: "Artifacts",
+        label: t("sidePanel.actionArtifacts"),
         keywords: ["artifacts", "html", "mcp", "app", "preview", "diagram", "svg", "mermaid"],
         icon: <Blocks className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />,
         trailing:
@@ -321,7 +325,7 @@ export function SidePanelLaunchpad({
       },
       {
         id: "terminal",
-        label: "Terminal",
+        label: t("sidePanel.actionTerminal"),
         keywords: ["terminal", "shell", "zsh", "bash", "console", "pty"],
         icon: (
           <SquareTerminal className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />
@@ -339,7 +343,7 @@ export function SidePanelLaunchpad({
       },
       {
         id: "browser",
-        label: "Browser",
+        label: t("sidePanel.actionBrowser"),
         keywords: ["browser", "web", "url", "preview", "http", "localhost"],
         icon: <Globe className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />,
         trailing: primaryLocalUrl ? (
@@ -359,7 +363,7 @@ export function SidePanelLaunchpad({
       },
       {
         id: "side_question",
-        label: "Side Question",
+        label: t("sidePanel.actionSideQuestion"),
         keywords: ["side question", "btw", "ask", "question", "chat"],
         icon: (
           <MessageCircleQuestion className="text-muted-foreground h-[15px] w-[15px] shrink-0 stroke-[1.75]" />
@@ -384,6 +388,7 @@ export function SidePanelLaunchpad({
       selectedHostId,
       sideQuestionCount,
       totalTerminalCount,
+      t,
     ],
   );
 
@@ -551,14 +556,14 @@ export function SidePanelLaunchpad({
             onChange={(e) => setQuery(e.target.value)}
             {...ime.compositionProps}
             onKeyDown={handleInputKeyDown}
-            placeholder="Search files or enter a URL"
-            aria-label="Search files or enter a URL"
+            placeholder={t("sidePanel.searchPlaceholder")}
+            aria-label={t("sidePanel.searchPlaceholder")}
             className="text-foreground placeholder:text-muted-foreground/60 min-w-0 flex-1 bg-transparent text-[13px] select-text focus:outline-none"
           />
           {query.length > 0 && (
             <button
               type="button"
-              aria-label="Clear search"
+              aria-label={t("sidePanel.clearSearch")}
               onClick={() => {
                 setQuery("");
                 inputRef.current?.focus({ preventScroll: true });
@@ -595,11 +600,11 @@ export function SidePanelLaunchpad({
                       <span className="flex min-w-0 items-center gap-2.5">
                         <MessageCircleQuestion className="text-primary h-[15px] w-[15px] shrink-0 stroke-[1.75]" />
                         <span className="truncate font-medium">
-                          Ask Side Question: &ldquo;{entry.question}&rdquo;
+                          {t("sidePanel.askSideQuestion", { question: entry.question })}
                         </span>
                       </span>
                       <span className="text-muted-foreground/65 flex shrink-0 items-center gap-1 text-[11px]">
-                        <span>Ask</span>
+                        <span>{t("sidePanel.ask")}</span>
                         {isSelected && <CornerDownLeft className="h-[11px] w-[11px]" />}
                       </span>
                     </button>
@@ -617,7 +622,7 @@ export function SidePanelLaunchpad({
                     >
                       <span className="flex min-w-0 items-center gap-2.5">
                         <Globe className="text-primary h-[15px] w-[15px] shrink-0 stroke-[1.75]" />
-                        <span className="shrink-0 font-medium">Open in Browser</span>
+                        <span className="shrink-0 font-medium">{t("sidePanel.openInBrowser")}</span>
                         <span className="text-muted-foreground/70 truncate text-[12px]">
                           {entry.url}
                         </span>
@@ -677,7 +682,7 @@ export function SidePanelLaunchpad({
               })
             ) : (
               <div className="text-muted-foreground/75 px-2.5 py-6 text-center text-[12.5px]">
-                No matching files, URLs, or actions for &ldquo;{trimmedQuery}&rdquo;
+                {t("sidePanel.noLaunchpadMatches", { query: trimmedQuery })}
               </div>
             )}
           </div>
@@ -718,7 +723,9 @@ export function SidePanelLaunchpad({
                 {backgroundTasks.length > 0 && (
                   <section>
                     <div className="mb-1.5 flex items-center gap-1.5 px-2.5 text-[11.5px] font-medium">
-                      <span className="text-muted-foreground/75">Background Tasks</span>
+                      <span className="text-muted-foreground/75">
+                        {t("sidePanel.backgroundTasks")}
+                      </span>
                       <span className="text-muted-foreground/55 tabular-nums">
                         {backgroundTasks.length}
                       </span>
@@ -796,7 +803,9 @@ export function SidePanelLaunchpad({
                           onClick={() => setShowAllTasks((prev) => !prev)}
                           className="text-muted-foreground hover:text-foreground mt-0.5 w-fit cursor-pointer px-2.5 py-1 text-[12px] transition-colors"
                         >
-                          {showAllTasks ? "Show less" : "See all"}
+                          {showAllTasks
+                            ? t("common.showLess")
+                            : t("common.showMore", { count: backgroundTasks.length - 4 })}
                         </button>
                       )}
                     </div>
@@ -807,7 +816,7 @@ export function SidePanelLaunchpad({
                 {recentFiles.length > 0 && (
                   <section>
                     <div className="mb-1.5 flex items-center gap-1.5 px-2.5 text-[11.5px] font-medium">
-                      <span className="text-muted-foreground/75">Recent Files</span>
+                      <span className="text-muted-foreground/75">{t("sidePanel.recentFiles")}</span>
                       <span className="text-muted-foreground/55 tabular-nums">
                         {insights.touched_files.length}
                       </span>

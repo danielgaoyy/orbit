@@ -42,6 +42,7 @@ import {
   semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
 import { isAgentInGitRepo, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
+import { useI18n } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -130,6 +131,7 @@ export function SharedConversationMenu({
   onRequestCreateWorkspace?: (req: CreateWorkspaceDialogTarget) => void;
   onRequestDelete: (target: DeleteConversationTarget) => void;
 }) {
+  const { t } = useI18n();
   const hostDetail = useOrbitSelector((s) =>
     target ? (s.hostDetails[target.host.host_id] ?? null) : null,
   );
@@ -208,7 +210,7 @@ export function SharedConversationMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Pencil className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>Rename</span>
+            <span>{t("common.rename")}</span>
           </span>
         </DropdownMenuItem>
 
@@ -222,7 +224,7 @@ export function SharedConversationMenu({
             ) : (
               <Pin className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
             )}
-            <span>{isPinned ? "Unpin" : "Pin"}</span>
+            <span>{isPinned ? t("sidebar.unpin") : t("sidebar.pin")}</span>
           </span>
         </DropdownMenuItem>
 
@@ -243,7 +245,7 @@ export function SharedConversationMenu({
               ) : (
                 <Circle className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
               )}
-              <span>{isUnread ? "Mark read" : "Mark unread"}</span>
+              <span>{isUnread ? t("sidebar.markRead") : t("sidebar.markUnread")}</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -258,7 +260,7 @@ export function SharedConversationMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Columns2 className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>Open split</span>
+            <span>{t("sidebar.openSplit")}</span>
           </span>
         </DropdownMenuItem>
 
@@ -267,7 +269,7 @@ export function SharedConversationMenu({
             <DropdownMenuSubTrigger className={COMPACT_MENU_ITEM_CLASS}>
               <span className="flex items-center gap-2 whitespace-nowrap">
                 <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>Fork</span>
+                <span>{t("sidebar.fork")}</span>
               </span>
             </DropdownMenuSubTrigger>
             <DropdownMenuSubContent className="w-max min-w-[168px] rounded-[12px] p-1">
@@ -282,7 +284,7 @@ export function SharedConversationMenu({
               >
                 <span className="flex items-center gap-2 whitespace-nowrap">
                   <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>Fork here</span>
+                  <span>{t("sidebar.forkHere")}</span>
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -297,7 +299,7 @@ export function SharedConversationMenu({
               >
                 <span className="flex items-center gap-2 whitespace-nowrap">
                   <GitBranch className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>Fork in new worktree</span>
+                  <span>{t("sidebar.forkInNewWorktree")}</span>
                 </span>
               </DropdownMenuItem>
             </DropdownMenuSubContent>
@@ -314,7 +316,7 @@ export function SharedConversationMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>Fork</span>
+              <span>{t("sidebar.fork")}</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -335,7 +337,7 @@ export function SharedConversationMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <ArrowLeftRight className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>Apply to Local…</span>
+              <span>{t("topbar.applyToLocal")}</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -344,14 +346,14 @@ export function SharedConversationMenu({
           <DropdownMenuSubTrigger className={COMPACT_MENU_ITEM_CLASS}>
             <span className="flex items-center gap-2 whitespace-nowrap">
               <Layers className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>Group</span>
+              <span>{t("sidebar.group")}</span>
             </span>
           </DropdownMenuSubTrigger>
           <DropdownMenuSubContent className="w-max max-w-[240px] min-w-[172px] rounded-[12px] p-1">
             {otherWorkspaces.length > 0 && (
               <>
                 <DropdownMenuLabel className="px-2 py-1 text-[11px] font-medium">
-                  Move to
+                  {t("sidebar.moveTo")}
                 </DropdownMenuLabel>
                 {otherWorkspaces.map((ws) => (
                   <DropdownMenuItem
@@ -391,7 +393,7 @@ export function SharedConversationMenu({
               >
                 <span className="flex items-center gap-2 whitespace-nowrap">
                   <FolderPlus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>New group</span>
+                  <span>{t("sidebar.newGroup")}</span>
                 </span>
               </DropdownMenuItem>
             )}
@@ -410,7 +412,7 @@ export function SharedConversationMenu({
               >
                 <span className="flex items-center gap-2 whitespace-nowrap">
                   <Sparkles className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>Assign automatically</span>
+                  <span>{t("sidebar.assignAutomatically")}</span>
                 </span>
               </DropdownMenuItem>
             )}
@@ -428,7 +430,7 @@ export function SharedConversationMenu({
               >
                 <span className="flex items-center gap-2 whitespace-nowrap">
                   <FileText className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span>Group notes</span>
+                  <span>{t("sidebar.groupNotes")}</span>
                 </span>
               </DropdownMenuItem>
             )}
@@ -446,7 +448,7 @@ export function SharedConversationMenu({
                 >
                   <span className="flex items-center gap-2 whitespace-nowrap">
                     <Inbox className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                    <span>Remove from group</span>
+                    <span>{t("sidebar.removeFromGroup")}</span>
                   </span>
                 </DropdownMenuItem>
               </>
@@ -458,7 +460,7 @@ export function SharedConversationMenu({
           <DropdownMenuSubTrigger className={COMPACT_MENU_ITEM_CLASS}>
             <span className="flex items-center gap-2 whitespace-nowrap">
               <MoreHorizontal className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>More</span>
+              <span>{t("common.more")}</span>
             </span>
           </DropdownMenuSubTrigger>
           <DropdownMenuSubContent className="w-max min-w-[172px] rounded-[12px] p-1">
@@ -481,7 +483,7 @@ export function SharedConversationMenu({
             >
               <span className="flex items-center gap-2 whitespace-nowrap">
                 <UserPlus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>Add reviewer</span>
+                <span>{t("sidebar.addReviewer")}</span>
               </span>
             </DropdownMenuItem>
 
@@ -493,7 +495,7 @@ export function SharedConversationMenu({
             >
               <span className="flex items-center gap-2 whitespace-nowrap">
                 <Sparkles className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>Summarize</span>
+                <span>{t("topbar.summarize")}</span>
               </span>
             </DropdownMenuItem>
 
@@ -508,7 +510,7 @@ export function SharedConversationMenu({
             >
               <span className="flex items-center gap-2 whitespace-nowrap">
                 <Download className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>Export…</span>
+                <span>{t("topbar.export")}</span>
               </span>
             </DropdownMenuItem>
 
@@ -520,21 +522,21 @@ export function SharedConversationMenu({
             >
               <span className="flex items-center gap-2 whitespace-nowrap">
                 <Copy className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>Copy transcript</span>
+                <span>{t("topbar.copyTranscript")}</span>
               </span>
             </DropdownMenuItem>
 
             <DropdownMenuItem
               onSelect={() => {
                 void navigator.clipboard.writeText(agent.agent_id).then(() => {
-                  orbitActions.showToast(`Copied ID ${agent.agent_id}`);
+                  orbitActions.showToast(t("sidebar.copiedId", { id: agent.agent_id }));
                 });
               }}
               className={COMPACT_MENU_ITEM_CLASS}
             >
               <span className="flex items-center gap-2 whitespace-nowrap">
                 <Hash className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                <span>Copy ID</span>
+                <span>{t("sidebar.copyId")}</span>
               </span>
             </DropdownMenuItem>
           </DropdownMenuSubContent>
@@ -551,7 +553,7 @@ export function SharedConversationMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <Unlink className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>Detach</span>
+              <span>{t("sidebar.detach")}</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -562,7 +564,7 @@ export function SharedConversationMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Archive className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>Archive</span>
+            <span>{t("common.archive")}</span>
           </span>
         </DropdownMenuItem>
 
@@ -575,7 +577,7 @@ export function SharedConversationMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap text-rose-600 dark:text-rose-400">
             <Trash2 className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>Delete</span>
+            <span>{t("common.delete")}</span>
           </span>
         </DropdownMenuItem>
       </DropdownMenuContent>
@@ -601,6 +603,7 @@ export function SharedProjectMenu({
   onRequestDelete: (project: SidebarProjectGroupView) => void;
   onRequestCreateWorkspace?: (req: CreateWorkspaceDialogTarget) => void;
 }) {
+  const { t } = useI18n();
   if (!target) return null;
   const { project: proj, host, anchor } = target;
   const isLocal = isLocalHostCard(host);
@@ -647,7 +650,7 @@ export function SharedProjectMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Pencil className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>Rename</span>
+            <span>{t("common.rename")}</span>
           </span>
         </DropdownMenuItem>
 
@@ -662,10 +665,10 @@ export function SharedProjectMenu({
               <FolderOpen className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
               <span>
                 {isMac
-                  ? "Reveal in Finder"
+                  ? t("sidebar.revealInFinder")
                   : isWindowsDesktop()
-                    ? "Reveal in File Explorer"
-                    : "Open folder"}
+                    ? t("sidebar.revealInExplorer")
+                    : t("sidebar.openFolder")}
               </span>
             </span>
           </DropdownMenuItem>
@@ -674,13 +677,13 @@ export function SharedProjectMenu({
         <DropdownMenuItem
           onSelect={() => {
             void navigator.clipboard.writeText(proj.primary_cwd);
-            orbitActions.showToast("Copied project path");
+            orbitActions.showToast(t("sidebar.copiedProjectPath"));
           }}
           className="h-[28px] rounded-[7px] px-2 py-0 text-[12.5px]"
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Copy className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>Copy path</span>
+            <span>{t("sidebar.copyPath")}</span>
           </span>
         </DropdownMenuItem>
 
@@ -694,7 +697,7 @@ export function SharedProjectMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <RefreshCw className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>Reconnect</span>
+              <span>{t("banner.reconnect")}</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -716,7 +719,7 @@ export function SharedProjectMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <FolderPlus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>New thread group</span>
+              <span>{t("sidebar.newThreadGroup")}</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -730,7 +733,7 @@ export function SharedProjectMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <Sparkles className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>Organize threads</span>
+              <span>{t("sidebar.organizeThreads")}</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -746,7 +749,7 @@ export function SharedProjectMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap text-rose-600 dark:text-rose-400">
             <Trash2 className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-            <span>Delete</span>
+            <span>{t("common.delete")}</span>
           </span>
         </DropdownMenuItem>
       </DropdownMenuContent>
@@ -781,6 +784,7 @@ export function DeleteConversationDialog({
   target: DeleteConversationTarget | null;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const [deleting, setDeleting] = useState(false);
 
   const isRunning = Boolean(
@@ -797,7 +801,7 @@ export function DeleteConversationDialog({
       await orbitActions.deleteThreadPermanently(target.host.host_id, target.agent.agent_id);
       onClose();
     } catch {
-      orbitActions.showToast("Failed to delete conversation");
+      orbitActions.showToast(t("sidebar.failedDeleteConversation"));
     } finally {
       setDeleting(false);
     }

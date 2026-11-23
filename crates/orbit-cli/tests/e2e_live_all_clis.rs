@@ -320,6 +320,7 @@ async fn live_all_three_clis_mission_workspace_sync_and_nested_worktree() {
         .expect("spawn daemon");
     let uri = rt
         .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("pairing offer")
         .to_qr_uri()
         .expect("pair uri");
 

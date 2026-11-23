@@ -21,6 +21,9 @@ import {
   SettingSectionHeader,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Checkbox } from "@/components/ui/checkbox";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { orbitIpc } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -41,6 +44,7 @@ function formatRelativeSyncTime(tsMs: number | null): string {
 }
 
 export function CloudSyncSection() {
+  const { t } = useI18n();
   const status = useOrbitSelector((s) => s.cloudSyncStatus);
   const busy = useOrbitSelector((s) => s.cloudSyncBusy);
   const storeError = useOrbitSelector((s) => s.cloudSyncError);
@@ -56,6 +60,7 @@ export function CloudSyncSection() {
   const [copiedFlag, setCopiedFlag] = useState<"code" | "key" | "cli" | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [clearHostsOnLogout, setClearHostsOnLogout] = useState(false);
+  const [confirmSignOutOpen, setConfirmSignOutOpen] = useState(false);
 
   const ime = useImeCompositionGuard();
 
@@ -148,8 +153,8 @@ export function CloudSyncSection() {
   return (
     <div className="space-y-6">
       <SettingSectionHeader
-        title="Cloud Sync"
-        description="Sync paired hosts, projects, and settings across all devices via your own GitHub Secret Gist — end-to-end encrypted, zero Orbit servers."
+        title={t("settings.cloudSyncTitle")}
+        description={t("settings.cloudSyncDesc")}
       />
 
       {/* Architecture / Zero-Server Trust Summary */}
@@ -202,12 +207,12 @@ export function CloudSyncSection() {
                       {copiedFlag === "code" ? (
                         <>
                           <Check className="h-3.5 w-3.5 text-emerald-500" />
-                          <span>Copied</span>
+                          <span>{t("common.copied")}</span>
                         </>
                       ) : (
                         <>
                           <Copy className="h-3.5 w-3.5" />
-                          <span>Copy</span>
+                          <span>{t("common.copy")}</span>
                         </>
                       )}
                     </button>
@@ -223,7 +228,7 @@ export function CloudSyncSection() {
                       className="bg-foreground text-background inline-flex h-[34px] cursor-pointer items-center gap-2 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90"
                     >
                       <ExternalLink className="h-3.5 w-3.5" />
-                      <span>Copy Code &amp; Open GitHub</span>
+                      <span>{t("settings.copyCodeOpenGithub")}</span>
                     </button>
 
                     <button
@@ -231,7 +236,7 @@ export function CloudSyncSection() {
                       onClick={() => orbitActions.cancelGithubCloudLogin()}
                       className="border-border text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[34px] cursor-pointer items-center rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
                     >
-                      Cancel
+                      {t("common.cancel")}
                     </button>
                   </div>
                 </div>
@@ -239,7 +244,7 @@ export function CloudSyncSection() {
             </div>
           ) : (
             <div className="space-y-2">
-              <SettingGroupLabel>Sign In with GitHub</SettingGroupLabel>
+              <SettingGroupLabel>{t("settings.signInGithub")}</SettingGroupLabel>
               <SettingCard>
                 <div className="space-y-4 p-4">
                   {/* Method Toggle */}
@@ -257,7 +262,7 @@ export function CloudSyncSection() {
                           : "text-muted-foreground hover:text-foreground",
                       )}
                     >
-                      GitHub OAuth (Device Flow)
+                      {t("settings.oauthDeviceFlow")}
                     </button>
                     <button
                       type="button"
@@ -272,7 +277,7 @@ export function CloudSyncSection() {
                           : "text-muted-foreground hover:text-foreground",
                       )}
                     >
-                      Personal Access Token
+                      {t("settings.personalAccessToken")}
                     </button>
                   </div>
 
@@ -664,20 +669,19 @@ export function CloudSyncSection() {
                   title="Sign out of this device"
                   description="Removes local credentials only — your encrypted GitHub Secret Gist remains safe for other devices."
                 >
-                  <div className="flex items-center gap-2">
-                    <label className="text-muted-foreground flex cursor-pointer items-center gap-1.5 text-[12px]">
-                      <input
-                        type="checkbox"
+                  <div className="flex items-center gap-2.5">
+                    <label className="text-muted-foreground flex cursor-pointer items-center gap-1.5 text-[12px] select-none">
+                      <Checkbox
+                        size="sm"
                         checked={clearHostsOnLogout}
-                        onChange={(e) => setClearHostsOnLogout(e.target.checked)}
-                        className="rounded"
+                        onCheckedChange={setClearHostsOnLogout}
                       />
                       <span>Clear hosts</span>
                     </label>
                     <button
                       type="button"
                       disabled={busy}
-                      onClick={() => void orbitActions.logoutCloudSync(clearHostsOnLogout)}
+                      onClick={() => setConfirmSignOutOpen(true)}
                       className="border-border hover:bg-rose-500/10 hover:text-rose-600 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12px] font-medium transition-colors"
                     >
                       <LogOut className="h-3.5 w-3.5" />
@@ -733,6 +737,24 @@ export function CloudSyncSection() {
           <span className="selectable-text break-words">{displayError}</span>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmSignOutOpen}
+        onOpenChange={setConfirmSignOutOpen}
+        title={
+          clearHostsOnLogout
+            ? "Sign out and clear paired hosts?"
+            : "Sign out of Cloud Sync?"
+        }
+        description={
+          clearHostsOnLogout
+            ? "Removes local sync credentials and clears synced host pairings on this device. Your encrypted GitHub Secret Gist remains safe for other devices."
+            : "Removes local Cloud Sync credentials from this device. Your paired hosts and encrypted GitHub Secret Gist remain intact."
+        }
+        confirmLabel={clearHostsOnLogout ? "Sign out & clear hosts" : "Sign out"}
+        tone={clearHostsOnLogout ? "danger" : "default"}
+        onConfirm={() => orbitActions.logoutCloudSync(clearHostsOnLogout)}
+      />
     </div>
   );
 }

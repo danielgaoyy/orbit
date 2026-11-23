@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Forbid cleartext HTTP across Android JVM/WebView networking.
+         Direct LAN daemon sessions run inside native Rust (orbit-client-core)
+         over Noise_NK_25519_ChaChaPoly_SHA256 end-to-end encrypted WebSockets. -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

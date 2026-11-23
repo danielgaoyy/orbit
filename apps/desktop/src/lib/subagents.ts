@@ -5,9 +5,15 @@ import type {
   ProviderKind,
   ProviderSubagentDescriptor,
   SessionSubagentEntryView,
+  TimelineItemView,
 } from "@/lib/orbit-ipc";
 
-export type ResolvedSubagentStatus = "awaiting_permission" | "running" | "failed" | "completed";
+export type ResolvedSubagentStatus =
+  | "awaiting_permission"
+  | "running"
+  | "failed"
+  | "canceled"
+  | "completed";
 
 export interface ResolvedSubagentItem {
   /** Stable unique key for React lists */
@@ -40,16 +46,26 @@ const STATUS_PRIORITY: Record<ResolvedSubagentStatus, number> = {
   awaiting_permission: 0,
   running: 1,
   failed: 2,
-  completed: 3,
+  canceled: 3,
+  completed: 4,
 };
 
 function mapManagedStatus(agent: AgentCardView, fallbackStatus?: string): ResolvedSubagentStatus {
   if (agent.is_awaiting_permission) return "awaiting_permission";
   if (agent.is_running || agent.has_background_tasks) return "running";
+  const lowerLabel = agent.status_label.toLowerCase();
+  if (
+    lowerLabel.includes("cancel") ||
+    lowerLabel.includes("interrupt") ||
+    lowerLabel.includes("stopped")
+  ) {
+    return "canceled";
+  }
   if (
     fallbackStatus === "failed" ||
     fallbackStatus === "denied" ||
-    agent.status_label.toLowerCase().includes("error")
+    lowerLabel.includes("error") ||
+    lowerLabel.includes("fail")
   ) {
     return "failed";
   }
@@ -61,6 +77,7 @@ function mapProviderSubagentStatus(
 ): ResolvedSubagentStatus {
   if (status === "running") return "running";
   if (status === "completed") return "completed";
+  if (status === "canceled" || status === "stopped") return "canceled";
   return "failed";
 }
 
@@ -258,4 +275,332 @@ export function resolveSessionSubagents(params: {
   });
 
   return out;
+}
+
+export interface ResolvedToolCallSubagent {
+  subagent: ResolvedSubagentItem;
+  action: "dispatch" | "message";
+}
+
+export interface SubagentMessageCallInfo {
+  callId: string;
+  recipient: string;
+  message: string;
+  status: "running" | "completed" | "failed" | "denied";
+}
+
+/**
+ * Extracts structured details from a generic inter-agent message tool call (`send_message`,
+ * `send_agent_prompt`, `message_peer`) so it can be surfaced cleanly outside folded tool groups
+ * even when the recipient is the parent agent rather than a child subagent.
+ */
+export function extractSubagentMessageCall(
+  item: Extract<TimelineItemView, { item_type: "tool_call" }>,
+): SubagentMessageCallInfo | null {
+  if (item.detail.kind !== "generic") return null;
+  if (classifyGenericSubagentTool(item.detail.tool_name) !== "message") return null;
+  const args = tryParseJsonObject(item.detail.arguments_json);
+  const recipient = readStringField(args, [
+    "handle",
+    "Recipient",
+    "recipient",
+    "agent_id",
+    "conversation_id",
+    "conversationId",
+  ]);
+  const message = readStringField(args, ["Message", "message", "prompt", "content", "text"]);
+  return {
+    callId: item.call_id || `msg-${item.seq}`,
+    recipient,
+    message,
+    status: item.status,
+  };
+}
+
+/** Structural value-equality check to keep `sessionSubagents` referentially stable across unrelated host ticks. */
+export function areResolvedSubagentsEqual(
+  a: readonly ResolvedSubagentItem[],
+  b: readonly ResolvedSubagentItem[],
+): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.key !== y.key ||
+      x.title !== y.title ||
+      x.status !== y.status ||
+      x.childAgentId !== y.childAgentId ||
+      x.providerSubagentId !== y.providerSubagentId ||
+      x.childHostId !== y.childHostId ||
+      x.promptPreview !== y.promptPreview
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function classifyGenericSubagentTool(toolName: string): "dispatch" | "message" | null {
+  const stripped = toolName.trim().replace(/^run\s+/i, "");
+  if (!stripped) return null;
+  const firstToken = (stripped.split(/\s+/)[0] ?? "").toLowerCase();
+  if (!firstToken) return null;
+  const leaf = firstToken.split(/[:/.]|__/).pop() ?? firstToken;
+  if (
+    leaf === "invoke_subagent" ||
+    leaf === "spawn_subagent" ||
+    leaf === "create_agent" ||
+    leaf === "spawn_workspace_peer" ||
+    leaf === "mcp_orbit_create_agent" ||
+    leaf === "mcp_orbit_spawn_workspace_peer"
+  ) {
+    return "dispatch";
+  }
+  if (
+    leaf === "send_message" ||
+    leaf === "sendmessage" ||
+    leaf === "send_agent_prompt" ||
+    leaf === "message_peer" ||
+    leaf === "mcp_orbit_send_agent_prompt" ||
+    leaf === "mcp_orbit_message_peer"
+  ) {
+    return "message";
+  }
+  return null;
+}
+
+function tryParseJsonObject(raw: string): Record<string, unknown> | null {
+  const trimmed = raw.trim();
+  if (!trimmed || !trimmed.startsWith("{")) return null;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readStringField(obj: Record<string, unknown> | null, keys: readonly string[]): string {
+  if (!obj) return "";
+  for (const key of keys) {
+    const val = obj[key];
+    if (typeof val === "string" && val.trim().length > 0) {
+      return val.trim();
+    }
+  }
+  return "";
+}
+
+/**
+ * Resolves a subagent dispatch (`invoke_subagent`, `create_agent`, `spawn_workspace_peer`, or
+ * `detail.kind === "subagent"`) or follow-up messaging (`send_message`, `send_agent_prompt`,
+ * `message_peer`) tool call against the session's unified `ResolvedSubagentItem` list.
+ */
+export function resolveToolCallSubagent(
+  item: Extract<TimelineItemView, { item_type: "tool_call" }>,
+  subagents: readonly ResolvedSubagentItem[],
+  fallbackHostId?: string,
+): ResolvedToolCallSubagent | null {
+  const matchById = (id: string | null | undefined): ResolvedSubagentItem | undefined => {
+    const clean = id?.trim();
+    if (!clean) return undefined;
+    return subagents.find(
+      (sa) =>
+        sa.childAgentId === clean ||
+        sa.providerSubagentId === clean ||
+        sa.callId === clean,
+    );
+  };
+
+  const matchByTitle = (title: string | null | undefined): ResolvedSubagentItem | undefined => {
+    const clean = title?.trim();
+    if (!clean || clean.toLowerCase() === "subagent") return undefined;
+    const lower = clean.toLowerCase();
+    return subagents.find((sa) => sa.title.trim().toLowerCase() === lower);
+  };
+
+  if (item.detail.kind === "subagent") {
+    const isLegacyPlaceholder =
+      !item.detail.child_agent_id &&
+      !item.detail.prompt_preview.trim() &&
+      item.detail.role.trim().toLowerCase() === "subagent";
+    if (isLegacyPlaceholder) return null;
+
+    const matched =
+      matchById(item.call_id) ??
+      matchById(item.detail.child_agent_id) ??
+      matchByTitle(item.detail.role);
+    if (matched) {
+      return { subagent: matched, action: "dispatch" };
+    }
+    const role = item.detail.role.trim() || "Subagent";
+    return {
+      subagent: {
+        key: `tool:${item.call_id}`,
+        callId: item.call_id,
+        title: role,
+        promptPreview: item.detail.prompt_preview || "",
+        status:
+          item.status === "running"
+            ? "running"
+            : item.status === "failed" || item.status === "denied"
+              ? "failed"
+              : "completed",
+        isManaged: false,
+        childHostId: fallbackHostId ?? "",
+        remoteHostName: null,
+        childAgentId: item.detail.child_agent_id,
+        childProvider: null,
+        providerSubagentId: null,
+        sortOrder: item.seq,
+      },
+      action: "dispatch",
+    };
+  }
+
+  if (item.detail.kind === "generic") {
+    const action = classifyGenericSubagentTool(item.detail.tool_name);
+    if (!action) return null;
+    const args = tryParseJsonObject(item.detail.arguments_json);
+    const targetId = readStringField(args, [
+      "Recipient",
+      "recipient",
+      "agent_id",
+      "conversation_id",
+      "conversationId",
+      "child_agent_id",
+    ]);
+    const targetRole = readStringField(args, ["Role", "role", "title", "handle"]);
+    const matched =
+      (action === "dispatch" ? matchById(item.call_id) : undefined) ??
+      matchById(targetId) ??
+      matchByTitle(targetRole);
+    if (matched) {
+      return { subagent: matched, action };
+    }
+  }
+
+  return null;
+}
+
+const GENERIC_SUBAGENT_TITLES = new Set([
+  "subagent",
+  "agent",
+  "research",
+  "self",
+  "task",
+  "worker",
+  "assistant",
+  "default",
+  "helper",
+  "peer",
+]);
+
+function escapeRegExp(raw: string): string {
+  return raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isAsciiWordChar(ch: string | undefined): boolean {
+  return Boolean(ch && /[A-Za-z0-9_]/.test(ch));
+}
+
+export type SubagentTextSegment =
+  | { kind: "text"; text: string }
+  | { kind: "subagent"; text: string; subagent: ResolvedSubagentItem };
+
+export interface SubagentNameMatcher {
+  matchExact: (text: string) => ResolvedSubagentItem | null;
+  splitText: (text: string) => SubagentTextSegment[];
+}
+
+/**
+ * Compiles a memoizable longest-first matcher for known session subagent names so assistant
+ * markdown prose can turn exact subagent references into clickable links with minimal overhead.
+ */
+export function buildSubagentNameMatcher(
+  subagents: readonly ResolvedSubagentItem[] | undefined,
+): SubagentNameMatcher | null {
+  if (!subagents || subagents.length === 0) return null;
+
+  const byLower = new Map<string, ResolvedSubagentItem>();
+  for (const sa of subagents) {
+    const trimmed = sa.title.trim();
+    if (trimmed.length < 3) continue;
+    const lower = trimmed.toLowerCase();
+    if (GENERIC_SUBAGENT_TITLES.has(lower)) continue;
+    if (!byLower.has(lower)) {
+      byLower.set(lower, sa);
+    }
+  }
+
+  if (byLower.size === 0) return null;
+
+  const entries = Array.from(byLower.entries()).sort((a, b) => b[0].length - a[0].length);
+  const pattern = entries.map(([lower]) => escapeRegExp(lower)).join("|");
+  const regex = new RegExp(pattern, "gi");
+
+  const matchExact = (raw: string): ResolvedSubagentItem | null => {
+    const trimmed = raw.trim().replace(/^@+/, "").toLowerCase();
+    if (!trimmed) return null;
+    return byLower.get(trimmed) ?? null;
+  };
+
+  const splitText = (text: string): SubagentTextSegment[] => {
+    if (!text) return [{ kind: "text", text }];
+    regex.lastIndex = 0;
+    const out: SubagentTextSegment[] = [];
+    let cursor = 0;
+    let match: RegExpExecArray | null = null;
+
+    while ((match = regex.exec(text)) !== null) {
+      const matchedText = match[0];
+      const start = match.index;
+      const end = start + matchedText.length;
+
+      const firstChar = matchedText[0];
+      const lastChar = matchedText[matchedText.length - 1];
+      const prevChar = start > 0 ? text[start - 1] : undefined;
+      const nextChar = end < text.length ? text[end] : undefined;
+
+      // ASCII word boundary guard (avoid matching inside identifiers or file paths while staying CJK-safe)
+      if (
+        isAsciiWordChar(firstChar) &&
+        (isAsciiWordChar(prevChar) || prevChar === "/" || prevChar === "-" || prevChar === ".")
+      ) {
+        continue;
+      }
+      if (
+        isAsciiWordChar(lastChar) &&
+        (isAsciiWordChar(nextChar) ||
+          nextChar === "/" ||
+          nextChar === "-" ||
+          (nextChar === "." && isAsciiWordChar(text[end + 1])))
+      ) {
+        continue;
+      }
+
+      const sa = byLower.get(matchedText.toLowerCase());
+      if (!sa) continue;
+
+      if (start > cursor) {
+        out.push({ kind: "text", text: text.slice(cursor, start) });
+      }
+      out.push({ kind: "subagent", text: matchedText, subagent: sa });
+      cursor = end;
+    }
+
+    if (out.length === 0) {
+      return [{ kind: "text", text }];
+    }
+    if (cursor < text.length) {
+      out.push({ kind: "text", text: text.slice(cursor) });
+    }
+    return out;
+  };
+
+  return { matchExact, splitText };
 }

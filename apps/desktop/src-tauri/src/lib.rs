@@ -23,11 +23,16 @@ use crate::updater::{
 };
 
 use orbit_client_core::HostRouteMode;
+use orbit_client_core::app_core::LifecycleHooksSnapshotView;
 use orbit_client_core::app_core::{
     AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest, ClientProjectView,
     ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest, FleetOverviewView,
-    GitReviewView, HostCardView, HostDetailView, OrbitAppCore, RewindAgentResultView,
-    SideQuestionStreamEvent, SubscribeOptions, WorkspaceFileView,
+    GitReviewView, GuardianConfigSnapshotView, HostCardView, HostDetailView,
+    ImChannelTestResultView, ImChannelsSnapshotView, ImportManagedSkillRequest,
+    ManagedSkillContentView, OrbitAppCore, PushDevicesSnapshotView, PushTestResultView,
+    RegisterPushDeviceRequest, RewindAgentResultView, SideQuestionStreamEvent, SubscribeOptions,
+    UpdatePushPreferencesRequest, UpsertImChannelRequest, UpsertManagedSkillRequest,
+    WorkspaceFileView,
 };
 use orbit_client_core::catalog::ResolvedModelSelectionView;
 use orbit_client_core::cloud_sync::{
@@ -38,26 +43,47 @@ use orbit_client_core::composer::{
     SlashCommandView,
 };
 use orbit_client_core::contract::{
-    BridgeInfoView, FleetSidebarRequest, GitReposInspectionView, MentionRankRequest,
-    ModelSelectionRequest, RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
+    AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, CreateWorkspaceEntryRequest,
+    DeletePathRuleRequest, DeleteWorkspaceEntryRequest, EventTriggersSnapshotView,
+    ExecuteWorktreeHandoffRequest, FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView,
+    GitReposInspectionView, InstructionFileContentView, InstructionFileSavedView,
+    InstructionFilesSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
+    MatchedPathRulesView, MentionRankRequest, ModelSelectionRequest, PathRulesSnapshotView,
+    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
+    RenderDiagramRequest, RenderDiagramView, SaveInstructionFileRequest,
+    SearchWorkspaceSymbolsRequest, SpawnWorkspacePeerRequest, UpsertArtifactRequest,
+    UpsertEventTriggerRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WorkspaceSymbolsView,
+    WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
     detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
-    open_external_url, open_in_external_editor, pick_local_directory, provision_relay_over_ssh,
-    resolve_user_home, upgrade_remote_daemon_over_ssh,
+    open_external_url, open_in_external_editor, open_local_file_externally as open_local_file_os,
+    pick_local_directory, pick_local_save_file, provision_relay_over_ssh, resolve_user_home,
+    upgrade_remote_daemon_over_ssh,
 };
-use orbit_client_core::render::{RichBlockView, parse_markdown_blocks};
+use orbit_client_core::export::{
+    ExportOptions, ExportedTranscript, ExtractedCodeBlock, write_file_atomically,
+};
+use orbit_client_core::render::{
+    HighlightedLineView, RichBlockView, highlight_code_lines_capped, parse_markdown_blocks,
+};
 use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentProfile, OrchestrationConfig, PromptBadge, ProviderKind,
+    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
+    ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
+    EventTriggerDelivery, ExternalMcpServerRecord, GuardianPolicyConfig, HookExecutionRecord,
+    HookScope, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
-    ScheduleTarget, SessionMode, WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation,
-    WorktreeCreateMode,
+    ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
+    WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
-use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
+use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
 
 struct DesktopAppState {
     core: Arc<OrbitAppCore>,
@@ -101,6 +127,75 @@ fn get_bridge_info(state: State<'_, DesktopAppState>) -> BridgeInfoView {
 #[tauri::command]
 fn get_fleet_overview(state: State<'_, DesktopAppState>) -> FleetOverviewView {
     state.core.fleet_overview()
+}
+
+#[tauri::command]
+async fn search_messages(
+    state: State<'_, DesktopAppState>,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<ConversationSearchHit>, String> {
+    let core = Arc::clone(&state.core);
+    let max_hits = limit.unwrap_or(20);
+    tauri::async_runtime::spawn_blocking(move || core.search_messages(&query, max_hits))
+        .await
+        .map_err(|e| format!("search messages task error: {e}"))
+}
+
+#[tauri::command]
+async fn export_agent_transcript(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    options: Option<ExportOptions>,
+) -> Result<ExportedTranscript, String> {
+    let core = Arc::clone(&state.core);
+    let opts = options.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        core.export_agent_transcript(&host_id, &agent_id, &opts)
+    })
+    .await
+    .map_err(|e| format!("export transcript task error: {e}"))?
+}
+
+#[tauri::command]
+async fn save_exported_transcript(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    options: Option<ExportOptions>,
+    initial_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    let core = Arc::clone(&state.core);
+    let opts = options.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let exported = core.export_agent_transcript(&host_id, &agent_id, &opts)?;
+        let Some(chosen) = pick_local_save_file(
+            &exported.suggested_filename,
+            opts.format.extension(),
+            initial_dir.as_deref(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let target_path = PathBuf::from(&chosen);
+        write_file_atomically(&target_path, exported.content.as_bytes())?;
+        Ok(Some(chosen))
+    })
+    .await
+    .map_err(|e| format!("save exported transcript task error: {e}"))?
+}
+
+#[tauri::command]
+async fn list_agent_code_blocks(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> Result<Vec<ExtractedCodeBlock>, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.list_agent_code_blocks(&host_id, &agent_id))
+        .await
+        .map_err(|e| format!("list code blocks task error: {e}"))?
 }
 
 #[tauri::command]
@@ -503,8 +598,10 @@ fn create_agent(
     cwd: String,
     extra_dirs: Option<Vec<String>>,
     provider: ProviderKind,
+    acp_agent_id: Option<String>,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
+    fast_mode: Option<bool>,
     mode: SessionMode,
     initial_prompt: String,
     initial_display_prompt: Option<String>,
@@ -521,8 +618,10 @@ fn create_agent(
             cwd: &cwd,
             extra_dirs: extra_dirs.unwrap_or_default(),
             provider,
+            acp_agent_id,
             model,
             effort,
+            fast_mode,
             mode,
             initial_prompt: &initial_prompt,
             initial_display_prompt,
@@ -663,10 +762,16 @@ fn switch_agent_provider(
     provider: ProviderKind,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
+    acp_agent_id: Option<String>,
 ) {
-    state
-        .core
-        .switch_agent_provider_with_config(&host_id, &agent_id, provider, model, effort);
+    state.core.switch_agent_provider_with_config(
+        &host_id,
+        &agent_id,
+        provider,
+        model,
+        effort,
+        acp_agent_id,
+    );
 }
 
 #[tauri::command]
@@ -703,12 +808,13 @@ fn update_agent(
     title: Option<String>,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
+    fast_mode: Option<bool>,
     mode: Option<SessionMode>,
     labels: Option<HashMap<String, String>>,
     handle: Option<String>,
 ) {
-    state.core.update_agent_with_handle(
-        &host_id, &agent_id, title, model, effort, mode, labels, handle,
+    state.core.update_agent_full(
+        &host_id, &agent_id, title, model, effort, fast_mode, mode, labels, handle,
     );
 }
 
@@ -997,6 +1103,174 @@ fn delete_profile(state: State<'_, DesktopAppState>, host_id: String, profile_id
 }
 
 #[tauri::command]
+async fn list_artifacts(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: Option<String>,
+    agent_id: Option<String>,
+) -> Result<Vec<ArtifactSummary>, String> {
+    state
+        .core
+        .list_artifacts_async(&host_id, workspace_id, agent_id)
+        .await
+}
+
+#[tauri::command]
+async fn get_artifact(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    artifact_id: String,
+    version: Option<u32>,
+) -> Result<ArtifactDetail, String> {
+    state
+        .core
+        .get_artifact_async(&host_id, &artifact_id, version)
+        .await
+}
+
+#[tauri::command]
+async fn upsert_artifact(
+    state: State<'_, DesktopAppState>,
+    request: UpsertArtifactRequest,
+) -> Result<ArtifactSummary, String> {
+    state.core.upsert_artifact_async(request).await
+}
+
+#[tauri::command]
+async fn delete_artifact(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    artifact_id: String,
+) -> Result<String, String> {
+    state
+        .core
+        .delete_artifact_async(&host_id, &artifact_id)
+        .await
+}
+
+#[tauri::command]
+fn list_acp_agents(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Vec<AcpAgentAvailability> {
+    state.core.list_acp_agents(&host_id)
+}
+
+#[tauri::command]
+fn refresh_acp_agents(state: State<'_, DesktopAppState>, host_id: String) {
+    state.core.refresh_acp_agents(&host_id);
+}
+
+#[tauri::command]
+async fn upsert_custom_acp_agent(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    spec: AcpAgentSpec,
+) -> Result<Vec<AcpAgentAvailability>, String> {
+    state
+        .core
+        .upsert_custom_acp_agent_async(&host_id, spec)
+        .await
+}
+
+#[tauri::command]
+async fn delete_custom_acp_agent(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> Result<Vec<AcpAgentAvailability>, String> {
+    state
+        .core
+        .delete_custom_acp_agent_async(&host_id, &agent_id)
+        .await
+}
+
+#[tauri::command]
+async fn test_acp_agent(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    cwd: Option<String>,
+) -> Result<AcpProbeResult, String> {
+    state
+        .core
+        .test_acp_agent_async(&host_id, &agent_id, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn refresh_acp_registry(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    registry_url: Option<String>,
+) -> Result<AcpRegistryRefreshView, String> {
+    state
+        .core
+        .refresh_acp_registry_async(&host_id, registry_url)
+        .await
+}
+
+#[tauri::command]
+async fn list_external_mcp_servers(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+) -> Result<Vec<ExternalMcpServerRecord>, String> {
+    state
+        .core
+        .list_external_mcp_servers_async(&host_id, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn upsert_external_mcp_server(
+    state: State<'_, DesktopAppState>,
+    request: UpsertExternalMcpServerRequest,
+) -> Result<Vec<ExternalMcpServerRecord>, String> {
+    state.core.upsert_external_mcp_server_async(request).await
+}
+
+#[tauri::command]
+async fn toggle_external_mcp_server(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    server_id: String,
+    enabled: bool,
+    cwd: Option<String>,
+) -> Result<Vec<ExternalMcpServerRecord>, String> {
+    state
+        .core
+        .toggle_external_mcp_server_async(&host_id, &server_id, enabled, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn delete_external_mcp_server(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    server_id: String,
+    cwd: Option<String>,
+) -> Result<Vec<ExternalMcpServerRecord>, String> {
+    state
+        .core
+        .delete_external_mcp_server_async(&host_id, &server_id, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn probe_external_mcp_server(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    server_id: String,
+    cwd: Option<String>,
+) -> Result<McpProbeResult, String> {
+    state
+        .core
+        .probe_external_mcp_server_async(&host_id, &server_id, cwd)
+        .await
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn create_schedule(
     state: State<'_, DesktopAppState>,
@@ -1133,6 +1407,106 @@ fn sync_orchestration_skills(
 }
 
 #[tauri::command]
+async fn list_managed_skills(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state.core.list_managed_skills_async(&host_id, cwd).await
+}
+
+#[tauri::command]
+async fn read_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    skill_id: String,
+    cwd: Option<String>,
+) -> Result<ManagedSkillContentView, String> {
+    state
+        .core
+        .read_managed_skill_async(&host_id, &skill_id, cwd)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn upsert_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    scope: SkillWriteScope,
+    cwd: Option<String>,
+    slug: String,
+    name: String,
+    description: String,
+    content: String,
+    enabled: bool,
+    expected_etag: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state
+        .core
+        .upsert_managed_skill_async(UpsertManagedSkillRequest {
+            host_id,
+            scope,
+            cwd,
+            slug,
+            name,
+            description,
+            content,
+            enabled,
+            expected_etag,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn toggle_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    skill_id: String,
+    enabled: bool,
+    cwd: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state
+        .core
+        .toggle_managed_skill_async(&host_id, &skill_id, enabled, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn delete_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    skill_id: String,
+    cwd: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state
+        .core
+        .delete_managed_skill_async(&host_id, &skill_id, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn import_managed_skill(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    scope: SkillWriteScope,
+    cwd: Option<String>,
+    source_markdown_or_path: String,
+    slug_override: Option<String>,
+) -> Result<Vec<ManagedSkillRecord>, String> {
+    state
+        .core
+        .import_managed_skill_async(ImportManagedSkillRequest {
+            host_id,
+            scope,
+            cwd,
+            source_markdown_or_path,
+            slug_override,
+        })
+        .await
+}
+
+#[tauri::command]
 fn list_provider_subagents(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -1200,6 +1574,30 @@ async fn rewind_agent(
         .core
         .rewind_agent_on_host(&host_id, &agent_id, to_before_seq, restore_files)
         .await
+}
+
+#[tauri::command]
+async fn fork_agent(
+    state: State<'_, DesktopAppState>,
+    req: ForkAgentRequest,
+) -> Result<ForkAgentResultView, String> {
+    state.core.fork_agent_on_host(req).await
+}
+
+#[tauri::command]
+async fn preview_worktree_handoff(
+    state: State<'_, DesktopAppState>,
+    req: PreviewWorktreeHandoffRequest,
+) -> Result<WorktreeHandoffPreview, String> {
+    state.core.preview_worktree_handoff_on_host(req).await
+}
+
+#[tauri::command]
+async fn execute_worktree_handoff(
+    state: State<'_, DesktopAppState>,
+    req: ExecuteWorktreeHandoffRequest,
+) -> Result<WorktreeHandoffOutcome, String> {
+    state.core.execute_worktree_handoff_on_host(req).await
 }
 
 #[tauri::command]
@@ -1376,6 +1774,917 @@ async fn read_workspace_file(
 }
 
 #[tauri::command]
+async fn search_workspace_symbols(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    query: String,
+    limit: Option<u32>,
+) -> Result<WorkspaceSymbolsView, String> {
+    state
+        .core
+        .search_workspace_symbols_on_host(SearchWorkspaceSymbolsRequest {
+            host_id,
+            cwd,
+            query,
+            limit: limit.unwrap_or(30),
+        })
+        .await
+}
+
+#[tauri::command]
+async fn write_workspace_file(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    content: String,
+    expected_etag: Option<String>,
+    force: Option<bool>,
+) -> Result<WorkspaceFileWriteResultView, String> {
+    state
+        .core
+        .write_workspace_file_on_host(WriteWorkspaceFileRequest {
+            host_id,
+            cwd,
+            path,
+            content,
+            expected_etag,
+            force: force.unwrap_or(false),
+        })
+        .await
+}
+
+#[tauri::command]
+async fn create_workspace_entry(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    is_dir: bool,
+    initial_content: Option<String>,
+) -> Result<WorkspaceEntryMutationResultView, String> {
+    state
+        .core
+        .create_workspace_entry_on_host(CreateWorkspaceEntryRequest {
+            host_id,
+            cwd,
+            path,
+            is_dir,
+            initial_content,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn rename_workspace_entry(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    old_path: String,
+    new_path: String,
+) -> Result<WorkspaceEntryMutationResultView, String> {
+    state
+        .core
+        .rename_workspace_entry_on_host(RenameWorkspaceEntryRequest {
+            host_id,
+            cwd,
+            old_path,
+            new_path,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn delete_workspace_entry(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+) -> Result<WorkspaceEntryMutationResultView, String> {
+    state
+        .core
+        .delete_workspace_entry_on_host(DeleteWorkspaceEntryRequest { host_id, cwd, path })
+        .await
+}
+
+#[tauri::command]
+async fn list_instruction_files(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<InstructionFilesSnapshotView, String> {
+    state
+        .core
+        .list_instruction_files_on_host(ListInstructionFilesRequest { host_id, cwd })
+        .await
+}
+
+#[tauri::command]
+async fn read_instruction_file(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+) -> Result<InstructionFileContentView, String> {
+    state
+        .core
+        .read_instruction_file_on_host(ReadInstructionFileRequest { host_id, cwd, path })
+        .await
+}
+
+#[tauri::command]
+async fn save_instruction_file(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    content: String,
+    expected_etag: Option<String>,
+) -> Result<InstructionFileSavedView, String> {
+    state
+        .core
+        .save_instruction_file_on_host(SaveInstructionFileRequest {
+            host_id,
+            cwd,
+            path,
+            content,
+            expected_etag,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn list_path_rules(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<PathRulesSnapshotView, String> {
+    state.core.list_path_rules_on_host(host_id, cwd).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn upsert_path_rule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    scope: orbit_protocol::RuleScope,
+    name: String,
+    description: String,
+    trigger_mode: orbit_protocol::RuleTriggerMode,
+    globs: Vec<String>,
+    enabled: bool,
+    body: String,
+    expected_etag: Option<String>,
+) -> Result<PathRulesSnapshotView, String> {
+    state
+        .core
+        .upsert_path_rule_on_host(UpsertPathRuleRequest {
+            host_id,
+            cwd,
+            scope,
+            name,
+            description,
+            trigger_mode,
+            globs,
+            enabled,
+            body,
+            expected_etag,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn delete_path_rule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+) -> Result<PathRulesSnapshotView, String> {
+    state
+        .core
+        .delete_path_rule_on_host(DeletePathRuleRequest { host_id, cwd, path })
+        .await
+}
+
+#[tauri::command]
+async fn match_path_rules(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    active_paths: Vec<String>,
+    manual_rule_names: Vec<String>,
+) -> Result<MatchedPathRulesView, String> {
+    state
+        .core
+        .match_path_rules_on_host(MatchPathRulesRequest {
+            host_id,
+            cwd,
+            active_paths,
+            manual_rule_names,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn create_conditional_timer(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    duration_seconds: u64,
+    prompt: String,
+    condition: TimerCondition,
+) -> Result<ConditionalTimerRecord, String> {
+    state
+        .core
+        .create_conditional_timer_on_host(&host_id, &agent_id, duration_seconds, prompt, condition)
+        .await
+}
+
+#[tauri::command]
+async fn list_conditional_timers(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: Option<String>,
+    include_resolved: Option<bool>,
+) -> Result<Vec<ConditionalTimerRecord>, String> {
+    state
+        .core
+        .list_conditional_timers_on_host(&host_id, agent_id, include_resolved.unwrap_or(true))
+        .await
+}
+
+#[tauri::command]
+async fn cancel_conditional_timer(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    timer_id: String,
+) -> Result<ConditionalTimerRecord, String> {
+    state
+        .core
+        .cancel_conditional_timer_on_host(&host_id, &timer_id)
+        .await
+}
+
+#[tauri::command]
+async fn fire_conditional_timer_now(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    timer_id: String,
+) -> Result<ConditionalTimerRecord, String> {
+    state
+        .core
+        .fire_conditional_timer_now_on_host(&host_id, &timer_id)
+        .await
+}
+
+#[tauri::command]
+async fn list_lsp_servers(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<Vec<LspServerStatus>, String> {
+    state.core.list_lsp_servers_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn lsp_query_symbols(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    query: String,
+    path: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<LspSymbolInfo>, String> {
+    state
+        .core
+        .lsp_query_symbols_on_host(&host_id, &cwd, &query, path, limit.unwrap_or(50))
+        .await
+}
+
+#[tauri::command]
+async fn lsp_get_diagnostics(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: Option<String>,
+) -> Result<Vec<LspDiagnostic>, String> {
+    state
+        .core
+        .lsp_get_diagnostics_on_host(&host_id, &cwd, path)
+        .await
+}
+
+#[tauri::command]
+async fn lsp_goto_definition(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+) -> Result<Vec<LspLocation>, String> {
+    state
+        .core
+        .lsp_goto_definition_on_host(&host_id, &cwd, &path, line, col)
+        .await
+}
+
+#[tauri::command]
+async fn restart_lsp_server(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    server_id: String,
+) -> Result<Vec<LspServerStatus>, String> {
+    state
+        .core
+        .restart_lsp_server_on_host(&host_id, &cwd, &server_id)
+        .await
+}
+
+#[tauri::command]
+async fn get_usage_insights(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    days: Option<u32>,
+) -> Result<UsageInsightsSnapshot, String> {
+    state
+        .core
+        .get_usage_insights_on_host(&host_id, days.unwrap_or(7))
+        .await
+}
+
+#[tauri::command]
+async fn get_context_occupancy(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> Result<ContextOccupancyBreakdown, String> {
+    state
+        .core
+        .get_context_occupancy_on_host(&host_id, &agent_id)
+        .await
+}
+
+#[tauri::command]
+async fn list_lifecycle_hooks(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+) -> Result<LifecycleHooksSnapshotView, String> {
+    state.core.list_lifecycle_hooks_on_host(&host_id, cwd).await
+}
+
+#[tauri::command]
+async fn upsert_lifecycle_hook(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+    hook: LifecycleHookRule,
+) -> Result<LifecycleHooksSnapshotView, String> {
+    state
+        .core
+        .upsert_lifecycle_hook_on_host(&host_id, cwd, hook)
+        .await
+}
+
+#[tauri::command]
+async fn delete_lifecycle_hook(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+    hook_id: String,
+    scope: HookScope,
+) -> Result<LifecycleHooksSnapshotView, String> {
+    state
+        .core
+        .delete_lifecycle_hook_on_host(&host_id, cwd, hook_id, scope)
+        .await
+}
+
+#[tauri::command]
+async fn set_project_hooks_trust(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    trusted: bool,
+) -> Result<LifecycleHooksSnapshotView, String> {
+    state
+        .core
+        .set_project_hooks_trust_on_host(&host_id, cwd, trusted)
+        .await
+}
+
+#[tauri::command]
+async fn test_lifecycle_hook(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: Option<String>,
+    hook_id: String,
+    sample_payload: serde_json::Value,
+) -> Result<HookExecutionRecord, String> {
+    state
+        .core
+        .test_lifecycle_hook_on_host(&host_id, cwd, hook_id, sample_payload)
+        .await
+}
+
+#[tauri::command]
+async fn list_event_triggers(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<EventTriggersSnapshotView, String> {
+    state.core.list_event_triggers_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn upsert_event_trigger(
+    state: State<'_, DesktopAppState>,
+    req: UpsertEventTriggerRequest,
+) -> Result<EventTriggersSnapshotView, String> {
+    state.core.upsert_event_trigger_on_host(req).await
+}
+
+#[tauri::command]
+async fn delete_event_trigger(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    trigger_id: String,
+) -> Result<EventTriggersSnapshotView, String> {
+    state
+        .core
+        .delete_event_trigger_on_host(&host_id, trigger_id)
+        .await
+}
+
+#[tauri::command]
+async fn test_event_trigger(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    trigger_id: String,
+    sample_event_type: String,
+    sample_payload: serde_json::Value,
+) -> Result<EventTriggerDelivery, String> {
+    state
+        .core
+        .test_event_trigger_on_host(&host_id, trigger_id, sample_event_type, sample_payload)
+        .await
+}
+
+#[tauri::command]
+async fn get_guardian_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<GuardianConfigSnapshotView, String> {
+    state.core.get_guardian_config_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn update_guardian_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    config: GuardianPolicyConfig,
+) -> Result<GuardianConfigSnapshotView, String> {
+    state
+        .core
+        .update_guardian_config_on_host(&host_id, config)
+        .await
+}
+
+#[tauri::command]
+async fn list_im_channels(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<ImChannelsSnapshotView, String> {
+    state.core.list_im_channels_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn upsert_im_channel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    request: UpsertImChannelRequest,
+) -> Result<ImChannelsSnapshotView, String> {
+    state
+        .core
+        .upsert_im_channel_on_host(&host_id, request)
+        .await
+}
+
+#[tauri::command]
+async fn delete_im_channel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    channel_id: String,
+) -> Result<ImChannelsSnapshotView, String> {
+    state
+        .core
+        .delete_im_channel_on_host(&host_id, channel_id)
+        .await
+}
+
+#[tauri::command]
+async fn test_im_channel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    channel_id: String,
+    target_chat_id: String,
+    message: String,
+) -> Result<ImChannelTestResultView, String> {
+    state
+        .core
+        .test_im_channel_on_host(&host_id, channel_id, target_chat_id, message)
+        .await
+}
+
+#[tauri::command]
+fn focus_main_window(app: AppHandle) -> Result<(), String> {
+    let win = app
+        .get_webview_window("main")
+        .or_else(|| app.webview_windows().into_values().next())
+        .ok_or_else(|| "main window not found".to_string())?;
+    let _ = win.unminimize();
+    let _ = win.show();
+    win.set_focus()
+        .map_err(|e| format!("failed to focus window: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_push_devices(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<PushDevicesSnapshotView, String> {
+    state.core.list_push_devices_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn register_push_device(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    request: RegisterPushDeviceRequest,
+) -> Result<PushDevicesSnapshotView, String> {
+    state
+        .core
+        .register_push_device_on_host(&host_id, request)
+        .await
+}
+
+#[tauri::command]
+async fn unregister_push_device(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    device_id: String,
+) -> Result<PushDevicesSnapshotView, String> {
+    state
+        .core
+        .unregister_push_device_on_host(&host_id, device_id)
+        .await
+}
+
+#[tauri::command]
+async fn update_push_preferences(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    request: UpdatePushPreferencesRequest,
+) -> Result<PushDevicesSnapshotView, String> {
+    state
+        .core
+        .update_push_preferences_on_host(&host_id, request)
+        .await
+}
+
+#[tauri::command]
+async fn test_push_notification(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    device_id: Option<String>,
+) -> Result<PushTestResultView, String> {
+    state
+        .core
+        .test_push_notification_on_host(&host_id, device_id)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_goal_run(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    objective: String,
+    criteria: Option<Vec<String>>,
+    verify_command: Option<String>,
+    max_iterations: Option<u32>,
+    max_duration_secs: Option<u64>,
+) -> Result<orbit_protocol::GoalRunRecord, String> {
+    state
+        .core
+        .start_goal_run_on_host(orbit_client_core::contract::StartGoalRunRequest {
+            host_id,
+            agent_id,
+            objective,
+            criteria: criteria.unwrap_or_default(),
+            verify_command,
+            max_iterations,
+            max_duration_secs,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn list_goal_runs(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: Option<String>,
+) -> Result<Vec<orbit_protocol::GoalRunRecord>, String> {
+    state.core.list_goal_runs_on_host(&host_id, agent_id).await
+}
+
+#[tauri::command]
+async fn control_goal_run(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    goal_id: String,
+    action: orbit_protocol::GoalControlAction,
+) -> Result<orbit_protocol::GoalRunRecord, String> {
+    state
+        .core
+        .control_goal_run_on_host(orbit_client_core::contract::ControlGoalRunRequest {
+            host_id,
+            goal_id,
+            action,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn start_monitor_watch(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    name: String,
+    kind: orbit_protocol::MonitorKind,
+    expires_in_secs: Option<u64>,
+) -> Result<orbit_protocol::MonitorWatchRecord, String> {
+    state
+        .core
+        .start_monitor_watch_on_host(orbit_client_core::contract::StartMonitorWatchRequest {
+            host_id,
+            agent_id,
+            name,
+            kind,
+            expires_in_secs,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn list_monitor_watches(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: Option<String>,
+) -> Result<Vec<orbit_protocol::MonitorWatchRecord>, String> {
+    state
+        .core
+        .list_monitor_watches_on_host(&host_id, agent_id)
+        .await
+}
+
+#[tauri::command]
+async fn stop_monitor_watch(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    monitor_id: String,
+) -> Result<orbit_protocol::MonitorWatchRecord, String> {
+    state
+        .core
+        .stop_monitor_watch_on_host(orbit_client_core::contract::StopMonitorWatchRequest {
+            host_id,
+            monitor_id,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn list_browser_sessions(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<orbit_client_core::contract::BrowserSessionsSnapshotView, String> {
+    state.core.list_browser_sessions_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn create_browser_session(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: Option<String>,
+    initial_url: Option<String>,
+    headless: Option<bool>,
+    viewport_width: Option<u32>,
+    viewport_height: Option<u32>,
+) -> Result<orbit_protocol::BrowserSessionSummary, String> {
+    state
+        .core
+        .create_browser_session_on_host(orbit_client_core::contract::CreateBrowserSessionRequest {
+            host_id,
+            agent_id,
+            initial_url,
+            headless,
+            viewport_width,
+            viewport_height,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn execute_browser_action(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    session_id: String,
+    action: orbit_protocol::BrowserActionRequest,
+) -> Result<orbit_client_core::contract::BrowserActionResponseView, String> {
+    state
+        .core
+        .execute_browser_action_on_host(orbit_client_core::contract::ExecuteBrowserActionRequest {
+            host_id,
+            session_id,
+            action,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn close_browser_session(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    session_id: String,
+) -> Result<orbit_client_core::contract::BrowserSessionsSnapshotView, String> {
+    state
+        .core
+        .close_browser_session_on_host(&host_id, &session_id)
+        .await
+}
+
+#[tauri::command]
+async fn update_browser_policy(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    policy: orbit_protocol::BrowserPolicyConfig,
+) -> Result<orbit_client_core::contract::BrowserSessionsSnapshotView, String> {
+    state
+        .core
+        .update_browser_policy_on_host(&host_id, policy)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_batch_fanout(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    name: String,
+    cwd: String,
+    csv_content: String,
+    prompt_template: String,
+    provider: orbit_protocol::ProviderKind,
+    model: Option<String>,
+    mode: orbit_protocol::SessionMode,
+    max_concurrency: Option<u32>,
+    isolated_worktree: Option<bool>,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .start_batch_fanout_on_host(orbit_client_core::contract::StartBatchFanoutRequest {
+            host_id,
+            name,
+            cwd,
+            csv_content,
+            prompt_template,
+            provider,
+            model,
+            mode,
+            max_concurrency,
+            isolated_worktree: isolated_worktree.unwrap_or(false),
+        })
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_dag_workflow(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    name: String,
+    cwd: String,
+    steps: Vec<orbit_protocol::DagStepSpec>,
+    default_provider: orbit_protocol::ProviderKind,
+    default_mode: orbit_protocol::SessionMode,
+    max_concurrency: Option<u32>,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .start_dag_workflow_on_host(orbit_client_core::contract::StartDagWorkflowRequest {
+            host_id,
+            name,
+            cwd,
+            steps,
+            default_provider,
+            default_mode,
+            max_concurrency,
+        })
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_best_of_n(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    name: String,
+    cwd: String,
+    prompt: String,
+    candidates: Vec<orbit_protocol::BestOfNCandidateSpec>,
+    mode: orbit_protocol::SessionMode,
+    verify_command: Option<String>,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .start_best_of_n_on_host(orbit_client_core::contract::StartBestOfNRequest {
+            host_id,
+            name,
+            cwd,
+            prompt,
+            candidates,
+            mode,
+            verify_command,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn list_workflow_runs(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    include_completed: Option<bool>,
+) -> Result<Vec<orbit_protocol::WorkflowRunRecord>, String> {
+    state
+        .core
+        .list_workflow_runs_on_host(&host_id, include_completed.unwrap_or(true))
+        .await
+}
+
+#[tauri::command]
+async fn cancel_workflow_run(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    run_id: String,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .cancel_workflow_run_on_host(orbit_client_core::contract::CancelWorkflowRunRequest {
+            host_id,
+            run_id,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn select_best_of_n_winner(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    run_id: String,
+    winner_step_id: String,
+    apply_to_workspace: Option<bool>,
+) -> Result<orbit_protocol::WorkflowRunRecord, String> {
+    state
+        .core
+        .select_best_of_n_winner_on_host(orbit_client_core::contract::SelectBestOfNWinnerRequest {
+            host_id,
+            run_id,
+            winner_step_id,
+            apply_to_workspace: apply_to_workspace.unwrap_or(true),
+        })
+        .await
+}
+
+#[tauri::command]
+async fn highlight_workspace_code(
+    language: String,
+    content: String,
+    max_lines: Option<usize>,
+) -> Result<Vec<HighlightedLineView>, String> {
+    let cap = max_lines.unwrap_or(2500).clamp(1, 5000);
+    tauri::async_runtime::spawn_blocking(move || {
+        highlight_code_lines_capped(&language, &content, cap)
+    })
+    .await
+    .map_err(|e| format!("code highlight task error: {e}"))
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn ask_side_question(
     state: State<'_, DesktopAppState>,
@@ -1540,6 +2849,23 @@ fn open_external_browser_url(url: String) -> Result<(), String> {
         return Err("Only http:// and https:// URLs can be opened externally".into());
     }
     open_external_url(parsed.as_str())
+}
+
+#[tauri::command]
+fn open_local_file_externally(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+) -> Result<(), String> {
+    if !state.core.is_local_host(&host_id) {
+        return Err("Only files on the local host can be opened externally".into());
+    }
+    let authorized_cwd = state
+        .core
+        .is_registered_local_cwd(&host_id, &cwd)
+        .then_some(cwd.as_str());
+    open_local_file_os(authorized_cwd, &path)
 }
 
 fn decode_percent_utf8(raw: &str) -> String {
@@ -2048,6 +3374,7 @@ pub fn run() {
             subscribe_core_events,
             get_bridge_info,
             get_fleet_overview,
+            search_messages,
             get_fleet_sidebar,
             get_host_detail,
             get_agent_stage,
@@ -2130,6 +3457,21 @@ pub fn run() {
             stop_workspace_script,
             upsert_profile,
             delete_profile,
+            list_artifacts,
+            get_artifact,
+            upsert_artifact,
+            delete_artifact,
+            list_acp_agents,
+            refresh_acp_agents,
+            upsert_custom_acp_agent,
+            delete_custom_acp_agent,
+            test_acp_agent,
+            refresh_acp_registry,
+            list_external_mcp_servers,
+            upsert_external_mcp_server,
+            toggle_external_mcp_server,
+            delete_external_mcp_server,
+            probe_external_mcp_server,
             create_schedule,
             update_schedule,
             pause_schedule,
@@ -2144,12 +3486,21 @@ pub fn run() {
             sync_fleet_connected_hosts,
             update_orchestration_config,
             sync_orchestration_skills,
+            list_managed_skills,
+            read_managed_skill,
+            upsert_managed_skill,
+            toggle_managed_skill,
+            delete_managed_skill,
+            import_managed_skill,
             list_provider_subagents,
             open_provider_subagent_timeline,
             get_provider_subagent_timeline,
             get_provider_subagent_turns,
             refresh_pending_permissions,
             rewind_agent,
+            fork_agent,
+            preview_worktree_handoff,
+            execute_worktree_handoff,
             resolve_permission,
             answer_question,
             fetch_git_status,
@@ -2165,13 +3516,79 @@ pub fn run() {
             list_external_editors,
             open_in_editor,
             pick_project_folder,
+            export_agent_transcript,
+            save_exported_transcript,
+            list_agent_code_blocks,
             get_workspace_files,
+            search_workspace_symbols,
             read_workspace_file,
+            write_workspace_file,
+            create_workspace_entry,
+            rename_workspace_entry,
+            delete_workspace_entry,
+            list_instruction_files,
+            read_instruction_file,
+            save_instruction_file,
+            list_path_rules,
+            upsert_path_rule,
+            delete_path_rule,
+            match_path_rules,
+            list_lsp_servers,
+            lsp_query_symbols,
+            lsp_get_diagnostics,
+            lsp_goto_definition,
+            restart_lsp_server,
+            get_usage_insights,
+            get_context_occupancy,
+            list_lifecycle_hooks,
+            upsert_lifecycle_hook,
+            delete_lifecycle_hook,
+            set_project_hooks_trust,
+            test_lifecycle_hook,
+            create_conditional_timer,
+            list_conditional_timers,
+            cancel_conditional_timer,
+            fire_conditional_timer_now,
+            get_guardian_config,
+            update_guardian_config,
+            list_im_channels,
+            upsert_im_channel,
+            delete_im_channel,
+            test_im_channel,
+            focus_main_window,
+            list_push_devices,
+            register_push_device,
+            unregister_push_device,
+            update_push_preferences,
+            test_push_notification,
+            start_goal_run,
+            list_goal_runs,
+            control_goal_run,
+            start_monitor_watch,
+            list_monitor_watches,
+            stop_monitor_watch,
+            list_event_triggers,
+            upsert_event_trigger,
+            delete_event_trigger,
+            test_event_trigger,
+            list_browser_sessions,
+            create_browser_session,
+            execute_browser_action,
+            close_browser_session,
+            update_browser_policy,
+            start_batch_fanout,
+            start_dag_workflow,
+            start_best_of_n,
+            list_workflow_runs,
+            cancel_workflow_run,
+            select_best_of_n_winner,
+            highlight_workspace_code,
             ask_side_question,
             render_diagram,
             parse_markdown_preview,
             open_browser_popout_window,
             open_external_browser_url,
+            open_local_file_externally,
             stage_host_attachment,
             stage_host_attachment_bytes,
             read_clipboard_images,

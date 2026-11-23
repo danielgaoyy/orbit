@@ -1,6 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
+  Activity,
   ArrowUpRight,
+  CheckCircle2,
   ChevronRight,
   Clock,
   FileText,
@@ -15,15 +17,27 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  Square,
+  Target,
+  Timer,
   Trash2,
+  X,
   Zap,
   type LucideIcon,
 } from "lucide-react";
 import {
+  PROVIDER_LIST,
+  formatProviderLabel,
+  formatTimerConditionLabel,
+  formatTimerCountdown,
+  type ConditionalTimerRecord,
+  type GoalRunRecord,
+  type MonitorWatchRecord,
   type ProviderKind,
   type ScheduleRunRecord,
   type ScheduleSpec,
   type SessionMode,
+  type TimerCondition,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isBareHomeDir, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
@@ -43,7 +57,9 @@ import {
   ToggleSwitch,
   type SettingSelectOption,
 } from "@/components/settings/settings-primitives";
+import { WorkflowsPanel } from "@/components/automations/workflows-panel";
 import { type SlashDirective, orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { EventTriggersSection } from "@/components/automations/event-triggers-section";
 import { cn } from "@/lib/utils";
 
 interface AutomationTemplate {
@@ -158,15 +174,15 @@ function deriveAutomationName(rawPrompt: string): string {
   return `${cut.trimEnd()}…`;
 }
 
-const PROVIDER_OPTIONS: SettingSelectOption<ProviderKind>[] = [
-  { value: "claude_code", label: "Claude Code" },
-  { value: "codex", label: "Codex" },
-  { value: "antigravity", label: "Antigravity" },
-];
+const PROVIDER_OPTIONS: SettingSelectOption<ProviderKind>[] = PROVIDER_LIST.map((p) => ({
+  value: p.id,
+  label: p.label,
+}));
 
-type SimpleSessionMode = "accept_edits" | "full_access" | "plan" | "default";
+type SimpleSessionMode = "auto" | "accept_edits" | "full_access" | "plan" | "default";
 
 const PERMISSION_OPTIONS: SettingSelectOption<SimpleSessionMode>[] = [
+  { value: "auto", label: "Auto", description: "Guardian risk filter" },
   { value: "accept_edits", label: "Accept Edits", description: "Auto-approve file edits" },
   { value: "full_access", label: "Full Access", description: "Unattended edits & commands" },
   { value: "plan", label: "Plan (Read-only)", description: "Inspect without modifying files" },
@@ -182,20 +198,11 @@ function shortWorkspaceName(cwd: string): string {
   return idx >= 0 ? clean.slice(idx + 1) || "/" : clean;
 }
 
-function formatProviderLabel(provider: ProviderKind): string {
-  switch (provider) {
-    case "claude_code":
-      return "Claude Code";
-    case "codex":
-      return "Codex";
-    case "antigravity":
-      return "Antigravity";
-  }
-}
-
 function formatModeLabel(mode: SessionMode): string {
   if (typeof mode !== "string") return mode.custom;
   switch (mode) {
+    case "auto":
+      return "Auto";
     case "accept_edits":
       return "Accept Edits";
     case "full_access":
@@ -315,10 +322,50 @@ interface ProjectChoice {
 export function AutomationsView() {
   const fleet = useOrbitSelector((s) => s.fleet);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const hostDetail = useOrbitSelector((s) =>
     s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
   );
+  const goalRuns: GoalRunRecord[] = useMemo(
+    () => hostDetail?.goal_runs ?? [],
+    [hostDetail?.goal_runs],
+  );
+  const monitorWatches: MonitorWatchRecord[] = useMemo(
+    () => hostDetail?.monitor_watches ?? [],
+    [hostDetail?.monitor_watches],
+  );
+  const workflowRuns = useMemo(
+    () => hostDetail?.workflow_runs ?? [],
+    [hostDetail?.workflow_runs],
+  );
+  const activeWorkflowCount = useMemo(
+    () => workflowRuns.filter((r) => r.status === "pending" || r.status === "running").length,
+    [workflowRuns],
+  );
+  const activeGoalCount = useMemo(
+    () =>
+      goalRuns.filter(
+        (g) => g.status === "running" || g.status === "verifying" || g.status === "paused",
+      ).length,
+    [goalRuns],
+  );
+  const activeMonitorCount = useMemo(
+    () =>
+      monitorWatches.filter((m) => m.status === "active" || m.status === "triggered").length,
+    [monitorWatches],
+  );
+  const eventTriggerCount = useOrbitSelector((s) =>
+    s.selectedHostId ? (s.eventTriggersByHost[s.selectedHostId]?.triggers.length ?? 0) : 0,
+  );
+  const [sectionTab, setSectionTab] = useState<
+    "schedules" | "triggers" | "live_runs" | "workflows"
+  >("schedules");
+  useEffect(() => {
+    if (selectedHostId) {
+      void orbitActions.refreshGoalsAndMonitors(selectedHostId);
+    }
+  }, [selectedHostId]);
   const gitReposCache = useOrbitSelector((s) => s.gitReposCache);
   const sidebarView = useOrbitSelector((s) => s.sidebarView);
   const draftProvider = useOrbitSelector((s) => s.draftProvider);
@@ -348,6 +395,135 @@ export function AutomationsView() {
   const [loadingRunsId, setLoadingRunsId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const runsPollTokenRef = useRef(0);
+
+  // Conditional Timers creation dialog state
+  const [timerDialogOpen, setTimerDialogOpen] = useState(false);
+  const [timerAgentId, setTimerAgentId] = useState("");
+  const [timerDurationSec, setTimerDurationSec] = useState("300");
+  const [timerConditionKind, setTimerConditionKind] = useState<TimerCondition["kind"]>("any_message");
+  const [timerConditionArg, setTimerConditionArg] = useState("");
+  const [timerPrompt, setTimerPrompt] = useState("");
+  const [timerSubmitting, setTimerSubmitting] = useState(false);
+  const [timerBusyId, setTimerBusyId] = useState<string | null>(null);
+  const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
+
+  const conditionalTimers = useMemo(
+    () => hostDetail?.conditional_timers ?? [],
+    [hostDetail?.conditional_timers],
+  );
+  const armedTimerCount = useMemo(
+    () => conditionalTimers.filter((t) => t.state === "armed").length,
+    [conditionalTimers],
+  );
+  const hasArmedTimers = armedTimerCount > 0;
+  const activeAgentChoices = useMemo(
+    () =>
+      (hostDetail?.agents ?? []).filter(
+        (a) => !a.archived_at_rfc3339 && !a.background && !a.parent_agent_id,
+      ),
+    [hostDetail?.agents],
+  );
+
+  useEffect(() => {
+    if (!hasArmedTimers) return;
+    setTimerNowMs(Date.now());
+    const id = window.setInterval(() => setTimerNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [hasArmedTimers]);
+
+  useEffect(() => {
+    setTimerDialogOpen(false);
+    setTimerAgentId("");
+    setTimerPrompt("");
+    setTimerConditionArg("");
+    if (!selectedHostId) return;
+    void orbitActions.refreshConditionalTimers(selectedHostId, null, true).catch(() => {});
+  }, [selectedHostId]);
+
+  const openTimerDialog = useCallback(() => {
+    const defaultAgent =
+      (selectedAgentId && activeAgentChoices.some((a) => a.agent_id === selectedAgentId)
+        ? selectedAgentId
+        : activeAgentChoices[0]?.agent_id) ?? "";
+    setTimerAgentId(defaultAgent);
+    setTimerDurationSec("300");
+    setTimerConditionKind("any_message");
+    setTimerConditionArg("");
+    setTimerPrompt("");
+    setTimerDialogOpen(true);
+  }, [selectedAgentId, activeAgentChoices]);
+
+  const submitConditionalTimer = useCallback(async () => {
+    if (!selectedHostId || timerSubmitting) return;
+    const secs = Math.floor(Number(timerDurationSec));
+    if (!Number.isFinite(secs) || secs < 1 || secs > 86400) {
+      orbitActions.showToast("Duration must be between 1 and 86400 seconds");
+      return;
+    }
+    if (!timerAgentId) {
+      orbitActions.showToast("Select a target agent first");
+      return;
+    }
+    const cleanPrompt = timerPrompt.trim();
+    if (!cleanPrompt) {
+      orbitActions.showToast("Enter a wakeup prompt");
+      return;
+    }
+    let condition: TimerCondition;
+    switch (timerConditionKind) {
+      case "never":
+        condition = { kind: "never" };
+        break;
+      case "any_message":
+        condition = { kind: "any_message" };
+        break;
+      case "all_subagents_settled":
+        condition = { kind: "all_subagents_settled" };
+        break;
+      case "sender": {
+        const sid = timerConditionArg.trim();
+        if (!sid) {
+          orbitActions.showToast("Enter a sender agent ID");
+          return;
+        }
+        condition = { kind: "sender", sender_id: sid };
+        break;
+      }
+      case "file_changed": {
+        const path = timerConditionArg.trim();
+        if (!path) {
+          orbitActions.showToast("Enter a workspace-relative file path");
+          return;
+        }
+        condition = { kind: "file_changed", path };
+        break;
+      }
+    }
+    setTimerSubmitting(true);
+    try {
+      await orbitActions.createConditionalTimer({
+        hostId: selectedHostId,
+        agentId: timerAgentId,
+        durationSeconds: secs,
+        prompt: cleanPrompt,
+        condition,
+      });
+      orbitActions.showToast("One-shot timer armed");
+      setTimerDialogOpen(false);
+    } catch (err) {
+      orbitActions.showToast(`Failed to arm timer: ${String(err)}`);
+    } finally {
+      setTimerSubmitting(false);
+    }
+  }, [
+    selectedHostId,
+    timerSubmitting,
+    timerDurationSec,
+    timerAgentId,
+    timerPrompt,
+    timerConditionKind,
+    timerConditionArg,
+  ]);
   const deleteConfirmTimerRef = useRef<number | null>(null);
 
   const allSchedules = useMemo(
@@ -363,6 +539,19 @@ export function AutomationsView() {
     [allSchedules],
   );
   const profiles = hostDetail?.profiles ?? [];
+  const providerSelectOptions = useMemo<SettingSelectOption<ProviderKind>[]>(() => {
+    const installed = hostDetail?.host.available_providers ?? [];
+    if (installed.length === 0) return PROVIDER_OPTIONS;
+    const installedOpts = PROVIDER_LIST.filter((p) => installed.includes(p.id)).map((p) => ({
+      value: p.id,
+      label: p.label,
+    }));
+    const currentMissing = !installedOpts.some((o) => o.value === provider);
+    if (currentMissing) {
+      installedOpts.push({ value: provider, label: formatProviderLabel(provider) });
+    }
+    return installedOpts;
+  }, [hostDetail?.host.available_providers, provider]);
 
   const activeCount = useMemo(
     () => cronSchedules.filter((s) => s.status === "active").length,
@@ -399,11 +588,26 @@ export function AutomationsView() {
       if (selectedHostId && lp.host_id !== selectedHostId) continue;
       push(lp.path, lp.name, lp.branch ?? null);
     }
-    if (selectedCwd) {
-      push(selectedCwd, shortWorkspaceName(selectedCwd), null);
+    if (selectedCwd && selectedHostId) {
+      const cleanSel = normalizeProjectPath(selectedCwd);
+      const belongsToHost =
+        out.some((p) => p.path === cleanSel) ||
+        (hostDetail?.workspaces ?? []).some((w) => normalizeProjectPath(w.cwd) === cleanSel) ||
+        (hostDetail?.discovered_projects ?? []).some(
+          (d) => normalizeProjectPath(d.path) === cleanSel,
+        );
+      if (belongsToHost) {
+        push(cleanSel, shortWorkspaceName(cleanSel), null);
+      }
     }
     return out;
-  }, [sidebarView, selectedHostId, selectedCwd]);
+  }, [sidebarView, selectedHostId, selectedCwd, hostDetail]);
+
+  const hostScopedSelectedCwd = useMemo(() => {
+    if (!selectedCwd || !selectedHostId) return "";
+    const cleanSel = normalizeProjectPath(selectedCwd);
+    return hostProjects.some((p) => p.path === cleanSel) ? cleanSel : "";
+  }, [selectedCwd, selectedHostId, hostProjects]);
 
   const effectiveProjectPath = useMemo(() => {
     const chosen = normalizeProjectPath(targetProjectPath);
@@ -719,61 +923,129 @@ export function AutomationsView() {
         style={stagePushStyle}
         className="mx-auto w-full max-w-[var(--orbit-stage-max-w,768px)] space-y-6"
       >
-        {/* Compact Single-Row Toolbar (shown once schedules exist) */}
-        {cronSchedules.length > 0 && (
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="bg-muted/70 inline-flex items-center gap-0.5 rounded-[9px] p-0.5">
-              {(
-                [
-                  { id: "all", label: "All", count: cronSchedules.length },
-                  { id: "active", label: "Active", count: activeCount },
-                  { id: "paused", label: "Paused", count: pausedCount },
-                ] as const
-              ).map((tab) => {
-                const selected = filterTab === tab.id;
-                return (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setFilterTab(tab.id)}
-                    className={cn(
-                      "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] px-2.5 text-[12px] font-medium transition-colors",
-                      selected
-                        ? "bg-background text-foreground shadow-2xs"
-                        : "text-muted-foreground hover:text-foreground",
-                    )}
-                  >
-                    <span>{tab.label}</span>
+        {/* Top-level 4-Tab Navigation: Schedules · Triggers · Live Runs · Workflows */}
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="bg-muted/70 inline-flex items-center gap-0.5 rounded-[9px] p-0.5">
+            {(
+              [
+                { id: "schedules", label: "Schedules", count: cronSchedules.length },
+                { id: "triggers", label: "Triggers", count: eventTriggerCount },
+                {
+                  id: "live_runs",
+                  label: "Live Runs",
+                  count: activeGoalCount + activeMonitorCount + armedTimerCount,
+                  pulsing: activeGoalCount + activeMonitorCount + armedTimerCount > 0,
+                },
+                {
+                  id: "workflows",
+                  label: "Workflows",
+                  count: activeWorkflowCount > 0 ? activeWorkflowCount : workflowRuns.length,
+                  pulsing: activeWorkflowCount > 0,
+                },
+              ] as const
+            ).map((tab) => {
+              const selected = sectionTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setSectionTab(tab.id)}
+                  className={cn(
+                    "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[7px] px-2.5 text-[12px] font-medium transition-colors",
+                    selected
+                      ? "bg-background text-foreground shadow-2xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {"pulsing" in tab && tab.pulsing && (
+                    <span className="size-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  )}
+                  <span>{tab.label}</span>
+                  {tab.count > 0 && (
                     <span className="text-muted-foreground/75 tabular-nums text-[11px] font-normal">
                       {tab.count}
                     </span>
-                  </button>
-                );
-              })}
-            </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
 
-            <div className="flex items-center gap-2.5">
-              {showHostContext && (
-                <span className="text-muted-foreground inline-flex items-center gap-1.5 text-[12px]">
-                  <span
-                    className={cn(
-                      "size-1.5 shrink-0 rounded-full",
-                      activeHostOnline ? "bg-emerald-500" : "bg-zinc-400",
-                    )}
-                  />
-                  <span className="max-w-36 truncate">{activeHostLabel}</span>
-                </span>
-              )}
+          <div className="flex items-center gap-2.5">
+            {showHostContext && (
+              <span className="text-muted-foreground inline-flex items-center gap-1.5 text-[12px]">
+                <span
+                  className={cn(
+                    "size-1.5 shrink-0 rounded-full",
+                    activeHostOnline ? "bg-emerald-500" : "bg-zinc-400",
+                  )}
+                />
+                <span className="max-w-36 truncate">{activeHostLabel}</span>
+              </span>
+            )}
+            {sectionTab === "schedules" && cronSchedules.length > 0 && (
               <button
                 type="button"
                 disabled={!selectedHostId}
                 onClick={() => openCreateDialog()}
-                className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[9px] px-3 text-[12.5px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
+                className="bg-foreground text-background hover:opacity-90 inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-[8px] px-2.5 text-[12px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <Plus className="size-3.5 stroke-[2]" />
                 <span>New</span>
               </button>
-            </div>
+            )}
+          </div>
+        </div>
+
+        {sectionTab === "workflows" ? (
+          <WorkflowsPanel
+            hostId={selectedHostId}
+            defaultProvider={draftProvider}
+            defaultCwd={hostScopedSelectedCwd || hostProjects[0]?.path || ""}
+            projectChoices={hostProjects}
+            runs={workflowRuns}
+          />
+        ) : sectionTab === "triggers" ? (
+          <EventTriggersSection
+            hostId={selectedHostId}
+            availableProviders={hostDetail?.host.available_providers ?? []}
+            activeAgents={activeAgentChoices}
+            hostProjects={hostProjects}
+            defaultCwd={effectiveProjectPath}
+            defaultProvider={draftProvider}
+          />
+        ) : sectionTab === "schedules" ? (
+          <>
+        {/* Quiet inline filter strip (avoids stacked double segmented controls) */}
+        {cronSchedules.length > 0 && (
+          <div className="flex items-center gap-1">
+            {(
+              [
+                { id: "all", label: "All", count: cronSchedules.length },
+                { id: "active", label: "Active", count: activeCount },
+                { id: "paused", label: "Paused", count: pausedCount },
+              ] as const
+            ).map((tab) => {
+              const selected = filterTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setFilterTab(tab.id)}
+                  className={cn(
+                    "inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[12px] transition-colors",
+                    selected
+                      ? "bg-black/[0.06] text-foreground font-medium dark:bg-white/[0.08]"
+                      : "text-muted-foreground hover:text-foreground hover:bg-black/[0.03] dark:hover:bg-white/[0.04]",
+                  )}
+                >
+                  <span>{tab.label}</span>
+                  <span className="text-muted-foreground/70 tabular-nums text-[11px]">
+                    {tab.count}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         )}
 
@@ -913,7 +1185,7 @@ export function AutomationsView() {
           </div>
         )}
 
-        {/* Live Agent Heartbeats — Unified Hairline List */}
+        {/* Live Agent Heartbeats — Unified Hairline List (kept alongside Schedules when present) */}
         {heartbeats.length > 0 && (
           <div className="space-y-2">
             <div className="text-muted-foreground/80 flex items-center gap-1.5 px-0.5 text-[11.5px] font-medium">
@@ -1008,7 +1280,547 @@ export function AutomationsView() {
             </div>
           </div>
         )}
+          </>
+        ) : (
+          /* Live Runs Tab: One-Shot Conditional Timers, Autonomous Goals & Streaming Monitors */
+          <div className="space-y-5">
+            {/* One-Shot Conditional Timers — Active countdowns & recent history */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2 px-0.5">
+                <div className="text-muted-foreground/80 flex items-center gap-1.5 text-[11.5px] font-medium">
+                  <span>Timers</span>
+                  {armedTimerCount > 0 && (
+                    <span className="text-muted-foreground/60 tabular-nums">
+                      {armedTimerCount} armed
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  disabled={!selectedHostId || activeAgentChoices.length === 0}
+                  onClick={openTimerDialog}
+                  className="border-border/80 bg-elevated/50 hover:bg-accent text-foreground/85 inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-[7px] border px-2 text-[11.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Plus className="size-3 stroke-[2]" />
+                  <span>One-Shot Timer</span>
+                </button>
+              </div>
+
+              {conditionalTimers.length === 0 ? (
+                <div className="border-border/65 text-muted-foreground/75 rounded-xl border border-dashed px-4 py-3 text-[12px]">
+                  No active or recent one-shot conditional timers.
+                </div>
+              ) : (
+                <div className="border-border/80 bg-elevated/35 divide-border/70 divide-y overflow-hidden rounded-xl border">
+                  {conditionalTimers.slice(0, 20).map((timer: ConditionalTimerRecord) => {
+                    const isArmed = timer.state === "armed";
+                    const targetAgent = hostDetail?.agents.find((a) => a.agent_id === timer.agent_id);
+                    const stateLabel =
+                      timer.state === "fired"
+                        ? "Fired"
+                        : timer.state === "canceled_early"
+                          ? "Canceled early"
+                          : timer.state === "canceled_manual"
+                            ? "Canceled"
+                            : "Armed";
+                    const busy = timerBusyId === timer.timer_id;
+                    return (
+                      <div
+                        key={timer.timer_id}
+                        className="group flex items-center justify-between gap-3 px-4 py-2.5 transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.025]"
+                      >
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          <Timer
+                            className={cn(
+                              "mt-0.5 size-3.5 shrink-0",
+                              isArmed ? "text-amber-500/85" : "text-muted-foreground/55",
+                            )}
+                          />
+                          <div className="min-w-0 space-y-0.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="text-foreground max-w-[320px] truncate text-[12.5px] font-medium">
+                                {timer.prompt}
+                              </span>
+                              {isArmed ? (
+                                <span className="text-foreground/90 tabular-nums shrink-0 rounded-md bg-amber-500/12 px-1.5 py-0.5 font-mono text-[11px] font-medium">
+                                  {formatTimerCountdown(timer.fire_at_ms, timerNowMs)}
+                                </span>
+                              ) : (
+                                <span className="text-muted-foreground bg-muted/70 shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-medium">
+                                  {stateLabel}
+                                </span>
+                              )}
+                              <span className="text-muted-foreground/80 border-border/70 shrink-0 rounded-md border px-1.5 py-0.5 text-[10.5px]">
+                                {formatTimerConditionLabel(timer.condition)}
+                              </span>
+                            </div>
+                            <div className="text-muted-foreground/80 flex flex-wrap items-center gap-1.5 text-[11.5px]">
+                              <span className="max-w-[200px] truncate">
+                                {targetAgent?.title ?? timer.agent_id}
+                              </span>
+                              {timer.resolved_reason && (
+                                <>
+                                  <span>·</span>
+                                  <span className="truncate">{timer.resolved_reason}</span>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {selectedHostId && (
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => orbitActions.selectAgent(selectedHostId, timer.agent_id)}
+                              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors"
+                            >
+                              <span>Open</span>
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                            {isArmed && (
+                              <>
+                                <SimpleTooltip label="Run now">
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    aria-label="Run timer now"
+                                    onClick={() => {
+                                      setTimerBusyId(timer.timer_id);
+                                      void orbitActions
+                                        .fireConditionalTimerNow(selectedHostId, timer.timer_id)
+                                        .then(
+                                          () => orbitActions.showToast("Timer triggered"),
+                                          (err) =>
+                                            orbitActions.showToast(
+                                              `Failed to trigger timer: ${String(err)}`,
+                                            ),
+                                        )
+                                        .finally(() => setTimerBusyId(null));
+                                    }}
+                                    className="text-muted-foreground/75 hover:text-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:opacity-40"
+                                  >
+                                    <Play className="size-3 fill-current" />
+                                  </button>
+                                </SimpleTooltip>
+                                <SimpleTooltip label="Cancel timer">
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    aria-label="Cancel timer"
+                                    onClick={() => {
+                                      setTimerBusyId(timer.timer_id);
+                                      void orbitActions
+                                        .cancelConditionalTimer(selectedHostId, timer.timer_id)
+                                        .then(
+                                          () => orbitActions.showToast("Timer canceled"),
+                                          (err) =>
+                                            orbitActions.showToast(
+                                              `Failed to cancel timer: ${String(err)}`,
+                                            ),
+                                        )
+                                        .finally(() => setTimerBusyId(null));
+                                    }}
+                                    className="text-muted-foreground/75 hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500 disabled:opacity-40"
+                                  >
+                                    <X className="size-3.5 stroke-[1.8]" />
+                                  </button>
+                                </SimpleTooltip>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {goalRuns.length === 0 && monitorWatches.length === 0 && conditionalTimers.length === 0 && (
+              <div className="flex flex-col items-center justify-center px-4 py-8 text-center">
+                <p className="text-muted-foreground max-w-md text-[12.5px] leading-relaxed">
+                  Autonomous <span className="text-foreground/85 font-mono">/goal</span> loops,
+                  streaming background monitors, and conditional timers appear here while active.
+                </p>
+              </div>
+            )}
+        {/* Autonomous Goals & Streaming Monitors */}
+        {(goalRuns.length > 0 || monitorWatches.length > 0) && (
+          <div className="space-y-4">
+            {goalRuns.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-muted-foreground/80 flex items-center gap-1.5 px-0.5 text-[11.5px] font-medium">
+                  <span>Autonomous Goals</span>
+                  <span className="text-muted-foreground/60 tabular-nums">{goalRuns.length}</span>
+                </div>
+                <div className="border-border/80 bg-elevated/35 divide-border/70 divide-y overflow-hidden rounded-xl border">
+                  {goalRuns.map((goal) => {
+                    const targetAgent = hostDetail?.agents.find(
+                      (a) => a.agent_id === goal.agent_id,
+                    );
+                    const isActive =
+                      goal.status === "running" ||
+                      goal.status === "verifying" ||
+                      goal.status === "paused";
+                    const isPaused = goal.status === "paused";
+                    const isVerifying = goal.status === "verifying";
+                    const dotClass =
+                      goal.status === "running"
+                        ? "bg-emerald-500 animate-pulse"
+                        : goal.status === "verifying"
+                          ? "bg-sky-500 animate-pulse"
+                          : goal.status === "paused"
+                            ? "bg-amber-500"
+                            : goal.status === "succeeded"
+                              ? "bg-emerald-500"
+                              : goal.status === "failed"
+                                ? "bg-rose-500"
+                                : "bg-muted-foreground/45";
+                    return (
+                      <div
+                        key={goal.goal_id}
+                        className="group flex items-center justify-between gap-3 px-4 py-2.5 transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.025]"
+                      >
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          <Target className="text-muted-foreground mt-0.5 size-3.5 shrink-0 stroke-[1.75]" />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span
+                                title={goal.status}
+                                className={cn("size-1.5 shrink-0 rounded-full", dotClass)}
+                              />
+                              <span className="text-foreground truncate text-[13px] font-medium">
+                                {goal.objective}
+                              </span>
+                              <span className="text-muted-foreground/80 tabular-nums shrink-0 font-mono text-[11px]">
+                                Iter {goal.current_iteration}/{goal.max_iterations}
+                              </span>
+                            </div>
+                            <div className="text-muted-foreground/75 flex items-center gap-2 truncate text-[11.5px]">
+                              <span className="capitalize">{goal.status}</span>
+                              {targetAgent && (
+                                <>
+                                  <span>·</span>
+                                  <span className="truncate">{targetAgent.title}</span>
+                                </>
+                              )}
+                              {goal.verify_command && (
+                                <>
+                                  <span>·</span>
+                                  <span className="truncate font-mono text-[11px]">
+                                    {goal.verify_command}
+                                  </span>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {selectedHostId && (
+                          <div className="flex shrink-0 items-center gap-0.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                orbitActions.selectAgent(selectedHostId, goal.agent_id)
+                              }
+                              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors"
+                            >
+                              <span>Open</span>
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                            {isActive && !isVerifying && (
+                              <SimpleTooltip label="Verify now">
+                                <button
+                                  type="button"
+                                  aria-label="Verify goal"
+                                  onClick={() =>
+                                    void orbitActions.controlGoalRun(
+                                      selectedHostId,
+                                      goal.goal_id,
+                                      "verify_now",
+                                    )
+                                  }
+                                  className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors"
+                                >
+                                  <CheckCircle2 className="size-3.5 stroke-[1.75]" />
+                                </button>
+                              </SimpleTooltip>
+                            )}
+                            {isActive && !isVerifying && (
+                              <SimpleTooltip label={isPaused ? "Resume" : "Pause"}>
+                                <button
+                                  type="button"
+                                  aria-label={isPaused ? "Resume goal" : "Pause goal"}
+                                  onClick={() =>
+                                    void orbitActions.controlGoalRun(
+                                      selectedHostId,
+                                      goal.goal_id,
+                                      isPaused ? "resume" : "pause",
+                                    )
+                                  }
+                                  className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors"
+                                >
+                                  {isPaused ? (
+                                    <Play className="size-3.5 stroke-[1.75]" />
+                                  ) : (
+                                    <Pause className="size-3.5 stroke-[1.75]" />
+                                  )}
+                                </button>
+                              </SimpleTooltip>
+                            )}
+                            {isActive && (
+                              <SimpleTooltip label="Stop">
+                                <button
+                                  type="button"
+                                  aria-label="Stop goal"
+                                  onClick={() =>
+                                    void orbitActions.controlGoalRun(
+                                      selectedHostId,
+                                      goal.goal_id,
+                                      "cancel",
+                                    )
+                                  }
+                                  className="text-muted-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500"
+                                >
+                                  <Square className="size-3.5 stroke-[1.75]" />
+                                </button>
+                              </SimpleTooltip>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {monitorWatches.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-muted-foreground/80 flex items-center gap-1.5 px-0.5 text-[11.5px] font-medium">
+                  <span>Streaming Monitors</span>
+                  <span className="text-muted-foreground/60 tabular-nums">
+                    {monitorWatches.length}
+                  </span>
+                </div>
+                <div className="border-border/80 bg-elevated/35 divide-border/70 divide-y overflow-hidden rounded-xl border">
+                  {monitorWatches.map((mon) => {
+                    const isRunning = mon.status === "active" || mon.status === "triggered";
+                    const dotClass =
+                      mon.status === "active"
+                        ? "bg-emerald-500 animate-pulse"
+                        : mon.status === "triggered"
+                          ? "bg-amber-500 animate-pulse"
+                          : mon.status === "error"
+                            ? "bg-rose-500"
+                            : "bg-muted-foreground/45";
+                    const kindDetail =
+                      mon.kind.kind === "command_stream"
+                        ? `cmd: ${mon.kind.command}`
+                        : mon.kind.kind === "log_file_tail"
+                          ? `tail: ${mon.kind.path}`
+                          : `http: ${mon.kind.url}`;
+                    return (
+                      <div
+                        key={mon.monitor_id}
+                        className="group flex items-center justify-between gap-3 px-4 py-2.5 transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.025]"
+                      >
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          <Activity className="text-muted-foreground mt-0.5 size-3.5 shrink-0 stroke-[1.75]" />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span
+                                title={mon.status}
+                                className={cn("size-1.5 shrink-0 rounded-full", dotClass)}
+                              />
+                              <span className="text-foreground truncate text-[13px] font-medium">
+                                {mon.name}
+                              </span>
+                              <span className="text-muted-foreground/75 tabular-nums shrink-0 font-mono text-[11px]">
+                                {mon.match_count} {mon.match_count === 1 ? "match" : "matches"}
+                              </span>
+                            </div>
+                            <div className="text-muted-foreground/75 flex items-center gap-2 truncate text-[11.5px]">
+                              <span className="truncate font-mono text-[11px]">{kindDetail}</span>
+                              {mon.last_event_preview && (
+                                <>
+                                  <span>·</span>
+                                  <span className="truncate">{mon.last_event_preview}</span>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {selectedHostId && (
+                          <div className="flex shrink-0 items-center gap-0.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                orbitActions.selectAgent(selectedHostId, mon.agent_id)
+                              }
+                              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors"
+                            >
+                              <span>Open</span>
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                            {isRunning && (
+                              <SimpleTooltip label="Stop monitor">
+                                <button
+                                  type="button"
+                                  aria-label="Stop monitor"
+                                  onClick={() =>
+                                    void orbitActions.stopMonitorWatch(
+                                      selectedHostId,
+                                      mon.monitor_id,
+                                    )
+                                  }
+                                  className="text-muted-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500"
+                                >
+                                  <Square className="size-3.5 stroke-[1.75]" />
+                                </button>
+                              </SimpleTooltip>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+          </div>
+        )}
       </div>
+
+      {/* One-Shot Conditional Timer Dialog */}
+      <Dialog open={timerDialogOpen} onOpenChange={setTimerDialogOpen}>
+        <DialogContent className="max-w-[440px] gap-0 p-0">
+          <DialogHeader className="px-5 pt-5 pb-3">
+            <DialogTitle className="text-[15px]">New one-shot timer</DialogTitle>
+            <DialogDescription className="text-[12px]">
+              Wake an agent after a delay unless an early-cancel condition triggers first.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex flex-col gap-3.5 px-5 pb-4">
+            <label className="flex flex-col gap-1.5 text-[12px]">
+              <span className="text-muted-foreground font-medium">Agent</span>
+              <SettingSelect
+                value={timerAgentId}
+                onChange={setTimerAgentId}
+                options={activeAgentChoices.map((a) => ({
+                  value: a.agent_id,
+                  label: a.title || a.agent_id,
+                  description: shortWorkspaceName(a.cwd),
+                }))}
+                placeholder="Select agent"
+              />
+            </label>
+
+            <div className="flex flex-col gap-1.5 text-[12px]">
+              <span className="text-muted-foreground font-medium">Delay (seconds)</span>
+              <div className="flex items-center gap-1.5">
+                {[
+                  { label: "1m", secs: "60" },
+                  { label: "5m", secs: "300" },
+                  { label: "15m", secs: "900" },
+                  { label: "30m", secs: "1800" },
+                  { label: "1h", secs: "3600" },
+                ].map((preset) => (
+                  <button
+                    key={preset.secs}
+                    type="button"
+                    onClick={() => setTimerDurationSec(preset.secs)}
+                    className={cn(
+                      "h-[28px] cursor-pointer rounded-md border px-2 text-[11.5px] font-medium transition-colors",
+                      timerDurationSec === preset.secs
+                        ? "border-foreground/35 bg-accent text-foreground"
+                        : "border-border/75 text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+                <input
+                  type="number"
+                  min={1}
+                  max={86400}
+                  value={timerDurationSec}
+                  onChange={(e) => setTimerDurationSec(e.target.value)}
+                  className="border-border bg-canvas text-foreground focus:border-foreground/30 ml-auto h-[28px] w-[84px] rounded-md border px-2 font-mono text-[12px] outline-none"
+                />
+              </div>
+            </div>
+
+            <label className="flex flex-col gap-1.5 text-[12px]">
+              <span className="text-muted-foreground font-medium">Early-cancel condition</span>
+              <SettingSelect
+                value={timerConditionKind}
+                onChange={(val) => {
+                  setTimerConditionKind(val);
+                  setTimerConditionArg("");
+                }}
+                options={[
+                  { value: "any_message", label: "Any incoming message" },
+                  { value: "all_subagents_settled", label: "All subagents settled" },
+                  { value: "sender", label: "Message from specific sender" },
+                  { value: "file_changed", label: "Workspace file changed" },
+                  { value: "never", label: "Never (fixed timer)" },
+                ]}
+              />
+            </label>
+
+            {(timerConditionKind === "sender" || timerConditionKind === "file_changed") && (
+              <label className="flex flex-col gap-1.5 text-[12px]">
+                <span className="text-muted-foreground font-medium">
+                  {timerConditionKind === "sender" ? "Sender Agent ID" : "Relative Workspace Path"}
+                </span>
+                <input
+                  value={timerConditionArg}
+                  onChange={(e) => setTimerConditionArg(e.target.value)}
+                  placeholder={
+                    timerConditionKind === "sender" ? "e.g. ag_12345678" : "e.g. dist/build.log"
+                  }
+                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[34px] w-full rounded-lg border px-3 font-mono text-[12px] outline-none"
+                />
+              </label>
+            )}
+
+            <label className="flex flex-col gap-1.5 text-[12px]">
+              <span className="text-muted-foreground font-medium">Wakeup prompt</span>
+              <textarea
+                rows={3}
+                value={timerPrompt}
+                onChange={(e) => setTimerPrompt(e.target.value)}
+                placeholder="What should the agent check if this timer elapses?"
+                className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 w-full resize-none rounded-lg border px-3 py-2 text-[12.5px] outline-none"
+              />
+            </label>
+          </div>
+
+          <div className="border-border/70 flex items-center justify-end gap-2 border-t px-5 py-3">
+            <button
+              type="button"
+              onClick={() => setTimerDialogOpen(false)}
+              className="text-muted-foreground hover:text-foreground h-[30px] cursor-pointer rounded-lg px-3 text-[12.5px] font-medium transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={timerSubmitting}
+              onClick={() => void submitConditionalTimer()}
+              className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity disabled:opacity-40"
+            >
+              {timerSubmitting ? "Arming…" : "Arm timer"}
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Unified Create / Edit Automation Dialog */}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
@@ -1152,7 +1964,7 @@ export function AutomationsView() {
                           <span className="text-muted-foreground font-medium">Provider</span>
                           <SettingSelect
                             value={provider}
-                            options={PROVIDER_OPTIONS}
+                            options={providerSelectOptions}
                             onChange={setProvider}
                             triggerClassName="w-full h-[30px] min-w-0"
                             menuClassName="w-44"

@@ -94,6 +94,8 @@ pub struct PendingPermissionSummary {
     pub title: String,
     pub detail: ToolCallDetail,
     pub allowed_decisions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_assessment: Option<crate::GuardianAssessment>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -169,9 +171,13 @@ pub struct AgentProfile {
     pub name: String,
     pub provider: ProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub mode: SessionMode,
     #[serde(default)]
     pub when_to_use: String,
@@ -207,6 +213,9 @@ pub struct OrchestrationConfig {
     /// Automatically cluster closely related new conversations into existing Mission Workspaces (default: `false`; manual AI triage on demand).
     #[serde(default)]
     pub auto_cluster_enabled: bool,
+    /// Prevent OS idle sleep while agents, autonomous wakeups, or scheduled runs are active (default: `true`).
+    #[serde(default = "default_true")]
+    pub keep_awake_while_running: bool,
 }
 
 impl Default for OrchestrationConfig {
@@ -219,8 +228,26 @@ impl Default for OrchestrationConfig {
             resume_prompt: default_resume_prompt(),
             installed_skills: Vec::new(),
             auto_cluster_enabled: false,
+            keep_awake_while_running: true,
         }
     }
+}
+
+/// Live runtime status of the daemon's OS sleep-prevention guard (`KeepAwakeManager`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeepAwakeStatus {
+    /// Whether automatic keep-awake is enabled in host configuration.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `true` while an OS sleep-prevention assertion/process is actively held.
+    #[serde(default)]
+    pub active: bool,
+    /// Number of currently busy agents or active background runs requesting keep-awake.
+    #[serde(default)]
+    pub active_agents: usize,
+    /// Active OS backend identifier (e.g. `"caffeinate"`, `"systemd-inhibit"`, `"windows-stub"`, `"noop"`).
+    #[serde(default)]
+    pub backend: String,
 }
 
 /// Status projection of a bundled Orbit orchestration skill on a host.
@@ -260,9 +287,13 @@ pub struct ScheduleNewAgentConfig {
     pub workspace_id: Option<String>,
     pub provider: ProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub mode: SessionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,

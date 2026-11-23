@@ -72,6 +72,7 @@ export default class EntryAbility extends UIAbility {
 
     this.applyLaunchWant(want);
     this.registerNetworkObserver();
+    store.registerPushTokenSilently();
   }
 
   onNewWant(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
@@ -82,6 +83,19 @@ export default class EntryAbility extends UIAbility {
     const store = OrbitHarmonyStore.getInstance();
     if (want.uri !== undefined && want.uri.length > 0) {
       store.handleDeepLinkUri(want.uri);
+      return;
+    }
+    const openUri = want.parameters?.['orbit_open_uri'];
+    if (typeof openUri === 'string' && openUri.length > 0) {
+      store.handleDeepLinkUri(openUri);
+      return;
+    }
+    const hostParam = want.parameters?.['orbit_host_id'];
+    const agentParam = want.parameters?.['orbit_agent_id'];
+    if (typeof hostParam === 'string' && hostParam.length > 0) {
+      const agentId = typeof agentParam === 'string' ? agentParam : '';
+      store.openSessionFromDeepLink(hostParam, agentId);
+      return;
     }
     const paramUri = want.parameters?.['orbit_pair_uri'];
     if (typeof paramUri === 'string' && paramUri.length > 0) {

@@ -6,23 +6,46 @@
 //! Daemon-to-Daemon Connected Host links, and optionally registers outbound to Relay with full
 //! `Noise_NK_25519_ChaChaPoly_SHA256` end-to-end encryption.
 
+pub mod artifacts;
 pub mod attachments;
+pub mod browser;
 pub mod connected_hosts;
 pub mod cron;
 pub mod discovery;
+pub mod fast_copy;
 pub mod finish_subscriptions;
 pub mod git;
+pub mod goals;
+pub mod guardian;
+pub mod hooks;
 pub mod idle_cleanup;
+pub mod im_channels;
+pub mod instructions;
+pub mod keep_awake;
+pub mod lsp;
 pub mod manager;
 pub mod mcp;
+pub mod mcp_servers;
 pub mod messaging;
+pub mod platform;
+pub mod push;
+pub mod rules;
 pub mod scheduler;
 pub mod skills;
+pub mod skills_manager;
+pub mod symbols;
+pub mod timers;
 pub mod tools;
+pub mod triggers;
+pub mod usage;
+pub mod workflows;
 pub mod workspace_board;
 pub mod workspace_cluster;
+pub mod workspace_files;
 pub mod workspace_organizer;
 pub mod workspace_runtime;
+pub mod worktree_handoff;
+pub mod worktree_pool;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -34,7 +57,7 @@ use axum::{
     Router,
     body::Body,
     extract::{
-        State,
+        DefaultBodyLimit, State,
         ws::{Message as AxumWsMsg, WebSocket, WebSocketUpgrade},
     },
     http::{Request, StatusCode},
@@ -61,17 +84,40 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::attachments::AttachmentStagingManager;
+use crate::browser::{BrowserManager, CreateBrowserSessionSpec};
 use crate::connected_hosts::ConnectedHostsManager;
 use crate::finish_subscriptions::FinishSubscriptionManager;
-use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files, read_workspace_file};
+use crate::git::{
+    compute_git_diff, inspect_git_status, list_workspace_files,
+    read_workspace_file_with_attachments_dir,
+};
+use crate::goals::{GoalMonitorEngine, StartGoalSpec, StartMonitorSpec};
+use crate::hooks::HooksEngine;
 use crate::idle_cleanup::IdleRuntimeCleanup;
+use crate::im_channels::{ImChannelBridge, UpsertImChannelSpec};
+use crate::instructions::{
+    discover_instruction_hierarchy, read_instruction_file, save_instruction_file,
+};
+use crate::keep_awake::KeepAwakeManager;
+use crate::lsp::LspManager;
 use crate::manager::{
     AgentOrchestrator, CreateAgentSpec, CreateWorkspaceSpec, DaemonBroadcast, PtyBroadcast,
 };
 use crate::messaging::{
     AgentMessageDelivery, AgentPromptSource, DEFAULT_COALESCE_WINDOW, QueuedAgentMessage,
 };
+use crate::push::PushManager;
 use crate::scheduler::ScheduleEngine;
+use crate::symbols::WorkspaceSymbolIndex;
+use crate::timers::ConditionalTimerEngine;
+use crate::triggers::{EventTriggerEngine, UpsertTriggerRequest};
+use crate::workflows::{
+    StartBatchFanoutSpec, StartBestOfNSpec, StartDagWorkflowSpec, WorkflowEngine,
+};
+use crate::workspace_files::{
+    canonicalize_workspace_root, create_workspace_entry, delete_workspace_entry,
+    rename_workspace_entry, write_workspace_file,
+};
 use crate::workspace_runtime::WorkspaceScriptRegistry;
 
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
@@ -192,8 +238,21 @@ pub struct DaemonRuntime {
     pub finish_subs: Arc<FinishSubscriptionManager>,
     pub connected_hosts: Arc<ConnectedHostsManager>,
     pub scheduler: Arc<ScheduleEngine>,
+    pub conditional_timers: Arc<ConditionalTimerEngine>,
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
-    provider_catalogs: RwLock<Option<Vec<ProviderModelCatalog>>>,
+    pub keep_awake: Arc<KeepAwakeManager>,
+    pub goals: Arc<GoalMonitorEngine>,
+    pub triggers: Arc<EventTriggerEngine>,
+    pub workflows: Arc<WorkflowEngine>,
+    pub symbol_index: Arc<WorkspaceSymbolIndex>,
+    pub lsp: Arc<LspManager>,
+    pub browser: Arc<BrowserManager>,
+    pub hooks: Arc<HooksEngine>,
+    pub im_channels: Arc<ImChannelBridge>,
+    pub push: Arc<PushManager>,
+    provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
+    pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
+    pub mcp_config_lock: Arc<AsyncMutex<()>>,
     catalog_refresh_lock: AsyncMutex<()>,
     upgrade_lock: AsyncMutex<()>,
 }
@@ -205,6 +264,7 @@ impl DaemonRuntime {
     pub async fn bootstrap(home_dir: &Path) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(home_dir)?;
         std::fs::create_dir_all(home_dir.join("shims"))?;
+        orbit_providers::set_snapshot_orbit_home(home_dir);
 
         let keypair_path = home_dir.join("host-keypair.json");
         let keypair = if keypair_path.exists() {
@@ -228,11 +288,15 @@ impl DaemonRuntime {
         let listen_port = Arc::new(RwLock::new(
             persisted.listen_addr.map(|a| a.port()).unwrap_or(0),
         ));
+        let keep_awake_enabled = persisted.orchestration.keep_awake_while_running;
         let orch_config = Arc::new(RwLock::new(persisted.orchestration));
 
         let host_id = keypair.host_id()?;
         let store = Arc::new(OrbitStore::open(home_dir.join("orbit.db"))?);
         let scripts = WorkspaceScriptRegistry::new();
+        let keep_awake = Arc::new(KeepAwakeManager::new(keep_awake_enabled));
+        let provider_catalogs = Arc::new(RwLock::new(None));
+        let hooks = HooksEngine::new(home_dir.to_path_buf());
         let orchestrator = AgentOrchestrator::new(
             home_dir.to_path_buf(),
             host_id.clone(),
@@ -241,8 +305,15 @@ impl DaemonRuntime {
             orch_config.clone(),
             store.clone(),
             scripts,
+            keep_awake.clone(),
+            provider_catalogs.clone(),
+            hooks.clone(),
         )
         .await;
+        let ka_bcast_tx = orchestrator.broadcast_tx.clone();
+        keep_awake.set_on_status_change(move |status| {
+            let _ = ka_bcast_tx.send(DaemonBroadcast::KeepAwakeStatusUpdated(status));
+        });
         let attachments = Arc::new(AttachmentStagingManager::new(home_dir));
 
         let orch_for_dispatch = orchestrator.clone();
@@ -263,6 +334,41 @@ impl DaemonRuntime {
             connected_hosts.clone(),
         );
         let scheduler = ScheduleEngine::new(store.clone(), orchestrator.clone(), delivery.clone());
+        let conditional_timers =
+            ConditionalTimerEngine::new(store.clone(), orchestrator.clone(), delivery.clone());
+        orchestrator
+            .set_conditional_timers(conditional_timers.clone())
+            .await;
+        let timers_for_admission = conditional_timers.clone();
+        delivery
+            .set_on_admitted(Arc::new(move |recipient_id, kind, sender_id| {
+                let timers = Arc::clone(&timers_for_admission);
+                Box::pin(async move {
+                    if matches!(
+                        kind,
+                        AgentMessageKind::DirectMessage | AgentMessageKind::FinishNotification
+                    ) {
+                        timers
+                            .notify_agent_message(&recipient_id, sender_id.as_deref())
+                            .await;
+                    }
+                })
+            }))
+            .await;
+        let goals = GoalMonitorEngine::new(
+            store.clone(),
+            &orchestrator,
+            delivery.clone(),
+            keep_awake.clone(),
+        );
+        let triggers = EventTriggerEngine::new(
+            store.clone(),
+            orchestrator.clone(),
+            delivery.clone(),
+            listen_port.clone(),
+            home_dir,
+        );
+        let workflows = WorkflowEngine::new(store.clone(), &orchestrator, keep_awake.clone());
         let idle_cleanup = IdleRuntimeCleanup::new(
             store.clone(),
             orchestrator.clone(),
@@ -270,13 +376,34 @@ impl DaemonRuntime {
             finish_subs.clone(),
             orch_config.clone(),
         );
+        let lsp = LspManager::new(home_dir.to_path_buf());
+        let browser = BrowserManager::new(home_dir.to_path_buf());
+        let im_channels =
+            ImChannelBridge::new(store.clone(), orchestrator.clone(), listen_port.clone());
+        let host_display_name = hostname_string();
+        let push = PushManager::new(
+            store.clone(),
+            orchestrator.clone(),
+            host_id.clone(),
+            host_display_name.clone(),
+        );
 
-        let discovered = discover_installed_providers();
-        let available_providers = discovered.into_iter().map(|d| d.kind).collect();
+        let home_for_probe = home_dir.to_path_buf();
+        let available_providers = tokio::task::spawn_blocking(move || {
+            let discovered = discover_installed_providers();
+            let mut providers: Vec<orbit_protocol::ProviderKind> =
+                discovered.into_iter().map(|d| d.kind).collect();
+            if orbit_providers::has_any_installed_acp_agent(&home_for_probe) {
+                providers.push(orbit_protocol::ProviderKind::Acp);
+            }
+            providers
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("provider discovery task failed: {e}"))?;
 
         let host_info = HostInfo {
             host_id,
-            hostname: hostname_string(),
+            hostname: host_display_name,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             public_key_b64: keypair.public_key_b64.clone(),
@@ -299,8 +426,23 @@ impl DaemonRuntime {
             finish_subs,
             connected_hosts,
             scheduler,
+            conditional_timers,
             idle_cleanup,
-            provider_catalogs: RwLock::new(None),
+            keep_awake,
+            goals,
+            triggers,
+            workflows,
+            symbol_index: Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
+                crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
+            ))),
+            lsp,
+            browser,
+            hooks,
+            im_channels,
+            push,
+            provider_catalogs,
+            mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
+            mcp_config_lock: Arc::new(AsyncMutex::new(())),
             catalog_refresh_lock: AsyncMutex::new(()),
             upgrade_lock: AsyncMutex::new(()),
         }))
@@ -315,15 +457,38 @@ impl DaemonRuntime {
         self.orchestrator.activate_runtime().await;
         // 2. Establish outbound Daemon-to-Daemon mesh connections
         self.connected_hosts.start_all().await;
-        // 3. Resume any persisted finish subscriptions across restarts
+        // 3. Resume any persisted finish subscriptions & armed conditional timers across restarts
         self.finish_subs.start_recovery().await;
-        // 4. Start Cron/Heartbeat scheduler & Idle Runtime Cleanup background loops
+        self.conditional_timers.start_recovery().await;
+        // 3b. Recover active autonomous Goals, streaming Monitor watches & interrupted Workflows
+        self.goals.start_recovery().await;
+        self.workflows.start_recovery().await;
+        // 3c. Start GitHub PR/Issue/CI polling fallback loop for enabled event triggers
+        self.triggers.spawn_background_poller().await;
+        // 3d. Start Bidirectional IM Channels bridge & NAT-friendly pollers
+        self.im_channels.start().await;
+        // 3e. Start Native Mobile Background Push dispatcher (APNs / FCM / HarmonyOS Push Kit)
+        self.push.start().await;
+        // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup, LSP & Browser Idle Reaper loops
         drop(self.scheduler.spawn_background());
         drop(self.idle_cleanup.spawn_background());
+        drop(self.lsp.spawn_idle_reaper());
+        drop(self.browser.spawn_idle_reaper());
 
-        // 5. Warm provider model catalogs in background
+        // 5. Warm login-shell environment snapshot & provider model catalogs in background (non-blocking)
+        orbit_providers::set_snapshot_orbit_home(&self.home_dir);
         let rt_warm = Arc::clone(self);
         tokio::spawn(async move {
+            let env_map = orbit_providers::resolve_login_shell_env().await;
+            let stats = orbit_providers::shell_snapshot_stats();
+            tracing::debug!(
+                shell = %stats.shell,
+                var_count = env_map.len(),
+                hits = stats.hits,
+                misses = stats.misses,
+                disk_hits = stats.disk_hits,
+                "Login shell environment snapshot warmed"
+            );
             let _ = rt_warm.get_or_probe_provider_catalogs(false).await;
         });
 
@@ -395,16 +560,42 @@ pub fn read_live_daemon_port(home_dir: &Path) -> u16 {
 }
 
 fn resolve_user_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    crate::platform::resolve_user_home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
+    let im_webhook_routes = Router::new()
+        .route(
+            "/im/lark/{channel_id}",
+            post(crate::im_channels::lark_webhook_handler),
+        )
+        .route(
+            "/im/slack/{channel_id}",
+            post(crate::im_channels::slack_webhook_handler),
+        )
+        .route(
+            "/im/telegram/{channel_id}",
+            post(crate::im_channels::telegram_webhook_handler),
+        )
+        .route(
+            "/im/discord/{channel_id}",
+            post(crate::im_channels::discord_webhook_handler),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::im_channels::MAX_WEBHOOK_BODY_BYTES,
+        ));
+
     Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/ws", get(ws_handler))
         .route("/mcp/agents", post(crate::mcp::mcp_agents_handler))
+        .route(
+            "/webhooks/{trigger_id}",
+            post(crate::triggers::webhook_ingress_handler).layer(DefaultBodyLimit::max(
+                crate::triggers::MAX_WEBHOOK_BODY_BYTES,
+            )),
+        )
+        .merge(im_webhook_routes)
         .fallback(service_reverse_proxy_fallback)
         .with_state(runtime)
 }
@@ -511,6 +702,16 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         .with_graceful_shutdown(async move {
             wait_daemon_shutdown_signal().await;
             runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
+            runtime_shutdown.orchestrator.shutdown_worktree_pool().await;
+            runtime_shutdown.conditional_timers.shutdown().await;
+            runtime_shutdown.goals.shutdown_all().await;
+            runtime_shutdown.triggers.shutdown().await;
+            runtime_shutdown.workflows.shutdown_all().await;
+            runtime_shutdown.im_channels.shutdown_all().await;
+            runtime_shutdown.push.shutdown_all().await;
+            runtime_shutdown.lsp.shutdown_all().await;
+            runtime_shutdown.browser.shutdown_all().await;
+            runtime_shutdown.keep_awake.shutdown();
         })
         .await?;
     Ok(())
@@ -722,7 +923,8 @@ async fn serve_e2ee_relay_tunnel(
                             }
                         }
                         Err(err) => {
-                            tracing::warn!(error = %err, bytes = plain.len(), "failed to decode E2EE zstd wire message");
+                            let summary = format_concise_wire_decode_error(&err);
+                            tracing::warn!(error = %summary, bytes = plain.len(), "failed to decode E2EE zstd wire message");
                         }
                     },
                     E2EE_FRAME_TERMINAL => {
@@ -748,7 +950,9 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(runtime): State<Arc<DaemonRuntime>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_direct_socket(socket, runtime))
+    ws.max_frame_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+        .max_message_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_direct_socket(socket, runtime))
 }
 
 async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
@@ -812,7 +1016,8 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
                                 }
                             }
                             Err(err) => {
-                                tracing::warn!(error = %err, bytes = bin.len(), "failed to decode direct zstd wire message");
+                                let summary = format_concise_wire_decode_error(&err);
+                                tracing::warn!(error = %summary, bytes = bin.len(), "failed to decode direct zstd wire message");
                             }
                         }
                     } else if let Ok(term) = TerminalBinaryFrame::decode(&bin)
@@ -831,6 +1036,25 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
 }
 
 // --- Unified Transport-Neutral Session Controller (shared by Direct WS & Relay E2EE) ---
+
+fn format_concise_wire_decode_error(err: &impl std::fmt::Display) -> String {
+    const MAX_LEN: usize = 240;
+    let raw = err.to_string();
+    let condensed = if let Some(idx) = raw.find(", expected one of") {
+        format!("{}, expected known WireMessage variant", &raw[..idx])
+    } else {
+        raw
+    };
+    if condensed.len() <= MAX_LEN {
+        return condensed;
+    }
+    let ellipsis = "…";
+    let mut cut = MAX_LEN.saturating_sub(ellipsis.len());
+    while cut > 0 && !condensed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &condensed[..cut], ellipsis)
+}
 
 #[allow(clippy::large_enum_variant)]
 enum SessionFrame {
@@ -993,6 +1217,38 @@ async fn run_client_session_loop(
                     }
                     DaemonBroadcast::WorkspaceOrganizeProgress(event) => {
                         Some(WireMessage::WorkspaceOrganizeProgress { event })
+                    }
+                    DaemonBroadcast::KeepAwakeStatusUpdated(status) => {
+                        Some(WireMessage::KeepAwakeStatusUpdated { status })
+                    }
+                    DaemonBroadcast::AcpAgentsUpdated(agents) => {
+                        Some(WireMessage::AcpAgentsSnapshot {
+                            request_id: Uuid::nil(),
+                            agents,
+                            warning: None,
+                        })
+                    }
+                    DaemonBroadcast::ArtifactUpdated(artifact) => {
+                        Some(WireMessage::ArtifactUpdated {
+                            request_id: None,
+                            artifact,
+                        })
+                    }
+                    DaemonBroadcast::ArtifactDeleted(artifact_id) => {
+                        Some(WireMessage::ArtifactDeleted {
+                            request_id: None,
+                            artifact_id,
+                        })
+                    }
+                    DaemonBroadcast::ConditionalTimerEvent(timer) => {
+                        Some(WireMessage::ConditionalTimerEvent { timer })
+                    }
+                    DaemonBroadcast::GoalRunEvent(goal) => Some(WireMessage::GoalRunEvent { goal }),
+                    DaemonBroadcast::MonitorWatchEvent(monitor) => {
+                        Some(WireMessage::MonitorWatchEvent { monitor })
+                    }
+                    DaemonBroadcast::WorkflowRunEvent(run) => {
+                        Some(WireMessage::WorkflowRunEvent { run })
                     }
                 };
                 if let Some(msg) = maybe_msg
@@ -1309,6 +1565,110 @@ async fn handle_wire_rpc(
             Ok(_) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "stop_script_failed", e)),
         },
+        WireMessage::PreviewWorktreeHandoff {
+            request_id,
+            workspace_id,
+            direction,
+            target_workspace_id,
+            include_committed,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match orch
+                    .preview_worktree_handoff(
+                        &workspace_id,
+                        direction,
+                        target_workspace_id.as_deref(),
+                        include_committed,
+                    )
+                    .await
+                {
+                    Ok(preview) => WireMessage::WorktreeHandoffPreviewResult {
+                        request_id,
+                        preview,
+                    },
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let code = if msg.contains("unrelated_git_repo") {
+                            "unrelated_git_repo"
+                        } else if msg.contains("not_a_git_repo") {
+                            "not_a_git_repo"
+                        } else if msg.contains("not_a_worktree") {
+                            "not_a_worktree"
+                        } else if msg.contains("same_directory") {
+                            "same_directory"
+                        } else if msg.contains("directory_not_found") {
+                            "directory_not_found"
+                        } else {
+                            "handoff_preview_failed"
+                        };
+                        rpc_err(request_id, code, e)
+                    }
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ExecuteWorktreeHandoff {
+            request_id,
+            workspace_id,
+            direction,
+            mode,
+            target_workspace_id,
+            include_committed,
+            branch,
+            allow_three_way_conflicts,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match orch
+                    .execute_worktree_handoff(crate::manager::ExecuteWorktreeHandoffSpec {
+                        workspace_id,
+                        direction,
+                        mode,
+                        target_workspace_id,
+                        include_committed,
+                        branch,
+                        allow_three_way_conflicts,
+                    })
+                    .await
+                {
+                    Ok(outcome) => WireMessage::WorktreeHandoffExecuted {
+                        request_id,
+                        outcome,
+                    },
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let code = if msg.contains("handoff_conflict") {
+                            "handoff_conflict"
+                        } else if msg.contains("escaping_symlink") {
+                            "escaping_symlink"
+                        } else if msg.contains("unrelated_git_repo") {
+                            "unrelated_git_repo"
+                        } else if msg.contains("invalid_git_ref") {
+                            "invalid_git_ref"
+                        } else if msg.contains("not_a_git_repo") {
+                            "not_a_git_repo"
+                        } else if msg.contains("not_a_worktree") {
+                            "not_a_worktree"
+                        } else if msg.contains("same_directory") {
+                            "same_directory"
+                        } else if msg.contains("directory_not_found") {
+                            "directory_not_found"
+                        } else {
+                            "handoff_execute_failed"
+                        };
+                        rpc_err(request_id, code, e)
+                    }
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::GetGitStatus { request_id, cwd } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;
@@ -1398,6 +1758,39 @@ async fn handle_wire_rpc(
             });
             None
         }
+        WireMessage::SearchWorkspaceSymbols {
+            request_id,
+            cwd,
+            query,
+            limit,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(authorized_cwd) => {
+                        match symbol_index
+                            .search(&authorized_cwd, &query, limit as usize)
+                            .await
+                        {
+                            Ok(res) => WireMessage::WorkspaceSymbolsResponse {
+                                request_id,
+                                cwd,
+                                symbols: res.symbols,
+                                truncated: res.truncated,
+                            },
+                            Err(e) => rpc_err(request_id, "search_symbols_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "search_symbols_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::ReadWorkspaceFile {
             request_id,
             cwd,
@@ -1406,9 +1799,17 @@ async fn handle_wire_rpc(
         } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;
+            let attachments_dir = runtime.attachments.attachments_dir().to_path_buf();
             tokio::spawn(async move {
                 let resolved_cwd = expand_host_path(&cwd);
-                let reply = match read_workspace_file(&resolved_cwd, &path, max_bytes).await {
+                let reply = match read_workspace_file_with_attachments_dir(
+                    &resolved_cwd,
+                    &path,
+                    max_bytes,
+                    Some(&attachments_dir),
+                )
+                .await
+                {
                     Ok(file_data) => WireMessage::WorkspaceFileContentResponse {
                         request_id,
                         cwd,
@@ -1419,8 +1820,192 @@ async fn handle_wire_rpc(
                         content: file_data.content,
                         size_bytes: file_data.size_bytes,
                         truncated: file_data.truncated,
+                        etag: file_data.etag,
+                        mtime_unix_ms: file_data.mtime_unix_ms,
+                        writable: file_data.writable,
+                        line_ending: file_data.line_ending,
                     },
                     Err(e) => rpc_err(request_id, "read_file_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::WriteWorkspaceFile {
+            request_id,
+            cwd,
+            path,
+            content,
+            expected_etag,
+            force,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            let lsp = Arc::clone(&runtime.lsp);
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match write_workspace_file(
+                        &authorized_cwd,
+                        &path,
+                        &content,
+                        expected_etag.as_deref(),
+                        force,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            if outcome.conflict.is_none() {
+                                symbol_index.invalidate(&authorized_cwd);
+                                let lsp_cwd = authorized_cwd.clone();
+                                let lsp_path = path.clone();
+                                let lsp_content = content.clone();
+                                tokio::spawn(async move {
+                                    lsp.notify_file_saved(&lsp_cwd, &lsp_path, &lsp_content)
+                                        .await;
+                                });
+                                let hook_cwd = authorized_cwd.clone();
+                                let hook_path = path.clone();
+                                let hook_payload = serde_json::json!({
+                                    "event": "post_file_edit",
+                                    "cwd": hook_cwd.to_string_lossy().to_string(),
+                                    "path": &hook_path,
+                                    "source": "workspace_editor",
+                                });
+                                tokio::spawn(async move {
+                                    let _ = hooks
+                                        .dispatch_event(
+                                            orbit_protocol::HookEventKind::PostFileEdit,
+                                            Some(&hook_cwd),
+                                            Some(&hook_path),
+                                            hook_payload,
+                                        )
+                                        .await;
+                                });
+                            }
+                            WireMessage::WorkspaceFileWritten {
+                                request_id,
+                                cwd,
+                                path,
+                                etag: outcome.etag,
+                                size_bytes: outcome.size_bytes,
+                                mtime_unix_ms: outcome.mtime_unix_ms,
+                                conflict: outcome.conflict,
+                            }
+                        }
+                        Err(e) => rpc_err(request_id, "write_file_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "write_file_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::CreateWorkspaceEntry {
+            request_id,
+            cwd,
+            path,
+            is_dir,
+            initial_content,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match create_workspace_entry(
+                        &authorized_cwd,
+                        &path,
+                        is_dir,
+                        initial_content.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            symbol_index.invalidate(&authorized_cwd);
+                            WireMessage::WorkspaceEntryMutated {
+                                request_id,
+                                cwd,
+                                path: outcome.path,
+                                new_path: outcome.new_path,
+                                action: outcome.action,
+                            }
+                        }
+                        Err(e) => rpc_err(request_id, "create_entry_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "create_entry_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::RenameWorkspaceEntry {
+            request_id,
+            cwd,
+            old_path,
+            new_path,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match rename_workspace_entry(&authorized_cwd, &old_path, &new_path).await {
+                            Ok(outcome) => {
+                                symbol_index.invalidate(&authorized_cwd);
+                                WireMessage::WorkspaceEntryMutated {
+                                    request_id,
+                                    cwd,
+                                    path: outcome.path,
+                                    new_path: outcome.new_path,
+                                    action: outcome.action,
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, "rename_entry_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "rename_entry_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteWorkspaceEntry {
+            request_id,
+            cwd,
+            path,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match delete_workspace_entry(&authorized_cwd, &path).await {
+                            Ok(outcome) => {
+                                symbol_index.invalidate(&authorized_cwd);
+                                WireMessage::WorkspaceEntryMutated {
+                                    request_id,
+                                    cwd,
+                                    path: outcome.path,
+                                    new_path: outcome.new_path,
+                                    action: outcome.action,
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, "delete_entry_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "delete_entry_denied", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
@@ -1451,6 +2036,7 @@ async fn handle_wire_rpc(
             provider,
             model,
             effort,
+            fast_mode,
             mode,
             initial_prompt,
             initial_display_prompt,
@@ -1469,6 +2055,7 @@ async fn handle_wire_rpc(
             branch,
             handle,
             auto_cluster,
+            acp_agent_id,
         } => {
             let mut reserved_key: Option<String> = None;
             if let Some(ref idem) = idempotency_key
@@ -1478,7 +2065,9 @@ async fn handle_wire_rpc(
                     "cwd": cwd,
                     "title": title,
                     "provider": provider,
+                    "acp_agent_id": acp_agent_id,
                     "model": model,
+                    "fast_mode": fast_mode,
                     "mode": mode,
                     "initial_prompt": initial_prompt,
                     "worktree": worktree,
@@ -1529,6 +2118,7 @@ async fn handle_wire_rpc(
                     provider,
                     model,
                     effort,
+                    fast_mode,
                     mode,
                     initial_prompt,
                     initial_display_prompt,
@@ -1546,6 +2136,7 @@ async fn handle_wire_rpc(
                     pr_number: None,
                     handle,
                     auto_cluster,
+                    acp_agent_id,
                 })
                 .await
             {
@@ -1587,6 +2178,41 @@ async fn handle_wire_rpc(
                 }
             }
         }
+        WireMessage::ForkAgent {
+            request_id,
+            source_agent_id,
+            up_to_seq,
+            target,
+            title,
+            initial_prompt,
+        } => match runtime
+            .orchestrator
+            .fork_agent(crate::manager::ForkAgentSpec {
+                source_agent_id,
+                up_to_seq,
+                target,
+                title,
+                initial_prompt,
+            })
+            .await
+        {
+            Ok(outcome) => {
+                subscribed_agents.insert(outcome.agent.agent_id.clone());
+                Some(WireMessage::AgentForked {
+                    request_id,
+                    agent: outcome.agent,
+                    workspace: outcome.workspace,
+                })
+            }
+            Err(e) => {
+                let err_code = if e.to_string().contains("not_a_git_repo") {
+                    "not_a_git_repo"
+                } else {
+                    "fork_agent_failed"
+                };
+                Some(rpc_err(request_id, err_code, e))
+            }
+        },
         WireMessage::SendPrompt {
             request_id,
             agent_id,
@@ -1816,9 +2442,10 @@ async fn handle_wire_rpc(
             provider,
             model,
             effort,
+            acp_agent_id,
         } => match runtime
             .orchestrator
-            .switch_agent_provider(&agent_id, provider, model, effort)
+            .switch_agent_provider(&agent_id, provider, model, effort, acp_agent_id)
             .await
         {
             Ok(()) => Some(WireMessage::Ack { request_id }),
@@ -1898,6 +2525,7 @@ async fn handle_wire_rpc(
             title,
             model,
             effort,
+            fast_mode,
             mode,
             labels,
             handle,
@@ -1909,6 +2537,7 @@ async fn handle_wire_rpc(
                 title,
                 model,
                 effort,
+                fast_mode,
                 mode,
                 labels,
                 handle,
@@ -2312,6 +2941,1707 @@ async fn handle_wire_rpc(
             Err(e) => Some(rpc_err(request_id, "delete_profile_failed", e)),
         },
 
+        // Universal ACP Agent Registry & Live Probing
+        WireMessage::ListAcpAgents { request_id } => {
+            let home = runtime.home_dir.clone();
+            match tokio::task::spawn_blocking(move || orbit_providers::list_acp_agents(&home)).await
+            {
+                Ok(agents) => Some(WireMessage::AcpAgentsSnapshot {
+                    request_id,
+                    agents,
+                    warning: None,
+                }),
+                Err(e) => Some(rpc_err(request_id, "list_acp_agents_failed", e)),
+            }
+        }
+        WireMessage::UpsertCustomAcpAgent { request_id, spec } => {
+            let home = runtime.home_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                orbit_providers::upsert_custom_acp_agent(&home, spec)?;
+                Ok::<_, String>(orbit_providers::list_acp_agents(&home))
+            })
+            .await
+            {
+                Ok(Ok(agents)) => {
+                    let _ = runtime
+                        .orchestrator
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AcpAgentsUpdated(agents.clone()));
+                    Some(WireMessage::AcpAgentsSnapshot {
+                        request_id,
+                        agents,
+                        warning: None,
+                    })
+                }
+                Ok(Err(e)) => Some(rpc_err(request_id, "upsert_acp_agent_failed", e)),
+                Err(e) => Some(rpc_err(request_id, "upsert_acp_agent_failed", e)),
+            }
+        }
+        WireMessage::DeleteCustomAcpAgent {
+            request_id,
+            agent_id,
+        } => {
+            let home = runtime.home_dir.clone();
+            let id_for_task = agent_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                let removed = orbit_providers::delete_custom_acp_agent(&home, &id_for_task)?;
+                Ok::<_, String>((removed, orbit_providers::list_acp_agents(&home)))
+            })
+            .await
+            {
+                Ok(Ok((true, agents))) => {
+                    let _ = runtime
+                        .orchestrator
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AcpAgentsUpdated(agents.clone()));
+                    Some(WireMessage::AcpAgentsSnapshot {
+                        request_id,
+                        agents,
+                        warning: None,
+                    })
+                }
+                Ok(Ok((false, _))) => Some(rpc_err(
+                    request_id,
+                    "not_found",
+                    format!("custom ACP agent `{agent_id}` not found"),
+                )),
+                Ok(Err(e)) => Some(rpc_err(request_id, "delete_acp_agent_failed", e)),
+                Err(e) => Some(rpc_err(request_id, "delete_acp_agent_failed", e)),
+            }
+        }
+        WireMessage::TestAcpAgent {
+            request_id,
+            agent_id,
+            cwd,
+        } => {
+            let home = runtime.home_dir.clone();
+            let id_clone = agent_id.clone();
+            let spec_opt = tokio::task::spawn_blocking(move || {
+                orbit_providers::get_acp_agent_spec(&home, &id_clone)
+            })
+            .await
+            .ok()
+            .flatten();
+            let result = match spec_opt {
+                Some(spec) => {
+                    let cwd_path = cwd
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(expand_host_path);
+                    orbit_providers::probe_acp_agent(&spec, cwd_path.as_deref()).await
+                }
+                None => orbit_protocol::AcpProbeResult {
+                    agent_id,
+                    ok: false,
+                    protocol_version: None,
+                    server_name: None,
+                    server_version: None,
+                    capabilities_summary: Vec::new(),
+                    auth_methods: Vec::new(),
+                    latency_ms: 0,
+                    error: Some("ACP agent not found in registry on this host".to_string()),
+                },
+            };
+            Some(WireMessage::AcpAgentProbeResult { request_id, result })
+        }
+        WireMessage::RefreshAcpRegistry {
+            request_id,
+            registry_url,
+        } => {
+            match orbit_providers::refresh_acp_registry(&runtime.home_dir, registry_url.as_deref())
+                .await
+            {
+                Ok((agents, warning)) => {
+                    let _ = runtime
+                        .orchestrator
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AcpAgentsUpdated(agents.clone()));
+                    Some(WireMessage::AcpAgentsSnapshot {
+                        request_id,
+                        agents,
+                        warning,
+                    })
+                }
+                Err(e) => Some(rpc_err(request_id, "refresh_acp_registry_failed", e)),
+            }
+        }
+
+        // External MCP Server Manager (stdio + Streamable HTTP/SSE + live probe)
+        WireMessage::ListExternalMcpServers { request_id, cwd } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let cache = cache_lock.read().await.clone();
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::mcp_servers::list_external_mcp_servers(
+                        &home,
+                        authorized_cwd.as_deref(),
+                        &cache,
+                    )
+                })
+                .await
+                {
+                    Ok(servers) => WireMessage::ExternalMcpServersSnapshot {
+                        request_id,
+                        servers,
+                    },
+                    Err(e) => rpc_err(request_id, "list_external_mcp_servers_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertExternalMcpServer {
+            request_id,
+            scope,
+            cwd,
+            name,
+            transport,
+            env,
+            headers,
+            keep_existing_secrets,
+            enabled,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let config_lock = Arc::clone(&runtime.mcp_config_lock);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let server_id_to_clear = match scope {
+                orbit_protocol::McpWriteScope::User => format!("orbit_user:{}", name.trim()),
+                orbit_protocol::McpWriteScope::Project => {
+                    format!("project_dot_mcp:{}", name.trim())
+                }
+            };
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let _config_guard = config_lock.lock().await;
+                let cache_key = crate::mcp_servers::probe_cache_key(
+                    &server_id_to_clear,
+                    authorized_cwd.as_deref(),
+                );
+                let mut cache_snapshot = cache_lock.read().await.clone();
+                cache_snapshot.remove(&cache_key);
+                let input = crate::mcp_servers::UpsertExternalMcpInput {
+                    scope,
+                    cwd: authorized_cwd,
+                    name,
+                    transport,
+                    env,
+                    headers,
+                    keep_existing_secrets,
+                    enabled,
+                };
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::mcp_servers::upsert_external_mcp_server(&home, input, &cache_snapshot)
+                })
+                .await
+                {
+                    Ok(Ok(servers)) => {
+                        cache_lock.write().await.remove(&cache_key);
+                        WireMessage::ExternalMcpServersSnapshot {
+                            request_id,
+                            servers,
+                        }
+                    }
+                    Ok(Err(e)) => rpc_err(request_id, "upsert_external_mcp_server_failed", e),
+                    Err(e) => rpc_err(request_id, "upsert_external_mcp_server_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ToggleExternalMcpServer {
+            request_id,
+            server_id,
+            enabled,
+            cwd,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let config_lock = Arc::clone(&runtime.mcp_config_lock);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let _config_guard = config_lock.lock().await;
+                let cache = cache_lock.read().await.clone();
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::mcp_servers::toggle_external_mcp_server(
+                        &home,
+                        &server_id,
+                        enabled,
+                        authorized_cwd.as_deref(),
+                        &cache,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(servers)) => WireMessage::ExternalMcpServersSnapshot {
+                        request_id,
+                        servers,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "toggle_external_mcp_server_failed", e),
+                    Err(e) => rpc_err(request_id, "toggle_external_mcp_server_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteExternalMcpServer {
+            request_id,
+            server_id,
+            cwd,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let config_lock = Arc::clone(&runtime.mcp_config_lock);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let _config_guard = config_lock.lock().await;
+                let cache_key =
+                    crate::mcp_servers::probe_cache_key(&server_id, authorized_cwd.as_deref());
+                let mut cache_snapshot = cache_lock.read().await.clone();
+                cache_snapshot.remove(&cache_key);
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::mcp_servers::delete_external_mcp_server(
+                        &home,
+                        &server_id,
+                        authorized_cwd.as_deref(),
+                        &cache_snapshot,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(servers)) => {
+                        cache_lock.write().await.remove(&cache_key);
+                        WireMessage::ExternalMcpServersSnapshot {
+                            request_id,
+                            servers,
+                        }
+                    }
+                    Ok(Err(e)) => rpc_err(request_id, "delete_external_mcp_server_failed", e),
+                    Err(e) => rpc_err(request_id, "delete_external_mcp_server_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ProbeExternalMcpServer {
+            request_id,
+            server_id,
+            cwd,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let cache_lock = Arc::clone(&runtime.mcp_probe_cache);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let authorized_cwd = match authorize_optional_mcp_cwd(&store, cwd).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, "unauthorized_workspace_cwd", e),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let result = crate::mcp_servers::probe_external_mcp_server(
+                    &home,
+                    &server_id,
+                    authorized_cwd.as_deref(),
+                )
+                .await;
+                let cache_key =
+                    crate::mcp_servers::probe_cache_key(&server_id, authorized_cwd.as_deref());
+                {
+                    let mut guard = cache_lock.write().await;
+                    crate::mcp_servers::insert_probe_cache(&mut guard, cache_key, result.clone());
+                }
+                let reply = WireMessage::ExternalMcpProbeResponse {
+                    request_id,
+                    server_id,
+                    result,
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Pure-Rust LSP Language Server Integration (offloaded async + strict workspace cwd authorization)
+        WireMessage::ListLspServers { request_id, cwd } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match lsp.list_servers(&authorized_cwd).await {
+                        Ok(servers) => WireMessage::LspServersSnapshot {
+                            request_id,
+                            cwd,
+                            servers,
+                        },
+                        Err(e) => rpc_err(request_id, "list_lsp_servers_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspQuerySymbols {
+            request_id,
+            cwd,
+            query,
+            path,
+            limit,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match lsp
+                        .query_symbols(&authorized_cwd, &query, path.as_deref(), limit)
+                        .await
+                    {
+                        Ok(symbols) => WireMessage::LspSymbolsResponse {
+                            request_id,
+                            cwd,
+                            symbols,
+                        },
+                        Err(e) => rpc_err(request_id, "lsp_query_symbols_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspGetDiagnostics {
+            request_id,
+            cwd,
+            path,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp.get_diagnostics(&authorized_cwd, path.as_deref()).await {
+                            Ok(diagnostics) => WireMessage::LspDiagnosticsResponse {
+                                request_id,
+                                cwd,
+                                diagnostics,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_diagnostics_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspGotoDefinition {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp.goto_definition(&authorized_cwd, &path, line, col).await {
+                            Ok(locations) => WireMessage::LspLocationsResponse {
+                                request_id,
+                                cwd,
+                                locations,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_goto_definition_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::RestartLspServer {
+            request_id,
+            cwd,
+            server_id,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp.restart_server(&authorized_cwd, &server_id).await {
+                            Ok(servers) => WireMessage::LspServersSnapshot {
+                                request_id,
+                                cwd,
+                                servers,
+                            },
+                            Err(e) => rpc_err(request_id, "restart_lsp_server_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Early-Wakeup One-Shot Conditional Timers
+        WireMessage::CreateConditionalTimer {
+            request_id,
+            agent_id,
+            duration_seconds,
+            prompt,
+            condition,
+        } => {
+            let timers = Arc::clone(&runtime.conditional_timers);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match timers
+                    .create_timer(&agent_id, duration_seconds, prompt, condition)
+                    .await
+                {
+                    Ok(timer) => WireMessage::ConditionalTimerCreated { request_id, timer },
+                    Err(e) => rpc_err(request_id, "create_conditional_timer_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ListConditionalTimers {
+            request_id,
+            agent_id,
+            include_resolved,
+        } => {
+            let timers = Arc::clone(&runtime.conditional_timers);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    timers.list_timers(agent_id.as_deref(), include_resolved)
+                })
+                .await
+                {
+                    Ok(Ok(timers)) => WireMessage::ConditionalTimersSnapshot { request_id, timers },
+                    Ok(Err(e)) => rpc_err(request_id, "list_conditional_timers_failed", e),
+                    Err(e) => rpc_err(request_id, "list_conditional_timers_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::CancelConditionalTimer {
+            request_id,
+            timer_id,
+        } => {
+            let timers = Arc::clone(&runtime.conditional_timers);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match timers.cancel_timer(&timer_id).await {
+                    Ok(timer) => WireMessage::ConditionalTimerUpdated { request_id, timer },
+                    Err(e) => rpc_err(request_id, "cancel_conditional_timer_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::FireConditionalTimerNow {
+            request_id,
+            timer_id,
+        } => {
+            let timers = Arc::clone(&runtime.conditional_timers);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match timers.fire_timer_now(&timer_id).await {
+                    Ok(timer) => WireMessage::ConditionalTimerUpdated { request_id, timer },
+                    Err(e) => rpc_err(request_id, "fire_conditional_timer_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Guardian AI Risk-Assessment Auto-Approval Policy & Audit Log
+        WireMessage::GetGuardianConfig { request_id } => {
+            let (config, recent_audits) = runtime.orchestrator.guardian.snapshot().await;
+            Some(WireMessage::GuardianConfigSnapshot {
+                request_id,
+                config,
+                recent_audits,
+            })
+        }
+        WireMessage::UpdateGuardianConfig { request_id, config } => {
+            match runtime.orchestrator.guardian.update_config(config).await {
+                Ok((saved, recent_audits)) => Some(WireMessage::GuardianConfigSnapshot {
+                    request_id,
+                    config: saved,
+                    recent_audits,
+                }),
+                Err(e) => Some(rpc_err(request_id, "update_guardian_config_failed", e)),
+            }
+        }
+
+        // Unattended Autonomous Goal Mode & Streaming Monitor Engine
+        WireMessage::StartGoalRun {
+            request_id,
+            agent_id,
+            objective,
+            criteria,
+            verify_command,
+            max_iterations,
+            max_duration_secs,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals
+                    .start_goal(StartGoalSpec {
+                        agent_id,
+                        objective,
+                        criteria,
+                        verify_command,
+                        max_iterations,
+                        max_duration_secs,
+                        dispatch_initial_prompt: true,
+                    })
+                    .await
+                {
+                    Ok(goal) => WireMessage::GoalRunUpdated { request_id, goal },
+                    Err(e) => rpc_err(request_id, "start_goal_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ListGoalRuns {
+            request_id,
+            agent_id,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    goals.list_goals(agent_id.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(goals)) => WireMessage::GoalRunsSnapshot { request_id, goals },
+                    Ok(Err(e)) => rpc_err(request_id, "list_goals_failed", e),
+                    Err(e) => rpc_err(request_id, "list_goals_failed", e.to_string()),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ControlGoalRun {
+            request_id,
+            goal_id,
+            action,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals.control_goal(&goal_id, action).await {
+                    Ok(goal) => WireMessage::GoalRunUpdated { request_id, goal },
+                    Err(e) => rpc_err(request_id, "control_goal_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::StartMonitorWatch {
+            request_id,
+            agent_id,
+            name,
+            kind,
+            expires_in_secs,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals
+                    .start_monitor(StartMonitorSpec {
+                        agent_id,
+                        name,
+                        kind,
+                        expires_in_secs,
+                    })
+                    .await
+                {
+                    Ok(monitor) => WireMessage::MonitorWatchUpdated {
+                        request_id,
+                        monitor,
+                    },
+                    Err(e) => rpc_err(request_id, "start_monitor_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ListMonitorWatches {
+            request_id,
+            agent_id,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    goals.list_monitors(agent_id.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(monitors)) => WireMessage::MonitorWatchesSnapshot {
+                        request_id,
+                        monitors,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "list_monitors_failed", e),
+                    Err(e) => rpc_err(request_id, "list_monitors_failed", e.to_string()),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::StopMonitorWatch {
+            request_id,
+            monitor_id,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals.stop_monitor(&monitor_id).await {
+                    Ok(monitor) => WireMessage::MonitorWatchUpdated {
+                        request_id,
+                        monitor,
+                    },
+                    Err(e) => rpc_err(request_id, "stop_monitor_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Pure-Rust CDP Browser Automation & Guarded Computer Use
+        WireMessage::ListBrowserSessions {
+            request_id,
+            include_screenshots,
+        } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let snap = browser
+                    .list_snapshot_with_options(include_screenshots)
+                    .await;
+                let reply = WireMessage::BrowserSessionsSnapshot {
+                    request_id,
+                    sessions: snap.sessions,
+                    policy: snap.policy,
+                    chrome_binary: snap.chrome_binary,
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::CreateBrowserSession {
+            request_id,
+            agent_id,
+            initial_url,
+            headless,
+            viewport_width,
+            viewport_height,
+        } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match browser
+                    .create_session(CreateBrowserSessionSpec {
+                        agent_id,
+                        initial_url,
+                        headless,
+                        viewport_width,
+                        viewport_height,
+                    })
+                    .await
+                {
+                    Ok(session) => WireMessage::BrowserSessionUpdated {
+                        request_id,
+                        session,
+                    },
+                    Err(e) => rpc_err(request_id, "create_browser_session_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ExecuteBrowserAction {
+            request_id,
+            session_id,
+            action,
+        } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match browser.execute_action(&session_id, action).await {
+                    Ok(outcome) => WireMessage::BrowserActionResponse {
+                        request_id,
+                        session: outcome.session,
+                        elements: outcome.elements,
+                        screenshot_base64: outcome.screenshot_base64,
+                        text_excerpt: outcome.text_excerpt,
+                        captcha_detected: outcome.captcha_detected,
+                    },
+                    Err(e) => rpc_err(request_id, "execute_browser_action_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::CloseBrowserSession {
+            request_id,
+            session_id,
+        } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match browser.close_session(&session_id).await {
+                    Ok(snap) => WireMessage::BrowserSessionsSnapshot {
+                        request_id,
+                        sessions: snap.sessions,
+                        policy: snap.policy,
+                        chrome_binary: snap.chrome_binary,
+                    },
+                    Err(e) => rpc_err(request_id, "close_browser_session_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::UpdateBrowserPolicy { request_id, policy } => {
+            let browser = Arc::clone(&runtime.browser);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match browser.update_policy(policy).await {
+                    Ok(snap) => WireMessage::BrowserSessionsSnapshot {
+                        request_id,
+                        sessions: snap.sessions,
+                        policy: snap.policy,
+                        chrome_binary: snap.chrome_binary,
+                    },
+                    Err(e) => rpc_err(request_id, "update_browser_policy_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Batch CSV Fan-Out, Programmable DAG Workflows & Best-of-N Parallel Arena
+        WireMessage::StartBatchFanout {
+            request_id,
+            name,
+            cwd,
+            csv_content,
+            prompt_template,
+            provider,
+            model,
+            mode,
+            max_concurrency,
+            isolated_worktree,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows
+                    .start_batch_fanout(StartBatchFanoutSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: None,
+                        csv_content,
+                        prompt_template,
+                        provider,
+                        model,
+                        mode,
+                        max_concurrency,
+                        isolated_worktree,
+                    })
+                    .await
+                {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "start_batch_fanout_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::StartDagWorkflow {
+            request_id,
+            name,
+            cwd,
+            steps,
+            default_provider,
+            default_mode,
+            max_concurrency,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows
+                    .start_dag_workflow(StartDagWorkflowSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: None,
+                        steps,
+                        default_provider,
+                        default_mode,
+                        max_concurrency,
+                    })
+                    .await
+                {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "start_dag_workflow_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::StartBestOfN {
+            request_id,
+            name,
+            cwd,
+            prompt,
+            candidates,
+            mode,
+            verify_command,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows
+                    .start_best_of_n(StartBestOfNSpec {
+                        name,
+                        cwd,
+                        owner_agent_id: None,
+                        prompt,
+                        candidates,
+                        mode,
+                        verify_command,
+                    })
+                    .await
+                {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "start_best_of_n_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ListWorkflowRuns {
+            request_id,
+            include_completed,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    workflows.list_runs(include_completed)
+                })
+                .await
+                {
+                    Ok(Ok(runs)) => WireMessage::WorkflowRunsSnapshot { request_id, runs },
+                    Ok(Err(e)) => rpc_err(request_id, "list_workflow_runs_failed", e),
+                    Err(e) => rpc_err(request_id, "list_workflow_runs_failed", e.to_string()),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::CancelWorkflowRun { request_id, run_id } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows.cancel_run(&run_id).await {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "cancel_workflow_run_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::SelectBestOfNWinner {
+            request_id,
+            run_id,
+            winner_step_id,
+            apply_to_workspace,
+        } => {
+            let workflows = Arc::clone(&runtime.workflows);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match workflows
+                    .select_best_of_n_winner(&run_id, &winner_step_id, apply_to_workspace)
+                    .await
+                {
+                    Ok(run) => WireMessage::WorkflowRunUpdated { request_id, run },
+                    Err(e) => rpc_err(request_id, "select_best_of_n_winner_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // First-Class Artifacts & SEP-1865 MCP Apps (offloaded via spawn_blocking)
+        WireMessage::ListArtifacts {
+            request_id,
+            workspace_id,
+            agent_id,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    orch.list_artifacts(workspace_id.as_deref(), agent_id.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(artifacts)) => WireMessage::ArtifactsSnapshot {
+                        request_id,
+                        artifacts,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "list_artifacts_failed", e),
+                    Err(e) => rpc_err(request_id, "list_artifacts_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GetArtifact {
+            request_id,
+            artifact_id,
+            version,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let id_for_err = artifact_id.clone();
+                let reply = match tokio::task::spawn_blocking(move || {
+                    orch.get_artifact(&artifact_id, version)
+                })
+                .await
+                {
+                    Ok(Ok(Some(artifact))) => WireMessage::ArtifactContent {
+                        request_id,
+                        artifact,
+                    },
+                    Ok(Ok(None)) => rpc_err(
+                        request_id,
+                        "artifact_not_found",
+                        format!("artifact `{id_for_err}` not found"),
+                    ),
+                    Ok(Err(e)) => rpc_err(request_id, "get_artifact_failed", e),
+                    Err(e) => rpc_err(request_id, "get_artifact_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertArtifact {
+            request_id,
+            artifact_id,
+            workspace_id,
+            agent_id,
+            title,
+            kind,
+            language,
+            mime_type,
+            resource_uri,
+            content,
+            summary_note,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    orch.upsert_artifact(orbit_store::UpsertArtifactInput {
+                        artifact_id,
+                        workspace_id,
+                        agent_id,
+                        title,
+                        kind,
+                        language,
+                        mime_type,
+                        resource_uri,
+                        content,
+                        summary_note,
+                    })
+                })
+                .await
+                {
+                    Ok(Ok(artifact)) => WireMessage::ArtifactUpdated {
+                        request_id: Some(request_id),
+                        artifact,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "upsert_artifact_failed", e),
+                    Err(e) => rpc_err(request_id, "upsert_artifact_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteArtifact {
+            request_id,
+            artifact_id,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let id_for_reply = artifact_id.clone();
+                let reply =
+                    match tokio::task::spawn_blocking(move || orch.delete_artifact(&artifact_id))
+                        .await
+                    {
+                        Ok(Ok(true)) => WireMessage::ArtifactDeleted {
+                            request_id: Some(request_id),
+                            artifact_id: id_for_reply,
+                        },
+                        Ok(Ok(false)) => rpc_err(
+                            request_id,
+                            "artifact_not_found",
+                            format!("artifact `{id_for_reply}` not found"),
+                        ),
+                        Ok(Err(e)) => rpc_err(request_id, "delete_artifact_failed", e),
+                        Err(e) => rpc_err(request_id, "delete_artifact_failed", e),
+                    };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Project Instruction Hierarchy Discovery & Atomic Editing
+        WireMessage::ListInstructionFiles { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match discover_instruction_hierarchy(&authorized_cwd).await {
+                            Ok(res) => WireMessage::InstructionFilesSnapshot {
+                                request_id,
+                                cwd,
+                                files: res.files,
+                                total_tokens: res.total_tokens,
+                                merged_preview: res.merged_preview,
+                            },
+                            Err(e) => rpc_err(request_id, e.rpc_code(), e.to_string()),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "instruction_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ReadInstructionFile {
+            request_id,
+            cwd,
+            path,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match read_instruction_file(&authorized_cwd, &path).await
+                    {
+                        Ok(res) => WireMessage::InstructionFileContentResponse {
+                            request_id,
+                            cwd,
+                            path: res.path,
+                            content: res.content,
+                            etag: res.etag,
+                            exists: res.exists,
+                        },
+                        Err(e) => rpc_err(request_id, e.rpc_code(), e.to_string()),
+                    },
+                    Err(e) => rpc_err(request_id, "instruction_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::SaveInstructionFile {
+            request_id,
+            cwd,
+            path,
+            content,
+            expected_etag,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => match save_instruction_file(
+                        &authorized_cwd,
+                        &path,
+                        &content,
+                        expected_etag.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(res) => WireMessage::InstructionFileSavedResponse {
+                            request_id,
+                            cwd,
+                            path: res.path,
+                            etag: res.etag,
+                            size_bytes: res.size_bytes,
+                            approx_tokens: res.approx_tokens,
+                        },
+                        Err(e) => rpc_err(request_id, e.rpc_code(), e.to_string()),
+                    },
+                    Err(e) => rpc_err(request_id, "instruction_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Path-Scoped Glob Rules (.orbit/rules/*.md, .claude/rules/*.md, .cursor/rules/*.mdc)
+        WireMessage::ListPathRules { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let home_dir = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let auth_res = authorize_path_rules_cwd(&store, &cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match tokio::task::spawn_blocking(move || {
+                        crate::rules::discover_path_rules(&home_dir, authorized_cwd.as_deref())
+                    })
+                    .await
+                    {
+                        Ok(snap) => WireMessage::PathRulesSnapshot {
+                            request_id,
+                            cwd,
+                            rules: snap.rules,
+                            total_always_tokens: snap.total_always_tokens,
+                            token_budget_warning: snap.token_budget_warning,
+                        },
+                        Err(e) => rpc_err(request_id, "list_path_rules_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "list_path_rules_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertPathRule {
+            request_id,
+            cwd,
+            scope,
+            name,
+            description,
+            trigger_mode,
+            globs,
+            enabled,
+            body,
+            expected_etag,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let home_dir = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let auth_res = authorize_path_rules_cwd(&store, &cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => {
+                        let spec = crate::rules::UpsertRuleSpec {
+                            scope,
+                            name,
+                            description,
+                            trigger_mode,
+                            globs,
+                            enabled,
+                            body,
+                            expected_etag,
+                        };
+                        match tokio::task::spawn_blocking(move || {
+                            crate::rules::upsert_path_rule(
+                                &home_dir,
+                                authorized_cwd.as_deref(),
+                                &spec,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(snap)) => WireMessage::PathRulesSnapshot {
+                                request_id,
+                                cwd,
+                                rules: snap.rules,
+                                total_always_tokens: snap.total_always_tokens,
+                                token_budget_warning: snap.token_budget_warning,
+                            },
+                            Ok(Err(e)) => rpc_err(request_id, "upsert_path_rule_failed", e),
+                            Err(e) => rpc_err(request_id, "upsert_path_rule_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "upsert_path_rule_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeletePathRule {
+            request_id,
+            cwd,
+            path,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let home_dir = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let auth_res = authorize_path_rules_cwd(&store, &cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match tokio::task::spawn_blocking(move || {
+                        crate::rules::delete_path_rule(&home_dir, authorized_cwd.as_deref(), &path)
+                    })
+                    .await
+                    {
+                        Ok(Ok(snap)) => WireMessage::PathRulesSnapshot {
+                            request_id,
+                            cwd,
+                            rules: snap.rules,
+                            total_always_tokens: snap.total_always_tokens,
+                            token_budget_warning: snap.token_budget_warning,
+                        },
+                        Ok(Err(e)) => rpc_err(request_id, "delete_path_rule_failed", e),
+                        Err(e) => rpc_err(request_id, "delete_path_rule_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "delete_path_rule_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::MatchPathRules {
+            request_id,
+            cwd,
+            active_paths,
+            manual_rule_names,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let home_dir = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let auth_res = authorize_path_rules_cwd(&store, &cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match tokio::task::spawn_blocking(move || {
+                        crate::rules::match_rules_for_workspace(
+                            &home_dir,
+                            authorized_cwd.as_deref(),
+                            &active_paths,
+                            &manual_rule_names,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(res) => WireMessage::MatchedPathRulesResponse {
+                            request_id,
+                            cwd,
+                            matched: res.matched,
+                            injected_markdown: res.injected_markdown,
+                            total_tokens: res.total_tokens,
+                        },
+                        Err(e) => rpc_err(request_id, "match_path_rules_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "match_path_rules_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // Deterministic Lifecycle Hooks (`$ORBIT_HOME/hooks.json` & `<cwd>/.orbit/hooks.json`)
+        WireMessage::ListLifecycleHooks { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = authorize_optional_hooks_cwd(&store, cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => {
+                        match hooks.list_snapshot(authorized_cwd.as_deref()).await {
+                            Ok(snap) => WireMessage::LifecycleHooksSnapshot {
+                                request_id,
+                                hooks: snap.hooks,
+                                recent_executions: snap.recent_executions,
+                                project_hooks_trusted: snap.project_hooks_trusted,
+                            },
+                            Err(e) => rpc_err(request_id, "list_lifecycle_hooks_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "list_lifecycle_hooks_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertLifecycleHook {
+            request_id,
+            cwd,
+            hook,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = authorize_optional_hooks_cwd(&store, cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => {
+                        match hooks.upsert_hook(authorized_cwd.as_deref(), hook).await {
+                            Ok(snap) => WireMessage::LifecycleHooksSnapshot {
+                                request_id,
+                                hooks: snap.hooks,
+                                recent_executions: snap.recent_executions,
+                                project_hooks_trusted: snap.project_hooks_trusted,
+                            },
+                            Err(e) => rpc_err(request_id, "upsert_lifecycle_hook_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "upsert_lifecycle_hook_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteLifecycleHook {
+            request_id,
+            cwd,
+            hook_id,
+            scope,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = authorize_optional_hooks_cwd(&store, cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match hooks
+                        .delete_hook(authorized_cwd.as_deref(), &hook_id, scope)
+                        .await
+                    {
+                        Ok(snap) => WireMessage::LifecycleHooksSnapshot {
+                            request_id,
+                            hooks: snap.hooks,
+                            recent_executions: snap.recent_executions,
+                            project_hooks_trusted: snap.project_hooks_trusted,
+                        },
+                        Err(e) => rpc_err(request_id, "delete_lifecycle_hook_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "delete_lifecycle_hook_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::SetProjectHooksTrust {
+            request_id,
+            cwd,
+            trusted,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = match authorize_optional_hooks_cwd(&store, Some(cwd)).await {
+                    Ok(Some(dir)) => Ok(dir),
+                    Ok(None) => Err(
+                        "A valid workspace directory is required to update project hook trust"
+                            .to_string(),
+                    ),
+                    Err(e) => Err(e),
+                };
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => {
+                        match hooks.set_project_trust(&authorized_cwd, trusted).await {
+                            Ok(snap) => WireMessage::LifecycleHooksSnapshot {
+                                request_id,
+                                hooks: snap.hooks,
+                                recent_executions: snap.recent_executions,
+                                project_hooks_trusted: snap.project_hooks_trusted,
+                            },
+                            Err(e) => rpc_err(request_id, "set_project_hooks_trust_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "set_project_hooks_trust_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::TestLifecycleHook {
+            request_id,
+            cwd,
+            hook_id,
+            sample_payload,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let hooks = Arc::clone(&runtime.hooks);
+            tokio::spawn(async move {
+                let auth_res = authorize_optional_hooks_cwd(&store, cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match hooks
+                        .test_hook(authorized_cwd.as_deref(), &hook_id, sample_payload)
+                        .await
+                    {
+                        Ok(record) => WireMessage::HookTestResultResponse { request_id, record },
+                        Err(e) => rpc_err(request_id, "test_lifecycle_hook_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "test_lifecycle_hook_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // External Event Triggers (GitHub, Slack, Linear, Generic Webhook + GitHub PR Polling)
+        WireMessage::ListEventTriggers { request_id } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let triggers = Arc::clone(&runtime.triggers);
+            tokio::spawn(async move {
+                let reply = match triggers.list_snapshot().await {
+                    Ok(snap) => WireMessage::EventTriggersSnapshot {
+                        request_id,
+                        triggers: snap.triggers,
+                        recent_deliveries: snap.recent_deliveries,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "list_event_triggers_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertEventTrigger {
+            request_id,
+            trigger_id,
+            name,
+            source,
+            event_filters,
+            prompt_template,
+            target,
+            secret,
+            keep_existing_secret,
+            github_poll,
+            github_token,
+            keep_existing_token,
+            enabled,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let triggers = Arc::clone(&runtime.triggers);
+            tokio::spawn(async move {
+                let req = UpsertTriggerRequest {
+                    trigger_id,
+                    name,
+                    source,
+                    event_filters,
+                    prompt_template,
+                    target,
+                    secret,
+                    keep_existing_secret,
+                    github_poll,
+                    github_token,
+                    keep_existing_token,
+                    enabled,
+                };
+                let reply = match triggers.upsert_trigger(req).await {
+                    Ok(snap) => WireMessage::EventTriggersSnapshot {
+                        request_id,
+                        triggers: snap.triggers,
+                        recent_deliveries: snap.recent_deliveries,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "upsert_event_trigger_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteEventTrigger {
+            request_id,
+            trigger_id,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let triggers = Arc::clone(&runtime.triggers);
+            tokio::spawn(async move {
+                let reply = match triggers.delete_trigger(&trigger_id).await {
+                    Ok(snap) => WireMessage::EventTriggersSnapshot {
+                        request_id,
+                        triggers: snap.triggers,
+                        recent_deliveries: snap.recent_deliveries,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "delete_event_trigger_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::TestEventTrigger {
+            request_id,
+            trigger_id,
+            sample_event_type,
+            sample_payload,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let triggers = Arc::clone(&runtime.triggers);
+            tokio::spawn(async move {
+                let reply = match triggers
+                    .test_trigger(&trigger_id, &sample_event_type, sample_payload)
+                    .await
+                {
+                    Ok(delivery) => WireMessage::EventTriggerTestResponse {
+                        request_id,
+                        delivery,
+                    },
+                    Err(e) => rpc_err(request_id, "test_event_trigger_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
         // Schedules & Heartbeats
         WireMessage::ListSchedules {
             request_id,
@@ -2484,12 +4814,19 @@ async fn handle_wire_rpc(
         }
         WireMessage::UpdateOrchestrationConfig { request_id, config } => {
             *runtime.orch_config.write().await = config.clone();
+            runtime
+                .keep_awake
+                .set_enabled(config.keep_awake_while_running);
             let mut persisted = DaemonPersistedConfig::load(&runtime.home_dir);
             persisted.orchestration = config.clone();
             match persisted.save(&runtime.home_dir) {
                 Ok(()) => Some(WireMessage::OrchestrationConfigSnapshot { request_id, config }),
                 Err(e) => Some(rpc_err(request_id, "save_config_failed", e)),
             }
+        }
+        WireMessage::GetKeepAwakeStatus { request_id } => {
+            let status = runtime.keep_awake.status();
+            Some(WireMessage::KeepAwakeStatusSnapshot { request_id, status })
         }
         WireMessage::ListOrchestrationSkills { request_id } => {
             let user_home = resolve_user_home();
@@ -2513,6 +4850,178 @@ async fn handle_wire_rpc(
                     Some(WireMessage::OrchestrationSkillsSnapshot { request_id, skills })
                 }
                 Err(e) => Some(rpc_err(request_id, "sync_skills_failed", e)),
+            }
+        }
+        WireMessage::ListManagedSkills { request_id, cwd } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::list_managed_skills(
+                    &orbit_home,
+                    &user_home,
+                    authorized_cwd.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(skills) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Err(e) => Some(rpc_err(request_id, "list_managed_skills_failed", e)),
+            }
+        }
+        WireMessage::ReadManagedSkill {
+            request_id,
+            skill_id,
+            cwd,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::read_managed_skill(
+                    &orbit_home,
+                    &user_home,
+                    &skill_id,
+                    authorized_cwd.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(outcome)) => Some(WireMessage::ManagedSkillContentResponse {
+                    request_id,
+                    skill_id: outcome.skill_id,
+                    content: outcome.content,
+                    etag: outcome.etag,
+                }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "read_managed_skill_failed", e)),
+            }
+        }
+        WireMessage::UpsertManagedSkill {
+            request_id,
+            scope,
+            cwd,
+            slug,
+            name,
+            description,
+            content,
+            enabled,
+            expected_etag,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            let params = crate::skills_manager::UpsertSkillParams {
+                scope,
+                cwd: authorized_cwd,
+                slug,
+                name,
+                description,
+                content,
+                enabled,
+                expected_etag,
+            };
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::upsert_managed_skill(&orbit_home, &user_home, params)
+            })
+            .await
+            {
+                Ok(Ok(skills)) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "upsert_managed_skill_failed", e)),
+            }
+        }
+        WireMessage::ToggleManagedSkill {
+            request_id,
+            skill_id,
+            enabled,
+            cwd,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::toggle_managed_skill(
+                    &orbit_home,
+                    &user_home,
+                    &skill_id,
+                    enabled,
+                    authorized_cwd.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(skills)) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "toggle_managed_skill_failed", e)),
+            }
+        }
+        WireMessage::DeleteManagedSkill {
+            request_id,
+            skill_id,
+            cwd,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::delete_managed_skill(
+                    &orbit_home,
+                    &user_home,
+                    &skill_id,
+                    authorized_cwd.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(skills)) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "delete_managed_skill_failed", e)),
+            }
+        }
+        WireMessage::ImportManagedSkill {
+            request_id,
+            scope,
+            cwd,
+            source_markdown_or_path,
+            slug_override,
+        } => {
+            let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "skill_permission_denied", e)),
+            };
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            match tokio::task::spawn_blocking(move || {
+                crate::skills_manager::import_managed_skill(
+                    &orbit_home,
+                    &user_home,
+                    scope,
+                    authorized_cwd.as_deref(),
+                    &source_markdown_or_path,
+                    slug_override.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(skills)) => Some(WireMessage::ManagedSkillsSnapshot { request_id, skills }),
+                Ok(Err(e)) => Some(rpc_err(request_id, e.rpc_code(), e)),
+                Err(e) => Some(rpc_err(request_id, "import_managed_skill_failed", e)),
             }
         }
 
@@ -2554,10 +5063,18 @@ async fn handle_wire_rpc(
 
         // Quotas & Provider Model Catalogs (spawned off-loop so slow CLI probes never block RPC or PTY!)
         WireMessage::RefreshQuotas { request_id } => {
+            let rt = Arc::clone(runtime);
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             tokio::spawn(async move {
                 let snapshots = probe_all_provider_quotas().await;
+                let samples = crate::usage::quota_snapshots_to_samples(&snapshots);
+                if !samples.is_empty() {
+                    let store = Arc::clone(&rt.store);
+                    let _ =
+                        tokio::task::spawn_blocking(move || store.record_quota_samples(&samples))
+                            .await;
+                }
                 let _ = tx
                     .send(SessionFrame::Wire {
                         msg: WireMessage::QuotaReport {
@@ -2567,6 +5084,63 @@ async fn handle_wire_rpc(
                         zstd,
                     })
                     .await;
+            });
+            None
+        }
+        WireMessage::GetUsageInsights { request_id, days } => {
+            let store = Arc::clone(&runtime.store);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::usage::build_usage_insights_snapshot(&store, days, chrono::Utc::now())
+                })
+                .await
+                {
+                    Ok(Ok(snapshot)) => WireMessage::UsageInsightsResponse {
+                        request_id,
+                        snapshot,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "usage_insights_failed", e),
+                    Err(e) => rpc_err(request_id, "usage_insights_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GetContextOccupancy {
+            request_id,
+            agent_id,
+        } => {
+            let store = Arc::clone(&runtime.store);
+            let orchestrator = Arc::clone(&runtime.orchestrator);
+            let orbit_home = runtime.home_dir.clone();
+            let user_home = resolve_user_home();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let single_call_prompt = orchestrator
+                    .latest_single_call_prompt_tokens(&agent_id)
+                    .await;
+                let reply = match tokio::task::spawn_blocking(move || {
+                    crate::usage::compute_context_occupancy(
+                        &store,
+                        &orbit_home,
+                        &user_home,
+                        &agent_id,
+                        single_call_prompt,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(breakdown)) => WireMessage::ContextOccupancyResponse {
+                        request_id,
+                        breakdown,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "context_occupancy_failed", e),
+                    Err(e) => rpc_err(request_id, "context_occupancy_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
             None
         }
@@ -2634,7 +5208,10 @@ async fn handle_wire_rpc(
         } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;
+            let keep_awake = runtime.keep_awake.clone();
             let handle = tokio::spawn(async move {
+                let _keep_awake_lease =
+                    keep_awake.acquire_lease(format!("side_question:{request_id}"));
                 let resolved_cwd = expand_host_path(&cwd);
                 let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
                 let forward_tx = tx.clone();
@@ -2692,6 +5269,240 @@ async fn handle_wire_rpc(
             active_side_questions.push(handle.abort_handle());
             None
         }
+
+        // Bidirectional IM Channels (Lark / Feishu, Telegram, Slack, Discord + Remote Approvals)
+        WireMessage::ListImChannels { request_id } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let im = Arc::clone(&runtime.im_channels);
+            tokio::spawn(async move {
+                let reply = match im.list_snapshot().await {
+                    Ok(snap) => WireMessage::ImChannelsSnapshot {
+                        request_id,
+                        channels: snap.channels,
+                        bindings: snap.bindings,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "list_im_channels_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertImChannel {
+            request_id,
+            channel_id,
+            name,
+            platform,
+            enabled,
+            app_id,
+            primary_secret,
+            signing_secret,
+            keep_existing_secrets,
+            allowed_chat_ids,
+            allowed_user_ids,
+            default_workspace_cwd,
+            default_provider,
+            default_mode,
+            forward_approvals,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let im = Arc::clone(&runtime.im_channels);
+            tokio::spawn(async move {
+                let spec = UpsertImChannelSpec {
+                    channel_id,
+                    name,
+                    platform,
+                    enabled,
+                    app_id,
+                    primary_secret,
+                    signing_secret,
+                    keep_existing_secrets,
+                    allowed_chat_ids,
+                    allowed_user_ids,
+                    default_workspace_cwd,
+                    default_provider,
+                    default_mode,
+                    forward_approvals,
+                };
+                let reply = match im.upsert_channel(spec).await {
+                    Ok(snap) => WireMessage::ImChannelsSnapshot {
+                        request_id,
+                        channels: snap.channels,
+                        bindings: snap.bindings,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "upsert_im_channel_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteImChannel {
+            request_id,
+            channel_id,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let im = Arc::clone(&runtime.im_channels);
+            tokio::spawn(async move {
+                let reply = match im.delete_channel(&channel_id).await {
+                    Ok(snap) => WireMessage::ImChannelsSnapshot {
+                        request_id,
+                        channels: snap.channels,
+                        bindings: snap.bindings,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "delete_im_channel_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::TestImChannel {
+            request_id,
+            channel_id,
+            target_chat_id,
+            message,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let im = Arc::clone(&runtime.im_channels);
+            tokio::spawn(async move {
+                let (ok, detail) = im
+                    .test_channel(&channel_id, &target_chat_id, &message)
+                    .await;
+                let reply = WireMessage::ImChannelTestResponse {
+                    request_id,
+                    ok,
+                    detail,
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ListPushDevices { request_id } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || push.list_snapshot()).await {
+                    Ok(Ok(snap)) => WireMessage::PushDevicesSnapshot {
+                        request_id,
+                        devices: snap.devices,
+                        preferences: snap.preferences,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "list_push_devices_failed", e),
+                    Err(e) => rpc_err(request_id, "list_push_devices_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::RegisterPushDevice {
+            request_id,
+            device_id,
+            platform,
+            device_name,
+            device_token,
+            sandbox,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    push.register_device(device_id, platform, device_name, device_token, sandbox)
+                })
+                .await
+                {
+                    Ok(Ok(snap)) => WireMessage::PushDevicesSnapshot {
+                        request_id,
+                        devices: snap.devices,
+                        preferences: snap.preferences,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "register_push_device_failed", e),
+                    Err(e) => rpc_err(request_id, "register_push_device_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UnregisterPushDevice {
+            request_id,
+            device_id,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let reply =
+                    match tokio::task::spawn_blocking(move || push.unregister_device(&device_id))
+                        .await
+                    {
+                        Ok(Ok(snap)) => WireMessage::PushDevicesSnapshot {
+                            request_id,
+                            devices: snap.devices,
+                            preferences: snap.preferences,
+                        },
+                        Ok(Err(e)) => rpc_err(request_id, "unregister_push_device_failed", e),
+                        Err(e) => rpc_err(request_id, "unregister_push_device_failed", e),
+                    };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpdatePushPreferences {
+            request_id,
+            preferences,
+            gateway_auth_token,
+            keep_existing_gateway_token,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    push.update_preferences(
+                        preferences,
+                        gateway_auth_token,
+                        keep_existing_gateway_token,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(snap)) => WireMessage::PushDevicesSnapshot {
+                        request_id,
+                        devices: snap.devices,
+                        preferences: snap.preferences,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "update_push_preferences_failed", e),
+                    Err(e) => rpc_err(request_id, "update_push_preferences_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::TestPushNotification {
+            request_id,
+            device_id,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let res = push.test_push(device_id.as_deref()).await;
+                let reply = WireMessage::PushTestResponse {
+                    request_id,
+                    attempted: res.attempted,
+                    delivered: res.delivered,
+                    detail: res.detail,
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         _ => None,
     }
 }
@@ -2706,14 +5517,14 @@ fn hash_payload(val: &serde_json::Value) -> String {
 pub(crate) fn expand_host_path(raw: &str) -> PathBuf {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        return crate::platform::resolve_user_home_dir().unwrap_or_else(|| PathBuf::from("."));
     }
-    if let Some(rest) = trimmed.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix(r"~\"))
+        && let Some(home) = crate::platform::resolve_user_home_dir()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(rest);
     }
     PathBuf::from(trimmed)
 }
@@ -2811,6 +5622,7 @@ fn rpc_err(request_id: uuid::Uuid, code: &str, message: impl ToString) -> WireMe
 fn hostname_string() -> String {
     std::env::var("HOSTNAME")
         .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| {
             std::fs::read_to_string("/etc/hostname")
                 .ok()
@@ -2824,19 +5636,53 @@ fn shell_single_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
 
+#[allow(dead_code)]
+fn ps_single_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "''"))
+}
+
+#[allow(dead_code)]
+fn build_windows_self_upgrade_ps_script(
+    install_path: &Path,
+    custom_home: Option<&Path>,
+    port: u16,
+    restart_relay: bool,
+) -> String {
+    let exe_q = ps_single_quote(&install_path.to_string_lossy());
+    let home_prefix = match custom_home {
+        Some(h) => format!("'--home', {}, ", ps_single_quote(&h.to_string_lossy())),
+        None => String::new(),
+    };
+    let port_suffix = if port > 0 {
+        format!(", '--port', '{port}'")
+    } else {
+        String::new()
+    };
+    let mut script = format!(
+        "Start-Sleep -Milliseconds 400; & {exe_q} @({home_prefix}'daemon', 'up'{port_suffix}) *>$null"
+    );
+    if restart_relay {
+        script.push_str(&format!(
+            "; & {exe_q} @({home_prefix}'relay', 'up') *>$null"
+        ));
+    }
+    script
+}
+
 fn daemon_release_asset_name() -> anyhow::Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("orbit-cli-macos-arm64"),
         ("linux", "x86_64") => Ok("orbit-cli-linux-x64"),
         ("linux", "aarch64") => Ok("orbit-cli-linux-arm64"),
+        ("windows", "x86_64") => Ok("orbit-windows-x86_64.exe"),
         (os, arch) => anyhow::bail!("Unsupported platform for self-upgrade: {os}/{arch}"),
     }
 }
 
 impl DaemonRuntime {
     /// Download the matching Orbit release binary, verify `--version`, atomically install to
-    /// `~/.local/bin/orbit`, and trigger a detached `orbit daemon up` hot-restart so all
-    /// `orbit shim` agent & PTY sessions stay alive uninterrupted.
+    /// `~/.local/bin/orbit` (or `%USERPROFILE%\.local\bin\orbit.exe` on Windows), and trigger a
+    /// detached `orbit daemon up` hot-restart so all `orbit shim` agent & PTY sessions stay alive.
     pub async fn self_upgrade_and_restart(
         &self,
         target_version: Option<String>,
@@ -2846,17 +5692,26 @@ impl DaemonRuntime {
         let _upgrade_guard = self.upgrade_lock.lock().await;
 
         let asset = daemon_release_asset_name()?;
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("Unable to resolve HOME directory"))?;
-        let install_dir = home.join(".local/bin");
+        let home = crate::platform::resolve_user_home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
+        let install_dir = home.join(".local").join("bin");
         std::fs::create_dir_all(&install_dir)?;
-        let install_path = install_dir.join("orbit");
-        let tmp_path = install_dir.join(format!(
-            "orbit.upgrade.{}.{}",
-            std::process::id(),
-            Uuid::new_v4().simple()
-        ));
+        let exe_name = if cfg!(windows) { "orbit.exe" } else { "orbit" };
+        let install_path = install_dir.join(exe_name);
+        let tmp_name = if cfg!(windows) {
+            format!(
+                "orbit.upgrade.{}.{}.exe",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            )
+        } else {
+            format!(
+                "orbit.upgrade.{}.{}",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            )
+        };
+        let tmp_path = install_dir.join(tmp_name);
 
         let repo = std::env::var("ORBIT_REPO")
             .ok()
@@ -2968,45 +5823,74 @@ impl DaemonRuntime {
             }
         }
 
-        if let Err(e) = std::fs::rename(&tmp_path, &install_path) {
+        if let Err(e) = crate::platform::replace_executable_safely(&tmp_path, &install_path) {
             let _ = std::fs::remove_file(&tmp_path);
             anyhow::bail!("Failed to replace {}: {e}", install_path.display());
         }
 
         let port = *self.listen_port.read().await;
         let default_home = home.join(".orbit");
-        let is_default_home = std::fs::canonicalize(&self.home_dir)
+        let is_default_home = crate::platform::canonicalize_clean(&self.home_dir)
             .unwrap_or_else(|_| self.home_dir.clone())
-            == std::fs::canonicalize(&default_home).unwrap_or(default_home);
+            == crate::platform::canonicalize_clean(&default_home).unwrap_or(default_home);
 
         let restart_relay = detect_running_local_relay(&self.home_dir).await;
-        let restart_script = build_self_upgrade_restart_script(
-            &install_path,
-            if is_default_home {
-                None
-            } else {
-                Some(&self.home_dir)
-            },
-            port,
-            restart_relay,
-        );
+        let custom_home = (!is_default_home).then_some(self.home_dir.as_path());
+        let restart_script =
+            build_self_upgrade_restart_script(&install_path, custom_home, port, restart_relay);
 
         // Persist exact shim frame cursors before launching the hot-restart script so reattached
         // shims resume strictly after the last consumed frame with zero history replay.
         self.orchestrator.flush_all_shim_cursors().await;
 
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &restart_script])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
         #[cfg(unix)]
         {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", &restart_script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+            cmd.spawn()
+                .map_err(|e| anyhow::anyhow!("Failed to spawn daemon hot-restart: {e}"))?;
         }
-        cmd.spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn daemon hot-restart: {e}"))?;
+        #[cfg(windows)]
+        {
+            let _ = restart_script;
+            use std::os::windows::process::CommandExt;
+            // Delay 400ms in a detached background PowerShell helper so the current RPC ack flushes
+            // cleanly over WebSocket/Relay before `orbit.exe daemon up` restarts the daemon (and
+            // optionally `orbit.exe relay up`), matching Unix hot-upgrade behavior.
+            let ps_script = build_windows_self_upgrade_ps_script(
+                &install_path,
+                custom_home,
+                port,
+                restart_relay,
+            );
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &ps_script,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(
+                crate::platform::WIN_CREATE_NEW_PROCESS_GROUP
+                    | crate::platform::WIN_CREATE_NO_WINDOW,
+            );
+            cmd.spawn()
+                .map_err(|e| anyhow::anyhow!("Failed to spawn Windows daemon hot-restart: {e}"))?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = restart_script;
+        }
 
         tracing::info!(
             install_path = %install_path.display(),
@@ -3102,9 +5986,325 @@ fn is_valid_release_semver(ver: &str) -> bool {
     true
 }
 
+async fn authorize_optional_skills_cwd(
+    store: &Arc<OrbitStore>,
+    cwd: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(raw) = cwd else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "~" {
+        return Ok(None);
+    }
+    let expanded = expand_host_path(trimmed);
+    let canonical = authorize_workspace_mutation_cwd(store, &expanded).await?;
+    Ok(Some(canonical.to_string_lossy().to_string()))
+}
+
+/// Authorize `cwd` for Path Rules RPCs:
+/// - Empty or `"~"` maps to `Ok(None)` (`UserGlobal`-only `~/.orbit/rules/*.md`).
+/// - Any other path MUST pass `authorize_workspace_mutation_cwd` BEFORE any filesystem access.
+async fn authorize_path_rules_cwd(
+    store: &Arc<OrbitStore>,
+    raw_cwd: &str,
+) -> Result<Option<PathBuf>, String> {
+    let trimmed = raw_cwd.trim();
+    if trimmed.is_empty() || trimmed == "~" {
+        return Ok(None);
+    }
+    let resolved = expand_host_path(trimmed);
+    authorize_workspace_mutation_cwd(store, &resolved)
+        .await
+        .map(Some)
+}
+
+/// Verify that a workspace mutation `cwd` is strictly contained within (equals or is a
+/// subdirectory of) a registered workspace, agent `cwd`, synced host project directory, or
+/// discovered project root on this host — preventing mutations in arbitrary host directories
+/// such as `~/.ssh`, `$HOME`, `/`, or `/etc`.
+pub(crate) async fn authorize_workspace_mutation_cwd(
+    store: &Arc<OrbitStore>,
+    resolved_cwd: &Path,
+) -> Result<PathBuf, String> {
+    let store_owned = Arc::clone(store);
+    let cwd_owned = resolved_cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        authorize_workspace_mutation_cwd_sync(&store_owned, &cwd_owned)
+    })
+    .await
+    .map_err(|_| "Workspace authorization task cancelled".to_string())?
+}
+
+/// Authorize an optional External MCP workspace `cwd` against registered/discovered host
+/// workspaces, rejecting raw `..` segments or arbitrary directories outside registered projects.
+async fn authorize_optional_mcp_cwd(
+    store: &Arc<OrbitStore>,
+    cwd: Option<String>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let expanded = expand_host_path(raw);
+    if expanded
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("Workspace path must not contain `..` traversal segments".to_string());
+    }
+    let authorized = authorize_workspace_mutation_cwd(store, &expanded).await?;
+    Ok(Some(authorized))
+}
+
+/// Authorize an optional Lifecycle Hooks workspace `cwd` against registered/discovered host
+/// workspaces (`None`, `""`, or `"~"` maps to user-global hooks only).
+async fn authorize_optional_hooks_cwd(
+    store: &Arc<OrbitStore>,
+    cwd: Option<String>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "~")
+    else {
+        return Ok(None);
+    };
+    let expanded = expand_host_path(raw);
+    if expanded
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("Workspace path must not contain `..` traversal segments".to_string());
+    }
+    let authorized = authorize_workspace_mutation_cwd(store, &expanded).await?;
+    Ok(Some(authorized))
+}
+
+fn authorize_workspace_mutation_cwd_sync(
+    store: &OrbitStore,
+    resolved_cwd: &Path,
+) -> Result<PathBuf, String> {
+    let canon_cwd = canonicalize_workspace_root(resolved_cwd)?;
+    let mut candidate_roots: Vec<String> = Vec::new();
+
+    if let Ok(workspaces) = store.list_workspaces() {
+        for ws in workspaces {
+            candidate_roots.push(ws.cwd);
+            if let Some(root) = ws.project_root {
+                candidate_roots.push(root);
+            }
+            if let Some(src) = ws.source_cwd {
+                candidate_roots.push(src);
+            }
+        }
+    }
+    if let Ok(agents) = store.list_agents(None) {
+        for ag in agents {
+            candidate_roots.push(ag.cwd);
+        }
+    }
+    if let Ok(sync_state) = store.get_host_sync_state() {
+        for proj in sync_state.projects {
+            candidate_roots.extend(proj.directories);
+        }
+    }
+    for dp in crate::discovery::discover_host_projects(store) {
+        candidate_roots.push(dp.path);
+    }
+
+    for raw_root in candidate_roots {
+        let trimmed = raw_root.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let expanded = expand_host_path(trimmed);
+        // `canonicalize_workspace_root` automatically filters out `/`, `$HOME`, `.git`, and missing dirs.
+        if let Ok(canon_root) = canonicalize_workspace_root(&expanded)
+            && (canon_cwd == canon_root || canon_cwd.starts_with(&canon_root))
+        {
+            return Ok(canon_cwd);
+        }
+    }
+
+    Err(format!(
+        "Workspace `{}` is not a registered or discovered project directory on this host",
+        canon_cwd.display()
+    ))
+}
+
 #[cfg(test)]
 mod self_upgrade_tests {
     use super::*;
+
+    #[test]
+    fn authorize_workspace_mutation_cwd_allows_registered_and_rejects_unregistered() {
+        let root = std::env::temp_dir().join(format!("orbit_auth_cwd_{}", Uuid::new_v4()));
+        let registered = root.join("proj_a");
+        let nested = registered.join("packages/web");
+        let unregistered = root.join("unregistered_secret");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+        std::fs::create_dir_all(registered.join(".git")).expect("mkdir .git");
+
+        let db_path = root.join("orbit.db");
+        let store = OrbitStore::open(&db_path).expect("open store");
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "proj_a".into(),
+                name: "Project A".into(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert project");
+
+        assert!(authorize_workspace_mutation_cwd_sync(&store, &registered).is_ok());
+        assert!(authorize_workspace_mutation_cwd_sync(&store, &nested).is_ok());
+        assert!(authorize_workspace_mutation_cwd_sync(&store, &unregistered).is_err());
+        assert!(authorize_workspace_mutation_cwd_sync(&store, &registered.join(".git")).is_err());
+        assert!(authorize_workspace_mutation_cwd_sync(&store, Path::new("/")).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn search_workspace_symbols_authorization_denies_unregistered_and_allows_registered() {
+        let root = std::env::temp_dir().join(format!("orbit_sym_auth_{}", Uuid::new_v4()));
+        let registered = root.join("repo_ok");
+        let unregistered = root.join("repo_unregistered");
+        std::fs::create_dir_all(&registered).expect("mkdir registered");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+        std::fs::write(registered.join("lib.rs"), "pub fn authorized_symbol() {}\n")
+            .expect("write lib.rs");
+        std::fs::write(
+            unregistered.join("secret.rs"),
+            "pub fn forbidden_symbol() {}\n",
+        )
+        .expect("write secret.rs");
+
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "repo_ok".into(),
+                name: "Repo OK".into(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert project");
+
+        let index = WorkspaceSymbolIndex::new();
+        assert!(
+            authorize_workspace_mutation_cwd(&store, &unregistered)
+                .await
+                .is_err()
+        );
+        let auth_dir = authorize_workspace_mutation_cwd(&store, &registered)
+            .await
+            .expect("registered project authorized");
+        let res = index
+            .search(&auth_dir, "authorized", 10)
+            .await
+            .expect("search authorized dir");
+        assert_eq!(res.symbols.len(), 1);
+        assert_eq!(res.symbols[0].name, "authorized_symbol");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn authorize_optional_mcp_cwd_allows_none_and_registered_and_rejects_unregistered() {
+        let root = std::env::temp_dir().join(format!("orbit_mcp_auth_cwd_{}", Uuid::new_v4()));
+        let registered = root.join("proj_mcp");
+        let unregistered = root.join("outside_mcp");
+        std::fs::create_dir_all(&registered).expect("mkdir registered");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "proj_mcp".into(),
+                name: "MCP Project".into(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert project");
+
+        assert!(
+            authorize_optional_mcp_cwd(&store, None)
+                .await
+                .expect("none")
+                .is_none()
+        );
+        assert!(
+            authorize_optional_mcp_cwd(&store, Some("   ".into()))
+                .await
+                .expect("blank")
+                .is_none()
+        );
+        assert!(
+            authorize_optional_mcp_cwd(&store, Some(registered.to_string_lossy().to_string()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            authorize_optional_mcp_cwd(&store, Some(unregistered.to_string_lossy().to_string()))
+                .await
+                .is_err()
+        );
+        let traversal = format!("{}/../proj_mcp", registered.display());
+        assert!(
+            authorize_optional_mcp_cwd(&store, Some(traversal))
+                .await
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn authorize_path_rules_cwd_maps_global_and_rejects_unregistered_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "orbit-auth-rules-cwd-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let registered = root.join("registered");
+        let unregistered = root.join("unregistered");
+        std::fs::create_dir_all(&registered).expect("mkdir registered");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "proj_r".into(),
+                name: "Project R".into(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert project");
+
+        assert_eq!(authorize_path_rules_cwd(&store, "").await, Ok(None));
+        assert_eq!(authorize_path_rules_cwd(&store, "~").await, Ok(None));
+        assert!(
+            authorize_path_rules_cwd(&store, &registered.to_string_lossy())
+                .await
+                .expect("registered cwd allowed")
+                .is_some()
+        );
+        assert!(
+            authorize_path_rules_cwd(&store, &unregistered.to_string_lossy())
+                .await
+                .is_err()
+        );
+        assert!(authorize_path_rules_cwd(&store, "/").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn parse_relay_port_from_json_reads_listen_addr() {
@@ -3131,5 +6331,226 @@ mod self_upgrade_tests {
             build_self_upgrade_restart_script(bin, Some(Path::new("/tmp/o home")), 7474, true);
         assert!(with_relay.contains("--home '/tmp/o home' daemon up --port 7474"));
         assert!(with_relay.contains("relay up >/dev/null 2>&1 || true"));
+    }
+
+    #[tokio::test]
+    async fn websocket_48mib_frame_limit_roundtrips_18mib_binary_payload() {
+        use axum::{Router, extract::ws::WebSocketUpgrade, routing::get};
+        use futures_util::{SinkExt, StreamExt};
+        use orbit_relay_transport::RelayConnector;
+
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async move {
+                ws.max_frame_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+                    .max_message_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+                    .on_upgrade(|mut socket| async move {
+                        if let Some(Ok(axum::extract::ws::Message::Binary(data))) =
+                            socket.recv().await
+                        {
+                            let _ = socket.send(axum::extract::ws::Message::Binary(data)).await;
+                        }
+                    })
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let connector = RelayConnector::connect(&format!("ws://127.0.0.1:{}", addr.port()))
+            .await
+            .expect("connect");
+        let mut client_ws = connector.open_ws("/ws").await.expect("connect ws");
+
+        // 18 MiB exceeds the default 16 MiB Axum/tungstenite frame cap and must round-trip cleanly.
+        let payload_len = 18 * 1024 * 1024;
+        let payload = vec![0x5Au8; payload_len];
+        client_ws
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                payload.into(),
+            ))
+            .await
+            .expect("send 18 MiB frame");
+
+        let reply = client_ws
+            .next()
+            .await
+            .expect("echo frame present")
+            .expect("echo frame ok");
+        match reply {
+            tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                assert_eq!(bytes.len(), payload_len);
+                assert_eq!(bytes[0], 0x5A);
+                assert_eq!(bytes[payload_len - 1], 0x5A);
+            }
+            other => panic!("expected binary echo frame, got {other:?}"),
+        }
+
+        server.abort();
+    }
+
+    #[test]
+    fn concise_wire_decode_error_strips_enum_variant_dump_and_caps_at_240_chars() {
+        let giant_variants: String = (0..100)
+            .map(|i| format!("`variant_name_{i:03}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let raw_err = format!(
+            "unknown variant `FutureClientFeature`, expected one of {giant_variants} at line 1 column 28"
+        );
+        assert!(raw_err.len() > 2000);
+        let summary = format_concise_wire_decode_error(&raw_err);
+        assert!(
+            summary.len() <= 240,
+            "summary must be <= 240 bytes, got {}",
+            summary.len()
+        );
+        assert!(summary.contains("FutureClientFeature"));
+        assert!(!summary.contains("variant_name_050"));
+
+        let long_generic = "解码错误: ".to_string() + &"a".repeat(500);
+        let truncated = format_concise_wire_decode_error(&long_generic);
+        assert!(truncated.len() <= 240);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn authorize_optional_skills_cwd_enforces_workspace_boundary() {
+        let base =
+            std::env::temp_dir().join(format!("orbit_skills_cwd_auth_{}", Uuid::new_v4().simple()));
+        let registered = base.join("registered_repo");
+        let unregistered = base.join("unregistered_dir");
+        std::fs::create_dir_all(&registered).expect("mkdir registered");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+        let store = Arc::new(OrbitStore::open(base.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "ws-skills-test".to_string(),
+                name: "Skills Test".to_string(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("insert host project");
+
+        // None / empty / "~" map cleanly to None (user-only scope)
+        assert_eq!(
+            authorize_optional_skills_cwd(&store, None)
+                .await
+                .expect("none ok"),
+            None
+        );
+        assert_eq!(
+            authorize_optional_skills_cwd(&store, Some("  ".to_string()))
+                .await
+                .expect("empty ok"),
+            None
+        );
+        assert_eq!(
+            authorize_optional_skills_cwd(&store, Some("~".to_string()))
+                .await
+                .expect("tilde ok"),
+            None
+        );
+
+        // Registered workspace directory is authorized
+        let ok_cwd =
+            authorize_optional_skills_cwd(&store, Some(registered.to_string_lossy().to_string()))
+                .await
+                .expect("registered cwd authorized");
+        assert!(ok_cwd.is_some());
+
+        // Root `/`, `$HOME`, `~/.ssh`, and unregistered directories MUST be rejected
+        assert!(
+            authorize_optional_skills_cwd(&store, Some("/".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(
+            authorize_optional_skills_cwd(&store, Some("~/.ssh".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(
+            authorize_optional_skills_cwd(
+                &store,
+                Some(unregistered.to_string_lossy().to_string()),
+            )
+            .await
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn lsp_mcp_tools_reject_unregistered_host_cwd() {
+        let home = std::env::temp_dir().join(format!("orbit-lsp-auth-home-{}", Uuid::new_v4()));
+        let rogue_dir =
+            std::env::temp_dir().join(format!("orbit-lsp-auth-rogue-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&rogue_dir).expect("create rogue");
+        std::fs::write(rogue_dir.join("main.rs"), "fn main() {}\n").expect("write rs");
+
+        let runtime = DaemonRuntime::bootstrap(&home)
+            .await
+            .expect("bootstrap daemon");
+
+        for (tool, args) in [
+            (
+                "lsp_diagnostics",
+                serde_json::json!({ "cwd": rogue_dir.to_string_lossy(), "path": "main.rs" }),
+            ),
+            (
+                "lsp_symbols",
+                serde_json::json!({ "cwd": rogue_dir.to_string_lossy(), "query": "main" }),
+            ),
+            (
+                "lsp_goto_definition",
+                serde_json::json!({
+                    "cwd": rogue_dir.to_string_lossy(),
+                    "path": "main.rs",
+                    "line": 1,
+                    "col": 4
+                }),
+            ),
+        ] {
+            let res = crate::tools::execute_tool(&runtime, None, tool, args).await;
+            assert!(
+                res.is_error,
+                "expected `{tool}` to reject unregistered cwd, got: {}",
+                res.text
+            );
+            assert!(
+                res.text.contains("not a registered or discovered project"),
+                "unexpected error text for `{tool}`: {}",
+                res.text
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&rogue_dir);
+    }
+
+    #[test]
+    fn windows_self_upgrade_ps_script_delays_and_handles_custom_home_and_relay() {
+        let exe = Path::new(r"C:\Users\O'Connor\.local\bin\orbit.exe");
+        let default_script = build_windows_self_upgrade_ps_script(exe, None, 17890, false);
+        assert!(default_script.starts_with("Start-Sleep -Milliseconds 400; "));
+        assert!(default_script.contains(r"'C:\Users\O''Connor\.local\bin\orbit.exe'"));
+        assert!(default_script.contains("@('daemon', 'up', '--port', '17890')"));
+        assert!(!default_script.contains("'relay', 'up'"));
+
+        let custom_home = Path::new(r"C:\Orbit's Home");
+        let full_script = build_windows_self_upgrade_ps_script(exe, Some(custom_home), 0, true);
+        assert!(full_script.contains(r"'--home', 'C:\Orbit''s Home', 'daemon', 'up'"));
+        assert!(!full_script.contains("'--port'"));
+        assert!(full_script.contains(r"'--home', 'C:\Orbit''s Home', 'relay', 'up'"));
     }
 }

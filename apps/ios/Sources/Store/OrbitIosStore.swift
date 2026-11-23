@@ -1567,6 +1567,7 @@ public final class OrbitIosStore: ObservableObject {
             providerLabel: "Claude Code",
             model: "claude-sonnet-4-6",
             effort: .high,
+            fastMode: false,
             mode: .acceptEdits,
             statusLabel: "Working",
             isRunning: true,
@@ -1579,6 +1580,9 @@ public final class OrbitIosStore: ObservableObject {
             clusterSuggestion: nil,
             worktreeBranch: "feat/ios-parity",
             taskSummary: "Verifying markdown rendering & queue reorder",
+            forkedFromAgentId: nil,
+            forkedAtSeq: nil,
+            acpAgentId: nil,
             attentionLabel: nil,
             latestSeq: 22,
             updatedAtRfc3339: "2026-11-22T06:00:00Z",
@@ -1623,7 +1627,13 @@ public final class OrbitIosStore: ObservableObject {
             gitReposByCwd: [:],
             workspaceBoards: [:],
             workspaceEvents: [:],
-            workspaceOrganizeStatus: [:]
+            workspaceOrganizeStatus: [:],
+            acpAgents: [],
+            artifacts: [],
+            conditionalTimers: [],
+            goalRuns: [],
+            monitorWatches: [],
+            workflowRuns: []
         )
         hosts = [demoHost]
         hostDetailsByHostId[demoHostId] = demoDetail
@@ -2605,7 +2615,8 @@ public final class OrbitIosStore: ObservableObject {
                     agentId: aid,
                     provider: provider,
                     model: selectedModel,
-                    effort: selectedEffort
+                    effort: selectedEffort,
+                    acpAgentId: nil
                 )
             } else {
                 core?.setAgentConfig(
@@ -3415,8 +3426,10 @@ public final class OrbitIosStore: ObservableObject {
                 cwd: effectiveCwd,
                 extraDirs: activeExtraDirs,
                 provider: selectedProvider,
+                acpAgentId: nil,
                 model: selectedModel,
                 effort: selectedEffort,
+                fastMode: nil,
                 mode: selectedMode,
                 initialPrompt: composed.wirePrompt,
                 initialDisplayPrompt: composed.displayPrompt,
@@ -3906,6 +3919,7 @@ public final class OrbitIosStore: ObservableObject {
     public static func sessionModeFromRaw(_ raw: String) -> FfiSessionMode {
         switch raw.lowercased() {
         case "default", "ask": return .default
+        case "auto", "guardian": return .auto
         case "full_access", "full": return .fullAccess
         default: return .acceptEdits
         }
@@ -3915,6 +3929,7 @@ public final class OrbitIosStore: ObservableObject {
         switch OrbitFormatters.normalizePermissionMode(mode) {
         case .default, .plan, .custom: return "default"
         case .acceptEdits: return "accept_edits"
+        case .auto: return "auto"
         case .fullAccess: return "full_access"
         }
     }
@@ -4291,8 +4306,10 @@ public final class OrbitIosStore: ObservableObject {
             cwd: cwd,
             extraDirs: activeExtraDirs,
             provider: provider,
+            acpAgentId: nil,
             model: model,
             effort: effort,
+            fastMode: nil,
             mode: mode,
             initialPrompt: initialPrompt,
             worktreeBranch: useWorktree ? "auto" : nil,
@@ -4809,7 +4826,7 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Fleet Daemon Version & One-Click Over-the-Wire Update
 
     public var appShortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.8.4"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.9.1"
     }
 
     public func isHostProtocolBehind(_ host: FfiHostCard) -> Bool {
@@ -4947,8 +4964,10 @@ public final class OrbitIosStore: ObservableObject {
             cwd: cwd,
             workspaceId: activeWorkspace?.workspaceId,
             provider: provider,
+            acpAgentId: nil,
             model: selectedModel,
             effort: selectedEffort,
+            fastMode: false,
             mode: mode,
             worktree: worktree,
             archiveOnFinish: archiveOnFinish,

@@ -74,6 +74,10 @@ export function useGlobalErgonomicKeybindings(): void {
         snap.pairDialogOpen ||
         snap.relayDialogOpen ||
         snap.remoteFolderPickerHostId !== null ||
+        snap.exportDialogTarget !== null ||
+        snap.copyCodeBlocksTarget !== null ||
+        snap.handoffDialogTarget !== null ||
+        snap.mediaPreviewTarget !== null ||
         Boolean(document.querySelector('[data-slot="dialog-content"]'));
 
       if (isModalOverlayOpen) {
@@ -169,7 +173,15 @@ export function useGlobalErgonomicKeybindings(): void {
 
       // 9. Cycle Session Mode (`Shift+Tab`)
       if (e.shiftKey && e.key === "Tab" && !mod && !e.altKey) {
-        if (!snap.commandPaletteOpen && !snap.pairDialogOpen && !snap.relayDialogOpen) {
+        if (
+          !snap.commandPaletteOpen &&
+          !snap.pairDialogOpen &&
+          !snap.relayDialogOpen &&
+          !snap.exportDialogTarget &&
+          !snap.copyCodeBlocksTarget &&
+          !snap.handoffDialogTarget &&
+          !snap.mediaPreviewTarget
+        ) {
           e.preventDefault();
           orbitActions.cycleActiveMode();
           return;
@@ -249,7 +261,11 @@ export function useGlobalErgonomicKeybindings(): void {
         e.key === "Escape" &&
         !snap.commandPaletteOpen &&
         !snap.pairDialogOpen &&
-        !snap.relayDialogOpen
+        !snap.relayDialogOpen &&
+        !snap.exportDialogTarget &&
+        !snap.copyCodeBlocksTarget &&
+        !snap.handoffDialogTarget &&
+        !snap.mediaPreviewTarget
       ) {
         const now = Date.now();
         if (now - lastEscTimeRef.current < 420) {

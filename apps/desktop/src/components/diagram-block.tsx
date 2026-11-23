@@ -1,6 +1,5 @@
 import {
   type PointerEvent as ReactPointerEvent,
-  type WheelEvent as ReactWheelEvent,
   memo,
   useCallback,
   useEffect,
@@ -38,6 +37,13 @@ import { cn } from "@/lib/utils";
 const DIAGRAM_CACHE_LIMIT = 128;
 const diagramViewCache = new Map<string, RenderDiagramView>();
 
+const MIN_LIGHTBOX_ZOOM = 0.25;
+const MAX_LIGHTBOX_ZOOM = 5.0;
+
+function clampZoom(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 function diagramCacheKey(kind: DiagramKind, theme: DiagramTheme, source: string): string {
   return `${kind}::${theme}::${source}`;
 }
@@ -45,7 +51,6 @@ function diagramCacheKey(kind: DiagramKind, theme: DiagramTheme, source: string)
 function getCachedDiagram(key: string): RenderDiagramView | undefined {
   const hit = diagramViewCache.get(key);
   if (hit !== undefined) {
-    // Refresh LRU recency
     diagramViewCache.delete(key);
     diagramViewCache.set(key, hit);
   }
@@ -78,11 +83,11 @@ function kindBaseTitle(kind: DiagramKind): string {
 function DiagramKindIcon({ kind }: { kind: DiagramKind }) {
   switch (kind) {
     case "mermaid":
-      return <Workflow className="size-3.5 text-zinc-500 dark:text-zinc-400" />;
+      return <Workflow className="size-3 text-zinc-500 dark:text-zinc-400" />;
     case "graphviz":
-      return <GitFork className="size-3.5 text-zinc-500 dark:text-zinc-400" />;
+      return <GitFork className="size-3 text-zinc-500 dark:text-zinc-400" />;
     case "svg":
-      return <ImageIcon className="size-3.5 text-zinc-500 dark:text-zinc-400" />;
+      return <ImageIcon className="size-3 text-zinc-500 dark:text-zinc-400" />;
   }
 }
 
@@ -103,7 +108,23 @@ const DiagramLightbox = memo(function DiagramLightbox({
 }) {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const [copied, setCopied] = useState(false);
+  const [copiedMode, setCopiedMode] = useState<"none" | "svg" | "source">("none");
+  const copyTimerRef = useRef<number | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const activePointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const pinchStartRef = useRef<{ distance: number; zoom: number } | null>(null);
   const dragRef = useRef<{
     active: boolean;
     pointerId: number;
@@ -111,6 +132,7 @@ const DiagramLightbox = memo(function DiagramLightbox({
     startY: number;
     origX: number;
     origY: number;
+    moved: boolean;
   }>({
     active: false,
     pointerId: -1,
@@ -118,7 +140,13 @@ const DiagramLightbox = memo(function DiagramLightbox({
     startY: 0,
     origX: 0,
     origY: 0,
+    moved: false,
   });
+
+  const resetView = useCallback(() => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (ev: KeyboardEvent) => {
@@ -126,30 +154,50 @@ const DiagramLightbox = memo(function DiagramLightbox({
         ev.preventDefault();
         onClose();
       } else if (ev.key === "+" || ev.key === "=") {
-        setZoom((z) => Math.min(4, Math.round((z + 0.2) * 100) / 100));
+        ev.preventDefault();
+        setZoom((z) => clampZoom(z * 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
       } else if (ev.key === "-") {
-        setZoom((z) => Math.max(0.25, Math.round((z - 0.2) * 100) / 100));
+        ev.preventDefault();
+        setZoom((z) => clampZoom(z / 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
       } else if (ev.key === "0") {
-        setZoom(1);
-        setPan({ x: 0, y: 0 });
+        ev.preventDefault();
+        resetView();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [onClose, resetView]);
 
-  const handleWheel = useCallback((ev: ReactWheelEvent<HTMLDivElement>) => {
-    if (ev.ctrlKey || ev.metaKey || Math.abs(ev.deltaY) > 0) {
+  // Native non-passive wheel listener for smooth multiplicative trackpad pinch & wheel zoom
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const onWheel = (ev: WheelEvent) => {
       ev.preventDefault();
-      const step = ev.deltaY < 0 ? 0.12 : -0.12;
-      setZoom((z) => Math.min(4, Math.max(0.25, Math.round((z + step) * 100) / 100)));
-    }
+      // Trackpad pinch (`ctrlKey`) uses finer sensitivity than standard mouse wheel ticks
+      const sensitivity = ev.ctrlKey || ev.metaKey ? 0.0085 : 0.0022;
+      const factor = Math.exp(-ev.deltaY * sensitivity);
+      setZoom((z) => clampZoom(z * factor, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
   const handlePointerDown = useCallback(
     (ev: ReactPointerEvent<HTMLDivElement>) => {
-      if (ev.button !== 0) return;
+      if (ev.button !== 0 && ev.pointerType === "mouse") return;
       ev.currentTarget.setPointerCapture(ev.pointerId);
+      activePointersRef.current.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+      if (activePointersRef.current.size === 2) {
+        const pts = Array.from(activePointersRef.current.values());
+        const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+        pinchStartRef.current = { distance: Math.max(dist, 1), zoom: zoomRef.current };
+        dragRef.current.active = false;
+        dragRef.current.moved = true;
+        return;
+      }
+
       dragRef.current = {
         active: true,
         pointerId: ev.pointerId,
@@ -157,21 +205,40 @@ const DiagramLightbox = memo(function DiagramLightbox({
         startY: ev.clientY,
         origX: pan.x,
         origY: pan.y,
+        moved: false,
       };
     },
     [pan],
   );
 
   const handlePointerMove = useCallback((ev: ReactPointerEvent<HTMLDivElement>) => {
+    if (activePointersRef.current.has(ev.pointerId)) {
+      activePointersRef.current.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    }
+
+    if (activePointersRef.current.size === 2 && pinchStartRef.current) {
+      const pts = Array.from(activePointersRef.current.values());
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      const ratio = dist / pinchStartRef.current.distance;
+      setZoom(clampZoom(pinchStartRef.current.zoom * ratio, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
+      return;
+    }
+
     const d = dragRef.current;
     if (!d.active || d.pointerId !== ev.pointerId) return;
-    setPan({
-      x: d.origX + (ev.clientX - d.startX),
-      y: d.origY + (ev.clientY - d.startY),
-    });
+    const dx = ev.clientX - d.startX;
+    const dy = ev.clientY - d.startY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+      d.moved = true;
+    }
+    setPan({ x: d.origX + dx, y: d.origY + dy });
   }, []);
 
   const handlePointerUp = useCallback((ev: ReactPointerEvent<HTMLDivElement>) => {
+    activePointersRef.current.delete(ev.pointerId);
+    if (activePointersRef.current.size < 2) {
+      pinchStartRef.current = null;
+    }
     if (dragRef.current.pointerId === ev.pointerId) {
       dragRef.current.active = false;
     }
@@ -187,76 +254,116 @@ const DiagramLightbox = memo(function DiagramLightbox({
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }, [svg, kind]);
 
-  const handleCopySource = useCallback(async () => {
-    await navigator.clipboard.writeText(rawSource);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
-  }, [rawSource]);
+  const handleCopy = useCallback(
+    async (mode: "svg" | "source") => {
+      try {
+        await navigator.clipboard.writeText(mode === "svg" ? svg : rawSource);
+        setCopiedMode(mode);
+        if (copyTimerRef.current !== null) {
+          window.clearTimeout(copyTimerRef.current);
+        }
+        copyTimerRef.current = window.setTimeout(() => {
+          copyTimerRef.current = null;
+          setCopiedMode("none");
+        }, 1500);
+      } catch {
+        // Clipboard permission denied or unavailable; ignore gracefully
+      }
+    },
+    [svg, rawSource],
+  );
 
   return createPortal(
     <div
-      className="fixed inset-0 z-50 flex flex-col bg-black/65 backdrop-blur-xs"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className="fixed inset-0 z-50 flex flex-col bg-black/70 backdrop-blur-sm"
       onClick={(ev) => {
         if (ev.target === ev.currentTarget) onClose();
       }}
     >
-      <div className="flex shrink-0 items-center justify-between border-b border-white/10 bg-zinc-950/85 px-4 py-2.5 text-zinc-100 select-none">
-        <div className="flex items-center gap-2 text-[13px] font-medium">
+      <div className="flex shrink-0 items-center justify-between border-b border-white/[0.08] bg-zinc-950/90 px-4 py-2 text-zinc-100 select-none">
+        <div className="flex items-center gap-2 text-[12.5px] font-medium text-zinc-200">
           <DiagramKindIcon kind={kind} />
           <span>{title}</span>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1">
           <button
             type="button"
-            onClick={() => setZoom((z) => Math.max(0.25, Math.round((z - 0.2) * 100) / 100))}
-            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-300 hover:bg-white/10 hover:text-white"
+            onClick={() =>
+              setZoom((z) => clampZoom(z / 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM))
+            }
+            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
             title="Zoom out (-)"
           >
             <ZoomOut className="size-3.5" />
           </button>
-          <span className="tabular-nums min-w-[44px] text-center font-mono text-[11.5px] text-zinc-300">
-            {Math.round(zoom * 100)}%
-          </span>
           <button
             type="button"
-            onClick={() => setZoom((z) => Math.min(4, Math.round((z + 0.2) * 100) / 100))}
-            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-300 hover:bg-white/10 hover:text-white"
+            onClick={resetView}
+            title="Reset zoom (0)"
+            className="tabular-nums orbit-press min-w-[44px] cursor-pointer rounded-md px-1.5 py-1 text-center font-mono text-[11px] text-zinc-300 hover:bg-white/10 hover:text-white"
+          >
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              setZoom((z) => clampZoom(z * 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM))
+            }
+            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
             title="Zoom in (+)"
           >
             <ZoomIn className="size-3.5" />
           </button>
           <button
             type="button"
-            onClick={() => {
-              setZoom(1);
-              setPan({ x: 0, y: 0 });
-            }}
-            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-300 hover:bg-white/10 hover:text-white"
+            onClick={resetView}
+            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
             title="Reset view (0)"
           >
             <RotateCcw className="size-3.5" />
           </button>
-          <div className="mx-1 h-4 w-px bg-white/15" />
+          <div className="mx-1.5 h-3.5 w-px bg-white/12" />
           <button
             type="button"
-            onClick={handleDownloadSvg}
-            className="orbit-press inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[12px] text-zinc-300 hover:bg-white/10 hover:text-white"
+            onClick={() => void handleCopy("svg")}
+            className="orbit-press inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11.5px] text-zinc-300 hover:bg-white/10 hover:text-white"
+            title="Copy SVG"
           >
-            <Download className="size-3.5" />
-            <span>SVG</span>
+            {copiedMode === "svg" ? (
+              <Check className="size-3.5 text-emerald-400" />
+            ) : (
+              <Copy className="size-3.5" />
+            )}
+            <span>{copiedMode === "svg" ? "Copied" : "SVG"}</span>
           </button>
           <button
             type="button"
-            onClick={() => void handleCopySource()}
-            className="orbit-press inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[12px] text-zinc-300 hover:bg-white/10 hover:text-white"
+            onClick={handleDownloadSvg}
+            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
+            title="Download SVG"
           >
-            {copied ? <Check className="size-3.5 text-emerald-400" /> : <Copy className="size-3.5" />}
-            <span>{copied ? "Copied" : "Copy"}</span>
+            <Download className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleCopy("source")}
+            className="orbit-press inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11.5px] text-zinc-300 hover:bg-white/10 hover:text-white"
+            title="Copy source"
+          >
+            {copiedMode === "source" ? (
+              <Check className="size-3.5 text-emerald-400" />
+            ) : (
+              <Code2 className="size-3.5" />
+            )}
+            <span>{copiedMode === "source" ? "Copied" : "Source"}</span>
           </button>
           <button
             type="button"
             onClick={onClose}
-            className="orbit-press ml-1 inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-300 hover:bg-white/10 hover:text-white"
+            className="orbit-press ml-1 inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
             title="Close (Esc)"
           >
             <X className="size-4" />
@@ -265,13 +372,23 @@ const DiagramLightbox = memo(function DiagramLightbox({
       </div>
 
       <div
-        className="flex min-h-0 flex-1 cursor-grab items-center justify-center overflow-hidden p-8 active:cursor-grabbing"
-        onWheel={handleWheel}
+        ref={viewportRef}
+        className="flex min-h-0 flex-1 cursor-grab touch-none items-center justify-center overflow-hidden p-8 active:cursor-grabbing"
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onDoubleClick={() => {
+          if (zoom !== 1 || pan.x !== 0 || pan.y !== 0) {
+            resetView();
+          } else {
+            setZoom(1.6);
+          }
+        }}
         onClick={(ev) => {
-          if (ev.target === ev.currentTarget && pan.x === 0 && pan.y === 0) onClose();
+          if (ev.target === ev.currentTarget && !dragRef.current.moved) {
+            onClose();
+          }
         }}
       >
         <div
@@ -306,13 +423,25 @@ export const DiagramBlock = memo(
     );
 
     const cardRef = useRef<HTMLDivElement | null>(null);
-    const [nearViewport, setNearViewport] = useState<boolean>(() => getCachedDiagram(key) !== undefined);
+    const [nearViewport, setNearViewport] = useState<boolean>(
+      () => getCachedDiagram(key) !== undefined,
+    );
     const [viewMode, setViewMode] = useState<"diagram" | "code">("diagram");
     const [rendered, setRendered] = useState<RenderDiagramView | null>(
       () => getCachedDiagram(key) ?? null,
     );
     const [lightboxOpen, setLightboxOpen] = useState(false);
     const [copied, setCopied] = useState(false);
+    const copyTimerRef = useRef<number | null>(null);
+
+    useEffect(() => {
+      return () => {
+        if (copyTimerRef.current !== null) {
+          window.clearTimeout(copyTimerRef.current);
+          copyTimerRef.current = null;
+        }
+      };
+    }, []);
 
     useEffect(() => {
       const cached = getCachedDiagram(key);
@@ -361,27 +490,42 @@ export const DiagramBlock = memo(
           if (!cancelled) {
             setRendered(res);
           }
+        })
+        .catch((err: unknown) => {
+          if (!cancelled) {
+            setRendered({
+              kind,
+              theme,
+              svg: null,
+              width: 0,
+              height: 0,
+              error: err instanceof Error ? err.message : "Failed to render diagram",
+              diagram_type_label: null,
+            });
+          }
         });
       return () => {
         cancelled = true;
       };
     }, [isStreamingBlock, nearViewport, key, kind, block.raw_code, theme]);
 
-    const handleCopy = async () => {
-      await navigator.clipboard.writeText(block.raw_code);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    };
+    const svgReady = !isStreamingBlock && rendered?.svg != null && rendered.error == null;
+    const showDiagram = viewMode === "diagram" && svgReady;
 
-    const handleDownloadSvg = () => {
-      if (!rendered?.svg) return;
-      const blob = new Blob([rendered.svg], { type: "image/svg+xml;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `orbit-${kind}-diagram.svg`;
-      a.click();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const handleCopy = async () => {
+      try {
+        await navigator.clipboard.writeText(block.raw_code);
+        setCopied(true);
+        if (copyTimerRef.current !== null) {
+          window.clearTimeout(copyTimerRef.current);
+        }
+        copyTimerRef.current = window.setTimeout(() => {
+          copyTimerRef.current = null;
+          setCopied(false);
+        }, 1500);
+      } catch {
+        // Clipboard permission denied or unavailable; ignore gracefully
+      }
     };
 
     const baseTitle = kindBaseTitle(kind);
@@ -391,13 +535,12 @@ export const DiagramBlock = memo(
         : `${baseTitle} · ${rendered.diagram_type_label}`
       : baseTitle;
 
-    const svgReady = !isStreamingBlock && rendered?.svg != null && rendered.error == null;
-    const showDiagram = viewMode === "diagram" && svgReady;
-
     const estimatedIntrinsicHeight = Math.min(
-      Math.max(rendered ? Math.round(rendered.height * 0.65 + 48) : 220, 140),
+      Math.max(rendered ? Math.round(rendered.height * 0.65 + 40) : 200, 136),
       560,
     );
+
+    const keepToolbarVisible = !showDiagram;
 
     return (
       <div
@@ -408,126 +551,115 @@ export const DiagramBlock = memo(
             : undefined
         }
         className={cn(
-          "border-border my-3 overflow-hidden rounded-xl border bg-zinc-50 text-zinc-800 dark:bg-[#141519] dark:text-zinc-200",
+          "group relative my-3 overflow-hidden rounded-xl border border-black/[0.075] bg-white text-zinc-800 dark:border-white/[0.08] dark:bg-[#141519] dark:text-zinc-200",
           !isStreamingBlock ? "orbit-heavy-block-settled" : "[contain:layout_style_paint]",
         )}
       >
-        <div className="border-border text-muted-foreground flex items-center justify-between gap-2 border-b bg-black/[0.02] px-3.5 py-1.5 text-xs select-none dark:bg-white/[0.02]">
-          <div className="flex min-w-0 items-center gap-2">
+        {/* Subtle top-left type badge (hidden until hover in diagram view for zero clutter) */}
+        <div
+          className={cn(
+            "pointer-events-none absolute top-2.5 left-3 z-10 flex items-center gap-1.5 transition-opacity duration-150 select-none",
+            showDiagram
+              ? "opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
+              : "opacity-100",
+          )}
+        >
+          <span className="border-border/75 bg-background/88 text-muted-foreground inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 font-mono text-[10.5px] shadow-2xs backdrop-blur-md">
             <DiagramKindIcon kind={kind} />
-            <span className="truncate font-mono text-[11.5px]">{headerTitle}</span>
-            {isStreamingBlock && (
-              <span className="rounded-full bg-black/[0.06] px-2 py-0.5 text-[10.5px] text-zinc-500 dark:bg-white/[0.08] dark:text-zinc-400">
-                Streaming…
-              </span>
-            )}
-            {!isStreamingBlock && rendered?.error && (
-              <span
-                title={rendered.error}
-                className="rounded-full bg-amber-500/12 px-2 py-0.5 text-[10.5px] text-amber-700 dark:text-amber-300"
-              >
-                Code view
-              </span>
-            )}
-          </div>
+            <span className="max-w-[180px] truncate">{headerTitle}</span>
+          </span>
+          {isStreamingBlock && (
+            <span className="rounded-md bg-black/[0.06] px-1.5 py-0.5 text-[10.5px] text-zinc-500 dark:bg-white/[0.08] dark:text-zinc-400">
+              Streaming…
+            </span>
+          )}
+          {!isStreamingBlock && rendered?.error && (
+            <span
+              title={rendered.error}
+              className="rounded-md bg-amber-500/12 px-1.5 py-0.5 text-[10.5px] text-amber-700 dark:text-amber-300"
+            >
+              Source
+            </span>
+          )}
+        </div>
 
-          <div className="flex shrink-0 items-center gap-1">
-            {svgReady && (
-              <>
-                <div className="border-border/80 mr-1 inline-flex items-center rounded-md border bg-black/[0.03] p-0.5 dark:bg-white/[0.04]">
-                  <button
-                    type="button"
-                    onClick={() => setViewMode("diagram")}
-                    className={cn(
-                      "orbit-press inline-flex cursor-pointer items-center gap-1 rounded-[4px] px-1.5 py-0.5 text-[11px] transition-colors",
-                      viewMode === "diagram"
-                        ? "bg-background text-foreground font-medium shadow-2xs"
-                        : "text-muted-foreground hover:text-foreground",
-                    )}
-                  >
-                    <Eye className="size-3" />
-                    <span>Diagram</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setViewMode("code")}
-                    className={cn(
-                      "orbit-press inline-flex cursor-pointer items-center gap-1 rounded-[4px] px-1.5 py-0.5 text-[11px] transition-colors",
-                      viewMode === "code"
-                        ? "bg-background text-foreground font-medium shadow-2xs"
-                        : "text-muted-foreground hover:text-foreground",
-                    )}
-                  >
-                    <Code2 className="size-3" />
-                    <span>Code</span>
-                  </button>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleDownloadSvg}
-                  title="Download SVG"
-                  className="text-muted-foreground hover:text-foreground orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.06]"
-                >
-                  <Download className="size-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setLightboxOpen(true)}
-                  title="Fullscreen interactive view"
-                  className="text-muted-foreground hover:text-foreground orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.06]"
-                >
-                  <Maximize2 className="size-3.5" />
-                </button>
-              </>
+        {/* Restrained 3-action floating hover toolbar (zoom & SVG export live inside fullscreen Lightbox) */}
+        <div
+          className={cn(
+            "absolute top-2.5 right-2.5 z-10 flex items-center gap-0.5 rounded-lg border border-black/[0.08] bg-white/90 p-0.5 shadow-xs backdrop-blur-md transition-opacity duration-150 select-none dark:border-white/[0.1] dark:bg-zinc-900/90",
+            keepToolbarVisible
+              ? "pointer-events-auto opacity-100"
+              : "pointer-events-none opacity-0 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100",
+          )}
+        >
+          <button
+            type="button"
+            onClick={() => void handleCopy()}
+            title="Copy source"
+            className="text-muted-foreground hover:text-foreground orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
+          >
+            {copied ? (
+              <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+            ) : (
+              <Copy className="size-3.5" />
             )}
+          </button>
 
+          {svgReady && (
             <button
               type="button"
-              onClick={() => void handleCopy()}
-              className="text-muted-foreground hover:text-foreground orbit-press inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] hover:bg-black/[0.05] dark:hover:bg-white/[0.06]"
+              onClick={() => setViewMode((m) => (m === "diagram" ? "code" : "diagram"))}
+              title={viewMode === "diagram" ? "View source" : "View diagram"}
+              className={cn(
+                "orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.07]",
+                viewMode === "code"
+                  ? "bg-black/[0.06] text-foreground dark:bg-white/[0.1]"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
             >
-              <span className="relative inline-flex size-3.5 items-center justify-center">
-                <Copy
-                  className={`size-3.5 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] ${
-                    copied ? "scale-50 -rotate-12 opacity-0" : "scale-100 rotate-0 opacity-100"
-                  }`}
-                />
-                <Check
-                  className={`absolute size-3.5 text-emerald-600 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] dark:text-emerald-400 ${
-                    copied ? "scale-100 rotate-0 opacity-100" : "scale-50 rotate-12 opacity-0"
-                  }`}
-                />
-              </span>
-              <span>{copied ? "Copied" : "Copy"}</span>
+              {viewMode === "diagram" ? <Code2 className="size-3.5" /> : <Eye className="size-3.5" />}
             </button>
-          </div>
+          )}
+
+          {showDiagram && (
+            <button
+              type="button"
+              onClick={() => setLightboxOpen(true)}
+              title="Fullscreen"
+              className="text-muted-foreground hover:text-foreground orbit-press inline-flex size-6 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
+            >
+              <Maximize2 className="size-3.5" />
+            </button>
+          )}
         </div>
 
         {showDiagram && rendered?.svg ? (
-          <ScrollArea
-            orientation="horizontal"
-            viewportClassName="p-4"
-          >
+          <ScrollArea orientation="horizontal" viewportClassName="px-5 py-5">
             <div
               onDoubleClick={() => setLightboxOpen(true)}
               title="Double-click to expand"
-              className="flex min-w-full cursor-zoom-in justify-center transition-opacity duration-150 ease-out [&>svg]:block [&>svg]:h-auto [&>svg]:max-w-full"
+              className="flex min-w-full cursor-zoom-in items-center justify-center transition-opacity duration-150 ease-out"
               style={{
-                minHeight: Math.min(Math.max(rendered.height * 0.4, 96), 240),
+                minHeight: Math.min(Math.max(rendered.height * 0.42, 92), 340),
               }}
-              dangerouslySetInnerHTML={{ __html: rendered.svg }}
-            />
+            >
+              <div
+                className="[&>svg]:block [&>svg]:h-auto [&>svg]:max-w-full"
+                dangerouslySetInnerHTML={{ __html: rendered.svg }}
+              />
+            </div>
           </ScrollArea>
         ) : (
-          <HighlightedCodeBlock
-            kind="code_block"
-            language={block.language}
-            raw_code={block.raw_code}
-            lines={block.lines}
-            isDark={isDark}
-            embedded
-          />
+          <div className="pt-8">
+            <HighlightedCodeBlock
+              kind="code_block"
+              language={block.language}
+              raw_code={block.raw_code}
+              lines={block.lines}
+              isDark={isDark}
+              embedded
+            />
+          </div>
         )}
 
         {lightboxOpen && rendered?.svg && (

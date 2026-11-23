@@ -13,8 +13,10 @@ import {
   formatCompactRelativeTime,
 } from "@/components/sidebar/sidebar-primitives";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
-import { orbitActions } from "@/state/orbit-store";
+import { orbitActions, useHasThreadDraft } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+
+const DRAFT_BADGE_CLASS = "text-muted-foreground/70 text-[11px] font-medium leading-none";
 
 export interface SidebarConversationRowProps {
   threadKey: string;
@@ -79,6 +81,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
 
   const isForegroundRunning = isAgentForegroundRunning(agent);
   const relativeLabel = formatCompactRelativeTime(agent.updated_at_rfc3339, nowMs);
+  const hasUnsentDraft = useHasThreadDraft(threadKey, !selected);
 
   useEffect(() => {
     if (!isRenaming) return;
@@ -104,6 +107,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   const showSemanticBadge = Boolean(peerHandle && !isGenericHarnessHandle(peerHandle));
   const hoverTooltip = [
     isPinned ? `${effectiveTitle} · ${projectName}` : effectiveTitle,
+    hasUnsentDraft ? "Unsent draft" : null,
     agent.task_summary ? agent.task_summary : null,
   ]
     .filter(Boolean)
@@ -206,17 +210,32 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         )}
       </div>
 
-      {/* Right Slot: Resting Loading / Relative Time ↔ Hover Actions */}
+      {/* Right Slot: Resting Loading / Draft / Relative Time ↔ Hover Actions */}
       {!isRenaming && (
         <div className="flex min-w-[46px] shrink-0 items-center justify-end">
           {isForegroundRunning ? (
             <span
               className={cn(
-                "text-foreground/65 items-center justify-center pr-0.5",
+                "text-foreground/65 items-center justify-center gap-1.5 pr-0.5",
                 menuOpen ? "hidden" : "inline-flex group-hover/item:hidden",
               )}
             >
+              {hasUnsentDraft && (
+                <span data-draft-indicator="true" className={DRAFT_BADGE_CLASS}>
+                  Draft
+                </span>
+              )}
               <OrbitSpinner size={13.5} />
+            </span>
+          ) : hasUnsentDraft ? (
+            <span
+              data-draft-indicator="true"
+              className={cn(
+                DRAFT_BADGE_CLASS,
+                menuOpen ? "hidden" : "group-hover/item:hidden",
+              )}
+            >
+              Draft
             </span>
           ) : (
             <span

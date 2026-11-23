@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ArrowLeftRight,
   Check,
   ChevronsDownUp,
   ChevronsUpDown,
@@ -11,6 +12,7 @@ import {
   Send,
   WrapText,
 } from "lucide-react";
+import { normalizeProjectPath } from "@/lib/projects";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { DiffFilesViewer, type ReviewCommentDraft } from "@/components/diff-viewer";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -38,6 +40,27 @@ export const ReviewTab = memo(function ReviewTab({
   const diffLayout = useOrbitSelector((s) => s.diffLayout);
   const selectedDiffPath = useOrbitSelector((s) => s.selectedDiffPath);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+
+  const activeWorkspace = useOrbitSelector((s) => {
+    const detail = s.hostDetails[selectedHostId];
+    if (!detail) return null;
+    const normCwd = selectedCwd ? normalizeProjectPath(selectedCwd) : "";
+    if (s.selectedAgentId) {
+      const ag = detail.agents.find((a) => a.agent_id === s.selectedAgentId);
+      if (ag) {
+        const ws = detail.workspaces.find((w) => w.workspace_id === ag.workspace_id);
+        if (ws && (!normCwd || normalizeProjectPath(ws.cwd) === normCwd)) {
+          return ws;
+        }
+      }
+    }
+    if (!normCwd) return null;
+    return (
+      detail.workspaces.find(
+        (w) => !w.archived_at && normalizeProjectPath(w.cwd) === normCwd,
+      ) ?? null
+    );
+  });
 
   const gitReview = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedWorkspaceCwd
@@ -201,11 +224,19 @@ export const ReviewTab = memo(function ReviewTab({
     if (isRefreshing) return;
     setIsRefreshing(true);
     try {
-      await orbitActions.refreshGit(selectedHostId, selectedCwd, selectedDiffPath, diffStaged);
+      await orbitActions.refreshGit(selectedHostId, selectedCwd, null, diffStaged);
     } finally {
       setIsRefreshing(false);
     }
-  }, [isRefreshing, selectedHostId, selectedCwd, selectedDiffPath, diffStaged]);
+  }, [isRefreshing, selectedHostId, selectedCwd, diffStaged]);
+
+  const showApplyToLocal = Boolean(activeWorkspace?.is_worktree);
+  const showMoveToWorktree = Boolean(
+    activeWorkspace &&
+      !activeWorkspace.is_worktree &&
+      gitReview?.status?.is_git_repo &&
+      (gitReview.status.files?.length ?? 0) > 0,
+  );
 
   const emptyMessage =
     reviewScope === "session_turns"
@@ -351,7 +382,25 @@ export const ReviewTab = memo(function ReviewTab({
                 )}
               </div>
 
-              <div className="flex items-center gap-1">
+              <div className="flex shrink-0 items-center gap-1">
+                {(showApplyToLocal || showMoveToWorktree) && activeWorkspace && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      orbitActions.openWorktreeHandoffDialog({
+                        hostId: selectedHostId,
+                        workspaceId: activeWorkspace.workspace_id,
+                        direction: showApplyToLocal ? "worktree_to_local" : "local_to_worktree",
+                        defaultMode: showApplyToLocal ? "apply" : "move",
+                        sourceCwd: activeWorkspace.cwd,
+                      })
+                    }
+                    className="border-border text-foreground/80 hover:bg-accent hover:text-foreground mr-1 inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors"
+                  >
+                    <ArrowLeftRight className="h-[11px] w-[11px] shrink-0 opacity-75" />
+                    <span>{showApplyToLocal ? "Apply to Local" : "Move to Worktree"}</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => orbitActions.setDiffStaged(false)}

@@ -3,15 +3,31 @@
 //! - Mobile UniFFI (`crates/orbit-ffi-uniffi`)
 //! - HarmonyOS N-API (`crates/orbit-ffi-ohos`)
 
-use orbit_protocol::{NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort, SessionMode};
+use std::collections::BTreeMap;
+
+use orbit_protocol::{
+    AcpAgentAvailability, ArtifactKind, ForkTarget, InstructionFileEntry, McpTransportKind,
+    McpWriteScope, NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort, SessionMode,
+    WorkspaceSummary, WorktreeHandoffDirection, WorktreeHandoffMode,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::HostRouteMode;
-pub use crate::app_core::AskSideQuestionRequest;
+pub use crate::app_core::{AgentCardView, AskSideQuestionRequest};
 pub use crate::diagram::{DiagramKind, DiagramTheme, RenderDiagramRequest, RenderDiagramView};
+pub use crate::export::{
+    ExportAgentMeta, ExportFormat, ExportOptions, ExportedTranscript, ExtractedCodeBlock,
+};
 use crate::sidebar::{SidebarProjectSort, SidebarThreadFilter};
 
 pub const CLIENT_BRIDGE_PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpRegistryRefreshView {
+    pub agents: Vec<AcpAgentAvailability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeInfoView {
@@ -54,9 +70,13 @@ pub struct CreateSessionRequest {
     pub extra_dirs: Vec<String>,
     pub provider: ProviderKind,
     #[serde(default)]
+    pub acp_agent_id: Option<String>,
+    #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
     pub mode: SessionMode,
     pub initial_prompt: String,
     #[serde(default)]
@@ -117,10 +137,115 @@ pub struct RewindAgentRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkAgentRequest {
+    pub host_id: String,
+    pub source_agent_id: String,
+    #[serde(default)]
+    pub up_to_seq: Option<u64>,
+    #[serde(default)]
+    pub target: ForkTarget,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkAgentResultView {
+    pub agent: AgentCardView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadWorkspaceFileRequest {
     pub host_id: String,
     pub cwd: String,
     pub path: String,
+}
+
+fn default_symbol_search_limit() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchWorkspaceSymbolsRequest {
+    pub host_id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default = "default_symbol_search_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSymbolsView {
+    pub host_id: String,
+    pub cwd: String,
+    pub symbols: Vec<orbit_protocol::WorkspaceSymbolEntry>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteWorkspaceFileRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub expected_etag: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceFileWriteResultView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub etag: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<orbit_protocol::WorkspaceFileConflict>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    #[serde(default)]
+    pub is_dir: bool,
+    #[serde(default)]
+    pub initial_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub old_path: String,
+    pub new_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceEntryMutationResultView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_path: Option<String>,
+    pub action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +283,20 @@ pub struct GitReposInspectionView {
     pub nested_git_repos: Vec<NestedGitRepo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSearchHit {
+    pub host_id: String,
+    #[serde(default)]
+    pub host_name: String,
+    pub agent_id: String,
+    pub seq: u64,
+    pub role: String,
+    pub title: String,
+    pub project_name: String,
+    pub snippet: String,
+    pub updated_at_rfc3339: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnWorkspacePeerRequest {
     pub host_id: String,
@@ -167,9 +306,13 @@ pub struct SpawnWorkspacePeerRequest {
     pub extra_dirs: Vec<String>,
     pub provider: ProviderKind,
     #[serde(default)]
+    pub acp_agent_id: Option<String>,
+    #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
     pub mode: SessionMode,
     pub initial_prompt: String,
     #[serde(default)]
@@ -178,4 +321,357 @@ pub struct SpawnWorkspacePeerRequest {
     pub handle: Option<String>,
     #[serde(default)]
     pub profile_id: Option<String>,
+}
+
+fn default_include_committed_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewWorktreeHandoffRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub direction: WorktreeHandoffDirection,
+    #[serde(default)]
+    pub target_workspace_id: Option<String>,
+    #[serde(default = "default_include_committed_true")]
+    pub include_committed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteWorktreeHandoffRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub direction: WorktreeHandoffDirection,
+    pub mode: WorktreeHandoffMode,
+    #[serde(default)]
+    pub target_workspace_id: Option<String>,
+    #[serde(default = "default_include_committed_true")]
+    pub include_committed: bool,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub allow_three_way_conflicts: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertArtifactRequest {
+    pub host_id: String,
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    pub workspace_id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    pub title: String,
+    pub kind: ArtifactKind,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub resource_uri: Option<String>,
+    pub content: String,
+    #[serde(default)]
+    pub summary_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListInstructionFilesRequest {
+    pub host_id: String,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionFilesSnapshotView {
+    pub host_id: String,
+    pub cwd: String,
+    pub files: Vec<InstructionFileEntry>,
+    pub total_tokens: u32,
+    pub merged_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadInstructionFileRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionFileContentView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveInstructionFileRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub expected_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionFileSavedView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub etag: String,
+    pub size_bytes: u64,
+    pub approx_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertExternalMcpServerRequest {
+    pub host_id: String,
+    pub scope: McpWriteScope,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub name: String,
+    pub transport: McpTransportKind,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub keep_existing_secrets: bool,
+    #[serde(default = "default_include_committed_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathRulesSnapshotView {
+    pub host_id: String,
+    pub cwd: String,
+    pub rules: Vec<orbit_protocol::PathScopedRule>,
+    pub total_always_tokens: u32,
+    pub token_budget_warning: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertPathRuleRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub scope: orbit_protocol::RuleScope,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub trigger_mode: orbit_protocol::RuleTriggerMode,
+    #[serde(default)]
+    pub globs: Vec<String>,
+    #[serde(default = "default_include_committed_true")]
+    pub enabled: bool,
+    pub body: String,
+    #[serde(default)]
+    pub expected_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletePathRuleRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchPathRulesRequest {
+    pub host_id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub active_paths: Vec<String>,
+    #[serde(default)]
+    pub manual_rule_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchedPathRulesView {
+    pub host_id: String,
+    pub cwd: String,
+    pub matched: Vec<orbit_protocol::MatchedRuleSummary>,
+    pub injected_markdown: String,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleHooksSnapshotView {
+    pub hooks: Vec<orbit_protocol::LifecycleHookRule>,
+    pub recent_executions: Vec<orbit_protocol::HookExecutionRecord>,
+    pub project_hooks_trusted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartGoalRunRequest {
+    pub host_id: String,
+    pub agent_id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub criteria: Vec<String>,
+    #[serde(default)]
+    pub verify_command: Option<String>,
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlGoalRunRequest {
+    pub host_id: String,
+    pub goal_id: String,
+    pub action: orbit_protocol::GoalControlAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartMonitorWatchRequest {
+    pub host_id: String,
+    pub agent_id: String,
+    pub name: String,
+    pub kind: orbit_protocol::MonitorKind,
+    #[serde(default)]
+    pub expires_in_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopMonitorWatchRequest {
+    pub host_id: String,
+    pub monitor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventTriggersSnapshotView {
+    pub triggers: Vec<orbit_protocol::EventTriggerRecord>,
+    pub recent_deliveries: Vec<orbit_protocol::EventTriggerDelivery>,
+    pub base_webhook_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertEventTriggerRequest {
+    pub host_id: String,
+    #[serde(default)]
+    pub trigger_id: Option<String>,
+    pub name: String,
+    pub source: orbit_protocol::TriggerSourceKind,
+    #[serde(default)]
+    pub event_filters: Vec<String>,
+    pub prompt_template: String,
+    pub target: orbit_protocol::TriggerDispatchTarget,
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub keep_existing_secret: bool,
+    #[serde(default)]
+    pub github_poll: Option<orbit_protocol::GitHubPollConfig>,
+    #[serde(default)]
+    pub github_token: Option<String>,
+    #[serde(default)]
+    pub keep_existing_token: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserSessionsSnapshotView {
+    pub host_id: String,
+    pub sessions: Vec<orbit_protocol::BrowserSessionSummary>,
+    pub policy: orbit_protocol::BrowserPolicyConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_binary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateBrowserSessionRequest {
+    pub host_id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub initial_url: Option<String>,
+    #[serde(default)]
+    pub headless: Option<bool>,
+    #[serde(default)]
+    pub viewport_width: Option<u32>,
+    #[serde(default)]
+    pub viewport_height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteBrowserActionRequest {
+    pub host_id: String,
+    pub session_id: String,
+    pub action: orbit_protocol::BrowserActionRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserActionResponseView {
+    pub host_id: String,
+    pub session: orbit_protocol::BrowserSessionSummary,
+    #[serde(default)]
+    pub elements: Vec<orbit_protocol::BrowserElementRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_excerpt: Option<String>,
+    #[serde(default)]
+    pub captcha_detected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartBatchFanoutRequest {
+    pub host_id: String,
+    pub name: String,
+    pub cwd: String,
+    pub csv_content: String,
+    pub prompt_template: String,
+    pub provider: orbit_protocol::ProviderKind,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub mode: orbit_protocol::SessionMode,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    #[serde(default)]
+    pub isolated_worktree: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartDagWorkflowRequest {
+    pub host_id: String,
+    pub name: String,
+    pub cwd: String,
+    pub steps: Vec<orbit_protocol::DagStepSpec>,
+    pub default_provider: orbit_protocol::ProviderKind,
+    pub default_mode: orbit_protocol::SessionMode,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartBestOfNRequest {
+    pub host_id: String,
+    pub name: String,
+    pub cwd: String,
+    pub prompt: String,
+    pub candidates: Vec<orbit_protocol::BestOfNCandidateSpec>,
+    pub mode: orbit_protocol::SessionMode,
+    #[serde(default)]
+    pub verify_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelWorkflowRunRequest {
+    pub host_id: String,
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectBestOfNWinnerRequest {
+    pub host_id: String,
+    pub run_id: String,
+    pub winner_step_id: String,
+    #[serde(default)]
+    pub apply_to_workspace: bool,
 }

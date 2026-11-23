@@ -37,6 +37,14 @@ export interface OrbitLinkOpener {
       fallbackPath?: string;
     },
   ) => void;
+  prefetchFile?: (
+    rawPath: string,
+    opts?: {
+      hostId?: string;
+      cwd?: string;
+      fallbackPath?: string;
+    },
+  ) => void;
   openBrowser: (url: string) => void;
   openExternal: (url: string) => void;
 }
@@ -501,4 +509,30 @@ export function openOrbitLink(rawHref: string, opts?: OpenOrbitLinkOptions): boo
     fallbackPath,
   });
   return true;
+}
+
+/**
+ * Silently warms the file cache on link hover so clicking opens the side panel instantaneously.
+ */
+export function prefetchOrbitLink(rawHref: string, opts?: OpenOrbitLinkOptions): void {
+  if (!registeredOpener?.prefetchFile) return;
+  const target = parseOrbitLinkTarget(rawHref);
+  if (!target || target.kind !== "file") return;
+
+  const isExplicitRelative =
+    target.rawPath.startsWith("./") || target.rawPath.startsWith("../");
+  const baseResolved = resolvePathAgainstBase(target.rawPath, opts?.baseFilePath);
+  const pathToOpen = opts?.baseFilePath ? baseResolved.direct : target.rawPath;
+  const fallbackPath =
+    opts?.baseFilePath &&
+    !isExplicitRelative &&
+    baseResolved.fallback !== baseResolved.direct
+      ? baseResolved.fallback
+      : undefined;
+
+  registeredOpener.prefetchFile(pathToOpen, {
+    hostId: opts?.hostId,
+    cwd: opts?.cwd,
+    fallbackPath,
+  });
 }

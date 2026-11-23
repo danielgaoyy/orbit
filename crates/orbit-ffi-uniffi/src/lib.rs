@@ -3,14 +3,17 @@
 //! - Android `minSdk 29` / `targetSdk 36` (`Kotlin 2` + `Jetpack Compose`)
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
 
 use orbit_client_core::app_core::{
     AgentCardView, AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest,
     ClientProjectView, ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest,
     DirectoryListingView, FleetOverviewView, GitReviewView, HostCardView, HostDetailView,
-    OrbitAppCore, RewindAgentResultView, SideQuestionStreamEvent, StagedAttachmentView,
-    TimelineItemView, WorkspaceFileView,
+    OrbitAppCore, PushDevicesSnapshotView, RegisterPushDeviceRequest, RewindAgentResultView,
+    SideQuestionStreamEvent, StagedAttachmentView, TimelineItemView, WorkspaceFileView,
 };
 use orbit_client_core::catalog::{
     ResolvedModelSelectionView, default_effort_description as core_default_effort_description,
@@ -25,16 +28,25 @@ use orbit_client_core::cloud_sync::{
 };
 use orbit_client_core::composer::{
     ClientPlatform, ComposePromptRequest, ComposedPromptView, ComposerContextInput,
-    ComposerPasteInput, ComposerQuoteInput, MentionCandidateView, SlashCommandView, SlashDirective,
+    ComposerPasteInput, ComposerQuoteInput, FastModeSlashAction, MentionCandidateView,
+    SlashCommandView, SlashDirective,
 };
 use orbit_client_core::contract::{
-    AgentStageDeltaRequest, BridgeInfoView, CreateSessionRequest, FleetSidebarRequest,
-    GitReposInspectionView, MentionRankRequest, ModelSelectionRequest, ReadWorkspaceFileRequest,
-    RenderDiagramRequest, RenderDiagramView, RewindAgentRequest, SendPromptRequest,
-    SpawnWorkspacePeerRequest, UpdateHostConfigRequest,
+    AgentStageDeltaRequest, BridgeInfoView, CancelWorkflowRunRequest, ControlGoalRunRequest,
+    ConversationSearchHit, CreateSessionRequest, CreateWorkspaceEntryRequest,
+    DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, FleetSidebarRequest,
+    ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, MentionRankRequest,
+    ModelSelectionRequest, PreviewWorktreeHandoffRequest, ReadWorkspaceFileRequest,
+    RenameWorkspaceEntryRequest, RenderDiagramRequest, RenderDiagramView, RewindAgentRequest,
+    SendPromptRequest, SpawnWorkspacePeerRequest, StopMonitorWatchRequest, UpdateHostConfigRequest,
+    UpsertArtifactRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WriteWorkspaceFileRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, DiagramTheme, detect_diagram_kind as core_detect_diagram_kind,
+};
+use orbit_client_core::export::{
+    ExportFormat, ExportOptions, ExportedTranscript, ExtractedCodeBlock,
 };
 use orbit_client_core::render::{
     DiffFileView, DiffLineKind, DiffLineView, HighlightedLineView, HighlightedTokenView,
@@ -55,15 +67,21 @@ use orbit_client_core::stage::{
 };
 use orbit_client_core::{HostConnectionState, HostRouteMode};
 use orbit_protocol::{
-    AgentMessageKind, AttentionState, DirectoryEntry, DiscoveredProject, NestedGitRepo,
-    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
-    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    ProviderSubagentStatus, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
+    AcpAgentAvailability, AcpAgentSource, AcpAgentSpec, AcpProbeResult, AgentMessageKind,
+    ArtifactDetail, ArtifactKind, ArtifactRevisionMeta, ArtifactSummary, AttentionState,
+    ConditionalTimerRecord, ConditionalTimerState, DirectoryEntry, DiscoveredProject, ForkTarget,
+    GoalControlAction, GoalCriterion, GoalRunRecord, GoalStatus, HandoffFileChange, MonitorKind,
+    MonitorStatus, MonitorWatchRecord, NestedGitRepo, PermissionCheckpointRef, PromptBadge,
+    ProviderKind, ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, ProviderSubagentStatus, PushDeviceRecord,
+    PushPlatform, PushPreferences, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
     ScheduleNewAgentConfig, ScheduleRunRecord, ScheduleRunStatus, ScheduleSpec, ScheduleStatus,
     ScheduleTarget, SessionMode, TerminalSummary, ThinkingOptionSpec, TimelinePayload,
-    ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
-    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
-    WorkspaceOrganizePhase, WorkspaceSummary,
+    TimerCondition, ToolCallDetail, ToolCallStatus, WorkflowKind, WorkflowRunRecord,
+    WorkflowRunStatus, WorkflowStepRecord, WorkflowStepStatus, WorkspaceBoardSnapshot,
+    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceFileConflict,
+    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceOrganizePhase, WorkspaceSummary,
+    WorktreeHandoffDirection, WorktreeHandoffMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 
 uniffi::setup_scaffolding!();
@@ -74,11 +92,141 @@ pub enum FfiOrbitError {
     Core { detail: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiConversationSearchHit {
+    pub host_id: String,
+    pub host_name: String,
+    pub agent_id: String,
+    pub seq: u64,
+    pub role: String,
+    pub title: String,
+    pub project_name: String,
+    pub snippet: String,
+    pub updated_at_rfc3339: String,
+}
+
+impl From<ConversationSearchHit> for FfiConversationSearchHit {
+    fn from(v: ConversationSearchHit) -> Self {
+        Self {
+            host_id: v.host_id,
+            host_name: v.host_name,
+            agent_id: v.agent_id,
+            seq: v.seq,
+            role: v.role,
+            title: v.title,
+            project_name: v.project_name,
+            snippet: v.snippet,
+            updated_at_rfc3339: v.updated_at_rfc3339,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiExportFormat {
+    Markdown,
+    Json,
+    Html,
+}
+
+impl From<FfiExportFormat> for ExportFormat {
+    fn from(v: FfiExportFormat) -> Self {
+        match v {
+            FfiExportFormat::Markdown => Self::Markdown,
+            FfiExportFormat::Json => Self::Json,
+            FfiExportFormat::Html => Self::Html,
+        }
+    }
+}
+
+impl From<ExportFormat> for FfiExportFormat {
+    fn from(v: ExportFormat) -> Self {
+        match v {
+            ExportFormat::Markdown => Self::Markdown,
+            ExportFormat::Json => Self::Json,
+            ExportFormat::Html => Self::Html,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiExportOptions {
+    pub format: FfiExportFormat,
+    pub include_thinking: bool,
+    pub include_tool_calls: bool,
+    pub include_timestamps: bool,
+}
+
+impl From<FfiExportOptions> for ExportOptions {
+    fn from(v: FfiExportOptions) -> Self {
+        Self {
+            format: v.format.into(),
+            include_thinking: v.include_thinking,
+            include_tool_calls: v.include_tool_calls,
+            include_timestamps: v.include_timestamps,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiExportedTranscript {
+    pub suggested_filename: String,
+    pub mime_type: String,
+    pub content: String,
+    pub turn_count: u64,
+    pub byte_len: u64,
+}
+
+impl From<ExportedTranscript> for FfiExportedTranscript {
+    fn from(v: ExportedTranscript) -> Self {
+        Self {
+            suggested_filename: v.suggested_filename,
+            mime_type: v.mime_type,
+            content: v.content,
+            turn_count: v.turn_count as u64,
+            byte_len: v.byte_len as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiExtractedCodeBlock {
+    pub index: u64,
+    pub turn_index: u64,
+    pub language: String,
+    pub preview: String,
+    pub line_count: u64,
+    pub code: String,
+}
+
+impl From<ExtractedCodeBlock> for FfiExtractedCodeBlock {
+    fn from(v: ExtractedCodeBlock) -> Self {
+        Self {
+            index: v.index as u64,
+            turn_index: v.turn_index as u64,
+            language: v.language,
+            preview: v.preview,
+            line_count: v.line_count as u64,
+            code: v.code,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiProviderKind {
     Antigravity,
     Codex,
     ClaudeCode,
+    OpenCode,
+    GeminiCli,
+    CursorAgent,
+    Copilot,
+    Goose,
+    Pi,
+    Kimi,
+    Cline,
+    MistralVibe,
+    Augment,
+    Acp,
 }
 
 impl From<ProviderKind> for FfiProviderKind {
@@ -87,6 +235,17 @@ impl From<ProviderKind> for FfiProviderKind {
             ProviderKind::Antigravity => Self::Antigravity,
             ProviderKind::Codex => Self::Codex,
             ProviderKind::ClaudeCode => Self::ClaudeCode,
+            ProviderKind::OpenCode => Self::OpenCode,
+            ProviderKind::GeminiCli => Self::GeminiCli,
+            ProviderKind::CursorAgent => Self::CursorAgent,
+            ProviderKind::Copilot => Self::Copilot,
+            ProviderKind::Goose => Self::Goose,
+            ProviderKind::Pi => Self::Pi,
+            ProviderKind::Kimi => Self::Kimi,
+            ProviderKind::Cline => Self::Cline,
+            ProviderKind::MistralVibe => Self::MistralVibe,
+            ProviderKind::Augment => Self::Augment,
+            ProviderKind::Acp => Self::Acp,
         }
     }
 }
@@ -97,6 +256,141 @@ impl From<FfiProviderKind> for ProviderKind {
             FfiProviderKind::Antigravity => Self::Antigravity,
             FfiProviderKind::Codex => Self::Codex,
             FfiProviderKind::ClaudeCode => Self::ClaudeCode,
+            FfiProviderKind::OpenCode => Self::OpenCode,
+            FfiProviderKind::GeminiCli => Self::GeminiCli,
+            FfiProviderKind::CursorAgent => Self::CursorAgent,
+            FfiProviderKind::Copilot => Self::Copilot,
+            FfiProviderKind::Goose => Self::Goose,
+            FfiProviderKind::Pi => Self::Pi,
+            FfiProviderKind::Kimi => Self::Kimi,
+            FfiProviderKind::Cline => Self::Cline,
+            FfiProviderKind::MistralVibe => Self::MistralVibe,
+            FfiProviderKind::Augment => Self::Augment,
+            FfiProviderKind::Acp => Self::Acp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiAcpAgentSource {
+    BuiltinCatalog,
+    RemoteRegistry,
+    Custom,
+}
+
+impl From<AcpAgentSource> for FfiAcpAgentSource {
+    fn from(v: AcpAgentSource) -> Self {
+        match v {
+            AcpAgentSource::BuiltinCatalog => Self::BuiltinCatalog,
+            AcpAgentSource::RemoteRegistry => Self::RemoteRegistry,
+            AcpAgentSource::Custom => Self::Custom,
+        }
+    }
+}
+
+impl From<FfiAcpAgentSource> for AcpAgentSource {
+    fn from(v: FfiAcpAgentSource) -> Self {
+        match v {
+            FfiAcpAgentSource::BuiltinCatalog => Self::BuiltinCatalog,
+            FfiAcpAgentSource::RemoteRegistry => Self::RemoteRegistry,
+            FfiAcpAgentSource::Custom => Self::Custom,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAcpAgentSpec {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub install_hint: Option<String>,
+    pub homepage: Option<String>,
+    pub version: Option<String>,
+    pub source: FfiAcpAgentSource,
+    pub enabled: bool,
+}
+
+impl From<AcpAgentSpec> for FfiAcpAgentSpec {
+    fn from(v: AcpAgentSpec) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            description: v.description,
+            command: v.command,
+            args: v.args,
+            env: v.env,
+            install_hint: v.install_hint,
+            homepage: v.homepage,
+            version: v.version,
+            source: v.source.into(),
+            enabled: v.enabled,
+        }
+    }
+}
+
+impl From<FfiAcpAgentSpec> for AcpAgentSpec {
+    fn from(v: FfiAcpAgentSpec) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            description: v.description,
+            command: v.command,
+            args: v.args,
+            env: v.env,
+            install_hint: v.install_hint,
+            homepage: v.homepage,
+            version: v.version,
+            source: v.source.into(),
+            enabled: v.enabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAcpAgentAvailability {
+    pub spec: FfiAcpAgentSpec,
+    pub installed: bool,
+    pub resolved_path: Option<String>,
+}
+
+impl From<AcpAgentAvailability> for FfiAcpAgentAvailability {
+    fn from(v: AcpAgentAvailability) -> Self {
+        Self {
+            spec: v.spec.into(),
+            installed: v.installed,
+            resolved_path: v.resolved_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAcpProbeResult {
+    pub agent_id: String,
+    pub ok: bool,
+    pub protocol_version: Option<String>,
+    pub server_name: Option<String>,
+    pub server_version: Option<String>,
+    pub capabilities_summary: Vec<String>,
+    pub auth_methods: Vec<String>,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+impl From<AcpProbeResult> for FfiAcpProbeResult {
+    fn from(v: AcpProbeResult) -> Self {
+        Self {
+            agent_id: v.agent_id,
+            ok: v.ok,
+            protocol_version: v.protocol_version,
+            server_name: v.server_name,
+            server_version: v.server_version,
+            capabilities_summary: v.capabilities_summary,
+            auth_methods: v.auth_methods,
+            latency_ms: v.latency_ms,
+            error: v.error,
         }
     }
 }
@@ -147,12 +441,14 @@ pub enum FfiSessionMode {
     AcceptEdits,
     FullAccess,
     Custom { name: String },
+    Auto,
 }
 
 impl From<SessionMode> for FfiSessionMode {
     fn from(v: SessionMode) -> Self {
         match v {
             SessionMode::Default => Self::Default,
+            SessionMode::Auto => Self::Auto,
             SessionMode::Plan => Self::Plan,
             SessionMode::AcceptEdits => Self::AcceptEdits,
             SessionMode::FullAccess => Self::FullAccess,
@@ -165,6 +461,7 @@ impl From<FfiSessionMode> for SessionMode {
     fn from(v: FfiSessionMode) -> Self {
         match v {
             FfiSessionMode::Default => Self::Default,
+            FfiSessionMode::Auto => Self::Auto,
             FfiSessionMode::Plan => Self::Plan,
             FfiSessionMode::AcceptEdits => Self::AcceptEdits,
             FfiSessionMode::FullAccess => Self::FullAccess,
@@ -531,6 +828,7 @@ pub struct FfiProviderModelSpec {
     pub is_default: bool,
     pub default_effort: Option<FfiReasoningEffort>,
     pub thinking_options: Vec<FfiThinkingOptionSpec>,
+    pub supports_fast_mode: bool,
 }
 
 impl From<ProviderModelSpec> for FfiProviderModelSpec {
@@ -542,6 +840,7 @@ impl From<ProviderModelSpec> for FfiProviderModelSpec {
             is_default: v.is_default,
             default_effort: v.default_effort.map(Into::into),
             thinking_options: v.thinking_options.into_iter().map(Into::into).collect(),
+            supports_fast_mode: v.supports_fast_mode,
         }
     }
 }
@@ -555,6 +854,7 @@ impl From<FfiProviderModelSpec> for ProviderModelSpec {
             is_default: v.is_default,
             default_effort: v.default_effort.map(Into::into),
             thinking_options: v.thinking_options.into_iter().map(Into::into).collect(),
+            supports_fast_mode: v.supports_fast_mode,
         }
     }
 }
@@ -1053,6 +1353,7 @@ pub struct FfiAgentCard {
     pub provider_label: String,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
+    pub fast_mode: bool,
     pub mode: FfiSessionMode,
     pub status_label: String,
     pub is_running: bool,
@@ -1065,6 +1366,9 @@ pub struct FfiAgentCard {
     pub cluster_suggestion: Option<FfiWorkspaceClusterSuggestion>,
     pub worktree_branch: Option<String>,
     pub task_summary: Option<String>,
+    pub forked_from_agent_id: Option<String>,
+    pub forked_at_seq: Option<u64>,
+    pub acp_agent_id: Option<String>,
     pub attention_label: Option<String>,
     pub latest_seq: u64,
     pub updated_at_rfc3339: String,
@@ -1092,6 +1396,7 @@ impl From<AgentCardView> for FfiAgentCard {
             provider_label: v.provider_label,
             model: v.model,
             effort: v.effort.map(Into::into),
+            fast_mode: v.fast_mode,
             mode: v.mode.into(),
             status_label: v.status_label,
             is_running: v.is_running,
@@ -1104,6 +1409,9 @@ impl From<AgentCardView> for FfiAgentCard {
             cluster_suggestion: v.cluster_suggestion.map(Into::into),
             worktree_branch: v.worktree_branch,
             task_summary: v.task_summary,
+            forked_from_agent_id: v.forked_from_agent_id,
+            forked_at_seq: v.forked_at_seq,
+            acp_agent_id: v.acp_agent_id,
             attention_label,
             latest_seq: v.latest_seq,
             updated_at_rfc3339: v.updated_at_rfc3339,
@@ -1156,6 +1464,439 @@ impl From<ProviderQuotaSnapshot> for FfiProviderQuota {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiTimerCondition {
+    Never,
+    AnyMessage,
+    Sender { sender_id: String },
+    AllSubagentsSettled,
+    FileChanged { path: String },
+}
+
+impl From<TimerCondition> for FfiTimerCondition {
+    fn from(v: TimerCondition) -> Self {
+        match v {
+            TimerCondition::Never => Self::Never,
+            TimerCondition::AnyMessage => Self::AnyMessage,
+            TimerCondition::Sender { sender_id } => Self::Sender { sender_id },
+            TimerCondition::AllSubagentsSettled => Self::AllSubagentsSettled,
+            TimerCondition::FileChanged { path } => Self::FileChanged { path },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiConditionalTimerState {
+    Armed,
+    Fired,
+    CanceledEarly,
+    CanceledManual,
+}
+
+impl From<ConditionalTimerState> for FfiConditionalTimerState {
+    fn from(v: ConditionalTimerState) -> Self {
+        match v {
+            ConditionalTimerState::Armed => Self::Armed,
+            ConditionalTimerState::Fired => Self::Fired,
+            ConditionalTimerState::CanceledEarly => Self::CanceledEarly,
+            ConditionalTimerState::CanceledManual => Self::CanceledManual,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiConditionalTimerRecord {
+    pub timer_id: String,
+    pub agent_id: String,
+    pub workspace_id: String,
+    pub prompt: String,
+    pub duration_seconds: u64,
+    pub condition: FfiTimerCondition,
+    pub condition_label: String,
+    pub state: FfiConditionalTimerState,
+    pub created_at_ms: u64,
+    pub fire_at_ms: u64,
+    pub resolved_at_ms: Option<u64>,
+    pub resolved_reason: Option<String>,
+}
+
+impl From<ConditionalTimerRecord> for FfiConditionalTimerRecord {
+    fn from(v: ConditionalTimerRecord) -> Self {
+        let condition_label = v.condition.short_label();
+        Self {
+            timer_id: v.timer_id,
+            agent_id: v.agent_id,
+            workspace_id: v.workspace_id,
+            prompt: v.prompt,
+            duration_seconds: v.duration_seconds,
+            condition: v.condition.into(),
+            condition_label,
+            state: v.state.into(),
+            created_at_ms: v.created_at_ms,
+            fire_at_ms: v.fire_at_ms,
+            resolved_at_ms: v.resolved_at_ms,
+            resolved_reason: v.resolved_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiGoalStatus {
+    Running,
+    Verifying,
+    Paused,
+    Succeeded,
+    Failed,
+    Canceled,
+}
+
+impl From<GoalStatus> for FfiGoalStatus {
+    fn from(v: GoalStatus) -> Self {
+        match v {
+            GoalStatus::Running => Self::Running,
+            GoalStatus::Verifying => Self::Verifying,
+            GoalStatus::Paused => Self::Paused,
+            GoalStatus::Succeeded => Self::Succeeded,
+            GoalStatus::Failed => Self::Failed,
+            GoalStatus::Canceled => Self::Canceled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiGoalControlAction {
+    Pause,
+    Resume,
+    Cancel,
+    VerifyNow,
+}
+
+impl From<FfiGoalControlAction> for GoalControlAction {
+    fn from(v: FfiGoalControlAction) -> Self {
+        match v {
+            FfiGoalControlAction::Pause => Self::Pause,
+            FfiGoalControlAction::Resume => Self::Resume,
+            FfiGoalControlAction::Cancel => Self::Cancel,
+            FfiGoalControlAction::VerifyNow => Self::VerifyNow,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiGoalCriterion {
+    pub id: String,
+    pub label: String,
+    pub passed: bool,
+}
+
+impl From<GoalCriterion> for FfiGoalCriterion {
+    fn from(v: GoalCriterion) -> Self {
+        Self {
+            id: v.id,
+            label: v.label,
+            passed: v.passed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiGoalRunRecord {
+    pub goal_id: String,
+    pub agent_id: String,
+    pub workspace_id: String,
+    pub objective: String,
+    pub criteria: Vec<FfiGoalCriterion>,
+    pub verify_command: Option<String>,
+    pub max_iterations: u32,
+    pub current_iteration: u32,
+    pub max_duration_secs: u64,
+    pub status: FfiGoalStatus,
+    pub last_verify_exit_code: Option<i32>,
+    pub last_verify_output: Option<String>,
+    pub consecutive_identical_failures: u32,
+    pub started_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+}
+
+impl From<GoalRunRecord> for FfiGoalRunRecord {
+    fn from(v: GoalRunRecord) -> Self {
+        Self {
+            goal_id: v.goal_id,
+            agent_id: v.agent_id,
+            workspace_id: v.workspace_id,
+            objective: v.objective,
+            criteria: v.criteria.into_iter().map(Into::into).collect(),
+            verify_command: v.verify_command,
+            max_iterations: v.max_iterations,
+            current_iteration: v.current_iteration,
+            max_duration_secs: v.max_duration_secs,
+            status: v.status.into(),
+            last_verify_exit_code: v.last_verify_exit_code,
+            last_verify_output: v.last_verify_output,
+            consecutive_identical_failures: v.consecutive_identical_failures,
+            started_at_ms: v.started_at_ms,
+            updated_at_ms: v.updated_at_ms,
+            finished_at_ms: v.finished_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMonitorKind {
+    CommandStream {
+        command: String,
+        args: Vec<String>,
+        pattern: Option<String>,
+    },
+    LogFileTail {
+        path: String,
+        pattern: String,
+    },
+    HttpHealth {
+        url: String,
+        expect_status: u16,
+        interval_secs: u64,
+    },
+}
+
+impl From<MonitorKind> for FfiMonitorKind {
+    fn from(v: MonitorKind) -> Self {
+        match v {
+            MonitorKind::CommandStream {
+                command,
+                args,
+                pattern,
+            } => Self::CommandStream {
+                command,
+                args,
+                pattern,
+            },
+            MonitorKind::LogFileTail { path, pattern } => Self::LogFileTail { path, pattern },
+            MonitorKind::HttpHealth {
+                url,
+                expect_status,
+                interval_secs,
+            } => Self::HttpHealth {
+                url,
+                expect_status,
+                interval_secs,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMonitorStatus {
+    Active,
+    Paused,
+    Triggered,
+    Stopped,
+    Error,
+}
+
+impl From<MonitorStatus> for FfiMonitorStatus {
+    fn from(v: MonitorStatus) -> Self {
+        match v {
+            MonitorStatus::Active => Self::Active,
+            MonitorStatus::Paused => Self::Paused,
+            MonitorStatus::Triggered => Self::Triggered,
+            MonitorStatus::Stopped => Self::Stopped,
+            MonitorStatus::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiMonitorWatchRecord {
+    pub monitor_id: String,
+    pub agent_id: String,
+    pub name: String,
+    pub kind: FfiMonitorKind,
+    pub status: FfiMonitorStatus,
+    pub match_count: u64,
+    pub last_event_preview: Option<String>,
+    pub last_triggered_at_ms: Option<u64>,
+    pub expires_at_ms: Option<u64>,
+    pub created_at_ms: u64,
+}
+
+impl From<MonitorWatchRecord> for FfiMonitorWatchRecord {
+    fn from(v: MonitorWatchRecord) -> Self {
+        Self {
+            monitor_id: v.monitor_id,
+            agent_id: v.agent_id,
+            name: v.name,
+            kind: v.kind.into(),
+            status: v.status.into(),
+            match_count: v.match_count,
+            last_event_preview: v.last_event_preview,
+            last_triggered_at_ms: v.last_triggered_at_ms,
+            expires_at_ms: v.expires_at_ms,
+            created_at_ms: v.created_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorkflowKind {
+    BatchCsv,
+    Dag,
+    BestOfN,
+}
+
+impl From<WorkflowKind> for FfiWorkflowKind {
+    fn from(v: WorkflowKind) -> Self {
+        match v {
+            WorkflowKind::BatchCsv => Self::BatchCsv,
+            WorkflowKind::Dag => Self::Dag,
+            WorkflowKind::BestOfN => Self::BestOfN,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorkflowRunStatus {
+    Pending,
+    Running,
+    Succeeded,
+    PartialFailure,
+    Failed,
+    Canceled,
+}
+
+impl From<WorkflowRunStatus> for FfiWorkflowRunStatus {
+    fn from(v: WorkflowRunStatus) -> Self {
+        match v {
+            WorkflowRunStatus::Pending => Self::Pending,
+            WorkflowRunStatus::Running => Self::Running,
+            WorkflowRunStatus::Succeeded => Self::Succeeded,
+            WorkflowRunStatus::PartialFailure => Self::PartialFailure,
+            WorkflowRunStatus::Failed => Self::Failed,
+            WorkflowRunStatus::Canceled => Self::Canceled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorkflowStepStatus {
+    Pending,
+    Running,
+    Verifying,
+    Succeeded,
+    Failed,
+    Canceled,
+    Skipped,
+}
+
+impl From<WorkflowStepStatus> for FfiWorkflowStepStatus {
+    fn from(v: WorkflowStepStatus) -> Self {
+        match v {
+            WorkflowStepStatus::Pending => Self::Pending,
+            WorkflowStepStatus::Running => Self::Running,
+            WorkflowStepStatus::Verifying => Self::Verifying,
+            WorkflowStepStatus::Succeeded => Self::Succeeded,
+            WorkflowStepStatus::Failed => Self::Failed,
+            WorkflowStepStatus::Canceled => Self::Canceled,
+            WorkflowStepStatus::Skipped => Self::Skipped,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiWorkflowStepRecord {
+    pub run_id: String,
+    pub step_id: String,
+    pub name: String,
+    pub status: FfiWorkflowStepStatus,
+    pub depends_on: Vec<String>,
+    pub agent_id: Option<String>,
+    pub worktree_cwd: Option<String>,
+    pub provider: FfiProviderKind,
+    pub model: Option<String>,
+    pub output_preview: Option<String>,
+    pub diff_additions: u32,
+    pub diff_deletions: u32,
+    pub diff_files: u32,
+    pub verify_passed: Option<bool>,
+    pub verify_output: Option<String>,
+    pub error: Option<String>,
+    pub is_winner: bool,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+}
+
+impl From<WorkflowStepRecord> for FfiWorkflowStepRecord {
+    fn from(v: WorkflowStepRecord) -> Self {
+        Self {
+            run_id: v.run_id,
+            step_id: v.step_id,
+            name: v.name,
+            status: v.status.into(),
+            depends_on: v.depends_on,
+            agent_id: v.agent_id,
+            worktree_cwd: v.worktree_cwd,
+            provider: v.provider.into(),
+            model: v.model,
+            output_preview: v.output_preview,
+            diff_additions: v.diff_additions,
+            diff_deletions: v.diff_deletions,
+            diff_files: v.diff_files,
+            verify_passed: v.verify_passed,
+            verify_output: v.verify_output,
+            error: v.error,
+            is_winner: v.is_winner,
+            started_at_ms: v.started_at_ms,
+            finished_at_ms: v.finished_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiWorkflowRunRecord {
+    pub run_id: String,
+    pub name: String,
+    pub kind: FfiWorkflowKind,
+    pub workspace_cwd: String,
+    pub owner_agent_id: Option<String>,
+    pub status: FfiWorkflowRunStatus,
+    pub max_concurrency: u32,
+    pub verify_command: Option<String>,
+    pub winner_step_id: Option<String>,
+    pub steps: Vec<FfiWorkflowStepRecord>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+}
+
+impl From<WorkflowRunRecord> for FfiWorkflowRunRecord {
+    fn from(v: WorkflowRunRecord) -> Self {
+        Self {
+            run_id: v.run_id,
+            name: v.name,
+            kind: v.kind.into(),
+            workspace_cwd: v.workspace_cwd,
+            owner_agent_id: v.owner_agent_id,
+            status: v.status.into(),
+            max_concurrency: v.max_concurrency,
+            verify_command: v.verify_command,
+            winner_step_id: v.winner_step_id,
+            steps: v.steps.into_iter().map(Into::into).collect(),
+            created_at_ms: v.created_at_ms,
+            updated_at_ms: v.updated_at_ms,
+            finished_at_ms: v.finished_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPushRegistrationStatus {
+    pub platform: String,
+    pub token_registered: bool,
+    pub token_preview: Option<String>,
+    pub relay_sync_supported: bool,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiHostDetail {
     pub revision: u64,
@@ -1178,6 +1919,12 @@ pub struct FfiHostDetail {
     pub workspace_boards: HashMap<String, FfiWorkspaceBoardSnapshot>,
     pub workspace_events: HashMap<String, Vec<FfiWorkspaceEvent>>,
     pub workspace_organize_status: HashMap<String, FfiWorkspaceOrganizeStatus>,
+    pub acp_agents: Vec<FfiAcpAgentAvailability>,
+    pub artifacts: Vec<FfiArtifactSummary>,
+    pub conditional_timers: Vec<FfiConditionalTimerRecord>,
+    pub goal_runs: Vec<FfiGoalRunRecord>,
+    pub monitor_watches: Vec<FfiMonitorWatchRecord>,
+    pub workflow_runs: Vec<FfiWorkflowRunRecord>,
 }
 
 impl From<HostDetailView> for FfiHostDetail {
@@ -1240,6 +1987,152 @@ impl From<HostDetailView> for FfiHostDetail {
                 .into_iter()
                 .map(|(k, val)| (k, val.into()))
                 .collect(),
+            acp_agents: v.acp_agents.into_iter().map(Into::into).collect(),
+            artifacts: v.artifacts.into_iter().map(Into::into).collect(),
+            conditional_timers: v.conditional_timers.into_iter().map(Into::into).collect(),
+            goal_runs: v.goal_runs.into_iter().map(Into::into).collect(),
+            monitor_watches: v.monitor_watches.into_iter().map(Into::into).collect(),
+            workflow_runs: v.workflow_runs.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiArtifactKind {
+    Markdown,
+    Html,
+    Code,
+    Svg,
+    Mermaid,
+    McpApp,
+}
+
+impl From<ArtifactKind> for FfiArtifactKind {
+    fn from(v: ArtifactKind) -> Self {
+        match v {
+            ArtifactKind::Markdown => Self::Markdown,
+            ArtifactKind::Html => Self::Html,
+            ArtifactKind::Code => Self::Code,
+            ArtifactKind::Svg => Self::Svg,
+            ArtifactKind::Mermaid => Self::Mermaid,
+            ArtifactKind::McpApp => Self::McpApp,
+        }
+    }
+}
+
+impl From<FfiArtifactKind> for ArtifactKind {
+    fn from(v: FfiArtifactKind) -> Self {
+        match v {
+            FfiArtifactKind::Markdown => Self::Markdown,
+            FfiArtifactKind::Html => Self::Html,
+            FfiArtifactKind::Code => Self::Code,
+            FfiArtifactKind::Svg => Self::Svg,
+            FfiArtifactKind::Mermaid => Self::Mermaid,
+            FfiArtifactKind::McpApp => Self::McpApp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiArtifactSummary {
+    pub artifact_id: String,
+    pub workspace_id: String,
+    pub agent_id: Option<String>,
+    pub title: String,
+    pub kind: FfiArtifactKind,
+    pub language: Option<String>,
+    pub mime_type: Option<String>,
+    pub resource_uri: Option<String>,
+    pub version: u32,
+    pub byte_len: u64,
+    pub created_at_rfc3339: String,
+    pub updated_at_rfc3339: String,
+}
+
+impl From<ArtifactSummary> for FfiArtifactSummary {
+    fn from(v: ArtifactSummary) -> Self {
+        Self {
+            artifact_id: v.artifact_id,
+            workspace_id: v.workspace_id,
+            agent_id: v.agent_id,
+            title: v.title,
+            kind: v.kind.into(),
+            language: v.language,
+            mime_type: v.mime_type,
+            resource_uri: v.resource_uri,
+            version: v.version,
+            byte_len: v.byte_len as u64,
+            created_at_rfc3339: v.created_at.to_rfc3339(),
+            updated_at_rfc3339: v.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiArtifactRevisionMeta {
+    pub version: u32,
+    pub created_at_rfc3339: String,
+    pub summary_note: Option<String>,
+    pub byte_len: u64,
+}
+
+impl From<ArtifactRevisionMeta> for FfiArtifactRevisionMeta {
+    fn from(v: ArtifactRevisionMeta) -> Self {
+        Self {
+            version: v.version,
+            created_at_rfc3339: v.created_at.to_rfc3339(),
+            summary_note: v.summary_note,
+            byte_len: v.byte_len as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiArtifactDetail {
+    pub summary: FfiArtifactSummary,
+    pub content: String,
+    pub revisions: Vec<FfiArtifactRevisionMeta>,
+}
+
+impl From<ArtifactDetail> for FfiArtifactDetail {
+    fn from(v: ArtifactDetail) -> Self {
+        Self {
+            summary: v.summary.into(),
+            content: v.content,
+            revisions: v.revisions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiUpsertArtifactRequest {
+    pub host_id: String,
+    pub artifact_id: Option<String>,
+    pub workspace_id: String,
+    pub agent_id: Option<String>,
+    pub title: String,
+    pub kind: FfiArtifactKind,
+    pub language: Option<String>,
+    pub mime_type: Option<String>,
+    pub resource_uri: Option<String>,
+    pub content: String,
+    pub summary_note: Option<String>,
+}
+
+impl From<FfiUpsertArtifactRequest> for UpsertArtifactRequest {
+    fn from(v: FfiUpsertArtifactRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            artifact_id: v.artifact_id,
+            workspace_id: v.workspace_id,
+            agent_id: v.agent_id,
+            title: v.title,
+            kind: v.kind.into(),
+            language: v.language,
+            mime_type: v.mime_type,
+            resource_uri: v.resource_uri,
+            content: v.content,
+            summary_note: v.summary_note,
         }
     }
 }
@@ -1281,6 +2174,7 @@ pub struct FfiInlineSpan {
     pub strikethrough: bool,
     pub inline_code: bool,
     pub link_url: Option<String>,
+    pub math_ml: Option<String>,
 }
 
 impl From<InlineSpanView> for FfiInlineSpan {
@@ -1292,6 +2186,7 @@ impl From<InlineSpanView> for FfiInlineSpan {
             strikethrough: v.strikethrough,
             inline_code: v.inline_code,
             link_url: v.link_url,
+            math_ml: v.math_ml,
         }
     }
 }
@@ -1404,6 +2299,10 @@ pub enum FfiRichBlock {
         rows: Vec<FfiTableRow>,
     },
     HorizontalRule,
+    MathBlock {
+        tex: String,
+        math_ml: String,
+    },
 }
 
 impl From<RichBlockView> for FfiRichBlock {
@@ -1448,6 +2347,7 @@ impl From<RichBlockView> for FfiRichBlock {
                 headers: headers.into_iter().map(Into::into).collect(),
                 rows: rows.into_iter().map(Into::into).collect(),
             },
+            RichBlockView::MathBlock { tex, math_ml } => Self::MathBlock { tex, math_ml },
             RichBlockView::HorizontalRule => Self::HorizontalRule,
         }
     }
@@ -2017,6 +2917,7 @@ impl From<TimelineItemView> for FfiTimelineItem {
                 allowed_decisions,
                 resolved_decision,
                 timestamp_ms,
+                ..
             } => {
                 let command_or_path = tool_primary_target(&detail);
                 Self::PermissionRequest {
@@ -2801,6 +3702,158 @@ impl From<RewindAgentResultView> for FfiRewindAgentResult {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiForkAgentResult {
+    pub agent: FfiAgentCard,
+    pub workspace: Option<FfiWorkspaceSummary>,
+}
+
+impl From<ForkAgentResultView> for FfiForkAgentResult {
+    fn from(v: ForkAgentResultView) -> Self {
+        Self {
+            agent: v.agent.into(),
+            workspace: v.workspace.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorktreeHandoffDirection {
+    WorktreeToLocal,
+    LocalToWorktree,
+}
+
+impl From<FfiWorktreeHandoffDirection> for WorktreeHandoffDirection {
+    fn from(v: FfiWorktreeHandoffDirection) -> Self {
+        match v {
+            FfiWorktreeHandoffDirection::WorktreeToLocal => Self::WorktreeToLocal,
+            FfiWorktreeHandoffDirection::LocalToWorktree => Self::LocalToWorktree,
+        }
+    }
+}
+
+impl From<WorktreeHandoffDirection> for FfiWorktreeHandoffDirection {
+    fn from(v: WorktreeHandoffDirection) -> Self {
+        match v {
+            WorktreeHandoffDirection::WorktreeToLocal => Self::WorktreeToLocal,
+            WorktreeHandoffDirection::LocalToWorktree => Self::LocalToWorktree,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorktreeHandoffMode {
+    Apply,
+    Move,
+}
+
+impl From<FfiWorktreeHandoffMode> for WorktreeHandoffMode {
+    fn from(v: FfiWorktreeHandoffMode) -> Self {
+        match v {
+            FfiWorktreeHandoffMode::Apply => Self::Apply,
+            FfiWorktreeHandoffMode::Move => Self::Move,
+        }
+    }
+}
+
+impl From<WorktreeHandoffMode> for FfiWorktreeHandoffMode {
+    fn from(v: WorktreeHandoffMode) -> Self {
+        match v {
+            WorktreeHandoffMode::Apply => Self::Apply,
+            WorktreeHandoffMode::Move => Self::Move,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiHandoffFileChange {
+    pub path: String,
+    pub status: String,
+    pub insertions: u32,
+    pub deletions: u32,
+    pub is_untracked: bool,
+    pub has_conflict: bool,
+}
+
+impl From<HandoffFileChange> for FfiHandoffFileChange {
+    fn from(v: HandoffFileChange) -> Self {
+        Self {
+            path: v.path,
+            status: v.status,
+            insertions: v.insertions,
+            deletions: v.deletions,
+            is_untracked: v.is_untracked,
+            has_conflict: v.has_conflict,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorktreeHandoffPreview {
+    pub direction: FfiWorktreeHandoffDirection,
+    pub source_cwd: String,
+    pub target_cwd: String,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub commit_count: u32,
+    pub files: Vec<FfiHandoffFileChange>,
+    pub total_insertions: u32,
+    pub total_deletions: u32,
+    pub target_dirty: bool,
+    pub conflicts: Vec<String>,
+    pub can_apply_cleanly: bool,
+    pub warning: Option<String>,
+}
+
+impl From<WorktreeHandoffPreview> for FfiWorktreeHandoffPreview {
+    fn from(v: WorktreeHandoffPreview) -> Self {
+        Self {
+            direction: v.direction.into(),
+            source_cwd: v.source_cwd,
+            target_cwd: v.target_cwd,
+            source_branch: v.source_branch,
+            target_branch: v.target_branch,
+            commit_count: v.commit_count,
+            files: v.files.into_iter().map(Into::into).collect(),
+            total_insertions: v.total_insertions,
+            total_deletions: v.total_deletions,
+            target_dirty: v.target_dirty,
+            conflicts: v.conflicts,
+            can_apply_cleanly: v.can_apply_cleanly,
+            warning: v.warning,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorktreeHandoffOutcome {
+    pub direction: FfiWorktreeHandoffDirection,
+    pub mode: FfiWorktreeHandoffMode,
+    pub applied_files: u32,
+    pub backup_ref: Option<String>,
+    pub target_workspace: Option<FfiWorkspaceSummary>,
+    pub target_cwd: String,
+    pub had_conflicts: bool,
+    pub conflict_files: Vec<String>,
+    pub summary: String,
+}
+
+impl From<WorktreeHandoffOutcome> for FfiWorktreeHandoffOutcome {
+    fn from(v: WorktreeHandoffOutcome) -> Self {
+        Self {
+            direction: v.direction.into(),
+            mode: v.mode.into(),
+            applied_files: v.applied_files,
+            backup_ref: v.backup_ref,
+            target_workspace: v.target_workspace.map(Into::into),
+            target_cwd: v.target_cwd,
+            had_conflicts: v.had_conflicts,
+            conflict_files: v.conflict_files,
+            summary: v.summary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiWorkspaceFile {
     pub host_id: String,
     pub cwd: String,
@@ -2812,6 +3865,10 @@ pub struct FfiWorkspaceFile {
     pub content: String,
     pub size_bytes: u64,
     pub truncated: bool,
+    pub etag: Option<String>,
+    pub mtime_unix_ms: Option<i64>,
+    pub writable: bool,
+    pub line_ending: Option<String>,
     pub highlighted_lines: Vec<FfiHighlightedLine>,
     pub markdown_blocks: Vec<FfiRichBlock>,
 }
@@ -2829,8 +3886,77 @@ impl From<WorkspaceFileView> for FfiWorkspaceFile {
             content: v.content,
             size_bytes: v.size_bytes,
             truncated: v.truncated,
+            etag: v.etag,
+            mtime_unix_ms: v.mtime_unix_ms,
+            writable: v.writable,
+            line_ending: v.line_ending,
             highlighted_lines: v.highlighted_lines.into_iter().map(Into::into).collect(),
             markdown_blocks: v.markdown_blocks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceFileConflict {
+    pub current_etag: String,
+    pub current_content: Option<String>,
+    pub current_size_bytes: u64,
+    pub current_mtime_unix_ms: Option<i64>,
+}
+
+impl From<WorkspaceFileConflict> for FfiWorkspaceFileConflict {
+    fn from(v: WorkspaceFileConflict) -> Self {
+        Self {
+            current_etag: v.current_etag,
+            current_content: v.current_content,
+            current_size_bytes: v.current_size_bytes,
+            current_mtime_unix_ms: v.current_mtime_unix_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceFileWriteResult {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub etag: String,
+    pub size_bytes: u64,
+    pub mtime_unix_ms: Option<i64>,
+    pub conflict: Option<FfiWorkspaceFileConflict>,
+}
+
+impl From<WorkspaceFileWriteResultView> for FfiWorkspaceFileWriteResult {
+    fn from(v: WorkspaceFileWriteResultView) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+            etag: v.etag,
+            size_bytes: v.size_bytes,
+            mtime_unix_ms: v.mtime_unix_ms,
+            conflict: v.conflict.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceEntryMutationResult {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub new_path: Option<String>,
+    pub action: String,
+}
+
+impl From<WorkspaceEntryMutationResultView> for FfiWorkspaceEntryMutationResult {
+    fn from(v: WorkspaceEntryMutationResultView) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+            new_path: v.new_path,
+            action: v.action,
         }
     }
 }
@@ -3205,6 +4331,23 @@ impl From<FfiComposePromptRequest> for ComposePromptRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiFastModeSlashAction {
+    Toggle,
+    Enable,
+    Disable,
+}
+
+impl From<FastModeSlashAction> for FfiFastModeSlashAction {
+    fn from(v: FastModeSlashAction) -> Self {
+        match v {
+            FastModeSlashAction::Toggle => Self::Toggle,
+            FastModeSlashAction::Enable => Self::Enable,
+            FastModeSlashAction::Disable => Self::Disable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiComposedPrompt {
     pub wire_prompt: String,
@@ -3214,6 +4357,11 @@ pub struct FfiComposedPrompt {
     pub is_compact: bool,
     pub is_btw: bool,
     pub btw_question: Option<String>,
+    pub is_fork: bool,
+    pub fork_worktree: bool,
+    pub fork_branch: Option<String>,
+    pub fork_prompt: Option<String>,
+    pub fast_mode_action: Option<FfiFastModeSlashAction>,
     pub is_empty: bool,
 }
 
@@ -3227,6 +4375,11 @@ impl From<ComposedPromptView> for FfiComposedPrompt {
             is_compact: v.is_compact,
             is_btw: v.is_btw,
             btw_question: v.btw_question,
+            is_fork: v.is_fork,
+            fork_worktree: v.fork_worktree,
+            fork_branch: v.fork_branch,
+            fork_prompt: v.fork_prompt,
+            fast_mode_action: v.fast_mode_action.map(Into::into),
             is_empty: v.is_empty,
         }
     }
@@ -3308,6 +4461,7 @@ pub struct FfiResolvedModelSelection {
     pub selected_effort: Option<FfiReasoningEffort>,
     pub selected_effort_label: Option<String>,
     pub thinking_options: Vec<FfiThinkingOptionSpec>,
+    pub supports_fast_mode: bool,
 }
 
 impl From<ResolvedModelSelectionView> for FfiResolvedModelSelection {
@@ -3320,8 +4474,15 @@ impl From<ResolvedModelSelectionView> for FfiResolvedModelSelection {
             selected_effort: v.selected_effort.map(Into::into),
             selected_effort_label: v.selected_effort_label,
             thinking_options: v.thinking_options.into_iter().map(Into::into).collect(),
+            supports_fast_mode: v.supports_fast_mode,
         }
     }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAcpRegistryRefreshResult {
+    pub agents: Vec<FfiAcpAgentAvailability>,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -3330,8 +4491,10 @@ pub struct FfiCreateSessionRequest {
     pub cwd: String,
     pub extra_dirs: Vec<String>,
     pub provider: FfiProviderKind,
+    pub acp_agent_id: Option<String>,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
+    pub fast_mode: Option<bool>,
     pub mode: FfiSessionMode,
     pub initial_prompt: String,
     pub initial_display_prompt: Option<String>,
@@ -3346,8 +4509,10 @@ impl From<FfiCreateSessionRequest> for CreateSessionRequest {
             cwd: v.cwd,
             extra_dirs: v.extra_dirs,
             provider: v.provider.into(),
+            acp_agent_id: v.acp_agent_id,
             model: v.model,
             effort: v.effort.map(Into::into),
+            fast_mode: v.fast_mode,
             mode: v.mode.into(),
             initial_prompt: v.initial_prompt,
             initial_display_prompt: v.initial_display_prompt,
@@ -3469,6 +4634,87 @@ impl From<FfiRewindAgentRequest> for RewindAgentRequest {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiForkAgentRequest {
+    pub host_id: String,
+    pub source_agent_id: String,
+    pub up_to_seq: Option<u64>,
+    pub worktree: bool,
+    pub branch: Option<String>,
+    pub base_ref: Option<String>,
+    pub title: Option<String>,
+    pub initial_prompt: Option<String>,
+}
+
+impl From<FfiForkAgentRequest> for ForkAgentRequest {
+    fn from(v: FfiForkAgentRequest) -> Self {
+        let target = if v.worktree || v.branch.is_some() || v.base_ref.is_some() {
+            ForkTarget::NewWorktree {
+                branch: v.branch,
+                base_ref: v.base_ref,
+            }
+        } else {
+            ForkTarget::SameDirectory
+        };
+        Self {
+            host_id: v.host_id,
+            source_agent_id: v.source_agent_id,
+            up_to_seq: v.up_to_seq,
+            target,
+            title: v.title,
+            initial_prompt: v.initial_prompt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPreviewWorktreeHandoffRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub direction: FfiWorktreeHandoffDirection,
+    pub target_workspace_id: Option<String>,
+    pub include_committed: bool,
+}
+
+impl From<FfiPreviewWorktreeHandoffRequest> for PreviewWorktreeHandoffRequest {
+    fn from(v: FfiPreviewWorktreeHandoffRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            workspace_id: v.workspace_id,
+            direction: v.direction.into(),
+            target_workspace_id: v.target_workspace_id,
+            include_committed: v.include_committed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiExecuteWorktreeHandoffRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub direction: FfiWorktreeHandoffDirection,
+    pub mode: FfiWorktreeHandoffMode,
+    pub target_workspace_id: Option<String>,
+    pub include_committed: bool,
+    pub branch: Option<String>,
+    pub allow_three_way_conflicts: bool,
+}
+
+impl From<FfiExecuteWorktreeHandoffRequest> for ExecuteWorktreeHandoffRequest {
+    fn from(v: FfiExecuteWorktreeHandoffRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            workspace_id: v.workspace_id,
+            direction: v.direction.into(),
+            mode: v.mode.into(),
+            target_workspace_id: v.target_workspace_id,
+            include_committed: v.include_committed,
+            branch: v.branch,
+            allow_three_way_conflicts: v.allow_three_way_conflicts,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiReadWorkspaceFileRequest {
     pub host_id: String,
     pub cwd: String,
@@ -3486,14 +4732,96 @@ impl From<FfiReadWorkspaceFileRequest> for ReadWorkspaceFileRequest {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWriteWorkspaceFileRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub content: String,
+    pub expected_etag: Option<String>,
+    pub force: bool,
+}
+
+impl From<FfiWriteWorkspaceFileRequest> for WriteWorkspaceFileRequest {
+    fn from(v: FfiWriteWorkspaceFileRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+            content: v.content,
+            expected_etag: v.expected_etag,
+            force: v.force,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCreateWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub initial_content: Option<String>,
+}
+
+impl From<FfiCreateWorkspaceEntryRequest> for CreateWorkspaceEntryRequest {
+    fn from(v: FfiCreateWorkspaceEntryRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+            is_dir: v.is_dir,
+            initial_content: v.initial_content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiRenameWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub old_path: String,
+    pub new_path: String,
+}
+
+impl From<FfiRenameWorkspaceEntryRequest> for RenameWorkspaceEntryRequest {
+    fn from(v: FfiRenameWorkspaceEntryRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            old_path: v.old_path,
+            new_path: v.new_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDeleteWorkspaceEntryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+}
+
+impl From<FfiDeleteWorkspaceEntryRequest> for DeleteWorkspaceEntryRequest {
+    fn from(v: FfiDeleteWorkspaceEntryRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiSpawnWorkspacePeerRequest {
     pub host_id: String,
     pub workspace_id: String,
     pub cwd: String,
     pub extra_dirs: Vec<String>,
     pub provider: FfiProviderKind,
+    pub acp_agent_id: Option<String>,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
+    pub fast_mode: Option<bool>,
     pub mode: FfiSessionMode,
     pub initial_prompt: String,
     pub worktree_branch: Option<String>,
@@ -3509,8 +4837,10 @@ impl From<FfiSpawnWorkspacePeerRequest> for SpawnWorkspacePeerRequest {
             cwd: v.cwd,
             extra_dirs: v.extra_dirs,
             provider: v.provider.into(),
+            acp_agent_id: v.acp_agent_id,
             model: v.model,
             effort: v.effort.map(Into::into),
+            fast_mode: v.fast_mode,
             mode: v.mode.into(),
             initial_prompt: v.initial_prompt,
             worktree_branch: v.worktree_branch,
@@ -3530,8 +4860,10 @@ pub struct FfiCreateScheduleRequest {
     pub cwd: String,
     pub workspace_id: Option<String>,
     pub provider: FfiProviderKind,
+    pub acp_agent_id: Option<String>,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
+    pub fast_mode: bool,
     pub mode: FfiSessionMode,
     pub worktree: bool,
     pub archive_on_finish: bool,
@@ -3687,11 +5019,11 @@ pub fn fallback_provider_catalog(provider: FfiProviderKind) -> FfiProviderModelC
 
 #[uniffi::export]
 pub fn fallback_provider_catalogs() -> Vec<FfiProviderModelCatalog> {
-    vec![
-        core_fallback_provider_catalog(ProviderKind::Antigravity).into(),
-        core_fallback_provider_catalog(ProviderKind::Codex).into(),
-        core_fallback_provider_catalog(ProviderKind::ClaudeCode).into(),
-    ]
+    ProviderKind::all()
+        .iter()
+        .copied()
+        .map(|p| core_fallback_provider_catalog(p).into())
+        .collect()
 }
 
 #[uniffi::export]
@@ -3736,9 +5068,49 @@ pub fn parse_markdown_preview(markdown: String, streaming: bool) -> Vec<FfiRichB
         .collect()
 }
 
+struct ThreadWaker(thread::Thread);
+
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Blocks the calling FFI thread on a future that spawns its real work onto `OrbitAppCore`'s
+/// internal Tokio runtime and only awaits a bounded `tokio::sync::oneshot::Receiver`.
+///
+/// Precondition: MUST ONLY be called with `OrbitAppCore::*_on_host` RPC wrappers whose top-level
+/// future performs no direct Tokio timer/IO reactor calls outside `self.runtime.spawn(...)`.
+fn block_on_oneshot_future<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+fn mask_push_token(token: &str) -> String {
+    let chars: Vec<char> = token.trim().chars().collect();
+    if chars.len() <= 12 {
+        return "••••".to_string();
+    }
+    let prefix: String = chars.iter().take(6).collect();
+    let suffix: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("{prefix}…{suffix}")
+}
+
 #[derive(uniffi::Object)]
 pub struct OrbitMobileCore {
     inner: Arc<OrbitAppCore>,
+    push_registration: Mutex<Option<(String, String)>>,
 }
 
 #[uniffi::export]
@@ -3748,7 +5120,10 @@ impl OrbitMobileCore {
         let inner = OrbitAppCore::open(&db_path, false).map_err(|e| FfiOrbitError::Core {
             detail: e.to_string(),
         })?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner,
+            push_registration: Mutex::new(None),
+        }))
     }
 
     #[uniffi::constructor]
@@ -3760,7 +5135,10 @@ impl OrbitMobileCore {
             OrbitAppCore::open(&db_path, auto_discover_local).map_err(|e| FfiOrbitError::Core {
                 detail: e.to_string(),
             })?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner,
+            push_registration: Mutex::new(None),
+        }))
     }
 
     #[uniffi::constructor]
@@ -3768,7 +5146,10 @@ impl OrbitMobileCore {
         let inner = OrbitAppCore::open_in_memory().map_err(|e| FfiOrbitError::Core {
             detail: e.to_string(),
         })?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner,
+            push_registration: Mutex::new(None),
+        }))
     }
 
     pub fn subscribe(&self, listener: Arc<dyn MobileCoreListener>) {
@@ -3793,6 +5174,38 @@ impl OrbitMobileCore {
 
     pub fn bridge_info(&self) -> FfiBridgeInfo {
         self.inner.bridge_info().into()
+    }
+
+    pub fn search_messages(&self, query: String, limit: u32) -> Vec<FfiConversationSearchHit> {
+        self.inner
+            .search_messages(query, limit)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn export_agent_transcript(
+        &self,
+        host_id: String,
+        agent_id: String,
+        options: FfiExportOptions,
+    ) -> Result<FfiExportedTranscript, FfiOrbitError> {
+        let core_opts: ExportOptions = options.into();
+        self.inner
+            .export_agent_transcript(&host_id, &agent_id, &core_opts)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn list_agent_code_blocks(
+        &self,
+        host_id: String,
+        agent_id: String,
+    ) -> Result<Vec<FfiExtractedCodeBlock>, FfiOrbitError> {
+        self.inner
+            .list_agent_code_blocks(&host_id, &agent_id)
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
     pub fn fleet_sidebar_request(&self, req: FfiFleetSidebarRequest) -> FfiFleetSidebar {
@@ -3847,6 +5260,36 @@ impl OrbitMobileCore {
             req.to_before_seq,
             req.restore_files,
         )
+    }
+
+    pub fn fork_agent_request(
+        &self,
+        req: FfiForkAgentRequest,
+    ) -> Result<FfiForkAgentResult, FfiOrbitError> {
+        self.inner
+            .fork_agent_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn preview_worktree_handoff(
+        &self,
+        req: FfiPreviewWorktreeHandoffRequest,
+    ) -> Result<FfiWorktreeHandoffPreview, FfiOrbitError> {
+        self.inner
+            .preview_worktree_handoff_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn execute_worktree_handoff(
+        &self,
+        req: FfiExecuteWorktreeHandoffRequest,
+    ) -> Result<FfiWorktreeHandoffOutcome, FfiOrbitError> {
+        self.inner
+            .execute_worktree_handoff_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
     pub fn read_workspace_file_request(
@@ -4153,6 +5596,7 @@ impl OrbitMobileCore {
         cwd: String,
         extra_dirs: Vec<String>,
         provider: FfiProviderKind,
+        acp_agent_id: Option<String>,
         model: Option<String>,
         effort: Option<FfiReasoningEffort>,
         mode: FfiSessionMode,
@@ -4166,8 +5610,10 @@ impl OrbitMobileCore {
             cwd: &cwd,
             extra_dirs,
             provider: provider.into(),
+            acp_agent_id,
             model,
             effort: effort.map(Into::into),
+            fast_mode: None,
             mode: mode.into(),
             initial_prompt: &initial_prompt,
             initial_display_prompt,
@@ -4273,6 +5719,11 @@ impl OrbitMobileCore {
             .set_agent_config(&host_id, &agent_id, model, effort.map(Into::into));
     }
 
+    pub fn set_agent_fast_mode(&self, host_id: String, agent_id: String, fast_mode: bool) {
+        self.inner
+            .set_agent_fast_mode(&host_id, &agent_id, fast_mode);
+    }
+
     pub fn switch_agent_provider(
         &self,
         host_id: String,
@@ -4280,6 +5731,7 @@ impl OrbitMobileCore {
         provider: FfiProviderKind,
         model: Option<String>,
         effort: Option<FfiReasoningEffort>,
+        acp_agent_id: Option<String>,
     ) {
         self.inner.switch_agent_provider_with_config(
             &host_id,
@@ -4287,6 +5739,7 @@ impl OrbitMobileCore {
             provider.into(),
             model,
             effort.map(Into::into),
+            acp_agent_id,
         );
     }
 
@@ -4402,6 +5855,46 @@ impl OrbitMobileCore {
     ) -> Result<FfiWorkspaceFile, FfiOrbitError> {
         self.inner
             .read_workspace_file_blocking(&host_id, &cwd, &path)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn write_workspace_file(
+        &self,
+        req: FfiWriteWorkspaceFileRequest,
+    ) -> Result<FfiWorkspaceFileWriteResult, FfiOrbitError> {
+        self.inner
+            .write_workspace_file_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn create_workspace_entry(
+        &self,
+        req: FfiCreateWorkspaceEntryRequest,
+    ) -> Result<FfiWorkspaceEntryMutationResult, FfiOrbitError> {
+        self.inner
+            .create_workspace_entry_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn rename_workspace_entry(
+        &self,
+        req: FfiRenameWorkspaceEntryRequest,
+    ) -> Result<FfiWorkspaceEntryMutationResult, FfiOrbitError> {
+        self.inner
+            .rename_workspace_entry_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn delete_workspace_entry(
+        &self,
+        req: FfiDeleteWorkspaceEntryRequest,
+    ) -> Result<FfiWorkspaceEntryMutationResult, FfiOrbitError> {
+        self.inner
+            .delete_workspace_entry_blocking(req.into())
             .map(Into::into)
             .map_err(|detail| FfiOrbitError::Core { detail })
     }
@@ -4727,6 +6220,114 @@ impl OrbitMobileCore {
             .map(Into::into)
     }
 
+    // --- First-Class Artifacts & SEP-1865 MCP Apps ---
+
+    pub fn list_artifacts(
+        &self,
+        host_id: String,
+        workspace_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<Vec<FfiArtifactSummary>, FfiOrbitError> {
+        self.inner
+            .list_artifacts_blocking(&host_id, workspace_id, agent_id)
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn get_artifact(
+        &self,
+        host_id: String,
+        artifact_id: String,
+        version: Option<u32>,
+    ) -> Result<FfiArtifactDetail, FfiOrbitError> {
+        self.inner
+            .get_artifact_blocking(&host_id, &artifact_id, version)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn upsert_artifact(
+        &self,
+        req: FfiUpsertArtifactRequest,
+    ) -> Result<FfiArtifactSummary, FfiOrbitError> {
+        self.inner
+            .upsert_artifact_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn delete_artifact(
+        &self,
+        host_id: String,
+        artifact_id: String,
+    ) -> Result<String, FfiOrbitError> {
+        self.inner
+            .delete_artifact_blocking(&host_id, &artifact_id)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    // --- Universal ACP Agent Registry & Probing ---
+
+    pub fn list_acp_agents(&self, host_id: String) -> Vec<FfiAcpAgentAvailability> {
+        self.inner
+            .list_acp_agents(&host_id)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn refresh_acp_agents(&self, host_id: String) {
+        self.inner.refresh_acp_agents(&host_id);
+    }
+
+    pub fn upsert_custom_acp_agent(
+        &self,
+        host_id: String,
+        spec: FfiAcpAgentSpec,
+    ) -> Result<Vec<FfiAcpAgentAvailability>, FfiOrbitError> {
+        self.inner
+            .upsert_custom_acp_agent_blocking(&host_id, spec.into())
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn delete_custom_acp_agent(
+        &self,
+        host_id: String,
+        agent_id: String,
+    ) -> Result<Vec<FfiAcpAgentAvailability>, FfiOrbitError> {
+        self.inner
+            .delete_custom_acp_agent_blocking(&host_id, &agent_id)
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn test_acp_agent(
+        &self,
+        host_id: String,
+        agent_id: String,
+        cwd: Option<String>,
+    ) -> Result<FfiAcpProbeResult, FfiOrbitError> {
+        self.inner
+            .test_acp_agent_blocking(&host_id, &agent_id, cwd)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn refresh_acp_registry(
+        &self,
+        host_id: String,
+        registry_url: Option<String>,
+    ) -> Result<FfiAcpRegistryRefreshResult, FfiOrbitError> {
+        self.inner
+            .refresh_acp_registry_blocking(&host_id, registry_url)
+            .map(|view| FfiAcpRegistryRefreshResult {
+                agents: view.agents.into_iter().map(Into::into).collect(),
+                warning: view.warning,
+            })
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
     pub fn list_provider_subagents(&self, host_id: String, parent_agent_id: String) {
         self.inner
             .list_provider_subagents(&host_id, &parent_agent_id);
@@ -4760,8 +6361,10 @@ impl OrbitMobileCore {
             cwd: req.cwd,
             workspace_id: req.workspace_id,
             provider: req.provider.into(),
+            acp_agent_id: req.acp_agent_id,
             model: req.model,
             effort: req.effort.map(Into::into),
+            fast_mode: req.fast_mode,
             mode: req.mode.into(),
             profile_id: None,
             worktree: req.worktree,
@@ -4931,6 +6534,370 @@ impl OrbitMobileCore {
             .map_err(|e| FfiOrbitError::Core {
                 detail: e.to_string(),
             })
+    }
+
+    // --- Native Mobile Background Push (APNs / FCM / HarmonyOS Push Kit) ---
+
+    pub fn register_push_device(
+        &self,
+        host_id: String,
+        req: FfiRegisterPushDeviceRequest,
+    ) -> Result<FfiPushDevicesSnapshot, FfiOrbitError> {
+        self.inner
+            .register_push_device_blocking(&host_id, req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn unregister_push_device(
+        &self,
+        host_id: String,
+        device_id: String,
+    ) -> Result<FfiPushDevicesSnapshot, FfiOrbitError> {
+        self.inner
+            .unregister_push_device_blocking(&host_id, &device_id)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn list_push_devices(
+        &self,
+        host_id: String,
+    ) -> Result<FfiPushDevicesSnapshot, FfiOrbitError> {
+        self.inner
+            .list_push_devices_blocking(&host_id)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    // --- Conditional Timers ---
+
+    pub fn list_conditional_timers(
+        &self,
+        host_id: String,
+        agent_id: Option<String>,
+        include_resolved: bool,
+    ) -> Result<Vec<FfiConditionalTimerRecord>, FfiOrbitError> {
+        block_on_oneshot_future(self.inner.list_conditional_timers_on_host(
+            &host_id,
+            agent_id,
+            include_resolved,
+        ))
+        .map(|list| list.into_iter().map(Into::into).collect())
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn cancel_conditional_timer(
+        &self,
+        host_id: String,
+        timer_id: String,
+    ) -> Result<FfiConditionalTimerRecord, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .cancel_conditional_timer_on_host(&host_id, &timer_id),
+        )
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn fire_conditional_timer_now(
+        &self,
+        host_id: String,
+        timer_id: String,
+    ) -> Result<FfiConditionalTimerRecord, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .fire_conditional_timer_now_on_host(&host_id, &timer_id),
+        )
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    // --- Goals & Monitors ---
+
+    pub fn list_goal_runs(
+        &self,
+        host_id: String,
+        agent_id: Option<String>,
+    ) -> Result<Vec<FfiGoalRunRecord>, FfiOrbitError> {
+        block_on_oneshot_future(self.inner.list_goal_runs_on_host(&host_id, agent_id))
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn control_goal_run(
+        &self,
+        host_id: String,
+        goal_id: String,
+        action: FfiGoalControlAction,
+    ) -> Result<FfiGoalRunRecord, FfiOrbitError> {
+        block_on_oneshot_future(self.inner.control_goal_run_on_host(ControlGoalRunRequest {
+            host_id,
+            goal_id,
+            action: action.into(),
+        }))
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn list_monitor_watches(
+        &self,
+        host_id: String,
+        agent_id: Option<String>,
+    ) -> Result<Vec<FfiMonitorWatchRecord>, FfiOrbitError> {
+        block_on_oneshot_future(self.inner.list_monitor_watches_on_host(&host_id, agent_id))
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn stop_monitor_watch(
+        &self,
+        host_id: String,
+        monitor_id: String,
+    ) -> Result<FfiMonitorWatchRecord, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .stop_monitor_watch_on_host(StopMonitorWatchRequest {
+                    host_id,
+                    monitor_id,
+                }),
+        )
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    // --- Workflows (Batch CSV, DAG, Best-of-N) ---
+
+    pub fn list_workflow_runs(
+        &self,
+        host_id: String,
+        include_completed: bool,
+    ) -> Result<Vec<FfiWorkflowRunRecord>, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .list_workflow_runs_on_host(&host_id, include_completed),
+        )
+        .map(|list| list.into_iter().map(Into::into).collect())
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn cancel_workflow_run(
+        &self,
+        host_id: String,
+        run_id: String,
+    ) -> Result<FfiWorkflowRunRecord, FfiOrbitError> {
+        block_on_oneshot_future(
+            self.inner
+                .cancel_workflow_run_on_host(CancelWorkflowRunRequest { host_id, run_id }),
+        )
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    // --- Mobile Push Token Registration Bridge ---
+
+    pub fn register_push_token(
+        &self,
+        platform: String,
+        token: String,
+    ) -> Result<FfiPushRegistrationStatus, FfiOrbitError> {
+        let clean_platform = platform.trim().to_ascii_lowercase();
+        let clean_token = token.trim().to_string();
+        if clean_platform.is_empty() {
+            return Err(FfiOrbitError::Core {
+                detail: "push platform cannot be empty".to_string(),
+            });
+        }
+        if clean_token.is_empty() {
+            return Err(FfiOrbitError::Core {
+                detail: "push token cannot be empty".to_string(),
+            });
+        }
+        let preview = mask_push_token(&clean_token);
+        let mut guard = self
+            .push_registration
+            .lock()
+            .map_err(|_| FfiOrbitError::Core {
+                detail: "push registration lock poisoned".to_string(),
+            })?;
+        *guard = Some((clean_platform.clone(), clean_token));
+        Ok(FfiPushRegistrationStatus {
+            platform: clean_platform,
+            token_registered: true,
+            token_preview: Some(preview),
+            relay_sync_supported: false,
+        })
+    }
+
+    pub fn unregister_push_token(&self, platform: String) -> Result<(), FfiOrbitError> {
+        let clean_platform = platform.trim().to_ascii_lowercase();
+        let mut guard = self
+            .push_registration
+            .lock()
+            .map_err(|_| FfiOrbitError::Core {
+                detail: "push registration lock poisoned".to_string(),
+            })?;
+        if guard
+            .as_ref()
+            .is_some_and(|(existing, _)| clean_platform.is_empty() || existing == &clean_platform)
+        {
+            *guard = None;
+        }
+        Ok(())
+    }
+
+    pub fn push_registration_status(&self) -> FfiPushRegistrationStatus {
+        match self.push_registration.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some((platform, token)) => FfiPushRegistrationStatus {
+                    platform: platform.clone(),
+                    token_registered: true,
+                    token_preview: Some(mask_push_token(token)),
+                    relay_sync_supported: false,
+                },
+                None => FfiPushRegistrationStatus {
+                    platform: String::new(),
+                    token_registered: false,
+                    token_preview: None,
+                    relay_sync_supported: false,
+                },
+            },
+            Err(_) => FfiPushRegistrationStatus {
+                platform: String::new(),
+                token_registered: false,
+                token_preview: None,
+                relay_sync_supported: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiPushPlatform {
+    Apns,
+    Fcm,
+    HarmonyPushKit,
+}
+
+impl From<PushPlatform> for FfiPushPlatform {
+    fn from(v: PushPlatform) -> Self {
+        match v {
+            PushPlatform::Apns => Self::Apns,
+            PushPlatform::Fcm => Self::Fcm,
+            PushPlatform::HarmonyPushKit => Self::HarmonyPushKit,
+        }
+    }
+}
+
+impl From<FfiPushPlatform> for PushPlatform {
+    fn from(v: FfiPushPlatform) -> Self {
+        match v {
+            FfiPushPlatform::Apns => Self::Apns,
+            FfiPushPlatform::Fcm => Self::Fcm,
+            FfiPushPlatform::HarmonyPushKit => Self::HarmonyPushKit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRegisterPushDeviceRequest {
+    pub device_id: String,
+    pub platform: FfiPushPlatform,
+    pub device_name: String,
+    pub device_token: String,
+    pub sandbox: bool,
+}
+
+impl From<FfiRegisterPushDeviceRequest> for RegisterPushDeviceRequest {
+    fn from(v: FfiRegisterPushDeviceRequest) -> Self {
+        Self {
+            device_id: v.device_id,
+            platform: v.platform.into(),
+            device_name: v.device_name,
+            device_token: v.device_token,
+            sandbox: v.sandbox,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPushDeviceRecord {
+    pub device_id: String,
+    pub platform: FfiPushPlatform,
+    pub device_name: String,
+    pub masked_token: String,
+    pub sandbox: bool,
+    pub enabled: bool,
+    pub last_delivered_at_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub registered_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+impl From<PushDeviceRecord> for FfiPushDeviceRecord {
+    fn from(v: PushDeviceRecord) -> Self {
+        Self {
+            device_id: v.device_id,
+            platform: v.platform.into(),
+            device_name: v.device_name,
+            masked_token: v.masked_token,
+            sandbox: v.sandbox,
+            enabled: v.enabled,
+            last_delivered_at_ms: v.last_delivered_at_ms,
+            last_error: v.last_error,
+            registered_at_ms: v.registered_at_ms,
+            updated_at_ms: v.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPushPreferences {
+    pub enabled: bool,
+    pub notify_permission_required: bool,
+    pub notify_turn_completed: bool,
+    pub notify_agent_error: bool,
+    pub notify_goal_finished: bool,
+    pub notify_timer_fired: bool,
+    pub include_message_preview: bool,
+    pub quiet_hours_enabled: bool,
+    pub quiet_start_hour: u8,
+    pub quiet_end_hour: u8,
+    pub push_gateway_url: Option<String>,
+    pub has_gateway_auth_token: bool,
+}
+
+impl From<PushPreferences> for FfiPushPreferences {
+    fn from(v: PushPreferences) -> Self {
+        Self {
+            enabled: v.enabled,
+            notify_permission_required: v.notify_permission_required,
+            notify_turn_completed: v.notify_turn_completed,
+            notify_agent_error: v.notify_agent_error,
+            notify_goal_finished: v.notify_goal_finished,
+            notify_timer_fired: v.notify_timer_fired,
+            include_message_preview: v.include_message_preview,
+            quiet_hours_enabled: v.quiet_hours_enabled,
+            quiet_start_hour: v.quiet_start_hour,
+            quiet_end_hour: v.quiet_end_hour,
+            push_gateway_url: v.push_gateway_url,
+            has_gateway_auth_token: v.has_gateway_auth_token,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPushDevicesSnapshot {
+    pub devices: Vec<FfiPushDeviceRecord>,
+    pub preferences: FfiPushPreferences,
+}
+
+impl From<PushDevicesSnapshotView> for FfiPushDevicesSnapshot {
+    fn from(v: PushDevicesSnapshotView) -> Self {
+        Self {
+            devices: v.devices.into_iter().map(Into::into).collect(),
+            preferences: v.preferences.into(),
+        }
     }
 }
 
@@ -5105,7 +7072,10 @@ mod tests {
             format_catalog_model_label(cat, Some("claude-opus-5-5".into())),
             "Opus 5.5"
         );
-        assert_eq!(core.fallback_provider_catalogs().len(), 3);
+        assert_eq!(
+            core.fallback_provider_catalogs().len(),
+            ProviderKind::all().len()
+        );
 
         let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
         let offer = orbit_crypto::PairingOffer {
@@ -5139,8 +7109,10 @@ mod tests {
             cwd: "/Users/jess/Code/orbit".into(),
             extra_dirs: Vec::new(),
             provider: FfiProviderKind::ClaudeCode,
+            acp_agent_id: None,
             model: None,
             effort: None,
+            fast_mode: None,
             mode: FfiSessionMode::Default,
             initial_prompt: "Verify sidebar & stage delta".into(),
             initial_display_prompt: None,
@@ -5247,5 +7219,135 @@ mod tests {
         core.on_app_background();
         core.on_app_foreground();
         core.on_network_changed();
+    }
+
+    #[test]
+    fn automation_records_and_push_bridge_roundtrip() {
+        let timer = ConditionalTimerRecord {
+            timer_id: "tmr_1".into(),
+            agent_id: "ag_1".into(),
+            workspace_id: "ws_1".into(),
+            prompt: "Check build status".into(),
+            duration_seconds: 120,
+            condition: TimerCondition::AllSubagentsSettled,
+            state: ConditionalTimerState::Armed,
+            created_at_ms: 1000,
+            fire_at_ms: 121_000,
+            resolved_at_ms: None,
+            resolved_reason: None,
+        };
+        let ffi_timer: FfiConditionalTimerRecord = timer.into();
+        assert_eq!(ffi_timer.state, FfiConditionalTimerState::Armed);
+        assert_eq!(ffi_timer.condition, FfiTimerCondition::AllSubagentsSettled);
+        assert_eq!(ffi_timer.condition_label, "until subagents settle");
+
+        let goal = GoalRunRecord {
+            goal_id: "goal_1".into(),
+            agent_id: "ag_1".into(),
+            workspace_id: "ws_1".into(),
+            objective: "Keep all tests green".into(),
+            criteria: vec![GoalCriterion {
+                id: "c1".into(),
+                label: "cargo test passes".into(),
+                passed: true,
+            }],
+            verify_command: Some("cargo test".into()),
+            max_iterations: 10,
+            current_iteration: 2,
+            max_duration_secs: 3600,
+            status: GoalStatus::Running,
+            last_verify_exit_code: Some(0),
+            last_verify_output: Some("ok".into()),
+            consecutive_identical_failures: 0,
+            started_at_ms: 1000,
+            updated_at_ms: 2000,
+            finished_at_ms: None,
+        };
+        let ffi_goal: FfiGoalRunRecord = goal.into();
+        assert_eq!(ffi_goal.status, FfiGoalStatus::Running);
+        assert_eq!(ffi_goal.criteria.len(), 1);
+        assert_eq!(
+            GoalControlAction::from(FfiGoalControlAction::Pause),
+            GoalControlAction::Pause
+        );
+
+        let monitor = MonitorWatchRecord {
+            monitor_id: "mon_1".into(),
+            agent_id: "ag_1".into(),
+            name: "Health Check".into(),
+            kind: MonitorKind::HttpHealth {
+                url: "https://example.com/health".into(),
+                expect_status: 200,
+                interval_secs: 30,
+            },
+            status: MonitorStatus::Active,
+            match_count: 3,
+            last_event_preview: Some("200 OK".into()),
+            last_triggered_at_ms: Some(1500),
+            expires_at_ms: None,
+            created_at_ms: 1000,
+        };
+        let ffi_monitor: FfiMonitorWatchRecord = monitor.into();
+        assert_eq!(ffi_monitor.status, FfiMonitorStatus::Active);
+
+        let workflow = WorkflowRunRecord {
+            run_id: "wf_1".into(),
+            name: "Nightly DAG".into(),
+            kind: WorkflowKind::Dag,
+            workspace_cwd: "/tmp/repo".into(),
+            owner_agent_id: Some("ag_1".into()),
+            status: WorkflowRunStatus::Running,
+            max_concurrency: 4,
+            verify_command: None,
+            winner_step_id: None,
+            steps: vec![WorkflowStepRecord {
+                run_id: "wf_1".into(),
+                step_id: "step_1".into(),
+                name: "Lint".into(),
+                status: WorkflowStepStatus::Succeeded,
+                depends_on: Vec::new(),
+                agent_id: Some("ag_2".into()),
+                worktree_cwd: None,
+                provider: ProviderKind::ClaudeCode,
+                model: None,
+                output_preview: Some("clean".into()),
+                diff_additions: 10,
+                diff_deletions: 2,
+                diff_files: 1,
+                verify_passed: Some(true),
+                verify_output: None,
+                error: None,
+                is_winner: false,
+                started_at_ms: Some(1000),
+                finished_at_ms: Some(1500),
+            }],
+            created_at_ms: 1000,
+            updated_at_ms: 1500,
+            finished_at_ms: None,
+        };
+        let ffi_wf: FfiWorkflowRunRecord = workflow.into();
+        assert_eq!(ffi_wf.kind, FfiWorkflowKind::Dag);
+        assert_eq!(ffi_wf.steps.len(), 1);
+
+        let core = OrbitMobileCore::open_in_memory().expect("open in-memory");
+        assert!(!core.push_registration_status().token_registered);
+        let registered = core
+            .register_push_token("android_fcm".into(), "fcm_token_1234567890abcdef".into())
+            .expect("register push token");
+        assert!(registered.token_registered);
+        assert_eq!(registered.platform, "android_fcm");
+        assert_eq!(registered.token_preview.as_deref(), Some("fcm_to…cdef"));
+
+        // Short ASCII and short multi-byte UTF-8 tokens must never leak plaintext.
+        assert_eq!(mask_push_token("short_tok"), "••••");
+        assert_eq!(mask_push_token("🔑令牌测试"), "••••");
+        assert_eq!(
+            mask_push_token("🔑令牌测试数据1234567890"),
+            "🔑令牌测试数…7890"
+        );
+
+        core.unregister_push_token("android_fcm".into())
+            .expect("unregister push token");
+        assert!(!core.push_registration_status().token_registered);
     }
 }

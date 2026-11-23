@@ -56,6 +56,14 @@ const AGY_STD_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::High,
 ];
 
+const PI_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::Off,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Xhigh,
+];
+
 const AGY_XHIGH_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
@@ -129,6 +137,7 @@ fn make_spec(
     is_default: bool,
     default_effort: Option<ReasoningEffort>,
     efforts: &[ReasoningEffort],
+    supports_fast_mode: bool,
 ) -> ProviderModelSpec {
     ProviderModelSpec {
         id: id.to_string(),
@@ -137,6 +146,7 @@ fn make_spec(
         is_default,
         default_effort,
         thinking_options: make_thinking_options(efforts, default_effort),
+        supports_fast_mode,
     }
 }
 
@@ -154,6 +164,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     true,
                     Some(ReasoningEffort::Low),
                     CODEX_FULL_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "gpt-6.2-astra",
@@ -162,6 +173,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Low),
                     CODEX_FULL_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "gpt-6.1-terra",
@@ -170,6 +182,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Low),
                     CODEX_FULL_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "gpt-6.1-sol",
@@ -178,6 +191,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Low),
                     CODEX_FULL_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "gpt-6-astra",
@@ -186,6 +200,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     CODEX_FULL_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "gpt-6-sol",
@@ -194,6 +209,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     CODEX_FULL_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "gpt-6-luna",
@@ -202,6 +218,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     CODEX_LUNA_EFFORTS,
+                    true,
                 ),
             ],
         },
@@ -217,6 +234,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     true,
                     Some(ReasoningEffort::Medium),
                     CLAUDE_XHIGH_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "claude-fable-5-2",
@@ -225,6 +243,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     CLAUDE_XHIGH_EFFORTS,
+                    false,
                 ),
                 make_spec(
                     "claude-sonnet-5-5",
@@ -233,6 +252,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     CLAUDE_XHIGH_EFFORTS,
+                    false,
                 ),
                 make_spec(
                     "claude-haiku-5-5",
@@ -241,6 +261,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     CLAUDE_XHIGH_OFF_EFFORTS,
+                    false,
                 ),
                 make_spec(
                     "claude-opus-5",
@@ -249,6 +270,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::High),
                     CLAUDE_XHIGH_OFF_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "claude-sonnet-5",
@@ -257,6 +279,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::High),
                     CLAUDE_XHIGH_OFF_EFFORTS,
+                    false,
                 ),
                 make_spec(
                     "claude-opus-4-8",
@@ -265,6 +288,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::High),
                     CLAUDE_XHIGH_OFF_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "claude-opus-4-6",
@@ -273,6 +297,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::High),
                     CLAUDE_STD_OFF_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "claude-sonnet-4-6",
@@ -281,6 +306,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::High),
                     CLAUDE_STD_OFF_EFFORTS,
+                    false,
                 ),
                 make_spec(
                     "claude-haiku-4-5",
@@ -289,6 +315,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     None,
                     &[],
+                    false,
                 ),
             ],
         },
@@ -304,6 +331,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     true,
                     Some(ReasoningEffort::Medium),
                     AGY_STD_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "gemini-4-argon",
@@ -312,6 +340,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     AGY_STD_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "gemini-4-hydrogen",
@@ -320,6 +349,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::High),
                     AGY_XHIGH_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "gemini-pro-orchestrator",
@@ -328,6 +358,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     None,
                     &[],
+                    false,
                 ),
                 make_spec(
                     "gemini-pro-orchestrator-argon",
@@ -336,6 +367,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     None,
                     &[],
+                    false,
                 ),
                 make_spec(
                     "gemini-3.8-flash",
@@ -344,6 +376,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     AGY_STD_EFFORTS,
+                    false,
                 ),
                 make_spec(
                     "claude-opus-5-5",
@@ -352,6 +385,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     AGY_STD_EFFORTS,
+                    true,
                 ),
                 make_spec(
                     "claude-sonnet-5-5",
@@ -360,20 +394,336 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     AGY_STD_EFFORTS,
+                    false,
                 ),
             ],
+        },
+        ProviderKind::OpenCode => ProviderModelCatalog {
+            provider: ProviderKind::OpenCode,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "default",
+                    "OpenCode Default",
+                    "Active model configured in OpenCode",
+                    true,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "anthropic/claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via OpenCode",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "openai/gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via OpenCode",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::GeminiCli => ProviderModelCatalog {
+            provider: ProviderKind::GeminiCli,
+            configured_default_model: Some("auto".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "auto",
+                    "Gemini Auto",
+                    "Default Gemini CLI model routing",
+                    true,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "gemini-2.5-pro",
+                    "Gemini 2.5 Pro",
+                    "Deep reasoning and multi-file edits",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "gemini-2.5-flash",
+                    "Gemini 2.5 Flash",
+                    "Fast interactive iteration",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::CursorAgent => ProviderModelCatalog {
+            provider: ProviderKind::CursorAgent,
+            configured_default_model: Some("auto".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "auto",
+                    "Cursor Auto",
+                    "Automatic model selection in Cursor Agent",
+                    true,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "claude-4-sonnet",
+                    "Claude 4 Sonnet",
+                    "Anthropic Sonnet via Cursor",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via Cursor",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::Copilot => ProviderModelCatalog {
+            provider: ProviderKind::Copilot,
+            configured_default_model: Some("claude-sonnet-4.5".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "claude-sonnet-4.5",
+                    "Claude Sonnet 4.5",
+                    "Default Copilot coding model",
+                    true,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via GitHub Copilot",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "gemini-2.5-pro",
+                    "Gemini 2.5 Pro",
+                    "Google Gemini via GitHub Copilot",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::Goose => ProviderModelCatalog {
+            provider: ProviderKind::Goose,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "default",
+                    "Goose Default",
+                    "Active profile model configured in Goose",
+                    true,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via Goose",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via Goose",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::Pi => ProviderModelCatalog {
+            provider: ProviderKind::Pi,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: Some(ReasoningEffort::Medium),
+            models: vec![
+                make_spec(
+                    "default",
+                    "Pi Default",
+                    "Active model configured in Pi CLI",
+                    true,
+                    Some(ReasoningEffort::Medium),
+                    PI_EFFORTS,
+                    false,
+                ),
+                make_spec(
+                    "anthropic/claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via Pi",
+                    false,
+                    Some(ReasoningEffort::Medium),
+                    PI_EFFORTS,
+                    false,
+                ),
+                make_spec(
+                    "openai/gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via Pi",
+                    false,
+                    Some(ReasoningEffort::Medium),
+                    PI_EFFORTS,
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::Kimi => ProviderModelCatalog {
+            provider: ProviderKind::Kimi,
+            configured_default_model: Some("kimi-k2-thinking".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "kimi-k2-thinking",
+                    "Kimi K2 Thinking",
+                    "Long-horizon reasoning & agentic coding",
+                    true,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "kimi-k2",
+                    "Kimi K2",
+                    "Fast everyday software engineering",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::Cline => ProviderModelCatalog {
+            provider: ProviderKind::Cline,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "default",
+                    "Cline Default",
+                    "Active model configured in Cline CLI",
+                    true,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via Cline",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via Cline",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::MistralVibe => ProviderModelCatalog {
+            provider: ProviderKind::MistralVibe,
+            configured_default_model: Some("devstral-latest".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "devstral-latest",
+                    "Devstral",
+                    "Mistral agentic software engineering model",
+                    true,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "mistral-large-latest",
+                    "Mistral Large",
+                    "General-purpose reasoning & coding",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::Augment => ProviderModelCatalog {
+            provider: ProviderKind::Augment,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "default",
+                    "Augment Default",
+                    "Active model configured in Auggie",
+                    true,
+                    None,
+                    &[],
+                    false,
+                ),
+                make_spec(
+                    "claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via Augment",
+                    false,
+                    None,
+                    &[],
+                    false,
+                ),
+            ],
+        },
+        ProviderKind::Acp => ProviderModelCatalog {
+            provider: ProviderKind::Acp,
+            configured_default_model: None,
+            configured_default_effort: None,
+            models: Vec::new(),
         },
     }
 }
 
 pub fn effective_provider_catalogs(live: &[ProviderModelCatalog]) -> Vec<ProviderModelCatalog> {
-    const ORDER: [ProviderKind; 3] = [
-        ProviderKind::ClaudeCode,
-        ProviderKind::Codex,
-        ProviderKind::Antigravity,
-    ];
-    ORDER
-        .into_iter()
+    ProviderKind::all()
+        .iter()
+        .copied()
         .map(|provider| {
             let mut cat = live
                 .iter()
@@ -583,6 +933,31 @@ pub fn sanitize_model_slug(raw: Option<&str>) -> Option<String> {
     }
 }
 
+/// Provider-aware sanitization: preserves any model explicitly listed in the selected provider's
+/// effective catalog and only filters legacy retired slugs on core providers (`Antigravity`,
+/// `Codex`, `ClaudeCode`) when absent from the catalog.
+pub fn sanitize_model_slug_for_provider(
+    provider: ProviderKind,
+    raw: Option<&str>,
+    catalog: Option<&ProviderModelCatalog>,
+) -> Option<String> {
+    let clean = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    if let Some(cat) = catalog
+        && cat.models.iter().any(|m| m.id.eq_ignore_ascii_case(clean))
+    {
+        return Some(clean.to_string());
+    }
+    let is_legacy_core = matches!(
+        provider,
+        ProviderKind::Antigravity | ProviderKind::Codex | ProviderKind::ClaudeCode
+    );
+    if is_legacy_core && is_retired_model_slug(clean) {
+        None
+    } else {
+        Some(clean.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedModelSelectionView {
     pub provider: ProviderKind,
@@ -592,6 +967,8 @@ pub struct ResolvedModelSelectionView {
     pub selected_effort: Option<ReasoningEffort>,
     pub selected_effort_label: Option<String>,
     pub thinking_options: Vec<ThinkingOptionSpec>,
+    #[serde(default)]
+    pub supports_fast_mode: bool,
 }
 
 pub fn resolve_model_selection(
@@ -606,7 +983,7 @@ pub fn resolve_model_selection(
         .cloned()
         .unwrap_or_else(|| fallback_provider_catalog(provider));
 
-    let clean_desired = sanitize_model_slug(desired_model);
+    let clean_desired = sanitize_model_slug_for_provider(provider, desired_model, Some(&catalog));
     let active_spec = resolve_active_model_spec(&catalog, clean_desired.as_deref());
     let selected_model_id = active_spec
         .map(|s| s.id.clone())
@@ -631,6 +1008,7 @@ pub fn resolve_model_selection(
     let thinking_options = active_spec
         .map(|s| s.thinking_options.clone())
         .unwrap_or_default();
+    let supports_fast_mode = active_spec.is_some_and(|s| s.supports_fast_mode);
 
     ResolvedModelSelectionView {
         provider,
@@ -640,6 +1018,7 @@ pub fn resolve_model_selection(
         selected_effort,
         selected_effort_label,
         thinking_options,
+        supports_fast_mode,
     }
 }
 
@@ -838,10 +1217,16 @@ mod tests {
     #[test]
     fn effective_catalogs_fallback_and_live_override() {
         let defaults = effective_provider_catalogs(&[]);
-        assert_eq!(defaults.len(), 3);
+        assert_eq!(defaults.len(), ProviderKind::all().len());
         assert_eq!(defaults[0].provider, ProviderKind::ClaudeCode);
         assert_eq!(defaults[1].provider, ProviderKind::Codex);
         assert_eq!(defaults[2].provider, ProviderKind::Antigravity);
+        assert!(
+            defaults
+                .iter()
+                .filter(|c| c.provider != ProviderKind::Acp)
+                .all(|c| !c.models.is_empty())
+        );
         assert_eq!(
             defaults[1].configured_default_model.as_deref(),
             Some("gpt-6.2-sol")
@@ -858,6 +1243,7 @@ mod tests {
                 is_default: true,
                 default_effort: Some(ReasoningEffort::High),
                 thinking_options: Vec::new(),
+                supports_fast_mode: true,
             }],
         };
         let empty_claude = ProviderModelCatalog {
@@ -1026,5 +1412,96 @@ mod tests {
         );
         assert_eq!(orch_res.selected_effort, None);
         assert!(orch_res.thinking_options.is_empty());
+        assert!(!orch_res.supports_fast_mode);
+
+        // Regression test (P0 #1): active models on new providers are never wiped by legacy core
+        // RETIRED_MODEL_SLUGS, while legacy Antigravity still resets retired `gemini-2.5-pro`.
+        let gemini_res = resolve_model_selection(
+            &catalogs,
+            ProviderKind::GeminiCli,
+            Some("gemini-2.5-pro"),
+            None,
+        );
+        assert_eq!(
+            gemini_res.selected_model_id.as_deref(),
+            Some("gemini-2.5-pro")
+        );
+        assert_eq!(gemini_res.selected_model_label, "Gemini 2.5 Pro");
+
+        let copilot_res = resolve_model_selection(
+            &catalogs,
+            ProviderKind::Copilot,
+            Some("gemini-2.5-pro"),
+            None,
+        );
+        assert_eq!(
+            copilot_res.selected_model_id.as_deref(),
+            Some("gemini-2.5-pro")
+        );
+
+        for prov in [
+            ProviderKind::Cline,
+            ProviderKind::Goose,
+            ProviderKind::Augment,
+        ] {
+            let res = resolve_model_selection(&catalogs, prov, Some("claude-sonnet-4-5"), None);
+            assert_eq!(
+                res.selected_model_id.as_deref(),
+                Some("claude-sonnet-4-5"),
+                "active model claude-sonnet-4-5 must be preserved on {prov:?}"
+            );
+        }
+
+        let agy_retired = resolve_model_selection(
+            &catalogs,
+            ProviderKind::Antigravity,
+            Some("gemini-2.5-pro"),
+            None,
+        );
+        assert_eq!(
+            agy_retired.selected_model_id.as_deref(),
+            Some("gemini-4-carbon")
+        );
+    }
+
+    #[test]
+    fn fast_mode_capability_propagates_across_catalog_and_selection() {
+        let catalogs = effective_provider_catalogs(&[]);
+
+        let claude_opus = resolve_model_selection(
+            &catalogs,
+            ProviderKind::ClaudeCode,
+            Some("claude-opus-5-5"),
+            None,
+        );
+        assert!(claude_opus.supports_fast_mode);
+
+        let claude_sonnet = resolve_model_selection(
+            &catalogs,
+            ProviderKind::ClaudeCode,
+            Some("claude-sonnet-5-5"),
+            None,
+        );
+        assert!(!claude_sonnet.supports_fast_mode);
+
+        let codex_sol =
+            resolve_model_selection(&catalogs, ProviderKind::Codex, Some("gpt-6.2-sol"), None);
+        assert!(codex_sol.supports_fast_mode);
+
+        let agy_carbon = resolve_model_selection(
+            &catalogs,
+            ProviderKind::Antigravity,
+            Some("gemini-4-carbon"),
+            None,
+        );
+        assert!(agy_carbon.supports_fast_mode);
+
+        let agy_flash = resolve_model_selection(
+            &catalogs,
+            ProviderKind::Antigravity,
+            Some("gemini-3.8-flash"),
+            None,
+        );
+        assert!(!agy_flash.supports_fast_mode);
     }
 }

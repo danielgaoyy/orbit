@@ -1,7 +1,9 @@
 //! Detached process & PTY supervisor (`orbit shim`).
 //!
 //! Keeps `agy`, `codex`, `claude`, and interactive PTY shells alive across `orbit daemon`
-//! restarts or binary hot-upgrades via Unix Domain Sockets (`$ORBIT_HOME/shims/<id>.sock`).
+//! restarts or binary hot-upgrades via Unix Domain Sockets on Unix and authenticated
+//! loopback TCP endpoints (`127.0.0.1` + per-shim 256-bit token descriptor) on Windows
+//! (`$ORBIT_HOME/shims/<id>.sock`).
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -21,14 +23,656 @@ pub fn set_test_parent_pid_watchdog(pid: Option<u32>) {
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+#[cfg(unix)]
+pub type ShimStream = tokio::net::UnixStream;
+#[cfg(unix)]
+pub type ShimReadHalf = tokio::net::unix::OwnedReadHalf;
+#[cfg(unix)]
+pub type ShimWriteHalf = tokio::net::unix::OwnedWriteHalf;
+
+#[cfg(not(unix))]
+pub type ShimStream = tokio::net::TcpStream;
+#[cfg(not(unix))]
+pub type ShimReadHalf = tokio::net::tcp::OwnedReadHalf;
+#[cfg(not(unix))]
+pub type ShimWriteHalf = tokio::net::tcp::OwnedWriteHalf;
+
+#[cfg(windows)]
+const WIN_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const WIN_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Descriptor written to `<id>.sock` on Windows (and tested cross-platform) for loopback IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShimTcpEndpoint {
+    pub port: u16,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShimAuthHandshake {
+    auth: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShimAuthAck {
+    auth_ok: bool,
+}
+
+#[allow(dead_code)]
+static ENDPOINT_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[allow(dead_code)]
+const MAX_CONCURRENT_AUTH_HANDSHAKES: usize = 16;
+
+#[allow(dead_code)]
+fn generate_shim_auth_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+#[allow(dead_code)]
+fn encode_shim_auth_line(token: &str) -> String {
+    let mut line = serde_json::to_string(&ShimAuthHandshake {
+        auth: token.to_string(),
+    })
+    .unwrap_or_else(|_| String::from("{\"auth\":\"\"}"));
+    line.push('\n');
+    line
+}
+
+#[allow(dead_code)]
+fn verify_shim_auth_line(raw_line: &str, expected_token: &str) -> bool {
+    let Ok(handshake) = serde_json::from_str::<ShimAuthHandshake>(raw_line.trim()) else {
+        return false;
+    };
+    constant_time_eq(handshake.auth.as_bytes(), expected_token.as_bytes())
+}
+
+#[allow(dead_code)]
+fn encode_shim_auth_ack_line() -> &'static str {
+    "{\"auth_ok\":true}\n"
+}
+
+#[allow(dead_code)]
+fn verify_shim_auth_ack_line(raw_line: &str) -> bool {
+    serde_json::from_str::<ShimAuthAck>(raw_line.trim()).is_ok_and(|ack| ack.auth_ok)
+}
+
+#[allow(dead_code)]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[allow(dead_code)]
+fn read_tcp_endpoint(socket_path: &Path) -> std::io::Result<ShimTcpEndpoint> {
+    let raw = std::fs::read_to_string(socket_path)?;
+    serde_json::from_str::<ShimTcpEndpoint>(raw.trim()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "stale or invalid shim endpoint descriptor",
+        )
+    })
+}
+
+#[allow(dead_code)]
+fn write_tcp_endpoint_atomic(
+    socket_path: &Path,
+    endpoint: &ShimTcpEndpoint,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string(endpoint).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("encode endpoint: {e}"),
+        )
+    })?;
+    let seq = ENDPOINT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = socket_path.with_extension(format!("sock.tmp.{}.{seq}", std::process::id()));
+    std::fs::write(&tmp, &json)?;
+    if let Err(err) = std::fs::rename(&tmp, socket_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Cross-platform Shim IPC listener (Unix Domain Socket on Unix, authenticated loopback TCP on Windows).
+pub struct ShimListener {
+    #[cfg(unix)]
+    inner: tokio::net::UnixListener,
+    #[cfg(not(unix))]
+    inner: tokio::net::TcpListener,
+    #[cfg(not(unix))]
+    auth_token: Arc<str>,
+    #[cfg(not(unix))]
+    handshake_sem: Arc<tokio::sync::Semaphore>,
+    #[cfg(not(unix))]
+    ready_tx: mpsc::Sender<ShimStream>,
+    #[cfg(not(unix))]
+    ready_rx: tokio::sync::Mutex<mpsc::Receiver<ShimStream>>,
+}
+
+impl ShimListener {
+    pub async fn bind(socket_path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let inner = tokio::net::UnixListener::bind(socket_path)?;
+            Ok(Self { inner })
+        }
+        #[cfg(not(unix))]
+        {
+            let inner = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = inner.local_addr()?.port();
+            let auth_token = generate_shim_auth_token();
+            write_tcp_endpoint_atomic(
+                socket_path,
+                &ShimTcpEndpoint {
+                    port,
+                    token: auth_token.clone(),
+                },
+            )?;
+            let (ready_tx, ready_rx) = mpsc::channel(64);
+            Ok(Self {
+                inner,
+                auth_token: Arc::from(auth_token),
+                handshake_sem: Arc::new(tokio::sync::Semaphore::new(
+                    MAX_CONCURRENT_AUTH_HANDSHAKES,
+                )),
+                ready_tx,
+                ready_rx: tokio::sync::Mutex::new(ready_rx),
+            })
+        }
+    }
+
+    pub async fn accept(&self) -> std::io::Result<ShimStream> {
+        #[cfg(unix)]
+        {
+            let (stream, _) = self.inner.accept().await?;
+            Ok(stream)
+        }
+        #[cfg(not(unix))]
+        {
+            use tokio::io::AsyncReadExt;
+            let mut rx = self.ready_rx.lock().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe_ready = rx.recv() => {
+                        if let Some(stream) = maybe_ready {
+                            return Ok(stream);
+                        }
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "shim listener channel closed",
+                        ));
+                    }
+                    accept_res = self.inner.accept() => {
+                        let (mut stream, _) = accept_res?;
+                        let _ = stream.set_nodelay(true);
+                        let Ok(permit) = self.handshake_sem.clone().try_acquire_owned() else {
+                            drop(stream);
+                            continue;
+                        };
+                        let expected_token = Arc::clone(&self.auth_token);
+                        let ready_tx = self.ready_tx.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            // Read the single auth line byte-by-byte (max 256 bytes) so zero
+                            // bytes of the subsequent `ShimFrame` stream are ever over-read.
+                            let mut buf = Vec::with_capacity(128);
+                            let mut byte = [0u8; 1];
+                            let auth_ok = tokio::time::timeout(Duration::from_secs(1), async {
+                                while buf.len() < 256 {
+                                    match stream.read(&mut byte).await {
+                                        Ok(0) | Err(_) => return false,
+                                        Ok(_) => {
+                                            if byte[0] == b'\n' {
+                                                break;
+                                            }
+                                            buf.push(byte[0]);
+                                        }
+                                    }
+                                }
+                                let line = String::from_utf8_lossy(&buf);
+                                verify_shim_auth_line(&line, &expected_token)
+                            })
+                            .await
+                            .unwrap_or(false);
+
+                            if !auth_ok {
+                                drop(stream);
+                                return;
+                            }
+                            if tokio::time::timeout(Duration::from_millis(500), async {
+                                stream.write_all(encode_shim_auth_ack_line().as_bytes()).await?;
+                                stream.flush().await
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .is_some()
+                            {
+                                let _ = ready_tx.send(stream).await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn connect_shim_stream(socket_path: &Path) -> std::io::Result<ShimStream> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(socket_path).await
+    }
+    #[cfg(not(unix))]
+    {
+        use tokio::io::AsyncReadExt;
+        let endpoint = read_tcp_endpoint(socket_path)?;
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], endpoint.port));
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        let _ = stream.set_nodelay(true);
+        let auth_line = encode_shim_auth_line(&endpoint.token);
+        stream.write_all(auth_line.as_bytes()).await?;
+        stream.flush().await?;
+
+        // Wait for the shim's `{"auth_ok":true}\n` ACK line byte-by-byte so:
+        // - Zero bytes of subsequent `ShimFrame` payloads are over-read.
+        // - A recycled ephemeral port owned by another local service that closes or sends
+        //   non-ACK data returns `ConnectionRefused` (allowing stale socket cleanup).
+        // - A transiently busy shim still in kernel backlog returns `TimedOut` (never unlinked).
+        let mut buf = Vec::with_capacity(64);
+        let mut byte = [0u8; 1];
+        let ack_res = tokio::time::timeout(Duration::from_millis(1000), async {
+            while buf.len() < 128 {
+                match stream.read(&mut byte).await {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "shim peer closed before auth ack",
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                    Ok(_) => {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                        buf.push(byte[0]);
+                    }
+                }
+            }
+            let line = String::from_utf8_lossy(&buf);
+            if verify_shim_auth_ack_line(&line) {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "unexpected shim auth ack (recycled port or token mismatch)",
+                ))
+            }
+        })
+        .await;
+
+        match ack_res {
+            Ok(Ok(())) => Ok(stream),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for shim auth ack",
+            )),
+        }
+    }
+}
+
+/// Parse `tasklist /FI "PID eq <pid>" /NH /FO CSV` stdout to verify PID presence (and optional image prefix).
+#[allow(dead_code)]
+fn parse_windows_tasklist_csv_match(
+    stdout: &str,
+    pid: u32,
+    required_image_prefix: Option<&str>,
+) -> bool {
+    let pid_str = pid.to_string();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('"') {
+            continue;
+        }
+        let mut cols = trimmed.split("\",\"").map(|c| c.trim_matches('"'));
+        let Some(image) = cols.next() else {
+            continue;
+        };
+        let Some(found_pid) = cols.next() else {
+            continue;
+        };
+        if found_pid.trim() == pid_str {
+            if let Some(prefix) = required_image_prefix {
+                return image
+                    .to_ascii_lowercase()
+                    .starts_with(&prefix.to_ascii_lowercase());
+            }
+            return true;
+        }
+    }
+    false
+}
 
 const STDIO_RING_CAPACITY: usize = 256;
 const PTY_SNAPSHOT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShimPidRecord {
+    shim_pid: u32,
+    #[serde(default)]
+    child_pid: Option<u32>,
+    #[serde(default)]
+    child_pgid: Option<u32>,
+}
+
+/// Derive the `.pid` sidecar path corresponding to a shim `.sock` path.
+pub fn pid_file_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("pid")
+}
+
+fn write_pid_file(
+    socket_path: &Path,
+    shim_pid: u32,
+    child_pid: Option<u32>,
+    child_pgid: Option<u32>,
+) {
+    let rec = ShimPidRecord {
+        shim_pid,
+        child_pid,
+        child_pgid,
+    };
+    if let Ok(json) = serde_json::to_string(&rec) {
+        let _ = std::fs::write(pid_file_path(socket_path), json);
+    }
+}
+
+fn read_pid_file(socket_path: &Path) -> Option<ShimPidRecord> {
+    let raw = std::fs::read_to_string(pid_file_path(socket_path)).ok()?;
+    serde_json::from_str::<ShimPidRecord>(&raw).ok()
+}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, signal: &str) {
+    if pid == 0 {
+        return;
+    }
+    let _ = std::process::Command::new("/bin/kill")
+        .args([signal, &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+fn signal_pid_group(pgid: u32, signal: &str) {
+    if pgid == 0 {
+        return;
+    }
+    let _ = std::process::Command::new("/bin/kill")
+        .args([signal, &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+fn is_orbit_shim_process(pid: u32, socket_path: &Path) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    let expected_sock = socket_path.to_string_lossy();
+    if expected_sock.is_empty() {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+            let args: Vec<String> = raw
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            let has_shim = args.iter().any(|a| a == "shim");
+            let has_matching_sock = args
+                .windows(2)
+                .any(|w| w[0] == "--socket" && w[1] == expected_sock.as_ref());
+            return has_shim && has_matching_sock;
+        }
+    }
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let cmd = String::from_utf8_lossy(&o.stdout);
+            cmd.contains("shim") && cmd.contains("--socket") && cmd.contains(expected_sock.as_ref())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn kill_process_tree_sync(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    use std::os::windows::process::CommandExt;
+    let pid_str = pid.to_string();
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid_str, "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(WIN_CREATE_NO_WINDOW)
+        .status();
+}
+
+#[cfg(windows)]
+async fn kill_process_tree_async(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    let pid_str = pid.to_string();
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/PID", &pid_str, "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(WIN_CREATE_NO_WINDOW);
+    let _ = cmd.status().await;
+}
+
+#[cfg(windows)]
+fn is_orbit_shim_process(pid: u32, _socket_path: &Path) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    use std::os::windows::process::CommandExt;
+    let filter = format!("PID eq {pid}");
+    std::process::Command::new("tasklist")
+        .args(["/FI", &filter, "/NH", "/FO", "CSV"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(WIN_CREATE_NO_WINDOW)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            parse_windows_tasklist_csv_match(&stdout, pid, Some("orbit"))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_orbit_shim_process(_pid: u32, _socket_path: &Path) -> bool {
+    false
+}
+
+async fn terminate_child_process_group(child: &mut tokio::process::Child) -> Option<i32> {
+    #[cfg(unix)]
+    let child_pid = child.id();
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        // Child was spawned with `process_group(0)` so its PGID equals its PID.
+        signal_pid_group(pid, "-TERM");
+        if let Ok(Ok(status)) = tokio::time::timeout(Duration::from_millis(150), child.wait()).await
+        {
+            signal_pid_group(pid, "-KILL");
+            return status.code();
+        }
+        signal_pid_group(pid, "-KILL");
+    }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        kill_process_tree_async(pid).await;
+    }
+    let _ = child.kill().await;
+    tokio::time::timeout(Duration::from_millis(200), child.wait())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .and_then(|s| s.code())
+}
+
+async fn reap_recorded_shim_pid(rec: &ShimPidRecord, socket_path: &Path) {
+    #[cfg(unix)]
+    {
+        if rec.shim_pid == 0 || rec.shim_pid == std::process::id() {
+            return;
+        }
+        if !is_pid_alive(rec.shim_pid) || !is_orbit_shim_process(rec.shim_pid, socket_path) {
+            return;
+        }
+        let safe_child_pgid = rec
+            .child_pgid
+            .filter(|&pgid| pgid > 0 && pgid != std::process::id() && pgid != rec.shim_pid);
+        // Give a recently signalled shim a brief grace window to exit on its own.
+        for _ in 0..6 {
+            if !is_pid_alive(rec.shim_pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if let Some(pgid) = safe_child_pgid {
+            signal_pid_group(pgid, "-TERM");
+        }
+        signal_pid(rec.shim_pid, "-TERM");
+        for _ in 0..8 {
+            if !is_pid_alive(rec.shim_pid) {
+                if let Some(pgid) = safe_child_pgid {
+                    signal_pid_group(pgid, "-KILL");
+                }
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if let Some(pgid) = safe_child_pgid {
+            signal_pid_group(pgid, "-KILL");
+        }
+        signal_pid(rec.shim_pid, "-KILL");
+        for _ in 0..4 {
+            if !is_pid_alive(rec.shim_pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if rec.shim_pid == 0 || rec.shim_pid == std::process::id() {
+            return;
+        }
+        if !is_pid_alive(rec.shim_pid) || !is_orbit_shim_process(rec.shim_pid, socket_path) {
+            return;
+        }
+        if let Some(child_pid) = rec
+            .child_pid
+            .filter(|&p| p > 0 && p != std::process::id() && p != rec.shim_pid)
+        {
+            kill_process_tree_async(child_pid).await;
+        }
+        kill_process_tree_async(rec.shim_pid).await;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (rec, socket_path);
+    }
+}
+
+fn reap_recorded_shim_pid_sync(rec: &ShimPidRecord, socket_path: &Path) {
+    #[cfg(unix)]
+    {
+        if rec.shim_pid == 0 || rec.shim_pid == std::process::id() {
+            return;
+        }
+        if !is_pid_alive(rec.shim_pid) || !is_orbit_shim_process(rec.shim_pid, socket_path) {
+            return;
+        }
+        let safe_child_pgid = rec
+            .child_pgid
+            .filter(|&pgid| pgid > 0 && pgid != std::process::id() && pgid != rec.shim_pid);
+        if let Some(pgid) = safe_child_pgid {
+            signal_pid_group(pgid, "-TERM");
+        }
+        signal_pid(rec.shim_pid, "-TERM");
+        std::thread::sleep(Duration::from_millis(50));
+        if is_pid_alive(rec.shim_pid) {
+            if let Some(pgid) = safe_child_pgid {
+                signal_pid_group(pgid, "-KILL");
+            }
+            signal_pid(rec.shim_pid, "-KILL");
+        }
+    }
+    #[cfg(windows)]
+    {
+        if rec.shim_pid == 0 || rec.shim_pid == std::process::id() {
+            return;
+        }
+        if !is_pid_alive(rec.shim_pid) || !is_orbit_shim_process(rec.shim_pid, socket_path) {
+            return;
+        }
+        if let Some(child_pid) = rec
+            .child_pid
+            .filter(|&p| p > 0 && p != std::process::id() && p != rec.shim_pid)
+        {
+            kill_process_tree_sync(child_pid);
+        }
+        kill_process_tree_sync(rec.shim_pid);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (rec, socket_path);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -125,14 +769,14 @@ pub enum ShimError {
 /// Client handle held by `orbit daemon` to interact with a running `orbit shim` over UDS.
 /// Dropping `ShimClient` only disconnects the UDS socket — the supervised child keeps running!
 pub struct ShimClient {
-    tx: mpsc::Sender<ShimFrame>,
+    tx: mpsc::Sender<(ShimFrame, Option<oneshot::Sender<()>>)>,
     pub rx: mpsc::Receiver<ShimFrame>,
     attach_ack_seq: Option<u64>,
 }
 
 impl ShimClient {
     pub async fn connect(socket_path: &Path) -> Result<Self, ShimError> {
-        let stream = UnixStream::connect(socket_path).await?;
+        let stream = connect_shim_stream(socket_path).await?;
         Ok(Self::from_stream(stream, Vec::new()))
     }
 
@@ -147,7 +791,7 @@ impl ShimClient {
         after_seq: Option<u64>,
         drain_legacy_unsequenced: bool,
     ) -> Result<Self, ShimError> {
-        let stream = UnixStream::connect(socket_path).await?;
+        let stream = connect_shim_stream(socket_path).await?;
         let (read_half, mut write_half) = stream.into_split();
 
         let mut attach_line = serde_json::to_string(&ShimFrame::Attach { after_seq })?;
@@ -204,17 +848,30 @@ impl ShimClient {
             }
         }
 
-        let (in_tx, mut in_rx) = mpsc::channel::<ShimFrame>(256);
+        let (in_tx, mut in_rx) = mpsc::channel::<(ShimFrame, Option<oneshot::Sender<()>>)>(256);
         let (out_tx, out_rx) = mpsc::channel::<ShimFrame>(512);
 
         tokio::spawn(async move {
-            while let Some(frame) = in_rx.recv().await {
+            while let Some((frame, ack)) = in_rx.recv().await {
+                let is_kill = matches!(frame, ShimFrame::Kill);
                 let Ok(mut line) = serde_json::to_string(&frame) else {
+                    if let Some(tx) = ack {
+                        let _ = tx.send(());
+                    }
                     continue;
                 };
                 line.push('\n');
                 if write_half.write_all(line.as_bytes()).await.is_err() {
+                    if let Some(tx) = ack {
+                        let _ = tx.send(());
+                    }
                     break;
+                }
+                if is_kill || ack.is_some() {
+                    let _ = write_half.flush().await;
+                }
+                if let Some(tx) = ack {
+                    let _ = tx.send(());
                 }
             }
         });
@@ -244,19 +901,32 @@ impl ShimClient {
         })
     }
 
-    fn from_stream(stream: UnixStream, preloaded: Vec<ShimFrame>) -> Self {
+    fn from_stream(stream: ShimStream, preloaded: Vec<ShimFrame>) -> Self {
         let (read_half, mut write_half) = stream.into_split();
-        let (in_tx, mut in_rx) = mpsc::channel::<ShimFrame>(256);
+        let (in_tx, mut in_rx) = mpsc::channel::<(ShimFrame, Option<oneshot::Sender<()>>)>(256);
         let (out_tx, out_rx) = mpsc::channel::<ShimFrame>(512);
 
         tokio::spawn(async move {
-            while let Some(frame) = in_rx.recv().await {
+            while let Some((frame, ack)) = in_rx.recv().await {
+                let is_kill = matches!(frame, ShimFrame::Kill);
                 let Ok(mut line) = serde_json::to_string(&frame) else {
+                    if let Some(tx) = ack {
+                        let _ = tx.send(());
+                    }
                     continue;
                 };
                 line.push('\n');
                 if write_half.write_all(line.as_bytes()).await.is_err() {
+                    if let Some(tx) = ack {
+                        let _ = tx.send(());
+                    }
                     break;
+                }
+                if is_kill || ack.is_some() {
+                    let _ = write_half.flush().await;
+                }
+                if let Some(tx) = ack {
+                    let _ = tx.send(());
                 }
             }
         });
@@ -294,7 +964,7 @@ impl ShimClient {
 
     pub async fn send(&self, frame: ShimFrame) -> Result<(), ShimError> {
         self.tx
-            .send(frame)
+            .send((frame, None))
             .await
             .map_err(|_| ShimError::ChannelClosed)
     }
@@ -314,38 +984,90 @@ impl ShimClient {
         self.send(ShimFrame::PtyResize { cols, rows }).await
     }
 
+    /// Send `ShimFrame::Kill` and wait until the writer task flushes it to the kernel socket so
+    /// dropping `ShimClient` immediately after `kill()` never drops the frame before delivery.
     pub async fn kill(&self) -> Result<(), ShimError> {
-        self.send(ShimFrame::Kill).await
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send((ShimFrame::Kill, Some(ack_tx)))
+            .await
+            .map_err(|_| ShimError::ChannelClosed)?;
+        let _ = tokio::time::timeout(Duration::from_millis(200), ack_rx).await;
+        Ok(())
+    }
+
+    /// Send `ShimFrame::Kill`, flush it cleanly, and wait up to `timeout` for `ShimFrame::Exited`
+    /// or socket EOF confirming the shim terminated.
+    pub async fn kill_and_wait(&mut self, timeout: Duration) -> Result<(), ShimError> {
+        self.kill().await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.rx.recv()).await {
+                Ok(Some(ShimFrame::Exited { .. })) | Ok(None) => break,
+                Ok(Some(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        Ok(())
     }
 }
 
 /// Probe whether a shim UDS socket is alive without triggering ring-buffer replay.
-/// Removes stale socket files whose listener is gone (`ECONNREFUSED`).
+/// Removes stale socket files ONLY when the listener is definitively gone (`ConnectionRefused`/`NotFound`).
 pub async fn probe_existing_shim(socket_path: &Path) -> bool {
     if !socket_path.exists() {
         return false;
     }
-    match tokio::time::timeout(Duration::from_millis(300), UnixStream::connect(socket_path)).await {
+    // On Windows loopback TCP, a closed port takes ~1-2s of SYN retries before WSAECONNREFUSED.
+    let timeout = if cfg!(unix) {
+        Duration::from_millis(300)
+    } else {
+        Duration::from_millis(3000)
+    };
+    match tokio::time::timeout(timeout, connect_shim_stream(socket_path)).await {
         Ok(Ok(_stream)) => true,
-        _ => {
+        Ok(Err(err))
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
             let _ = std::fs::remove_file(socket_path);
+            let _ = std::fs::remove_file(pid_file_path(socket_path));
             false
         }
+        _ => false,
     }
 }
 
 /// Attempt to reconnect to an already-running `orbit shim` UDS socket (e.g. after Daemon hot-restart).
-/// If the socket file exists on disk but the shim process is gone (`ECONNREFUSED`), removes the stale file.
+/// Only unlinks stale socket files on `ConnectionRefused` / `NotFound` — NEVER on timeout or transient error.
 pub async fn connect_existing_shim(socket_path: &Path) -> Option<ShimClient> {
     if !socket_path.exists() {
         return None;
     }
-    match tokio::time::timeout(Duration::from_millis(300), ShimClient::connect(socket_path)).await {
+    let timeout = if cfg!(unix) {
+        Duration::from_millis(300)
+    } else {
+        Duration::from_millis(3000)
+    };
+    match tokio::time::timeout(timeout, ShimClient::connect(socket_path)).await {
         Ok(Ok(client)) => Some(client),
-        _ => {
+        Ok(Err(ShimError::Io(ref err)))
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
             let _ = std::fs::remove_file(socket_path);
+            let _ = std::fs::remove_file(pid_file_path(socket_path));
             None
         }
+        _ => None,
     }
 }
 
@@ -361,31 +1083,48 @@ pub async fn connect_existing_shim_after(
         return None;
     }
     let effective_cursor = Some(after_seq.unwrap_or(u64::MAX));
+    let timeout = if cfg!(unix) {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_millis(3000)
+    };
     match tokio::time::timeout(
-        Duration::from_millis(500),
+        timeout,
         ShimClient::connect_with_cursor(socket_path, effective_cursor, true),
     )
     .await
     {
         Ok(Ok(client)) => Some(client),
-        _ => {
+        Ok(Err(ShimError::Io(ref err)))
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
             let _ = std::fs::remove_file(socket_path);
+            let _ = std::fs::remove_file(pid_file_path(socket_path));
             None
         }
+        _ => None,
     }
 }
 
-/// Best-effort kill for a surviving shim socket that should be closed before replacement.
+/// Best-effort kill for a surviving shim socket (and/or socketless `.pid` sidecar) before replacement.
 pub async fn kill_existing_shim(socket_path: &Path) {
-    if let Some(client) = connect_existing_shim(socket_path).await {
-        let _ = client.kill().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let pid_rec = read_pid_file(socket_path);
+    if let Some(mut client) = connect_existing_shim(socket_path).await {
+        let _ = client.kill_and_wait(Duration::from_millis(400)).await;
+    }
+    if let Some(rec) = pid_rec {
+        reap_recorded_shim_pid(&rec, socket_path).await;
     }
     let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(pid_file_path(socket_path));
 }
 
 /// Synchronous best-effort kill for a shim socket (safe to call from RAII `Drop` guards in tests).
 pub fn kill_existing_shim_sync(socket_path: &Path) {
+    let pid_rec = read_pid_file(socket_path);
     #[cfg(unix)]
     {
         use std::os::unix::net::UnixStream;
@@ -397,30 +1136,56 @@ pub fn kill_existing_shim_sync(socket_path: &Path) {
             std::thread::sleep(Duration::from_millis(30));
         }
     }
+    #[cfg(not(unix))]
+    {
+        if let Ok(endpoint) = read_tcp_endpoint(socket_path) {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], endpoint.port));
+            if let Ok(mut stream) =
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))
+            {
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                let auth_line = encode_shim_auth_line(&endpoint.token);
+                let _ = stream.write_all(auth_line.as_bytes());
+                let _ = stream.write_all(b"{\"type\":\"kill\"}\n");
+                let _ = stream.flush();
+                drop(stream);
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        }
+    }
+    if let Some(rec) = pid_rec {
+        reap_recorded_shim_pid_sync(&rec, socket_path);
+    }
     let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(pid_file_path(socket_path));
 }
 
-/// Synchronously kill every active shim whose `.sock` lives in `shims_dir`.
+/// Synchronously kill every active shim whose `.sock` or `.pid` lives in `shims_dir`.
 pub fn kill_all_shims_in_dir_sync(shims_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(shims_dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("sock") {
-            kill_existing_shim_sync(&path);
+        if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("sock") | Some("pid")
+        ) {
+            kill_existing_shim_sync(&path.with_extension("sock"));
         }
     }
 }
 
 /// Spawn a detached `orbit shim` process in its own OS process group and connect to its UDS.
+/// Reaps any surviving shim for the same `socket_path` (via UDS or `.pid` sidecar) first so two
+/// shims for the same agent/PTY can never coexist.
 pub async fn spawn_detached_shim(
     orbit_exe: &Path,
     socket_path: &Path,
     spec: &ShimSpawnSpec,
 ) -> Result<ShimClient, ShimError> {
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(socket_path);
+    if socket_path.exists() || pid_file_path(socket_path).exists() {
+        kill_existing_shim(socket_path).await;
     }
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -447,17 +1212,56 @@ pub async fn spawn_detached_shim(
         use std::os::unix::process::CommandExt;
         std_cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std_cmd.creation_flags(WIN_CREATE_NEW_PROCESS_GROUP | WIN_CREATE_NO_WINDOW);
+    }
 
-    let _child = std_cmd.spawn()?;
+    let err_sidecar = socket_path.with_extension("err");
+    let _ = std::fs::remove_file(&err_sidecar);
 
-    // Poll up to 3s for UDS listener readiness
-    for _ in 0..150 {
-        if socket_path.exists()
-            && let Ok(client) = ShimClient::connect(socket_path).await
-        {
-            return Ok(client);
+    let mut child = std_cmd.spawn()?;
+
+    // Poll for shim listener readiness (Windows cold process + ConPTY startup can exceed 3s under AV scanning).
+    let max_polls = if cfg!(windows) { 500 } else { 250 };
+    let mut last_connect_err: Option<String> = None;
+    for _ in 0..max_polls {
+        if socket_path.exists() {
+            match ShimClient::connect(socket_path).await {
+                Ok(client) => {
+                    let _ = std::fs::remove_file(&err_sidecar);
+                    return Ok(client);
+                }
+                Err(err) => {
+                    last_connect_err = Some(err.to_string());
+                }
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let detail = std::fs::read_to_string(&err_sidecar).unwrap_or_default();
+            let _ = std::fs::remove_file(&err_sidecar);
+            let detail = detail.trim();
+            return Err(ShimError::Pty(format!(
+                "shim process ({}) exited early ({status}) before {} became ready{}",
+                orbit_exe.display(),
+                socket_path.display(),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    if let Some(err) = last_connect_err {
+        return Err(ShimError::Pty(format!(
+            "shim socket {} existed (exe={}) but connect failed: {err}",
+            socket_path.display(),
+            orbit_exe.display()
+        )));
     }
 
     Err(ShimError::ReadyTimeout(socket_path.to_path_buf()))
@@ -471,17 +1275,38 @@ pub async fn run_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), Shi
     }
 }
 
-/// RAII guard that guarantees the shim Unix socket file is unlinked even on early error returns.
-struct SocketCleanupGuard(PathBuf);
+/// RAII guard that guarantees the shim Unix socket and `.pid` sidecar are unlinked on exit
+/// without accidentally clobbering a newer replacement shim's files.
+struct SocketCleanupGuard {
+    socket_path: PathBuf,
+    owner_pid: u32,
+}
+
+impl SocketCleanupGuard {
+    fn new(socket_path: PathBuf) -> Self {
+        Self {
+            socket_path,
+            owner_pid: std::process::id(),
+        }
+    }
+}
 
 impl Drop for SocketCleanupGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let should_clean = match read_pid_file(&self.socket_path) {
+            Some(rec) => rec.shim_pid == self.owner_pid,
+            None => false,
+        };
+        if should_clean {
+            let _ = std::fs::remove_file(&self.socket_path);
+            let _ = std::fs::remove_file(pid_file_path(&self.socket_path));
+        }
     }
 }
 
 /// Probe every `*.sock` entry under `shims_dir` and unlink orphaned sockets whose listener has
-/// already exited (`ConnectionRefused` / `NotFound`). Active shims survive untouched.
+/// already exited (`ConnectionRefused` / `NotFound`), along with stale `.pid` sidecars.
+/// Active shims survive untouched.
 pub async fn cleanup_stale_shim_sockets(shims_dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(shims_dir) else {
         return 0;
@@ -489,18 +1314,34 @@ pub async fn cleanup_stale_shim_sockets(shims_dir: &Path) -> usize {
     let mut removed = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
-            continue;
-        }
-        if let Ok(Err(err)) =
-            tokio::time::timeout(Duration::from_millis(150), UnixStream::connect(&path)).await
-            && matches!(
-                err.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            )
-            && std::fs::remove_file(&path).is_ok()
-        {
-            removed += 1;
+        if path.extension().and_then(|e| e.to_str()) == Some("sock") {
+            let probe_timeout = if cfg!(unix) {
+                Duration::from_millis(150)
+            } else {
+                // Windows loopback TCP SYN retries take ~1-2s before returning WSAECONNREFUSED.
+                Duration::from_millis(3000)
+            };
+            if let Ok(Err(err)) =
+                tokio::time::timeout(probe_timeout, connect_shim_stream(&path)).await
+                && matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                )
+                && std::fs::remove_file(&path).is_ok()
+            {
+                let pid_path = pid_file_path(&path);
+                if read_pid_file(&path).is_none_or(|rec| !is_pid_alive(rec.shim_pid)) {
+                    let _ = std::fs::remove_file(pid_path);
+                }
+                removed += 1;
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("pid") {
+            let sock_path = path.with_extension("sock");
+            if !sock_path.exists()
+                && read_pid_file(&sock_path).is_none_or(|rec| !is_pid_alive(rec.shim_pid))
+            {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
     removed
@@ -508,8 +1349,9 @@ pub async fn cleanup_stale_shim_sockets(shims_dir: &Path) -> usize {
 
 async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), ShimError> {
     prepare_socket_path(socket_path)?;
-    let listener = UnixListener::bind(socket_path)?;
-    let _socket_guard = SocketCleanupGuard(socket_path.to_path_buf());
+    let listener = ShimListener::bind(socket_path).await?;
+    let _socket_guard = SocketCleanupGuard::new(socket_path.to_path_buf());
+    write_pid_file(socket_path, std::process::id(), None, None);
 
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
@@ -523,8 +1365,18 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
     {
         cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(WIN_CREATE_NEW_PROCESS_GROUP | WIN_CREATE_NO_WINDOW);
+    }
 
     let mut child = cmd.spawn()?;
+    let child_pid = child.id();
+    #[cfg(unix)]
+    let child_pgid = child_pid;
+    #[cfg(not(unix))]
+    let child_pgid = None;
+    write_pid_file(socket_path, std::process::id(), child_pid, child_pgid);
     let mut child_stdin = child.stdin.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, "missing child stdin")
     })?;
@@ -599,7 +1451,7 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
     loop {
         tokio::select! {
             accept_res = listener.accept() => {
-                if let Ok((stream, _)) = accept_res {
+                if let Ok(stream) = accept_res {
                     handle_stdio_daemon_attach(
                         stream,
                         ring.clone(),
@@ -610,20 +1462,20 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
                 }
             }
             _ = kill_rx.recv() => {
-                let _ = child.kill().await;
-                let status = child.wait().await.ok();
-                let _ = out_tx.send(ShimFrame::Exited { code: status.and_then(|s| s.code()) });
+                let code = terminate_child_process_group(&mut child).await;
+                let _ = out_tx.send(ShimFrame::Exited { code });
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 break;
             }
             wait_res = child.wait() => {
                 let code = wait_res.ok().and_then(|s| s.code());
                 let _ = out_tx.send(ShimFrame::Exited { code });
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 break;
             }
         }
     }
 
-    let _ = std::fs::remove_file(socket_path);
     Ok(())
 }
 
@@ -634,8 +1486,6 @@ async fn run_pty_shim(
     rows: u16,
 ) -> Result<(), ShimError> {
     prepare_socket_path(socket_path)?;
-    let listener = UnixListener::bind(socket_path)?;
-    let _socket_guard = SocketCleanupGuard(socket_path.to_path_buf());
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -659,6 +1509,15 @@ async fn run_pty_shim(
         .slave
         .spawn_command(cmd)
         .map_err(|e| ShimError::Pty(e.to_string()))?;
+    let pty_child_pid = child.process_id();
+    let listener = ShimListener::bind(socket_path).await?;
+    let _socket_guard = SocketCleanupGuard::new(socket_path.to_path_buf());
+    write_pid_file(
+        socket_path,
+        std::process::id(),
+        pty_child_pid,
+        pty_child_pid,
+    );
     let mut child_killer = child.clone_killer();
     drop(pair.slave);
 
@@ -742,7 +1601,7 @@ async fn run_pty_shim(
     loop {
         tokio::select! {
             accept_res = listener.accept() => {
-                if let Ok((stream, _)) = accept_res {
+                if let Ok(stream) = accept_res {
                     let snap_bytes: Vec<u8> = scrollback
                         .lock()
                         .map(|sb| sb.iter().copied().collect())
@@ -762,18 +1621,31 @@ async fn run_pty_shim(
                 }
             }
             _ = kill_rx.recv() => {
+                #[cfg(unix)]
+                if let Some(pid) = pty_child_pid {
+                    signal_pid_group(pid, "-TERM");
+                }
+                #[cfg(windows)]
+                if let Some(pid) = pty_child_pid {
+                    kill_process_tree_async(pid).await;
+                }
                 let _ = child_killer.kill();
+                #[cfg(unix)]
+                if let Some(pid) = pty_child_pid {
+                    signal_pid_group(pid, "-KILL");
+                }
                 let _ = out_tx.send(ShimFrame::Exited { code: None });
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 break;
             }
             maybe_code = exit_rx.recv() => {
                 let _ = out_tx.send(ShimFrame::Exited { code: maybe_code.flatten() });
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 break;
             }
         }
     }
 
-    let _ = std::fs::remove_file(socket_path);
     Ok(())
 }
 
@@ -797,7 +1669,7 @@ fn push_ring(ring: &Arc<Mutex<VecDeque<ShimFrame>>>, frame: ShimFrame) {
 }
 
 fn handle_stdio_daemon_attach(
-    stream: UnixStream,
+    stream: ShimStream,
     ring: Arc<Mutex<VecDeque<ShimFrame>>>,
     next_seq: Arc<AtomicU64>,
     mut out_rx: broadcast::Receiver<ShimFrame>,
@@ -906,7 +1778,12 @@ fn handle_stdio_daemon_attach(
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => break,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!(
+                        "[orbit-shim] stdio daemon attach lagged by {skipped} frame(s); continuing from broadcast channel"
+                    );
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -914,7 +1791,7 @@ fn handle_stdio_daemon_attach(
 }
 
 fn handle_daemon_attach(
-    stream: UnixStream,
+    stream: ShimStream,
     initial_frames: Vec<ShimFrame>,
     mut out_rx: broadcast::Receiver<ShimFrame>,
     in_tx: mpsc::Sender<ShimFrame>,
@@ -997,7 +1874,24 @@ fn is_pid_alive(pid: u32) -> bool {
             .status()
             .is_ok_and(|s| s.success())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let filter = format!("PID eq {pid}");
+        std::process::Command::new("tasklist")
+            .args(["/FI", &filter, "/NH", "/FO", "CSV"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(WIN_CREATE_NO_WINDOW)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .is_some_and(|o| {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                parse_windows_tasklist_csv_match(&stdout, pid, None)
+            })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
@@ -1031,8 +1925,15 @@ fn spawn_optional_parent_watchdog(spec: &ShimSpawnSpec, kill_tx: mpsc::Sender<()
 mod tests {
     use super::*;
 
+    // On macOS, `UnixListener::bind` lacks atomic `SOCK_CLOEXEC`, so concurrent `fork()` calls
+    // from sibling tests in the same binary can momentarily inherit a test listener FD before
+    // `fcntl(FD_CLOEXEC)` runs. Serialize fork-spawning / socket-cleanup tests cleanly.
+    static SHIM_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn stdio_shim_survives_daemon_disconnect_and_replays_ring() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
         let sock_path =
             std::env::temp_dir().join(format!("orbit_test_shim_{}.sock", std::process::id()));
         let spec = ShimSpawnSpec {
@@ -1110,8 +2011,10 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stdio_shim_cursor_attach_skips_consumed_frames_and_delivers_only_new_ones() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
         let sock_path = std::env::temp_dir().join(format!(
             "orbit_test_shim_cursor_{}.sock",
             std::process::id()
@@ -1213,11 +2116,13 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("bind fake legacy shim");
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind fake legacy shim");
 
         // Simulate a legacy v0.8.0 shim that ignores `Attach` and dumps unsequenced ring frames.
         let server = tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
+            if let Ok(mut stream) = listener.accept().await {
                 let legacy_dump = concat!(
                     "{\"type\":\"stdout_line\",\"line\":\"stale-truncated-chunk-1\"}\n",
                     "{\"type\":\"stdout_line\",\"line\":\"stale-truncated-chunk-2\"}\n"
@@ -1253,16 +2158,17 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_stale_shim_sockets_removes_dead_and_keeps_live_sockets() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("orbit_stale_sock_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
 
         let live_sock = dir.join("live.sock");
-        let _live_listener = UnixListener::bind(&live_sock).expect("bind live");
+        let _live_listener = ShimListener::bind(&live_sock).await.expect("bind live");
 
         let dead_sock = dir.join("dead.sock");
         {
-            let _dead_listener = UnixListener::bind(&dead_sock).expect("bind dead");
+            let _dead_listener = ShimListener::bind(&dead_sock).await.expect("bind dead");
         } // listener dropped -> stale socket file remains on disk
 
         assert!(dead_sock.exists());
@@ -1274,8 +2180,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn parent_watchdog_terminates_shim_when_watched_pid_is_gone() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
         let sock_path =
             std::env::temp_dir().join(format!("orbit_watchdog_shim_{}.sock", std::process::id()));
         let mut env = HashMap::new();
@@ -1296,5 +2204,380 @@ mod tests {
             "shim with dead watchdog PID must self-terminate promptly"
         );
         assert!(!sock_path.exists(), "socket file must be unlinked on exit");
+        assert!(
+            !pid_file_path(&sock_path).exists(),
+            "pid sidecar must be unlinked on exit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_and_connect_keep_live_socket_and_pid_sidecar_cleans_on_exit() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
+        let sock_path =
+            std::env::temp_dir().join(format!("orbit_pid_sidecar_{}.sock", std::process::id()));
+        let pid_path = pid_file_path(&sock_path);
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&pid_path);
+
+        let spec = ShimSpawnSpec {
+            shim_id: "test_pid_sidecar".into(),
+            mode: ShimMode::Stdio,
+            program: "/bin/cat".into(),
+            args: vec![],
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+        };
+        let sock_bg = sock_path.clone();
+        let shim_task = tokio::spawn(async move {
+            run_shim(&sock_bg, spec).await.expect("shim run");
+        });
+        for _ in 0..50 {
+            if sock_path.exists() && pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(pid_path.exists(), "shim must write .pid sidecar");
+        let rec = read_pid_file(&sock_path).expect("valid pid record");
+        assert_eq!(rec.shim_pid, std::process::id());
+        assert!(rec.child_pid.is_some());
+        assert!(probe_existing_shim(&sock_path).await);
+
+        let mut client = connect_existing_shim(&sock_path)
+            .await
+            .expect("connect existing");
+        client
+            .kill_and_wait(Duration::from_millis(500))
+            .await
+            .expect("kill_and_wait");
+        let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
+        assert!(!sock_path.exists(), "socket cleaned after kill");
+        assert!(!pid_path.exists(), "pid sidecar cleaned after kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_shim_lagged_broadcast_resyncs_without_detaching() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
+        let sock_path =
+            std::env::temp_dir().join(format!("orbit_lag_resync_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let spec = ShimSpawnSpec {
+            shim_id: "test_lag".into(),
+            mode: ShimMode::Stdio,
+            program: "/bin/cat".into(),
+            args: vec![],
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+        };
+        let sock_bg = sock_path.clone();
+        let shim_task = tokio::spawn(async move {
+            run_shim(&sock_bg, spec).await.expect("shim run");
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut client = ShimClient::connect(&sock_path).await.expect("connect");
+        // Write > 1100 lines quickly without draining `client.rx` immediately so broadcast lags
+        let writer = ShimClient::connect(&sock_path).await.expect("writer");
+        for i in 0..1200 {
+            writer
+                .write_stdin_line(format!("burst-{i}"))
+                .await
+                .expect("write burst");
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        writer
+            .write_stdin_line("sentinel-after-lag")
+            .await
+            .expect("write sentinel");
+
+        let mut received_count = 0usize;
+        let mut saw_sentinel = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(300), client.rx.recv()).await {
+                Ok(Some(ShimFrame::StdoutLine { line, .. })) => {
+                    received_count += 1;
+                    if line == "sentinel-after-lag" {
+                        saw_sentinel = true;
+                        break;
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_sentinel,
+            "daemon attach must resync across broadcast lag instead of detaching"
+        );
+        assert!(
+            received_count > STDIO_RING_CAPACITY,
+            "lagged attach must preserve frames buffered in 1024-slot broadcast channel (> {STDIO_RING_CAPACITY}), got {received_count}"
+        );
+
+        client
+            .kill_and_wait(Duration::from_millis(500))
+            .await
+            .expect("kill");
+        let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_shim_kill_terminates_child_process_group_grandchildren() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
+        let sock_path =
+            std::env::temp_dir().join(format!("orbit_pgid_kill_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let spec = ShimSpawnSpec {
+            shim_id: "test_pgid".into(),
+            mode: ShimMode::Stdio,
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30 & echo $!; wait".into()],
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+        };
+        let sock_bg = sock_path.clone();
+        let shim_task = tokio::spawn(async move {
+            run_shim(&sock_bg, spec).await.expect("shim run");
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut client = ShimClient::connect(&sock_path).await.expect("connect");
+        let grandchild_pid: u32 = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), client.rx.recv())
+                .await
+                .expect("grandchild pid timeout")
+                .expect("frame");
+            if let ShimFrame::StdoutLine { line, .. } = frame
+                && let Ok(pid) = line.trim().parse::<u32>()
+            {
+                break pid;
+            }
+        };
+        assert!(
+            is_pid_alive(grandchild_pid),
+            "grandchild sleep must be alive before kill"
+        );
+
+        client
+            .kill_and_wait(Duration::from_millis(600))
+            .await
+            .expect("kill_and_wait");
+        let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
+
+        let mut died = false;
+        for _ in 0..20 {
+            if !is_pid_alive(grandchild_pid) {
+                died = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            died,
+            "grandchild process {grandchild_pid} must be terminated when shim kills process group"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_existing_shim_does_not_unlink_on_non_refused_timeout() {
+        // Bind a listening socket that never accepts connections, and connect via a cursor handshake
+        // that cannot fail with ConnectionRefused. Wait: on macOS UnixStream::connect succeeds into
+        // the kernel backlog immediately, so `connect_with_cursor` will time out waiting for AttachAck
+        // (returning Ok(client) after 180ms) — verify the socket is NEVER unlinked!
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_no_unlink_timeout_{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let _listener = ShimListener::bind(&sock_path).await.expect("bind listener");
+
+        #[cfg(unix)]
+        assert!(probe_existing_shim(&sock_path).await);
+        #[cfg(not(unix))]
+        let _ = probe_existing_shim(&sock_path).await;
+        assert!(
+            sock_path.exists(),
+            "live socket must remain on disk after non-refused timeout"
+        );
+
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn windows_tcp_endpoint_descriptor_and_auth_handshake_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("orbit_win_ep_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ep_path = dir.join("agent.sock");
+
+        let token = generate_shim_auth_token();
+        assert_eq!(token.len(), 64);
+        let ep = ShimTcpEndpoint {
+            port: 49152,
+            token: token.clone(),
+        };
+        write_tcp_endpoint_atomic(&ep_path, &ep).expect("write endpoint");
+        let loaded = read_tcp_endpoint(&ep_path).expect("read endpoint");
+        assert_eq!(loaded, ep);
+
+        let line = encode_shim_auth_line(&token);
+        assert!(verify_shim_auth_line(&line, &token));
+        assert!(!verify_shim_auth_line(&line, "wrong-token"));
+        assert!(!verify_shim_auth_line("{\"type\":\"kill\"}", &token));
+
+        let ack = encode_shim_auth_ack_line();
+        assert!(verify_shim_auth_ack_line(ack));
+        assert!(!verify_shim_auth_ack_line("{\"auth_ok\":false}\n"));
+        assert!(!verify_shim_auth_ack_line("HTTP/1.1 400 Bad Request\r\n"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_tasklist_csv_parser_matches_pid_and_image_prefix() {
+        let csv = "\"orbit.exe\",\"4242\",\"Console\",\"1\",\"18,432 K\"\r\n\"notepad.exe\",\"9999\",\"Console\",\"1\",\"4,000 K\"\r\n";
+        assert!(parse_windows_tasklist_csv_match(csv, 4242, None));
+        assert!(parse_windows_tasklist_csv_match(csv, 4242, Some("orbit")));
+        assert!(!parse_windows_tasklist_csv_match(csv, 9999, Some("orbit")));
+        assert!(!parse_windows_tasklist_csv_match(csv, 1234, None));
+        assert!(!parse_windows_tasklist_csv_match(
+            "INFO: No tasks are running which match the specified criteria.\r\n",
+            4242,
+            None
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_recorded_shim_pid_requires_matching_socket_and_guards_child_pgid() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
+        // Spawn a harmless sleep process whose cmdline does NOT match `shim --socket <path>`
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let sock_path = std::env::temp_dir().join("orbit_expected_match.sock");
+
+        assert!(
+            !is_orbit_shim_process(pid, &sock_path),
+            "non-shim process must not match is_orbit_shim_process"
+        );
+        // Even if a stale `.pid` file pointed at this recycled PID, reap MUST leave it untouched!
+        let stale_rec = ShimPidRecord {
+            shim_pid: pid,
+            child_pid: Some(pid),
+            child_pgid: Some(pid),
+        };
+        reap_recorded_shim_pid(&stale_rec, &sock_path).await;
+        assert!(
+            is_pid_alive(pid),
+            "reap_recorded_shim_pid must NEVER kill a process whose cmdline doesn't match socket_path"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn pty_shim_echoes_output_over_shim_ipc() {
+        let _guard = SHIM_TEST_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!("orbit_pty_shim_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        let sock_path = tmp.join("pty_echo.sock");
+
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/C".to_string(),
+                    "echo ORBIT_SHIM_PTY_OK & ping -n 4 127.0.0.1 >NUL".to_string(),
+                ],
+            )
+        } else {
+            (
+                "/bin/sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    "echo ORBIT_SHIM_PTY_OK; sleep 3".to_string(),
+                ],
+            )
+        };
+        let spec = ShimSpawnSpec {
+            shim_id: "pty_echo_test".into(),
+            mode: ShimMode::Pty { cols: 80, rows: 24 },
+            program,
+            args,
+            cwd: tmp.clone(),
+            env: HashMap::new(),
+        };
+
+        let sock_bg = sock_path.clone();
+        let shim_task = tokio::spawn(async move { run_shim(&sock_bg, spec).await });
+
+        let mut client = None;
+        for _ in 0..250 {
+            if sock_path.exists()
+                && let Ok(c) = ShimClient::connect(&sock_path).await
+            {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("connect to in-process pty shim");
+
+        let mut collected = String::new();
+        let mut answered_dsr = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), client.rx.recv()).await {
+                Ok(Some(ShimFrame::PtyOutput { data_b64 }))
+                | Ok(Some(ShimFrame::PtySnapshot { data_b64 })) => {
+                    if let Ok(bytes) = B64.decode(data_b64) {
+                        let chunk = String::from_utf8_lossy(&bytes);
+                        if !answered_dsr && chunk.contains("\x1b[6n") {
+                            // Windows ConPTY waits for a CPR response to its initial DSR query.
+                            let _ = client.write_pty_input(b"\x1b[1;1R").await;
+                            answered_dsr = true;
+                        }
+                        collected.push_str(&chunk);
+                        if collected.contains("ORBIT_SHIM_PTY_OK") {
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(ShimFrame::Exited { .. })) | Ok(None) => break,
+                _ => {}
+            }
+        }
+        let _ = client.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), shim_task).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            collected.contains("ORBIT_SHIM_PTY_OK"),
+            "expected PTY shim output, got: {:?}",
+            collected
+        );
     }
 }

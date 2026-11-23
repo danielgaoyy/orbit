@@ -3,15 +3,21 @@ package dev.orbit.android.store
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.SystemClock
 import android.util.LruCache
 import androidx.compose.runtime.Immutable
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.orbit.android.BuildConfig
+import dev.orbit.android.notifications.OrbitFirebaseMessagingBridge
+import dev.orbit.android.notifications.OrbitNotificationHelper
+import dev.orbit.android.ui.sheets.SideQuestionEntry
 import dev.orbit.android.ui.theme.OrbitAppearanceMode
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -22,8 +28,11 @@ import kotlinx.coroutines.withContext
 import uniffi.orbit_ffi_uniffi.FfiAgentCard
 import uniffi.orbit_ffi_uniffi.FfiAgentStage
 import uniffi.orbit_ffi_uniffi.FfiAgentStageDelta
+import uniffi.orbit_ffi_uniffi.FfiAskSideQuestionRequest
 import uniffi.orbit_ffi_uniffi.FfiClientPlatform
 import uniffi.orbit_ffi_uniffi.FfiClientProject
+import uniffi.orbit_ffi_uniffi.FfiCloudSyncDevicePollStatus
+import uniffi.orbit_ffi_uniffi.FfiCloudSyncStatus
 import uniffi.orbit_ffi_uniffi.FfiComposePromptRequest
 import uniffi.orbit_ffi_uniffi.FfiComposedPrompt
 import uniffi.orbit_ffi_uniffi.FfiComposerContextInput
@@ -31,11 +40,19 @@ import uniffi.orbit_ffi_uniffi.FfiComposerPasteInput
 import uniffi.orbit_ffi_uniffi.FfiComposerQuoteInput
 import uniffi.orbit_ffi_uniffi.FfiConnectionState
 import uniffi.orbit_ffi_uniffi.FfiCoreEvent
+import uniffi.orbit_ffi_uniffi.FfiCreateScheduleRequest
+import uniffi.orbit_ffi_uniffi.FfiCreateSessionRequest
 import uniffi.orbit_ffi_uniffi.FfiDiagramKind
 import uniffi.orbit_ffi_uniffi.FfiDiagramTheme
+import uniffi.orbit_ffi_uniffi.FfiExportFormat
+import uniffi.orbit_ffi_uniffi.FfiExportOptions
+import uniffi.orbit_ffi_uniffi.FfiFastModeSlashAction
 import uniffi.orbit_ffi_uniffi.FfiFleetSidebar
 import uniffi.orbit_ffi_uniffi.FfiFleetSidebarRequest
+import uniffi.orbit_ffi_uniffi.FfiForkAgentRequest
+import uniffi.orbit_ffi_uniffi.FfiGitHubDeviceFlowStart
 import uniffi.orbit_ffi_uniffi.FfiGitReview
+import uniffi.orbit_ffi_uniffi.FfiGoalControlAction
 import uniffi.orbit_ffi_uniffi.FfiHostCard
 import uniffi.orbit_ffi_uniffi.FfiHostDetail
 import uniffi.orbit_ffi_uniffi.FfiHostRouteMode
@@ -48,16 +65,20 @@ import uniffi.orbit_ffi_uniffi.FfiPromptBadge
 import uniffi.orbit_ffi_uniffi.FfiProviderKind
 import uniffi.orbit_ffi_uniffi.FfiProviderModelCatalog
 import uniffi.orbit_ffi_uniffi.FfiProviderModelSpec
+import uniffi.orbit_ffi_uniffi.FfiPushRegistrationStatus
 import uniffi.orbit_ffi_uniffi.FfiQuestionItem
 import uniffi.orbit_ffi_uniffi.FfiReasoningEffort
 import uniffi.orbit_ffi_uniffi.FfiRenderDiagramRequest
 import uniffi.orbit_ffi_uniffi.FfiRenderDiagramView
 import uniffi.orbit_ffi_uniffi.FfiResolvedModelSelection
+import uniffi.orbit_ffi_uniffi.FfiScheduleRunRecord
 import uniffi.orbit_ffi_uniffi.FfiSessionMode
+import uniffi.orbit_ffi_uniffi.FfiSideQuestionEvent
 import uniffi.orbit_ffi_uniffi.FfiSidebarProjectSort
 import uniffi.orbit_ffi_uniffi.FfiSidebarThreadFilter
 import uniffi.orbit_ffi_uniffi.FfiSlashCommand
 import uniffi.orbit_ffi_uniffi.FfiSlashDirective
+import uniffi.orbit_ffi_uniffi.FfiSpawnWorkspacePeerRequest
 import uniffi.orbit_ffi_uniffi.FfiTerminalScreen
 import uniffi.orbit_ffi_uniffi.FfiThreadPrefSeed
 import uniffi.orbit_ffi_uniffi.FfiTimelineItem
@@ -65,6 +86,7 @@ import uniffi.orbit_ffi_uniffi.FfiToolCallDetail
 import uniffi.orbit_ffi_uniffi.FfiToolStepDescriptor
 import uniffi.orbit_ffi_uniffi.MobileCoreListener
 import uniffi.orbit_ffi_uniffi.OrbitMobileCore
+import uniffi.orbit_ffi_uniffi.SideQuestionListener
 import uniffi.orbit_ffi_uniffi.defaultEffortDescription
 import uniffi.orbit_ffi_uniffi.fallbackProviderCatalog
 import uniffi.orbit_ffi_uniffi.formatCatalogModelLabel
@@ -149,6 +171,7 @@ data class ComposerDraftState(
     val provider: FfiProviderKind = FfiProviderKind.CLAUDE_CODE,
     val model: String? = null,
     val effort: FfiReasoningEffort? = null,
+    val fastMode: Boolean = false,
     val mode: FfiSessionMode = FfiSessionMode.AcceptEdits,
     val mentionedFiles: List<String> = emptyList(),
     val stagedAttachments: List<StagedAttachmentItem> = emptyList(),
@@ -237,9 +260,38 @@ data class OrbitUiState(
     val demoPermissions: List<FfiTimelineItem> = emptyList(),
     val demoQuestions: List<FfiTimelineItem> = emptyList(),
     val localDaemonUri: String? = null,
+    val scheduleRunsById: Map<String, List<FfiScheduleRunRecord>> = emptyMap(),
+    val sideQuestionsByScope: Map<String, List<SideQuestionEntry>> = emptyMap(),
+    val sideQuestionDraftsByScope: Map<String, String> = emptyMap(),
+    val cloudSyncStatus: FfiCloudSyncStatus? = null,
+    val cloudSyncDeviceFlow: FfiGitHubDeviceFlowStart? = null,
+    val cloudSyncBusy: Boolean = false,
+    val cloudSyncError: String? = null,
+    val pushRegistrationStatus: FfiPushRegistrationStatus? = null,
+    val pendingSheetTriggerId: Long = 0L,
+    val pendingSheetTrigger: String? = null,
     val lastError: String? = null,
     val toastMessage: String? = null,
 ) {
+    val activeWorkspaceId: String?
+        get() = activeAgent?.workspaceId?.takeIf { it.isNotBlank() }
+            ?: hostDetail?.workspaces?.firstOrNull {
+                OrbitFormatters.pathsEquivalent(it.cwd, activeCwd)
+            }?.workspaceId
+            ?: hostDetail?.workspaces?.firstOrNull()?.workspaceId
+
+    val activeSideQuestionScopeKey: String
+        get() {
+            val hid = selectedHostId ?: "none"
+            val aid = selectedAgentId?.takeIf { !isNewSessionMode } ?: "draft:$activeCwd"
+            return "$hid::$aid"
+        }
+
+    val activeSideQuestions: List<SideQuestionEntry>
+        get() = sideQuestionsByScope[activeSideQuestionScopeKey].orEmpty()
+
+    val activeSideQuestionDraft: String
+        get() = sideQuestionDraftsByScope[activeSideQuestionScopeKey].orEmpty()
     val selectedHost: FfiHostCard?
         get() = hostDetail?.host ?: hosts.firstOrNull { it.hostId == selectedHostId }
 
@@ -341,16 +393,39 @@ object OrbitFormatters {
         FfiProviderKind.ANTIGRAVITY -> "Antigravity"
         FfiProviderKind.CODEX -> "Codex"
         FfiProviderKind.CLAUDE_CODE -> "Claude Code"
+        FfiProviderKind.OPEN_CODE -> "OpenCode"
+        FfiProviderKind.GEMINI_CLI -> "Gemini CLI"
+        FfiProviderKind.CURSOR_AGENT -> "Cursor Agent"
+        FfiProviderKind.COPILOT -> "Copilot"
+        FfiProviderKind.GOOSE -> "Goose"
+        FfiProviderKind.PI -> "Pi"
+        FfiProviderKind.KIMI -> "Kimi"
+        FfiProviderKind.CLINE -> "Cline"
+        FfiProviderKind.MISTRAL_VIBE -> "Mistral Vibe"
+        FfiProviderKind.AUGMENT -> "Augment"
+        FfiProviderKind.ACP -> "ACP Agent"
     }
 
     fun providerShortLabel(provider: FfiProviderKind): String = when (provider) {
         FfiProviderKind.ANTIGRAVITY -> "AGY"
         FfiProviderKind.CODEX -> "Codex"
         FfiProviderKind.CLAUDE_CODE -> "Claude"
+        FfiProviderKind.OPEN_CODE -> "OpenCode"
+        FfiProviderKind.GEMINI_CLI -> "Gemini"
+        FfiProviderKind.CURSOR_AGENT -> "Cursor"
+        FfiProviderKind.COPILOT -> "Copilot"
+        FfiProviderKind.GOOSE -> "Goose"
+        FfiProviderKind.PI -> "Pi"
+        FfiProviderKind.KIMI -> "Kimi"
+        FfiProviderKind.CLINE -> "Cline"
+        FfiProviderKind.MISTRAL_VIBE -> "Mistral"
+        FfiProviderKind.AUGMENT -> "Augment"
+        FfiProviderKind.ACP -> "ACP"
     }
 
     fun sessionModeLabel(mode: FfiSessionMode): String = when (mode) {
         FfiSessionMode.Default -> "Always Ask"
+        FfiSessionMode.Auto -> "Auto (Guardian)"
         FfiSessionMode.Plan -> "Always Ask"
         FfiSessionMode.AcceptEdits -> "Accept Edits"
         FfiSessionMode.FullAccess -> "Full Access"
@@ -504,8 +579,15 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val runningAgentKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val drainingAgentKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val notifiedApprovalAgentKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val draftSelectionsByProvider: MutableMap<FfiProviderKind, Pair<String?, FfiReasoningEffort?>> =
         ConcurrentHashMap()
+    @Volatile
+    private var cloudSyncPollJob: Job? = null
+    @Volatile
+    private var isAppInForeground: Boolean = true
+    @Volatile
+    private var pendingDeepLink: Pair<String, String>? = null
     @Volatile
     private var hasUserCustomizedDraftModel: Boolean = false
     private val coreReady = CompletableDeferred<OrbitMobileCore?>()
@@ -592,6 +674,17 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 }
                 reloadFleetInternal()
                 refreshSidebarInternal()
+                val initialSync = runCatching { instance.cloudSyncStatus() }.getOrNull()
+                val initialPush = runCatching { instance.pushRegistrationStatus() }.getOrNull()
+                _state.update {
+                    it.copy(
+                        cloudSyncStatus = initialSync ?: it.cloudSyncStatus,
+                        pushRegistrationStatus = initialPush ?: it.pushRegistrationStatus,
+                    )
+                }
+                OrbitFirebaseMessagingBridge.attachTokenListener(application) { fcmToken ->
+                    registerPushToken(OrbitFirebaseMessagingBridge.PLATFORM_ANDROID_FCM, fcmToken)
+                }
                 coreReady.complete(instance)
                 instance.connectAllHosts()
                 _state.value.selectedHostId?.let { reloadHostDetailInternal(it) }
@@ -622,6 +715,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 reloadFleetInternal()
                 if (event.hostId == _state.value.selectedHostId) {
                     reloadHostDetailInternal(event.hostId)
+                } else {
+                    checkHostNotifications(event.hostId)
                 }
             }
             is FfiCoreEvent.TimelineChanged -> {
@@ -675,6 +770,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun onAppForeground() {
+        isAppInForeground = true
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { core?.onAppForeground() }
             reloadFleetInternal()
@@ -683,6 +779,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun onAppBackground() {
+        isAppInForeground = false
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { core?.onAppBackground() }
         }
@@ -907,8 +1004,90 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
     fun handleDeepLinkUri(uriString: String?) {
         val trimmed = uriString?.trim().orEmpty()
+        if (trimmed.isEmpty()) return
         if (trimmed.startsWith("orbit://pair", ignoreCase = true)) {
             pairHost(trimmed)
+            return
+        }
+        val parsed = runCatching { Uri.parse(trimmed) }.getOrNull() ?: return
+        if (parsed.scheme.equals("orbit", ignoreCase = true) &&
+            parsed.host.equals("open", ignoreCase = true)
+        ) {
+            val hostParam = parsed.getQueryParameter("host")?.trim().orEmpty()
+            val agentParam = parsed.getQueryParameter("agent")?.trim().orEmpty()
+            if (hostParam.isNotEmpty() && !SAFE_DEEP_LINK_ID_REGEX.matches(hostParam)) {
+                postToast("Invalid host link")
+                return
+            }
+            if (agentParam.isNotEmpty() && !SAFE_DEEP_LINK_ID_REGEX.matches(agentParam)) {
+                postToast("Invalid session link")
+                return
+            }
+            if (hostParam.isNotEmpty() && agentParam.isNotEmpty()) {
+                openThreadFromDeepLink(hostParam, agentParam)
+            } else if (hostParam.isNotEmpty()) {
+                openHostFromDeepLink(hostParam)
+            }
+        }
+    }
+
+    private fun openHostFromDeepLink(hostId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val readyCore = core ?: coreReady.await() ?: return@launch
+            reloadFleetInternal()
+            val known = _state.value.hosts.any { it.hostId == hostId }
+            if (!known) {
+                postToast("Host not found")
+                return@launch
+            }
+            pendingDeepLink = null
+            selectHost(hostId)
+            runCatching { readyCore.connectHost(hostId) }
+        }
+    }
+
+    fun openThreadFromDeepLink(hostId: String, agentId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val readyCore = core ?: coreReady.await() ?: return@launch
+            reloadFleetInternal()
+            val knownHost = _state.value.hosts.any { it.hostId == hostId }
+            if (!knownHost) {
+                pendingDeepLink = null
+                postToast("Host not found")
+                return@launch
+            }
+            pendingDeepLink = hostId to agentId
+            prefs.edit().putString(KEY_LAST_HOST_ID, hostId).apply()
+            _state.update { prev ->
+                prev.copy(
+                    selectedHostId = hostId,
+                    selectedAgentId = agentId,
+                    isNewSessionMode = false,
+                    lastError = null,
+                )
+            }
+            runCatching { readyCore.connectHost(hostId) }
+            reloadHostDetailInternal(hostId)
+            val hasAgent = _state.value.hostDetail?.agents?.any { it.agentId == agentId } == true
+            if (hasAgent) {
+                pendingDeepLink = null
+                runCatching { readyCore.openAgentTimeline(hostId, agentId) }
+                reloadStageInternal(hostId, agentId)
+            }
+            refreshSidebarInternal()
+        }
+    }
+
+    fun consumePendingSheetTrigger() {
+        _state.update { it.copy(pendingSheetTrigger = null) }
+    }
+
+    fun requestSheet(target: String) {
+        _state.update {
+            it.copy(
+                pendingSheetTriggerId = it.pendingSheetTriggerId + 1L,
+                pendingSheetTrigger = target,
+            )
         }
     }
 
@@ -953,6 +1132,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     private fun reloadHostDetailInternal(hostId: String) {
         val detail = runCatching { core?.hostDetail(hostId) }.getOrNull() ?: return
         var autoOpenedLatestAgentId: String? = null
+        var deepLinkMissingToast = false
+        val activeDeepLink = pendingDeepLink?.takeIf { it.first == hostId }
         _state.update { prev ->
             // Remap optimistic agent IDs once daemon confirms real session ID
             val remappedAgentId = prev.selectedAgentId?.let { currentId ->
@@ -965,13 +1146,31 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 pendingSelectLatestSession = false
                 autoOpenedLatestAgentId = latestAgentByTime.agentId
             }
+            val isHostOnline = detail.host.connectionState == FfiConnectionState.ONLINE_DIRECT ||
+                detail.host.connectionState == FfiConnectionState.ONLINE_RELAY
+            val deepLinkAgentId = activeDeepLink?.second
+            val deepLinkMatched = deepLinkAgentId != null &&
+                detail.agents.any { it.agentId == deepLinkAgentId }
+            if (deepLinkMatched) {
+                pendingDeepLink = null
+                autoOpenedLatestAgentId = deepLinkAgentId
+            } else if (deepLinkAgentId != null &&
+                isHostOnline &&
+                detail.revision > 0uL &&
+                detail.host.agentCount <= detail.agents.size.toUInt()
+            ) {
+                pendingDeepLink = null
+                deepLinkMissingToast = true
+            }
             val nextSelectedAgentId = when {
+                deepLinkMatched -> deepLinkAgentId
+                deepLinkAgentId != null && !deepLinkMissingToast -> deepLinkAgentId
                 shouldForceLatest -> latestAgentByTime.agentId
                 prev.isNewSessionMode -> null
                 remappedAgentId != null && (remappedAgentId.startsWith("opt_") || detail.agents.any { it.agentId == remappedAgentId }) -> remappedAgentId
                 else -> latestAgentByTime?.agentId
             }
-            val nextNewSessionMode = if (shouldForceLatest) false else prev.isNewSessionMode
+            val nextNewSessionMode = if (shouldForceLatest || deepLinkMatched) false else prev.isNewSessionMode
             val matchedAgent = detail.agents.firstOrNull { it.agentId == nextSelectedAgentId }
             val nextCwd = matchedAgent?.cwd
                 ?: prev.activeCwd.takeIf { it.isNotBlank() && it != "~" }
@@ -1050,6 +1249,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     provider = preferredProvider,
                     model = resolvedModel,
                     effort = resolvedEffort,
+                    fastMode = matchedAgent?.fastMode ?: prev.composer.fastMode,
                     mode = resolvedMode,
                 ),
             )
@@ -1063,24 +1263,95 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             }
         }
 
+        if (deepLinkMissingToast) {
+            postToast("Session not found")
+        }
+
         autoOpenedLatestAgentId?.let { latestId ->
             runCatching { core?.openAgentTimeline(hostId, latestId) }
         }
 
-        detail.agents.forEach { ag ->
+        dispatchAgentNotificationsAndQueues(
+            hostId = hostId,
+            agents = detail.agents,
+            activeAgentId = activeAgentId,
+        )
+        refreshSidebarInternal()
+        if (activeAgentId != null && !stateSnapshot.isNewSessionMode) {
+            reloadStageInternal(hostId, activeAgentId)
+        }
+    }
+
+    private fun reloadHostDetailIfSelected(hostId: String) {
+        if (_state.value.selectedHostId == hostId) {
+            reloadHostDetailInternal(hostId)
+        }
+    }
+
+    private fun checkHostNotifications(hostId: String) {
+        val detail = runCatching { core?.hostDetail(hostId) }.getOrNull() ?: return
+        dispatchAgentNotificationsAndQueues(
+            hostId = hostId,
+            agents = detail.agents,
+            activeAgentId = null,
+        )
+    }
+
+    private fun dispatchAgentNotificationsAndQueues(
+        hostId: String,
+        agents: List<FfiAgentCard>,
+        activeAgentId: String?,
+    ) {
+        agents.forEach { ag ->
             val qKey = agentQueueKey(hostId, ag.agentId)
             val busy = ag.isForegroundRunning() || ag.isAwaitingPermission
+            if (ag.isAwaitingPermission) {
+                val shouldNotify = !isAppInForeground || ag.agentId != activeAgentId
+                if (shouldNotify && notifiedApprovalAgentKeys.add(qKey)) {
+                    OrbitNotificationHelper.notifyApprovalRequired(
+                        context = getApplication(),
+                        hostId = hostId,
+                        agentId = ag.agentId,
+                        title = ag.title.ifBlank { OrbitFormatters.providerLabel(ag.provider) },
+                        body = "Approval needed in ${OrbitFormatters.shortPath(ag.cwd)}",
+                    )
+                }
+            } else {
+                notifiedApprovalAgentKeys.remove(qKey)
+            }
             if (busy) {
                 runningAgentKeys.add(qKey)
-            } else if (ag.agentId != activeAgentId && runningAgentKeys.remove(qKey)) {
-                if (_state.value.queuedPromptsByAgent[qKey]?.isNotEmpty() == true) {
+            } else if (runningAgentKeys.remove(qKey)) {
+                if (!isAppInForeground) {
+                    notifyAgentSettledInBackground(hostId, ag)
+                }
+                if (ag.agentId != activeAgentId &&
+                    _state.value.queuedPromptsByAgent[qKey]?.isNotEmpty() == true
+                ) {
                     drainNextQueuedPromptIfSettled(hostId, ag.agentId)
                 }
             }
         }
-        refreshSidebarInternal()
-        if (activeAgentId != null && !stateSnapshot.isNewSessionMode) {
-            reloadStageInternal(hostId, activeAgentId)
+    }
+
+    private fun notifyAgentSettledInBackground(hostId: String, ag: FfiAgentCard) {
+        val title = ag.title.ifBlank { OrbitFormatters.providerLabel(ag.provider) }
+        if (ag.attentionLabel == "error") {
+            OrbitNotificationHelper.notifyAgentError(
+                context = getApplication(),
+                hostId = hostId,
+                agentId = ag.agentId,
+                title = title,
+                body = ag.statusLabel.ifBlank { "Agent run ended with an error." },
+            )
+        } else {
+            OrbitNotificationHelper.notifyAgentCompleted(
+                context = getApplication(),
+                hostId = hostId,
+                agentId = ag.agentId,
+                title = title,
+                body = ag.taskSummary?.takeIf { it.isNotBlank() } ?: "Run completed.",
+            )
         }
     }
 
@@ -1136,6 +1407,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     provider = ag.provider,
                     model = ag.model ?: prev.composer.model,
                     effort = ag.effort ?: prev.composer.effort,
+                    fastMode = ag.fastMode,
                     mode = OrbitFormatters.normalizeSessionMode(ag.mode),
                 )
             } else {
@@ -1164,6 +1436,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         if (isBusy) {
             runningAgentKeys.add(queueKey)
         } else if (runningAgentKeys.remove(queueKey)) {
+            if (!isAppInForeground && ag != null) {
+                notifyAgentSettledInBackground(hostId, ag)
+            }
             if (_state.value.queuedPromptsByAgent[queueKey]?.isNotEmpty() == true) {
                 drainNextQueuedPromptIfSettled(hostId, agentId)
             }
@@ -1171,6 +1446,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun selectHost(hostId: String) {
+        pendingDeepLink = null
         prefs.edit().putString(KEY_LAST_HOST_ID, hostId).apply()
         _state.update {
             it.copy(
@@ -1372,6 +1648,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun startNewSessionInWorkspace(cwd: String? = null, provider: FfiProviderKind? = null) {
+        pendingDeepLink = null
         val nextCwd = cwd?.trim()?.takeIf { it.isNotBlank() } ?: _state.value.activeCwd
         prefs.edit().putString(KEY_LAST_CWD, nextCwd).apply()
         _state.update { prev ->
@@ -1453,6 +1730,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun selectAgent(agentId: String) {
+        pendingDeepLink = null
         val hostId = _state.value.selectedHostId ?: return
         _state.update { prev ->
             prev.copy(
@@ -1665,11 +1943,32 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         viewModelScope.launch(Dispatchers.IO) {
             val activeProvider = prev.activeAgent?.provider
             if (activeProvider != null && activeProvider != provider) {
-                runCatching { core?.switchAgentProvider(hostId, agentId, provider, resolvedModel, resolvedEffort) }
+                runCatching { core?.switchAgentProvider(hostId, agentId, provider, resolvedModel, resolvedEffort, null) }
             } else {
                 runCatching { core?.setAgentConfig(hostId, agentId, resolvedModel, resolvedEffort) }
             }
             reloadHostDetailInternal(hostId)
+        }
+    }
+
+    fun toggleFastMode() {
+        setFastMode(!_state.value.composer.fastMode)
+    }
+
+    fun setFastMode(enabled: Boolean) {
+        val prev = _state.value
+        _state.update {
+            it.copy(
+                composer = it.composer.copy(fastMode = enabled),
+                toastMessage = if (enabled) "Fast mode enabled" else "Fast mode disabled",
+            )
+        }
+        val hostId = prev.selectedHostId ?: return
+        val agentId = prev.selectedAgentId ?: return
+        if (prev.isNewSessionMode) return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.setAgentFastMode(hostId, agentId, enabled) }
+            reloadStageInternal(hostId, agentId)
         }
     }
 
@@ -1811,15 +2110,37 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         cmd: FfiSlashCommand,
         onOpenTerminal: () -> Unit = {},
         onOpenSettings: () -> Unit = {},
+        onOpenSideQuestion: () -> Unit = {},
+        onOpenAutomations: () -> Unit = {},
+        onOpenWorkspaceBoard: () -> Unit = {},
+        onOpenArchived: () -> Unit = {},
+        onOpenFork: () -> Unit = {},
+        onExportTranscript: () -> Unit = {},
     ) {
         when (cmd.id) {
             "plan" -> setSlashCommand("/plan")
             "review" -> setSlashCommand("/review")
             "diff" -> toggleDiffInspector()
             "compact" -> submitSlashCompact("")
-            "ask" -> {
+            "btw" -> onOpenSideQuestion()
+            "fast" -> toggleFastMode()
+            "fork" -> onOpenFork()
+            "automations" -> onOpenAutomations()
+            "board" -> onOpenWorkspaceBoard()
+            "archived" -> onOpenArchived()
+            "export" -> onExportTranscript()
+            "supervised", "ask" -> {
                 selectSessionMode(FfiSessionMode.Default)
                 postToast("Permissions: Always Ask")
+            }
+            "auto" -> {
+                if (cmd.command.equals("/edits", ignoreCase = true)) {
+                    selectSessionMode(FfiSessionMode.AcceptEdits)
+                    postToast("Permissions: Accept Edits")
+                } else {
+                    selectSessionMode(FfiSessionMode.Auto)
+                    postToast("Permissions: Auto (Guardian)")
+                }
             }
             "edits" -> {
                 selectSessionMode(FfiSessionMode.AcceptEdits)
@@ -2176,7 +2497,34 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         ) ?: return
         if (preview.isEmpty) return
         if (preview.isBtw) {
-            postToast("Side question (/btw) is available on Desktop & HarmonyOS")
+            _state.update { prev ->
+                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
+            }
+            requestSheet("btw")
+            preview.btwQuestion?.trim()?.takeIf { it.isNotEmpty() }?.let { submitSideQuestion(it) }
+            return
+        }
+        preview.fastModeAction?.let { action ->
+            _state.update { prev ->
+                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
+            }
+            when (action) {
+                FfiFastModeSlashAction.TOGGLE -> toggleFastMode()
+                FfiFastModeSlashAction.ENABLE -> setFastMode(true)
+                FfiFastModeSlashAction.DISABLE -> setFastMode(false)
+            }
+            return
+        }
+        if (preview.isFork) {
+            _state.update { prev ->
+                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
+            }
+            forkActiveAgent(
+                worktree = preview.forkWorktree,
+                branch = preview.forkBranch,
+                title = null,
+                initialPrompt = preview.forkPrompt,
+            )
             return
         }
         if (preview.isCompact) {
@@ -2439,7 +2787,34 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         ) ?: return
         if (preview.isEmpty) return
         if (preview.isBtw) {
-            postToast("Side question (/btw) is available on Desktop & HarmonyOS")
+            _state.update { prev ->
+                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
+            }
+            requestSheet("btw")
+            preview.btwQuestion?.trim()?.takeIf { it.isNotEmpty() }?.let { submitSideQuestion(it) }
+            return
+        }
+        preview.fastModeAction?.let { action ->
+            _state.update { prev ->
+                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
+            }
+            when (action) {
+                FfiFastModeSlashAction.TOGGLE -> toggleFastMode()
+                FfiFastModeSlashAction.ENABLE -> setFastMode(true)
+                FfiFastModeSlashAction.DISABLE -> setFastMode(false)
+            }
+            return
+        }
+        if (preview.isFork) {
+            _state.update { prev ->
+                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
+            }
+            forkActiveAgent(
+                worktree = preview.forkWorktree,
+                branch = preview.forkBranch,
+                title = null,
+                initialPrompt = preview.forkPrompt,
+            )
             return
         }
         if (preview.isCompact) {
@@ -2504,19 +2879,23 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
                 val targetAgentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode }
                 if (targetAgentId == null) {
-                    val createdId = core?.createAgentFull(
-                        hostId = hostId,
-                        cwd = cur.activeCwd.ifBlank { "~" },
-                        extraDirs = draft.extraDirs,
-                        provider = draft.provider,
-                        model = draft.model,
-                        effort = draft.effort,
-                        mode = draft.mode,
-                        initialPrompt = composed.wirePrompt,
-                        initialDisplayPrompt = composed.displayPrompt,
-                        initialBadges = composed.badges,
-                        worktreeBranch = draft.worktreeBranch?.takeIf { it.isNotBlank() }
-                            ?: if (cur.draftUseWorktree) "auto" else null,
+                    val createdId = core?.createSession(
+                        FfiCreateSessionRequest(
+                            hostId = hostId,
+                            cwd = cur.activeCwd.ifBlank { "~" },
+                            extraDirs = draft.extraDirs,
+                            provider = draft.provider,
+                            acpAgentId = null,
+                            model = draft.model,
+                            effort = draft.effort,
+                            fastMode = draft.fastMode,
+                            mode = draft.mode,
+                            initialPrompt = composed.wirePrompt,
+                            initialDisplayPrompt = composed.displayPrompt,
+                            initialBadges = composed.badges,
+                            worktreeBranch = draft.worktreeBranch?.takeIf { it.isNotBlank() }
+                                ?: if (cur.draftUseWorktree) "auto" else null,
+                        )
                     )
                     if (!createdId.isNullOrBlank()) {
                         runningAgentKeys.add(agentQueueKey(hostId, createdId))
@@ -2796,7 +3175,783 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         return rendered
     }
 
+    // --- Automations (Schedules, Timers, Goals, Monitors, Workflows) ---
+
+    fun refreshAutomations() {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.refreshHost(hostId) }
+            runCatching { core?.listConditionalTimers(hostId, null, true) }
+            runCatching { core?.listGoalRuns(hostId, null) }
+            runCatching { core?.listMonitorWatches(hostId, null) }
+            runCatching { core?.listWorkflowRuns(hostId, true) }
+            reloadHostDetailIfSelected(hostId)
+        }
+    }
+
+    fun createSchedule(
+        name: String,
+        cronExpr: String,
+        prompt: String,
+        cwd: String,
+        provider: FfiProviderKind,
+        mode: FfiSessionMode,
+        worktree: Boolean,
+        archiveOnFinish: Boolean,
+    ) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.createSchedule(
+                    FfiCreateScheduleRequest(
+                        hostId = hostId,
+                        name = name,
+                        cronExpr = cronExpr,
+                        timezone = null,
+                        prompt = prompt,
+                        cwd = cwd.ifBlank { "~" },
+                        workspaceId = _state.value.activeWorkspaceId,
+                        provider = provider,
+                        acpAgentId = null,
+                        model = _state.value.composer.model,
+                        effort = _state.value.composer.effort,
+                        fastMode = _state.value.composer.fastMode,
+                        mode = mode,
+                        worktree = worktree,
+                        archiveOnFinish = archiveOnFinish,
+                        maxRuns = null,
+                    )
+                )
+            }.onSuccess {
+                postToast("Created automation \"$name\"")
+                reloadHostDetailIfSelected(hostId)
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to create automation"))
+            }
+        }
+    }
+
+    fun pauseSchedule(scheduleId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.pauseSchedule(hostId, scheduleId)
+            }.onSuccess {
+                reloadHostDetailIfSelected(hostId)
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to pause automation"))
+            }
+        }
+    }
+
+    fun resumeSchedule(scheduleId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.resumeSchedule(hostId, scheduleId)
+            }.onSuccess {
+                reloadHostDetailIfSelected(hostId)
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to resume automation"))
+            }
+        }
+    }
+
+    fun runScheduleOnce(scheduleId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.runScheduleOnce(hostId, scheduleId)
+            }.onSuccess {
+                postToast("Triggered automation run")
+                reloadHostDetailIfSelected(hostId)
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to trigger automation"))
+            }
+        }
+    }
+
+    fun deleteSchedule(scheduleId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.deleteSchedule(hostId, scheduleId)
+            }.onSuccess {
+                postToast("Deleted automation")
+                reloadHostDetailIfSelected(hostId)
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to delete automation"))
+            }
+        }
+    }
+
+    fun fetchScheduleRuns(scheduleId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.fetchScheduleRuns(hostId, scheduleId, 16u) }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Failed to fetch run history")) }
+            delay(250)
+            if (_state.value.selectedHostId != hostId) return@launch
+            val runs = runCatching { core?.scheduleRuns(hostId, scheduleId) }.getOrNull().orEmpty()
+            _state.update { prev ->
+                prev.copy(scheduleRunsById = prev.scheduleRunsById + (scheduleId to runs))
+            }
+        }
+    }
+
+    fun cancelConditionalTimer(timerId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.cancelConditionalTimer(hostId, timerId)
+                postToast("Timer canceled")
+                reloadHostDetailIfSelected(hostId)
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to cancel timer"))
+            }
+        }
+    }
+
+    fun fireConditionalTimerNow(timerId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.fireConditionalTimerNow(hostId, timerId)
+                postToast("Timer fired")
+                reloadHostDetailIfSelected(hostId)
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to fire timer"))
+            }
+        }
+    }
+
+    fun controlGoalRun(goalId: String, action: FfiGoalControlAction) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.controlGoalRun(hostId, goalId, action)
+                val label = when (action) {
+                    FfiGoalControlAction.PAUSE -> "Goal paused"
+                    FfiGoalControlAction.RESUME -> "Goal resumed"
+                    FfiGoalControlAction.CANCEL -> "Goal stopped"
+                    FfiGoalControlAction.VERIFY_NOW -> "Verification triggered"
+                }
+                postToast(label)
+                reloadHostDetailIfSelected(hostId)
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to update goal"))
+            }
+        }
+    }
+
+    fun stopMonitorWatch(monitorId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.stopMonitorWatch(hostId, monitorId)
+                postToast("Monitor stopped")
+                reloadHostDetailIfSelected(hostId)
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to stop monitor"))
+            }
+        }
+    }
+
+    fun cancelWorkflowRun(runId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.cancelWorkflowRun(hostId, runId)
+                postToast("Workflow canceled")
+                reloadHostDetailIfSelected(hostId)
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to cancel workflow"))
+            }
+        }
+    }
+
+    // --- Workspace Shared Board & Sibling Peers ---
+
+    fun fetchWorkspaceBoardAndEvents(workspaceId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.fetchWorkspaceBoard(hostId, workspaceId) }
+            runCatching { core?.fetchWorkspaceEvents(hostId, workspaceId, 40u) }
+            delay(200)
+            reloadHostDetailIfSelected(hostId)
+        }
+    }
+
+    fun updateWorkspaceGoal(workspaceId: String, goal: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.updateWorkspaceGoal(hostId, workspaceId, goal)
+            }.onSuccess {
+                postToast("Mission goal updated")
+                reloadHostDetailIfSelected(hostId)
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to update mission goal"))
+            }
+        }
+    }
+
+    fun updateWorkspaceBoard(workspaceId: String, content: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.updateWorkspaceBoard(hostId, workspaceId, content, null, "android")
+            }.onSuccess {
+                postToast("Board saved")
+                reloadHostDetailIfSelected(hostId)
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to save board"))
+            }
+        }
+    }
+
+    fun spawnWorkspacePeer(
+        workspaceId: String,
+        handle: String,
+        prompt: String,
+        worktree: Boolean,
+    ) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val wsCwd = cur.hostDetail?.workspaces?.firstOrNull { it.workspaceId == workspaceId }?.cwd
+            ?: cur.activeCwd
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.spawnWorkspacePeer(
+                    FfiSpawnWorkspacePeerRequest(
+                        hostId = hostId,
+                        workspaceId = workspaceId,
+                        cwd = wsCwd.ifBlank { "~" },
+                        extraDirs = emptyList(),
+                        provider = cur.composer.provider,
+                        acpAgentId = null,
+                        model = cur.composer.model,
+                        effort = cur.composer.effort,
+                        fastMode = cur.composer.fastMode,
+                        mode = cur.composer.mode,
+                        initialPrompt = prompt,
+                        worktreeBranch = if (worktree) "auto" else null,
+                        handle = handle.trim().ifEmpty { null },
+                        profileId = null,
+                    )
+                )
+            }.onSuccess { spawnedId ->
+                if (spawnedId.isNotBlank()) {
+                    postToast("Spawned peer ${handle.ifBlank { "session" }}")
+                    reloadHostDetailIfSelected(hostId)
+                }
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to spawn peer"))
+            }
+        }
+    }
+
+    // --- Side Question (`/btw`) ---
+
+    fun setSideQuestionDraft(text: String) {
+        val scopeKey = _state.value.activeSideQuestionScopeKey
+        _state.update { prev ->
+            prev.copy(sideQuestionDraftsByScope = prev.sideQuestionDraftsByScope + (scopeKey to text))
+        }
+    }
+
+    fun clearSideQuestions() {
+        val scopeKey = _state.value.activeSideQuestionScopeKey
+        _state.update { prev ->
+            prev.copy(sideQuestionsByScope = prev.sideQuestionsByScope - scopeKey)
+        }
+    }
+
+    fun promoteSideQuestionToComposer(entry: SideQuestionEntry) {
+        val excerpt = buildString {
+            appendLine("Side Q: ${entry.question}")
+            append(entry.answer.trim())
+        }
+        addQuotedAssistantReply(excerpt)
+    }
+
+    fun submitSideQuestion(question: String) {
+        val trimmed = question.trim()
+        if (trimmed.isEmpty()) return
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: run {
+            postToast("Select a host first to ask a side question")
+            return
+        }
+        val scopeKey = cur.activeSideQuestionScopeKey
+        val entryId = UUID.randomUUID().toString()
+        val initialEntry = SideQuestionEntry(
+            id = entryId,
+            question = trimmed,
+            answer = "",
+            isStreaming = true,
+        )
+        _state.update { prev ->
+            val list = prev.sideQuestionsByScope[scopeKey].orEmpty() + initialEntry
+            prev.copy(sideQuestionsByScope = prev.sideQuestionsByScope + (scopeKey to list))
+        }
+
+        val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode }
+        val cwd = cur.activeCwd.ifBlank { "~" }
+        val provider = cur.activeAgent?.provider ?: cur.composer.provider
+        val model = cur.activeAgent?.model ?: cur.composer.model
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val sideListener = object : SideQuestionListener {
+                override fun onSideQuestionEvent(event: FfiSideQuestionEvent) {
+                    when (event) {
+                        is FfiSideQuestionEvent.Delta -> {
+                            _state.update { prev ->
+                                val list = prev.sideQuestionsByScope[scopeKey].orEmpty().map { item ->
+                                    if (item.id == entryId) {
+                                        item.copy(answer = item.answer + event.textDelta, isStreaming = true)
+                                    } else {
+                                        item
+                                    }
+                                }
+                                prev.copy(sideQuestionsByScope = prev.sideQuestionsByScope + (scopeKey to list))
+                            }
+                        }
+                        is FfiSideQuestionEvent.Done -> {
+                            _state.update { prev ->
+                                val list = prev.sideQuestionsByScope[scopeKey].orEmpty().map { item ->
+                                    if (item.id == entryId) {
+                                        item.copy(
+                                            answer = event.fullText.ifBlank { item.answer },
+                                            isStreaming = false,
+                                            error = event.error?.takeIf { it.isNotBlank() },
+                                        )
+                                    } else {
+                                        item
+                                    }
+                                }
+                                prev.copy(sideQuestionsByScope = prev.sideQuestionsByScope + (scopeKey to list))
+                            }
+                        }
+                    }
+                }
+            }
+
+            try {
+                val contextSummary = if (agentId != null) {
+                    runCatching { core?.buildSideQuestionContext(hostId, agentId, 3000u) }.getOrNull().orEmpty()
+                } else {
+                    ""
+                }
+                val answer = core?.askSideQuestion(
+                    FfiAskSideQuestionRequest(
+                        hostId = hostId,
+                        agentId = agentId,
+                        cwd = cwd,
+                        provider = provider,
+                        model = model,
+                        question = trimmed,
+                        contextSummary = contextSummary,
+                    ),
+                    sideListener,
+                )
+                if (answer != null) {
+                    _state.update { prev ->
+                        val list = prev.sideQuestionsByScope[scopeKey].orEmpty().map { item ->
+                            if (item.id == entryId) {
+                                item.copy(answer = answer.ifBlank { item.answer }, isStreaming = false)
+                            } else {
+                                item
+                            }
+                        }
+                        prev.copy(sideQuestionsByScope = prev.sideQuestionsByScope + (scopeKey to list))
+                    }
+                }
+            } catch (t: Throwable) {
+                val msg = extractErrorMessage(t, "Side question failed")
+                _state.update { prev ->
+                    val list = prev.sideQuestionsByScope[scopeKey].orEmpty().map { item ->
+                        if (item.id == entryId) {
+                            item.copy(isStreaming = false, error = msg)
+                        } else {
+                            item
+                        }
+                    }
+                    prev.copy(sideQuestionsByScope = prev.sideQuestionsByScope + (scopeKey to list))
+                }
+            }
+        }
+    }
+
+    // --- Archived Sessions ---
+
+    fun unarchiveAgent(agentId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.unarchiveAgent(hostId, agentId)
+            }.onSuccess {
+                if (_state.value.selectedHostId == hostId) {
+                    reloadHostDetailInternal(hostId)
+                    selectAgent(agentId)
+                }
+                postToast("Session restored")
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to restore session"))
+            }
+        }
+    }
+
+    fun deleteAgentPermanently(agentId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                activeCore.deleteAgent(hostId, agentId)
+            }.onSuccess {
+                reloadHostDetailIfSelected(hostId)
+                postToast("Session deleted")
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to delete session"))
+            }
+        }
+    }
+
+    // --- Fork / Branch Conversation & Markdown Export ---
+
+    fun forkActiveAgent(
+        worktree: Boolean,
+        branch: String?,
+        title: String?,
+        initialPrompt: String?,
+    ) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val sourceAgentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: run {
+            postToast("Open an active session first to fork")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                val forked = activeCore.forkAgentRequest(
+                    FfiForkAgentRequest(
+                        hostId = hostId,
+                        sourceAgentId = sourceAgentId,
+                        upToSeq = null,
+                        worktree = worktree,
+                        branch = branch?.trim()?.ifEmpty { null },
+                        baseRef = null,
+                        title = title?.trim()?.ifEmpty { null },
+                        initialPrompt = initialPrompt?.trim()?.ifEmpty { null },
+                    )
+                )
+                if (_state.value.selectedHostId == hostId) {
+                    reloadHostDetailInternal(hostId)
+                    selectAgent(forked.agent.agentId)
+                }
+                postToast("Forked conversation")
+            } catch (t: Throwable) {
+                _state.update { it.copy(lastError = extractErrorMessage(t, "Failed to fork conversation")) }
+            }
+        }
+    }
+
+    fun exportActiveTranscriptMarkdown() {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: run {
+            postToast("Open an active session first to export")
+            return
+        }
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                val exported = activeCore.exportAgentTranscript(
+                    hostId = hostId,
+                    agentId = agentId,
+                    options = FfiExportOptions(
+                        format = FfiExportFormat.MARKDOWN,
+                        includeThinking = false,
+                        includeToolCalls = true,
+                        includeTimestamps = true,
+                    ),
+                )
+                val exportDir = File(app.cacheDir, "orbit_exports").apply { mkdirs() }
+                // Prune stale export artifacts so cacheDir does not grow unbounded.
+                val nowMs = System.currentTimeMillis()
+                exportDir.listFiles()
+                    ?.sortedByDescending { it.lastModified() }
+                    ?.forEachIndexed { idx, existing ->
+                        if (idx >= 8 || (nowMs - existing.lastModified()) > 3_600_000L) {
+                            runCatching { existing.delete() }
+                        }
+                    }
+
+                val sanitizedStem = exported.suggestedFilename
+                    .substringAfterLast('/')
+                    .substringAfterLast('\\')
+                    .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                    .trimStart('.')
+                    .removeSuffix(".md")
+                    .ifBlank { "orbit_transcript" }
+                    .take(80)
+                val safeName = "$sanitizedStem.md"
+                val outFile = File(exportDir, safeName)
+                require(outFile.canonicalFile.parentFile == exportDir.canonicalFile) {
+                    "Refused unsafe export path"
+                }
+                outFile.writeText(exported.content, Charsets.UTF_8)
+                val uri = FileProvider.getUriForFile(
+                    app,
+                    "${app.packageName}.fileprovider",
+                    outFile,
+                )
+                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = exported.mimeType.ifBlank { "text/markdown" }
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_SUBJECT, safeName)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                withContext(Dispatchers.Main) {
+                    app.startActivity(
+                        Intent.createChooser(shareIntent, "Export Transcript")
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to export transcript"))
+            }
+        }
+    }
+
+    // --- Cloud Sync (GitHub Secret Gist E2EE) ---
+
+    fun refreshCloudSyncStatus() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val st = runCatching { core?.cloudSyncStatus() }.getOrNull()
+            if (st != null) {
+                _state.update { it.copy(cloudSyncStatus = st) }
+            }
+        }
+    }
+
+    suspend fun generateCloudSyncPassphrase(): String = withContext(Dispatchers.IO) {
+        runCatching { core?.cloudSyncGeneratePassphrase() }.getOrNull().orEmpty()
+    }
+
+    fun startGithubCloudLogin(clientIdOverride: String?) {
+        cloudSyncPollJob?.cancel()
+        _state.update { it.copy(cloudSyncBusy = true, cloudSyncError = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                if (!clientIdOverride.isNullOrBlank()) {
+                    runCatching { core?.cloudSyncSetGithubClientId(clientIdOverride) }
+                }
+                val flow = core?.cloudSyncStartGithubDeviceFlow(clientIdOverride)
+                    ?: throw IllegalStateException("Core not ready")
+                _state.update { it.copy(cloudSyncDeviceFlow = flow, cloudSyncBusy = false) }
+                cloudSyncPollJob = viewModelScope.launch(Dispatchers.IO) {
+                    var intervalMs = (flow.intervalSecs.toLong().coerceAtLeast(5L)) * 1000L
+                    val deadlineMs = SystemClock.elapsedRealtime() + flow.expiresInSecs.toLong() * 1000L
+                    var completed = false
+                    while (SystemClock.elapsedRealtime() < deadlineMs) {
+                        delay(intervalMs)
+                        val poll = runCatching {
+                            core?.cloudSyncPollGithubDeviceFlow(flow.deviceCode, clientIdOverride)
+                        }.getOrNull() ?: continue
+                        when (poll.status) {
+                            FfiCloudSyncDevicePollStatus.PENDING -> Unit
+                            FfiCloudSyncDevicePollStatus.SLOW_DOWN -> intervalMs += 5_000L
+                            FfiCloudSyncDevicePollStatus.AUTHORIZED -> {
+                                completed = true
+                                val nextStatus = poll.syncStatus ?: runCatching { core?.cloudSyncStatus() }.getOrNull()
+                                _state.update {
+                                    it.copy(
+                                        cloudSyncDeviceFlow = null,
+                                        cloudSyncStatus = nextStatus ?: it.cloudSyncStatus,
+                                        cloudSyncError = null,
+                                    )
+                                }
+                                postToast("Signed in to GitHub")
+                                break
+                            }
+                            FfiCloudSyncDevicePollStatus.EXPIRED,
+                            FfiCloudSyncDevicePollStatus.DENIED -> {
+                                completed = true
+                                _state.update {
+                                    it.copy(
+                                        cloudSyncDeviceFlow = null,
+                                        cloudSyncError = poll.error ?: "GitHub authorization did not complete.",
+                                    )
+                                }
+                                break
+                            }
+                        }
+                    }
+                    if (!completed) {
+                        _state.update {
+                            it.copy(
+                                cloudSyncDeviceFlow = null,
+                                cloudSyncError = "GitHub authorization code expired. Please try again.",
+                            )
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                _state.update {
+                    it.copy(
+                        cloudSyncBusy = false,
+                        cloudSyncError = extractErrorMessage(t, "Failed to start GitHub login"),
+                    )
+                }
+            }
+        }
+    }
+
+    fun cancelGithubCloudLogin() {
+        cloudSyncPollJob?.cancel()
+        cloudSyncPollJob = null
+        _state.update { it.copy(cloudSyncDeviceFlow = null, cloudSyncBusy = false) }
+    }
+
+    fun loginCloudSyncWithToken(token: String) {
+        val clean = token.trim()
+        if (clean.isEmpty()) return
+        _state.update { it.copy(cloudSyncBusy = true, cloudSyncError = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val st = core?.cloudSyncLoginWithToken(clean)
+                _state.update { it.copy(cloudSyncStatus = st ?: it.cloudSyncStatus, cloudSyncBusy = false) }
+                postToast("GitHub token verified")
+            } catch (t: Throwable) {
+                _state.update {
+                    it.copy(
+                        cloudSyncBusy = false,
+                        cloudSyncError = extractErrorMessage(t, "Failed to verify GitHub token"),
+                    )
+                }
+            }
+        }
+    }
+
+    fun unlockCloudSyncWithPassphrase(passphrase: String) {
+        val clean = passphrase.trim()
+        if (clean.isEmpty()) return
+        _state.update { it.copy(cloudSyncBusy = true, cloudSyncError = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val res = core?.cloudSyncUnlockWithPassphrase(clean)
+                val st = runCatching { core?.cloudSyncStatus() }.getOrNull()
+                _state.update { it.copy(cloudSyncStatus = st ?: it.cloudSyncStatus, cloudSyncBusy = false) }
+                reloadFleetInternal()
+                _state.value.selectedHostId?.let { reloadHostDetailInternal(it) }
+                val summary = res?.let { "Synced rev #${it.vaultRevision}" } ?: "Cloud vault unlocked"
+                postToast(summary)
+            } catch (t: Throwable) {
+                _state.update {
+                    it.copy(
+                        cloudSyncBusy = false,
+                        cloudSyncError = extractErrorMessage(t, "Failed to unlock cloud vault"),
+                    )
+                }
+            }
+        }
+    }
+
+    fun syncCloudNow() {
+        _state.update { it.copy(cloudSyncBusy = true, cloudSyncError = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val res = core?.cloudSyncNow()
+                val st = runCatching { core?.cloudSyncStatus() }.getOrNull()
+                _state.update { it.copy(cloudSyncStatus = st ?: it.cloudSyncStatus, cloudSyncBusy = false) }
+                reloadFleetInternal()
+                _state.value.selectedHostId?.let { reloadHostDetailInternal(it) }
+                val summary = res?.let { "Synced · rev #${it.vaultRevision}" } ?: "Cloud sync complete"
+                postToast(summary)
+            } catch (t: Throwable) {
+                _state.update {
+                    it.copy(
+                        cloudSyncBusy = false,
+                        cloudSyncError = extractErrorMessage(t, "Cloud sync failed"),
+                    )
+                }
+            }
+        }
+    }
+
+    fun setCloudAutoSync(enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.cloudSyncSetAutoSync(enabled) }
+                .onSuccess { st ->
+                    if (st != null) {
+                        _state.update { it.copy(cloudSyncStatus = st) }
+                    }
+                }
+        }
+    }
+
+    fun logoutCloudSync(clearLocalHosts: Boolean = false) {
+        cancelGithubCloudLogin()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val st = core?.cloudSyncLogout(clearLocalHosts)
+                _state.update {
+                    it.copy(
+                        cloudSyncStatus = st ?: it.cloudSyncStatus,
+                        cloudSyncError = null,
+                    )
+                }
+                if (clearLocalHosts) {
+                    reloadFleetInternal()
+                }
+                postToast("Disconnected Cloud Sync")
+            } catch (t: Throwable) {
+                _state.update { it.copy(cloudSyncError = extractErrorMessage(t, "Failed to disconnect")) }
+            }
+        }
+    }
+
+    // --- Push Notification Registration Bridge ---
+
+    fun registerPushToken(platform: String, token: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: coreReady.await() ?: return@launch
+            runCatching { activeCore.registerPushToken(platform, token) }
+                .onSuccess { st ->
+                    _state.update { it.copy(pushRegistrationStatus = st) }
+                }
+        }
+    }
+
+    fun unregisterPushToken() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.unregisterPushToken(OrbitFirebaseMessagingBridge.PLATFORM_ANDROID_FCM) }
+            OrbitFirebaseMessagingBridge.clearToken(getApplication())
+            val st = runCatching { core?.pushRegistrationStatus() }.getOrNull()
+            _state.update { it.copy(pushRegistrationStatus = st) }
+        }
+    }
+
     override fun onCleared() {
+        cloudSyncPollJob?.cancel()
+        OrbitFirebaseMessagingBridge.detachTokenListener()
         networkObserver.stop()
         runCatching { core?.close() }
         super.onCleared()
@@ -2811,6 +3966,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         private const val KEY_PINNED_THREAD_KEYS = "pinned_thread_keys"
         private const val KEY_MIGRATED_THREAD_PREFS_V1 = "migrated_thread_prefs_v1"
         private const val KEY_DRAFT_USE_WORKTREE = "draft_use_worktree"
+        private val SAFE_DEEP_LINK_ID_REGEX = Regex("^[A-Za-z0-9_.:-]{1,128}$")
 
         const val EXTRA_PAIR_URI = "orbit_pair_uri"
         const val EXTRA_SELECT_LATEST = "orbit_select_latest"

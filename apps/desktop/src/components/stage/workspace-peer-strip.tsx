@@ -15,12 +15,15 @@ import {
   X,
 } from "lucide-react";
 import {
+  formatProviderShortLabel,
+  isMacDesktop,
   type ProviderKind,
   type SessionMode,
   semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { normalizeProjectPath } from "@/lib/projects";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import {
   Popover,
@@ -32,22 +35,18 @@ import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-st
 import { cn } from "@/lib/utils";
 
 function providerShortName(provider: ProviderKind): string {
-  switch (provider) {
-    case "claude_code":
-      return "Claude";
-    case "codex":
-      return "Codex";
-    case "antigravity":
-      return "AGY";
-  }
+  return formatProviderShortLabel(provider);
 }
 
 function pickAlternateProvider(
   current: ProviderKind,
   available: ProviderKind[],
 ): ProviderKind {
-  const alt = available.find((p) => p !== current);
-  return alt ?? current;
+  const direct = available.filter((p) => p !== "acp");
+  const alt = direct.find((p) => p !== current);
+  if (alt) return alt;
+  if (current !== "acp") return current;
+  return direct[0] ?? "claude_code";
 }
 
 /**
@@ -140,9 +139,9 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
   const canWorktree =
     Boolean(workspace?.git_branch) ||
     Boolean(gitInsp?.is_git_repo) ||
-    (gitInsp?.nested_git_repos.length ?? 0) > 0;
+    (gitInsp?.nested_git_repos?.length ?? 0) > 0;
   const worktreeCwd =
-    gitInsp && !gitInsp.is_git_repo && gitInsp.nested_git_repos.length > 0
+    gitInsp && !gitInsp.is_git_repo && (gitInsp.nested_git_repos?.length ?? 0) > 0
       ? gitInsp.nested_git_repos[0].path
       : rootCwd;
 
@@ -458,9 +457,9 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
   const canWorktree =
     Boolean(workspace?.git_branch) ||
     Boolean(gitInsp?.is_git_repo) ||
-    (gitInsp?.nested_git_repos.length ?? 0) > 0;
+    (gitInsp?.nested_git_repos?.length ?? 0) > 0;
   const worktreeCwd =
-    gitInsp && !gitInsp.is_git_repo && gitInsp.nested_git_repos.length > 0
+    gitInsp && !gitInsp.is_git_repo && (gitInsp.nested_git_repos?.length ?? 0) > 0
       ? gitInsp.nested_git_repos[0].path
       : rootCwd;
 
@@ -760,7 +759,9 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
             const tooltipParts = [
               `${label} (${providerShortName(peer.provider)}${peer.model ? ` · ${peer.model}` : ""})`,
               peer.task_summary || peer.title,
-              isActive ? "Double-click to rename" : "Click to switch · ⌘/Ctrl+click to split",
+              isActive
+                ? "Double-click to rename"
+                : `Click to switch · ${isMacDesktop() ? "⌘" : "Ctrl"}+click to split`,
             ];
 
             return (
@@ -819,7 +820,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       className="inline-flex cursor-pointer items-center gap-1.5"
                     >
                       {peer.is_running ? (
-                        <Loader2 className="text-foreground/70 h-[10.5px] w-[10.5px] shrink-0 animate-spin" />
+                        <OrbitSpinner size={11} className="text-foreground/70" />
                       ) : peer.is_awaiting_permission ? (
                         <span className="h-[5.5px] w-[5.5px] shrink-0 rounded-full bg-amber-500" />
                       ) : peer.is_unread && !isActive ? (
@@ -973,6 +974,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       onChange={(e) => setCustomMode(e.target.value as SessionMode)}
                       className="border-border bg-canvas text-foreground rounded-md border px-1.5 py-0.5 text-[11.5px]"
                     >
+                      <option value="auto">Auto (Guardian)</option>
                       <option value="accept_edits">Accept Edits</option>
                       <option value="plan">Plan</option>
                       <option value="full_access">Full Access</option>

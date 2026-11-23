@@ -8,7 +8,7 @@ use std::sync::Arc;
 use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
     AskSideQuestionRequest, ClientThreadPref, CoreEventSubscriber, CoreNotification,
-    CreateAgentRequest, OrbitAppCore, TimelineItemView,
+    CreateAgentRequest, OrbitAppCore, RegisterPushDeviceRequest, TimelineItemView,
 };
 use orbit_client_core::catalog::{
     default_effort_description as core_default_effort_description,
@@ -19,32 +19,68 @@ use orbit_client_core::catalog::{
 };
 use orbit_client_core::composer::{ClientPlatform, ComposePromptRequest};
 use orbit_client_core::contract::{
-    AgentStageDeltaRequest, CreateSessionRequest, FleetSidebarRequest, MentionRankRequest,
-    ModelSelectionRequest, RenderDiagramRequest, SendPromptRequest, UpdateHostConfigRequest,
+    AgentStageDeltaRequest, CancelWorkflowRunRequest, ControlGoalRunRequest, CreateSessionRequest,
+    CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest,
+    FleetSidebarRequest, ForkAgentRequest, MentionRankRequest, ModelSelectionRequest,
+    PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest,
+    SendPromptRequest, SpawnWorkspacePeerRequest, StopMonitorWatchRequest, UpdateHostConfigRequest,
+    UpsertArtifactRequest, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, detect_diagram_kind as core_detect_diagram_kind,
     render_diagram as core_render_diagram,
 };
+use orbit_client_core::export::ExportOptions;
 use orbit_client_core::sidebar::{SidebarProjectSort, SidebarThreadFilter};
 use orbit_client_core::stage::describe_tool_step;
 use orbit_protocol::{
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec, ReasoningEffort,
-    SessionMode,
+    AcpAgentSpec, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
+    ReasoningEffort, ScheduleNewAgentConfig, ScheduleTarget, SessionMode,
 };
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::task::{Context, Poll, Wake, Waker};
+
+struct OhosThreadWaker(std::thread::Thread);
+
+impl Wake for OhosThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Polls an `OrbitAppCore` async RPC future on the calling thread without `unsafe` or a second
+/// Tokio runtime.
+///
+/// # Precondition
+/// Only pass **bounded** `OrbitAppCore` RPC futures that spawn their I/O work onto
+/// `OrbitAppCore`'s internal Tokio runtime and await a bounded `oneshot` reply (with timeout).
+/// Do **not** pass unbounded futures or futures that rely on an ambient Tokio reactor on the
+/// calling thread, as `std::thread::park` will block the calling thread until the waker fires.
+fn block_on_core_rpc<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(OhosThreadWaker(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(future);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => return val,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
 
 fn parse_provider_str(raw: &str) -> ProviderKind {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "codex" => ProviderKind::Codex,
-        "claude_code" | "claude" => ProviderKind::ClaudeCode,
-        _ => ProviderKind::Antigravity,
-    }
+    ProviderKind::from_slug(raw).unwrap_or(ProviderKind::Antigravity)
 }
 
 fn parse_mode_str(raw: &str) -> SessionMode {
     match raw.trim() {
         "default" | "" => SessionMode::Default,
+        "auto" => SessionMode::Auto,
         "plan" => SessionMode::Plan,
         "accept_edits" => SessionMode::AcceptEdits,
         "full_access" => SessionMode::FullAccess,
@@ -207,6 +243,64 @@ struct OhosAskSideQuestionPayload {
     context_summary: Option<String>,
 }
 
+fn default_true_bool() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct OhosCreateSchedulePayload {
+    host_id: String,
+    name: String,
+    cron_expr: String,
+    #[serde(default)]
+    timezone: Option<String>,
+    prompt: String,
+    #[serde(default)]
+    existing_agent_id: Option<String>,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    acp_agent_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    fast_mode: bool,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    worktree: bool,
+    #[serde(default)]
+    base_ref: Option<String>,
+    #[serde(default = "default_true_bool")]
+    archive_on_finish: bool,
+    #[serde(default)]
+    background: bool,
+    #[serde(default)]
+    max_runs: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OhosUpdateSchedulePayload {
+    host_id: String,
+    schedule_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    cron_expr: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    max_runs: Option<u32>,
+    #[serde(default)]
+    archive_on_finish: Option<bool>,
+}
+
 /// Pure-Rust JSON facade shared by both host unit tests and the HarmonyOS N-API wrapper.
 #[derive(Clone)]
 pub struct OhosCoreFacade {
@@ -260,6 +354,37 @@ impl OhosCoreFacade {
 
     pub fn bridge_info_json(&self) -> Result<String, String> {
         serde_json::to_string(&self.inner.bridge_info()).map_err(|e| e.to_string())
+    }
+
+    pub fn search_messages_json(&self, query: &str, limit: Option<u32>) -> Result<String, String> {
+        serde_json::to_string(&self.inner.search_messages(query, limit.unwrap_or(20)))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn export_agent_transcript_json(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        options_json: &str,
+    ) -> Result<String, String> {
+        let opts: ExportOptions = if options_json.trim().is_empty() {
+            ExportOptions::default()
+        } else {
+            serde_json::from_str(options_json).map_err(|e| e.to_string())?
+        };
+        let exported = self
+            .inner
+            .export_agent_transcript(host_id, agent_id, &opts)?;
+        serde_json::to_string(&exported).map_err(|e| e.to_string())
+    }
+
+    pub fn list_agent_code_blocks_json(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<String, String> {
+        let blocks = self.inner.list_agent_code_blocks(host_id, agent_id)?;
+        serde_json::to_string(&blocks).map_err(|e| e.to_string())
     }
 
     pub fn fleet_sidebar_by_request_json(&self, req_json: &str) -> Result<String, String> {
@@ -628,6 +753,7 @@ impl OhosCoreFacade {
         cwd: &str,
         extra_dirs_json: Option<&str>,
         provider_str: &str,
+        acp_agent_id: Option<&str>,
         model: Option<String>,
         effort_str: Option<&str>,
         mode_str: &str,
@@ -643,8 +769,10 @@ impl OhosCoreFacade {
             cwd,
             extra_dirs,
             provider: parse_provider_str(provider_str),
+            acp_agent_id: acp_agent_id.map(ToOwned::to_owned),
             model,
             effort: parse_effort_opt(effort_str),
+            fast_mode: None,
             mode: parse_mode_str(mode_str),
             initial_prompt,
             initial_display_prompt,
@@ -736,6 +864,10 @@ impl OhosCoreFacade {
             .set_agent_config(host_id, agent_id, model, parse_effort_opt(effort_str));
     }
 
+    pub fn set_agent_fast_mode(&self, host_id: &str, agent_id: &str, fast_mode: bool) {
+        self.inner.set_agent_fast_mode(host_id, agent_id, fast_mode);
+    }
+
     pub fn switch_agent_provider(
         &self,
         host_id: &str,
@@ -743,6 +875,7 @@ impl OhosCoreFacade {
         provider_str: &str,
         model: Option<String>,
         effort_str: Option<&str>,
+        acp_agent_id: Option<String>,
     ) {
         self.inner.switch_agent_provider_with_config(
             host_id,
@@ -750,11 +883,20 @@ impl OhosCoreFacade {
             parse_provider_str(provider_str),
             model,
             parse_effort_opt(effort_str),
+            acp_agent_id,
         );
     }
 
     pub fn archive_agent(&self, host_id: &str, agent_id: &str) {
         self.inner.archive_agent(host_id, agent_id);
+    }
+
+    pub fn unarchive_agent(&self, host_id: &str, agent_id: &str) {
+        self.inner.unarchive_agent(host_id, agent_id);
+    }
+
+    pub fn delete_agent(&self, host_id: &str, agent_id: &str) {
+        self.inner.delete_agent(host_id, agent_id);
     }
 
     pub fn resolve_permission(
@@ -855,6 +997,27 @@ impl OhosCoreFacade {
         serde_json::to_string(&res).map_err(|e| e.to_string())
     }
 
+    pub fn fork_agent_json(&self, req_json: &str) -> Result<String, String> {
+        let req: ForkAgentRequest =
+            serde_json::from_str(req_json).map_err(|e| format!("invalid ForkAgentRequest: {e}"))?;
+        let res = self.inner.fork_agent_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn preview_worktree_handoff_json(&self, req_json: &str) -> Result<String, String> {
+        let req: PreviewWorktreeHandoffRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid PreviewWorktreeHandoffRequest: {e}"))?;
+        let res = self.inner.preview_worktree_handoff_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn execute_worktree_handoff_json(&self, req_json: &str) -> Result<String, String> {
+        let req: ExecuteWorktreeHandoffRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid ExecuteWorktreeHandoffRequest: {e}"))?;
+        let res = self.inner.execute_worktree_handoff_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
     pub fn read_workspace_file_json(
         &self,
         host_id: &str,
@@ -865,6 +1028,34 @@ impl OhosCoreFacade {
             .inner
             .read_workspace_file_blocking(host_id, cwd, path)?;
         serde_json::to_string(&file).map_err(|e| e.to_string())
+    }
+
+    pub fn write_workspace_file_json(&self, req_json: &str) -> Result<String, String> {
+        let req: WriteWorkspaceFileRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid WriteWorkspaceFileRequest: {e}"))?;
+        let res = self.inner.write_workspace_file_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn create_workspace_entry_json(&self, req_json: &str) -> Result<String, String> {
+        let req: CreateWorkspaceEntryRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid CreateWorkspaceEntryRequest: {e}"))?;
+        let res = self.inner.create_workspace_entry_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn rename_workspace_entry_json(&self, req_json: &str) -> Result<String, String> {
+        let req: RenameWorkspaceEntryRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid RenameWorkspaceEntryRequest: {e}"))?;
+        let res = self.inner.rename_workspace_entry_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_workspace_entry_json(&self, req_json: &str) -> Result<String, String> {
+        let req: DeleteWorkspaceEntryRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid DeleteWorkspaceEntryRequest: {e}"))?;
+        let res = self.inner.delete_workspace_entry_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
     }
 
     pub fn build_side_question_context(
@@ -1072,6 +1263,344 @@ impl OhosCoreFacade {
             .cloud_sync_update_preferences(patch)
             .map_err(|e| e.to_string())
     }
+
+    // --- Universal ACP Agent Registry & Probing ---
+
+    pub fn list_acp_agents_json(&self, host_id: &str) -> Result<String, String> {
+        serde_json::to_string(&self.inner.list_acp_agents(host_id)).map_err(|e| e.to_string())
+    }
+
+    pub fn refresh_acp_agents(&self, host_id: &str) {
+        self.inner.refresh_acp_agents(host_id);
+    }
+
+    pub fn upsert_custom_acp_agent_json(
+        &self,
+        host_id: &str,
+        spec_json: &str,
+    ) -> Result<String, String> {
+        let spec: AcpAgentSpec = serde_json::from_str(spec_json).map_err(|e| e.to_string())?;
+        let agents = self.inner.upsert_custom_acp_agent_blocking(host_id, spec)?;
+        serde_json::to_string(&agents).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_custom_acp_agent_json(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<String, String> {
+        let agents = self
+            .inner
+            .delete_custom_acp_agent_blocking(host_id, agent_id)?;
+        serde_json::to_string(&agents).map_err(|e| e.to_string())
+    }
+
+    pub fn test_acp_agent_json(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        cwd: Option<String>,
+    ) -> Result<String, String> {
+        let res = self.inner.test_acp_agent_blocking(host_id, agent_id, cwd)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn refresh_acp_registry_json(
+        &self,
+        host_id: &str,
+        registry_url: Option<String>,
+    ) -> Result<String, String> {
+        let agents = self
+            .inner
+            .refresh_acp_registry_blocking(host_id, registry_url)?;
+        serde_json::to_string(&agents).map_err(|e| e.to_string())
+    }
+
+    // --- First-Class Artifacts & SEP-1865 MCP Apps ---
+
+    pub fn list_artifacts_json(
+        &self,
+        host_id: &str,
+        workspace_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<String, String> {
+        let artifacts = self
+            .inner
+            .list_artifacts_blocking(host_id, workspace_id, agent_id)?;
+        serde_json::to_string(&artifacts).map_err(|e| e.to_string())
+    }
+
+    pub fn get_artifact_json(
+        &self,
+        host_id: &str,
+        artifact_id: &str,
+        version: Option<u32>,
+    ) -> Result<String, String> {
+        let detail = self
+            .inner
+            .get_artifact_blocking(host_id, artifact_id, version)?;
+        serde_json::to_string(&detail).map_err(|e| e.to_string())
+    }
+
+    pub fn upsert_artifact_json(&self, req_json: &str) -> Result<String, String> {
+        let req: UpsertArtifactRequest =
+            serde_json::from_str(req_json).map_err(|e| e.to_string())?;
+        let summary = self.inner.upsert_artifact_blocking(req)?;
+        serde_json::to_string(&summary).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_artifact(&self, host_id: &str, artifact_id: &str) -> Result<String, String> {
+        self.inner.delete_artifact_blocking(host_id, artifact_id)
+    }
+
+    // --- Mission Workspace Shared Board (`BOARD.md`), Events & Peers ---
+
+    pub fn fetch_workspace_board(&self, host_id: &str, workspace_id: &str) {
+        self.inner.fetch_workspace_board(host_id, workspace_id);
+    }
+
+    pub fn workspace_board_json(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.workspace_board(host_id, workspace_id))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn update_workspace_board(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+        content: String,
+        section: Option<String>,
+        updated_by: Option<String>,
+    ) {
+        self.inner
+            .update_workspace_board(host_id, workspace_id, content, section, updated_by);
+    }
+
+    pub fn fetch_workspace_events(&self, host_id: &str, workspace_id: &str, limit: Option<u32>) {
+        self.inner
+            .fetch_workspace_events(host_id, workspace_id, limit);
+    }
+
+    pub fn workspace_events_json(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.workspace_events(host_id, workspace_id))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn spawn_workspace_peer_json(&self, req_json: &str) -> Result<String, String> {
+        let req: SpawnWorkspacePeerRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid SpawnWorkspacePeerRequest: {e}"))?;
+        Ok(self.inner.spawn_workspace_peer(req))
+    }
+
+    // --- Automations: Schedules, Conditional Timers, Goals, Monitors & Workflows ---
+
+    pub fn create_schedule_json(&self, req_json: &str) -> Result<(), String> {
+        let payload: OhosCreateSchedulePayload = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid create schedule payload: {e}"))?;
+        let target = match payload
+            .existing_agent_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+        {
+            Some(agent_id) => ScheduleTarget::ExistingAgent { agent_id },
+            None => ScheduleTarget::NewAgent(ScheduleNewAgentConfig {
+                cwd: if payload.cwd.trim().is_empty() {
+                    "~".to_string()
+                } else {
+                    payload.cwd
+                },
+                workspace_id: payload.workspace_id,
+                provider: parse_provider_str(&payload.provider),
+                acp_agent_id: payload.acp_agent_id,
+                model: payload.model,
+                effort: parse_effort_opt(payload.effort.as_deref()),
+                fast_mode: payload.fast_mode,
+                mode: parse_mode_str(&payload.mode),
+                profile_id: None,
+                worktree: payload.worktree,
+                base_ref: payload.base_ref,
+                archive_on_finish: payload.archive_on_finish,
+                background: payload.background,
+            }),
+        };
+        self.inner.create_schedule(
+            &payload.host_id,
+            payload.name,
+            payload.cron_expr,
+            payload.timezone,
+            payload.prompt,
+            target,
+            payload.max_runs,
+        );
+        Ok(())
+    }
+
+    pub fn update_schedule_json(&self, req_json: &str) -> Result<(), String> {
+        let payload: OhosUpdateSchedulePayload = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid update schedule payload: {e}"))?;
+        self.inner.update_schedule(
+            &payload.host_id,
+            &payload.schedule_id,
+            payload.name,
+            payload.cron_expr,
+            payload.prompt,
+            payload.max_runs,
+            payload.archive_on_finish,
+        );
+        Ok(())
+    }
+
+    pub fn pause_schedule(&self, host_id: &str, schedule_id: &str) {
+        self.inner.pause_schedule(host_id, schedule_id);
+    }
+
+    pub fn resume_schedule(&self, host_id: &str, schedule_id: &str) {
+        self.inner.resume_schedule(host_id, schedule_id);
+    }
+
+    pub fn run_schedule_once(&self, host_id: &str, schedule_id: &str) {
+        self.inner.run_schedule_once(host_id, schedule_id);
+    }
+
+    pub fn delete_schedule(&self, host_id: &str, schedule_id: &str) {
+        self.inner.delete_schedule(host_id, schedule_id);
+    }
+
+    pub fn fetch_schedule_runs(&self, host_id: &str, schedule_id: &str, limit: Option<u32>) {
+        self.inner.fetch_schedule_runs(host_id, schedule_id, limit);
+    }
+
+    pub fn schedule_runs_json(&self, host_id: &str, schedule_id: &str) -> Result<String, String> {
+        serde_json::to_string(&self.inner.schedule_runs(host_id, schedule_id))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn list_conditional_timers_json(
+        &self,
+        host_id: &str,
+        agent_id: Option<String>,
+        include_resolved: bool,
+    ) -> Result<String, String> {
+        let timers = block_on_core_rpc(self.inner.list_conditional_timers_on_host(
+            host_id,
+            agent_id,
+            include_resolved,
+        ))?;
+        serde_json::to_string(&timers).map_err(|e| e.to_string())
+    }
+
+    pub fn cancel_conditional_timer_json(
+        &self,
+        host_id: &str,
+        timer_id: &str,
+    ) -> Result<String, String> {
+        let record = block_on_core_rpc(
+            self.inner
+                .cancel_conditional_timer_on_host(host_id, timer_id),
+        )?;
+        serde_json::to_string(&record).map_err(|e| e.to_string())
+    }
+
+    pub fn fire_conditional_timer_now_json(
+        &self,
+        host_id: &str,
+        timer_id: &str,
+    ) -> Result<String, String> {
+        let record = block_on_core_rpc(
+            self.inner
+                .fire_conditional_timer_now_on_host(host_id, timer_id),
+        )?;
+        serde_json::to_string(&record).map_err(|e| e.to_string())
+    }
+
+    pub fn list_goal_runs_json(
+        &self,
+        host_id: &str,
+        agent_id: Option<String>,
+    ) -> Result<String, String> {
+        let goals = block_on_core_rpc(self.inner.list_goal_runs_on_host(host_id, agent_id))?;
+        serde_json::to_string(&goals).map_err(|e| e.to_string())
+    }
+
+    pub fn control_goal_run_json(&self, req_json: &str) -> Result<String, String> {
+        let req: ControlGoalRunRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid ControlGoalRunRequest: {e}"))?;
+        let record = block_on_core_rpc(self.inner.control_goal_run_on_host(req))?;
+        serde_json::to_string(&record).map_err(|e| e.to_string())
+    }
+
+    pub fn list_monitor_watches_json(
+        &self,
+        host_id: &str,
+        agent_id: Option<String>,
+    ) -> Result<String, String> {
+        let monitors =
+            block_on_core_rpc(self.inner.list_monitor_watches_on_host(host_id, agent_id))?;
+        serde_json::to_string(&monitors).map_err(|e| e.to_string())
+    }
+
+    pub fn stop_monitor_watch_json(&self, req_json: &str) -> Result<String, String> {
+        let req: StopMonitorWatchRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid StopMonitorWatchRequest: {e}"))?;
+        let record = block_on_core_rpc(self.inner.stop_monitor_watch_on_host(req))?;
+        serde_json::to_string(&record).map_err(|e| e.to_string())
+    }
+
+    pub fn list_workflow_runs_json(
+        &self,
+        host_id: &str,
+        include_completed: bool,
+    ) -> Result<String, String> {
+        let runs = block_on_core_rpc(
+            self.inner
+                .list_workflow_runs_on_host(host_id, include_completed),
+        )?;
+        serde_json::to_string(&runs).map_err(|e| e.to_string())
+    }
+
+    pub fn cancel_workflow_run_json(&self, req_json: &str) -> Result<String, String> {
+        let req: CancelWorkflowRunRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid CancelWorkflowRunRequest: {e}"))?;
+        let run = block_on_core_rpc(self.inner.cancel_workflow_run_on_host(req))?;
+        serde_json::to_string(&run).map_err(|e| e.to_string())
+    }
+
+    // --- Native Mobile Background Push (APNs / FCM / HarmonyOS Push Kit) ---
+
+    pub fn register_push_device_json(
+        &self,
+        host_id: &str,
+        req_json: &str,
+    ) -> Result<String, String> {
+        let req: RegisterPushDeviceRequest =
+            serde_json::from_str(req_json).map_err(|e| e.to_string())?;
+        let snap = self.inner.register_push_device_blocking(host_id, req)?;
+        serde_json::to_string(&snap).map_err(|e| e.to_string())
+    }
+
+    pub fn unregister_push_device_json(
+        &self,
+        host_id: &str,
+        device_id: &str,
+    ) -> Result<String, String> {
+        let snap = self
+            .inner
+            .unregister_push_device_blocking(host_id, device_id)?;
+        serde_json::to_string(&snap).map_err(|e| e.to_string())
+    }
+
+    pub fn list_push_devices_json(&self, host_id: &str) -> Result<String, String> {
+        let snap = self.inner.list_push_devices_blocking(host_id)?;
+        serde_json::to_string(&snap).map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(target_env = "ohos")]
@@ -1095,6 +1624,68 @@ mod ohos_napi {
         filename: String,
         mime_type: Option<String>,
         bytes: Vec<u8>,
+    }
+
+    pub struct RegisterPushDeviceTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        req_json: String,
+    }
+
+    impl Task for RegisterPushDeviceTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .register_push_device_json(&self.host_id, &self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct UnregisterPushDeviceTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        device_id: String,
+    }
+
+    impl Task for UnregisterPushDeviceTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .unregister_push_device_json(&self.host_id, &self.device_id)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ListPushDevicesTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+    }
+
+    impl Task for ListPushDevicesTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .list_push_devices_json(&self.host_id)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
     }
 
     impl Task for StageAttachmentTask {
@@ -1146,6 +1737,66 @@ mod ohos_napi {
         }
     }
 
+    pub struct ForkAgentTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for ForkAgentTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .fork_agent_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct PreviewWorktreeHandoffTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for PreviewWorktreeHandoffTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .preview_worktree_handoff_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ExecuteWorktreeHandoffTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for ExecuteWorktreeHandoffTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .execute_worktree_handoff_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
     pub struct ReadWorkspaceFileTask {
         facade: OhosCoreFacade,
         host_id: String,
@@ -1168,6 +1819,86 @@ mod ohos_napi {
         }
     }
 
+    pub struct WriteWorkspaceFileTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for WriteWorkspaceFileTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .write_workspace_file_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct CreateWorkspaceEntryTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for CreateWorkspaceEntryTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .create_workspace_entry_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct RenameWorkspaceEntryTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for RenameWorkspaceEntryTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .rename_workspace_entry_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct DeleteWorkspaceEntryTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for DeleteWorkspaceEntryTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .delete_workspace_entry_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
     pub struct RenderDiagramTask {
         facade: OhosCoreFacade,
         req_json: String,
@@ -1180,6 +1911,389 @@ mod ohos_napi {
         fn compute(&mut self) -> Result<Self::Output> {
             self.facade
                 .render_diagram_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ListConditionalTimersTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        agent_id: Option<String>,
+        include_resolved: bool,
+    }
+
+    impl Task for ListConditionalTimersTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .list_conditional_timers_json(
+                    &self.host_id,
+                    self.agent_id.clone(),
+                    self.include_resolved,
+                )
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct CancelConditionalTimerTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        timer_id: String,
+    }
+
+    impl Task for CancelConditionalTimerTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .cancel_conditional_timer_json(&self.host_id, &self.timer_id)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct FireConditionalTimerNowTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        timer_id: String,
+    }
+
+    impl Task for FireConditionalTimerNowTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .fire_conditional_timer_now_json(&self.host_id, &self.timer_id)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ListGoalRunsTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        agent_id: Option<String>,
+    }
+
+    impl Task for ListGoalRunsTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .list_goal_runs_json(&self.host_id, self.agent_id.clone())
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ControlGoalRunTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for ControlGoalRunTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .control_goal_run_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ListMonitorWatchesTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        agent_id: Option<String>,
+    }
+
+    impl Task for ListMonitorWatchesTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .list_monitor_watches_json(&self.host_id, self.agent_id.clone())
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct StopMonitorWatchTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for StopMonitorWatchTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .stop_monitor_watch_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ListWorkflowRunsTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        include_completed: bool,
+    }
+
+    impl Task for ListWorkflowRunsTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .list_workflow_runs_json(&self.host_id, self.include_completed)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct CancelWorkflowRunTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for CancelWorkflowRunTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .cancel_workflow_run_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct CloudSyncStartGithubDeviceFlowTask {
+        facade: OhosCoreFacade,
+        client_id_override: Option<String>,
+    }
+
+    impl Task for CloudSyncStartGithubDeviceFlowTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .cloud_sync_start_github_device_flow_json(self.client_id_override.clone())
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct CloudSyncPollGithubDeviceFlowTask {
+        facade: OhosCoreFacade,
+        device_code: String,
+        client_id_override: Option<String>,
+    }
+
+    impl Task for CloudSyncPollGithubDeviceFlowTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .cloud_sync_poll_github_device_flow_json(
+                    &self.device_code,
+                    self.client_id_override.clone(),
+                )
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct CloudSyncLoginWithTokenTask {
+        facade: OhosCoreFacade,
+        token: String,
+    }
+
+    impl Task for CloudSyncLoginWithTokenTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .cloud_sync_login_with_token_json(&self.token)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct CloudSyncUnlockWithPassphraseTask {
+        facade: OhosCoreFacade,
+        passphrase: String,
+    }
+
+    impl Task for CloudSyncUnlockWithPassphraseTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .cloud_sync_unlock_with_passphrase_json(&self.passphrase)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct CloudSyncNowTask {
+        facade: OhosCoreFacade,
+    }
+
+    impl Task for CloudSyncNowTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .cloud_sync_now_json()
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ListArtifactsTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        workspace_id: Option<String>,
+        agent_id: Option<String>,
+    }
+
+    impl Task for ListArtifactsTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .list_artifacts_json(
+                    &self.host_id,
+                    self.workspace_id.clone(),
+                    self.agent_id.clone(),
+                )
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct GetArtifactTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        artifact_id: String,
+        version: Option<u32>,
+    }
+
+    impl Task for GetArtifactTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .get_artifact_json(&self.host_id, &self.artifact_id, self.version)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct UpsertArtifactTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for UpsertArtifactTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .upsert_artifact_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct DeleteArtifactTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        artifact_id: String,
+    }
+
+    impl Task for DeleteArtifactTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .delete_artifact(&self.host_id, &self.artifact_id)
                 .map_err(Error::from_reason)
         }
 
@@ -1229,6 +2343,36 @@ mod ohos_napi {
         #[napi]
         pub fn bridge_info_json(&self) -> Result<String> {
             self.facade.bridge_info_json().map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn search_messages_json(&self, query: String, limit: Option<u32>) -> Result<String> {
+            self.facade
+                .search_messages_json(&query, limit)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn export_agent_transcript_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+            options_json: String,
+        ) -> Result<String> {
+            self.facade
+                .export_agent_transcript_json(&host_id, &agent_id, &options_json)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn list_agent_code_blocks_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+        ) -> Result<String> {
+            self.facade
+                .list_agent_code_blocks_json(&host_id, &agent_id)
+                .map_err(Error::from_reason)
         }
 
         #[napi]
@@ -1608,6 +2752,7 @@ mod ohos_napi {
             cwd: String,
             extra_dirs_json: Option<String>,
             provider: String,
+            acp_agent_id: Option<String>,
             model: Option<String>,
             effort: Option<String>,
             mode: String,
@@ -1622,6 +2767,7 @@ mod ohos_napi {
                     &cwd,
                     extra_dirs_json.as_deref(),
                     &provider,
+                    acp_agent_id.as_deref(),
                     model,
                     effort.as_deref(),
                     &mode,
@@ -1732,6 +2878,12 @@ mod ohos_napi {
         }
 
         #[napi]
+        pub fn set_agent_fast_mode(&self, host_id: String, agent_id: String, fast_mode: bool) {
+            self.facade
+                .set_agent_fast_mode(&host_id, &agent_id, fast_mode);
+        }
+
+        #[napi]
         pub fn switch_agent_provider(
             &self,
             host_id: String,
@@ -1739,6 +2891,7 @@ mod ohos_napi {
             provider: String,
             model: Option<String>,
             effort: Option<String>,
+            acp_agent_id: Option<String>,
         ) {
             self.facade.switch_agent_provider(
                 &host_id,
@@ -1746,12 +2899,23 @@ mod ohos_napi {
                 &provider,
                 model,
                 effort.as_deref(),
+                acp_agent_id,
             );
         }
 
         #[napi]
         pub fn archive_agent(&self, host_id: String, agent_id: String) {
             self.facade.archive_agent(&host_id, &agent_id);
+        }
+
+        #[napi]
+        pub fn unarchive_agent(&self, host_id: String, agent_id: String) {
+            self.facade.unarchive_agent(&host_id, &agent_id);
+        }
+
+        #[napi]
+        pub fn delete_agent(&self, host_id: String, agent_id: String) {
+            self.facade.delete_agent(&host_id, &agent_id);
         }
 
         #[napi]
@@ -1883,6 +3047,36 @@ mod ohos_napi {
         }
 
         #[napi]
+        pub fn fork_agent_json(&self, req_json: String) -> AsyncTask<ForkAgentTask> {
+            AsyncTask::new(ForkAgentTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn preview_worktree_handoff_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<PreviewWorktreeHandoffTask> {
+            AsyncTask::new(PreviewWorktreeHandoffTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn execute_worktree_handoff_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<ExecuteWorktreeHandoffTask> {
+            AsyncTask::new(ExecuteWorktreeHandoffTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
         pub fn read_workspace_file_json(
             &self,
             host_id: String,
@@ -1894,6 +3088,50 @@ mod ohos_napi {
                 host_id,
                 cwd,
                 path,
+            })
+        }
+
+        #[napi]
+        pub fn write_workspace_file_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<WriteWorkspaceFileTask> {
+            AsyncTask::new(WriteWorkspaceFileTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn create_workspace_entry_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<CreateWorkspaceEntryTask> {
+            AsyncTask::new(CreateWorkspaceEntryTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn rename_workspace_entry_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<RenameWorkspaceEntryTask> {
+            AsyncTask::new(RenameWorkspaceEntryTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn delete_workspace_entry_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<DeleteWorkspaceEntryTask> {
+            AsyncTask::new(DeleteWorkspaceEntryTask {
+                facade: self.facade.clone(),
+                req_json,
             })
         }
 
@@ -1986,10 +3224,11 @@ mod ohos_napi {
         pub fn cloud_sync_start_github_device_flow_json(
             &self,
             client_id_override: Option<String>,
-        ) -> Result<String> {
-            self.facade
-                .cloud_sync_start_github_device_flow_json(client_id_override)
-                .map_err(Error::from_reason)
+        ) -> AsyncTask<CloudSyncStartGithubDeviceFlowTask> {
+            AsyncTask::new(CloudSyncStartGithubDeviceFlowTask {
+                facade: self.facade.clone(),
+                client_id_override,
+            })
         }
 
         #[napi]
@@ -1997,31 +3236,41 @@ mod ohos_napi {
             &self,
             device_code: String,
             client_id_override: Option<String>,
-        ) -> Result<String> {
-            self.facade
-                .cloud_sync_poll_github_device_flow_json(&device_code, client_id_override)
-                .map_err(Error::from_reason)
+        ) -> AsyncTask<CloudSyncPollGithubDeviceFlowTask> {
+            AsyncTask::new(CloudSyncPollGithubDeviceFlowTask {
+                facade: self.facade.clone(),
+                device_code,
+                client_id_override,
+            })
         }
 
         #[napi]
-        pub fn cloud_sync_login_with_token_json(&self, token: String) -> Result<String> {
-            self.facade
-                .cloud_sync_login_with_token_json(&token)
-                .map_err(Error::from_reason)
+        pub fn cloud_sync_login_with_token_json(
+            &self,
+            token: String,
+        ) -> AsyncTask<CloudSyncLoginWithTokenTask> {
+            AsyncTask::new(CloudSyncLoginWithTokenTask {
+                facade: self.facade.clone(),
+                token,
+            })
         }
 
         #[napi]
-        pub fn cloud_sync_unlock_with_passphrase_json(&self, passphrase: String) -> Result<String> {
-            self.facade
-                .cloud_sync_unlock_with_passphrase_json(&passphrase)
-                .map_err(Error::from_reason)
+        pub fn cloud_sync_unlock_with_passphrase_json(
+            &self,
+            passphrase: String,
+        ) -> AsyncTask<CloudSyncUnlockWithPassphraseTask> {
+            AsyncTask::new(CloudSyncUnlockWithPassphraseTask {
+                facade: self.facade.clone(),
+                passphrase,
+            })
         }
 
         #[napi]
-        pub fn cloud_sync_now_json(&self) -> Result<String> {
-            self.facade
-                .cloud_sync_now_json()
-                .map_err(Error::from_reason)
+        pub fn cloud_sync_now_json(&self) -> AsyncTask<CloudSyncNowTask> {
+            AsyncTask::new(CloudSyncNowTask {
+                facade: self.facade.clone(),
+            })
         }
 
         #[napi]
@@ -2043,6 +3292,313 @@ mod ohos_napi {
             self.facade
                 .cloud_sync_update_preferences_json(&patch_json)
                 .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn list_artifacts_json(
+            &self,
+            host_id: String,
+            workspace_id: Option<String>,
+            agent_id: Option<String>,
+        ) -> AsyncTask<ListArtifactsTask> {
+            AsyncTask::new(ListArtifactsTask {
+                facade: self.facade.clone(),
+                host_id,
+                workspace_id,
+                agent_id,
+            })
+        }
+
+        #[napi]
+        pub fn get_artifact_json(
+            &self,
+            host_id: String,
+            artifact_id: String,
+            version: Option<u32>,
+        ) -> AsyncTask<GetArtifactTask> {
+            AsyncTask::new(GetArtifactTask {
+                facade: self.facade.clone(),
+                host_id,
+                artifact_id,
+                version,
+            })
+        }
+
+        #[napi]
+        pub fn upsert_artifact_json(&self, req_json: String) -> AsyncTask<UpsertArtifactTask> {
+            AsyncTask::new(UpsertArtifactTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn delete_artifact(
+            &self,
+            host_id: String,
+            artifact_id: String,
+        ) -> AsyncTask<DeleteArtifactTask> {
+            AsyncTask::new(DeleteArtifactTask {
+                facade: self.facade.clone(),
+                host_id,
+                artifact_id,
+            })
+        }
+
+        #[napi]
+        pub fn fetch_workspace_board(&self, host_id: String, workspace_id: String) {
+            self.facade.fetch_workspace_board(&host_id, &workspace_id);
+        }
+
+        #[napi]
+        pub fn workspace_board_json(
+            &self,
+            host_id: String,
+            workspace_id: String,
+        ) -> Result<String> {
+            self.facade
+                .workspace_board_json(&host_id, &workspace_id)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn update_workspace_board(
+            &self,
+            host_id: String,
+            workspace_id: String,
+            content: String,
+            section: Option<String>,
+            updated_by: Option<String>,
+        ) {
+            self.facade.update_workspace_board(
+                &host_id,
+                &workspace_id,
+                content,
+                section,
+                updated_by,
+            );
+        }
+
+        #[napi]
+        pub fn fetch_workspace_events(
+            &self,
+            host_id: String,
+            workspace_id: String,
+            limit: Option<u32>,
+        ) {
+            self.facade
+                .fetch_workspace_events(&host_id, &workspace_id, limit);
+        }
+
+        #[napi]
+        pub fn workspace_events_json(
+            &self,
+            host_id: String,
+            workspace_id: String,
+        ) -> Result<String> {
+            self.facade
+                .workspace_events_json(&host_id, &workspace_id)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn spawn_workspace_peer_json(&self, req_json: String) -> Result<String> {
+            self.facade
+                .spawn_workspace_peer_json(&req_json)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn create_schedule_json(&self, req_json: String) -> Result<()> {
+            self.facade
+                .create_schedule_json(&req_json)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn update_schedule_json(&self, req_json: String) -> Result<()> {
+            self.facade
+                .update_schedule_json(&req_json)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn pause_schedule(&self, host_id: String, schedule_id: String) {
+            self.facade.pause_schedule(&host_id, &schedule_id);
+        }
+
+        #[napi]
+        pub fn resume_schedule(&self, host_id: String, schedule_id: String) {
+            self.facade.resume_schedule(&host_id, &schedule_id);
+        }
+
+        #[napi]
+        pub fn run_schedule_once(&self, host_id: String, schedule_id: String) {
+            self.facade.run_schedule_once(&host_id, &schedule_id);
+        }
+
+        #[napi]
+        pub fn delete_schedule(&self, host_id: String, schedule_id: String) {
+            self.facade.delete_schedule(&host_id, &schedule_id);
+        }
+
+        #[napi]
+        pub fn fetch_schedule_runs(
+            &self,
+            host_id: String,
+            schedule_id: String,
+            limit: Option<u32>,
+        ) {
+            self.facade
+                .fetch_schedule_runs(&host_id, &schedule_id, limit);
+        }
+
+        #[napi]
+        pub fn schedule_runs_json(&self, host_id: String, schedule_id: String) -> Result<String> {
+            self.facade
+                .schedule_runs_json(&host_id, &schedule_id)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn list_conditional_timers_json(
+            &self,
+            host_id: String,
+            agent_id: Option<String>,
+            include_resolved: bool,
+        ) -> AsyncTask<ListConditionalTimersTask> {
+            AsyncTask::new(ListConditionalTimersTask {
+                facade: self.facade.clone(),
+                host_id,
+                agent_id,
+                include_resolved,
+            })
+        }
+
+        #[napi]
+        pub fn cancel_conditional_timer_json(
+            &self,
+            host_id: String,
+            timer_id: String,
+        ) -> AsyncTask<CancelConditionalTimerTask> {
+            AsyncTask::new(CancelConditionalTimerTask {
+                facade: self.facade.clone(),
+                host_id,
+                timer_id,
+            })
+        }
+
+        #[napi]
+        pub fn fire_conditional_timer_now_json(
+            &self,
+            host_id: String,
+            timer_id: String,
+        ) -> AsyncTask<FireConditionalTimerNowTask> {
+            AsyncTask::new(FireConditionalTimerNowTask {
+                facade: self.facade.clone(),
+                host_id,
+                timer_id,
+            })
+        }
+
+        #[napi]
+        pub fn list_goal_runs_json(
+            &self,
+            host_id: String,
+            agent_id: Option<String>,
+        ) -> AsyncTask<ListGoalRunsTask> {
+            AsyncTask::new(ListGoalRunsTask {
+                facade: self.facade.clone(),
+                host_id,
+                agent_id,
+            })
+        }
+
+        #[napi]
+        pub fn control_goal_run_json(&self, req_json: String) -> AsyncTask<ControlGoalRunTask> {
+            AsyncTask::new(ControlGoalRunTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn list_monitor_watches_json(
+            &self,
+            host_id: String,
+            agent_id: Option<String>,
+        ) -> AsyncTask<ListMonitorWatchesTask> {
+            AsyncTask::new(ListMonitorWatchesTask {
+                facade: self.facade.clone(),
+                host_id,
+                agent_id,
+            })
+        }
+
+        #[napi]
+        pub fn stop_monitor_watch_json(&self, req_json: String) -> AsyncTask<StopMonitorWatchTask> {
+            AsyncTask::new(StopMonitorWatchTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn list_workflow_runs_json(
+            &self,
+            host_id: String,
+            include_completed: bool,
+        ) -> AsyncTask<ListWorkflowRunsTask> {
+            AsyncTask::new(ListWorkflowRunsTask {
+                facade: self.facade.clone(),
+                host_id,
+                include_completed,
+            })
+        }
+
+        #[napi]
+        pub fn cancel_workflow_run_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<CancelWorkflowRunTask> {
+            AsyncTask::new(CancelWorkflowRunTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn register_push_device_json(
+            &self,
+            host_id: String,
+            req_json: String,
+        ) -> AsyncTask<RegisterPushDeviceTask> {
+            AsyncTask::new(RegisterPushDeviceTask {
+                facade: self.facade.clone(),
+                host_id,
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn unregister_push_device_json(
+            &self,
+            host_id: String,
+            device_id: String,
+        ) -> AsyncTask<UnregisterPushDeviceTask> {
+            AsyncTask::new(UnregisterPushDeviceTask {
+                facade: self.facade.clone(),
+                host_id,
+                device_id,
+            })
+        }
+
+        #[napi]
+        pub fn list_push_devices_json(&self, host_id: String) -> AsyncTask<ListPushDevicesTask> {
+            AsyncTask::new(ListPushDevicesTask {
+                facade: self.facade.clone(),
+                host_id,
+            })
         }
     }
 }
@@ -2091,6 +3647,7 @@ mod tests {
                 "/workspace/orbit",
                 Some(r#"["/workspace/shared"]"#),
                 "claude_code",
+                None,
                 Some("claude-opus-5-5".into()),
                 Some("high"),
                 "accept_edits",
@@ -2155,6 +3712,7 @@ mod tests {
                 "/repo/orbit",
                 None,
                 "claude_code",
+                None,
                 None,
                 None,
                 "default",
@@ -2266,5 +3824,117 @@ mod tests {
             )
             .expect("diagram");
         assert!(diagram_json.contains("<svg"));
+    }
+
+    #[test]
+    fn ohos_facade_parity_automations_board_archive_and_modes() {
+        assert_eq!(parse_mode_str("auto"), SessionMode::Auto);
+        assert_eq!(parse_mode_str("accept_edits"), SessionMode::AcceptEdits);
+        assert_eq!(parse_mode_str("full_access"), SessionMode::FullAccess);
+
+        let facade = OhosCoreFacade::open_in_memory().expect("open");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = orbit_crypto::PairingOffer {
+            host_id: "host_parity".into(),
+            hostname: "ohos-parity".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "secret".into(),
+        };
+        facade
+            .pair_host_json(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let opt_id = facade
+            .create_agent_full(
+                "host_parity",
+                "/workspace/parity",
+                None,
+                "claude_code",
+                None,
+                None,
+                None,
+                "auto",
+                "Test parity controls",
+                None,
+                None,
+                None,
+            )
+            .expect("create");
+        facade.set_agent_fast_mode("host_parity", &opt_id, true);
+        facade.unarchive_agent("host_parity", &opt_id);
+        facade.delete_agent("host_parity", &opt_id);
+
+        // Workspace board & events roundtrip
+        facade.fetch_workspace_board("host_parity", "ws_1");
+        let board_json = facade
+            .workspace_board_json("host_parity", "ws_1")
+            .expect("board json");
+        assert_eq!(board_json, "null");
+        facade.update_workspace_board(
+            "host_parity",
+            "ws_1",
+            "## Goal\nShip HarmonyOS parity".into(),
+            None,
+            Some("harmony-client".into()),
+        );
+        facade.fetch_workspace_events("host_parity", "ws_1", Some(20));
+        let events_json = facade
+            .workspace_events_json("host_parity", "ws_1")
+            .expect("events json");
+        assert_eq!(events_json, "[]");
+
+        // Schedules CRUD fire-and-forget & runs snapshot
+        facade
+            .create_schedule_json(
+                r#"{"host_id":"host_parity","name":"Nightly Check","cron_expr":"0 9 * * *","prompt":"Run tests","cwd":"/workspace/parity","provider":"claude_code","mode":"auto"}"#,
+            )
+            .expect("create schedule");
+        facade.pause_schedule("host_parity", "sched_1");
+        facade.resume_schedule("host_parity", "sched_1");
+        facade.run_schedule_once("host_parity", "sched_1");
+        facade.delete_schedule("host_parity", "sched_1");
+        facade.fetch_schedule_runs("host_parity", "sched_1", Some(10));
+        let runs_json = facade
+            .schedule_runs_json("host_parity", "sched_1")
+            .expect("runs json");
+        assert_eq!(runs_json, "[]");
+
+        // Offline RPCs return structured errors cleanly without panicking
+        assert!(
+            facade
+                .list_conditional_timers_json("host_parity", None, true)
+                .is_err()
+        );
+        assert!(
+            facade
+                .cancel_conditional_timer_json("host_parity", "tmr_1")
+                .is_err()
+        );
+        assert!(facade.list_goal_runs_json("host_parity", None).is_err());
+        assert!(
+            facade
+                .control_goal_run_json(
+                    r#"{"host_id":"host_parity","goal_id":"g1","action":"pause"}"#,
+                )
+                .is_err()
+        );
+        assert!(
+            facade
+                .list_monitor_watches_json("host_parity", None)
+                .is_err()
+        );
+        assert!(
+            facade
+                .stop_monitor_watch_json(r#"{"host_id":"host_parity","monitor_id":"m1"}"#)
+                .is_err()
+        );
+        assert!(facade.list_workflow_runs_json("host_parity", true).is_err());
+        assert!(
+            facade
+                .cancel_workflow_run_json(r#"{"host_id":"host_parity","run_id":"wf1"}"#)
+                .is_err()
+        );
     }
 }

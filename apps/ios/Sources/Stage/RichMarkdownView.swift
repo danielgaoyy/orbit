@@ -264,6 +264,9 @@ struct RichMarkdownView: View {
             case let .codeBlock(language, rawCode, lines):
                 flushProseBuffer()
                 out.append(.codeBlock(language: language, rawCode: rawCode, lines: lines))
+            case let .mathBlock(tex, _):
+                flushProseBuffer()
+                out.append(.codeBlock(language: "math", rawCode: tex, lines: []))
             case .table:
                 break
             }
@@ -409,7 +412,8 @@ struct RichMarkdownView: View {
                                 italic: span.italic,
                                 strikethrough: span.strikethrough,
                                 inlineCode: span.inlineCode,
-                                linkUrl: span.linkUrl
+                                linkUrl: span.linkUrl,
+                                mathMl: span.mathMl
                             )
                         )
                     }
@@ -473,7 +477,8 @@ struct RichMarkdownView: View {
                             italic: false,
                             strikethrough: false,
                             inlineCode: false,
-                            linkUrl: nil
+                            linkUrl: nil,
+                            mathMl: nil
                         )
                     ])
                 ])
@@ -527,7 +532,8 @@ struct RichMarkdownView: View {
                     italic: false,
                     strikethrough: false,
                     inlineCode: false,
-                    linkUrl: nil
+                    linkUrl: nil,
+                    mathMl: nil
                 )
             ]
         }

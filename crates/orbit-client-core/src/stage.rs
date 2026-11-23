@@ -1486,6 +1486,31 @@ pub fn collect_stage_auxiliary_state(
     )
 }
 
+/// Settles any leftover running tool calls or streaming assistant messages in a timeline slice
+/// belonging to an already-finished session/subagent so turn projection never keeps phantom
+/// `has_active_item = true` or shimmering `Running…` step summaries.
+pub fn settle_timeline_items_for_finished_session(
+    items: &mut [TimelineItemView],
+    terminal_status: ToolCallStatus,
+) {
+    for item in items.iter_mut() {
+        match item {
+            TimelineItemView::ToolCall {
+                status,
+                step_descriptor,
+                ..
+            } if *status == ToolCallStatus::Running => {
+                *status = terminal_status;
+                *step_descriptor = None;
+            }
+            TimelineItemView::AssistantMessage { streaming, .. } if *streaming => {
+                *streaming = false;
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn process_timeline_for_stage(
     items: &[TimelineItemView],
     cwd: Option<&str>,
@@ -3295,6 +3320,7 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 resolved_decision: None,
+                guardian_assessment: None,
                 timestamp_ms: Some(23_000),
             },
             TimelineItemView::QuestionRequest {
@@ -3430,6 +3456,7 @@ mod tests {
             provider_label: "Claude Code".into(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::AutonomousWakeup {
                 source: "cron".into(),
@@ -3458,6 +3485,9 @@ mod tests {
             cluster_suggestion: None,
             worktree_branch: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
         };
         let insights = derive_session_insights(&items, Some("/repo"), Some(&cur_agent), &[], &[]);
         assert_eq!(
@@ -3594,6 +3624,7 @@ Log: file:///tmp/spoofed.log\n";
             provider_label: "Antigravity".into(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status: if running {
                 AgentStatus::Running {
@@ -3625,6 +3656,9 @@ Log: file:///tmp/spoofed.log\n";
             cluster_suggestion: None,
             worktree_branch: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
         };
 
         let mut items: Vec<TimelineItemView> = Vec::new();
@@ -3834,6 +3868,7 @@ Log: file:///tmp/spoofed.log\n";
             provider_label: "Antigravity".into(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status: if running {
                 AgentStatus::Running {
@@ -3865,6 +3900,9 @@ Log: file:///tmp/spoofed.log\n";
             cluster_suggestion: None,
             worktree_branch: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
         };
 
         let items = vec![
@@ -4016,6 +4054,7 @@ Log: file:///tmp/spoofed.log\n";
             provider_label: "Antigravity".into(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status: AgentStatus::AutonomousWakeup {
                 turn_id: "bgwait_1".into(),
@@ -4044,6 +4083,9 @@ Log: file:///tmp/spoofed.log\n";
             cluster_suggestion: None,
             worktree_branch: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
         };
 
         let items = vec![TimelineItemView::ToolCall {

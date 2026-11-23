@@ -23,10 +23,33 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::attachments::{build_agy_prompt_blocks, is_path_within_dir};
+use crate::attachments::{AcpPromptMediaCaps, build_acp_prompt_blocks_async, is_path_within_dir};
 use crate::driver::{
     DriverCommand, DriverEvent, ProviderSessionHandle, RpcId, SessionLaunchConfig,
 };
+
+fn build_agy_launch_env(cfg: &SessionLaunchConfig) -> HashMap<String, String> {
+    let mut env = cfg.extra_env.clone();
+    env.insert("NO_COLOR".into(), "1".into());
+    if let Some(eff) = cfg.effort {
+        let eff_str = match eff {
+            ReasoningEffort::Off => None,
+            ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Xhigh => Some("xhigh"),
+            ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
+        };
+        if let Some(s) = eff_str {
+            env.insert("AGY_EFFORT".into(), s.into());
+        }
+    }
+    if cfg.fast_mode {
+        env.insert("AGY_FAST_MODE".into(), "1".into());
+    }
+    crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
+    env
+}
 
 pub async fn spawn_antigravity_session(
     cfg: SessionLaunchConfig,
@@ -55,21 +78,7 @@ pub async fn spawn_antigravity_session(
             args.push(extra.to_string_lossy().to_string());
         }
 
-        let mut env = cfg.extra_env.clone();
-        env.insert("NO_COLOR".into(), "1".into());
-        if let Some(eff) = cfg.effort {
-            let eff_str = match eff {
-                ReasoningEffort::Off => None,
-                ReasoningEffort::Low => Some("low"),
-                ReasoningEffort::Medium => Some("medium"),
-                ReasoningEffort::High => Some("high"),
-                ReasoningEffort::Xhigh => Some("xhigh"),
-                ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
-            };
-            if let Some(s) = eff_str {
-                env.insert("AGY_EFFORT".into(), s.into());
-            }
-        }
+        let env = build_agy_launch_env(&cfg);
 
         let spec = ShimSpawnSpec {
             shim_id: format!("agy_{}", cfg.agent_id),
@@ -160,18 +169,60 @@ fn build_agy_mcp_servers_stdio(cfg: &SessionLaunchConfig) -> Value {
 }
 
 fn build_agy_session_meta(cfg: &SessionLaunchConfig) -> Option<Value> {
-    let append = cfg
+    let mut agy_meta = serde_json::Map::new();
+    if let Some(append) = cfg
         .system_prompt_append
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-    Some(json!({
-        "antigravity": {
-            "systemPrompt": {
+        .filter(|s| !s.is_empty())
+    {
+        agy_meta.insert(
+            "systemPrompt".to_string(),
+            json!({
                 "append": append
-            }
+            }),
+        );
+    }
+    if cfg.fast_mode {
+        agy_meta.insert("fastMode".to_string(), Value::Bool(true));
+    }
+    if agy_meta.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "antigravity": Value::Object(agy_meta)
+        }))
+    }
+}
+
+fn build_agy_set_fast_mode_request(rpc_id: i64, session_id: &str, enabled: bool) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "method": "session/set_config_option",
+        "params": {
+            "sessionId": session_id,
+            "configId": "fast_mode",
+            "value": if enabled { "on" } else { "off" }
         }
-    }))
+    })
+}
+
+fn parse_agy_fast_mode_config_value(sess_val: &Value) -> Option<bool> {
+    let opt = sess_val
+        .get("configOptions")
+        .and_then(|v| v.as_array())?
+        .iter()
+        .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some("fast_mode"))?;
+    let current = opt.get("currentValue").or_else(|| opt.get("value"))?;
+    if let Some(b) = current.as_bool() {
+        return Some(b);
+    }
+    match current.as_str()?.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "enabled" => Some(true),
+        "off" | "false" | "0" | "disabled" => Some(false),
+        _ => None,
+    }
 }
 
 struct OpenedAgySession {
@@ -199,39 +250,72 @@ fn prepend_handoff_context(ctx: Option<String>, prompt: &str) -> String {
     format!("{ctx}\n\n{prompt}")
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AgySessionOpenMode<'a> {
+    New,
+    Load(&'a str),
+    Fork(&'a str),
+}
+
+fn agy_supports_session_fork(init_val: &Value) -> bool {
+    for ptr in [
+        "/agentCapabilities/sessionCapabilities/fork",
+        "/agentCapabilities/session/fork",
+        "/capabilities/session/fork",
+    ] {
+        if let Some(v) = init_val.pointer(ptr)
+            && (v.is_object() || v.as_bool() == Some(true))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_agy_session(
     cfg: &SessionLaunchConfig,
     shim: &mut orbit_shim::ShimClient,
     next_rpc_id: &mut i64,
     pending_rpcs: &mut HashMap<String, oneshot::Sender<Result<Value, Value>>>,
-    resume_id: Option<&str>,
+    open_mode: AgySessionOpenMode<'_>,
     requested_model: Option<&str>,
     requested_effort: Option<ReasoningEffort>,
     mode: &SessionMode,
 ) -> Result<OpenedAgySession, String> {
-    let is_resume = resume_id.is_some();
+    let drains_replay = matches!(
+        open_mode,
+        AgySessionOpenMode::Load(_) | AgySessionOpenMode::Fork(_)
+    );
     let open_session_with = |mcp_val: Value| {
-        let mut params = if let Some(sid) = resume_id {
-            json!({
-                "sessionId": sid,
-                "cwd": cfg.cwd.to_string_lossy(),
-                "mcpServers": mcp_val
-            })
-        } else {
-            json!({
-                "cwd": cfg.cwd.to_string_lossy(),
-                "mcpServers": mcp_val
-            })
+        let (method, mut params) = match open_mode {
+            AgySessionOpenMode::Fork(sid) => (
+                "session/fork",
+                json!({
+                    "sessionId": sid,
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "mcpServers": mcp_val
+                }),
+            ),
+            AgySessionOpenMode::Load(sid) => (
+                "session/load",
+                json!({
+                    "sessionId": sid,
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "mcpServers": mcp_val
+                }),
+            ),
+            AgySessionOpenMode::New => (
+                "session/new",
+                json!({
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "mcpServers": mcp_val
+                }),
+            ),
         };
         if let Some(meta) = build_agy_session_meta(cfg) {
             params["_meta"] = meta;
         }
-        let method = if is_resume {
-            "session/load"
-        } else {
-            "session/new"
-        };
         (method, params)
     };
 
@@ -256,9 +340,9 @@ async fn open_agy_session(
             Err(e) => return Err(e),
         };
 
-    // Drain replay notifications on `session/load` until 250ms of quiet (up to 8s ceiling)
+    // Drain replay notifications on `session/load` and `session/fork` until 250ms of quiet (up to 8s ceiling)
     // so large monorepo trajectories never leak historical `session/update` frames into the next prompt turn.
-    if is_resume {
+    if drains_replay {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(250), shim.rx.recv()).await {
@@ -272,10 +356,14 @@ async fn open_agy_session(
         }
     }
 
+    let fallback_sid = match open_mode {
+        AgySessionOpenMode::Load(sid) => Some(sid),
+        AgySessionOpenMode::Fork(_) | AgySessionOpenMode::New => None,
+    };
     let session_id = sess_val
         .get("sessionId")
         .and_then(|v| v.as_str())
-        .or(resume_id)
+        .or(fallback_sid)
         .unwrap_or("unknown")
         .to_string();
 
@@ -365,6 +453,25 @@ async fn open_agy_session(
         let _ = wait_rpc_during_boot(shim, pending_rpcs, rx, &cfg.shim_seq_tracker).await;
     }
 
+    // Reconcile `fast_mode` when ACP advertises a differing `configOptions` value (e.g. cold `session/load`)
+    if let Some(advertised_fast) = parse_agy_fast_mode_config_value(&sess_val)
+        && advertised_fast != cfg.fast_mode
+        && let Ok(rx) = send_acp_req(
+            shim,
+            next_rpc_id,
+            pending_rpcs,
+            "session/set_config_option",
+            json!({
+                "sessionId": session_id,
+                "configId": "fast_mode",
+                "value": if cfg.fast_mode { "on" } else { "off" }
+            }),
+        )
+        .await
+    {
+        let _ = wait_rpc_during_boot(shim, pending_rpcs, rx, &cfg.shim_seq_tracker).await;
+    }
+
     Ok(OpenedAgySession {
         session_id,
         available_model_ids,
@@ -374,7 +481,7 @@ async fn open_agy_session(
 }
 
 async fn run_agy_actor(
-    cfg: SessionLaunchConfig,
+    mut cfg: SessionLaunchConfig,
     mut shim: orbit_shim::ShimClient,
     is_reattached: bool,
     mut cmd_rx: mpsc::Receiver<DriverCommand>,
@@ -383,6 +490,7 @@ async fn run_agy_actor(
     let mut next_rpc_id: i64 = if is_reattached { 100_000 } else { 1 };
     let mut pending_rpcs: HashMap<String, oneshot::Sender<Result<Value, Value>>> = HashMap::new();
     let mut inject_handoff_on_next_prompt = false;
+    let mut prompt_media_caps = AcpPromptMediaCaps::antigravity();
     let mut recovered_missing_trajectory = false;
     let mut pending_handoff_context = cfg.fallback_handoff_context.clone();
 
@@ -422,102 +530,209 @@ async fn run_agy_actor(
         {
             Ok(rx) => rx,
             Err(_) => {
+                if !is_reattached {
+                    let _ = shim.kill().await;
+                }
                 let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                 return;
             }
         };
 
-        if wait_rpc_during_boot(&mut shim, &mut pending_rpcs, init_rx, &cfg.shim_seq_tracker)
-            .await
-            .is_err()
-        {
-            warn!(agent_id = %cfg.agent_id, "Antigravity ACP initialize failed");
-            let _ = evt_tx
-                .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                    message: "Antigravity ACP initialize failed".into(),
-                    recoverable: false,
-                }))
-                .await;
-            return;
-        }
-
-        // 2. `session/load` or `session/new` with Orbit MCP servers (HTTP first, stdio fallback)
-        let opened = match open_agy_session(
-            &cfg,
+        let init_val = match wait_rpc_during_boot(
             &mut shim,
-            &mut next_rpc_id,
             &mut pending_rpcs,
-            cfg.resume_session_id.as_deref(),
-            cfg.model.as_deref(),
-            cfg.effort,
-            &cfg.mode,
+            init_rx,
+            &cfg.shim_seq_tracker,
         )
         .await
         {
-            Ok(s) => s,
-            Err(first_err)
-                if cfg.resume_session_id.is_some()
-                    && is_agy_missing_trajectory_error(&first_err) =>
-            {
-                let old_short: String = cfg
-                    .resume_session_id
-                    .as_deref()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(8)
-                    .collect();
-                warn!(
-                    agent_id = %cfg.agent_id,
-                    old_session_id = ?cfg.resume_session_id,
-                    error = %first_err,
-                    "Antigravity session/load failed with missing trajectory; transparently creating fresh session"
-                );
-                match open_agy_session(
+            Ok(v) => v,
+            Err(_) => {
+                warn!(agent_id = %cfg.agent_id, "Antigravity ACP initialize failed");
+                let _ = evt_tx
+                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                        message: "Antigravity ACP initialize failed".into(),
+                        recoverable: false,
+                    }))
+                    .await;
+                if !is_reattached {
+                    let _ = shim.kill().await;
+                }
+                return;
+            }
+        };
+        prompt_media_caps = AcpPromptMediaCaps::from_antigravity_initialize(&init_val);
+
+        // 2. `session/fork`, `session/load`, or `session/new` with Orbit MCP servers (HTTP first, stdio fallback)
+        let opened = if let Some(ref fork_sid) = cfg.fork_from_session_id {
+            let native_attempt = if agy_supports_session_fork(&init_val) {
+                open_agy_session(
                     &cfg,
                     &mut shim,
                     &mut next_rpc_id,
                     &mut pending_rpcs,
-                    None,
+                    AgySessionOpenMode::Fork(fork_sid),
                     cfg.model.as_deref(),
                     cfg.effort,
                     &cfg.mode,
                 )
                 .await
+            } else {
+                Err("session/fork not advertised by Antigravity ACP".to_string())
+            };
+            match native_attempt {
+                Ok(s)
+                    if !s.session_id.is_empty()
+                        && s.session_id != "unknown"
+                        && s.session_id != *fork_sid =>
                 {
-                    Ok(fresh) => {
-                        inject_handoff_on_next_prompt = true;
-                        recovered_missing_trajectory = true;
-                        let _ = evt_tx
-                            .send(DriverEvent::Notice {
-                                level: "info".into(),
-                                message: format!(
-                                    "Previous Antigravity session ({old_short}…) was evicted from local cache; automatically started a fresh session with recent conversation context restored."
-                                ),
-                            })
-                            .await;
-                        fresh
-                    }
-                    Err(e) => {
-                        let _ = evt_tx
-                            .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                                message: format!(
-                                    "Antigravity session open failed: {first_err} (fresh session fallback: {e})"
-                                ),
-                                recoverable: false,
-                            }))
-                            .await;
+                    s
+                }
+                other => {
+                    let reason = match other {
+                        Err(e) => e,
+                        Ok(s) => format!(
+                            "session/fork returned non-distinct or empty sessionId `{}`",
+                            s.session_id
+                        ),
+                    };
+                    warn!(
+                        agent_id = %cfg.agent_id,
+                        source_session_id = %fork_sid,
+                        reason = %reason,
+                        native_fork_only = cfg.native_fork_only,
+                        "Antigravity native session/fork unavailable; falling back"
+                    );
+                    if cfg.native_fork_only {
+                        let _ = shim.kill().await;
                         return;
+                    }
+                    match open_agy_session(
+                        &cfg,
+                        &mut shim,
+                        &mut next_rpc_id,
+                        &mut pending_rpcs,
+                        AgySessionOpenMode::New,
+                        cfg.model.as_deref(),
+                        cfg.effort,
+                        &cfg.mode,
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            inject_handoff_on_next_prompt = true;
+                            fresh
+                        }
+                        Err(e) => {
+                            let _ = evt_tx
+                                .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                    message: format!(
+                                        "Antigravity fork fresh session open failed: {e}"
+                                    ),
+                                    recoverable: false,
+                                }))
+                                .await;
+                            if !is_reattached {
+                                let _ = shim.kill().await;
+                            }
+                            return;
+                        }
                     }
                 }
             }
-            Err(e) => {
-                let _ = evt_tx
-                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                        message: format!("Antigravity session open failed: {e}"),
-                        recoverable: false,
-                    }))
-                    .await;
-                return;
+        } else {
+            let open_mode = match cfg.resume_session_id.as_deref() {
+                Some(sid) => AgySessionOpenMode::Load(sid),
+                None => AgySessionOpenMode::New,
+            };
+            match open_agy_session(
+                &cfg,
+                &mut shim,
+                &mut next_rpc_id,
+                &mut pending_rpcs,
+                open_mode,
+                cfg.model.as_deref(),
+                cfg.effort,
+                &cfg.mode,
+            )
+            .await
+            {
+                Ok(s) => {
+                    if cfg.resume_session_id.is_none() && cfg.fallback_handoff_context.is_some() {
+                        inject_handoff_on_next_prompt = true;
+                    }
+                    s
+                }
+                Err(first_err)
+                    if cfg.resume_session_id.is_some()
+                        && is_agy_missing_trajectory_error(&first_err) =>
+                {
+                    let old_short: String = cfg
+                        .resume_session_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(8)
+                        .collect();
+                    warn!(
+                        agent_id = %cfg.agent_id,
+                        old_session_id = ?cfg.resume_session_id,
+                        error = %first_err,
+                        "Antigravity session/load failed with missing trajectory; transparently creating fresh session"
+                    );
+                    match open_agy_session(
+                        &cfg,
+                        &mut shim,
+                        &mut next_rpc_id,
+                        &mut pending_rpcs,
+                        AgySessionOpenMode::New,
+                        cfg.model.as_deref(),
+                        cfg.effort,
+                        &cfg.mode,
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            inject_handoff_on_next_prompt = true;
+                            recovered_missing_trajectory = true;
+                            let _ = evt_tx
+                                .send(DriverEvent::Notice {
+                                    level: "info".into(),
+                                    message: format!(
+                                        "Previous Antigravity session ({old_short}…) was evicted from local cache; automatically started a fresh session with recent conversation context restored."
+                                    ),
+                                })
+                                .await;
+                            fresh
+                        }
+                        Err(e) => {
+                            let _ = evt_tx
+                                .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                    message: format!(
+                                        "Antigravity session open failed: {first_err} (fresh session fallback: {e})"
+                                    ),
+                                    recoverable: false,
+                                }))
+                                .await;
+                            if !is_reattached {
+                                let _ = shim.kill().await;
+                            }
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = evt_tx
+                        .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                            message: format!("Antigravity session open failed: {e}"),
+                            recoverable: false,
+                        }))
+                        .await;
+                    if !is_reattached {
+                        let _ = shim.kill().await;
+                    }
+                    return;
+                }
             }
         };
 
@@ -552,6 +767,7 @@ async fn run_agy_actor(
     let mut reattached_turn_in_flight = is_reattached && active_turn_id.is_some();
     let mut active_prompt_rpc_key: Option<String> = None;
     let mut post_reattach_non_prompt_rpcs: HashSet<String> = HashSet::new();
+    let mut pending_fast_mode_rpcs: HashMap<String, bool> = HashMap::new();
     let mut last_dispatched_prompt: Option<(String, String)> = None;
     let mut seg_state = if let Some(ref tid) = active_turn_id {
         AgyStreamSegmentState {
@@ -627,6 +843,11 @@ async fn run_agy_actor(
                 )
                 .await;
             }
+            BgTaskDelta::SubagentMessaged { .. } => {}
+            BgTaskDelta::SubagentsCanceled { ids } => {
+                cancel_agy_subagent_monitors(ids.as_deref(), &mut subagent_monitors, &evt_tx).await;
+            }
+            BgTaskDelta::Compacted => {}
         }
     }
     let now_utc = Utc::now();
@@ -791,6 +1012,7 @@ async fn run_agy_actor(
                             &shim,
                             &session_id,
                             cfg.attachments_dir.as_deref(),
+                            prompt_media_caps,
                             &mut next_rpc_id,
                             &mut active_turn_id,
                             &mut active_prompt_rpc_key,
@@ -812,6 +1034,7 @@ async fn run_agy_actor(
                         user_interrupted = true;
                         pending_self_heal = None;
                         bg_tracker.clear();
+                        cancel_agy_subagent_monitors(None, &mut subagent_monitors, &evt_tx).await;
                         if autonomous_turn_id.take().is_some() {
                             transcript_monitor.sync_silent();
                             for (cid, detail, bg_info) in
@@ -871,6 +1094,9 @@ async fn run_agy_actor(
                             let mode_str = match mode {
                                 SessionMode::AcceptEdits => "accept-edits",
                                 SessionMode::Plan => "plan",
+                                // Auto (Guardian) uses approval-gating `default` mode so Orbit's
+                                // daemon evaluates every permission request through Guardian.
+                                SessionMode::Auto => "default",
                                 _ => "default",
                             };
                             let id = next_rpc_id;
@@ -889,7 +1115,12 @@ async fn run_agy_actor(
                             let _ = shim.write_stdin_line(req).await;
                         }
                     }
-                    DriverCommand::SetConfig { model, effort } => {
+                    DriverCommand::SetConfig {
+                        model,
+                        effort,
+                        fast_mode,
+                    } => {
+                        let model_or_effort_changed = model.is_some() || effort.is_some();
                         if let Some(m) = model {
                             current_base_model =
                                 Some(normalize_agy_base_model_id(&m, &canonical_base_ids));
@@ -897,7 +1128,9 @@ async fn run_agy_actor(
                         if effort.is_some() {
                             active_effort = effort;
                         }
-                        if let Some(ref base_m) = current_base_model {
+                        if model_or_effort_changed
+                            && let Some(ref base_m) = current_base_model
+                        {
                             let wire_model_id = resolve_agy_wire_model_id(
                                 base_m,
                                 active_effort,
@@ -917,6 +1150,18 @@ async fn run_agy_actor(
                                 }
                             })
                             .to_string();
+                            let _ = shim.write_stdin_line(req).await;
+                        }
+                        if let Some(enabled) = fast_mode
+                            && enabled != cfg.fast_mode
+                        {
+                            cfg.fast_mode = enabled;
+                            let id = next_rpc_id;
+                            next_rpc_id += 1;
+                            pending_fast_mode_rpcs.insert(RpcId::Num(id).as_key(), enabled);
+                            let req =
+                                build_agy_set_fast_mode_request(id, &session_id, enabled)
+                                    .to_string();
                             let _ = shim.write_stdin_line(req).await;
                         }
                     }
@@ -1025,6 +1270,20 @@ async fn run_agy_actor(
                             // Response to our request (e.g. `session/prompt` completion)
                             if let Ok(rid) = serde_json::from_value::<RpcId>(val["id"].clone()) {
                                 let key = rid.as_key();
+                                if let Some(enabled) = pending_fast_mode_rpcs.remove(&key) {
+                                    if val.get("error").filter(|v| !v.is_null()).is_some() {
+                                        let state_label = if enabled { "on" } else { "off" };
+                                        let _ = evt_tx
+                                            .send(DriverEvent::Notice {
+                                                level: "info".into(),
+                                                message: format!(
+                                                    "Fast mode ({state_label}) saved; takes effect on next Antigravity session restart."
+                                                ),
+                                            })
+                                            .await;
+                                    }
+                                    continue;
+                                }
                                 if post_reattach_non_prompt_rpcs.remove(&key) {
                                     continue;
                                 }
@@ -1083,7 +1342,7 @@ async fn run_agy_actor(
                                                 &mut shim,
                                                 &mut next_rpc_id,
                                                 &mut pending_rpcs,
-                                                None,
+                                                AgySessionOpenMode::New,
                                                 current_base_model.as_deref(),
                                                 active_effort,
                                                 &mode,
@@ -1125,6 +1384,7 @@ async fn run_agy_actor(
                                                         &shim,
                                                         &session_id,
                                                         cfg.attachments_dir.as_deref(),
+                                                        prompt_media_caps,
                                                         &mut next_rpc_id,
                                                         &mut active_turn_id,
                                                         &mut active_prompt_rpc_key,
@@ -1198,6 +1458,7 @@ async fn run_agy_actor(
                                             &shim,
                                             &session_id,
                                             cfg.attachments_dir.as_deref(),
+                                            prompt_media_caps,
                                             &mut next_rpc_id,
                                             &mut active_turn_id,
                                             &mut active_prompt_rpc_key,
@@ -1377,9 +1638,14 @@ async fn run_agy_actor(
                     idle_poll_tick = 0;
                 }
 
-                // Poll native Antigravity subagent transcripts for read-only Subagents Track timelines
+                // Poll native Antigravity subagent transcripts for read-only Subagents Track timelines.
+                // Non-Running subagents are checked cheaply via `has_unconsumed_growth()` so resumed
+                // subagents (e.g. via `send_message` or after reconnect/compaction) self-heal back to
+                // `Running` and stream follow-up turns automatically.
                 for (sub_id, (desc, sub_mon)) in subagent_monitors.iter_mut() {
-                    if desc.status != ProviderSubagentStatus::Running {
+                    if desc.status != ProviderSubagentStatus::Running
+                        && !sub_mon.has_unconsumed_growth()
+                    {
                         continue;
                     }
                     poll_agy_subagent_monitor(sub_id, desc, sub_mon, &evt_tx).await;
@@ -1500,6 +1766,15 @@ async fn run_agy_actor(
                                             &evt_tx,
                                         )
                                         .await;
+                                    } else if let Some(recipient_id) =
+                                        extract_send_message_recipient_from_detail(&emit_detail)
+                                    {
+                                        resume_agy_subagent_monitor(
+                                            &recipient_id,
+                                            &mut subagent_monitors,
+                                            &evt_tx,
+                                        )
+                                        .await;
                                     }
                                     tool_cache.insert(canon_id.clone(), emit_detail.clone());
                                     let _ = evt_tx
@@ -1528,6 +1803,23 @@ async fn run_agy_actor(
                                 )
                                 .await;
                             }
+                            WakeupStep::SubagentMessaged { subagent_id } => {
+                                resume_agy_subagent_monitor(
+                                    &subagent_id,
+                                    &mut subagent_monitors,
+                                    &evt_tx,
+                                )
+                                .await;
+                            }
+                            WakeupStep::SubagentsCanceled { ids } => {
+                                cancel_agy_subagent_monitors(
+                                    ids.as_deref(),
+                                    &mut subagent_monitors,
+                                    &evt_tx,
+                                )
+                                .await;
+                            }
+                            WakeupStep::UserMessage { .. } => {}
                             WakeupStep::Notice { level, message } => {
                                 if level != "info" {
                                     warn!(
@@ -1749,6 +2041,7 @@ async fn run_agy_actor(
                                     &shim,
                                     &session_id,
                                     cfg.attachments_dir.as_deref(),
+                                    prompt_media_caps,
                                     &mut next_rpc_id,
                                     &mut active_turn_id,
                                     &mut active_prompt_rpc_key,
@@ -1894,6 +2187,20 @@ async fn apply_foreground_bg_deltas(
                 )
                 .await;
             }
+            BgTaskDelta::SubagentMessaged { subagent_id } => {
+                resume_agy_subagent_monitor(&subagent_id, subagent_monitors, evt_tx).await;
+            }
+            BgTaskDelta::SubagentsCanceled { ids } => {
+                cancel_agy_subagent_monitors(ids.as_deref(), subagent_monitors, evt_tx).await;
+            }
+            BgTaskDelta::Compacted => {
+                let _ = evt_tx
+                    .send(DriverEvent::Notice {
+                        level: "info".into(),
+                        message: "Context compacted automatically".into(),
+                    })
+                    .await;
+            }
         }
     }
 }
@@ -1903,6 +2210,7 @@ async fn dispatch_agy_prompt(
     shim: &orbit_shim::ShimClient,
     session_id: &str,
     attachments_dir: Option<&Path>,
+    prompt_media_caps: AcpPromptMediaCaps,
     next_rpc_id: &mut i64,
     active_turn_id: &mut Option<String>,
     active_prompt_rpc_key: &mut Option<String>,
@@ -1933,7 +2241,12 @@ async fn dispatch_agy_prompt(
     let key = RpcId::Num(id).as_key();
     *active_prompt_rpc_key = Some(key);
 
-    let prompt_blocks = build_agy_prompt_blocks(&prompt, attachments_dir);
+    let prompt_blocks = build_acp_prompt_blocks_async(
+        prompt,
+        attachments_dir.map(Path::to_path_buf),
+        prompt_media_caps,
+    )
+    .await;
     let req = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -2275,6 +2588,48 @@ async fn handle_acp_session_update(
                     evt_tx,
                 )
                 .await;
+            } else if let Some(recipient_id) = extract_send_message_recipient_from_detail(&detail)
+                .or_else(|| {
+                    let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    if is_send_message_tool_name(title) {
+                        transcript_arg_str(
+                            update.get("rawInput"),
+                            &[
+                                "Recipient",
+                                "recipient",
+                                "conversationId",
+                                "conversation_id",
+                                "agent_id",
+                            ],
+                        )
+                    } else {
+                        None
+                    }
+                })
+            {
+                resume_agy_subagent_monitor(&recipient_id, subagent_monitors, evt_tx).await;
+            } else if effective_status == ToolCallStatus::Completed {
+                let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let is_manage = is_manage_subagents_tool_name(title)
+                    || matches!(
+                        &detail,
+                        ToolCallDetail::Generic { tool_name, .. }
+                            if is_manage_subagents_tool_name(tool_name)
+                    );
+                if is_manage {
+                    let raw_out_text = extract_acp_raw_output_text(update.get("rawOutput"));
+                    if let Some(target_ids) = extract_manage_subagents_cancel(
+                        update.get("rawInput"),
+                        raw_out_text.as_deref(),
+                    ) {
+                        cancel_agy_subagent_monitors(
+                            target_ids.as_deref(),
+                            subagent_monitors,
+                            evt_tx,
+                        )
+                        .await;
+                    }
+                }
             }
             tool_cache.insert(call_id.clone(), detail.clone());
             let _ = evt_tx
@@ -2291,6 +2646,222 @@ async fn handle_acp_session_update(
     }
 }
 
+fn extract_system_message_content(raw: &str) -> Option<String> {
+    let idx = raw.find("content=")?;
+    let body = raw[idx + "content=".len()..]
+        .trim_end()
+        .trim_end_matches("</SYSTEM_MESSAGE>")
+        .trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
+fn is_send_message_tool_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    let without_run = trimmed
+        .strip_prefix("Run ")
+        .or_else(|| trimmed.strip_prefix("run "))
+        .unwrap_or(trimmed);
+    let first_tok = without_run.split_whitespace().next().unwrap_or("");
+    let leaf = first_tok
+        .rsplit([':', '/', '.'])
+        .next()
+        .unwrap_or(first_tok)
+        .rsplit("__")
+        .next()
+        .unwrap_or(first_tok);
+    leaf.eq_ignore_ascii_case("send_message") || leaf.eq_ignore_ascii_case("sendmessage")
+}
+
+fn is_manage_subagents_tool_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    let without_run = trimmed
+        .strip_prefix("Run ")
+        .or_else(|| trimmed.strip_prefix("run "))
+        .unwrap_or(trimmed);
+    let first_tok = without_run.split_whitespace().next().unwrap_or("");
+    let leaf = first_tok
+        .rsplit([':', '/', '.'])
+        .next()
+        .unwrap_or(first_tok)
+        .rsplit("__")
+        .next()
+        .unwrap_or(first_tok);
+    leaf.eq_ignore_ascii_case("manage_subagents") || leaf.eq_ignore_ascii_case("managesubagents")
+}
+
+fn extract_uuids_from_text(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    if bytes.len() < 36 {
+        return out;
+    }
+    let is_hex = |b: u8| b.is_ascii_hexdigit();
+    let mut i = 0;
+    while i + 36 <= bytes.len() {
+        let slice = &bytes[i..i + 36];
+        let matches_shape = slice[8] == b'-'
+            && slice[13] == b'-'
+            && slice[18] == b'-'
+            && slice[23] == b'-'
+            && slice[0..8].iter().all(|&b| is_hex(b))
+            && slice[9..13].iter().all(|&b| is_hex(b))
+            && slice[14..18].iter().all(|&b| is_hex(b))
+            && slice[19..23].iter().all(|&b| is_hex(b))
+            && slice[24..36].iter().all(|&b| is_hex(b));
+        if matches_shape {
+            let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let right_ok = i + 36 == bytes.len() || !bytes[i + 36].is_ascii_alphanumeric();
+            if left_ok
+                && right_ok
+                && let Ok(s) = std::str::from_utf8(slice)
+            {
+                let id = s.to_string();
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+                i += 36;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn extract_manage_subagents_cancel(
+    args: Option<&Value>,
+    text_fallback: Option<&str>,
+) -> Option<Option<Vec<String>>> {
+    let action = transcript_arg_str(args, &["Action", "action"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if action == "kill_all" {
+        return Some(None);
+    }
+    if action != "kill" {
+        return None;
+    }
+    let mut ids: Vec<String> = args
+        .and_then(|a| {
+            a.get("ConversationIds")
+                .or_else(|| a.get("conversation_ids"))
+                .and_then(|v| v.as_array())
+        })
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty()
+        && let Some(single) = transcript_arg_str(args, &["ConversationId", "conversation_id"])
+    {
+        ids.push(single);
+    }
+    if ids.is_empty()
+        && let Some(txt) = text_fallback
+    {
+        ids = extract_uuids_from_text(txt);
+    }
+    if ids.is_empty() {
+        None
+    } else {
+        Some(Some(ids))
+    }
+}
+
+fn extract_send_message_recipient_from_detail(detail: &ToolCallDetail) -> Option<String> {
+    let ToolCallDetail::Generic {
+        tool_name,
+        arguments_json,
+    } = detail
+    else {
+        return None;
+    };
+    if !is_send_message_tool_name(tool_name) {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(arguments_json).ok()?;
+    transcript_arg_str(
+        Some(&parsed),
+        &[
+            "Recipient",
+            "recipient",
+            "conversationId",
+            "conversation_id",
+            "agent_id",
+        ],
+    )
+}
+
+async fn cancel_agy_subagent_monitors(
+    target_ids: Option<&[String]>,
+    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let now = Utc::now();
+    for (sub_id, (desc, sub_mon)) in subagent_monitors.iter_mut() {
+        if desc.status != ProviderSubagentStatus::Running {
+            continue;
+        }
+        let matches = match target_ids {
+            None => true,
+            Some(ids) => ids.iter().any(|id| id.trim() == sub_id.as_str()),
+        };
+        if !matches {
+            continue;
+        }
+        desc.status = ProviderSubagentStatus::Canceled;
+        desc.updated_at = now;
+        sub_mon.in_wakeup = false;
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .await;
+    }
+}
+
+async fn resume_agy_subagent_monitor(
+    recipient_id: &str,
+    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let clean_id = recipient_id.trim();
+    if clean_id.is_empty() {
+        return;
+    }
+    let Some((desc, sub_mon)) = subagent_monitors.get_mut(clean_id) else {
+        return;
+    };
+    sub_mon.in_wakeup = true;
+    if desc.status != ProviderSubagentStatus::Running {
+        desc.status = ProviderSubagentStatus::Running;
+        desc.updated_at = Utc::now();
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .await;
+    }
+}
+
+async fn ensure_subagent_running(
+    desc: &mut ProviderSubagentDescriptor,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    if desc.status != ProviderSubagentStatus::Running {
+        desc.status = ProviderSubagentStatus::Running;
+        desc.updated_at = Utc::now();
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .await;
+    }
+}
+
 async fn poll_agy_subagent_monitor(
     sub_id: &str,
     desc: &mut ProviderSubagentDescriptor,
@@ -2299,7 +2870,24 @@ async fn poll_agy_subagent_monitor(
 ) {
     for wake_ev in sub_mon.poll_post_turn_wakeup() {
         match wake_ev {
+            WakeupStep::Started { .. } => {
+                ensure_subagent_running(desc, evt_tx).await;
+            }
+            WakeupStep::UserMessage { id, text } => {
+                ensure_subagent_running(desc, evt_tx).await;
+                let _ = evt_tx
+                    .send(DriverEvent::ProviderSubagentTimeline {
+                        subagent_id: sub_id.to_string(),
+                        payload: TimelinePayload::UserPrompt {
+                            message_id: id,
+                            text,
+                            badges: Vec::new(),
+                        },
+                    })
+                    .await;
+            }
             WakeupStep::Thinking { id, text } => {
+                ensure_subagent_running(desc, evt_tx).await;
                 let _ = evt_tx
                     .send(DriverEvent::ProviderSubagentTimeline {
                         subagent_id: sub_id.to_string(),
@@ -2308,6 +2896,7 @@ async fn poll_agy_subagent_monitor(
                     .await;
             }
             WakeupStep::Message { id, text } => {
+                ensure_subagent_running(desc, evt_tx).await;
                 let _ = evt_tx
                     .send(DriverEvent::ProviderSubagentTimeline {
                         subagent_id: sub_id.to_string(),
@@ -2324,6 +2913,7 @@ async fn poll_agy_subagent_monitor(
                 status,
                 detail,
             } => {
+                ensure_subagent_running(desc, evt_tx).await;
                 let _ = evt_tx
                     .send(DriverEvent::ProviderSubagentTimeline {
                         subagent_id: sub_id.to_string(),
@@ -2359,10 +2949,11 @@ async fn poll_agy_subagent_monitor(
                     })
                     .await;
             }
-            WakeupStep::Started { .. }
-            | WakeupStep::BackgroundTaskStarted { .. }
+            WakeupStep::BackgroundTaskStarted { .. }
             | WakeupStep::BackgroundTaskCompleted { .. }
-            | WakeupStep::SubagentSpawned { .. } => {}
+            | WakeupStep::SubagentSpawned { .. }
+            | WakeupStep::SubagentMessaged { .. }
+            | WakeupStep::SubagentsCanceled { .. } => {}
         }
     }
 }
@@ -2454,10 +3045,22 @@ async fn register_agy_subagent_monitor(
                     desc.subtitle = Some(message);
                     desc.updated_at = Utc::now();
                 }
-                WakeupStep::Started { .. }
-                | WakeupStep::BackgroundTaskStarted { .. }
+                WakeupStep::Started { .. } => {
+                    desc.status = ProviderSubagentStatus::Running;
+                    desc.updated_at = Utc::now();
+                }
+                WakeupStep::UserMessage { id, text } => {
+                    initial_timeline.push(TimelinePayload::UserPrompt {
+                        message_id: id,
+                        text,
+                        badges: Vec::new(),
+                    });
+                }
+                WakeupStep::BackgroundTaskStarted { .. }
                 | WakeupStep::BackgroundTaskCompleted { .. }
-                | WakeupStep::SubagentSpawned { .. } => {}
+                | WakeupStep::SubagentSpawned { .. }
+                | WakeupStep::SubagentMessaged { .. }
+                | WakeupStep::SubagentsCanceled { .. } => {}
             }
         }
         let _ = evt_tx
@@ -3171,6 +3774,10 @@ enum WakeupStep {
     Started {
         source: String,
     },
+    UserMessage {
+        id: String,
+        text: String,
+    },
     Thinking {
         id: String,
         text: String,
@@ -3199,6 +3806,12 @@ enum WakeupStep {
         subagent_id: String,
         role: String,
         prompt_preview: String,
+    },
+    SubagentMessaged {
+        subagent_id: String,
+    },
+    SubagentsCanceled {
+        ids: Option<Vec<String>>,
     },
     Notice {
         level: String,
@@ -3250,6 +3863,13 @@ enum BgTaskDelta {
         role: String,
         prompt_preview: String,
     },
+    SubagentMessaged {
+        subagent_id: String,
+    },
+    SubagentsCanceled {
+        ids: Option<Vec<String>>,
+    },
+    Compacted,
 }
 
 #[derive(Debug, Default)]
@@ -4856,6 +5476,10 @@ enum PendingTranscriptToolMeta {
         action: String,
         task_id: Option<String>,
     },
+    ManageSubagents {
+        action: String,
+        ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -4947,6 +5571,17 @@ impl AgyTranscriptMonitor {
         }
     }
 
+    /// Cheap `stat()` probe used to detect follow-up activity on previously settled subagents.
+    fn has_unconsumed_growth(&self) -> bool {
+        let Some(path) = self.active_path() else {
+            return false;
+        };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        meta.len() != self.byte_offset
+    }
+
     fn sync_silent(&mut self) {
         let _ = self.sync_silent_with_bg_tasks();
     }
@@ -5002,6 +5637,12 @@ impl AgyTranscriptMonitor {
             let Ok(raw) = std::fs::read_to_string(&path) else {
                 continue;
             };
+            if self.seen_undelivered_files.len() >= 2048 {
+                self.seen_undelivered_files.retain(|p| p.exists());
+                if self.seen_undelivered_files.len() >= 2048 {
+                    self.seen_undelivered_files.clear();
+                }
+            }
             self.seen_undelivered_files.insert(path);
 
             let lower = raw.to_ascii_lowercase();
@@ -5251,6 +5892,55 @@ impl AgyTranscriptMonitor {
                         let task_id = transcript_arg_str(args, &["TaskId", "task_id"]);
                         self.pending_silent_tools
                             .push_back(PendingTranscriptToolMeta::ManageTask { action, task_id });
+                    } else if is_manage_subagents_tool_name(tname) {
+                        let action = transcript_arg_str(args, &["Action", "action"])
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        let mut ids: Vec<String> = args
+                            .and_then(|a| {
+                                a.get("ConversationIds")
+                                    .or_else(|| a.get("conversation_ids"))
+                                    .and_then(|v| v.as_array())
+                            })
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(ToOwned::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if ids.is_empty()
+                            && let Some(single) =
+                                transcript_arg_str(args, &["ConversationId", "conversation_id"])
+                        {
+                            ids.push(single);
+                        }
+                        self.pending_silent_tools
+                            .push_back(PendingTranscriptToolMeta::ManageSubagents { action, ids });
+                    } else if is_send_message_tool_name(tname) {
+                        if let Some(recipient_id) = transcript_arg_str(
+                            args,
+                            &[
+                                "Recipient",
+                                "recipient",
+                                "conversationId",
+                                "conversation_id",
+                                "agent_id",
+                            ],
+                        ) {
+                            bg_deltas.push(BgTaskDelta::SubagentMessaged {
+                                subagent_id: recipient_id.clone(),
+                            });
+                            if !silent {
+                                out.push(WakeupStep::SubagentMessaged {
+                                    subagent_id: recipient_id,
+                                });
+                            }
+                        }
+                        self.pending_silent_tools
+                            .push_back(PendingTranscriptToolMeta::Other);
                     } else {
                         self.pending_silent_tools
                             .push_back(PendingTranscriptToolMeta::Other);
@@ -5377,6 +6067,34 @@ impl AgyTranscriptMonitor {
                             }
                         }
                     }
+                    // 5) Paired `manage_subagents(Action: "kill" | "kill_all")` subagent cancellation
+                    if status == "DONE"
+                        && let PendingTranscriptToolMeta::ManageSubagents { action, ids } =
+                            &pending_meta
+                    {
+                        if action == "kill_all" {
+                            bg_deltas.push(BgTaskDelta::SubagentsCanceled { ids: None });
+                            if !silent {
+                                out.push(WakeupStep::SubagentsCanceled { ids: None });
+                            }
+                        } else if action == "kill" {
+                            let resolved_ids = if ids.is_empty() {
+                                extract_uuids_from_text(content)
+                            } else {
+                                ids.clone()
+                            };
+                            if !resolved_ids.is_empty() {
+                                bg_deltas.push(BgTaskDelta::SubagentsCanceled {
+                                    ids: Some(resolved_ids.clone()),
+                                });
+                                if !silent {
+                                    out.push(WakeupStep::SubagentsCanceled {
+                                        ids: Some(resolved_ids),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     for (task_id, canceled) in &completed_bg_tasks {
                         bg_deltas.push(BgTaskDelta::Completed {
                             task_id: task_id.clone(),
@@ -5444,6 +6162,10 @@ impl AgyTranscriptMonitor {
                             completed_bg_tasks.push((tid, true));
                         }
                     }
+                    bg_deltas.push(BgTaskDelta::SubagentsCanceled { ids: None });
+                    if !silent {
+                        out.push(WakeupStep::SubagentsCanceled { ids: None });
+                    }
                 }
                 for (task_id, canceled) in &completed_bg_tasks {
                     bg_deltas.push(BgTaskDelta::Completed {
@@ -5453,20 +6175,26 @@ impl AgyTranscriptMonitor {
                 }
             }
 
+            if step_type == "CHECKPOINT" {
+                bg_deltas.push(BgTaskDelta::Compacted);
+                if !silent {
+                    self.consecutive_errors = 0;
+                    self.last_error_at = None;
+                    self.last_error_message = None;
+                    self.last_in_progress_heartbeat = Some(Instant::now());
+                    out.push(WakeupStep::Notice {
+                        level: "info".into(),
+                        message: "Context compacted automatically".into(),
+                    });
+                }
+                continue;
+            }
+
             if silent {
                 continue;
             }
 
-            if step_type == "CHECKPOINT" {
-                self.consecutive_errors = 0;
-                self.last_error_at = None;
-                self.last_error_message = None;
-                self.last_in_progress_heartbeat = Some(Instant::now());
-                out.push(WakeupStep::Notice {
-                    level: "info".into(),
-                    message: "Context compacted automatically".into(),
-                });
-            } else if is_system_message_step(step_type, content) {
+            if is_system_message_step(step_type, content) {
                 for (task_id, canceled) in completed_bg_tasks {
                     out.push(WakeupStep::BackgroundTaskCompleted { task_id, canceled });
                 }
@@ -5476,17 +6204,34 @@ impl AgyTranscriptMonitor {
                     self.last_error_at = None;
                     self.last_error_message = None;
                     self.last_in_progress_heartbeat = Some(Instant::now());
-                    if !self.always_active {
-                        out.push(WakeupStep::Started {
-                            source: "background_task".into(),
+                    out.push(WakeupStep::Started {
+                        source: if self.always_active {
+                            "message".into()
+                        } else {
+                            "background_task".into()
+                        },
+                    });
+                    if self.always_active
+                        && step_idx > 0
+                        && let Some(msg_text) = extract_system_message_content(content)
+                    {
+                        out.push(WakeupStep::UserMessage {
+                            id: format!("sub_msg_{step_idx}"),
+                            text: msg_text,
                         });
                     }
                 }
             } else if self.always_active && step_type == "USER_INPUT" {
+                let was_idle = !self.in_wakeup;
                 self.in_wakeup = true;
                 self.consecutive_errors = 0;
                 self.last_error_at = None;
                 self.last_error_message = None;
+                if was_idle {
+                    out.push(WakeupStep::Started {
+                        source: "user_input".into(),
+                    });
+                }
             } else if step_type == "ERROR_MESSAGE" {
                 let err_msg = step
                     .get("error")
@@ -5624,6 +6369,8 @@ pub fn resolve_agy_data_dir() -> PathBuf {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "antigravity-cli".into());
     std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".gemini")
@@ -5665,14 +6412,19 @@ struct AgyUsageBucket {
 }
 
 pub async fn probe_antigravity_quota(executable: &Path) -> ProviderQuotaSnapshot {
-    let usage_fut = Command::new(executable)
+    let mut usage_cmd = Command::new(executable);
+    usage_cmd
         .args(["-p", "/usage", "--output-format", "json"])
-        .env("NO_COLOR", "1")
-        .output();
-    let credits_fut = Command::new(executable)
+        .env("NO_COLOR", "1");
+    crate::shell_snapshot::apply_cached_shell_env(&mut usage_cmd);
+    let usage_fut = usage_cmd.output();
+
+    let mut credits_cmd = Command::new(executable);
+    credits_cmd
         .args(["-p", "/credits", "--output-format", "json"])
-        .env("NO_COLOR", "1")
-        .output();
+        .env("NO_COLOR", "1");
+    crate::shell_snapshot::apply_cached_shell_env(&mut credits_cmd);
+    let credits_fut = credits_cmd.output();
 
     let (u_res, c_res) = tokio::time::timeout(Duration::from_secs(18), async {
         tokio::join!(usage_fut, credits_fut)
@@ -5834,6 +6586,31 @@ struct AgyFallbackRow<'a> {
     efforts: &'a [ReasoningEffort],
 }
 
+pub fn antigravity_model_supports_fast_mode(
+    model_id: &str,
+    opt: Option<&Value>,
+    has_fast_config_option: bool,
+) -> bool {
+    if let Some(obj) = opt
+        && let Some(explicit) = obj
+            .get("supportsFastMode")
+            .or_else(|| obj.get("supports_fast_mode"))
+            .and_then(|v| v.as_bool())
+    {
+        return explicit;
+    }
+    if !has_fast_config_option {
+        // Never fabricate fast-mode support for Antigravity unless `agy acp` explicitly
+        // advertises a `fast_mode` config option or per-model flag.
+        return false;
+    }
+    let lower = model_id.trim().to_ascii_lowercase();
+    !(lower.contains("orchestrator")
+        || lower.contains("flash")
+        || lower.contains("haiku")
+        || lower.starts_with("gpt-oss"))
+}
+
 pub fn fallback_antigravity_models() -> ProviderModelCatalog {
     let std_efforts = [
         ReasoningEffort::Low,
@@ -5932,6 +6709,7 @@ pub fn fallback_antigravity_models() -> ProviderModelCatalog {
                     is_default: Some(*e) == row.default_effort,
                 })
                 .collect(),
+            supports_fast_mode: antigravity_model_supports_fast_mode(row.id, None, false),
         })
         .collect();
 
@@ -5949,19 +6727,21 @@ pub async fn probe_antigravity_models(executable: Option<&Path>) -> ProviderMode
     };
 
     let probe_cwd = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
     let rpc_res = tokio::time::timeout(Duration::from_secs(6), async {
-        let mut child = Command::new(exe)
-            .args(["acp", "--stdio"])
+        let mut cmd = Command::new(exe);
+        cmd.args(["acp", "--stdio"])
             .env("NO_COLOR", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .kill_on_drop(true);
+        crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
 
         let Some(mut stdin) = child.stdin.take() else {
             return Err("agy stdin unavailable".to_string());
@@ -6071,6 +6851,9 @@ pub async fn probe_antigravity_models(executable: Option<&Path>) -> ProviderMode
     let thought_opt = config_options
         .iter()
         .find(|o| o.get("id").and_then(|x| x.as_str()) == Some("thought_level"));
+    let has_fast_config_option = config_options
+        .iter()
+        .any(|o| o.get("id").and_then(|x| x.as_str()) == Some("fast_mode"));
 
     let default_model_id = model_opt
         .and_then(|o| o.get("currentValue"))
@@ -6148,6 +6931,11 @@ pub async fn probe_antigravity_models(executable: Option<&Path>) -> ProviderMode
                 is_default: default_model_id.as_deref() == Some(base_id),
                 default_effort: model_def_eff,
                 thinking_options,
+                supports_fast_mode: antigravity_model_supports_fast_mode(
+                    base_id,
+                    Some(opt),
+                    has_fast_config_option,
+                ),
             });
         }
     }
@@ -8154,38 +8942,36 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
     #[tokio::test]
     async fn agy_prompt_missing_trajectory_transparently_recreates_session_with_handoff() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
 
         let sock_path = std::env::temp_dir().join(format!(
             "orbit_test_agy_evicted_{}.sock",
             uuid::Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("bind mock agy shim");
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock agy shim");
 
         let received_prompts: Arc<tokio::sync::Mutex<Vec<(String, String)>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received_prompts);
 
-        // Mock ACP server over shim UDS:
+        // Mock ACP server over shim IPC:
         // - `initialize` -> OK
         // - `session/load` for stale UUID -> silently returns OK (matching real `agy` bug!)
         // - `session/prompt` on stale UUID -> returns `Failed to send user message: not_found: trajectory not found: ...`
         // - `session/new` -> returns fresh UUID `fresh-sess-9999`
         // - `session/prompt` on fresh UUID -> streams assistant chunk and returns `stopReason: end_turn`
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
+            let stream = listener.accept().await.expect("accept");
             let (rh, mut wh) = stream.into_split();
             let mut lines = BufReader::new(rh).lines();
             let mut seq = 0u64;
-            async fn send_stdout(
-                wh: &mut tokio::net::unix::OwnedWriteHalf,
-                seq: &mut u64,
-                payload: Value,
-            ) {
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, payload: Value) {
                 *seq += 1;
                 let frame = ShimFrame::StdoutLine {
                     line: payload.to_string(),
@@ -8329,8 +9115,11 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             attachments_dir: None,
             model: Some("gemini-4-neon".into()),
             effort: Some(ReasoningEffort::Xhigh),
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             resume_session_id: Some("f8c809f0-5617-41ca-b27f-63bd7019833f".into()),
+            fork_from_session_id: None,
+            native_fork_only: false,
             mcp_spec: None,
             system_prompt_append: None,
             extra_env: HashMap::new(),
@@ -8345,6 +9134,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             ),
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
         };
 
         let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
@@ -8435,22 +9226,24 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
     #[tokio::test]
     async fn agy_reattach_restores_active_turn_segment_ids_and_settles_preflight_prompt() {
+        use orbit_shim::ShimListener;
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
         use tokio::io::AsyncWriteExt;
-        use tokio::net::UnixListener;
 
         let sock_path = std::env::temp_dir().join(format!(
             "orbit_test_agy_reattach_{}.sock",
             uuid::Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("bind mock reattached shim");
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock reattached shim");
 
         // Simulate frames arriving after daemon hot-restart for an in-flight turn whose
         // original `session/prompt` RPC had `id: 7` (from before restart).
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut stream = listener.accept().await.expect("accept");
             let frames = [
                 ShimFrame::AttachAck { latest_seq: 500 },
                 ShimFrame::StdoutLine {
@@ -8504,8 +9297,11 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             attachments_dir: None,
             model: Some("gemini-4-carbon".into()),
             effort: Some(ReasoningEffort::High),
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             resume_session_id: Some("sess_live_reattach".into()),
+            fork_from_session_id: None,
+            native_fork_only: false,
             mcp_spec: None,
             system_prompt_append: None,
             extra_env: HashMap::new(),
@@ -8517,6 +9313,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
         };
 
         let actor = tokio::spawn(run_agy_actor(cfg, shim, true, cmd_rx, evt_tx));
@@ -8556,5 +9354,966 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn agy_fast_mode_launch_env_and_session_meta() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        let mut cfg = SessionLaunchConfig {
+            agent_id: "ag_fast".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: PathBuf::from("/tmp/agy_fast.sock"),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-4-carbon".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let env_off = build_agy_launch_env(&cfg);
+        assert!(!env_off.contains_key("AGY_FAST_MODE"));
+        assert!(build_agy_session_meta(&cfg).is_none());
+
+        cfg.fast_mode = true;
+        let env_on = build_agy_launch_env(&cfg);
+        assert_eq!(env_on.get("AGY_FAST_MODE").map(String::as_str), Some("1"));
+        assert_eq!(
+            build_agy_session_meta(&cfg),
+            Some(json!({ "antigravity": { "fastMode": true } }))
+        );
+
+        cfg.system_prompt_append = Some("Keep it concise.".into());
+        assert_eq!(
+            build_agy_session_meta(&cfg),
+            Some(json!({
+                "antigravity": {
+                    "systemPrompt": { "append": "Keep it concise." },
+                    "fastMode": true
+                }
+            }))
+        );
+
+        let req_on = build_agy_set_fast_mode_request(42, "sess_1", true);
+        assert_eq!(req_on["method"], "session/set_config_option");
+        assert_eq!(req_on["params"]["sessionId"], "sess_1");
+        assert_eq!(req_on["params"]["configId"], "fast_mode");
+        assert_eq!(req_on["params"]["value"], "on");
+
+        let req_off = build_agy_set_fast_mode_request(43, "sess_1", false);
+        assert_eq!(req_off["params"]["value"], "off");
+
+        // Fallback catalog must NOT advertise fake fast-mode support when `agy acp` has not
+        // advertised `fast_mode` in `configOptions`.
+        let catalog = fallback_antigravity_models();
+        let carbon = catalog
+            .models
+            .iter()
+            .find(|m| m.id == "gemini-4-carbon")
+            .expect("carbon");
+        assert!(!carbon.supports_fast_mode);
+        let opus = catalog
+            .models
+            .iter()
+            .find(|m| m.id == "claude-opus-5-5")
+            .expect("opus");
+        assert!(!opus.supports_fast_mode);
+        let flash = catalog
+            .models
+            .iter()
+            .find(|m| m.id == "gemini-3.8-flash")
+            .expect("flash");
+        assert!(!flash.supports_fast_mode);
+
+        // When `agy acp` explicitly advertises `fast_mode`, flagship models enable it while
+        // flash/orchestrator models remain excluded.
+        assert!(antigravity_model_supports_fast_mode(
+            "gemini-4-carbon",
+            None,
+            true
+        ));
+        assert!(antigravity_model_supports_fast_mode(
+            "claude-opus-5-5",
+            None,
+            true
+        ));
+        assert!(!antigravity_model_supports_fast_mode(
+            "gemini-3.8-flash",
+            None,
+            true
+        ));
+        assert!(antigravity_model_supports_fast_mode(
+            "gemini-4-carbon",
+            Some(&json!({ "supportsFastMode": true })),
+            false
+        ));
+    }
+
+    #[tokio::test]
+    async fn agy_live_fast_mode_toggle_ignores_unsupported_method_error() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_agy_fast_toggle_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let observed_fast_calls: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_fast_calls);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1}}),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "result":{
+                                    "sessionId":"sess_fast_live",
+                                    "models":{
+                                        "currentModelId":"gemini-4-carbon",
+                                        "availableModels":[{"modelId":"gemini-4-carbon"}]
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/set_config_option" => {
+                        observed_bg.lock().await.push(rpc.clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "error":{"code":-32601,"message":"Method not found"}
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "method":"session/update",
+                                "params":{
+                                    "sessionId":"sess_fast_live",
+                                    "update":{
+                                        "sessionUpdate":"agent_message_chunk",
+                                        "content":{"type":"text","text":"Fast mode ok"}
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}),
+                        )
+                        .await;
+                        break;
+                    }
+                    _ => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_fast_live".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-4-carbon".into()),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(true),
+            })
+            .await
+            .expect("send fast toggle");
+        // Redundant toggle to the same state must NOT send a duplicate RPC
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(true),
+            })
+            .await
+            .expect("send redundant fast toggle");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "turn_fast_1".into(),
+                prompt: "ping".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("send prompt");
+
+        let mut saw_error = false;
+        let mut saw_reply = false;
+        let mut saw_restart_notice = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::StatusChanged(AgentStatus::Error { .. }) => saw_error = true,
+                DriverEvent::Notice { level, message }
+                    if level == "info"
+                        && message.contains("takes effect on next Antigravity session restart") =>
+                {
+                    saw_restart_notice = true;
+                }
+                DriverEvent::AssistantText {
+                    text,
+                    streaming: false,
+                    ..
+                } if text == "Fast mode ok" => saw_reply = true,
+                DriverEvent::StatusChanged(AgentStatus::Idle) => break,
+                _ => {}
+            }
+        }
+
+        assert!(
+            !saw_error,
+            "unsupported set_config_option must not fail session"
+        );
+        assert!(
+            saw_restart_notice,
+            "unsupported set_config_option should inform user via info notice"
+        );
+        assert!(saw_reply);
+        let calls = observed_fast_calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["params"]["configId"], "fast_mode");
+        assert_eq!(calls[0]["params"]["value"], "on");
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn agy_open_session_reconciles_fast_mode_config_option() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_agy_fast_reconcile_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let observed_set_opts: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_set_opts);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "session/load" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "result":{
+                                    "sessionId":"sess_resume_1",
+                                    "models":{
+                                        "currentModelId":"gemini-4-carbon",
+                                        "availableModels":[{"modelId":"gemini-4-carbon"}]
+                                    },
+                                    "configOptions":[
+                                        {"id":"fast_mode","currentValue":"on"}
+                                    ]
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/set_config_option" => {
+                        observed_bg.lock().await.push(rpc.clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                        break;
+                    }
+                    _ => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let mut shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_fast_reconcile".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: Some("sess_resume_1".into()),
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let mut next_id = 1i64;
+        let mut pending = HashMap::new();
+        let opened = open_agy_session(
+            &cfg,
+            &mut shim,
+            &mut next_id,
+            &mut pending,
+            AgySessionOpenMode::Load("sess_resume_1"),
+            None,
+            None,
+            &SessionMode::FullAccess,
+        )
+        .await
+        .expect("open session");
+        assert_eq!(opened.session_id, "sess_resume_1");
+
+        let opts = observed_set_opts.lock().await;
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0]["params"]["sessionId"], "sess_resume_1");
+        assert_eq!(opts[0]["params"]["configId"], "fast_mode");
+        assert_eq!(opts[0]["params"]["value"], "off");
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn resumed_agy_subagent_transitions_back_to_running_and_settles_on_follow_up_turn() {
+        use std::io::Write;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "orbit_agy_subagent_resume_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let logs_dir = tmp.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs_dir).expect("create logs dir");
+        let transcript = logs_dir.join("transcript.jsonl");
+
+        // Turn 1: initial prompt + settled final assistant reply.
+        {
+            let mut f = std::fs::File::create(&transcript).expect("create transcript");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "content": "Initial audit task"
+                })
+            )
+            .expect("write step 0");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "Initial audit complete."
+                })
+            )
+            .expect("write step 1");
+        }
+
+        let now = Utc::now();
+        let sub_id = "sub_resume_1";
+        let mut desc = ProviderSubagentDescriptor {
+            subagent_id: sub_id.into(),
+            parent_agent_id: "ag_parent".into(),
+            parent_subagent_id: None,
+            title: "Code Reviewer".into(),
+            subtitle: None,
+            status: ProviderSubagentStatus::Running,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut sub_mon = AgyTranscriptMonitor::from_brain_dir_subagent(tmp.clone(), sub_id);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        // Poll Turn 1 -> settles to Completed.
+        poll_agy_subagent_monitor(sub_id, &mut desc, &mut sub_mon, &tx).await;
+        assert_eq!(desc.status, ProviderSubagentStatus::Completed);
+        assert!(!sub_mon.has_unconsumed_growth());
+        while rx.try_recv().is_ok() {}
+
+        // Turn 2 arrives via parent `send_message`: new SYSTEM_MESSAGE + active tool call.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("open transcript for append");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 2,
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "content": "[Message] sender=ag_parent content=Please fix the P0 finding."
+                })
+            )
+            .expect("write step 2");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "thinking": "Inspecting the P0 finding now.",
+                    "tool_calls": [
+                        {
+                            "name": "read_file",
+                            "args": { "Path": "/repo/src/lib.rs" }
+                        }
+                    ]
+                })
+            )
+            .expect("write step 3");
+        }
+
+        // Self-healing fallback detects growth on the previously Completed subagent.
+        assert!(sub_mon.has_unconsumed_growth());
+        poll_agy_subagent_monitor(sub_id, &mut desc, &mut sub_mon, &tx).await;
+        assert_eq!(desc.status, ProviderSubagentStatus::Running);
+
+        let mut saw_running_upsert = false;
+        let mut saw_turn2_thinking = false;
+        let mut saw_turn2_tool = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                DriverEvent::ProviderSubagentUpsert(d)
+                    if d.status == ProviderSubagentStatus::Running =>
+                {
+                    assert!(
+                        !saw_turn2_thinking && !saw_turn2_tool,
+                        "Running upsert must precede follow-up turn timeline events"
+                    );
+                    saw_running_upsert = true;
+                }
+                DriverEvent::ProviderSubagentTimeline {
+                    payload: TimelinePayload::AssistantThinking { text, .. },
+                    ..
+                } if text.contains("P0 finding") => {
+                    saw_turn2_thinking = true;
+                }
+                DriverEvent::ProviderSubagentTimeline {
+                    payload: TimelinePayload::ToolCall { .. },
+                    ..
+                } => {
+                    saw_turn2_tool = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_running_upsert);
+        assert!(saw_turn2_thinking);
+        assert!(saw_turn2_tool);
+
+        // Turn 2 finishes: tool completes + final assistant reply settles back to Completed.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("open transcript for settle");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 4,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "file contents"
+                })
+            )
+            .expect("write step 4");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 5,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "P0 fixed and verified."
+                })
+            )
+            .expect("write step 5");
+        }
+
+        poll_agy_subagent_monitor(sub_id, &mut desc, &mut sub_mon, &tx).await;
+        assert_eq!(desc.status, ProviderSubagentStatus::Completed);
+
+        let mut saw_turn2_reply = false;
+        let mut saw_completed_upsert = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                DriverEvent::ProviderSubagentTimeline {
+                    payload: TimelinePayload::AssistantMessage { text, .. },
+                    ..
+                } if text.contains("P0 fixed and verified.") => {
+                    saw_turn2_reply = true;
+                }
+                DriverEvent::ProviderSubagentUpsert(d)
+                    if d.status == ProviderSubagentStatus::Completed =>
+                {
+                    saw_completed_upsert = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_turn2_reply);
+        assert!(saw_completed_upsert);
+
+        // Also verify explicit parent `send_message` resume flips Completed -> Running immediately.
+        let mut monitors = HashMap::new();
+        monitors.insert(sub_id.to_string(), (desc, sub_mon));
+        resume_agy_subagent_monitor(sub_id, &mut monitors, &tx).await;
+        assert_eq!(monitors[sub_id].0.status, ProviderSubagentStatus::Running);
+        assert!(monitors[sub_id].1.in_wakeup);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn manage_subagents_kill_and_kill_all_mark_running_subagents_canceled() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orbit_agy_cancel_sub_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let logs = tmp.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        let transcript = logs.join("transcript_full.jsonl");
+
+        // Parent invokes two subagents, then calls manage_subagents(kill) on sub_1, then kill_all on sub_2
+        let lines = [
+            json!({
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "tool_calls": [
+                    { "name": "invoke_subagent", "args": { "Role": "Worker 1", "Prompt": "Do A" } },
+                    { "name": "invoke_subagent", "args": { "Role": "Worker 2", "Prompt": "Do B" } }
+                ]
+            }),
+            json!({
+                "step_index": 1,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created the following subagent: {\"conversationId\": \"11111111-1111-1111-1111-111111111111\"}"
+            }),
+            json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created the following subagent: {\"conversationId\": \"22222222-2222-2222-2222-222222222222\"}"
+            }),
+            json!({
+                "step_index": 3,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "tool_calls": [
+                    {
+                        "name": "manage_subagents",
+                        "args": {
+                            "Action": "kill",
+                            "ConversationIds": ["11111111-1111-1111-1111-111111111111"]
+                        }
+                    }
+                ]
+            }),
+            json!({
+                "step_index": 4,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Killed subagent 11111111-1111-1111-1111-111111111111"
+            }),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        std::fs::write(&transcript, lines).expect("write transcript");
+
+        let mut monitor = AgyTranscriptMonitor::from_brain_dir_with_session(tmp.clone(), "sess_c");
+        let deltas1 = monitor.poll_foreground_bg_deltas();
+        assert!(deltas1.iter().any(|d| matches!(
+            d,
+            BgTaskDelta::SubagentsCanceled { ids: Some(ids) }
+                if ids.as_slice() == ["11111111-1111-1111-1111-111111111111"]
+        )));
+
+        let mut wakeup_tools = WakeupToolRegistry::default();
+        let mut bg_tracker = BackgroundTaskTracker::default();
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors = HashMap::new();
+        let (evt_tx, mut evt_rx) = mpsc::channel(32);
+
+        apply_foreground_bg_deltas(
+            "ag_parent",
+            deltas1,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &evt_tx,
+        )
+        .await;
+
+        assert_eq!(
+            subagent_monitors["11111111-1111-1111-1111-111111111111"]
+                .0
+                .status,
+            ProviderSubagentStatus::Canceled
+        );
+        assert_eq!(
+            subagent_monitors["22222222-2222-2222-2222-222222222222"]
+                .0
+                .status,
+            ProviderSubagentStatus::Running
+        );
+        while evt_rx.try_recv().is_ok() {}
+
+        // Now append `manage_subagents(Action: "kill_all")`
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("open append");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 5,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [
+                        { "name": "manage_subagents", "args": { "Action": "kill_all" } }
+                    ]
+                })
+            )
+            .expect("w5");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 6,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "Killed all subagents"
+                })
+            )
+            .expect("w6");
+        }
+
+        let deltas2 = monitor.poll_foreground_bg_deltas();
+        apply_foreground_bg_deltas(
+            "ag_parent",
+            deltas2,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &evt_tx,
+        )
+        .await;
+
+        assert_eq!(
+            subagent_monitors["22222222-2222-2222-2222-222222222222"]
+                .0
+                .status,
+            ProviderSubagentStatus::Canceled
+        );
+        let mut saw_canceled_2 = false;
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let DriverEvent::ProviderSubagentUpsert(d) = ev
+                && d.subagent_id == "22222222-2222-2222-2222-222222222222"
+                && d.status == ProviderSubagentStatus::Canceled
+            {
+                saw_canceled_2 = true;
+            }
+        }
+        assert!(saw_canceled_2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn foreground_checkpoint_emits_compaction_notice() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orbit_agy_fg_ckpt_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let logs = tmp.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        let transcript = logs.join("transcript_full.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 12,
+                    "type": "CHECKPOINT",
+                    "status": "DONE"
+                })
+            ),
+        )
+        .expect("write checkpoint");
+
+        let mut monitor = AgyTranscriptMonitor::from_brain_dir_with_session(tmp.clone(), "sess_cp");
+        let deltas = monitor.poll_foreground_bg_deltas();
+        assert!(deltas.iter().any(|d| matches!(d, BgTaskDelta::Compacted)));
+
+        let mut wakeup_tools = WakeupToolRegistry::default();
+        let mut bg_tracker = BackgroundTaskTracker::default();
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors = HashMap::new();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+
+        apply_foreground_bg_deltas(
+            "ag_parent",
+            deltas,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &evt_tx,
+        )
+        .await;
+
+        let notice = evt_rx.try_recv().expect("compaction notice emitted");
+        assert!(matches!(
+            notice,
+            DriverEvent::Notice { level, message }
+                if level == "info" && message == "Context compacted automatically"
+        ));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn manage_subagents_name_normalization_and_output_uuid_fallback_work() {
+        assert!(is_manage_subagents_tool_name("manage_subagents"));
+        assert!(is_manage_subagents_tool_name(
+            "default_api:manage_subagents"
+        ));
+        assert!(is_manage_subagents_tool_name("Run manage_subagents"));
+        assert!(is_manage_subagents_tool_name(
+            "mcp__orbit__manage_subagents"
+        ));
+        assert!(!is_manage_subagents_tool_name("invoke_subagent"));
+
+        let fallback = extract_manage_subagents_cancel(
+            Some(&json!({ "Action": "kill" })),
+            Some("Terminated subagent aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee cleanly."),
+        );
+        assert_eq!(
+            fallback,
+            Some(Some(vec!["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()]))
+        );
+        assert_eq!(
+            extract_manage_subagents_cancel(Some(&json!({ "Action": "kill_all" })), None),
+            Some(None)
+        );
     }
 }

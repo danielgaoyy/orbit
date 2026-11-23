@@ -41,6 +41,7 @@ import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.Layers
 import androidx.compose.material.icons.outlined.MarkChatUnread
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.QrCodeScanner
@@ -131,6 +132,9 @@ fun FleetDrawerContent(
     onCopiedPath: () -> Unit,
     onOpenPairHost: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenAutomations: () -> Unit = {},
+    onOpenWorkspaceBoard: () -> Unit = {},
+    onOpenArchived: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
@@ -639,6 +643,41 @@ fun FleetDrawerContent(
             }
         }
 
+        // 2b. Compact Workspace Utility Strip (Automations · Board · Archived)
+        if (ui.selectedHostId != null) {
+            val automationCount = (ui.hostDetail?.schedules?.size ?: 0) +
+                (ui.hostDetail?.conditionalTimers?.size ?: 0) +
+                (ui.hostDetail?.goalRuns?.size ?: 0) +
+                (ui.hostDetail?.workflowRuns?.size ?: 0)
+            val archivedCount = ui.hostDetail?.archivedAgents?.size ?: 0
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = OrbitSpacing.md)
+                    .padding(top = OrbitSpacing.xs),
+                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+            ) {
+                DrawerUtilityChip(
+                    icon = Icons.Outlined.Schedule,
+                    label = if (automationCount > 0) "Auto ($automationCount)" else "Automations",
+                    onClick = onOpenAutomations,
+                    modifier = Modifier.weight(1f),
+                )
+                DrawerUtilityChip(
+                    icon = Icons.Outlined.Layers,
+                    label = "Board",
+                    onClick = onOpenWorkspaceBoard,
+                    modifier = Modifier.weight(1f),
+                )
+                DrawerUtilityChip(
+                    icon = Icons.Outlined.Archive,
+                    label = if (archivedCount > 0) "Archived ($archivedCount)" else "Archived",
+                    onClick = onOpenArchived,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+
         // 3. Thumb-Zone Bottom Utility Bar: [ Host Switcher Pill ] + [ Settings Circle ]
         Row(
             modifier = Modifier
@@ -814,6 +853,41 @@ fun FleetDrawerContent(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun DrawerUtilityChip(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    Row(
+        modifier = modifier
+            .height(32.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(colors.subtleFill)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = colors.fgSecondary,
+            modifier = Modifier.size(13.dp),
+        )
+        Text(
+            text = label,
+            style = typography.metaMedium,
+            color = colors.fgSecondary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

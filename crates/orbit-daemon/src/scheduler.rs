@@ -266,6 +266,10 @@ impl ScheduleEngine {
         scheduled_tick: bool,
     ) -> ScheduleRunRecord {
         let run_id = format!("run_{}", &Uuid::new_v4().simple().to_string()[..10]);
+        let _keep_awake_lease = self
+            .orchestrator
+            .keep_awake()
+            .acquire_lease(format!("schedule:{run_id}"));
         let started_at = Utc::now();
         let mut run = ScheduleRunRecord {
             run_id: run_id.clone(),
@@ -431,6 +435,7 @@ impl ScheduleEngine {
                     provider: cfg.provider,
                     model: cfg.model.clone(),
                     effort: cfg.effort,
+                    fast_mode: if cfg.fast_mode { Some(true) } else { None },
                     mode: cfg.mode.clone(),
                     initial_prompt: sched.prompt.clone(),
                     initial_display_prompt: None,
@@ -448,6 +453,7 @@ impl ScheduleEngine {
                     pr_number: None,
                     handle: None,
                     auto_cluster: Some(false),
+                    acp_agent_id: cfg.acp_agent_id.clone(),
                 };
                 match self.orchestrator.create_and_start_agent(spec).await {
                     Ok(agent) => {

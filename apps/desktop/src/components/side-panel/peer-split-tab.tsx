@@ -7,6 +7,7 @@ import {
   Loader2,
   Square,
 } from "lucide-react";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { orbitIpc, semanticAgentTabLabel } from "@/lib/orbit-ipc";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { ProviderIcon } from "@/components/ui/provider-icons";
@@ -33,6 +34,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
 
   const [reply, setReply] = useState("");
   const [sending, setSending] = useState(false);
+  const replyIme = useImeCompositionGuard();
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -191,7 +193,9 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
           <input
             value={reply}
             onChange={(e) => setReply(e.target.value)}
+            {...replyIme.compositionProps}
             onKeyDown={(e) => {
+              if (replyIme.shouldIgnoreKeyDown(e)) return;
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 void handleSend();

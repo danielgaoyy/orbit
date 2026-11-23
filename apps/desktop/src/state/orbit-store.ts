@@ -1,4 +1,9 @@
 import { useSyncExternalStore } from "react";
+import { PROVIDERS } from "@/components/composer/composer-constants";
+import {
+  createDraftPersistenceController,
+  hasNonEmptyScopeDraft,
+} from "@/lib/draft-persistence";
 import {
   normalizeLineRange,
   normalizeWorkspacePathCandidate,
@@ -6,22 +11,43 @@ import {
   resolveUniqueWorkspaceFileSuffix,
 } from "@/lib/file-links";
 import {
+  defaultMimeForMedia,
+  detectRichMediaKind,
+  estimatePdfPageCount,
+  type RichMediaKind,
+} from "@/lib/media-utils";
+import {
+  getCachedPromptImage,
+  lookupRecentSentTurnImage,
   recordRecentSentTurnImages,
   seedPromptImagePreview,
   type SentImagePreviewMeta,
 } from "@/lib/prompt-image-cache";
 import {
   getCatalogForProvider,
+  modelSupportsFastMode,
   resolveActiveModelSpec,
   resolveSupportedEffortForModel,
   seedFallbackProviderCatalogs,
 } from "@/lib/model-catalog";
+import { sharedDisclosureStateStore } from "@/lib/disclosure-state";
 import {
   isBareHomeDir,
   isLocalHostCard,
   matchesProjectDirectory,
   projectPathScopeKey,
 } from "@/lib/projects";
+import {
+  MAX_CACHED_STAGE_VIEWS,
+  collectPinnedStageKeys,
+  computeGitReviewSignature,
+  evictInactiveStageEntries,
+  mergeGitReviewSnapshot,
+  normalizeCwdForCompare,
+  recordStageAccess,
+  removeStageAccessKeys,
+  upsertSubagentSidePanelTab,
+} from "@/lib/stage-cache";
 import {
   SIDE_PANEL_DEFAULT_WIDTH_PX,
   SIDEBAR_DEFAULT_WIDTH_PX,
@@ -31,20 +57,66 @@ import {
 } from "@/lib/workspace-layout";
 import {
   type AgentStageView,
+  type BrowserActionRequest,
+  type BrowserActionResponseView,
+  type BrowserElementRef,
+  type BrowserPolicyConfig,
+  type BrowserSessionSummary,
+  type BrowserSessionsSnapshotView,
   type ClientThreadPrefSeed,
   type CloudSyncResultView,
   type CloudSyncStatusView,
   type ComposerContextInput,
+  type ContextOccupancyBreakdown,
   type CoreNotification,
+  type GoalControlAction,
+  type GoalRunRecord,
+  type MonitorKind,
+  type MonitorWatchRecord,
+  type BestOfNCandidateSpec,
+  type DagStepSpec,
+  type WorkflowRunRecord,
+  type MatchedPathRulesView,
+  type PathRulesSnapshotView,
+  type UpsertPathRuleParams,
   type ExternalEditorInfo,
   type ExternalEditorKind,
+  type ExternalMcpServerRecord,
+  type EventTriggerDelivery,
+  type EventTriggerRecord,
+  type EventTriggersSnapshotView,
+  type ExtractedCodeBlock,
+  type UpsertEventTriggerRequest,
   type FleetOverviewView,
   type FleetSidebarView,
+  type HookExecutionRecord,
+  type HookScope,
+  type LifecycleHookRule,
+  type LifecycleHooksSnapshotView,
+  type LspDiagnostic,
+  type LspLocation,
+  type LspServerStatus,
   type GitHubDeviceFlowStartView,
   type GitReposInspectionView,
   type GitReviewView,
   type HostDetailView,
+  type McpProbeResult,
   type PromptBadge,
+  PROVIDER_LIST,
+  formatProviderLabel,
+  type GuardianAuditEntry,
+  type GuardianConfigSnapshotView,
+  type GuardianPolicyConfig,
+  type ImChannelRecord,
+  type ImChannelTestResultView,
+  type ImChannelsSnapshotView,
+  type ImThreadBinding,
+  type PushDeviceRecord,
+  type PushDevicesSnapshotView,
+  type PushPreferences,
+  type PushTestResultView,
+  type UpdatePushPreferencesRequest,
+  type UpsertImChannelRequest,
   type ProviderKind,
   type ReasoningEffort,
   type ReleaseUpdateInfo,
@@ -55,14 +127,22 @@ import {
   type SlashDirective,
   type SpawnWorkspacePeerRequest,
   type SshHostItem,
+  type UpsertExternalMcpServerRequest,
+  type UsageInsightsSnapshot,
+  type WorkspaceFileConflict,
+  type WorktreeHandoffDirection,
+  type WorktreeHandoffMode,
   type WorkspaceFileView,
   isAgentBackgroundWaiting,
   isAgentForegroundRunning,
+  isLinuxDesktop,
   isMacDesktop,
+  isWindowsDesktop,
   compareSemver,
   normalizeSemver,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import { containsInlineMentionToken, extractLineSnippet } from "@/lib/symbol-mentions";
 
 export interface HostDaemonUpgradeState {
   status: "upgrading" | "done" | "failed" | "skipped";
@@ -137,6 +217,18 @@ export type InlineMentionTarget =
       label: string;
       lineCount: number;
       content: string;
+    }
+  | {
+      token: string;
+      kind: "code_symbol";
+      path: string;
+      startLine: number;
+      endLine: number;
+      symbolName: string;
+      symbolKind: string;
+      signature?: string | null;
+      container?: string | null;
+      language: string;
     };
 
 export interface QueuedPromptItem {
@@ -157,6 +249,18 @@ export interface DiffQuoteSnippet {
   code: string;
 }
 
+export interface MediaPreviewTarget {
+  kind: RichMediaKind;
+  filename: string;
+  path?: string | null;
+  hostId?: string | null;
+  cwd?: string | null;
+  localUrl?: string | null;
+  mimeType?: string | null;
+  sizeBytes?: number | null;
+  pdfPageCount?: number | null;
+}
+
 export type ContextMentionItem =
   | {
       id: string;
@@ -167,9 +271,26 @@ export type ContextMentionItem =
       stagedHostId?: string;
       localFile?: File;
       uploading?: boolean;
+      mediaKind?: RichMediaKind;
+      mimeType?: string;
+      pdfPageCount?: number | null;
+      previewUrl?: string;
     }
   | { id: string; kind: "git_diff"; staged: boolean; label: string }
   | { id: string; kind: "terminal_output"; label: string; lineCount: number; content: string }
+  | {
+      id: string;
+      kind: "code_symbol";
+      path: string;
+      startLine: number;
+      endLine: number;
+      symbolName: string;
+      symbolKind: string;
+      signature?: string | null;
+      container?: string | null;
+      language: string;
+      snippet?: string | null;
+    }
   | {
       id: string;
       kind: "image";
@@ -200,7 +321,8 @@ export type SidePanelTabKind =
   | "side_question"
   | "subagent"
   | "board"
-  | "peer";
+  | "peer"
+  | "artifacts";
 
 export interface SidePanelTab {
   id: string;
@@ -221,12 +343,62 @@ export interface SidePanelTab {
   parentAgentId?: string | null;
   workspaceId?: string;
   peerAgentId?: string;
+  artifactId?: string;
 }
 
 export interface FileViewCacheEntry {
   status: "loading" | "ready" | "error";
   data?: WorkspaceFileView;
   error?: string;
+}
+
+export type WorkspaceLineEnding = "lf" | "crlf" | "mixed";
+
+export interface FileEditorDraftState {
+  hostId: string;
+  cwd: string;
+  path: string;
+  content: string;
+  baseEtag: string | null;
+  baseContent: string;
+  lineEnding: WorkspaceLineEnding;
+  dirty: boolean;
+  mode: "view" | "edit";
+  saving: boolean;
+  saveError: string | null;
+  conflict: WorkspaceFileConflict | null;
+}
+
+function normalizeLineEndingKind(raw?: string | null): WorkspaceLineEnding {
+  if (raw === "crlf" || raw === "mixed") return raw;
+  return "lf";
+}
+
+function normalizeEditorText(raw: string): string {
+  return raw.replace(/\r\n/g, "\n");
+}
+
+export interface PendingUnsavedFileAction {
+  fileKey: string;
+  label: string;
+  action:
+    | { kind: "focus_tab"; tabId: string }
+    | { kind: "close_tab"; tabId: string }
+    | {
+        kind: "open_file";
+        rawPath: string;
+        opts?: {
+          focusLine?: number | null;
+          focusEndLine?: number | null;
+          hostId?: string;
+          cwd?: string;
+          fallbackPath?: string;
+          initialMode?: "view" | "edit";
+        };
+      }
+    | { kind: "new_tab" }
+    | { kind: "switch_to_view"; hostId: string; cwd: string; path: string }
+    | { kind: "reload"; hostId: string; cwd: string; path: string };
 }
 
 export interface SideQuestionEntry {
@@ -248,9 +420,21 @@ export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
 export type WorkspacePanelMode = "conversation" | "automations";
-export type HostSettingsTab = "agents" | "usage" | "connection";
+export type HostSettingsTab =
+  | "agents"
+  | "guardian"
+  | "im_channels"
+  | "skills"
+  | "acp"
+  | "mcp"
+  | "rules"
+  | "hooks"
+  | "lsp"
+  | "usage"
+  | "connection";
 export type SettingsSection =
   | "general"
+  | "instructions"
   | "cloud_sync"
   | "appearance"
   | "shortcuts"
@@ -258,7 +442,7 @@ export type SettingsSection =
   | "archived"
   | "add_host"
   | `host:${string}:${HostSettingsTab}`;
-export type SettingsSectionTarget = SettingsSection | "hosts" | "providers";
+export type SettingsSectionTarget = SettingsSection | "hosts" | "providers" | "skills";
 export type TerminalCursorStyle = "bar" | "block" | "underline";
 export type SidebarProjectSort = "recent" | "alphabetical" | "manual";
 export type SidebarThreadFilter = "all" | "active_unread";
@@ -321,21 +505,46 @@ export function sideQuestionScopeKey(s: Pick<OrbitUiState, "selectedHostId" | "s
   return `${s.selectedHostId ?? "none"}::${s.selectedAgentId}`;
 }
 
+export interface PendingJumpTarget {
+  hostId: string;
+  agentId: string;
+  seq: number;
+  nonce: number;
+}
+
+export interface WorktreeHandoffDialogTarget {
+  hostId: string;
+  workspaceId: string;
+  direction: WorktreeHandoffDirection;
+  defaultMode?: WorktreeHandoffMode;
+  sourceCwd?: string;
+  targetWorkspaceId?: string | null;
+}
+
+export interface InstructionsTarget {
+  hostId: string;
+  cwd: string;
+}
+
 export interface OrbitUiState {
   fleet: FleetOverviewView;
   fleetHydrated: boolean;
   bootstrapError: string | null;
   hostDetails: Record<string, HostDetailView>;
   selectedHostId: string | null;
+  instructionsTarget: InstructionsTarget | null;
   selectedAgentId: string | null;
   selectedWorkspaceCwd: string;
   isDraftNewSession: boolean;
   sessionScrollNonce: number;
+  pendingJumpTarget: PendingJumpTarget | null;
 
   // Draft new-session launch configuration
   draftProvider: ProviderKind;
-  draftModels: Record<ProviderKind, string | null>;
+  draftAcpAgentId: string | null;
+  draftModels: Partial<Record<ProviderKind, string | null>>;
   draftEffort: ReasoningEffort;
+  draftFastMode: boolean;
   draftMode: SessionMode;
   draftProfileId: string | null;
   draftUseWorktree: boolean;
@@ -353,6 +562,7 @@ export interface OrbitUiState {
   diffQuotes: Record<string, DiffQuoteSnippet[]>;
   queuedPrompts: Record<string, QueuedPromptItem[]>;
   workspaceFilesCache: Record<string, string[]>;
+  workspaceEmptyDirsCache: Record<string, string[]>;
   promptHistory: string[];
 
   // Incremental stage projections keyed by `hostId::agentId` + Rust sidebar tree + slash commands
@@ -367,6 +577,8 @@ export interface OrbitUiState {
   sidePanelTabs: SidePanelTab[];
   activeSidePanelTabId: string | null;
   fileViewCache: Record<string, FileViewCacheEntry>;
+  fileEditorDrafts: Record<string, FileEditorDraftState>;
+  pendingUnsavedFileAction: PendingUnsavedFileAction | null;
   sideQuestionsByScope: Record<string, SideQuestionEntry[]>;
   sideQuestionDrafts: Record<string, string>;
   sideQuestionFocusNonce: number;
@@ -418,8 +630,17 @@ export interface OrbitUiState {
   pairDialogOpen: boolean;
   relayDialogOpen: boolean;
   remoteFolderPickerHostId: string | null;
+  exportDialogTarget: { hostId: string; agentId: string } | null;
+  copyCodeBlocksTarget: {
+    hostId: string;
+    agentId: string;
+    blocks: ExtractedCodeBlock[];
+  } | null;
+  handoffDialogTarget: WorktreeHandoffDialogTarget | null;
+  mediaPreviewTarget: MediaPreviewTarget | null;
   sshHosts: SshHostItem[];
   externalEditors: ExternalEditorInfo[];
+  externalMcpServersByHost: Record<string, ExternalMcpServerRecord[]>;
   toastNotice: string | null;
   lastArchivedUndo: UndoArchiveEntry | null;
   appVersion: string | null;
@@ -433,10 +654,96 @@ export interface OrbitUiState {
 
   // Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist)
   cloudSyncStatus: CloudSyncStatusView | null;
+  pathRulesByScope: Record<string, PathRulesSnapshotView>;
   cloudSyncBusy: boolean;
   cloudSyncError: string | null;
   cloudSyncDeviceFlow: GitHubDeviceFlowStartView | null;
   cloudSyncLastResult: CloudSyncResultView | null;
+
+  // Pure-Rust LSP Language Servers & File Diagnostics
+  lspServersByWorkspace: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      servers: LspServerStatus[];
+      error?: string | null;
+    }
+  >;
+  lspDiagnosticsByFile: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      diagnostics: LspDiagnostic[];
+    }
+  >;
+  // Deterministic Lifecycle Hooks (UserGlobal + ProjectOrbit)
+  lifecycleHooksByScope: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      hooks: LifecycleHookRule[];
+      recentExecutions: HookExecutionRecord[];
+      projectHooksTrusted: boolean;
+      error?: string | null;
+    }
+  >;
+  browserByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      sessions: BrowserSessionSummary[];
+      policy: BrowserPolicyConfig | null;
+      chromeBinary: string | null;
+      activeSessionId: string | null;
+      elementsBySession: Record<string, BrowserElementRef[]>;
+      textExcerptBySession: Record<string, string | null>;
+      busy: boolean;
+      error?: string | null;
+    }
+  >;
+  guardianByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      config: GuardianPolicyConfig | null;
+      recentAudits: GuardianAuditEntry[];
+      saving?: boolean;
+      error?: string | null;
+    }
+  >;
+  // External Event Triggers (GitHub, Slack, Linear, Generic Webhook + GitHub PR Polling)
+  eventTriggersByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      triggers: EventTriggerRecord[];
+      recentDeliveries: EventTriggerDelivery[];
+      baseWebhookUrl: string;
+      error?: string | null;
+    }
+  >;
+  imChannelsByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      channels: ImChannelRecord[];
+      bindings: ImThreadBinding[];
+      baseWebhookUrl: string;
+      saving?: boolean;
+      error?: string | null;
+    }
+  >;
+  pushByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      devices: PushDeviceRecord[];
+      preferences: PushPreferences | null;
+      saving?: boolean;
+      testing?: boolean;
+      error?: string | null;
+    }
+  >;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -444,6 +751,12 @@ export interface OrbitUiState {
   enterToSend: boolean;
   notifyOnApproval: boolean;
   notifyOnTurnComplete: boolean;
+  notifyOnAgentError: boolean;
+  notifyOnGoalFinished: boolean;
+  notifySoundEnabled: boolean;
+  notifyQuietHoursEnabled: boolean;
+  notifyQuietStartHour: number;
+  notifyQuietEndHour: number;
   coalesceExploration: boolean;
   worktreeBranchPrefix: string;
   preferredEditor: ExternalEditorKind | null;
@@ -459,6 +772,12 @@ interface PersistedPrefs {
   enterToSend?: boolean;
   notifyOnApproval?: boolean;
   notifyOnTurnComplete?: boolean;
+  notifyOnAgentError?: boolean;
+  notifyOnGoalFinished?: boolean;
+  notifySoundEnabled?: boolean;
+  notifyQuietHoursEnabled?: boolean;
+  notifyQuietStartHour?: number;
+  notifyQuietEndHour?: number;
   coalesceExploration?: boolean;
   worktreeBranchPrefix?: string;
   preferredEditor?: ExternalEditorKind | null;
@@ -484,8 +803,10 @@ interface PersistedPrefs {
   overviewCollapsedSections?: Partial<Record<OverviewSectionId, boolean>>;
   diffLayout?: DiffLayoutMode;
   draftProvider?: ProviderKind;
+  draftAcpAgentId?: string | null;
   draftModels?: Partial<Record<ProviderKind, string | null>>;
   draftEffort?: ReasoningEffort;
+  draftFastMode?: boolean;
   draftMode?: SessionMode;
   draftUseWorktree?: boolean;
   promptHistory?: string[];
@@ -518,6 +839,12 @@ function writePrefsNow(snap: OrbitUiState): void {
       enterToSend: snap.enterToSend,
       notifyOnApproval: snap.notifyOnApproval,
       notifyOnTurnComplete: snap.notifyOnTurnComplete,
+      notifyOnAgentError: snap.notifyOnAgentError,
+      notifyOnGoalFinished: snap.notifyOnGoalFinished,
+      notifySoundEnabled: snap.notifySoundEnabled,
+      notifyQuietHoursEnabled: snap.notifyQuietHoursEnabled,
+      notifyQuietStartHour: snap.notifyQuietStartHour,
+      notifyQuietEndHour: snap.notifyQuietEndHour,
       coalesceExploration: snap.coalesceExploration,
       worktreeBranchPrefix: snap.worktreeBranchPrefix,
       preferredEditor: snap.preferredEditor,
@@ -540,8 +867,10 @@ function writePrefsNow(snap: OrbitUiState): void {
       overviewCollapsedSections: snap.overviewCollapsedSections,
       diffLayout: snap.diffLayout,
       draftProvider: snap.draftProvider,
+      draftAcpAgentId: snap.draftAcpAgentId,
       draftModels: snap.draftModels,
       draftEffort: snap.draftEffort,
+      draftFastMode: snap.draftFastMode,
       draftMode: snap.draftMode,
       draftUseWorktree: snap.draftUseWorktree,
       promptHistory: snap.promptHistory.slice(-30),
@@ -565,14 +894,42 @@ function scheduleSavePrefs(): void {
   }, 180);
 }
 
-const beforeUnloadListener = () => {
+const beforeUnloadListener = (e: BeforeUnloadEvent) => {
   if (savePrefsPending) {
     writePrefsNow(state);
+  }
+  if (Object.values(state.fileEditorDrafts).some((d) => d.dirty)) {
+    e.preventDefault();
+    e.returnValue = "";
   }
 };
 
 if (typeof window !== "undefined") {
   window.addEventListener("beforeunload", beforeUnloadListener);
+}
+
+const handleAppFocusGitRefresh = () => {
+  if (!initialized || disposed) return;
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+  if (!state.selectedHostId || !state.selectedWorkspaceCwd) return;
+  scheduleAutoRefreshGit(state.selectedHostId, state.selectedWorkspaceCwd, {
+    delayMs: 600,
+    minIntervalMs: 3000,
+    reason: "focus",
+  });
+};
+
+const handleVisibilityGitRefresh = () => {
+  if (typeof document !== "undefined" && document.visibilityState === "visible") {
+    handleAppFocusGitRefresh();
+  }
+};
+
+if (typeof window !== "undefined") {
+  window.addEventListener("focus", handleAppFocusGitRefresh);
+}
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", handleVisibilityGitRefresh);
 }
 
 function detectSystemTheme(): ResolvedTheme {
@@ -603,10 +960,9 @@ applyDocumentTheme(initialResolvedTheme);
 if (typeof document !== "undefined") {
   if (isMacDesktop()) {
     document.documentElement.classList.add("orbit-mac");
-  } else if (
-    typeof navigator !== "undefined" &&
-    /Linux/i.test(navigator.platform || navigator.userAgent)
-  ) {
+  } else if (isWindowsDesktop()) {
+    document.documentElement.classList.add("orbit-windows");
+  } else if (isLinuxDesktop()) {
     document.documentElement.classList.add("orbit-linux");
   }
 }
@@ -641,6 +997,7 @@ interface OrbitStoreHmrData {
   state?: OrbitUiState;
   terminalChannels?: Map<string, TerminalStreamChannel>;
   wasInitialized?: boolean;
+  draftUpdatedAtByScope?: Record<string, number>;
 }
 
 const viteHot = (
@@ -653,24 +1010,35 @@ const viteHot = (
 ).hot;
 const hmrData = viteHot?.data;
 
+const draftPersistence = createDraftPersistenceController(() => state);
+const initialDrafts = draftPersistence.hydrate(initialPrefs.archivedThreads);
+if (hmrData?.draftUpdatedAtByScope) {
+  draftPersistence.restoreUpdatedAtByScope(hmrData.draftUpdatedAtByScope);
+}
+
+const externalMcpSnapshotSeqByHost: Record<string, number> = {};
+
 const defaultInitialState: OrbitUiState = {
   fleet: { revision: 0, total_pending_approvals: 0, hosts: [], projects: [] },
   fleetHydrated: false,
   bootstrapError: null,
   hostDetails: {},
   selectedHostId: null,
+  instructionsTarget: null,
   selectedAgentId: null,
   selectedWorkspaceCwd: "",
   isDraftNewSession: false,
   sessionScrollNonce: 0,
+  pendingJumpTarget: null,
 
   draftProvider: initialPrefs.draftProvider ?? "codex",
+  draftAcpAgentId: initialPrefs.draftAcpAgentId ?? null,
   draftModels: {
-    claude_code: initialPrefs.draftModels?.claude_code ?? null,
-    codex: initialPrefs.draftModels?.codex ?? null,
-    antigravity: initialPrefs.draftModels?.antigravity ?? null,
+    ...Object.fromEntries([...PROVIDER_LIST.map((p) => p.id), "acp" as const].map((id) => [id, null])),
+    ...(initialPrefs.draftModels ?? {}),
   },
   draftEffort: initialPrefs.draftEffort ?? "medium",
+  draftFastMode: initialPrefs.draftFastMode ?? false,
   draftMode:
     initialPrefs.draftMode && initialPrefs.draftMode !== "plan"
       ? initialPrefs.draftMode
@@ -682,14 +1050,15 @@ const defaultInitialState: OrbitUiState = {
   draftWorkspaceId: null,
   gitReposCache: {},
 
-  composerDrafts: {},
-  slashDirectives: {},
+  composerDrafts: initialDrafts.composerDrafts,
+  slashDirectives: initialDrafts.slashDirectives,
   inlineMentions: {},
-  contextItems: {},
-  pastedAttachments: {},
-  diffQuotes: {},
+  contextItems: initialDrafts.contextItems,
+  pastedAttachments: initialDrafts.pastedAttachments,
+  diffQuotes: initialDrafts.diffQuotes,
   queuedPrompts: {},
   workspaceFilesCache: {},
+  workspaceEmptyDirsCache: {},
   promptHistory: initialPrefs.promptHistory ?? [],
 
   stages: {},
@@ -703,8 +1072,10 @@ const defaultInitialState: OrbitUiState = {
   sidePanelTabs: [],
   activeSidePanelTabId: null,
   fileViewCache: {},
+  fileEditorDrafts: {},
+  pendingUnsavedFileAction: null,
   sideQuestionsByScope: {},
-  sideQuestionDrafts: {},
+  sideQuestionDrafts: initialDrafts.sideQuestionDrafts,
   sideQuestionFocusNonce: 0,
   sidePanelLaunchpadFocusNonce: 0,
 
@@ -713,6 +1084,14 @@ const defaultInitialState: OrbitUiState = {
   diffLayout: initialPrefs.diffLayout ?? "unified",
   selectedDiffPath: null,
   gitReviews: {},
+  lspServersByWorkspace: {},
+  lspDiagnosticsByFile: {},
+  lifecycleHooksByScope: {},
+  browserByHost: {},
+  guardianByHost: {},
+  eventTriggersByHost: {},
+  imChannelsByHost: {},
+  pushByHost: {},
 
   overviewDesktopOpenPref: initialPrefs.overviewDesktopOpenPref ?? true,
   overviewPopoverOpen: false,
@@ -761,8 +1140,13 @@ const defaultInitialState: OrbitUiState = {
   pairDialogOpen: false,
   relayDialogOpen: false,
   remoteFolderPickerHostId: null,
+  exportDialogTarget: null,
+  copyCodeBlocksTarget: null,
+  handoffDialogTarget: null,
+  mediaPreviewTarget: null,
   sshHosts: [],
   externalEditors: [],
+  externalMcpServersByHost: {},
   toastNotice: null,
   lastArchivedUndo: null,
   appVersion: null,
@@ -784,6 +1168,7 @@ const defaultInitialState: OrbitUiState = {
   },
 
   cloudSyncStatus: null,
+  pathRulesByScope: {},
   cloudSyncBusy: false,
   cloudSyncError: null,
   cloudSyncDeviceFlow: null,
@@ -794,6 +1179,18 @@ const defaultInitialState: OrbitUiState = {
   enterToSend: initialPrefs.enterToSend ?? true,
   notifyOnApproval: initialPrefs.notifyOnApproval ?? true,
   notifyOnTurnComplete: initialPrefs.notifyOnTurnComplete ?? false,
+  notifyOnAgentError: initialPrefs.notifyOnAgentError ?? true,
+  notifyOnGoalFinished: initialPrefs.notifyOnGoalFinished ?? true,
+  notifySoundEnabled: initialPrefs.notifySoundEnabled ?? true,
+  notifyQuietHoursEnabled: initialPrefs.notifyQuietHoursEnabled ?? false,
+  notifyQuietStartHour:
+    typeof initialPrefs.notifyQuietStartHour === "number"
+      ? Math.min(23, Math.max(0, Math.round(initialPrefs.notifyQuietStartHour)))
+      : 23,
+  notifyQuietEndHour:
+    typeof initialPrefs.notifyQuietEndHour === "number"
+      ? Math.min(23, Math.max(0, Math.round(initialPrefs.notifyQuietEndHour)))
+      : 7,
   coalesceExploration: initialPrefs.coalesceExploration ?? true,
   worktreeBranchPrefix: initialPrefs.worktreeBranchPrefix ?? "auto",
   preferredEditor: initialPrefs.preferredEditor ?? null,
@@ -811,7 +1208,12 @@ let state: OrbitUiState = hmrData?.state
 
 const listeners = new Set<() => void>();
 const composerDraftListeners = new Set<() => void>();
-const composerFocusListeners = new Set<() => void>();
+const draftPresenceListeners = new Set<() => void>();
+export interface ComposerFocusOptions {
+  onlyIfIdle?: boolean;
+}
+
+const composerFocusListeners = new Set<(opts?: ComposerFocusOptions) => void>();
 
 const autoUpgradeAttempted = new Map<string, string>();
 
@@ -869,10 +1271,64 @@ interface SimpleSyncGate {
   rafId: number | null;
 }
 const stagePullGates = new Map<string, StagePullGate>();
+let stageAccessOrder: string[] = [];
+
+function applyStageCacheUpdate(
+  s: OrbitUiState,
+  tlKey: string,
+  nextStage: AgentStageView,
+): Record<string, AgentStageView> {
+  const merged = {
+    ...s.stages,
+    [tlKey]: nextStage,
+  };
+  stageAccessOrder = recordStageAccess(stageAccessOrder, tlKey);
+  const pinnedKeys = collectPinnedStageKeys({
+    selectedHostId: s.selectedHostId,
+    selectedAgentId: s.selectedAgentId,
+    isDraftNewSession: s.isDraftNewSession,
+    sidePanelTabs: s.sidePanelTabs,
+  });
+  for (const [k, gate] of stagePullGates.entries()) {
+    if (gate.inFlight) {
+      pinnedKeys.add(k);
+    }
+  }
+  const { stages, accessOrder, evictedKeys } = evictInactiveStageEntries(
+    merged,
+    stageAccessOrder,
+    pinnedKeys,
+    MAX_CACHED_STAGE_VIEWS,
+  );
+  stageAccessOrder = accessOrder;
+  for (const evictedKey of evictedKeys) {
+    const gate = stagePullGates.get(evictedKey);
+    if (gate && !gate.inFlight) {
+      stagePullGates.delete(evictedKey);
+    }
+  }
+  return stages;
+}
+
+function hasVisibleActiveTerminal(s: {
+  sidePanelOpen: boolean;
+  sidePanelTabs: readonly SidePanelTab[];
+  activeSidePanelTabId: string | null;
+  terminalTabs: readonly TerminalTabSession[];
+  activeTerminalTabKey: string | null;
+}): boolean {
+  if (!s.sidePanelOpen || !s.activeSidePanelTabId || !s.activeTerminalTabKey) {
+    return false;
+  }
+  const activeSideTab = s.sidePanelTabs.find((t) => t.id === s.activeSidePanelTabId);
+  if (activeSideTab?.kind !== "terminal") return false;
+  return s.terminalTabs.some((t) => t.key === s.activeTerminalTabKey);
+}
 const hostSyncGates = new Map<string, SimpleSyncGate>();
 const fleetSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const sidebarSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const lastReportedSeenSeq = new Map<string, number>();
+let copyBlocksReqSeq = 0;
 const pendingSeenTimers = new Map<
   string,
   { hostId: string; agentId: string; seq: number; timerId: number }
@@ -881,6 +1337,158 @@ const SEEN_REPORT_DEBOUNCE_MS = 1500;
 const submittingComposerScopes = new Set<string>();
 const cancelledSideQuestionIds = new Set<string>();
 let gitChangedDebounceTimer: number | null = null;
+
+interface AutoGitRefreshGate {
+  timerId: number | null;
+  timerDueAt: number;
+  trailingTimerId: number | null;
+  inFlight: boolean;
+  queued: boolean;
+  lastStartedAt: number;
+  lastFocusTriggerAt: number;
+  cwd: string;
+}
+
+const autoGitRefreshGates = new Map<string, AutoGitRefreshGate>();
+
+function isAutoRefreshableCwd(cwd: string | null | undefined): cwd is string {
+  if (!cwd) return false;
+  const trimmed = cwd.trim();
+  if (!trimmed || trimmed === "~" || isBareHomeDir(trimmed)) return false;
+  return true;
+}
+
+function runAutoRefreshGit(hostId: string, gateKey: string): void {
+  const gate = autoGitRefreshGates.get(gateKey);
+  if (!gate || disposed) return;
+  if (gate.timerId !== null && typeof window !== "undefined") {
+    window.clearTimeout(gate.timerId);
+    gate.timerId = null;
+    gate.timerDueAt = 0;
+  }
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+    return;
+  }
+  if (gate.inFlight) {
+    gate.queued = true;
+    return;
+  }
+  const targetCwd = gate.cwd;
+  if (!isAutoRefreshableCwd(targetCwd)) return;
+  gate.inFlight = true;
+  gate.queued = false;
+  gate.lastStartedAt = Date.now();
+  void orbitActions
+    .refreshGit(hostId, targetCwd, null, state.diffStaged)
+    .catch(() => undefined)
+    .finally(() => {
+      gate.inFlight = false;
+      if (gate.queued && !disposed) {
+        gate.queued = false;
+        runAutoRefreshGit(hostId, gateKey);
+      }
+    });
+}
+
+function scheduleAutoRefreshGit(
+  hostId: string | null | undefined,
+  cwd: string | null | undefined,
+  opts?: {
+    delayMs?: number;
+    minIntervalMs?: number;
+    reason?: "stream" | "settled" | "focus";
+  },
+): void {
+  if (disposed || typeof window === "undefined") return;
+  if (!hostId || !isAutoRefreshableCwd(cwd)) return;
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+
+  const normCwd = normalizeCwdForCompare(cwd);
+  if (!normCwd) return;
+  const gateKey = `${hostId}::${normCwd}`;
+  let gate = autoGitRefreshGates.get(gateKey);
+  if (!gate) {
+    gate = {
+      timerId: null,
+      timerDueAt: 0,
+      trailingTimerId: null,
+      inFlight: false,
+      queued: false,
+      lastStartedAt: 0,
+      lastFocusTriggerAt: 0,
+      cwd,
+    };
+    autoGitRefreshGates.set(gateKey, gate);
+  } else {
+    gate.cwd = cwd;
+  }
+
+  const now = Date.now();
+  const reason = opts?.reason ?? "settled";
+
+  if (reason === "focus") {
+    if (now - gate.lastFocusTriggerAt < 3000) return;
+    gate.lastFocusTriggerAt = now;
+  }
+
+  const baseDelay = opts?.delayMs ?? 800;
+  const minInterval = opts?.minIntervalMs ?? 0;
+  const cooldownRemaining =
+    minInterval > 0 && gate.lastStartedAt > 0
+      ? Math.max(0, minInterval - (now - gate.lastStartedAt))
+      : 0;
+  const effectiveDelay = Math.max(baseDelay, cooldownRemaining);
+  const targetDueAt = now + effectiveDelay;
+
+  if (gate.timerId !== null) {
+    if (targetDueAt < gate.timerDueAt) {
+      window.clearTimeout(gate.timerId);
+      gate.timerId = null;
+      gate.timerDueAt = 0;
+    } else {
+      return;
+    }
+  }
+
+  gate.timerDueAt = targetDueAt;
+  gate.timerId = window.setTimeout(() => {
+    gate!.timerId = null;
+    gate!.timerDueAt = 0;
+    runAutoRefreshGit(hostId, gateKey);
+  }, effectiveDelay);
+}
+
+function scheduleStreamAutoRefreshGit(
+  hostId: string | null | undefined,
+  cwd: string | null | undefined,
+): void {
+  if (disposed || typeof window === "undefined") return;
+  if (!hostId || !isAutoRefreshableCwd(cwd)) return;
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+
+  // Periodic throttled refresh while streaming (1.8s debounce, max once per 5s)
+  scheduleAutoRefreshGit(hostId, cwd, {
+    delayMs: 1800,
+    minIntervalMs: 5000,
+    reason: "stream",
+  });
+
+  // Trailing settle refresh ~1.2s after streaming stops
+  const normCwd = normalizeCwdForCompare(cwd);
+  const gateKey = `${hostId}::${normCwd}`;
+  const gate = autoGitRefreshGates.get(gateKey);
+  if (!gate) return;
+  if (gate.trailingTimerId !== null) {
+    window.clearTimeout(gate.trailingTimerId);
+  }
+  gate.trailingTimerId = window.setTimeout(() => {
+    gate.trailingTimerId = null;
+    if (disposed) return;
+    if (Date.now() - gate.lastStartedAt >= 1200) {
+      runAutoRefreshGit(hostId, gateKey);
+    }
+  }, 1200);
+}
 
 function flushPendingSeenMarks(onlyKey?: string): void {
   const keys = onlyKey ? [onlyKey] : Array.from(pendingSeenTimers.keys());
@@ -992,6 +1600,77 @@ function emitComposerDraftChange(): void {
   }
 }
 
+function emitDraftPresenceChange(): void {
+  if (disposed) return;
+  for (const l of draftPresenceListeners) {
+    l();
+  }
+}
+
+function collectChangedRecordKeys<T>(
+  prev: Record<string, T>,
+  next: Record<string, T>,
+  out: Set<string>,
+): void {
+  if (prev === next) return;
+  for (const k of Object.keys(next)) {
+    if (prev[k] !== next[k]) out.add(k);
+  }
+  for (const k of Object.keys(prev)) {
+    if (!(k in next)) out.add(k);
+  }
+}
+
+function syncDraftMutations(prev: OrbitUiState, next: OrbitUiState): void {
+  if (
+    prev.composerDrafts === next.composerDrafts &&
+    prev.pastedAttachments === next.pastedAttachments &&
+    prev.diffQuotes === next.diffQuotes &&
+    prev.contextItems === next.contextItems &&
+    prev.slashDirectives === next.slashDirectives &&
+    prev.sideQuestionDrafts === next.sideQuestionDrafts
+  ) {
+    return;
+  }
+
+  const changedKeys = new Set<string>();
+  collectChangedRecordKeys(prev.composerDrafts, next.composerDrafts, changedKeys);
+  collectChangedRecordKeys(prev.pastedAttachments, next.pastedAttachments, changedKeys);
+  collectChangedRecordKeys(prev.diffQuotes, next.diffQuotes, changedKeys);
+  collectChangedRecordKeys(prev.contextItems, next.contextItems, changedKeys);
+  collectChangedRecordKeys(prev.slashDirectives, next.slashDirectives, changedKeys);
+  collectChangedRecordKeys(prev.sideQuestionDrafts, next.sideQuestionDrafts, changedKeys);
+
+  if (changedKeys.size === 0) return;
+
+  const dirtyKeys: string[] = [];
+  const clearedKeys: string[] = [];
+  let presenceChanged = false;
+
+  for (const key of changedKeys) {
+    const hadDraft = hasNonEmptyScopeDraft(prev, key);
+    const hasDraft = hasNonEmptyScopeDraft(next, key);
+    if (hadDraft !== hasDraft) {
+      presenceChanged = true;
+    }
+    if (hasDraft) {
+      dirtyKeys.push(key);
+    } else {
+      clearedKeys.push(key);
+    }
+  }
+
+  if (dirtyKeys.length > 0) {
+    draftPersistence.markDirty(dirtyKeys);
+  }
+  if (clearedKeys.length > 0) {
+    draftPersistence.removeScopes(clearedKeys, false);
+  }
+  if (presenceChanged) {
+    emitDraftPresenceChange();
+  }
+}
+
 function setState(updater: (prev: OrbitUiState) => OrbitUiState, persist = false): void {
   if (disposed) return;
   const prev = state;
@@ -1001,6 +1680,7 @@ function setState(updater: (prev: OrbitUiState) => OrbitUiState, persist = false
   if (persist) {
     scheduleSavePrefs();
   }
+  syncDraftMutations(prev, next);
   if (next.composerDrafts !== prev.composerDrafts) {
     emitComposerDraftChange();
   }
@@ -1067,8 +1747,14 @@ function subscribeCoreEvents(): Promise<void> {
         if (isMainStage || isOpenPeerTab) {
           void orbitActions.pullStageDelta(ev.host_id, ev.agent_id);
         }
+        if (isMainStage && state.selectedWorkspaceCwd) {
+          scheduleStreamAutoRefreshGit(ev.host_id, state.selectedWorkspaceCwd);
+        }
       } else if (ev.kind === "git_changed") {
-        if (ev.host_id === state.selectedHostId && ev.cwd === state.selectedWorkspaceCwd) {
+        if (
+          ev.host_id === state.selectedHostId &&
+          normalizeCwdForCompare(ev.cwd) === normalizeCwdForCompare(state.selectedWorkspaceCwd)
+        ) {
           const hostId = ev.host_id;
           const cwd = ev.cwd;
           if (gitChangedDebounceTimer !== null) {
@@ -1077,9 +1763,36 @@ function subscribeCoreEvents(): Promise<void> {
           gitChangedDebounceTimer = window.setTimeout(() => {
             gitChangedDebounceTimer = null;
             if (disposed) return;
-            void orbitActions.loadGitReviewSnapshot(hostId, cwd, state.selectedDiffPath);
-            void orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
-            orbitActions.markOpenFilesStaleForWorkspace(hostId, cwd);
+            void (async () => {
+              const rKey = `${hostId}::${cwd}`;
+              const prevSig = computeGitReviewSignature(state.gitReviews[rKey]);
+              await orbitActions.loadGitReviewSnapshot(hostId, cwd, null);
+              if (disposed) return;
+
+              // Preserve single-file diff from `selectDiffFile(path)` when omitted from `__all__`
+              const activeDiffPath = state.selectedDiffPath;
+              if (activeDiffPath) {
+                const loadedFiles = state.gitReviews[rKey]?.diff_files ?? [];
+                const normTarget = activeDiffPath.replace(/^\.\//, "");
+                const hasSelected = loadedFiles.some(
+                  (f) => f.path === activeDiffPath || f.path.replace(/^\.\//, "") === normTarget,
+                );
+                if (!hasSelected) {
+                  await orbitActions.loadGitReviewSnapshot(hostId, cwd, activeDiffPath);
+                  if (disposed) return;
+                }
+              }
+
+              // Only force-refresh workspace files when git status/diff actually changed;
+              // prevents `git_changed -> ListWorkspaceFiles -> WorkspaceFilesResponse -> git_changed` loops.
+              const nextSig = computeGitReviewSignature(state.gitReviews[rKey]);
+              if (nextSig !== prevSig) {
+                orbitActions.markOpenFilesStaleForWorkspace(hostId, cwd);
+                void orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+              } else if (!state.workspaceFilesCache[rKey]) {
+                void orbitActions.ensureWorkspaceFiles(hostId, cwd, false);
+              }
+            })().catch(() => undefined);
           }, 150);
         }
       } else if (ev.kind === "terminal_changed") {
@@ -1103,6 +1816,87 @@ function subscribeCoreEvents(): Promise<void> {
 }
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 const notifiedApprovalAgents = new Set<string>();
+const notifiedTerminalGoals = new Set<string>();
+const MAX_NOTIFIED_TERMINAL_GOALS = 512;
+const pushReqSeqByHost = new Map<string, number>();
+
+function trackNotifiedTerminalGoal(key: string): void {
+  if (notifiedTerminalGoals.size >= MAX_NOTIFIED_TERMINAL_GOALS) {
+    const oldest = notifiedTerminalGoals.values().next().value;
+    if (oldest !== undefined) {
+      notifiedTerminalGoals.delete(oldest);
+    }
+  }
+  notifiedTerminalGoals.add(key);
+}
+
+function isHourInQuietWindow(hour: number, startHour: number, endHour: number): boolean {
+  const h = ((Math.floor(hour) % 24) + 24) % 24;
+  const s = ((Math.floor(startHour) % 24) + 24) % 24;
+  const e = ((Math.floor(endHour) % 24) + 24) % 24;
+  if (s === e) return false;
+  if (s < e) return h >= s && h < e;
+  return h >= s || h < e;
+}
+
+function isInDesktopQuietHours(): boolean {
+  if (!state.notifyQuietHoursEnabled) return false;
+  return isHourInQuietWindow(
+    new Date().getHours(),
+    state.notifyQuietStartHour,
+    state.notifyQuietEndHour,
+  );
+}
+
+function isAgentErrorState(
+  ag: { status_label?: string; attention?: string } | null | undefined,
+): boolean {
+  if (!ag) return false;
+  return (
+    ag.attention === "error" ||
+    (typeof ag.status_label === "string" && ag.status_label.trim().toLowerCase() === "error")
+  );
+}
+
+function dispatchDesktopNotification(opts: {
+  title: string;
+  body: string;
+  hostId: string;
+  agentId?: string | null;
+  tag?: string;
+  forceEvenIfVisible?: boolean;
+}): boolean {
+  if (typeof window === "undefined" || !("Notification" in window)) return false;
+  if (Notification.permission !== "granted") return false;
+  if (!opts.forceEvenIfVisible) {
+    if (typeof document !== "undefined" && !document.hidden && document.hasFocus()) return false;
+    if (isInDesktopQuietHours()) return false;
+  }
+
+  try {
+    const notif = new Notification(opts.title, {
+      body: opts.body,
+      silent: !state.notifySoundEnabled,
+      tag: opts.tag,
+    });
+    notif.onclick = () => {
+      void orbitIpc.focusMainWindow().catch(() => undefined);
+      if (typeof window !== "undefined") {
+        window.focus();
+      }
+      orbitActions.closeSettings();
+      if (opts.hostId && opts.agentId) {
+        orbitActions.selectAgent(opts.hostId, opts.agentId);
+      } else if (opts.hostId) {
+        orbitActions.selectHost(opts.hostId);
+      }
+      notif.close();
+    };
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function notifyToast(msg: string, undo?: UndoArchiveEntry | null): void {
   if (toastTimer) clearTimeout(toastTimer);
@@ -1114,6 +1908,22 @@ function notifyToast(msg: string, undo?: UndoArchiveEntry | null): void {
   toastTimer = setTimeout(() => {
     setState((s) => ({ ...s, toastNotice: null, lastArchivedUndo: null }));
   }, undo ? 6000 : 3000);
+}
+
+function resolveAvailableDraftProvider(
+  detail: HostDetailView | null | undefined,
+  current: ProviderKind,
+): ProviderKind {
+  if (!detail) return current;
+  const hasInstalledAcp = Boolean(
+    detail.acp_agents?.some((a) => a.installed && a.spec.enabled),
+  );
+  if (current === "acp" && hasInstalledAcp) return "acp";
+  const avail = detail.host.available_providers;
+  if (avail.includes(current)) return current;
+  if (avail.length > 0) return avail[0];
+  if (hasInstalledAcp) return "acp";
+  return current;
 }
 
 function syncAttentionIndicators(overview: FleetOverviewView, details: Record<string, HostDetailView>): void {
@@ -1132,16 +1942,13 @@ function syncAttentionIndicators(overview: FleetOverviewView, details: Record<st
       if (ag.is_awaiting_permission) {
         if (!notifiedApprovalAgents.has(key)) {
           notifiedApprovalAgents.add(key);
-          if (
-            typeof document !== "undefined" &&
-            document.hidden &&
-            "Notification" in window &&
-            Notification.permission === "granted"
-          ) {
-            new Notification(`Orbit · ${detail.host.display_name}`, {
-              body: `${ag.title} requires your approval`,
-            });
-          }
+          dispatchDesktopNotification({
+            title: `Orbit · ${detail.host.display_name}`,
+            body: `${ag.title} requires your approval`,
+            hostId: detail.host.host_id,
+            agentId: ag.agent_id,
+            tag: `orbit-approval-${detail.host.host_id}-${ag.agent_id}`,
+          });
         }
       } else {
         notifiedApprovalAgents.delete(key);
@@ -1218,6 +2025,31 @@ function omitRecordKeys<T>(
   return mutated ? next : record;
 }
 
+function collectRemotelyArchivedDraftScopes(
+  s: OrbitUiState,
+  details: Iterable<readonly [string, HostDetailView]>,
+  activeScopeKey: string | null,
+): Set<string> {
+  const keysToPrune = new Set<string>();
+  for (const [hostId, detail] of details) {
+    for (const ag of detail.agents) {
+      if (!ag.archived_at_rfc3339 || isAgentForegroundRunning(ag)) continue;
+      const scopeKey = threadScopeKey(hostId, ag.agent_id);
+      if (scopeKey === activeScopeKey) continue;
+      if (
+        scopeKey in s.composerDrafts ||
+        scopeKey in s.slashDirectives ||
+        scopeKey in s.pastedAttachments ||
+        scopeKey in s.diffQuotes ||
+        scopeKey in s.sideQuestionDrafts
+      ) {
+        keysToPrune.add(scopeKey);
+      }
+    }
+  }
+  return keysToPrune;
+}
+
 function resolveSettingsSectionTarget(
   s: OrbitUiState,
   section?: SettingsSectionTarget,
@@ -1229,14 +2061,19 @@ function resolveSettingsSectionTarget(
   if (section === "providers") {
     return targetHostId ? `host:${targetHostId}:agents` : "general";
   }
+  if (section === "skills") {
+    return targetHostId ? `host:${targetHostId}:skills` : "general";
+  }
   return section ?? s.settingsSection;
 }
 
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const inflightAttachmentUploads = new Map<string, Promise<void>>();
+const pathRulesReqSeqByScope = new Map<string, number>();
 
 function isLikelyTextFile(file: File, bytes: Uint8Array): boolean {
   if (file.size > 64 * 1024) return false;
+  if (detectRichMediaKind(file.name, file.type) !== null) return false;
   const mime = (file.type || "").toLowerCase();
   if (
     mime === "application/pdf" ||
@@ -1272,6 +2109,31 @@ function updateContextMentionItem(
 
 function isOfflineUploadError(errText: string): boolean {
   return /disconnected|reconnect|offline/i.test(errText);
+}
+
+function removeContextMentionInScope(scopeKey: string, id: string): void {
+  const removed = (state.contextItems[scopeKey] ?? []).find((c) => c.id === id);
+  if (
+    removed &&
+    (removed.kind === "image" || removed.kind === "file") &&
+    removed.previewUrl?.startsWith("blob:")
+  ) {
+    URL.revokeObjectURL(removed.previewUrl);
+  }
+  setState((s) => ({
+    ...s,
+    contextItems: {
+      ...s.contextItems,
+      [scopeKey]: (s.contextItems[scopeKey] ?? []).filter((c) => c.id !== id),
+    },
+    mediaPreviewTarget:
+      removed &&
+      (removed.kind === "image" || removed.kind === "file") &&
+      removed.previewUrl &&
+      s.mediaPreviewTarget?.localUrl === removed.previewUrl
+        ? null
+        : s.mediaPreviewTarget,
+  }));
 }
 
 async function uploadContextAttachmentToHost(
@@ -1328,7 +2190,7 @@ async function uploadContextAttachmentToHost(
       if (isOfflineUploadError(msg)) {
         notifyToast("Host is offline; attachment will upload when reconnected before sending");
       } else {
-        orbitActions.removeContextMention(itemId);
+        removeContextMentionInScope(scopeKey, itemId);
         notifyToast(`Attachment upload failed: ${msg}`);
       }
     } finally {
@@ -1338,6 +2200,21 @@ async function uploadContextAttachmentToHost(
 
   inflightAttachmentUploads.set(itemId, task);
   await task;
+}
+
+const MAX_FILE_CACHE_ENTRIES = 20;
+const MAX_FILE_CACHE_BYTES = 64 * 1024 * 1024;
+const fileLoadSeqByKey = new Map<string, number>();
+const prefetchInFlightFileKeys = new Set<string>();
+
+function bumpFileLoadSeq(cKey: string): number {
+  const next = (fileLoadSeqByKey.get(cKey) ?? 0) + 1;
+  fileLoadSeqByKey.set(cKey, next);
+  return next;
+}
+
+function estimateFileCacheEntryBytes(entry: FileViewCacheEntry): number {
+  return (entry.data?.content.length ?? 0) + 4096;
 }
 
 const localQueuedDraftExtras = new Map<
@@ -1355,6 +2232,8 @@ function rememberLocalQueuedDraftExtras(
     if (oldest) localQueuedDraftExtras.delete(oldest);
   }
 }
+
+const inFlightForks = new Set<string>();
 
 export const orbitActions = {
   async init(): Promise<void> {
@@ -1433,7 +2312,7 @@ export const orbitActions = {
       maybeAutoSyncOutdatedHosts();
 
       // Sanitize persisted draft models against Rust catalog & retired-slug table
-      const providers: ProviderKind[] = ["claude_code", "codex", "antigravity"];
+      const providers: ProviderKind[] = PROVIDER_LIST.map((p) => p.id);
       const sanitizedEntries = await Promise.all(
         providers.map(async (provider) => {
           const current = state.draftModels[provider] ?? null;
@@ -2189,9 +3068,17 @@ export const orbitActions = {
         activeDetail?.discovered_projects[0]?.path ||
         "~";
 
-      const avail = activeDetail?.host.available_providers ?? [];
-      const nextDraftProvider =
-        avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider;
+      const nextDraftProvider = resolveAvailableDraftProvider(activeDetail, s.draftProvider);
+
+      const activeScopeKey =
+        !nextDraft && activeHostId && nextAgentId
+          ? threadScopeKey(activeHostId, nextAgentId)
+          : null;
+      const remotelyArchivedDraftKeys = collectRemotelyArchivedDraftScopes(
+        s,
+        Object.entries(nextDetails),
+        activeScopeKey,
+      );
 
       return {
         ...s,
@@ -2204,6 +3091,15 @@ export const orbitActions = {
         selectedWorkspaceCwd: nextCwd,
         isDraftNewSession: nextDraft,
         draftProvider: nextDraftProvider,
+        ...(remotelyArchivedDraftKeys.size > 0
+          ? {
+              composerDrafts: omitRecordKeys(s.composerDrafts, remotelyArchivedDraftKeys),
+              slashDirectives: omitRecordKeys(s.slashDirectives, remotelyArchivedDraftKeys),
+              pastedAttachments: omitRecordKeys(s.pastedAttachments, remotelyArchivedDraftKeys),
+              diffQuotes: omitRecordKeys(s.diffQuotes, remotelyArchivedDraftKeys),
+              sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, remotelyArchivedDraftKeys),
+            }
+          : {}),
       };
     }, true);
 
@@ -2246,7 +3142,39 @@ export const orbitActions = {
       : [await orbitIpc.getHostDetail(hostId), null];
     if (!detail) return;
 
-    const prevAgents = state.hostDetails[hostId]?.agents ?? [];
+    const prevHostDetail = state.hostDetails[hostId];
+    const prevAgents = prevHostDetail?.agents ?? [];
+
+    let settledGitRefreshCwd: string | null = null;
+    if (state.selectedHostId === hostId && !state.isDraftNewSession && state.selectedAgentId) {
+      const selId = state.selectedAgentId;
+      const prevActive = prevAgents.find((a) => a.agent_id === selId);
+      const nextActive = detail.agents.find((a) => a.agent_id === selId);
+      const activeTurnSettled =
+        isAgentForegroundRunning(prevActive) && !isAgentForegroundRunning(nextActive);
+      const childSubagentSettled = detail.agents.some((nextAg) => {
+        if (nextAg.parent_agent_id !== selId) return false;
+        const prevAg = prevAgents.find((p) => p.agent_id === nextAg.agent_id);
+        return isAgentForegroundRunning(prevAg) && !isAgentForegroundRunning(nextAg);
+      });
+      const prevProviderSubs = prevHostDetail?.provider_subagents?.[selId] ?? [];
+      const nextProviderSubs = detail.provider_subagents?.[selId] ?? [];
+      const providerSubagentSettled = nextProviderSubs.some((nextPs) => {
+        if (
+          nextPs.status !== "completed" &&
+          nextPs.status !== "failed" &&
+          nextPs.status !== "canceled" &&
+          nextPs.status !== "stopped"
+        ) {
+          return false;
+        }
+        const prevPs = prevProviderSubs.find((p) => p.subagent_id === nextPs.subagent_id);
+        return !prevPs || prevPs.status === "running";
+      });
+      if (activeTurnSettled || childSubagentSettled || providerSubagentSettled) {
+        settledGitRefreshCwd = nextActive?.cwd || state.selectedWorkspaceCwd || null;
+      }
+    }
     if (
       pendingDraftCreate &&
       Date.now() - pendingDraftCreate.startedAt > PENDING_DRAFT_CREATE_TTL_MS
@@ -2271,24 +3199,72 @@ export const orbitActions = {
       pendingDraftCreate = null;
     }
 
-    if (
-      state.notifyOnTurnComplete &&
-      typeof document !== "undefined" &&
-      document.hidden &&
-      "Notification" in window &&
-      Notification.permission === "granted"
-    ) {
-      for (const nextAg of detail.agents) {
-        const prevAg = prevAgents.find((p) => p.agent_id === nextAg.agent_id);
-        if (
-          isAgentForegroundRunning(prevAg) &&
-          !isAgentForegroundRunning(nextAg) &&
-          !nextAg.is_awaiting_permission
-        ) {
-          new Notification(`Orbit · ${detail.host.display_name}`, {
-            body: `Completed: ${nextAg.title}`,
-          });
-        }
+    for (const nextAg of detail.agents) {
+      const prevAg = prevAgents.find((p) => p.agent_id === nextAg.agent_id);
+      if (
+        state.notifyOnTurnComplete &&
+        isAgentForegroundRunning(prevAg) &&
+        !isAgentForegroundRunning(nextAg) &&
+        !nextAg.is_awaiting_permission &&
+        !isAgentErrorState(nextAg)
+      ) {
+        dispatchDesktopNotification({
+          title: `Orbit · ${detail.host.display_name}`,
+          body: `Completed: ${nextAg.title}`,
+          hostId,
+          agentId: nextAg.agent_id,
+          tag: `orbit-done-${hostId}-${nextAg.agent_id}`,
+        });
+      } else if (
+        state.notifyOnAgentError &&
+        prevAg !== undefined &&
+        !isAgentErrorState(prevAg) &&
+        isAgentErrorState(nextAg)
+      ) {
+        dispatchDesktopNotification({
+          title: `Orbit · ${detail.host.display_name}`,
+          body: `Agent error: ${nextAg.title}`,
+          hostId,
+          agentId: nextAg.agent_id,
+          tag: `orbit-error-${hostId}-${nextAg.agent_id}`,
+        });
+      }
+    }
+
+    const prevGoals = state.hostDetails[hostId]?.goal_runs ?? [];
+    const nextGoals = detail.goal_runs ?? [];
+    const liveGoalKeysForHost = new Set(nextGoals.map((g) => `${hostId}::${g.goal_id}`));
+    const hostGoalPrefix = `${hostId}::`;
+    for (const existingKey of Array.from(notifiedTerminalGoals)) {
+      if (existingKey.startsWith(hostGoalPrefix) && !liveGoalKeysForHost.has(existingKey)) {
+        notifiedTerminalGoals.delete(existingKey);
+      }
+    }
+    for (const nextGoal of nextGoals) {
+      const gKey = `${hostId}::${nextGoal.goal_id}`;
+      const isTerminal =
+        nextGoal.status === "succeeded" ||
+        nextGoal.status === "failed" ||
+        nextGoal.status === "canceled";
+      if (!isTerminal) {
+        notifiedTerminalGoals.delete(gKey);
+        continue;
+      }
+      const prevGoal = prevGoals.find((g) => g.goal_id === nextGoal.goal_id);
+      const wasActive =
+        prevGoal !== undefined &&
+        (prevGoal.status === "running" ||
+          prevGoal.status === "verifying" ||
+          prevGoal.status === "paused");
+      if (state.notifyOnGoalFinished && wasActive && !notifiedTerminalGoals.has(gKey)) {
+        trackNotifiedTerminalGoal(gKey);
+        dispatchDesktopNotification({
+          title: `Orbit · ${detail.host.display_name}`,
+          body: `Goal ${nextGoal.status}: ${nextGoal.objective}`,
+          hostId,
+          agentId: nextGoal.agent_id,
+          tag: `orbit-goal-${hostId}-${nextGoal.goal_id}`,
+        });
       }
     }
 
@@ -2336,11 +3312,20 @@ export const orbitActions = {
           s.archivedThreads[threadScopeKey(hostId, nextAgentId)] ||
           !detail.agents.some((a) => a.agent_id === nextAgentId)
         ) {
+          const prevOptId =
+            nextAgentId &&
+            nextAgentId.startsWith("opt_") &&
+            !detail.agents.some((a) => a.agent_id === nextAgentId)
+              ? nextAgentId
+              : null;
           const firstVisible = detail.agents.find(
             (a) => !s.archivedThreads[threadScopeKey(hostId, a.agent_id)],
           );
           nextAgentId = firstVisible?.agent_id ?? null;
           nextDraft = nextAgentId === null;
+          if (prevOptId && nextAgentId && !nextAgentId.startsWith("opt_")) {
+            sharedDisclosureStateStore.migrateAgent(prevOptId, nextAgentId);
+          }
         }
       }
 
@@ -2377,10 +3362,20 @@ export const orbitActions = {
         }
       }
 
-      const avail =
-        s.selectedHostId === hostId ? detail.host.available_providers : [];
       const nextDraftProvider =
-        avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider;
+        s.selectedHostId === hostId
+          ? resolveAvailableDraftProvider(detail, s.draftProvider)
+          : s.draftProvider;
+
+      const activeScopeKey =
+        !nextDraft && s.selectedHostId && nextAgentId
+          ? threadScopeKey(s.selectedHostId, nextAgentId)
+          : null;
+      const remotelyArchivedDraftKeys = collectRemotelyArchivedDraftScopes(
+        s,
+        [[hostId, detail]],
+        activeScopeKey,
+      );
 
       return {
         ...s,
@@ -2399,6 +3394,15 @@ export const orbitActions = {
         draftProvider: nextDraftProvider,
         terminalTabs: nextTabs,
         activeTerminalTabKey: nextActiveTab,
+        ...(remotelyArchivedDraftKeys.size > 0
+          ? {
+              composerDrafts: omitRecordKeys(s.composerDrafts, remotelyArchivedDraftKeys),
+              slashDirectives: omitRecordKeys(s.slashDirectives, remotelyArchivedDraftKeys),
+              pastedAttachments: omitRecordKeys(s.pastedAttachments, remotelyArchivedDraftKeys),
+              diffQuotes: omitRecordKeys(s.diffQuotes, remotelyArchivedDraftKeys),
+              sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, remotelyArchivedDraftKeys),
+            }
+          : {}),
       };
     });
 
@@ -2415,6 +3419,13 @@ export const orbitActions = {
     orbitActions.refreshSidebarView();
     maybeAutoSyncOutdatedHosts();
     void drainPromptQueueIfIdle(hostId, detail);
+
+    if (settledGitRefreshCwd) {
+      scheduleAutoRefreshGit(hostId, settledGitRefreshCwd, {
+        delayMs: 800,
+        reason: "settled",
+      });
+    }
 
     if (newestCreated) {
       void orbitIpc.openAgentTimeline(hostId, newestCreated.agent_id);
@@ -2489,8 +3500,13 @@ export const orbitActions = {
 
         if (hasChanges) {
           let latestSeqToMark: number | null = null;
+          let needsFullRetry = false;
           setState((s) => {
             const prev = s.stages[tlKey];
+            if (sinceRevision > 0 && !prev && !delta.reset) {
+              needsFullRetry = true;
+              return s;
+            }
             const resetTurns = delta.reset || sinceRevision === 0 || !prev;
             const turns = resetTurns
               ? delta.changed_turns
@@ -2527,12 +3543,13 @@ export const orbitActions = {
             }
             return {
               ...s,
-              stages: {
-                ...s.stages,
-                [tlKey]: mergedStage,
-              },
+              stages: applyStageCacheUpdate(s, tlKey, mergedStage),
             };
           });
+          if (needsFullRetry) {
+            gate.queued = true;
+            gate.forceFull = true;
+          }
           if (latestSeqToMark !== null) {
             markThreadSeenInCore(hostId, agentId, latestSeqToMark);
           }
@@ -2577,8 +3594,6 @@ export const orbitActions = {
       firstDiscovered?.path ??
       detail?.discovered_projects[0]?.path ??
       "~";
-    const avail = detail?.host.available_providers ?? [];
-
     setState(
       (s) => ({
         ...s,
@@ -2588,18 +3603,22 @@ export const orbitActions = {
         selectedAgentId: firstAgent?.agent_id ?? null,
         isDraftNewSession: stayInDraft || firstAgent === null,
         sessionScrollNonce: s.sessionScrollNonce + 1,
+        pendingJumpTarget: null,
         selectedWorkspaceCwd: nextCwd,
         selectedDiffPath: null,
         draftWorktreeRepoPath: null,
         draftWorkspaceId: null,
-        draftProvider:
-          avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
+        draftProvider: resolveAvailableDraftProvider(detail, s.draftProvider),
       }),
     );
 
     orbitActions.refreshSidebarView();
     void orbitIpc.refreshQuotas(hostId);
     if (firstAgent) {
+      const firstKey = threadScopeKey(hostId, firstAgent.agent_id);
+      if (state.stages[firstKey]) {
+        stageAccessOrder = recordStageAccess(stageAccessOrder, firstKey);
+      }
       markThreadSeenInCore(hostId, firstAgent.agent_id, firstAgent.latest_seq);
       void orbitIpc.openAgentTimeline(hostId, firstAgent.agent_id);
       void orbitIpc.listProviderSubagents(hostId, firstAgent.agent_id);
@@ -2611,13 +3630,22 @@ export const orbitActions = {
     }
   },
 
-  selectAgent(hostId: string, agentId: string): void {
+  selectAgent(hostId: string, agentId: string, jumpToSeq?: number | null): void {
     flushPendingSeenMarks();
     pendingDraftCreate = null;
+    const isSwitchingThread =
+      state.activeView !== "workspace" ||
+      state.workspacePanel !== "conversation" ||
+      state.isDraftNewSession ||
+      state.selectedHostId !== hostId ||
+      state.selectedAgentId !== agentId;
     const detail = state.hostDetails[hostId];
     const ag = detail?.agents.find((a) => a.agent_id === agentId);
     const nextCwd = ag?.cwd ?? state.selectedWorkspaceCwd;
     const tKey = threadScopeKey(hostId, agentId);
+    if (state.stages[tKey]) {
+      stageAccessOrder = recordStageAccess(stageAccessOrder, tKey);
+    }
     const seenSeq = Math.max(ag?.latest_seq ?? 0, state.stages[tKey]?.latest_seq ?? 0);
 
     setState(
@@ -2638,6 +3666,11 @@ export const orbitActions = {
             : (remainingSideTabs[remainingSideTabs.length - 1]?.id ?? null)
           : s.activeSidePanelTabId;
         const shouldCloseSidePanel = tabsChanged && remainingSideTabs.length === 0;
+        const nextNonce = s.sessionScrollNonce + 1;
+        const nextJumpTarget =
+          typeof jumpToSeq === "number" && jumpToSeq > 0
+            ? { hostId, agentId, seq: jumpToSeq, nonce: nextNonce }
+            : null;
         return {
           ...s,
           activeView: "workspace",
@@ -2645,7 +3678,8 @@ export const orbitActions = {
           selectedHostId: hostId,
           selectedAgentId: agentId,
           isDraftNewSession: false,
-          sessionScrollNonce: s.sessionScrollNonce + 1,
+          sessionScrollNonce: nextNonce,
+          pendingJumpTarget: nextJumpTarget,
           selectedWorkspaceCwd: nextCwd,
           selectedDiffPath: null,
           archivedThreads: nextArchived,
@@ -2663,6 +3697,9 @@ export const orbitActions = {
 
     markThreadSeenInCore(hostId, agentId, seenSeq, true);
     orbitActions.refreshSidebarView();
+    if (isSwitchingThread) {
+      orbitActions.focusComposer({ onlyIfIdle: true });
+    }
     void orbitIpc.openAgentTimeline(hostId, agentId);
     void orbitIpc.markAgentRead(hostId, agentId);
     void orbitIpc.listProviderSubagents(hostId, agentId);
@@ -2682,6 +3719,14 @@ export const orbitActions = {
     }
   },
 
+  clearPendingJumpTarget(nonce: number): void {
+    setState((s) =>
+      s.pendingJumpTarget && s.pendingJumpTarget.nonce === nonce
+        ? { ...s, pendingJumpTarget: null }
+        : s,
+    );
+  },
+
   startNewThreadDraft(
     hostId?: string,
     cwd?: string,
@@ -2699,11 +3744,7 @@ export const orbitActions = {
       detail?.discovered_projects[0]?.path ||
       "~";
 
-    const available = detail?.host.available_providers ?? [];
-    const nextProvider =
-      available.length > 0 && !available.includes(state.draftProvider)
-        ? available[0]
-        : state.draftProvider;
+    const nextProvider = resolveAvailableDraftProvider(detail, state.draftProvider);
     const draftKey = `draft::${targetHostId ?? "none"}`;
 
     setState((s) => ({
@@ -2713,6 +3754,7 @@ export const orbitActions = {
       selectedHostId: targetHostId,
       selectedAgentId: null,
       isDraftNewSession: true,
+      pendingJumpTarget: null,
       selectedWorkspaceCwd: defaultCwd || "~",
       draftWorktreeRepoPath: null,
       draftWorkspaceId: workspaceId ?? null,
@@ -2752,15 +3794,15 @@ export const orbitActions = {
     }));
   },
 
-  focusComposer(): void {
+  focusComposer(opts?: ComposerFocusOptions): void {
     setTimeout(() => {
       for (const fn of composerFocusListeners) {
-        fn();
+        fn(opts);
       }
     }, 16);
   },
 
-  onComposerFocusRequest(cb: () => void): () => void {
+  onComposerFocusRequest(cb: (opts?: ComposerFocusOptions) => void): () => void {
     composerFocusListeners.add(cb);
     return () => composerFocusListeners.delete(cb);
   },
@@ -2781,7 +3823,6 @@ export const orbitActions = {
 
   selectProjectWorkspace(hostId: string, cwd: string): void {
     const detail = state.hostDetails[hostId];
-    const avail = detail?.host.available_providers ?? [];
     setState((s) => ({
       ...s,
       selectedHostId: hostId,
@@ -2790,8 +3831,7 @@ export const orbitActions = {
       selectedDiffPath: null,
       draftWorktreeRepoPath: null,
       draftWorkspaceId: null,
-      draftProvider:
-        avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
+      draftProvider: resolveAvailableDraftProvider(detail, s.draftProvider),
     }));
     orbitActions.refreshSidebarView();
     void orbitActions.ensureWorkspaceFiles(hostId, cwd);
@@ -2803,8 +3843,10 @@ export const orbitActions = {
 
   setDraftConfig(patch: {
     provider?: ProviderKind;
+    acpAgentId?: string | null;
     model?: string | null;
     effort?: ReasoningEffort;
+    fastMode?: boolean;
     mode?: SessionMode;
     profileId?: string | null;
     useWorktree?: boolean;
@@ -2822,8 +3864,11 @@ export const orbitActions = {
         return {
           ...s,
           draftProvider: nextProvider,
+          draftAcpAgentId:
+            patch.acpAgentId !== undefined ? patch.acpAgentId : s.draftAcpAgentId,
           draftModels: nextModels,
           draftEffort: patch.effort ?? s.draftEffort,
+          draftFastMode: patch.fastMode ?? s.draftFastMode,
           draftMode: patch.mode ?? s.draftMode,
           draftProfileId:
             patch.profileId !== undefined
@@ -2847,8 +3892,63 @@ export const orbitActions = {
     );
   },
 
+  toggleActiveFastMode(action: "toggle" | "enable" | "disable" | boolean = "toggle"): void {
+    const hostId = state.selectedHostId;
+    const detail = hostId ? state.hostDetails[hostId] : undefined;
+    const activeAgent =
+      !state.isDraftNewSession && hostId && state.selectedAgentId
+        ? detail?.agents.find((a) => a.agent_id === state.selectedAgentId)
+        : undefined;
+
+    const availableProviders = detail?.host.available_providers ?? [];
+    const draftProvider: ProviderKind =
+      availableProviders.length > 0 && !availableProviders.includes(state.draftProvider)
+        ? (PROVIDERS.find((p) => availableProviders.includes(p.id))?.id ?? availableProviders[0])
+        : state.draftProvider;
+
+    const activeProvider: ProviderKind = activeAgent ? activeAgent.provider : draftProvider;
+    const rawModel = activeAgent ? activeAgent.model : (state.draftModels[activeProvider] ?? null);
+    const cat = getCatalogForProvider(detail?.provider_catalogs, activeProvider);
+    const spec = resolveActiveModelSpec(cat, rawModel);
+    const modelAllowsFast = modelSupportsFastMode(activeProvider, spec);
+    const isDraft = !activeAgent;
+
+    if (!modelAllowsFast && (isDraft || !activeAgent.fast_mode)) {
+      if (isDraft && (action === false || action === "disable" || state.draftFastMode)) {
+        orbitActions.setDraftConfig({ fastMode: false });
+      }
+      notifyToast("Fast mode unavailable for this model");
+      return;
+    }
+
+    const current = activeAgent ? Boolean(activeAgent.fast_mode) : state.draftFastMode;
+
+    const next =
+      action === true || action === "enable"
+        ? true
+        : action === false || action === "disable"
+          ? false
+          : !current;
+
+    if (next && !modelAllowsFast) {
+      notifyToast("Fast mode unavailable for this model");
+      return;
+    }
+
+    if (activeAgent && hostId) {
+      void orbitIpc.updateAgent({
+        hostId,
+        agentId: activeAgent.agent_id,
+        fastMode: next,
+      });
+    } else {
+      orbitActions.setDraftConfig({ fastMode: next });
+    }
+    notifyToast(next ? "Fast mode on" : "Fast mode off");
+  },
+
   cycleActiveMode(): void {
-    const cycle: SessionMode[] = ["default", "accept_edits", "full_access"];
+    const cycle: SessionMode[] = ["default", "auto", "accept_edits", "full_access"];
     if (state.isDraftNewSession || !state.selectedHostId || !state.selectedAgentId) {
       const idx = cycle.findIndex((m) => m === state.draftMode);
       const next = cycle[(idx + 1) % cycle.length];
@@ -2866,6 +3966,7 @@ export const orbitActions = {
   setComposerDraft(text: string): void {
     const key = composerScopeKey(state);
     if ((state.composerDrafts[key] ?? "") === text) return;
+    const prev = state;
     // Update draft slice without broadcasting global `emitChange()` across unrelated components
     state = {
       ...state,
@@ -2874,6 +3975,16 @@ export const orbitActions = {
         [key]: text,
       },
     };
+    const hadDraft = hasNonEmptyScopeDraft(prev, key);
+    const hasDraft = hasNonEmptyScopeDraft(state, key);
+    if (hasDraft) {
+      draftPersistence.markDirty(key);
+    } else {
+      draftPersistence.removeScopes([key], false);
+    }
+    if (hadDraft !== hasDraft) {
+      emitDraftPresenceChange();
+    }
     emitComposerDraftChange();
   },
 
@@ -2917,6 +4028,30 @@ export const orbitActions = {
     }));
   },
 
+  openMediaPreview(target: MediaPreviewTarget): void {
+    setState((s) => ({ ...s, mediaPreviewTarget: target }));
+  },
+
+  closeMediaPreview(): void {
+    setState((s) => ({ ...s, mediaPreviewTarget: null }));
+  },
+
+  insertCitationIntoComposer(citation: string): void {
+    const clean = citation.trim();
+    if (!clean) return;
+    const key = composerScopeKey(state);
+    const current = state.composerDrafts[key] ?? "";
+    const sep = current.length === 0 || /\s$/.test(current) ? "" : " ";
+    const next = `${current}${sep}\`${clean}\` `;
+    setState((s) => ({
+      ...s,
+      composerDrafts: { ...s.composerDrafts, [key]: next },
+    }));
+    draftPersistence.markDirty(key);
+    notifyToast(`Cited ${clean}`);
+    orbitActions.focusComposer();
+  },
+
   quoteDiffLineToComposer(path: string, lineNumber: number | null, code: string): void {
     const key = composerScopeKey(state);
     const item: DiffQuoteSnippet = {
@@ -2934,6 +4069,24 @@ export const orbitActions = {
     }));
     orbitActions.refreshSidebarView();
     orbitActions.focusComposer();
+  },
+
+  appendToComposerDraft(text: string): void {
+    const clean = text.trim();
+    if (!clean) return;
+    const key = composerScopeKey(state);
+    setState((s) => {
+      const existing = (s.composerDrafts[key] ?? "").trimEnd();
+      const nextText = existing ? `${existing}\n\n${clean}` : clean;
+      return {
+        ...s,
+        composerDrafts: {
+          ...s.composerDrafts,
+          [key]: nextText,
+        },
+      };
+    });
+    orbitActions.refreshSidebarView();
   },
 
   removeDiffQuote(id: string): void {
@@ -2986,25 +4139,25 @@ export const orbitActions = {
   },
 
   removeContextMention(id: string): void {
-    const key = composerScopeKey(state);
-    const removed = (state.contextItems[key] ?? []).find((c) => c.id === id);
-    if (removed && removed.kind === "image" && removed.previewUrl?.startsWith("blob:")) {
-      URL.revokeObjectURL(removed.previewUrl);
-    }
-    setState((s) => ({
-      ...s,
-      contextItems: {
-        ...s.contextItems,
-        [key]: (s.contextItems[key] ?? []).filter((c) => c.id !== id),
-      },
-    }));
+    removeContextMentionInScope(composerScopeKey(state), id);
   },
 
   registerInlineMention(target: InlineMentionTarget): void {
     const key = composerScopeKey(state);
     setState((s) => {
       const prev = s.inlineMentions[key] ?? [];
-      const filtered = prev.filter((m) => m.token !== target.token);
+      const filtered =
+        target.kind === "code_symbol"
+          ? prev.filter(
+              (m) =>
+                !(
+                  m.kind === "code_symbol" &&
+                  m.path === target.path &&
+                  m.symbolName === target.symbolName &&
+                  m.startLine === target.startLine
+                ),
+            )
+          : prev.filter((m) => m.token !== target.token);
       return {
         ...s,
         inlineMentions: {
@@ -3101,6 +4254,34 @@ export const orbitActions = {
 
     const buf = await file.arrayBuffer();
     const rawBytes = new Uint8Array(buf);
+    const mediaKind = detectRichMediaKind(file.name, file.type);
+
+    if (mediaKind) {
+      const name = file.name || `attachment-${Date.now()}.${mediaKind === "pdf" ? "pdf" : mediaKind === "audio" ? "mp3" : "mp4"}`;
+      const id = `${mediaKind}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const mimeType = file.type || defaultMimeForMedia(name, mediaKind);
+      const previewUrl = URL.createObjectURL(file);
+      const pdfPageCount = mediaKind === "pdf" ? estimatePdfPageCount(rawBytes) : null;
+      orbitActions.addContextMention({
+        id,
+        kind: "file",
+        path: "",
+        filename: name,
+        sizeBytes: file.size,
+        localFile: file,
+        uploading: Boolean(hostId),
+        mediaKind,
+        mimeType,
+        pdfPageCount,
+        previewUrl,
+      });
+      if (hostId) {
+        await uploadContextAttachmentToHost(scopeKey, id, file, name, hostId, false);
+      } else {
+        notifyToast(`Select a host before sending to upload attached ${mediaKind.toUpperCase()}`);
+      }
+      return;
+    }
 
     // Text / code files <= 64 KiB without NUL bytes: inline into pastedAttachments
     if (isLikelyTextFile(file, rawBytes)) {
@@ -3190,15 +4371,66 @@ export const orbitActions = {
     key: string,
     steerImmediately: boolean,
   ): Promise<void> {
-    const rawDraft = (state.composerDrafts[key] ?? "").trim();
-    const storedDirective = state.slashDirectives[key] ?? null;
+    // Snapshot ALL routing and draft config fields up front before any async upload/diff/compose
+    // awaits so switching Agent or Workspace mid-submit can never misroute the prompt or settings.
+    const initialHostDetail = state.hostDetails[hostId];
+    const initialIsDraft = state.isDraftNewSession || !state.selectedAgentId;
+    const initialAgentId = initialIsDraft ? null : state.selectedAgentId;
+    const initialActiveAgent = initialAgentId
+      ? (initialHostDetail?.agents.find((a) => a.agent_id === initialAgentId) ?? null)
+      : null;
+    const submitTarget = {
+      hostId,
+      scopeKey: key,
+      isDraftNewSession: initialIsDraft,
+      agentId: initialAgentId,
+      workspaceCwd: state.selectedWorkspaceCwd || "~",
+      draftProvider: state.draftProvider,
+      draftAcpAgentId: state.draftAcpAgentId,
+      draftModels: { ...state.draftModels },
+      draftEffort: state.draftEffort,
+      draftFastMode: state.draftFastMode,
+      draftMode: state.draftMode,
+      draftProfileId: state.draftProfileId,
+      draftWorkspaceId: state.draftWorkspaceId,
+      draftUseWorktree: state.draftUseWorktree,
+      draftWorktreeBranch: state.draftWorktreeBranch,
+      draftWorktreeRepoPath: state.draftWorktreeRepoPath,
+      worktreeBranchPrefix: state.worktreeBranchPrefix,
+      providerForCompose: initialActiveAgent
+        ? initialActiveAgent.provider
+        : resolveAvailableDraftProvider(initialHostDetail, state.draftProvider),
+    };
 
-    const initialContexts = state.contextItems[key] ?? [];
-    const registeredInline = state.inlineMentions[key] ?? [];
-    const pastes = state.pastedAttachments[key] ?? [];
-    const quotes = state.diffQuotes[key] ?? [];
+    const rawDraft = (state.composerDrafts[submitTarget.scopeKey] ?? "").trim();
+    const storedDirective = state.slashDirectives[submitTarget.scopeKey] ?? null;
 
-    // Ensure every attached image/file has completed uploading to the target `hostId`
+    // Inline `/goal <objective>` command starts an unattended autonomous Goal run directly
+    if (!storedDirective && /^\/goal(?:\s+|$)/i.test(rawDraft)) {
+      const objective = rawDraft.replace(/^\/goal\s*/i, "").trim();
+      if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
+        notifyToast("Start an active session first to run /goal");
+        return;
+      }
+      if (!objective) {
+        notifyToast("Provide a goal objective after /goal");
+        return;
+      }
+      orbitActions.setComposerDraft("");
+      await orbitActions.startGoalRun({
+        hostId: submitTarget.hostId,
+        agentId: submitTarget.agentId,
+        objective,
+      });
+      return;
+    }
+
+    const initialContexts = state.contextItems[submitTarget.scopeKey] ?? [];
+    const registeredInline = state.inlineMentions[submitTarget.scopeKey] ?? [];
+    const pastes = state.pastedAttachments[submitTarget.scopeKey] ?? [];
+    const quotes = state.diffQuotes[submitTarget.scopeKey] ?? [];
+
+    // Ensure every attached image/file has completed uploading to the target `submitTarget.hostId`
     // BEFORE composing the wire prompt or clearing the composer draft.
     if (initialContexts.some((ctx) => ctx.kind === "image" || ctx.kind === "file")) {
       try {
@@ -3213,15 +4445,22 @@ export const orbitActions = {
           await Promise.all(pendingPromises);
         }
 
-        const refreshedContexts = state.contextItems[key] ?? [];
+        const refreshedContexts = state.contextItems[submitTarget.scopeKey] ?? [];
         for (const ctx of refreshedContexts) {
           if (
             (ctx.kind === "image" || ctx.kind === "file") &&
             ctx.localFile &&
-            (ctx.stagedHostId !== hostId || !ctx.path)
+            (ctx.stagedHostId !== submitTarget.hostId || !ctx.path)
           ) {
             const fname = ctx.filename || ctx.localFile.name || "attachment.bin";
-            await uploadContextAttachmentToHost(key, ctx.id, ctx.localFile, fname, hostId, true);
+            await uploadContextAttachmentToHost(
+              submitTarget.scopeKey,
+              ctx.id,
+              ctx.localFile,
+              fname,
+              submitTarget.hostId,
+              true,
+            );
           }
         }
       } catch (err) {
@@ -3230,12 +4469,12 @@ export const orbitActions = {
       }
     }
 
-    const existingContexts = state.contextItems[key] ?? [];
+    const existingContexts = state.contextItems[submitTarget.scopeKey] ?? [];
 
     // Resolve any inline `@tokens` still present in `rawDraft` without showing attachment boxes
     const resolvedInlineContexts: ContextMentionItem[] = [];
     for (const m of registeredInline) {
-      if (!rawDraft.includes(m.token)) continue;
+      if (!containsInlineMentionToken(rawDraft, m.token)) continue;
       if (m.kind === "file") {
         resolvedInlineContexts.push({ id: `inl_${m.path}`, kind: "file", path: m.path });
       } else if (m.kind === "git_diff") {
@@ -3253,6 +4492,19 @@ export const orbitActions = {
           lineCount: m.lineCount,
           content: m.content,
         });
+      } else if (m.kind === "code_symbol") {
+        resolvedInlineContexts.push({
+          id: `inl_sym_${m.path}_${m.symbolName}_${m.startLine}`,
+          kind: "code_symbol",
+          path: m.path,
+          startLine: m.startLine,
+          endLine: m.endLine,
+          symbolName: m.symbolName,
+          symbolKind: m.symbolKind,
+          signature: m.signature ?? null,
+          container: m.container ?? null,
+          language: m.language,
+        });
       }
     }
 
@@ -3262,12 +4514,50 @@ export const orbitActions = {
         if (x.kind === "file" && rc.kind === "file") return x.path === rc.path;
         if (x.kind === "git_diff" && rc.kind === "git_diff") return x.staged === rc.staged;
         if (x.kind === "terminal_output" && rc.kind === "terminal_output") return true;
+        if (x.kind === "code_symbol" && rc.kind === "code_symbol") {
+          return (
+            x.path === rc.path &&
+            x.symbolName === rc.symbolName &&
+            x.startLine === rc.startLine
+          );
+        }
         return false;
       });
       if (!dup) mergedContexts.push(rc);
     }
 
-    const cwd = state.selectedWorkspaceCwd || "~";
+    const cwd = submitTarget.workspaceCwd;
+
+    // Resolve line-numbered code snippets for any cited `@symbol` mentions (bounded & file-deduplicated)
+    const symbolContexts = mergedContexts.filter(
+      (c): c is Extract<ContextMentionItem, { kind: "code_symbol" }> =>
+        c.kind === "code_symbol" && !c.snippet,
+    );
+    const resolvedSymbolSnippets = new Map<string, string>();
+    if (symbolContexts.length > 0 && cwd && cwd !== "~") {
+      const uniquePaths = Array.from(new Set(symbolContexts.map((s) => s.path))).slice(0, 8);
+      const fileTextByPath = new Map<string, string>();
+      await Promise.all(
+        uniquePaths.map(async (relPath) => {
+          try {
+            const view = await orbitIpc.readWorkspaceFile(submitTarget.hostId, cwd, relPath);
+            if (view.content_kind === "text" && view.content) {
+              fileTextByPath.set(relPath, view.content);
+            }
+          } catch {
+            // Gracefully fall back to signature + path:lines metadata if file read fails
+          }
+        }),
+      );
+      for (const sym of symbolContexts) {
+        const text = fileTextByPath.get(sym.path);
+        if (!text) continue;
+        const snippet = extractLineSnippet(text, sym.startLine, sym.endLine, 6000);
+        if (snippet) {
+          resolvedSymbolSnippets.set(sym.id, snippet);
+        }
+      }
+    }
     const needsWorkingDiff =
       storedDirective === "review" ||
       (!storedDirective && /^\/review(?:\s|$)/i.test(rawDraft)) ||
@@ -3277,40 +4567,42 @@ export const orbitActions = {
     let workingDiffText: string | null = null;
     let stagedDiffText: string | null = null;
     if (needsWorkingDiff) {
-      await orbitIpc.fetchGitDiff(hostId, cwd, null, false);
-      const gr = await orbitIpc.getGitReview(hostId, cwd, null);
+      await orbitIpc.fetchGitDiff(submitTarget.hostId, cwd, null, false);
+      const gr = await orbitIpc.getGitReview(submitTarget.hostId, cwd, null);
       if (gr.raw_diff.trim()) workingDiffText = gr.raw_diff;
     }
     if (needsStagedDiff) {
-      await orbitIpc.fetchGitDiff(hostId, cwd, null, true);
-      const gr = await orbitIpc.getGitReview(hostId, cwd, null);
+      await orbitIpc.fetchGitDiff(submitTarget.hostId, cwd, null, true);
+      const gr = await orbitIpc.getGitReview(submitTarget.hostId, cwd, null);
       if (gr.raw_diff.trim()) stagedDiffText = gr.raw_diff;
     }
 
-    const detailForCompose = state.hostDetails[hostId];
-    const installedForCompose = detailForCompose?.host.available_providers ?? [];
-    const activeForCompose =
-      !state.isDraftNewSession && state.selectedAgentId
-        ? detailForCompose?.agents.find((a) => a.agent_id === state.selectedAgentId) ?? null
-        : null;
-    const providerForCompose: ProviderKind = activeForCompose
-      ? activeForCompose.provider
-      : installedForCompose.length > 0 && !installedForCompose.includes(state.draftProvider)
-        ? installedForCompose[0]
-        : state.draftProvider;
+    const providerForCompose: ProviderKind = submitTarget.providerForCompose;
 
     const contextInputs: ComposerContextInput[] = mergedContexts.map((ctx) => {
       switch (ctx.kind) {
         case "image":
           return { kind: "image", path: ctx.path, filename: ctx.filename };
-        case "file":
-          return ctx.stagedHostId
-            ? {
-                kind: "staged_file",
-                path: ctx.path,
-                filename: ctx.filename || ctx.path,
-              }
-            : { kind: "workspace_file", path: ctx.path };
+        case "file": {
+          if (ctx.stagedHostId) {
+            const fname = ctx.filename || ctx.path;
+            if (ctx.mediaKind === "pdf") {
+              return { kind: "pdf", path: ctx.path, filename: fname };
+            }
+            if (ctx.mediaKind === "audio") {
+              return { kind: "audio", path: ctx.path, filename: fname };
+            }
+            if (ctx.mediaKind === "video") {
+              return { kind: "video", path: ctx.path, filename: fname };
+            }
+            return {
+              kind: "staged_file",
+              path: ctx.path,
+              filename: fname,
+            };
+          }
+          return { kind: "workspace_file", path: ctx.path };
+        }
         case "git_diff":
           return {
             kind: "git_diff",
@@ -3324,6 +4616,19 @@ export const orbitActions = {
             label: ctx.label,
             content: ctx.content,
           };
+        case "code_symbol":
+          return {
+            kind: "code_symbol",
+            name: ctx.symbolName,
+            symbol_kind: ctx.symbolKind,
+            path: ctx.path,
+            start_line: ctx.startLine,
+            end_line: ctx.endLine,
+            signature: ctx.signature ?? null,
+            container: ctx.container ?? null,
+            language: ctx.language,
+            snippet: ctx.snippet ?? resolvedSymbolSnippets.get(ctx.id) ?? null,
+          };
       }
     });
 
@@ -3331,7 +4636,7 @@ export const orbitActions = {
       provider: providerForCompose,
       raw_text: rawDraft,
       explicit_directive: storedDirective,
-      host_id: hostId,
+      host_id: submitTarget.hostId,
       cwd,
       contexts: contextInputs,
       quotes: quotes.map((q) => ({
@@ -3346,29 +4651,84 @@ export const orbitActions = {
       })),
     });
 
+    if (composed.is_fork) {
+      if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
+        notifyToast("Start an active session first to fork");
+        return;
+      }
+      setState((s) => ({
+        ...s,
+        composerDrafts: { ...s.composerDrafts, [submitTarget.scopeKey]: "" },
+        slashDirectives: { ...s.slashDirectives, [submitTarget.scopeKey]: null },
+      }));
+      draftPersistence.flushNow();
+      void orbitActions.forkAgent({
+        hostId: submitTarget.hostId,
+        sourceAgentId: submitTarget.agentId,
+        worktree: Boolean(composed.fork_worktree),
+        branch: composed.fork_branch ?? undefined,
+        initialPrompt: composed.fork_prompt ?? undefined,
+      });
+      return;
+    }
+
+    if (composed.fast_mode_action) {
+      setState((s) => ({
+        ...s,
+        composerDrafts: { ...s.composerDrafts, [submitTarget.scopeKey]: "" },
+        slashDirectives: { ...s.slashDirectives, [submitTarget.scopeKey]: null },
+      }));
+      draftPersistence.flushNow();
+      const stillOnOrigin =
+        state.selectedHostId === submitTarget.hostId &&
+        (state.isDraftNewSession || !state.selectedAgentId) === submitTarget.isDraftNewSession &&
+        (submitTarget.isDraftNewSession || state.selectedAgentId === submitTarget.agentId);
+      if (stillOnOrigin) {
+        orbitActions.toggleActiveFastMode(composed.fast_mode_action);
+      }
+      return;
+    }
+
     if (composed.is_btw) {
       setState((s) => ({
         ...s,
-        composerDrafts: { ...s.composerDrafts, [key]: "" },
+        composerDrafts: { ...s.composerDrafts, [submitTarget.scopeKey]: "" },
       }));
-      orbitActions.openSideQuestionTab();
+      draftPersistence.flushNow();
+      const stillOnOrigin =
+        state.selectedHostId === submitTarget.hostId &&
+        (state.isDraftNewSession || !state.selectedAgentId) === submitTarget.isDraftNewSession &&
+        (submitTarget.isDraftNewSession || state.selectedAgentId === submitTarget.agentId);
+      if (stillOnOrigin) {
+        orbitActions.openSideQuestionTab();
+      }
       if (composed.btw_question) {
-        void orbitActions.submitSideQuestion(composed.btw_question);
+        void orbitActions.submitSideQuestion(composed.btw_question, {
+          hostId: submitTarget.hostId,
+          scopeKey: submitTarget.scopeKey,
+          isDraftNewSession: submitTarget.isDraftNewSession,
+          agentId: submitTarget.agentId,
+          workspaceCwd: submitTarget.workspaceCwd,
+          draftProvider: submitTarget.draftProvider,
+          draftAcpAgentId: submitTarget.draftAcpAgentId,
+          draftModels: submitTarget.draftModels,
+        });
       }
       return;
     }
 
     if (composed.is_compact) {
-      if (state.isDraftNewSession || !state.selectedAgentId) {
+      if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
         notifyToast("Start an active session first to compact context");
         return;
       }
       setState((s) => ({
         ...s,
-        composerDrafts: { ...s.composerDrafts, [key]: "" },
-        slashDirectives: { ...s.slashDirectives, [key]: null },
+        composerDrafts: { ...s.composerDrafts, [submitTarget.scopeKey]: "" },
+        slashDirectives: { ...s.slashDirectives, [submitTarget.scopeKey]: null },
       }));
-      await orbitIpc.sendPrompt(hostId, state.selectedAgentId, composed.wire_prompt, {
+      draftPersistence.flushNow();
+      await orbitIpc.sendPrompt(submitTarget.hostId, submitTarget.agentId, composed.wire_prompt, {
         displayPrompt: composed.display_prompt,
         badges: composed.badges,
       });
@@ -3384,40 +4744,58 @@ export const orbitActions = {
     const imagePathQueueByLabel = new Map<string, string[]>();
     const filePathQueueByLabel = new Map<string, string[]>();
     const sentImages: SentImagePreviewMeta[] = [];
-    const targetAgentId = state.isDraftNewSession ? null : state.selectedAgentId;
+    const targetAgentId = submitTarget.agentId;
+    const revokedLocalUrls = new Set<string>();
     for (const ctx of mergedContexts) {
       if (ctx.kind === "image") {
         if (ctx.path && ctx.previewUrl) {
-          seedPromptImagePreview(hostId, ctx.path, ctx.previewUrl, true);
+          seedPromptImagePreview(submitTarget.hostId, ctx.path, ctx.previewUrl, true);
         } else if (ctx.previewUrl?.startsWith("blob:")) {
           URL.revokeObjectURL(ctx.previewUrl);
+          revokedLocalUrls.add(ctx.previewUrl);
         }
+        const cachedEntry = ctx.path ? getCachedPromptImage(submitTarget.hostId, ctx.path) : null;
+        const safePreviewUrl =
+          ctx.previewUrl && !revokedLocalUrls.has(ctx.previewUrl) ? ctx.previewUrl : null;
+        const cachedPreview =
+          safePreviewUrl || (cachedEntry?.status === "ready" ? cachedEntry.url : null);
         sentImages.push({
           label: ctx.filename,
           path: ctx.path || null,
-          previewUrl: ctx.previewUrl || null,
+          previewUrl: cachedPreview,
         });
         if (ctx.path) {
           const queue = imagePathQueueByLabel.get(ctx.filename);
           if (queue) queue.push(ctx.path);
           else imagePathQueueByLabel.set(ctx.filename, [ctx.path]);
         }
-      } else if (ctx.kind === "file" && ctx.path) {
-        const label = ctx.filename || basenameFromPath(ctx.path);
-        const queue = filePathQueueByLabel.get(label);
-        if (queue) queue.push(ctx.path);
-        else filePathQueueByLabel.set(label, [ctx.path]);
+      } else if (ctx.kind === "file") {
+        if (ctx.previewUrl?.startsWith("blob:")) {
+          URL.revokeObjectURL(ctx.previewUrl);
+          revokedLocalUrls.add(ctx.previewUrl);
+        }
+        if (ctx.path) {
+          const label = ctx.filename || basenameFromPath(ctx.path);
+          const queue = filePathQueueByLabel.get(label);
+          if (queue) queue.push(ctx.path);
+          else filePathQueueByLabel.set(label, [ctx.path]);
+        }
       }
     }
     if (sentImages.length > 0) {
-      recordRecentSentTurnImages(hostId, targetAgentId, cleanUserText, sentImages);
+      recordRecentSentTurnImages(submitTarget.hostId, targetAgentId, cleanUserText, sentImages);
     }
     const badges: PromptBadge[] = composed.badges.map((b) => {
       if (b.path) return b;
       if (b.kind === "image") {
         const fallbackPath = imagePathQueueByLabel.get(b.label)?.shift();
         if (fallbackPath) return { ...b, path: fallbackPath };
-      } else if (b.kind === "file") {
+      } else if (
+        b.kind === "file" ||
+        b.kind === "pdf" ||
+        b.kind === "audio" ||
+        b.kind === "video"
+      ) {
         const fallbackPath = filePathQueueByLabel.get(b.label)?.shift();
         if (fallbackPath) return { ...b, path: fallbackPath };
       }
@@ -3433,28 +4811,43 @@ export const orbitActions = {
     setState(
       (s) => ({
         ...s,
-        composerDrafts: { ...s.composerDrafts, [key]: "" },
-        slashDirectives: { ...s.slashDirectives, [key]: null },
-        inlineMentions: { ...s.inlineMentions, [key]: [] },
-        contextItems: { ...s.contextItems, [key]: [] },
-        pastedAttachments: { ...s.pastedAttachments, [key]: [] },
-        diffQuotes: { ...s.diffQuotes, [key]: [] },
+        composerDrafts: { ...s.composerDrafts, [submitTarget.scopeKey]: "" },
+        slashDirectives: { ...s.slashDirectives, [submitTarget.scopeKey]: null },
+        inlineMentions: { ...s.inlineMentions, [submitTarget.scopeKey]: [] },
+        contextItems: { ...s.contextItems, [submitTarget.scopeKey]: [] },
+        pastedAttachments: { ...s.pastedAttachments, [submitTarget.scopeKey]: [] },
+        diffQuotes: { ...s.diffQuotes, [submitTarget.scopeKey]: [] },
         promptHistory: nextHistory,
+        mediaPreviewTarget:
+          s.mediaPreviewTarget?.localUrl && revokedLocalUrls.has(s.mediaPreviewTarget.localUrl)
+            ? null
+            : s.mediaPreviewTarget,
       }),
       true,
     );
+    draftPersistence.flushNow();
 
-    if (state.isDraftNewSession || !state.selectedAgentId) {
-      const hostDetailForCreate = state.hostDetails[hostId];
+    if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
+      const hostDetailForCreate = state.hostDetails[submitTarget.hostId];
       const installedProviders = hostDetailForCreate?.host.available_providers ?? [];
-      if (hostDetailForCreate && installedProviders.length === 0) {
+      const installedAcpList = (hostDetailForCreate?.acp_agents ?? []).filter(
+        (a) => a.installed && a.spec.enabled,
+      );
+      if (hostDetailForCreate && installedProviders.length === 0 && installedAcpList.length === 0) {
         orbitActions.showToast("No installed Agent CLI detected on this host");
         return;
       }
-      const effectiveProvider =
-        installedProviders.length > 0 && !installedProviders.includes(state.draftProvider)
-          ? installedProviders[0]
-          : state.draftProvider;
+      const effectiveProvider = resolveAvailableDraftProvider(
+        hostDetailForCreate,
+        submitTarget.draftProvider,
+      );
+      const effectiveAcpAgentId =
+        effectiveProvider === "acp"
+          ? submitTarget.draftAcpAgentId &&
+            installedAcpList.some((a) => a.spec.id === submitTarget.draftAcpAgentId)
+            ? submitTarget.draftAcpAgentId
+            : (installedAcpList[0]?.spec.id ?? submitTarget.draftAcpAgentId)
+          : null;
 
       const branchSeed =
         cleanUserText ||
@@ -3464,14 +4857,16 @@ export const orbitActions = {
             ? "plan"
             : badges[0]?.label ?? "task");
 
-      const selectedCwd = state.selectedWorkspaceCwd || "~";
-      const gitCacheKey = `${hostId}::${selectedCwd}`;
+      const selectedCwd = submitTarget.workspaceCwd;
+      const gitCacheKey = `${submitTarget.hostId}::${selectedCwd}`;
       const cachedInspection =
         state.gitReposCache[gitCacheKey] ??
         hostDetailForCreate?.git_repos_by_cwd?.[selectedCwd] ??
         null;
       const sidebarProj = state.sidebarView?.projects.find(
-        (p) => p.host_id === hostId && matchesProjectDirectory(p.directories, selectedCwd),
+        (p) =>
+          p.host_id === submitTarget.hostId &&
+          matchesProjectDirectory(p.directories, selectedCwd),
       );
       const discoveredProj = hostDetailForCreate?.discovered_projects.find(
         (p) => p.path === selectedCwd,
@@ -3486,25 +4881,25 @@ export const orbitActions = {
         sidebarProj?.nested_git_repos ??
         discoveredProj?.nested_git_repos ??
         [];
-      const chosenNestedRepo = state.draftWorktreeRepoPath
-        ? nestedRepos.find((r) => r.path === state.draftWorktreeRepoPath)?.path ??
-          state.draftWorktreeRepoPath
+      const chosenNestedRepo = submitTarget.draftWorktreeRepoPath
+        ? nestedRepos.find((r) => r.path === submitTarget.draftWorktreeRepoPath)?.path ??
+          submitTarget.draftWorktreeRepoPath
         : null;
 
       let effectiveCwd = selectedCwd;
       let effectiveExtraDirs: string[] = [];
       let worktreeBranch: string | null = null;
-      if (state.draftUseWorktree) {
+      if (submitTarget.draftUseWorktree) {
         const canUseWorktree = isDirectGitRepo || Boolean(chosenNestedRepo);
         if (canUseWorktree) {
-          const manual = state.draftWorktreeBranch.trim();
+          const manual = submitTarget.draftWorktreeBranch.trim();
           if (manual) {
             worktreeBranch = manual;
           } else if (
-            state.worktreeBranchPrefix.trim() &&
-            state.worktreeBranchPrefix.trim() !== "auto"
+            submitTarget.worktreeBranchPrefix.trim() &&
+            submitTarget.worktreeBranchPrefix.trim() !== "auto"
           ) {
-            worktreeBranch = slugifyPrefixedBranch(state.worktreeBranchPrefix, branchSeed);
+            worktreeBranch = slugifyPrefixedBranch(submitTarget.worktreeBranchPrefix, branchSeed);
           } else {
             worktreeBranch = "auto";
           }
@@ -3520,101 +4915,154 @@ export const orbitActions = {
           }
         }
       }
+      const explicitDraftModel = submitTarget.draftModels[effectiveProvider] ?? null;
       const resolvedSel = await orbitIpc
         .resolveModelSelection({
-          host_id: hostId,
+          host_id: submitTarget.hostId,
           provider: effectiveProvider,
-          desired_model: state.draftModels[effectiveProvider] ?? null,
-          desired_effort: state.draftEffort,
+          desired_model: explicitDraftModel,
+          desired_effort: submitTarget.draftEffort,
         })
         .catch(() => null);
       const cat = getCatalogForProvider(
         hostDetailForCreate?.provider_catalogs,
         effectiveProvider,
       );
-      const explicitDraftModel = state.draftModels[effectiveProvider] ?? null;
       const spec = resolveActiveModelSpec(cat, explicitDraftModel);
       const resolvedModel =
-        resolvedSel?.selected_model_id ?? explicitDraftModel ?? spec?.id ?? null;
+        effectiveProvider === "acp"
+          ? explicitDraftModel
+          : (resolvedSel?.selected_model_id ?? explicitDraftModel ?? spec?.id ?? null);
       const resolvedEffort =
-        resolvedSel?.selected_effort ??
-        resolveSupportedEffortForModel(
-          spec,
-          state.draftEffort,
-          cat.configured_default_effort,
-        );
+        effectiveProvider === "acp"
+          ? null
+          : (resolvedSel?.selected_effort ??
+            resolveSupportedEffortForModel(
+              spec,
+              submitTarget.draftEffort,
+              cat.configured_default_effort,
+            ));
+      const supportsFast =
+        effectiveProvider === "acp" || effectiveProvider === "antigravity"
+          ? false
+          : (resolvedSel?.supports_fast_mode ?? modelSupportsFastMode(effectiveProvider, spec));
 
-      pendingDraftCreate = { hostId, optimisticAgentId: null, startedAt: Date.now() };
+      const stillOnOriginDraft =
+        state.selectedHostId === submitTarget.hostId &&
+        state.isDraftNewSession &&
+        (state.selectedWorkspaceCwd || "~") === submitTarget.workspaceCwd;
+      let localPendingRef: typeof pendingDraftCreate = null;
+      if (stillOnOriginDraft) {
+        localPendingRef = {
+          hostId: submitTarget.hostId,
+          optimisticAgentId: null,
+          startedAt: Date.now(),
+        };
+        pendingDraftCreate = localPendingRef;
+      }
       let optimisticId: string | undefined;
       try {
         optimisticId = await orbitIpc.createAgent({
-          hostId,
+          hostId: submitTarget.hostId,
           cwd: effectiveCwd,
           extraDirs: effectiveExtraDirs,
           provider: effectiveProvider,
+          acpAgentId: effectiveAcpAgentId,
           model: resolvedModel,
           effort: resolvedEffort,
-          mode: state.draftMode,
+          fastMode: Boolean(submitTarget.draftFastMode && supportsFast),
+          mode: submitTarget.draftMode,
           initialPrompt: assembledWirePrompt,
           initialDisplayPrompt: cleanUserText,
           initialBadges: badges,
           worktreeBranch,
-          profileId: state.draftProfileId,
-          workspaceId: state.draftWorkspaceId,
+          profileId: submitTarget.draftProfileId,
+          workspaceId: submitTarget.draftWorkspaceId,
         });
       } catch (err) {
-        pendingDraftCreate = null;
+        if (localPendingRef && pendingDraftCreate === localPendingRef) {
+          pendingDraftCreate = null;
+        }
         throw err;
       }
-      if (optimisticId && pendingDraftCreate && pendingDraftCreate.hostId === hostId) {
+      const stillOnOriginDraftAfterCreate =
+        state.selectedHostId === submitTarget.hostId &&
+        state.isDraftNewSession &&
+        (state.selectedWorkspaceCwd || "~") === submitTarget.workspaceCwd;
+      if (
+        optimisticId &&
+        stillOnOriginDraftAfterCreate &&
+        localPendingRef &&
+        pendingDraftCreate === localPendingRef
+      ) {
         pendingDraftCreate = {
-          hostId,
+          hostId: submitTarget.hostId,
           optimisticAgentId: optimisticId,
           startedAt: Date.now(),
         };
       }
-      setState((s) => ({
-        ...s,
-        draftProvider: effectiveProvider,
-        draftWorktreeBranch: "",
-        draftWorkspaceId: null,
-      }));
+      if (stillOnOriginDraftAfterCreate) {
+        setState((s) => ({
+          ...s,
+          draftProvider: effectiveProvider,
+          draftWorktreeBranch: "",
+          draftWorkspaceId: null,
+        }));
+      }
       return;
     }
 
-    const agentId = state.selectedAgentId;
-    const detail = state.hostDetails[hostId];
+    const agentId = submitTarget.agentId;
+    const detail = state.hostDetails[submitTarget.hostId];
     const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
     const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
 
     if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
       if (steerImmediately) {
-        await orbitIpc.sendPrompt(hostId, agentId, assembledWirePrompt, {
+        await orbitIpc.sendPrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
           displayPrompt: cleanUserText,
           badges,
           activeTurnBehavior: "steer",
         });
       } else if (supportsServerQueue) {
+        const queuedContexts: ContextMentionItem[] = mergedContexts.map((ctx) => {
+          if (ctx.kind === "file" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
+            return { ...ctx, previewUrl: undefined };
+          }
+          if (ctx.kind === "image" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
+            return { ...ctx, previewUrl: "" };
+          }
+          return ctx;
+        });
         const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         rememberLocalQueuedDraftExtras(queueId, {
           slashDirective: effectiveDirective,
-          contexts: mergedContexts,
+          contexts: queuedContexts,
           pastes,
           quotes,
         });
-        await orbitIpc.enqueuePrompt(hostId, agentId, assembledWirePrompt, {
+        await orbitIpc.enqueuePrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
           displayPrompt: cleanUserText,
           badges,
           queueId,
         });
       } else {
+        const queuedContexts: ContextMentionItem[] = mergedContexts.map((ctx) => {
+          if (ctx.kind === "file" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
+            return { ...ctx, previewUrl: undefined };
+          }
+          if (ctx.kind === "image" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
+            return { ...ctx, previewUrl: "" };
+          }
+          return ctx;
+        });
         const queuedItem: QueuedPromptItem = {
           id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           wirePrompt: assembledWirePrompt,
           displayText: cleanUserText,
           badges,
           slashDirective: effectiveDirective,
-          contexts: mergedContexts,
+          contexts: queuedContexts,
           pastes,
           quotes,
         };
@@ -3622,15 +5070,21 @@ export const orbitActions = {
           ...s,
           queuedPrompts: {
             ...s.queuedPrompts,
-            [key]: [...(s.queuedPrompts[key] ?? []), queuedItem],
+            [submitTarget.scopeKey]: [...(s.queuedPrompts[submitTarget.scopeKey] ?? []), queuedItem],
           },
         }));
       }
       return;
     }
 
-    setState((s) => ({ ...s, sessionScrollNonce: s.sessionScrollNonce + 1 }));
-    await orbitIpc.sendPrompt(hostId, agentId, assembledWirePrompt, {
+    setState((s) =>
+      s.selectedHostId === submitTarget.hostId &&
+      !s.isDraftNewSession &&
+      s.selectedAgentId === agentId
+        ? { ...s, sessionScrollNonce: s.sessionScrollNonce + 1 }
+        : s,
+    );
+    await orbitIpc.sendPrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
       displayPrompt: cleanUserText,
       badges,
     });
@@ -3802,16 +5256,12 @@ export const orbitActions = {
           ag.agent_id === agentId ? { ...ag, queued_prompts: nextQueued } : ag,
         );
         const curStage = s.stages[tlKey];
-        const nextStages =
-          curStage?.agent
-            ? {
-                ...s.stages,
-                [tlKey]: {
-                  ...curStage,
-                  agent: { ...curStage.agent, queued_prompts: nextQueued },
-                },
-              }
-            : s.stages;
+        const nextStages = curStage?.agent
+          ? applyStageCacheUpdate(s, tlKey, {
+              ...curStage,
+              agent: { ...curStage.agent, queued_prompts: nextQueued },
+            })
+          : s.stages;
         return {
           ...s,
           hostDetails: {
@@ -3950,7 +5400,135 @@ export const orbitActions = {
     });
   },
 
+  openExportDialog(hostId: string, agentId: string): void {
+    setState((s) => ({
+      ...s,
+      exportDialogTarget: { hostId, agentId },
+    }));
+  },
+
+  closeExportDialog(): void {
+    setState((s) => (s.exportDialogTarget ? { ...s, exportDialogTarget: null } : s));
+  },
+
+  openWorktreeHandoffDialog(target: WorktreeHandoffDialogTarget): void {
+    setState((s) => ({
+      ...s,
+      handoffDialogTarget: target,
+    }));
+  },
+
+  closeWorktreeHandoffDialog(): void {
+    setState((s) => (s.handoffDialogTarget ? { ...s, handoffDialogTarget: null } : s));
+  },
+
+  async openCopyCodeBlocksModal(hostId: string, agentId: string): Promise<void> {
+    const reqSeq = ++copyBlocksReqSeq;
+    let blocks: ExtractedCodeBlock[] = [];
+    try {
+      blocks = await orbitIpc.listAgentCodeBlocks(hostId, agentId);
+    } catch {
+      blocks = [];
+    }
+    if (
+      reqSeq !== copyBlocksReqSeq ||
+      state.selectedHostId !== hostId ||
+      state.selectedAgentId !== agentId
+    ) {
+      return;
+    }
+
+    if (blocks.length > 0) {
+      setState((s) => ({
+        ...s,
+        copyCodeBlocksTarget: { hostId, agentId, blocks },
+      }));
+      return;
+    }
+
+    // Fallback when 0 code blocks exist: copy the latest assistant reply directly.
+    const tKey = threadScopeKey(hostId, agentId);
+    let lastReply = "";
+    const cachedStage = state.stages[tKey];
+    if (cachedStage && cachedStage.turns.length > 0) {
+      for (let t = cachedStage.turns.length - 1; t >= 0 && !lastReply; t -= 1) {
+        const segs = cachedStage.turns[t]?.live_segments ?? [];
+        for (let sIdx = segs.length - 1; sIdx >= 0; sIdx -= 1) {
+          const seg = segs[sIdx];
+          if (seg?.kind === "assistant_message" && seg.item.item_type === "assistant_message") {
+            const trimmed = seg.item.text.trim();
+            if (trimmed) {
+              lastReply = trimmed;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (!lastReply) {
+      try {
+        const full = await orbitIpc.getAgentTimeline(hostId, agentId);
+        if (
+          reqSeq !== copyBlocksReqSeq ||
+          state.selectedHostId !== hostId ||
+          state.selectedAgentId !== agentId
+        ) {
+          return;
+        }
+        for (let i = full.items.length - 1; i >= 0; i -= 1) {
+          const item = full.items[i];
+          if (item?.item_type === "assistant_message") {
+            const trimmed = item.text.trim();
+            if (trimmed) {
+              lastReply = trimmed;
+              break;
+            }
+          }
+        }
+      } catch {
+        // ignore fallback fetch errors
+      }
+    }
+
+    if (
+      reqSeq !== copyBlocksReqSeq ||
+      state.selectedHostId !== hostId ||
+      state.selectedAgentId !== agentId
+    ) {
+      return;
+    }
+    if (!lastReply) {
+      notifyToast("No assistant reply or code block to copy");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(lastReply);
+      notifyToast("Copied last assistant reply");
+    } catch {
+      notifyToast("Failed to copy reply");
+    }
+  },
+
+  closeCopyCodeBlocksModal(): void {
+    copyBlocksReqSeq += 1;
+    setState((s) => (s.copyCodeBlocksTarget ? { ...s, copyCodeBlocksTarget: null } : s));
+  },
+
   async copyThread(hostId: string, agentId: string): Promise<void> {
+    try {
+      const exported = await orbitIpc.exportAgentTranscript(hostId, agentId, {
+        format: "markdown",
+        include_thinking: false,
+        include_tool_calls: false,
+        include_timestamps: false,
+      });
+      await navigator.clipboard.writeText(exported.content);
+      notifyToast("Copied conversation");
+      return;
+    } catch {
+      // Fallback for non-Tauri browser preview
+    }
+
     const tKey = threadScopeKey(hostId, agentId);
     const sections: string[] = [];
     const cachedStage = state.stages[tKey];
@@ -4005,6 +5583,7 @@ export const orbitActions = {
     toBeforeSeq: number,
     restoreFiles: boolean,
     fallbackPromptText?: string,
+    fallbackBadges?: readonly PromptBadge[],
   ): Promise<boolean> {
     const tKey = threadScopeKey(hostId, agentId);
     // Clear queued follow-ups before calling the daemon so transitioning to Idle never auto-dispatches stale prompts
@@ -4017,7 +5596,101 @@ export const orbitActions = {
 
     try {
       const res = await orbitIpc.rewindAgent(hostId, agentId, toBeforeSeq, restoreFiles);
-      const restoredDraft = (res.restored_prompt ?? fallbackPromptText ?? "").trim();
+      const rawFallback = (fallbackPromptText ?? "").trim();
+      const rawServerPrompt = (res.restored_prompt ?? "").trim();
+      const hasFallbackBadges = Boolean(fallbackBadges && fallbackBadges.length > 0);
+
+      // Reconstruct composer attachments (images, files, media, diffs) & slash directive from the rewound prompt
+      const restoredContexts: ContextMentionItem[] = [];
+      let restoredSlash: SlashDirective | null = null;
+      const nowToken = Date.now();
+      let imageIdx = 0;
+
+      if (fallbackBadges && fallbackBadges.length > 0) {
+        for (let i = 0; i < fallbackBadges.length; i += 1) {
+          const badge = fallbackBadges[i];
+          if (badge.kind === "image") {
+            const recent = lookupRecentSentTurnImage(
+              hostId,
+              agentId,
+              rawFallback || rawServerPrompt,
+              imageIdx,
+              badge.label,
+            );
+            imageIdx += 1;
+            const resolvedPath = badge.path?.trim() || recent?.path?.trim() || "";
+            if (!resolvedPath) continue;
+            const cached = getCachedPromptImage(hostId, resolvedPath);
+            restoredContexts.push({
+              id: `img_rw_${nowToken}_${i}`,
+              kind: "image",
+              filename: badge.label || basenameFromPath(resolvedPath) || "image.png",
+              path: resolvedPath,
+              previewUrl:
+                (cached?.status === "ready" ? cached.url : null) ?? recent?.previewUrl ?? "",
+              sizeBytes: 0,
+              stagedHostId: hostId,
+            });
+          } else if (
+            badge.kind === "pdf" ||
+            badge.kind === "audio" ||
+            badge.kind === "video"
+          ) {
+            const resolvedPath = badge.path?.trim() || "";
+            if (!resolvedPath) continue;
+            restoredContexts.push({
+              id: `${badge.kind}_rw_${nowToken}_${i}`,
+              kind: "file",
+              path: resolvedPath,
+              filename: badge.label || basenameFromPath(resolvedPath),
+              stagedHostId: hostId,
+              mediaKind: badge.kind,
+              mimeType: defaultMimeForMedia(badge.label || resolvedPath, badge.kind),
+            });
+          } else if (badge.kind === "file") {
+            const resolvedPath = badge.path?.trim() || "";
+            if (!resolvedPath) continue;
+            const isStaged = resolvedPath.startsWith("/");
+            restoredContexts.push({
+              id: `file_rw_${nowToken}_${i}`,
+              kind: "file",
+              path: resolvedPath,
+              filename: badge.label || basenameFromPath(resolvedPath),
+              ...(isStaged ? { stagedHostId: hostId } : {}),
+            });
+          } else if (badge.kind === "git_diff") {
+            const staged = /staged/i.test(badge.label);
+            restoredContexts.push({
+              id: `diff_rw_${staged ? "s" : "w"}_${nowToken}_${i}`,
+              kind: "git_diff",
+              staged,
+              label: badge.label || (staged ? "Staged Diff" : "Working Tree Diff"),
+            });
+          } else if (badge.kind === "slash") {
+            const rawCmd = badge.label.replace(/^\//, "").trim();
+            if (
+              rawCmd === "plan" ||
+              rawCmd === "review" ||
+              rawCmd === "compact" ||
+              rawCmd === "orbit" ||
+              rawCmd === "orbit-handoff" ||
+              rawCmd === "orbit-committee" ||
+              rawCmd === "orbit-advisor"
+            ) {
+              restoredSlash = rawCmd;
+            }
+          }
+        }
+      }
+
+      // If the prompt came from a legacy wire format (e.g. `Attached image file: \`/path\``) and we
+      // already extracted structured badges, prefer the clean text so raw attachment markup isn't duplicated.
+      const serverLooksLikeLegacyMarkup =
+        hasFallbackBadges &&
+        /^Attached (?:image|PDF|audio|video)? ?file:\s*`[^`]+`/m.test(rawServerPrompt);
+      const restoredDraft = serverLooksLikeLegacyMarkup
+        ? rawFallback
+        : rawServerPrompt || rawFallback;
       const cwd = res.agent?.cwd || state.selectedWorkspaceCwd;
 
       const openFileTabsToReload: Array<{ hostId: string; cwd: string; path: string }> = [];
@@ -4029,6 +5702,8 @@ export const orbitActions = {
           for (const [k, v] of Object.entries(s.fileViewCache)) {
             if (!k.startsWith(prefix)) {
               nextFileCache[k] = v;
+            } else {
+              bumpFileLoadSeq(k);
             }
           }
           for (const tab of s.sidePanelTabs) {
@@ -4041,6 +5716,26 @@ export const orbitActions = {
             }
           }
         }
+
+        // Preserve any images/files already staged in the composer AND merge restored attachments from the rewound turn
+        const existingCtxs = s.contextItems[tKey] ?? [];
+        const mergedCtxs = [...existingCtxs];
+        for (const item of restoredContexts) {
+          const dup = mergedCtxs.some((cur) => {
+            if (cur.kind === "image" && item.kind === "image") {
+              return Boolean(cur.path && cur.path === item.path);
+            }
+            if (cur.kind === "file" && item.kind === "file") {
+              return Boolean(cur.path && cur.path === item.path);
+            }
+            if (cur.kind === "git_diff" && item.kind === "git_diff") {
+              return cur.staged === item.staged;
+            }
+            return false;
+          });
+          if (!dup) mergedCtxs.push(item);
+        }
+
         return {
           ...s,
           fileViewCache: nextFileCache,
@@ -4048,8 +5743,17 @@ export const orbitActions = {
           composerDrafts: restoredDraft
             ? { ...s.composerDrafts, [tKey]: restoredDraft }
             : s.composerDrafts,
+          contextItems:
+            mergedCtxs.length !== existingCtxs.length
+              ? { ...s.contextItems, [tKey]: mergedCtxs }
+              : s.contextItems,
+          slashDirectives:
+            restoredSlash && !s.slashDirectives[tKey]
+              ? { ...s.slashDirectives, [tKey]: restoredSlash }
+              : s.slashDirectives,
         };
       });
+      draftPersistence.flushNow();
 
       await Promise.all([
         orbitActions.pullStageDelta(hostId, agentId, true),
@@ -4087,6 +5791,65 @@ export const orbitActions = {
     }
   },
 
+  async forkAgent(opts: {
+    hostId: string;
+    sourceAgentId: string;
+    upToSeq?: number | null;
+    worktree?: boolean;
+    branch?: string;
+    baseRef?: string;
+    title?: string;
+    initialPrompt?: string;
+  }): Promise<boolean> {
+    const dedupKey = `${opts.hostId}::${opts.sourceAgentId}`;
+    if (inFlightForks.has(dedupKey)) {
+      return false;
+    }
+    inFlightForks.add(dedupKey);
+    try {
+      const useWorktree = Boolean(
+        opts.worktree || opts.branch?.trim() || opts.baseRef?.trim(),
+      );
+      const res = await orbitIpc.forkAgent({
+        host_id: opts.hostId,
+        source_agent_id: opts.sourceAgentId,
+        up_to_seq: opts.upToSeq ?? null,
+        target: useWorktree
+          ? {
+              kind: "new_worktree",
+              branch: opts.branch?.trim() || null,
+              base_ref: opts.baseRef?.trim() || null,
+            }
+          : { kind: "same_directory" },
+        title: opts.title?.trim() || null,
+        initial_prompt: opts.initialPrompt?.trim() || null,
+      });
+
+      await orbitActions.reloadHostDetail(opts.hostId, true);
+      orbitActions.selectAgent(opts.hostId, res.agent.agent_id);
+
+      if (res.workspace?.is_worktree) {
+        const branchNote = res.workspace.git_branch
+          ? ` · ${res.workspace.git_branch}`
+          : "";
+        notifyToast(`Forked in new worktree${branchNote}`);
+      }
+
+      setTimeout(() => {
+        for (const fn of composerFocusListeners) {
+          fn();
+        }
+      }, 24);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      notifyToast(msg || "Failed to fork conversation");
+      return false;
+    } finally {
+      inFlightForks.delete(dedupKey);
+    }
+  },
+
   archiveThread(hostId: string, agentId: string): void {
     const tKey = threadScopeKey(hostId, agentId);
     const wasSelected =
@@ -4107,6 +5870,7 @@ export const orbitActions = {
       fallbackAgentId = nextCandidate?.agent_id ?? null;
     }
 
+    const archivedKeySet = new Set([tKey]);
     setState(
       (s) => ({
         ...s,
@@ -4119,6 +5883,11 @@ export const orbitActions = {
             archivedAtMs: Date.now(),
           },
         },
+        composerDrafts: omitRecordKeys(s.composerDrafts, archivedKeySet),
+        slashDirectives: omitRecordKeys(s.slashDirectives, archivedKeySet),
+        pastedAttachments: omitRecordKeys(s.pastedAttachments, archivedKeySet),
+        diffQuotes: omitRecordKeys(s.diffQuotes, archivedKeySet),
+        sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, archivedKeySet),
         ...(wasSelected && !fallbackAgentId
           ? {
               selectedAgentId: null,
@@ -4128,6 +5897,7 @@ export const orbitActions = {
       }),
       true,
     );
+    draftPersistence.removeScopes(archivedKeySet, true);
 
     void orbitIpc.archiveAgent(hostId, agentId);
     orbitActions.refreshSidebarView();
@@ -4197,7 +5967,10 @@ export const orbitActions = {
       (s) => {
         for (const tKey of deletedThreadKeys) {
           for (const ctx of s.contextItems[tKey] ?? []) {
-            if (ctx.kind === "image" && ctx.previewUrl?.startsWith("blob:")) {
+            if (
+              (ctx.kind === "image" || ctx.kind === "file") &&
+              ctx.previewUrl?.startsWith("blob:")
+            ) {
               URL.revokeObjectURL(ctx.previewUrl);
             }
           }
@@ -4215,16 +5988,19 @@ export const orbitActions = {
           diffQuotes: omitRecordKeys(s.diffQuotes, deletedThreadKeys),
           queuedPrompts: omitRecordKeys(s.queuedPrompts, deletedThreadKeys),
           sideQuestionsByScope: omitRecordKeys(s.sideQuestionsByScope, deletedThreadKeys),
+          sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, deletedThreadKeys),
           rewoundSessions: omitRecordKeys(s.rewoundSessions, deletedThreadKeys),
         };
       },
       true,
     );
+    draftPersistence.removeScopes(deletedThreadKeys, true);
 
     for (const tKey of deletedThreadKeys) {
       lastReportedSeenSeq.delete(tKey);
       stagePullGates.delete(tKey);
     }
+    stageAccessOrder = removeStageAccessKeys(stageAccessOrder, deletedThreadKeys);
 
     await Promise.allSettled(
       items.map((it) => orbitIpc.deleteAgent(it.hostId, it.agentId)),
@@ -4276,7 +6052,10 @@ export const orbitActions = {
         delete nextInline[tKey];
         const nextContexts = { ...s.contextItems };
         for (const ctx of nextContexts[tKey] ?? []) {
-          if (ctx.kind === "image" && ctx.previewUrl?.startsWith("blob:")) {
+          if (
+            (ctx.kind === "image" || ctx.kind === "file") &&
+            ctx.previewUrl?.startsWith("blob:")
+          ) {
             URL.revokeObjectURL(ctx.previewUrl);
           }
         }
@@ -4289,6 +6068,8 @@ export const orbitActions = {
         delete nextQueued[tKey];
         const nextSideQ = { ...s.sideQuestionsByScope };
         delete nextSideQ[tKey];
+        const nextSideQDrafts = { ...s.sideQuestionDrafts };
+        delete nextSideQDrafts[tKey];
         const nextRewound = { ...s.rewoundSessions };
         delete nextRewound[tKey];
         return {
@@ -4304,15 +6085,18 @@ export const orbitActions = {
           diffQuotes: nextQuotes,
           queuedPrompts: nextQueued,
           sideQuestionsByScope: nextSideQ,
+          sideQuestionDrafts: nextSideQDrafts,
           rewoundSessions: nextRewound,
           ...(wasSelected ? { selectedAgentId: null, isDraftNewSession: true } : {}),
         };
       },
       true,
     );
+    draftPersistence.removeScopes([tKey], true);
 
     lastReportedSeenSeq.delete(tKey);
     stagePullGates.delete(tKey);
+    stageAccessOrder = removeStageAccessKeys(stageAccessOrder, new Set([tKey]));
     await orbitIpc.deleteAgent(hostId, agentId);
     orbitActions.refreshSidebarView();
     notifyToast("Conversation deleted");
@@ -4670,8 +6454,11 @@ export const orbitActions = {
           pastedAttachments: omitRecordKeys(s.pastedAttachments, deletedThreadKeys),
           diffQuotes: omitRecordKeys(s.diffQuotes, deletedThreadKeys),
           queuedPrompts: omitRecordKeys(s.queuedPrompts, deletedThreadKeys),
+          sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, deletedThreadKeys),
         };
       }, true);
+      draftPersistence.removeScopes(deletedThreadKeys, true);
+      stageAccessOrder = removeStageAccessKeys(stageAccessOrder, deletedThreadKeys);
 
       await orbitActions.reloadFleetOnly();
       await orbitActions.reloadHostDetail(hostId, false);
@@ -4713,6 +6500,7 @@ export const orbitActions = {
         overviewPopoverOpen: nextOpen ? false : s.overviewPopoverOpen,
         sidebarOpen: nextSidebarOpen,
         sidebarAutoYieldedForSidePanel: nextYielded,
+        terminalFocused: nextOpen ? s.terminalFocused : false,
         sidePanelLaunchpadFocusNonce: willShowLaunchpad
           ? s.sidePanelLaunchpadFocusNonce + 1
           : s.sidePanelLaunchpadFocusNonce,
@@ -4724,7 +6512,28 @@ export const orbitActions = {
     }
   },
 
-  openSidePanelNewTab(): void {
+  openSidePanelNewTab(opts?: { skipUnsavedGuard?: boolean }): void {
+    if (!opts?.skipUnsavedGuard) {
+      const activeTab = state.sidePanelTabs.find((t) => t.id === state.activeSidePanelTabId);
+      if (state.sidePanelOpen && activeTab?.kind === "file" && activeTab.filePath) {
+        const activeKey = fileCacheKey(
+          activeTab.hostId ?? state.selectedHostId ?? "",
+          activeTab.cwd ?? state.selectedWorkspaceCwd ?? "~",
+          activeTab.filePath,
+        );
+        if (state.fileEditorDrafts[activeKey]?.dirty) {
+          setState((s) => ({
+            ...s,
+            pendingUnsavedFileAction: {
+              fileKey: activeKey,
+              label: "Open new tab",
+              action: { kind: "new_tab" },
+            },
+          }));
+          return;
+        }
+      }
+    }
     setState((s) => {
       const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
       return {
@@ -4732,6 +6541,8 @@ export const orbitActions = {
         sidePanelOpen: true,
         overviewPopoverOpen: false,
         activeSidePanelTabId: null,
+        terminalFocused: false,
+        pendingUnsavedFileAction: null,
         sidePanelLaunchpadFocusNonce: s.sidePanelLaunchpadFocusNonce + 1,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
@@ -4770,7 +6581,8 @@ export const orbitActions = {
     setState((s) => {
       const nextCache = { ...s.fileViewCache };
       for (const k of matchingKeys) {
-        if (k !== activeFileKey) {
+        if (k !== activeFileKey && !s.fileEditorDrafts[k]?.dirty) {
+          bumpFileLoadSeq(k);
           delete nextCache[k];
         }
       }
@@ -4784,22 +6596,55 @@ export const orbitActions = {
       activeTab.cwd &&
       activeTab.filePath &&
       activeFileKey.startsWith(prefix) &&
-      state.fileViewCache[activeFileKey]?.status !== "error"
+      state.fileViewCache[activeFileKey]?.status !== "error" &&
+      !state.fileEditorDrafts[activeFileKey]?.dirty
     ) {
       void orbitActions.loadWorkspaceFile(activeTab.hostId, activeTab.cwd, activeTab.filePath, true);
     }
   },
 
-  focusSidePanelTab(tabId: string): void {
+  focusSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void {
     const target = state.sidePanelTabs.find((t) => t.id === tabId);
     if (!target) return;
+    if (!opts?.skipUnsavedGuard && state.activeSidePanelTabId !== tabId) {
+      const activeTab = state.sidePanelTabs.find((t) => t.id === state.activeSidePanelTabId);
+      if (state.sidePanelOpen && activeTab?.kind === "file" && activeTab.filePath) {
+        const activeKey = fileCacheKey(
+          activeTab.hostId ?? state.selectedHostId ?? "",
+          activeTab.cwd ?? state.selectedWorkspaceCwd ?? "~",
+          activeTab.filePath,
+        );
+        if (state.fileEditorDrafts[activeKey]?.dirty) {
+          setState((s) => ({
+            ...s,
+            pendingUnsavedFileAction: {
+              fileKey: activeKey,
+              label: `Switch to ${target.title}`,
+              action: { kind: "focus_tab", tabId },
+            },
+          }));
+          return;
+        }
+      }
+    }
     setState((s) => {
       const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      const nextTerminalFocused =
+        s.terminalFocused &&
+        hasVisibleActiveTerminal({
+          sidePanelOpen: true,
+          sidePanelTabs: s.sidePanelTabs,
+          activeSidePanelTabId: tabId,
+          terminalTabs: s.terminalTabs,
+          activeTerminalTabKey: s.activeTerminalTabKey,
+        });
       return {
         ...s,
         sidePanelOpen: true,
         overviewPopoverOpen: false,
         activeSidePanelTabId: tabId,
+        terminalFocused: nextTerminalFocused,
+        pendingUnsavedFileAction: null,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
       };
@@ -4809,7 +6654,7 @@ export const orbitActions = {
       void orbitActions.refreshGit(
         state.selectedHostId,
         state.selectedWorkspaceCwd,
-        state.selectedDiffPath,
+        null,
         state.diffStaged,
       );
     } else if (target.kind === "files" && state.selectedHostId && state.selectedWorkspaceCwd) {
@@ -4821,14 +6666,63 @@ export const orbitActions = {
       } else if (!hostTabs.some((t) => t.key === state.activeTerminalTabKey)) {
         setState((s) => ({ ...s, activeTerminalTabKey: hostTabs[0].key }));
       }
+    } else if (target.kind === "subagent") {
+      const subHostId = target.hostId ?? state.selectedHostId;
+      const parentHostId = state.selectedHostId ?? subHostId;
+      const parentAgentId = target.parentAgentId ?? state.selectedAgentId;
+      if (subHostId && target.childAgentId) {
+        void orbitIpc.openAgentTimeline(subHostId, target.childAgentId);
+        void orbitActions.pullStageDelta(subHostId, target.childAgentId, false);
+      } else if (parentHostId && parentAgentId && target.providerSubagentId) {
+        void orbitActions.openProviderSubagentTimeline(
+          parentHostId,
+          parentAgentId,
+          target.providerSubagentId,
+        );
+      }
     }
   },
 
-  closeSidePanelTab(tabId: string): void {
+  closeSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void {
+    const closingTab = state.sidePanelTabs.find((t) => t.id === tabId);
+    if (!opts?.skipUnsavedGuard && closingTab?.kind === "file" && closingTab.filePath) {
+      const closingKey = fileCacheKey(
+        closingTab.hostId ?? state.selectedHostId ?? "",
+        closingTab.cwd ?? state.selectedWorkspaceCwd ?? "~",
+        closingTab.filePath,
+      );
+      if (state.fileEditorDrafts[closingKey]?.dirty) {
+        setState((s) => ({
+          ...s,
+          sidePanelOpen: true,
+          activeSidePanelTabId: tabId,
+          pendingUnsavedFileAction: {
+            fileKey: closingKey,
+            label: `Close ${closingTab.title}`,
+            action: { kind: "close_tab", tabId },
+          },
+        }));
+        return;
+      }
+    }
+
     let closedPanel = false;
     setState((s) => {
       const idx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
       if (idx < 0) return s;
+      const targetTab = s.sidePanelTabs[idx];
+      let nextDrafts = s.fileEditorDrafts;
+      if (targetTab.kind === "file" && targetTab.filePath) {
+        const k = fileCacheKey(
+          targetTab.hostId ?? s.selectedHostId ?? "",
+          targetTab.cwd ?? s.selectedWorkspaceCwd ?? "~",
+          targetTab.filePath,
+        );
+        if (k in s.fileEditorDrafts) {
+          nextDrafts = { ...s.fileEditorDrafts };
+          delete nextDrafts[k];
+        }
+      }
       const remaining = s.sidePanelTabs.filter((t) => t.id !== tabId);
       const nextActive =
         s.activeSidePanelTabId === tabId
@@ -4839,15 +6733,28 @@ export const orbitActions = {
       const shouldRestoreSidebar =
         shouldClosePanel && s.sidebarAutoYieldedForSidePanel && !s.isCompactViewport;
       const showingLaunchpad = !shouldClosePanel && nextActive === null;
+      const nextSidePanelOpen = shouldClosePanel ? false : s.sidePanelOpen;
+      const nextTerminalFocused =
+        s.terminalFocused &&
+        hasVisibleActiveTerminal({
+          sidePanelOpen: nextSidePanelOpen,
+          sidePanelTabs: remaining,
+          activeSidePanelTabId: nextActive,
+          terminalTabs: s.terminalTabs,
+          activeTerminalTabKey: s.activeTerminalTabKey,
+        });
       return {
         ...s,
-        sidePanelOpen: shouldClosePanel ? false : s.sidePanelOpen,
+        sidePanelOpen: nextSidePanelOpen,
         sidebarOpen: shouldRestoreSidebar ? s.sidebarDesktopOpenPref : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldRestoreSidebar
           ? false
           : s.sidebarAutoYieldedForSidePanel,
         sidePanelTabs: remaining,
         activeSidePanelTabId: nextActive,
+        terminalFocused: nextTerminalFocused,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction: null,
         sidePanelLaunchpadFocusNonce: showingLaunchpad
           ? s.sidePanelLaunchpadFocusNonce + 1
           : s.sidePanelLaunchpadFocusNonce,
@@ -4873,6 +6780,7 @@ export const orbitActions = {
         overviewPopoverOpen: false,
         sidePanelTabs: nextTabs,
         activeSidePanelTabId: tabId,
+        terminalFocused: false,
         reviewScope: opts?.scope ?? s.reviewScope,
         selectedDiffPath: opts?.path !== undefined ? opts.path : s.selectedDiffPath,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
@@ -4881,7 +6789,6 @@ export const orbitActions = {
     });
 
     const effectiveScope = opts?.scope ?? state.reviewScope;
-    const effectivePath = opts?.path !== undefined ? opts.path : state.selectedDiffPath;
     if (
       effectiveScope === "working_tree" &&
       state.selectedHostId &&
@@ -4890,7 +6797,7 @@ export const orbitActions = {
       void orbitActions.refreshGit(
         state.selectedHostId,
         state.selectedWorkspaceCwd,
-        effectivePath,
+        null,
         state.diffStaged,
       );
     }
@@ -4930,6 +6837,7 @@ export const orbitActions = {
         overviewPopoverOpen: false,
         sidePanelTabs: nextTabs,
         activeSidePanelTabId: tabId,
+        terminalFocused: false,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
       };
@@ -4948,6 +6856,8 @@ export const orbitActions = {
       hostId?: string;
       cwd?: string;
       fallbackPath?: string;
+      initialMode?: "view" | "edit";
+      skipUnsavedGuard?: boolean;
     },
   ): void {
     const hostId = opts?.hostId ?? state.selectedHostId;
@@ -4968,6 +6878,40 @@ export const orbitActions = {
 
     const tabId = `tab:file:${hostId}::${cwd}::${cleanPath}`;
     const title = basenameFromPath(cleanPath) || cleanPath;
+
+    if (!opts?.skipUnsavedGuard && state.activeSidePanelTabId !== tabId) {
+      const activeTab = state.sidePanelTabs.find((t) => t.id === state.activeSidePanelTabId);
+      if (state.sidePanelOpen && activeTab?.kind === "file" && activeTab.filePath) {
+        const activeKey = fileCacheKey(
+          activeTab.hostId ?? state.selectedHostId ?? "",
+          activeTab.cwd ?? state.selectedWorkspaceCwd ?? "~",
+          activeTab.filePath,
+        );
+        if (state.fileEditorDrafts[activeKey]?.dirty) {
+          setState((s) => ({
+            ...s,
+            quickOpenFilesOpen: false,
+            pendingUnsavedFileAction: {
+              fileKey: activeKey,
+              label: `Open ${title}`,
+              action: {
+                kind: "open_file",
+                rawPath,
+                opts: {
+                  focusLine: opts?.focusLine,
+                  focusEndLine: opts?.focusEndLine,
+                  hostId: opts?.hostId,
+                  cwd: opts?.cwd,
+                  fallbackPath: opts?.fallbackPath,
+                  initialMode: opts?.initialMode,
+                },
+              },
+            },
+          }));
+          return;
+        }
+      }
+    }
 
     setState((s) => {
       const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
@@ -5006,6 +6950,8 @@ export const orbitActions = {
         quickOpenFilesOpen: false,
         sidePanelTabs: nextTabs,
         activeSidePanelTabId: tabId,
+        terminalFocused: false,
+        pendingUnsavedFileAction: null,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
       };
@@ -5052,7 +6998,12 @@ export const orbitActions = {
     void (async () => {
       await orbitActions.loadWorkspaceFile(hostId, cwd, cleanPath, false);
       const primaryKey = `${hostId}::${cwd}::${cleanPath}`;
-      if (state.fileViewCache[primaryKey]?.status !== "error") return;
+      if (state.fileViewCache[primaryKey]?.status !== "error") {
+        if (opts?.initialMode === "edit") {
+          orbitActions.enterFileEditMode(hostId, cwd, cleanPath);
+        }
+        return;
+      }
 
       const trySuffixResolve = async (candidate: string): Promise<string | null> => {
         if (!cwd || cwd === "~" || candidate.startsWith("/") || candidate.startsWith("~/")) {
@@ -5102,6 +7053,55 @@ export const orbitActions = {
     })();
   },
 
+  prefetchWorkspaceFile(
+    rawPath: string,
+    opts?: { hostId?: string; cwd?: string; fallbackPath?: string },
+  ): void {
+    const hostId = opts?.hostId ?? state.selectedHostId;
+    const cwd = opts?.cwd ?? state.selectedWorkspaceCwd ?? "~";
+    const normalizedCandidate = normalizeWorkspacePathCandidate(rawPath, cwd);
+    if (!hostId || !normalizedCandidate) return;
+
+    const cachedFiles = state.workspaceFilesCache[`${hostId}::${cwd}`];
+    const resolvedFromCache =
+      !normalizedCandidate.startsWith("/") && !normalizedCandidate.startsWith("~/")
+        ? resolveUniqueWorkspaceFileSuffix(normalizedCandidate, cachedFiles)
+        : null;
+    const cleanPath = resolvedFromCache ?? normalizedCandidate;
+    const cKey = fileCacheKey(hostId, cwd, cleanPath);
+    const existing = state.fileViewCache[cKey];
+    if (
+      existing?.status === "loading" ||
+      existing?.status === "ready" ||
+      prefetchInFlightFileKeys.has(cKey)
+    ) {
+      return;
+    }
+
+    prefetchInFlightFileKeys.add(cKey);
+    // Warm quietly in background without touching side-panel state or showing loading spinners
+    void orbitIpc
+      .readWorkspaceFile(hostId, cwd, cleanPath)
+      .then((data) => {
+        if (state.fileViewCache[cKey]?.status === "ready") return;
+        setState((s) => ({
+          ...s,
+          fileViewCache: upsertLruRecord(
+            s.fileViewCache,
+            cKey,
+            { status: "ready", data },
+            MAX_FILE_CACHE_ENTRIES,
+          ),
+        }));
+      })
+      .catch(() => {
+        // Ignore silent prefetch misses; real click handles fallback path resolution
+      })
+      .finally(() => {
+        prefetchInFlightFileKeys.delete(cKey);
+      });
+  },
+
   async loadWorkspaceFile(
     hostId: string,
     cwd: string,
@@ -5114,6 +7114,7 @@ export const orbitActions = {
       return;
     }
 
+    const loadSeq = bumpFileLoadSeq(cKey);
     setState((s) => ({
       ...s,
       fileViewCache: {
@@ -5124,22 +7125,76 @@ export const orbitActions = {
 
     try {
       const data = await orbitIpc.readWorkspaceFile(hostId, cwd, path);
+      if (fileLoadSeqByKey.get(cKey) !== loadSeq) {
+        return;
+      }
       setState((s) => {
-        // Maintain a bounded 20-entry LRU file cache so large files never grow memory unboundedly
+        // Maintain a bounded LRU file cache capped by BOTH 20 entries and ~64 MiB total memory
+        // (so repeated 25 MiB PDF/video previews never blow renderer RAM), while never evicting
+        // files with active editor drafts.
+        const nextEntry: FileViewCacheEntry = { status: "ready", data };
+        const pinnedEntries: Array<[string, FileViewCacheEntry]> = [];
+        const evictableEntries: Array<[string, FileViewCacheEntry]> = [];
+        for (const [k, v] of Object.entries(s.fileViewCache)) {
+          if (k === cKey) continue;
+          if (k in s.fileEditorDrafts) {
+            pinnedEntries.push([k, v]);
+          } else {
+            evictableEntries.push([k, v]);
+          }
+        }
+        let totalBytes = estimateFileCacheEntryBytes(nextEntry);
+        for (const [, v] of pinnedEntries) {
+          totalBytes += estimateFileCacheEntryBytes(v);
+        }
+        const maxEvictable = Math.max(0, MAX_FILE_CACHE_ENTRIES - 1 - pinnedEntries.length);
+        const keptReverse: Array<[string, FileViewCacheEntry]> = [];
+        for (let i = evictableEntries.length - 1; i >= 0; i -= 1) {
+          if (keptReverse.length >= maxEvictable) break;
+          const [k, v] = evictableEntries[i];
+          const entryBytes = estimateFileCacheEntryBytes(v);
+          if (totalBytes + entryBytes > MAX_FILE_CACHE_BYTES) continue;
+          totalBytes += entryBytes;
+          keptReverse.push([k, v]);
+        }
+        keptReverse.reverse();
         const nextCache: Record<string, FileViewCacheEntry> = {};
-        const entries = Object.entries(s.fileViewCache).filter(([k]) => k !== cKey);
-        const startIdx = Math.max(0, entries.length - 19);
-        for (let i = startIdx; i < entries.length; i += 1) {
-          const [k, v] = entries[i];
+        for (const [k, v] of pinnedEntries) {
           nextCache[k] = v;
         }
-        nextCache[cKey] = { status: "ready", data };
+        for (const [k, v] of keptReverse) {
+          nextCache[k] = v;
+        }
+        nextCache[cKey] = nextEntry;
+
+        // If this file is currently open in Edit mode with no unsaved changes, keep its draft synced with disk
+        let nextDrafts = s.fileEditorDrafts;
+        const existingDraft = s.fileEditorDrafts[cKey];
+        if (existingDraft && !existingDraft.dirty && data.content_kind === "text") {
+          const normalized = normalizeEditorText(data.content);
+          nextDrafts = {
+            ...s.fileEditorDrafts,
+            [cKey]: {
+              ...existingDraft,
+              content: normalized,
+              baseContent: normalized,
+              baseEtag: data.etag ?? null,
+              lineEnding: normalizeLineEndingKind(data.line_ending),
+              conflict: null,
+              saveError: null,
+            },
+          };
+        }
         return {
           ...s,
           fileViewCache: nextCache,
+          fileEditorDrafts: nextDrafts,
         };
       });
     } catch (err) {
+      if (fileLoadSeqByKey.get(cKey) !== loadSeq) {
+        return;
+      }
       setState((s) => ({
         ...s,
         fileViewCache: {
@@ -5147,6 +7202,2393 @@ export const orbitActions = {
           [cKey]: { status: "error", error: String(err) },
         },
       }));
+    }
+  },
+
+  enterFileEditMode(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const data = state.fileViewCache[cKey]?.data;
+    if (!data || data.content_kind !== "text" || data.truncated || data.writable === false) {
+      return;
+    }
+    const normalized = normalizeEditorText(data.content);
+    const lineEnding = normalizeLineEndingKind(data.line_ending);
+    setState((s) => {
+      const existing = s.fileEditorDrafts[cKey];
+      if (existing) {
+        return {
+          ...s,
+          fileEditorDrafts: {
+            ...s.fileEditorDrafts,
+            [cKey]: { ...existing, mode: "edit" },
+          },
+        };
+      }
+      return {
+        ...s,
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: {
+            hostId,
+            cwd,
+            path,
+            content: normalized,
+            baseEtag: data.etag ?? null,
+            baseContent: normalized,
+            lineEnding,
+            dirty: false,
+            mode: "edit",
+            saving: false,
+            saveError: null,
+            conflict: null,
+          },
+        },
+      };
+    });
+  },
+
+  requestFileViewMode(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const draft = state.fileEditorDrafts[cKey];
+    if (!draft) return;
+    if (draft.dirty) {
+      setState((s) => ({
+        ...s,
+        pendingUnsavedFileAction: {
+          fileKey: cKey,
+          label: "Switch to View mode",
+          action: { kind: "switch_to_view", hostId, cwd, path },
+        },
+      }));
+      return;
+    }
+    setState((s) => {
+      const nextDrafts = { ...s.fileEditorDrafts };
+      delete nextDrafts[cKey];
+      return {
+        ...s,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction:
+          s.pendingUnsavedFileAction?.fileKey === cKey ? null : s.pendingUnsavedFileAction,
+      };
+    });
+  },
+
+  requestFileReload(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    if (state.fileEditorDrafts[cKey]?.dirty) {
+      setState((s) => ({
+        ...s,
+        pendingUnsavedFileAction: {
+          fileKey: cKey,
+          label: "Reload from disk",
+          action: { kind: "reload", hostId, cwd, path },
+        },
+      }));
+      return;
+    }
+    void orbitActions.loadWorkspaceFile(hostId, cwd, path, true);
+  },
+
+  updateFileEditorDraft(hostId: string, cwd: string, path: string, nextContent: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const normalizedNext = normalizeEditorText(nextContent);
+    setState((s) => {
+      const existing = s.fileEditorDrafts[cKey];
+      const diskData = s.fileViewCache[cKey]?.data;
+      const baseContent = existing?.baseContent ?? normalizeEditorText(diskData?.content ?? "");
+      const baseEtag = existing?.baseEtag ?? diskData?.etag ?? null;
+      const lineEnding = existing?.lineEnding ?? normalizeLineEndingKind(diskData?.line_ending);
+      return {
+        ...s,
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: {
+            hostId,
+            cwd,
+            path,
+            content: normalizedNext,
+            baseEtag,
+            baseContent,
+            lineEnding,
+            dirty: normalizedNext !== baseContent,
+            mode: "edit",
+            saving: existing?.saving ?? false,
+            saveError: null,
+            conflict: existing?.conflict ?? null,
+          },
+        },
+      };
+    });
+  },
+
+  clearFileEditorError(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    setState((s) => {
+      const existing = s.fileEditorDrafts[cKey];
+      if (!existing || !existing.saveError) return s;
+      return {
+        ...s,
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: { ...existing, saveError: null },
+        },
+      };
+    });
+  },
+
+  discardFileEditorDraft(hostId: string, cwd: string, path: string): void {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    setState((s) => {
+      const nextDrafts = { ...s.fileEditorDrafts };
+      delete nextDrafts[cKey];
+      return {
+        ...s,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction:
+          s.pendingUnsavedFileAction?.fileKey === cKey ? null : s.pendingUnsavedFileAction,
+      };
+    });
+  },
+
+  async saveWorkspaceFile(
+    hostId: string,
+    cwd: string,
+    path: string,
+    force = false,
+  ): Promise<"saved" | "conflict" | "error"> {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const draft = state.fileEditorDrafts[cKey];
+    if (!draft || draft.saving) return "saved";
+
+    const savedNormalizedContent = draft.content;
+    const savedLineEnding = draft.lineEnding;
+    const wireContent =
+      savedLineEnding === "crlf"
+        ? savedNormalizedContent.replace(/\n/g, "\r\n")
+        : savedNormalizedContent;
+
+    setState((s) => {
+      const cur = s.fileEditorDrafts[cKey];
+      if (!cur) return s;
+      return {
+        ...s,
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: { ...cur, saving: true, saveError: null },
+        },
+      };
+    });
+
+    try {
+      const res = await orbitIpc.writeWorkspaceFile({
+        hostId,
+        cwd,
+        path,
+        content: wireContent,
+        expectedEtag: draft.baseEtag,
+        force,
+      });
+
+      if (res.conflict) {
+        setState((s) => {
+          const cur = s.fileEditorDrafts[cKey];
+          if (!cur) return s;
+          return {
+            ...s,
+            fileEditorDrafts: {
+              ...s.fileEditorDrafts,
+              [cKey]: {
+                ...cur,
+                saving: false,
+                saveError: null,
+                conflict: res.conflict ?? null,
+              },
+            },
+          };
+        });
+        return "conflict";
+      }
+
+      const cachedData = state.fileViewCache[cKey]?.data;
+      const language = cachedData?.language ?? "text";
+      const [highlightedLines, markdownBlocks] = await Promise.all([
+        orbitIpc
+          .highlightWorkspaceCode(
+            language,
+            savedNormalizedContent,
+            Math.max(2500, savedNormalizedContent.split("\n").length + 50),
+          )
+          .catch(() => cachedData?.highlighted_lines ?? []),
+        language === "markdown"
+          ? orbitIpc
+              .parseMarkdownPreview(savedNormalizedContent, false)
+              .catch(() => cachedData?.markdown_blocks ?? [])
+          : Promise.resolve(cachedData?.markdown_blocks ?? []),
+      ]);
+
+      setState((s) => {
+        const curDraft = s.fileEditorDrafts[cKey];
+        const stillEdited = curDraft && curDraft.content !== savedNormalizedContent;
+        const curCache = s.fileViewCache[cKey]?.data;
+        const nextCache = curCache
+          ? {
+              ...s.fileViewCache,
+              [cKey]: {
+                status: "ready" as const,
+                data: {
+                  ...curCache,
+                  content: wireContent,
+                  size_bytes: res.size_bytes,
+                  etag: res.etag,
+                  mtime_unix_ms: res.mtime_unix_ms ?? curCache.mtime_unix_ms ?? null,
+                  line_ending: savedLineEnding,
+                  highlighted_lines: highlightedLines,
+                  markdown_blocks: markdownBlocks,
+                },
+              },
+            }
+          : s.fileViewCache;
+
+        const nextDrafts = curDraft
+          ? {
+              ...s.fileEditorDrafts,
+              [cKey]: {
+                ...curDraft,
+                baseEtag: res.etag,
+                baseContent: savedNormalizedContent,
+                lineEnding: savedLineEnding,
+                dirty: Boolean(stillEdited),
+                saving: false,
+                saveError: null,
+                conflict: null,
+              },
+            }
+          : s.fileEditorDrafts;
+
+        return {
+          ...s,
+          fileViewCache: nextCache,
+          fileEditorDrafts: nextDrafts,
+        };
+      });
+
+      if (cwd && cwd !== "~") {
+        void orbitActions.refreshGit(hostId, cwd, null, state.diffStaged);
+        void orbitActions.loadFileDiagnostics(hostId, cwd, path, true);
+      }
+      notifyToast(`Saved ${basenameFromPath(path) || path}`);
+      return "saved";
+    } catch (err) {
+      setState((s) => {
+        const cur = s.fileEditorDrafts[cKey];
+        if (!cur) return s;
+        return {
+          ...s,
+          fileEditorDrafts: {
+            ...s.fileEditorDrafts,
+            [cKey]: {
+              ...cur,
+              saving: false,
+              saveError: String(err),
+            },
+          },
+        };
+      });
+      return "error";
+    }
+  },
+
+  async loadGuardianConfig(hostId: string): Promise<GuardianConfigSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (guardianReqSeqByHost.get(hostId) ?? 0) + 1;
+    guardianReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      guardianByHost: {
+        ...s.guardianByHost,
+        [hostId]: {
+          status: "loading",
+          config: s.guardianByHost[hostId]?.config ?? null,
+          recentAudits: s.guardianByHost[hostId]?.recentAudits ?? [],
+          saving: s.guardianByHost[hostId]?.saving ?? false,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.getGuardianConfig(hostId);
+      if (guardianReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        guardianByHost: {
+          ...s.guardianByHost,
+          [hostId]: {
+            status: "ready",
+            config: snap.config,
+            recentAudits: snap.recent_audits,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (guardianReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        guardianByHost: {
+          ...s.guardianByHost,
+          [hostId]: {
+            status: "error",
+            config: s.guardianByHost[hostId]?.config ?? null,
+            recentAudits: s.guardianByHost[hostId]?.recentAudits ?? [],
+            saving: false,
+            error: String(err),
+          },
+        },
+      }));
+      return null;
+    }
+  },
+
+  async updateGuardianConfig(
+    hostId: string,
+    config: GuardianPolicyConfig,
+  ): Promise<GuardianConfigSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (guardianReqSeqByHost.get(hostId) ?? 0) + 1;
+    guardianReqSeqByHost.set(hostId, seq);
+    const prevConfig = state.guardianByHost[hostId]?.config ?? null;
+    setState((s) => ({
+      ...s,
+      guardianByHost: {
+        ...s.guardianByHost,
+        [hostId]: {
+          status: s.guardianByHost[hostId]?.status ?? "ready",
+          config,
+          recentAudits: s.guardianByHost[hostId]?.recentAudits ?? [],
+          saving: true,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.updateGuardianConfig(hostId, config);
+      if (guardianReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        guardianByHost: {
+          ...s.guardianByHost,
+          [hostId]: {
+            status: "ready",
+            config: snap.config,
+            recentAudits: snap.recent_audits,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (guardianReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        guardianByHost: {
+          ...s.guardianByHost,
+          [hostId]: {
+            status: "error",
+            config: prevConfig,
+            recentAudits: s.guardianByHost[hostId]?.recentAudits ?? [],
+            saving: false,
+            error: String(err),
+          },
+        },
+      }));
+      notifyToast(`Guardian update failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async loadImChannels(hostId: string): Promise<ImChannelsSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (imChannelsReqSeqByHost.get(hostId) ?? 0) + 1;
+    imChannelsReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      imChannelsByHost: {
+        ...s.imChannelsByHost,
+        [hostId]: {
+          status: "loading",
+          channels: s.imChannelsByHost[hostId]?.channels ?? [],
+          bindings: s.imChannelsByHost[hostId]?.bindings ?? [],
+          baseWebhookUrl: s.imChannelsByHost[hostId]?.baseWebhookUrl ?? "",
+          saving: s.imChannelsByHost[hostId]?.saving ?? false,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.listImChannels(hostId);
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: "ready",
+            channels: snap.channels,
+            bindings: snap.bindings,
+            baseWebhookUrl: snap.base_webhook_url,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: "error",
+            channels: s.imChannelsByHost[hostId]?.channels ?? [],
+            bindings: s.imChannelsByHost[hostId]?.bindings ?? [],
+            baseWebhookUrl: s.imChannelsByHost[hostId]?.baseWebhookUrl ?? "",
+            saving: false,
+            error: String(err),
+          },
+        },
+      }));
+      return null;
+    }
+  },
+
+  async upsertImChannel(
+    hostId: string,
+    request: UpsertImChannelRequest,
+  ): Promise<ImChannelsSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (imChannelsReqSeqByHost.get(hostId) ?? 0) + 1;
+    imChannelsReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      imChannelsByHost: {
+        ...s.imChannelsByHost,
+        [hostId]: {
+          status: s.imChannelsByHost[hostId]?.status ?? "ready",
+          channels: s.imChannelsByHost[hostId]?.channels ?? [],
+          bindings: s.imChannelsByHost[hostId]?.bindings ?? [],
+          baseWebhookUrl: s.imChannelsByHost[hostId]?.baseWebhookUrl ?? "",
+          saving: true,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.upsertImChannel(hostId, request);
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: "ready",
+            channels: snap.channels,
+            bindings: snap.bindings,
+            baseWebhookUrl: snap.base_webhook_url,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: s.imChannelsByHost[hostId]?.status ?? "ready",
+            channels: s.imChannelsByHost[hostId]?.channels ?? [],
+            bindings: s.imChannelsByHost[hostId]?.bindings ?? [],
+            baseWebhookUrl: s.imChannelsByHost[hostId]?.baseWebhookUrl ?? "",
+            saving: false,
+            error: String(err),
+          },
+        },
+      }));
+      notifyToast(`IM channel save failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async deleteImChannel(
+    hostId: string,
+    channelId: string,
+  ): Promise<ImChannelsSnapshotView | null> {
+    if (!hostId || !channelId) return null;
+    const seq = (imChannelsReqSeqByHost.get(hostId) ?? 0) + 1;
+    imChannelsReqSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.deleteImChannel(hostId, channelId);
+      if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        imChannelsByHost: {
+          ...s.imChannelsByHost,
+          [hostId]: {
+            status: "ready",
+            channels: snap.channels,
+            bindings: snap.bindings,
+            baseWebhookUrl: snap.base_webhook_url,
+            saving: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      notifyToast(`Delete IM channel failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async testImChannel(
+    hostId: string,
+    channelId: string,
+    targetChatId: string,
+    message: string,
+  ): Promise<ImChannelTestResultView> {
+    try {
+      const res = await orbitIpc.testImChannel(hostId, channelId, targetChatId, message);
+      void orbitActions.loadImChannels(hostId);
+      return res;
+    } catch (err) {
+      return { ok: false, detail: String(err) };
+    }
+  },
+
+  async loadPushDevices(hostId: string): Promise<PushDevicesSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (pushReqSeqByHost.get(hostId) ?? 0) + 1;
+    pushReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      pushByHost: {
+        ...s.pushByHost,
+        [hostId]: {
+          status: "loading",
+          devices: s.pushByHost[hostId]?.devices ?? [],
+          preferences: s.pushByHost[hostId]?.preferences ?? null,
+          saving: s.pushByHost[hostId]?.saving ?? false,
+          testing: s.pushByHost[hostId]?.testing ?? false,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.listPushDevices(hostId);
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: "ready",
+            devices: snap.devices,
+            preferences: snap.preferences,
+            saving: false,
+            testing: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: "error",
+            devices: s.pushByHost[hostId]?.devices ?? [],
+            preferences: s.pushByHost[hostId]?.preferences ?? null,
+            saving: false,
+            testing: false,
+            error: String(err),
+          },
+        },
+      }));
+      return null;
+    }
+  },
+
+  async updatePushPreferences(
+    hostId: string,
+    request: UpdatePushPreferencesRequest,
+  ): Promise<PushDevicesSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (pushReqSeqByHost.get(hostId) ?? 0) + 1;
+    pushReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      pushByHost: {
+        ...s.pushByHost,
+        [hostId]: {
+          status: s.pushByHost[hostId]?.status ?? "ready",
+          devices: s.pushByHost[hostId]?.devices ?? [],
+          preferences: s.pushByHost[hostId]?.preferences ?? null,
+          saving: true,
+          testing: s.pushByHost[hostId]?.testing ?? false,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.updatePushPreferences(hostId, request);
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: "ready",
+            devices: snap.devices,
+            preferences: snap.preferences,
+            saving: false,
+            testing: false,
+            error: null,
+          },
+        },
+      }));
+      notifyToast("Push settings saved");
+      return snap;
+    } catch (err) {
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: s.pushByHost[hostId]?.status ?? "ready",
+            devices: s.pushByHost[hostId]?.devices ?? [],
+            preferences: s.pushByHost[hostId]?.preferences ?? null,
+            saving: false,
+            testing: false,
+            error: String(err),
+          },
+        },
+      }));
+      notifyToast(`Save push settings failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async unregisterPushDevice(
+    hostId: string,
+    deviceId: string,
+  ): Promise<PushDevicesSnapshotView | null> {
+    if (!hostId || !deviceId) return null;
+    const seq = (pushReqSeqByHost.get(hostId) ?? 0) + 1;
+    pushReqSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.unregisterPushDevice(hostId, deviceId);
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: "ready",
+            devices: snap.devices,
+            preferences: snap.preferences,
+            saving: false,
+            testing: false,
+            error: null,
+          },
+        },
+      }));
+      notifyToast("Device removed");
+      return snap;
+    } catch (err) {
+      notifyToast(`Remove device failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async testPushNotification(
+    hostId: string,
+    deviceId?: string | null,
+  ): Promise<PushTestResultView> {
+    if (!hostId) {
+      return { attempted: 0, delivered: 0, detail: "No host selected." };
+    }
+    setState((s) => ({
+      ...s,
+      pushByHost: {
+        ...s.pushByHost,
+        [hostId]: {
+          status: s.pushByHost[hostId]?.status ?? "ready",
+          devices: s.pushByHost[hostId]?.devices ?? [],
+          preferences: s.pushByHost[hostId]?.preferences ?? null,
+          saving: s.pushByHost[hostId]?.saving ?? false,
+          testing: true,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const res = await orbitIpc.testPushNotification(hostId, deviceId ?? null);
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: s.pushByHost[hostId]?.status ?? "ready",
+            devices: s.pushByHost[hostId]?.devices ?? [],
+            preferences: s.pushByHost[hostId]?.preferences ?? null,
+            saving: s.pushByHost[hostId]?.saving ?? false,
+            testing: false,
+            error: s.pushByHost[hostId]?.error ?? null,
+          },
+        },
+      }));
+      notifyToast(res.detail);
+      void orbitActions.loadPushDevices(hostId);
+      return res;
+    } catch (err) {
+      const detail = String(err);
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: s.pushByHost[hostId]?.status ?? "ready",
+            devices: s.pushByHost[hostId]?.devices ?? [],
+            preferences: s.pushByHost[hostId]?.preferences ?? null,
+            saving: false,
+            testing: false,
+            error: detail,
+          },
+        },
+      }));
+      notifyToast(`Test push failed: ${detail}`);
+      return { attempted: 0, delivered: 0, detail };
+    }
+  },
+
+  sendTestDesktopNotification(): boolean {
+    const hostId = state.selectedHostId ?? state.fleet.hosts[0]?.host_id ?? "";
+    const hostName =
+      state.fleet.hosts.find((h) => h.host_id === hostId)?.display_name ?? "Orbit";
+    const ok = dispatchDesktopNotification({
+      title: `Orbit · ${hostName}`,
+      body: "Click to focus Orbit and jump to your active session.",
+      hostId,
+      agentId: state.selectedAgentId,
+      tag: "orbit-desktop-test",
+      forceEvenIfVisible: true,
+    });
+    notifyToast(ok ? "Desktop test notification sent" : "Enable desktop notification permission first");
+    return ok;
+  },
+
+  async loadLspServers(hostId: string, cwd: string): Promise<LspServerStatus[]> {
+    if (!hostId || !cwd || cwd === "~") return [];
+    const scopeKey = `${hostId}::${cwd}`;
+    const seq = (lspServersSeqByKey.get(scopeKey) ?? 0) + 1;
+    lspServersSeqByKey.set(scopeKey, seq);
+    setState((s) => ({
+      ...s,
+      lspServersByWorkspace: upsertLruRecord(
+        s.lspServersByWorkspace,
+        scopeKey,
+        {
+          status: "loading",
+          servers: s.lspServersByWorkspace[scopeKey]?.servers ?? [],
+          error: null,
+        },
+        MAX_LSP_SERVERS_CACHE_ENTRIES,
+      ),
+    }));
+    try {
+      const servers = await orbitIpc.listLspServers(hostId, cwd);
+      if (lspServersSeqByKey.get(scopeKey) !== seq) return [];
+      setState((s) => ({
+        ...s,
+        lspServersByWorkspace: upsertLruRecord(
+          s.lspServersByWorkspace,
+          scopeKey,
+          { status: "ready", servers, error: null },
+          MAX_LSP_SERVERS_CACHE_ENTRIES,
+        ),
+      }));
+      return servers;
+    } catch (err) {
+      if (lspServersSeqByKey.get(scopeKey) !== seq) return [];
+      setState((s) => ({
+        ...s,
+        lspServersByWorkspace: upsertLruRecord(
+          s.lspServersByWorkspace,
+          scopeKey,
+          {
+            status: "error",
+            servers: s.lspServersByWorkspace[scopeKey]?.servers ?? [],
+            error: String(err),
+          },
+          MAX_LSP_SERVERS_CACHE_ENTRIES,
+        ),
+      }));
+      return [];
+    }
+  },
+
+  async refreshConditionalTimers(
+    hostId: string,
+    agentId?: string | null,
+    includeResolved = true,
+  ): Promise<import("@/lib/orbit-ipc").ConditionalTimerRecord[]> {
+    if (!hostId) return [];
+    const timers = await orbitIpc.listConditionalTimers(hostId, agentId, includeResolved);
+    if (!agentId && includeResolved) {
+      setState((s) => {
+        const detail = s.hostDetails[hostId];
+        if (!detail) return s;
+        return {
+          ...s,
+          hostDetails: {
+            ...s.hostDetails,
+            [hostId]: { ...detail, conditional_timers: timers },
+          },
+        };
+      });
+    }
+    return timers;
+  },
+
+  async createConditionalTimer(params: {
+    hostId: string;
+    agentId: string;
+    durationSeconds: number;
+    prompt: string;
+    condition: import("@/lib/orbit-ipc").TimerCondition;
+  }): Promise<import("@/lib/orbit-ipc").ConditionalTimerRecord> {
+    const created = await orbitIpc.createConditionalTimer(params);
+    setState((s) => {
+      const detail = s.hostDetails[params.hostId];
+      if (!detail) return s;
+      const existing = detail.conditional_timers ?? [];
+      const next = [created, ...existing.filter((t) => t.timer_id !== created.timer_id)].sort(
+        (a, b) => {
+          const aArmed = a.state === "armed";
+          const bArmed = b.state === "armed";
+          if (aArmed !== bArmed) return aArmed ? -1 : 1;
+          if (aArmed) return a.fire_at_ms - b.fire_at_ms;
+          return (b.resolved_at_ms ?? b.created_at_ms) - (a.resolved_at_ms ?? a.created_at_ms);
+        },
+      );
+      return {
+        ...s,
+        hostDetails: {
+          ...s.hostDetails,
+          [params.hostId]: { ...detail, conditional_timers: next },
+        },
+      };
+    });
+    return created;
+  },
+
+  async cancelConditionalTimer(
+    hostId: string,
+    timerId: string,
+  ): Promise<import("@/lib/orbit-ipc").ConditionalTimerRecord> {
+    const updated = await orbitIpc.cancelConditionalTimer(hostId, timerId);
+    setState((s) => {
+      const detail = s.hostDetails[hostId];
+      if (!detail) return s;
+      const existing = detail.conditional_timers ?? [];
+      const next = [updated, ...existing.filter((t) => t.timer_id !== updated.timer_id)].sort(
+        (a, b) => {
+          const aArmed = a.state === "armed";
+          const bArmed = b.state === "armed";
+          if (aArmed !== bArmed) return aArmed ? -1 : 1;
+          if (aArmed) return a.fire_at_ms - b.fire_at_ms;
+          return (b.resolved_at_ms ?? b.created_at_ms) - (a.resolved_at_ms ?? a.created_at_ms);
+        },
+      );
+      return {
+        ...s,
+        hostDetails: {
+          ...s.hostDetails,
+          [hostId]: { ...detail, conditional_timers: next },
+        },
+      };
+    });
+    return updated;
+  },
+
+  async fireConditionalTimerNow(
+    hostId: string,
+    timerId: string,
+  ): Promise<import("@/lib/orbit-ipc").ConditionalTimerRecord> {
+    const updated = await orbitIpc.fireConditionalTimerNow(hostId, timerId);
+    setState((s) => {
+      const detail = s.hostDetails[hostId];
+      if (!detail) return s;
+      const existing = detail.conditional_timers ?? [];
+      const next = [updated, ...existing.filter((t) => t.timer_id !== updated.timer_id)].sort(
+        (a, b) => {
+          const aArmed = a.state === "armed";
+          const bArmed = b.state === "armed";
+          if (aArmed !== bArmed) return aArmed ? -1 : 1;
+          if (aArmed) return a.fire_at_ms - b.fire_at_ms;
+          return (b.resolved_at_ms ?? b.created_at_ms) - (a.resolved_at_ms ?? a.created_at_ms);
+        },
+      );
+      return {
+        ...s,
+        hostDetails: {
+          ...s.hostDetails,
+          [hostId]: { ...detail, conditional_timers: next },
+        },
+      };
+    });
+    return updated;
+  },
+
+  async restartLspServer(hostId: string, cwd: string, serverId: string): Promise<void> {
+    if (!hostId || !cwd || cwd === "~" || !serverId) return;
+    const scopeKey = `${hostId}::${cwd}`;
+    const seq = (lspServersSeqByKey.get(scopeKey) ?? 0) + 1;
+    lspServersSeqByKey.set(scopeKey, seq);
+    try {
+      const servers = await orbitIpc.restartLspServer(hostId, cwd, serverId);
+      if (lspServersSeqByKey.get(scopeKey) !== seq) return;
+      setState((s) => ({
+        ...s,
+        lspServersByWorkspace: upsertLruRecord(
+          s.lspServersByWorkspace,
+          scopeKey,
+          { status: "ready", servers, error: null },
+          MAX_LSP_SERVERS_CACHE_ENTRIES,
+        ),
+      }));
+      notifyToast(`Restarted ${serverId}`);
+    } catch (err) {
+      if (lspServersSeqByKey.get(scopeKey) !== seq) return;
+      notifyToast(`Restart failed: ${String(err)}`);
+    }
+  },
+
+  async getUsageInsights(hostId: string, days = 7): Promise<UsageInsightsSnapshot> {
+    return orbitIpc.getUsageInsights(hostId, days);
+  },
+
+  async getContextOccupancy(
+    hostId: string,
+    agentId: string,
+  ): Promise<ContextOccupancyBreakdown> {
+    return orbitIpc.getContextOccupancy(hostId, agentId);
+  },
+
+  async loadLifecycleHooks(
+    hostId: string,
+    cwd: string | null,
+  ): Promise<LifecycleHooksSnapshotView | null> {
+    if (!hostId) return null;
+    const normalizedCwd = cwd && cwd.trim() && cwd.trim() !== "~" ? cwd.trim() : null;
+    const scopeKey = `${hostId}::${normalizedCwd ?? "__global__"}`;
+    const seq = (lifecycleHooksSeqByKey.get(scopeKey) ?? 0) + 1;
+    lifecycleHooksSeqByKey.set(scopeKey, seq);
+    setState((s) => {
+      const prev = s.lifecycleHooksByScope[scopeKey];
+      return {
+        ...s,
+        lifecycleHooksByScope: upsertLruRecord(
+          s.lifecycleHooksByScope,
+          scopeKey,
+          {
+            status: "loading",
+            hooks: prev?.hooks ?? [],
+            recentExecutions: prev?.recentExecutions ?? [],
+            projectHooksTrusted: prev?.projectHooksTrusted ?? false,
+            error: null,
+          },
+          MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+        ),
+      };
+    });
+    try {
+      const snap = await orbitIpc.listLifecycleHooks(hostId, normalizedCwd);
+      if (lifecycleHooksSeqByKey.get(scopeKey) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        lifecycleHooksByScope: upsertLruRecord(
+          s.lifecycleHooksByScope,
+          scopeKey,
+          {
+            status: "ready",
+            hooks: snap.hooks,
+            recentExecutions: snap.recent_executions,
+            projectHooksTrusted: snap.project_hooks_trusted,
+            error: null,
+          },
+          MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+        ),
+      }));
+      return snap;
+    } catch (err) {
+      if (lifecycleHooksSeqByKey.get(scopeKey) !== seq) return null;
+      setState((s) => {
+        const prev = s.lifecycleHooksByScope[scopeKey];
+        return {
+          ...s,
+          lifecycleHooksByScope: upsertLruRecord(
+            s.lifecycleHooksByScope,
+            scopeKey,
+            {
+              status: "error",
+              hooks: prev?.hooks ?? [],
+              recentExecutions: prev?.recentExecutions ?? [],
+              projectHooksTrusted: prev?.projectHooksTrusted ?? false,
+              error: String(err),
+            },
+            MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+          ),
+        };
+      });
+      return null;
+    }
+  },
+
+  async upsertLifecycleHook(
+    hostId: string,
+    cwd: string | null,
+    hook: LifecycleHookRule,
+  ): Promise<LifecycleHooksSnapshotView> {
+    const normalizedCwd = cwd && cwd.trim() && cwd.trim() !== "~" ? cwd.trim() : null;
+    const scopeKey = `${hostId}::${normalizedCwd ?? "__global__"}`;
+    const seq = (lifecycleHooksSeqByKey.get(scopeKey) ?? 0) + 1;
+    lifecycleHooksSeqByKey.set(scopeKey, seq);
+    try {
+      const snap = await orbitIpc.upsertLifecycleHook(hostId, normalizedCwd, hook);
+      if (lifecycleHooksSeqByKey.get(scopeKey) === seq) {
+        setState((s) => ({
+          ...s,
+          lifecycleHooksByScope: upsertLruRecord(
+            s.lifecycleHooksByScope,
+            scopeKey,
+            {
+              status: "ready",
+              hooks: snap.hooks,
+              recentExecutions: snap.recent_executions,
+              projectHooksTrusted: snap.project_hooks_trusted,
+              error: null,
+            },
+            MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+          ),
+        }));
+      }
+      return snap;
+    } catch (err) {
+      notifyToast(`Hook update failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async deleteLifecycleHook(
+    hostId: string,
+    cwd: string | null,
+    hookId: string,
+    scope: HookScope,
+  ): Promise<LifecycleHooksSnapshotView> {
+    const normalizedCwd = cwd && cwd.trim() && cwd.trim() !== "~" ? cwd.trim() : null;
+    const scopeKey = `${hostId}::${normalizedCwd ?? "__global__"}`;
+    const seq = (lifecycleHooksSeqByKey.get(scopeKey) ?? 0) + 1;
+    lifecycleHooksSeqByKey.set(scopeKey, seq);
+    const snap = await orbitIpc.deleteLifecycleHook(hostId, normalizedCwd, hookId, scope);
+    if (lifecycleHooksSeqByKey.get(scopeKey) === seq) {
+      setState((s) => ({
+        ...s,
+        lifecycleHooksByScope: upsertLruRecord(
+          s.lifecycleHooksByScope,
+          scopeKey,
+          {
+            status: "ready",
+            hooks: snap.hooks,
+            recentExecutions: snap.recent_executions,
+            projectHooksTrusted: snap.project_hooks_trusted,
+            error: null,
+          },
+          MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+        ),
+      }));
+    }
+    notifyToast("Hook deleted");
+    return snap;
+  },
+
+  async setProjectHooksTrust(
+    hostId: string,
+    cwd: string,
+    trusted: boolean,
+  ): Promise<LifecycleHooksSnapshotView> {
+    const scopeKey = `${hostId}::${cwd}`;
+    const seq = (lifecycleHooksSeqByKey.get(scopeKey) ?? 0) + 1;
+    lifecycleHooksSeqByKey.set(scopeKey, seq);
+    try {
+      const snap = await orbitIpc.setProjectHooksTrust(hostId, cwd, trusted);
+      if (lifecycleHooksSeqByKey.get(scopeKey) === seq) {
+        setState((s) => ({
+          ...s,
+          lifecycleHooksByScope: upsertLruRecord(
+            s.lifecycleHooksByScope,
+            scopeKey,
+            {
+              status: "ready",
+              hooks: snap.hooks,
+              recentExecutions: snap.recent_executions,
+              projectHooksTrusted: snap.project_hooks_trusted,
+              error: null,
+            },
+            MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+          ),
+        }));
+      }
+      notifyToast(trusted ? "Project hooks trusted" : "Project hook trust revoked");
+      return snap;
+    } catch (err) {
+      notifyToast(`Trust update failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async testLifecycleHook(
+    hostId: string,
+    cwd: string | null,
+    hookId: string,
+    samplePayload: Record<string, unknown>,
+  ): Promise<HookExecutionRecord> {
+    const normalizedCwd = cwd && cwd.trim() && cwd.trim() !== "~" ? cwd.trim() : null;
+    const scopeKey = `${hostId}::${normalizedCwd ?? "__global__"}`;
+    try {
+      const record = await orbitIpc.testLifecycleHook(
+        hostId,
+        normalizedCwd,
+        hookId,
+        samplePayload,
+      );
+      setState((s) => {
+        const prev = s.lifecycleHooksByScope[scopeKey];
+        if (!prev) return s;
+        const nextRuns = [
+          record,
+          ...prev.recentExecutions.filter((r) => r.id !== record.id),
+        ].slice(0, 100);
+        return {
+          ...s,
+          lifecycleHooksByScope: upsertLruRecord(
+            s.lifecycleHooksByScope,
+            scopeKey,
+            {
+              ...prev,
+              recentExecutions: nextRuns,
+            },
+            MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES,
+          ),
+        };
+      });
+      notifyToast(
+        `${record.hook_name}: ${record.decision.toUpperCase()} (${record.duration_ms}ms)`,
+      );
+      return record;
+    } catch (err) {
+      notifyToast(`Hook test failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async loadEventTriggers(hostId: string): Promise<EventTriggersSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (eventTriggersSeqByHost.get(hostId) ?? 0) + 1;
+    eventTriggersSeqByHost.set(hostId, seq);
+    setState((s) => {
+      const prev = s.eventTriggersByHost[hostId];
+      return {
+        ...s,
+        eventTriggersByHost: {
+          ...s.eventTriggersByHost,
+          [hostId]: {
+            status: "loading",
+            triggers: prev?.triggers ?? [],
+            recentDeliveries: prev?.recentDeliveries ?? [],
+            baseWebhookUrl: prev?.baseWebhookUrl ?? "http://127.0.0.1:6868",
+            error: null,
+          },
+        },
+      };
+    });
+    try {
+      const snap = await orbitIpc.listEventTriggers(hostId);
+      if (eventTriggersSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        eventTriggersByHost: {
+          ...s.eventTriggersByHost,
+          [hostId]: {
+            status: "ready",
+            triggers: snap.triggers,
+            recentDeliveries: snap.recent_deliveries,
+            baseWebhookUrl: snap.base_webhook_url,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (eventTriggersSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => {
+        const prev = s.eventTriggersByHost[hostId];
+        return {
+          ...s,
+          eventTriggersByHost: {
+            ...s.eventTriggersByHost,
+            [hostId]: {
+              status: "error",
+              triggers: prev?.triggers ?? [],
+              recentDeliveries: prev?.recentDeliveries ?? [],
+              baseWebhookUrl: prev?.baseWebhookUrl ?? "http://127.0.0.1:6868",
+              error: String(err),
+            },
+          },
+        };
+      });
+      return null;
+    }
+  },
+
+  async upsertEventTrigger(
+    req: UpsertEventTriggerRequest,
+  ): Promise<EventTriggersSnapshotView> {
+    const hostId = req.host_id;
+    const seq = (eventTriggersSeqByHost.get(hostId) ?? 0) + 1;
+    eventTriggersSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.upsertEventTrigger(req);
+      if (eventTriggersSeqByHost.get(hostId) === seq) {
+        setState((s) => ({
+          ...s,
+          eventTriggersByHost: {
+            ...s.eventTriggersByHost,
+            [hostId]: {
+              status: "ready",
+              triggers: snap.triggers,
+              recentDeliveries: snap.recent_deliveries,
+              baseWebhookUrl: snap.base_webhook_url,
+              error: null,
+            },
+          },
+        }));
+      }
+      return snap;
+    } catch (err) {
+      notifyToast(`Trigger save failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async deleteEventTrigger(
+    hostId: string,
+    triggerId: string,
+  ): Promise<EventTriggersSnapshotView> {
+    const seq = (eventTriggersSeqByHost.get(hostId) ?? 0) + 1;
+    eventTriggersSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.deleteEventTrigger(hostId, triggerId);
+      if (eventTriggersSeqByHost.get(hostId) === seq) {
+        setState((s) => ({
+          ...s,
+          eventTriggersByHost: {
+            ...s.eventTriggersByHost,
+            [hostId]: {
+              status: "ready",
+              triggers: snap.triggers,
+              recentDeliveries: snap.recent_deliveries,
+              baseWebhookUrl: snap.base_webhook_url,
+              error: null,
+            },
+          },
+        }));
+      }
+      notifyToast("Trigger deleted");
+      return snap;
+    } catch (err) {
+      notifyToast(`Trigger delete failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async testEventTrigger(
+    hostId: string,
+    triggerId: string,
+    sampleEventType: string,
+    samplePayload: Record<string, unknown>,
+  ): Promise<EventTriggerDelivery> {
+    try {
+      const delivery = await orbitIpc.testEventTrigger(
+        hostId,
+        triggerId,
+        sampleEventType,
+        samplePayload,
+      );
+      setState((s) => {
+        const prev = s.eventTriggersByHost[hostId];
+        if (!prev) return s;
+        const nextDeliveries = [
+          delivery,
+          ...prev.recentDeliveries.filter((d) => d.delivery_id !== delivery.delivery_id),
+        ].slice(0, 50);
+        const nextTriggers =
+          delivery.status === "dispatched"
+            ? prev.triggers.map((t) =>
+                t.trigger_id === triggerId
+                  ? {
+                      ...t,
+                      trigger_count: t.trigger_count + 1,
+                      last_triggered_at_ms: delivery.received_at_ms,
+                    }
+                  : t,
+              )
+            : prev.triggers;
+        return {
+          ...s,
+          eventTriggersByHost: {
+            ...s.eventTriggersByHost,
+            [hostId]: {
+              ...prev,
+              triggers: nextTriggers,
+              recentDeliveries: nextDeliveries,
+            },
+          },
+        };
+      });
+      notifyToast(`${delivery.event_type}: ${delivery.status} · ${delivery.summary}`);
+      return delivery;
+    } catch (err) {
+      notifyToast(`Trigger test failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async loadFileDiagnostics(
+    hostId: string,
+    cwd: string,
+    path: string,
+    silent = false,
+  ): Promise<LspDiagnostic[]> {
+    if (!hostId || !cwd || cwd === "~" || !path) return [];
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const seq = (lspDiagSeqByKey.get(cKey) ?? 0) + 1;
+    lspDiagSeqByKey.set(cKey, seq);
+    if (!silent) {
+      setState((s) => ({
+        ...s,
+        lspDiagnosticsByFile: upsertLruRecord(
+          s.lspDiagnosticsByFile,
+          cKey,
+          {
+            status: "loading",
+            diagnostics: s.lspDiagnosticsByFile[cKey]?.diagnostics ?? [],
+          },
+          MAX_LSP_DIAGNOSTICS_CACHE_ENTRIES,
+        ),
+      }));
+    }
+    try {
+      const diagnostics = await orbitIpc.lspGetDiagnostics(hostId, cwd, path);
+      if (lspDiagSeqByKey.get(cKey) !== seq) return [];
+      setState((s) => ({
+        ...s,
+        lspDiagnosticsByFile: upsertLruRecord(
+          s.lspDiagnosticsByFile,
+          cKey,
+          { status: "ready", diagnostics },
+          MAX_LSP_DIAGNOSTICS_CACHE_ENTRIES,
+        ),
+      }));
+      return diagnostics;
+    } catch {
+      if (lspDiagSeqByKey.get(cKey) !== seq) return [];
+      setState((s) => ({
+        ...s,
+        lspDiagnosticsByFile: upsertLruRecord(
+          s.lspDiagnosticsByFile,
+          cKey,
+          {
+            status: "error",
+            diagnostics: s.lspDiagnosticsByFile[cKey]?.diagnostics ?? [],
+          },
+          MAX_LSP_DIAGNOSTICS_CACHE_ENTRIES,
+        ),
+      }));
+      return [];
+    }
+  },
+
+  async gotoLspDefinition(
+    hostId: string,
+    cwd: string,
+    path: string,
+    line: number,
+    col: number,
+  ): Promise<LspLocation | null> {
+    if (!hostId || !cwd || cwd === "~" || !path || line < 1 || col < 1) return null;
+    const seq = ++nextLspGotoSeq;
+    try {
+      const locations = await orbitIpc.lspGotoDefinition({
+        hostId,
+        cwd,
+        path,
+        line,
+        col,
+      });
+      if (seq !== nextLspGotoSeq || !state.sidePanelOpen || state.selectedHostId !== hostId) {
+        return null;
+      }
+      const first = locations[0] ?? null;
+      if (!first) {
+        notifyToast("No definition found");
+        return null;
+      }
+      orbitActions.openFileInSidePanel(first.path, {
+        hostId,
+        cwd,
+        focusLine: first.line,
+        focusEndLine: first.end_line > first.line ? first.end_line : null,
+      });
+      return first;
+    } catch {
+      if (seq !== nextLspGotoSeq || !state.sidePanelOpen || state.selectedHostId !== hostId) {
+        return null;
+      }
+      notifyToast("No definition found");
+      return null;
+    }
+  },
+
+  async startGoalRun(req: {
+    hostId: string;
+    agentId: string;
+    objective: string;
+    criteria?: string[];
+    verifyCommand?: string | null;
+    maxIterations?: number | null;
+    maxDurationSecs?: number | null;
+  }): Promise<GoalRunRecord | null> {
+    try {
+      const goal = await orbitIpc.startGoalRun(req);
+      notifyToast("Goal loop started");
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return goal;
+    } catch (err) {
+      notifyToast(`Failed to start goal: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async controlGoalRun(
+    hostId: string,
+    goalId: string,
+    action: GoalControlAction,
+  ): Promise<GoalRunRecord | null> {
+    try {
+      const goal = await orbitIpc.controlGoalRun(hostId, goalId, action);
+      const label =
+        action === "pause"
+          ? "Goal paused"
+          : action === "resume"
+            ? "Goal resumed"
+            : action === "cancel"
+              ? "Goal stopped"
+              : goal.status === "succeeded"
+                ? "Goal verification passed"
+                : "Verification completed";
+      notifyToast(label);
+      void orbitActions.reloadHostDetail(hostId, true);
+      return goal;
+    } catch (err) {
+      notifyToast(`Goal action failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async startMonitorWatch(req: {
+    hostId: string;
+    agentId: string;
+    name: string;
+    kind: MonitorKind;
+    expiresInSecs?: number | null;
+  }): Promise<MonitorWatchRecord | null> {
+    try {
+      const monitor = await orbitIpc.startMonitorWatch(req);
+      notifyToast(`Monitor started: ${monitor.name}`);
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return monitor;
+    } catch (err) {
+      notifyToast(`Failed to start monitor: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async stopMonitorWatch(hostId: string, monitorId: string): Promise<MonitorWatchRecord | null> {
+    try {
+      const monitor = await orbitIpc.stopMonitorWatch(hostId, monitorId);
+      notifyToast(`Stopped monitor: ${monitor.name}`);
+      void orbitActions.reloadHostDetail(hostId, true);
+      return monitor;
+    } catch (err) {
+      notifyToast(`Failed to stop monitor: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async refreshGoalsAndMonitors(hostId: string): Promise<void> {
+    if (!hostId) return;
+    await Promise.all([
+      orbitIpc.listGoalRuns(hostId).catch(() => []),
+      orbitIpc.listMonitorWatches(hostId).catch(() => []),
+      orbitIpc.listWorkflowRuns(hostId, true).catch(() => []),
+    ]);
+    await orbitActions.reloadHostDetail(hostId, true);
+  },
+
+  async loadBrowserSessions(hostId: string): Promise<BrowserSessionsSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (browserReqSeqByHost.get(hostId) ?? 0) + 1;
+    browserReqSeqByHost.set(hostId, seq);
+    setState((s) => {
+      const prev = s.browserByHost[hostId];
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [hostId]: {
+            status: prev?.status === "ready" ? "ready" : "loading",
+            sessions: prev?.sessions ?? [],
+            policy: prev?.policy ?? null,
+            chromeBinary: prev?.chromeBinary ?? null,
+            activeSessionId: prev?.activeSessionId ?? null,
+            elementsBySession: prev?.elementsBySession ?? {},
+            textExcerptBySession: prev?.textExcerptBySession ?? {},
+            busy: prev?.busy ?? false,
+            error: null,
+          },
+        },
+      };
+    });
+    try {
+      const snap = await orbitIpc.listBrowserSessions(hostId);
+      if (browserReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        const nextActive =
+          prev?.activeSessionId && snap.sessions.some((x) => x.session_id === prev.activeSessionId)
+            ? prev.activeSessionId
+            : (snap.sessions[0]?.session_id ?? null);
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "ready",
+              sessions: snap.sessions,
+              policy: snap.policy,
+              chromeBinary: snap.chrome_binary ?? null,
+              activeSessionId: nextActive,
+              elementsBySession: prev?.elementsBySession ?? {},
+              textExcerptBySession: prev?.textExcerptBySession ?? {},
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      return snap;
+    } catch (err) {
+      if (browserReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "error",
+              sessions: prev?.sessions ?? [],
+              policy: prev?.policy ?? null,
+              chromeBinary: prev?.chromeBinary ?? null,
+              activeSessionId: prev?.activeSessionId ?? null,
+              elementsBySession: prev?.elementsBySession ?? {},
+              textExcerptBySession: prev?.textExcerptBySession ?? {},
+              busy: false,
+              error: String(err),
+            },
+          },
+        };
+      });
+      return null;
+    }
+  },
+
+  selectBrowserSession(hostId: string, sessionId: string | null) {
+    if (!hostId) return;
+    setState((s) => {
+      const prev = s.browserByHost[hostId];
+      if (!prev) return s;
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [hostId]: {
+            ...prev,
+            activeSessionId: sessionId,
+          },
+        },
+      };
+    });
+  },
+
+  async createBrowserSession(req: {
+    hostId: string;
+    agentId?: string | null;
+    initialUrl?: string | null;
+    headless?: boolean | null;
+    viewportWidth?: number | null;
+    viewportHeight?: number | null;
+  }): Promise<BrowserSessionSummary | null> {
+    if (!req.hostId) return null;
+    const seq = (browserReqSeqByHost.get(req.hostId) ?? 0) + 1;
+    browserReqSeqByHost.set(req.hostId, seq);
+    setState((s) => {
+      const prev = s.browserByHost[req.hostId];
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [req.hostId]: {
+            status: prev?.status ?? "loading",
+            sessions: prev?.sessions ?? [],
+            policy: prev?.policy ?? null,
+            chromeBinary: prev?.chromeBinary ?? null,
+            activeSessionId: prev?.activeSessionId ?? null,
+            elementsBySession: prev?.elementsBySession ?? {},
+            textExcerptBySession: prev?.textExcerptBySession ?? {},
+            busy: true,
+            error: null,
+          },
+        },
+      };
+    });
+    try {
+      const session = await orbitIpc.createBrowserSession(req);
+      setState((s) => {
+        const prev = s.browserByHost[req.hostId];
+        const nextSessions = [
+          session,
+          ...(prev?.sessions ?? []).filter((x) => x.session_id !== session.session_id),
+        ];
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [req.hostId]: {
+              status: "ready",
+              sessions: nextSessions,
+              policy: prev?.policy ?? null,
+              chromeBinary: prev?.chromeBinary ?? null,
+              activeSessionId: session.session_id,
+              elementsBySession: prev?.elementsBySession ?? {},
+              textExcerptBySession: prev?.textExcerptBySession ?? {},
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      // Immediately capture an initial viewport screenshot for visual feedback.
+      void orbitActions.executeBrowserAction(req.hostId, session.session_id, {
+        kind: "screenshot",
+        full_page: false,
+      });
+      return session;
+    } catch (err) {
+      const msg = String(err);
+      setState((s) => {
+        const prev = s.browserByHost[req.hostId];
+        if (!prev) return s;
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [req.hostId]: { ...prev, busy: false, error: msg },
+          },
+        };
+      });
+      notifyToast(`CDP session error: ${msg}`);
+      return null;
+    }
+  },
+
+  async executeBrowserAction(
+    hostId: string,
+    sessionId: string,
+    action: BrowserActionRequest,
+  ): Promise<BrowserActionResponseView | null> {
+    if (!hostId || !sessionId) return null;
+    setState((s) => {
+      const prev = s.browserByHost[hostId];
+      if (!prev) return s;
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [hostId]: { ...prev, busy: true, error: null },
+        },
+      };
+    });
+    try {
+      const res = await orbitIpc.executeBrowserAction({ hostId, sessionId, action });
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        if (!prev) return s;
+        const existingSession = prev.sessions.find((x) => x.session_id === res.session.session_id);
+        // Do not resurrect a session that was closed while this action was in flight.
+        if (!existingSession) {
+          return {
+            ...s,
+            browserByHost: {
+              ...s.browserByHost,
+              [hostId]: { ...prev, busy: false },
+            },
+          };
+        }
+        const mergedSession: BrowserSessionSummary = {
+          ...res.session,
+          last_screenshot_base64:
+            res.screenshot_base64 ??
+            res.session.last_screenshot_base64 ??
+            existingSession.last_screenshot_base64 ??
+            null,
+        };
+        const nextSessions = prev.sessions.map((x) =>
+          x.session_id === mergedSession.session_id ? mergedSession : x,
+        );
+        const nextActive =
+          prev.activeSessionId && nextSessions.some((x) => x.session_id === prev.activeSessionId)
+            ? prev.activeSessionId
+            : (nextSessions[0]?.session_id ?? null);
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "ready",
+              sessions: nextSessions,
+              policy: prev.policy,
+              chromeBinary: prev.chromeBinary,
+              activeSessionId: nextActive,
+              elementsBySession: {
+                ...prev.elementsBySession,
+                [mergedSession.session_id]: res.elements,
+              },
+              textExcerptBySession: {
+                ...prev.textExcerptBySession,
+                [mergedSession.session_id]:
+                  res.text_excerpt !== undefined
+                    ? res.text_excerpt
+                    : (prev.textExcerptBySession[mergedSession.session_id] ?? null),
+              },
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      return res;
+    } catch (err) {
+      const msg = String(err);
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        if (!prev) return s;
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: { ...prev, busy: false, error: msg },
+          },
+        };
+      });
+      notifyToast(msg);
+      return null;
+    }
+  },
+
+  async closeBrowserSession(
+    hostId: string,
+    sessionId: string,
+  ): Promise<BrowserSessionsSnapshotView | null> {
+    if (!hostId || !sessionId) return null;
+    const seq = (browserReqSeqByHost.get(hostId) ?? 0) + 1;
+    browserReqSeqByHost.set(hostId, seq);
+    setState((s) => {
+      const prev = s.browserByHost[hostId];
+      if (!prev) return s;
+      return {
+        ...s,
+        browserByHost: {
+          ...s.browserByHost,
+          [hostId]: { ...prev, busy: true, error: null },
+        },
+      };
+    });
+    try {
+      const snap = await orbitIpc.closeBrowserSession(hostId, sessionId);
+      if (browserReqSeqByHost.get(hostId) !== seq) return snap;
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        const nextElements = { ...(prev?.elementsBySession ?? {}) };
+        delete nextElements[sessionId];
+        const nextExcerpts = { ...(prev?.textExcerptBySession ?? {}) };
+        delete nextExcerpts[sessionId];
+        const nextActive =
+          prev?.activeSessionId &&
+          prev.activeSessionId !== sessionId &&
+          snap.sessions.some((x) => x.session_id === prev.activeSessionId)
+            ? prev.activeSessionId
+            : (snap.sessions[0]?.session_id ?? null);
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "ready",
+              sessions: snap.sessions,
+              policy: snap.policy,
+              chromeBinary: snap.chrome_binary ?? null,
+              activeSessionId: nextActive,
+              elementsBySession: nextElements,
+              textExcerptBySession: nextExcerpts,
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      notifyToast("CDP session closed");
+      return snap;
+    } catch (err) {
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        if (!prev) return s;
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: { ...prev, busy: false, error: String(err) },
+          },
+        };
+      });
+      notifyToast(`Failed to close CDP session: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async updateBrowserPolicy(
+    hostId: string,
+    policy: BrowserPolicyConfig,
+  ): Promise<BrowserSessionsSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (browserReqSeqByHost.get(hostId) ?? 0) + 1;
+    browserReqSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.updateBrowserPolicy(hostId, policy);
+      if (browserReqSeqByHost.get(hostId) !== seq) return snap;
+      setState((s) => {
+        const prev = s.browserByHost[hostId];
+        return {
+          ...s,
+          browserByHost: {
+            ...s.browserByHost,
+            [hostId]: {
+              status: "ready",
+              sessions: snap.sessions,
+              policy: snap.policy,
+              chromeBinary: snap.chrome_binary ?? null,
+              activeSessionId:
+                prev?.activeSessionId &&
+                snap.sessions.some((x) => x.session_id === prev.activeSessionId)
+                  ? prev.activeSessionId
+                  : (snap.sessions[0]?.session_id ?? null),
+              elementsBySession: prev?.elementsBySession ?? {},
+              textExcerptBySession: prev?.textExcerptBySession ?? {},
+              busy: false,
+              error: null,
+            },
+          },
+        };
+      });
+      notifyToast("Browser policy updated");
+      return snap;
+    } catch (err) {
+      notifyToast(`Failed to update browser policy: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async startBatchFanout(req: {
+    hostId: string;
+    name: string;
+    cwd: string;
+    csvContent: string;
+    promptTemplate: string;
+    provider: ProviderKind;
+    model?: string | null;
+    mode: SessionMode;
+    maxConcurrency?: number | null;
+    isolatedWorktree?: boolean;
+  }): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.startBatchFanout(req);
+      notifyToast(`Batch started: ${run.name}`);
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to start batch: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async startDagWorkflow(req: {
+    hostId: string;
+    name: string;
+    cwd: string;
+    steps: DagStepSpec[];
+    defaultProvider: ProviderKind;
+    defaultMode: SessionMode;
+    maxConcurrency?: number | null;
+  }): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.startDagWorkflow(req);
+      notifyToast(`DAG started: ${run.name}`);
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to start DAG: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async startBestOfN(req: {
+    hostId: string;
+    name: string;
+    cwd: string;
+    prompt: string;
+    candidates: BestOfNCandidateSpec[];
+    mode: SessionMode;
+    verifyCommand?: string | null;
+  }): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.startBestOfN(req);
+      notifyToast(`Arena started: ${run.name}`);
+      void orbitActions.reloadHostDetail(req.hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to start Arena: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async cancelWorkflowRun(hostId: string, runId: string): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.cancelWorkflowRun(hostId, runId);
+      notifyToast(`Canceled workflow: ${run.name}`);
+      void orbitActions.reloadHostDetail(hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to cancel workflow: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async selectBestOfNWinner(
+    hostId: string,
+    runId: string,
+    winnerStepId: string,
+    applyToWorkspace = true,
+  ): Promise<WorkflowRunRecord | null> {
+    try {
+      const run = await orbitIpc.selectBestOfNWinner(hostId, runId, winnerStepId, applyToWorkspace);
+      notifyToast(applyToWorkspace ? "Winner applied to workspace" : "Winner selected");
+      void orbitActions.reloadHostDetail(hostId, true);
+      return run;
+    } catch (err) {
+      notifyToast(`Failed to apply winner: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async refreshWorkflowRuns(hostId: string): Promise<void> {
+    if (!hostId) return;
+    await orbitIpc.listWorkflowRuns(hostId, true).catch(() => []);
+    await orbitActions.reloadHostDetail(hostId, true);
+  },
+
+  async reloadWorkspaceFileFromConflict(hostId: string, cwd: string, path: string): Promise<void> {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    try {
+      const refreshed = await orbitIpc.readWorkspaceFile(hostId, cwd, path);
+      const normalized = normalizeEditorText(refreshed.content);
+      const lineEnding = normalizeLineEndingKind(refreshed.line_ending);
+      setState((s) => ({
+        ...s,
+        fileViewCache: {
+          ...s.fileViewCache,
+          [cKey]: { status: "ready", data: refreshed },
+        },
+        fileEditorDrafts: {
+          ...s.fileEditorDrafts,
+          [cKey]: {
+            hostId,
+            cwd,
+            path,
+            content: normalized,
+            baseEtag: refreshed.etag ?? null,
+            baseContent: normalized,
+            lineEnding,
+            dirty: false,
+            mode: "edit",
+            saving: false,
+            saveError: null,
+            conflict: null,
+          },
+        },
+      }));
+      notifyToast(`Reloaded ${basenameFromPath(path) || path}`);
+    } catch (err) {
+      // Preserve existing cache & editor buffer so the user retains access to `Copy mine`
+      setState((s) => {
+        const cur = s.fileEditorDrafts[cKey];
+        if (!cur) return s;
+        return {
+          ...s,
+          fileEditorDrafts: {
+            ...s.fileEditorDrafts,
+            [cKey]: {
+              ...cur,
+              saving: false,
+              saveError: `Reload failed: ${String(err)}`,
+            },
+          },
+        };
+      });
+    }
+  },
+
+  async resolveUnsavedFileAction(choice: "save" | "discard" | "cancel"): Promise<void> {
+    const pending = state.pendingUnsavedFileAction;
+    if (!pending) return;
+
+    if (choice === "cancel") {
+      setState((s) => ({ ...s, pendingUnsavedFileAction: null }));
+      return;
+    }
+
+    const draft = state.fileEditorDrafts[pending.fileKey];
+    if (choice === "save" && draft) {
+      const outcome = await orbitActions.saveWorkspaceFile(
+        draft.hostId,
+        draft.cwd,
+        draft.path,
+        false,
+      );
+      if (outcome !== "saved") {
+        // Keep user on current file so conflict banner or save error is visible
+        setState((s) => ({ ...s, pendingUnsavedFileAction: null }));
+        return;
+      }
+    }
+
+    if (choice === "discard" && draft) {
+      orbitActions.discardFileEditorDraft(draft.hostId, draft.cwd, draft.path);
+    } else {
+      setState((s) => ({ ...s, pendingUnsavedFileAction: null }));
+    }
+
+    const act = pending.action;
+    switch (act.kind) {
+      case "focus_tab":
+        orbitActions.focusSidePanelTab(act.tabId, { skipUnsavedGuard: true });
+        break;
+      case "close_tab":
+        orbitActions.closeSidePanelTab(act.tabId, { skipUnsavedGuard: true });
+        break;
+      case "open_file":
+        orbitActions.openFileInSidePanel(act.rawPath, {
+          ...act.opts,
+          skipUnsavedGuard: true,
+        });
+        break;
+      case "new_tab":
+        orbitActions.openSidePanelNewTab({ skipUnsavedGuard: true });
+        break;
+      case "switch_to_view":
+        orbitActions.discardFileEditorDraft(act.hostId, act.cwd, act.path);
+        break;
+      case "reload":
+        orbitActions.discardFileEditorDraft(act.hostId, act.cwd, act.path);
+        void orbitActions.loadWorkspaceFile(act.hostId, act.cwd, act.path, true);
+        break;
+    }
+  },
+
+  async createWorkspaceEntry(
+    hostId: string,
+    cwd: string,
+    path: string,
+    isDir: boolean,
+    initialContent?: string,
+  ): Promise<string> {
+    const res = await orbitIpc.createWorkspaceEntry({
+      hostId,
+      cwd,
+      path,
+      isDir,
+      initialContent: initialContent ?? (isDir ? null : ""),
+    });
+    const wsKey = `${hostId}::${cwd}`;
+    const normalized = res.path;
+    if (isDir) {
+      setState((s) => {
+        const cur = s.workspaceEmptyDirsCache[wsKey] ?? [];
+        if (cur.includes(normalized)) return s;
+        return {
+          ...s,
+          workspaceEmptyDirsCache: {
+            ...s.workspaceEmptyDirsCache,
+            [wsKey]: [...cur, normalized],
+          },
+        };
+      });
+    }
+    await orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+    if (!isDir) {
+      orbitActions.openFileInSidePanel(normalized, { hostId, cwd, initialMode: "edit" });
+    }
+    if (cwd && cwd !== "~") {
+      void orbitActions.refreshGit(hostId, cwd, null, state.diffStaged);
+    }
+    return normalized;
+  },
+
+  async renameWorkspaceEntry(
+    hostId: string,
+    cwd: string,
+    oldPath: string,
+    newPath: string,
+  ): Promise<string> {
+    const res = await orbitIpc.renameWorkspaceEntry({ hostId, cwd, oldPath, newPath });
+    const oldNorm = res.path;
+    const newNorm = res.new_path ?? newPath;
+    const wsKey = `${hostId}::${cwd}`;
+    const remapPath = (p: string): string | null => {
+      if (p === oldNorm) return newNorm;
+      if (p.startsWith(`${oldNorm}/`)) return `${newNorm}${p.slice(oldNorm.length)}`;
+      return null;
+    };
+
+    const pathsNeedingHighlightReload: string[] = [];
+    const extOf = (p: string): string => {
+      const base = basenameFromPath(p);
+      const dot = base.lastIndexOf(".");
+      return dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
+    };
+
+    setState((s) => {
+      const prevEmptyDirs = s.workspaceEmptyDirsCache[wsKey] ?? [];
+      const nextEmptyDirs = prevEmptyDirs.map((d) => remapPath(d) ?? d);
+
+      const nextTabs = s.sidePanelTabs.map((t) => {
+        if (t.kind !== "file" || !t.filePath) return t;
+        const tHost = t.hostId ?? s.selectedHostId;
+        const tCwd = t.cwd ?? s.selectedWorkspaceCwd;
+        if (tHost !== hostId || tCwd !== cwd) return t;
+        const mapped = remapPath(t.filePath);
+        if (!mapped) return t;
+        const oldKey = `${hostId}::${cwd}::${t.filePath}`;
+        if (extOf(t.filePath) !== extOf(mapped) && !s.fileEditorDrafts[oldKey]?.dirty) {
+          pathsNeedingHighlightReload.push(mapped);
+        }
+        return {
+          ...t,
+          id: `tab:file:${hostId}::${cwd}::${mapped}`,
+          title: basenameFromPath(mapped) || mapped,
+          filePath: mapped,
+        };
+      });
+
+      let nextActiveTabId = s.activeSidePanelTabId;
+      for (let i = 0; i < s.sidePanelTabs.length; i += 1) {
+        if (s.sidePanelTabs[i].id === s.activeSidePanelTabId) {
+          nextActiveTabId = nextTabs[i]?.id ?? s.activeSidePanelTabId;
+          break;
+        }
+      }
+
+      const prefix = `${hostId}::${cwd}::`;
+      const nextCache: Record<string, FileViewCacheEntry> = {};
+      for (const [k, v] of Object.entries(s.fileViewCache)) {
+        if (k.startsWith(prefix)) {
+          const rel = k.slice(prefix.length);
+          const mapped = remapPath(rel);
+          if (mapped) {
+            nextCache[`${prefix}${mapped}`] = v.data
+              ? { ...v, data: { ...v.data, path: mapped } }
+              : v;
+            continue;
+          }
+        }
+        nextCache[k] = v;
+      }
+
+      const nextDrafts: Record<string, FileEditorDraftState> = {};
+      for (const [k, v] of Object.entries(s.fileEditorDrafts)) {
+        if (k.startsWith(prefix)) {
+          const rel = k.slice(prefix.length);
+          const mapped = remapPath(rel);
+          if (mapped) {
+            nextDrafts[`${prefix}${mapped}`] = { ...v, path: mapped };
+            continue;
+          }
+        }
+        nextDrafts[k] = v;
+      }
+
+      // Clear/remap any pending unsaved guard referencing the renamed file or tab
+      let nextPending = s.pendingUnsavedFileAction;
+      if (nextPending && nextPending.fileKey.startsWith(prefix)) {
+        const mappedKeyRel = remapPath(nextPending.fileKey.slice(prefix.length));
+        if (mappedKeyRel) {
+          nextPending = null;
+        }
+      }
+
+      return {
+        ...s,
+        workspaceEmptyDirsCache: {
+          ...s.workspaceEmptyDirsCache,
+          [wsKey]: nextEmptyDirs,
+        },
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: nextActiveTabId,
+        fileViewCache: nextCache,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction: nextPending,
+      };
+    });
+
+    for (const reloadPath of pathsNeedingHighlightReload) {
+      void orbitActions.loadWorkspaceFile(hostId, cwd, reloadPath, true);
+    }
+
+    await orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+    if (cwd && cwd !== "~") {
+      void orbitActions.refreshGit(hostId, cwd, null, state.diffStaged);
+    }
+    return newNorm;
+  },
+
+  async deleteWorkspaceEntry(
+    hostId: string,
+    cwd: string,
+    path: string,
+    opts?: { allowDirty?: boolean },
+  ): Promise<void> {
+    const cleanTarget = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    const prefix = `${hostId}::${cwd}::`;
+    if (!opts?.allowDirty) {
+      const hasDirtyMatch = Object.entries(state.fileEditorDrafts).some(([k, d]) => {
+        if (!d.dirty || !k.startsWith(prefix)) return false;
+        const rel = k.slice(prefix.length);
+        return rel === cleanTarget || rel.startsWith(`${cleanTarget}/`);
+      });
+      if (hasDirtyMatch) {
+        throw new Error("Cannot delete entry while it has unsaved edits in the editor");
+      }
+    }
+
+    const res = await orbitIpc.deleteWorkspaceEntry({ hostId, cwd, path });
+    const delNorm = res.path;
+    const wsKey = `${hostId}::${cwd}`;
+    const matchesDeleted = (p: string): boolean => p === delNorm || p.startsWith(`${delNorm}/`);
+
+    setState((s) => {
+      const prevEmptyDirs = s.workspaceEmptyDirsCache[wsKey] ?? [];
+      const nextEmptyDirs = prevEmptyDirs.filter((d) => !matchesDeleted(d));
+
+      const remainingTabs = s.sidePanelTabs.filter((t) => {
+        if (t.kind !== "file" || !t.filePath) return true;
+        const tHost = t.hostId ?? s.selectedHostId;
+        const tCwd = t.cwd ?? s.selectedWorkspaceCwd;
+        if (tHost !== hostId || tCwd !== cwd) return true;
+        return !matchesDeleted(t.filePath);
+      });
+
+      const activeRemoved = !remainingTabs.some((t) => t.id === s.activeSidePanelTabId);
+      const nextActive = activeRemoved
+        ? (remainingTabs[remainingTabs.length - 1]?.id ?? null)
+        : s.activeSidePanelTabId;
+
+      const nextCache: Record<string, FileViewCacheEntry> = {};
+      for (const [k, v] of Object.entries(s.fileViewCache)) {
+        if (k.startsWith(prefix) && matchesDeleted(k.slice(prefix.length))) continue;
+        nextCache[k] = v;
+      }
+
+      const nextDrafts: Record<string, FileEditorDraftState> = {};
+      for (const [k, v] of Object.entries(s.fileEditorDrafts)) {
+        if (k.startsWith(prefix) && matchesDeleted(k.slice(prefix.length))) continue;
+        nextDrafts[k] = v;
+      }
+
+      const nextPending =
+        s.pendingUnsavedFileAction &&
+        s.pendingUnsavedFileAction.fileKey.startsWith(prefix) &&
+        matchesDeleted(s.pendingUnsavedFileAction.fileKey.slice(prefix.length))
+          ? null
+          : s.pendingUnsavedFileAction;
+
+      return {
+        ...s,
+        workspaceEmptyDirsCache: {
+          ...s.workspaceEmptyDirsCache,
+          [wsKey]: nextEmptyDirs,
+        },
+        sidePanelTabs: remainingTabs,
+        activeSidePanelTabId: nextActive,
+        fileViewCache: nextCache,
+        fileEditorDrafts: nextDrafts,
+        pendingUnsavedFileAction: nextPending,
+      };
+    });
+
+    await orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+    if (cwd && cwd !== "~") {
+      void orbitActions.refreshGit(hostId, cwd, null, state.diffStaged);
     }
   },
 
@@ -5232,6 +9674,7 @@ export const orbitActions = {
         overviewPopoverOpen: false,
         sidePanelTabs: nextTabs,
         activeSidePanelTabId: tabId,
+        terminalFocused: false,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
       };
@@ -5275,6 +9718,7 @@ export const orbitActions = {
         overviewPopoverOpen: false,
         sidePanelTabs: nextTabs,
         activeSidePanelTabId: tabId,
+        terminalFocused: false,
         sideQuestionFocusNonce: s.sideQuestionFocusNonce + 1,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
@@ -5356,35 +9800,54 @@ export const orbitActions = {
     notifyToast("Copied to main Composer");
   },
 
-  async submitSideQuestion(rawQuestion?: string): Promise<void> {
-    const hostId = state.selectedHostId;
+  async submitSideQuestion(
+    rawQuestion?: string,
+    targetOverride?: {
+      hostId: string;
+      scopeKey?: string;
+      isDraftNewSession: boolean;
+      agentId: string | null;
+      workspaceCwd: string;
+      draftProvider?: ProviderKind;
+      draftAcpAgentId?: string | null;
+      draftModels?: Partial<Record<ProviderKind, string | null>>;
+    },
+  ): Promise<void> {
+    const hostId = targetOverride?.hostId ?? state.selectedHostId;
     if (!hostId) {
       notifyToast("Connect an Orbit host first");
       return;
     }
 
-    const scope = sideQuestionScopeKey(state);
+    const isDraft = targetOverride ? targetOverride.isDraftNewSession : state.isDraftNewSession;
+    const targetAgentId = targetOverride ? targetOverride.agentId : state.selectedAgentId;
+    const scope =
+      targetOverride?.scopeKey ??
+      (isDraft || !targetAgentId ? `draft::${hostId}` : `${hostId}::${targetAgentId}`);
     const question = (rawQuestion ?? state.sideQuestionDrafts[scope] ?? "").trim();
     if (!question) return;
 
     const detail = state.hostDetails[hostId];
     const currentAgent =
-      !state.isDraftNewSession && state.selectedAgentId
-        ? detail?.agents.find((a) => a.agent_id === state.selectedAgentId) ??
-          state.stages[`${hostId}::${state.selectedAgentId}`]?.agent ??
+      !isDraft && targetAgentId
+        ? detail?.agents.find((a) => a.agent_id === targetAgentId) ??
+          state.stages[`${hostId}::${targetAgentId}`]?.agent ??
           null
         : null;
 
-    const provider = currentAgent?.provider ?? state.draftProvider;
-    const model = currentAgent?.model ?? state.draftModels[provider] ?? null;
-    const cwd = currentAgent?.cwd || state.selectedWorkspaceCwd || "~";
+    const provider = currentAgent?.provider ?? targetOverride?.draftProvider ?? state.draftProvider;
+    const draftModels = targetOverride?.draftModels ?? state.draftModels;
+    const draftAcpAgentId =
+      targetOverride?.draftAcpAgentId !== undefined
+        ? targetOverride.draftAcpAgentId
+        : state.draftAcpAgentId;
+    const model = currentAgent?.model ?? draftModels[provider] ?? null;
+    const cwd = currentAgent?.cwd || targetOverride?.workspaceCwd || state.selectedWorkspaceCwd || "~";
     const providerLabel =
       currentAgent?.provider_label ??
-      (provider === "claude_code"
-        ? "Claude Code"
-        : provider === "antigravity"
-          ? "Antigravity"
-          : "Codex");
+      (provider === "acp"
+        ? (draftAcpAgentId ?? formatProviderLabel("acp"))
+        : formatProviderLabel(provider));
 
     const gitReview = state.gitReviews[`${hostId}::${cwd}`] ?? null;
     const branchName =
@@ -5392,9 +9855,9 @@ export const orbitActions = {
       detail?.workspaces.find((w) => w.cwd === cwd)?.git_branch ??
       null;
     const rustContext =
-      !state.isDraftNewSession && state.selectedAgentId
+      !isDraft && targetAgentId
         ? await orbitIpc
-            .buildSideQuestionContext(hostId, state.selectedAgentId, 3000)
+            .buildSideQuestionContext(hostId, targetAgentId, 3000)
             .catch(() => "")
         : "";
     const priorSideTurns = (state.sideQuestionsByScope[scope] ?? [])
@@ -5425,7 +9888,13 @@ export const orbitActions = {
       providerLabel,
     };
 
-    orbitActions.openSideQuestionTab();
+    const stillViewingTarget =
+      state.selectedHostId === hostId &&
+      (state.isDraftNewSession || !state.selectedAgentId) === (isDraft || !targetAgentId) &&
+      (isDraft || !targetAgentId || state.selectedAgentId === targetAgentId);
+    if (!targetOverride || stillViewingTarget) {
+      orbitActions.openSideQuestionTab();
+    }
     setState((s) => ({
       ...s,
       sideQuestionDrafts: { ...s.sideQuestionDrafts, [scope]: "" },
@@ -5434,6 +9903,7 @@ export const orbitActions = {
         [scope]: [...(s.sideQuestionsByScope[scope] ?? []), newEntry],
       },
     }));
+    draftPersistence.flushNow();
 
     let accumText = "";
     let parseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -5557,43 +10027,25 @@ export const orbitActions = {
     const effectiveProviderSubagentId =
       params.providerSubagentId ?? (!hasManagedChild ? params.childAgentId : null);
     const tabHostId = hasManagedChild ? targetHostId : parentHostId;
-    // Reuse a single dedicated subagent inspector tab so clicking subagents never spams the tab bar
-    const tabId = "tab:subagent:inspector";
     setState((s) => {
-      const existingIdx = s.sidePanelTabs.findIndex(
-        (t) => t.id === tabId || t.kind === "subagent",
-      );
-      let nextTabs = s.sidePanelTabs;
-      const tabObj: SidePanelTab = {
-        id: tabId,
-        kind: "subagent",
-        title: params.role || "Subagent",
-        hostId: tabHostId ?? undefined,
-        subagentCallId: params.callId,
-        subagentRole: params.role,
-        subagentPrompt: params.promptPreview,
-        childAgentId: effectiveChildAgentId,
-        providerSubagentId: effectiveProviderSubagentId ?? null,
-        parentAgentId: parentAgentId ?? null,
-      };
-      if (existingIdx >= 0) {
-        nextTabs = s.sidePanelTabs.filter((t, i) => i === existingIdx || t.kind !== "subagent");
-        const targetIdx = nextTabs.findIndex((t) => t.kind === "subagent");
-        if (targetIdx >= 0) {
-          nextTabs[targetIdx] = tabObj;
-        } else {
-          nextTabs.push(tabObj);
-        }
-      } else {
-        nextTabs = [...s.sidePanelTabs, tabObj];
-      }
+      const { tabs: nextTabs, activeTabId } = upsertSubagentSidePanelTab(s.sidePanelTabs, {
+        callId: params.callId,
+        role: params.role,
+        promptPreview: params.promptPreview,
+        tabHostId,
+        parentHostId,
+        parentAgentId,
+        effectiveChildAgentId,
+        effectiveProviderSubagentId,
+      });
       const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
       return {
         ...s,
         sidePanelOpen: true,
         overviewPopoverOpen: false,
         sidePanelTabs: nextTabs,
-        activeSidePanelTabId: tabId,
+        activeSidePanelTabId: activeTabId,
+        terminalFocused: false,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
       };
@@ -5603,12 +10055,20 @@ export const orbitActions = {
       void orbitIpc.openAgentTimeline(tabHostId, effectiveChildAgentId);
       void orbitActions.pullStageDelta(tabHostId, effectiveChildAgentId, false);
     } else if (parentHostId && parentAgentId && effectiveProviderSubagentId) {
-      void orbitIpc.openProviderSubagentTimeline(
+      void orbitActions.openProviderSubagentTimeline(
         parentHostId,
         parentAgentId,
         effectiveProviderSubagentId,
       );
     }
+  },
+
+  openProviderSubagentTimeline(
+    hostId: string,
+    parentAgentId: string,
+    subagentId: string,
+  ): Promise<void> {
+    return orbitIpc.openProviderSubagentTimeline(hostId, parentAgentId, subagentId);
   },
 
   setStageCanDockOverview(canDock: boolean): void {
@@ -5677,7 +10137,7 @@ export const orbitActions = {
       void orbitActions.refreshGit(
         state.selectedHostId,
         state.selectedWorkspaceCwd,
-        state.selectedDiffPath,
+        null,
         staged,
       );
     }
@@ -5732,13 +10192,28 @@ export const orbitActions = {
   async loadGitReviewSnapshot(hostId: string, cwd: string, path: string | null): Promise<void> {
     const gr = await orbitIpc.getGitReview(hostId, cwd, path);
     const rKey = `${hostId}::${cwd}`;
-    setState((s) => ({
-      ...s,
-      gitReviews: {
+    const normIncomingCwd = normalizeCwdForCompare(cwd);
+    setState((s) => {
+      const mergedPrimary = mergeGitReviewSnapshot(s.gitReviews[rKey], gr);
+      const nextGitReviews: Record<string, GitReviewView> = {
         ...s.gitReviews,
-        [rKey]: gr,
-      },
-    }));
+        [rKey]: mergedPrimary,
+      };
+      // Keep selectedWorkspaceCwd cache synchronized even if trailing slashes differ
+      if (
+        s.selectedHostId === hostId &&
+        s.selectedWorkspaceCwd &&
+        s.selectedWorkspaceCwd !== cwd &&
+        normalizeCwdForCompare(s.selectedWorkspaceCwd) === normIncomingCwd
+      ) {
+        const selectedKey = `${hostId}::${s.selectedWorkspaceCwd}`;
+        nextGitReviews[selectedKey] = mergeGitReviewSnapshot(s.gitReviews[selectedKey], gr);
+      }
+      return {
+        ...s,
+        gitReviews: nextGitReviews,
+      };
+    });
   },
 
   setTerminalFocused(focused: boolean): void {
@@ -5793,10 +10268,21 @@ export const orbitActions = {
         s.activeTerminalTabKey === tabKey
           ? (remaining.find((t) => t.hostId === s.selectedHostId)?.key ?? remaining[0]?.key ?? null)
           : s.activeTerminalTabKey;
+      const nextTerminalFocused =
+        s.terminalFocused &&
+        s.activeTerminalTabKey !== tabKey &&
+        hasVisibleActiveTerminal({
+          sidePanelOpen: s.sidePanelOpen,
+          sidePanelTabs: s.sidePanelTabs,
+          activeSidePanelTabId: s.activeSidePanelTabId,
+          terminalTabs: remaining,
+          activeTerminalTabKey: nextActive,
+        });
       return {
         ...s,
         terminalTabs: remaining,
         activeTerminalTabKey: nextActive,
+        terminalFocused: nextTerminalFocused,
       };
     });
   },
@@ -5871,8 +10357,23 @@ export const orbitActions = {
     }));
   },
 
+  openProjectInstructions(target?: InstructionsTarget | null): void {
+    setState((s) => ({
+      ...s,
+      activeView: "settings",
+      settingsSection: "instructions",
+      instructionsTarget: target ?? null,
+      commandPaletteOpen: false,
+      overviewPopoverOpen: false,
+    }));
+  },
+
+  setInstructionsTarget(target: InstructionsTarget | null): void {
+    setState((s) => ({ ...s, instructionsTarget: target }));
+  },
+
   closeSettings(): void {
-    setState((s) => ({ ...s, activeView: "workspace" }));
+    setState((s) => ({ ...s, activeView: "workspace", instructionsTarget: null }));
   },
 
   toggleSettings(section?: SettingsSectionTarget): void {
@@ -5886,6 +10387,175 @@ export const orbitActions = {
 
   setSettingsSection(section: SettingsSection): void {
     setState((s) => ({ ...s, settingsSection: section }));
+  },
+
+  async refreshExternalMcpServers(
+    hostId: string,
+    cwd?: string | null,
+  ): Promise<ExternalMcpServerRecord[]> {
+    const seq = (externalMcpSnapshotSeqByHost[hostId] ?? 0) + 1;
+    externalMcpSnapshotSeqByHost[hostId] = seq;
+    const servers = await orbitIpc.listExternalMcpServers(hostId, cwd);
+    if (externalMcpSnapshotSeqByHost[hostId] === seq) {
+      setState((s) => ({
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [hostId]: servers,
+        },
+      }));
+    }
+    return servers;
+  },
+
+  async upsertExternalMcpServer(
+    request: UpsertExternalMcpServerRequest,
+  ): Promise<ExternalMcpServerRecord[]> {
+    const seq = (externalMcpSnapshotSeqByHost[request.host_id] ?? 0) + 1;
+    externalMcpSnapshotSeqByHost[request.host_id] = seq;
+    const servers = await orbitIpc.upsertExternalMcpServer(request);
+    if (externalMcpSnapshotSeqByHost[request.host_id] === seq) {
+      setState((s) => ({
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [request.host_id]: servers,
+        },
+      }));
+    }
+    return servers;
+  },
+
+  async toggleExternalMcpServer(
+    hostId: string,
+    serverId: string,
+    enabled: boolean,
+    cwd?: string | null,
+  ): Promise<ExternalMcpServerRecord[]> {
+    const seq = (externalMcpSnapshotSeqByHost[hostId] ?? 0) + 1;
+    externalMcpSnapshotSeqByHost[hostId] = seq;
+    const servers = await orbitIpc.toggleExternalMcpServer(hostId, serverId, enabled, cwd);
+    if (externalMcpSnapshotSeqByHost[hostId] === seq) {
+      setState((s) => ({
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [hostId]: servers,
+        },
+      }));
+    }
+    return servers;
+  },
+
+  async deleteExternalMcpServer(
+    hostId: string,
+    serverId: string,
+    cwd?: string | null,
+  ): Promise<ExternalMcpServerRecord[]> {
+    const seq = (externalMcpSnapshotSeqByHost[hostId] ?? 0) + 1;
+    externalMcpSnapshotSeqByHost[hostId] = seq;
+    const servers = await orbitIpc.deleteExternalMcpServer(hostId, serverId, cwd);
+    if (externalMcpSnapshotSeqByHost[hostId] === seq) {
+      setState((s) => ({
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [hostId]: servers,
+        },
+      }));
+    }
+    return servers;
+  },
+
+  async probeExternalMcpServer(
+    hostId: string,
+    serverId: string,
+    cwd?: string | null,
+  ): Promise<McpProbeResult> {
+    const result = await orbitIpc.probeExternalMcpServer(hostId, serverId, cwd);
+    setState((s) => {
+      const existing = s.externalMcpServersByHost[hostId];
+      if (!existing) return s;
+      return {
+        ...s,
+        externalMcpServersByHost: {
+          ...s.externalMcpServersByHost,
+          [hostId]: existing.map((srv) =>
+            srv.id === serverId ? { ...srv, last_probe: result } : srv,
+          ),
+        },
+      };
+    });
+    return result;
+  },
+
+  async refreshPathRules(hostId: string, cwd: string): Promise<PathRulesSnapshotView | null> {
+    if (!hostId || !cwd) return null;
+    const scopeKey = `${hostId}::${cwd}`;
+    const reqSeq = (pathRulesReqSeqByScope.get(scopeKey) ?? 0) + 1;
+    pathRulesReqSeqByScope.set(scopeKey, reqSeq);
+    try {
+      const snap = await orbitIpc.listPathRules(hostId, cwd);
+      if (pathRulesReqSeqByScope.get(scopeKey) === reqSeq) {
+        setState((s) => ({
+          ...s,
+          pathRulesByScope: {
+            ...s.pathRulesByScope,
+            [scopeKey]: snap,
+          },
+        }));
+      }
+      return snap;
+    } catch {
+      return null;
+    }
+  },
+
+  async upsertPathRule(params: UpsertPathRuleParams): Promise<PathRulesSnapshotView> {
+    const scopeKey = `${params.hostId}::${params.cwd}`;
+    const reqSeq = (pathRulesReqSeqByScope.get(scopeKey) ?? 0) + 1;
+    pathRulesReqSeqByScope.set(scopeKey, reqSeq);
+    const snap = await orbitIpc.upsertPathRule(params);
+    if (pathRulesReqSeqByScope.get(scopeKey) === reqSeq) {
+      setState((s) => ({
+        ...s,
+        pathRulesByScope: {
+          ...s.pathRulesByScope,
+          [scopeKey]: snap,
+        },
+      }));
+    }
+    return snap;
+  },
+
+  async deletePathRule(params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+  }): Promise<PathRulesSnapshotView> {
+    const scopeKey = `${params.hostId}::${params.cwd}`;
+    const reqSeq = (pathRulesReqSeqByScope.get(scopeKey) ?? 0) + 1;
+    pathRulesReqSeqByScope.set(scopeKey, reqSeq);
+    const snap = await orbitIpc.deletePathRule(params);
+    if (pathRulesReqSeqByScope.get(scopeKey) === reqSeq) {
+      setState((s) => ({
+        ...s,
+        pathRulesByScope: {
+          ...s.pathRulesByScope,
+          [scopeKey]: snap,
+        },
+      }));
+    }
+    return snap;
+  },
+
+  async matchPathRules(params: {
+    hostId: string;
+    cwd: string;
+    activePaths: string[];
+    manualRuleNames: string[];
+  }): Promise<MatchedPathRulesView> {
+    return orbitIpc.matchPathRules(params);
   },
 
   setCommandPaletteOpen(open: boolean): void {
@@ -5929,12 +10599,30 @@ export const orbitActions = {
   setNotificationPrefs(patch: {
     notifyOnApproval?: boolean;
     notifyOnTurnComplete?: boolean;
+    notifyOnAgentError?: boolean;
+    notifyOnGoalFinished?: boolean;
+    notifySoundEnabled?: boolean;
+    notifyQuietHoursEnabled?: boolean;
+    notifyQuietStartHour?: number;
+    notifyQuietEndHour?: number;
   }): void {
     setState(
       (s) => ({
         ...s,
         notifyOnApproval: patch.notifyOnApproval ?? s.notifyOnApproval,
         notifyOnTurnComplete: patch.notifyOnTurnComplete ?? s.notifyOnTurnComplete,
+        notifyOnAgentError: patch.notifyOnAgentError ?? s.notifyOnAgentError,
+        notifyOnGoalFinished: patch.notifyOnGoalFinished ?? s.notifyOnGoalFinished,
+        notifySoundEnabled: patch.notifySoundEnabled ?? s.notifySoundEnabled,
+        notifyQuietHoursEnabled: patch.notifyQuietHoursEnabled ?? s.notifyQuietHoursEnabled,
+        notifyQuietStartHour:
+          patch.notifyQuietStartHour !== undefined
+            ? Math.min(23, Math.max(0, Math.round(patch.notifyQuietStartHour)))
+            : s.notifyQuietStartHour,
+        notifyQuietEndHour:
+          patch.notifyQuietEndHour !== undefined
+            ? Math.min(23, Math.max(0, Math.round(patch.notifyQuietEndHour)))
+            : s.notifyQuietEndHour,
       }),
       true,
     );
@@ -6147,6 +10835,62 @@ export const orbitActions = {
     notifyToast(`已归档 ${targets.length} 个已完成子代理`);
   },
 
+  openArtifactsTab(opts?: {
+    hostId?: string;
+    workspaceId?: string;
+    artifactId?: string;
+  }): void {
+    const resolvedHostId = opts?.hostId || state.selectedHostId || "";
+    const detail = resolvedHostId ? state.hostDetails[resolvedHostId] : null;
+    const activeAgent =
+      !state.isDraftNewSession && state.selectedAgentId
+        ? detail?.agents.find((a) => a.agent_id === state.selectedAgentId) ?? null
+        : null;
+    const resolvedWorkspaceId = opts?.workspaceId ?? activeAgent?.workspace_id ?? "";
+    const tabId = "tab:artifacts";
+    const nonce = Date.now();
+
+    setState((s) => {
+      const exists = s.sidePanelTabs.some((t) => t.id === tabId);
+      const nextTab: SidePanelTab = {
+        id: tabId,
+        kind: "artifacts",
+        title: "Artifacts",
+        hostId: resolvedHostId || undefined,
+        workspaceId: resolvedWorkspaceId || undefined,
+        artifactId: opts?.artifactId,
+        focusNonce: nonce,
+      };
+      const nextTabs = exists
+        ? s.sidePanelTabs.map((t) =>
+            t.id === tabId
+              ? {
+                  ...t,
+                  hostId: resolvedHostId || t.hostId,
+                  workspaceId: resolvedWorkspaceId || t.workspaceId,
+                  artifactId: opts?.artifactId ?? t.artifactId,
+                  focusNonce: nonce,
+                }
+              : t,
+          )
+        : [...s.sidePanelTabs, nextTab];
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: tabId,
+        terminalFocused: false,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+    if (resolvedHostId) {
+      void orbitIpc.listArtifacts(resolvedHostId, null, null).catch(() => {});
+    }
+  },
+
   openWorkspaceBoardTab(hostId: string, workspaceId: string, title?: string): void {
     const tabId = `tab:board:${hostId}::${workspaceId}`;
     const resolvedTitle = title ? `Board · ${title}` : "Workspace Board";
@@ -6171,6 +10915,7 @@ export const orbitActions = {
         overviewPopoverOpen: false,
         sidePanelTabs: nextTabs,
         activeSidePanelTabId: tabId,
+        terminalFocused: false,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
       };
@@ -6207,6 +10952,7 @@ export const orbitActions = {
         overviewPopoverOpen: false,
         sidePanelTabs: nextTabs,
         activeSidePanelTabId: tabId,
+        terminalFocused: false,
         sidebarOpen: shouldYield ? false : s.sidebarOpen,
         sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
       };
@@ -6411,6 +11157,30 @@ export const orbitActions = {
             typeof prefs.notifyOnTurnComplete === "boolean"
               ? prefs.notifyOnTurnComplete
               : s.notifyOnTurnComplete,
+          notifyOnAgentError:
+            typeof prefs.notifyOnAgentError === "boolean"
+              ? prefs.notifyOnAgentError
+              : s.notifyOnAgentError,
+          notifyOnGoalFinished:
+            typeof prefs.notifyOnGoalFinished === "boolean"
+              ? prefs.notifyOnGoalFinished
+              : s.notifyOnGoalFinished,
+          notifySoundEnabled:
+            typeof prefs.notifySoundEnabled === "boolean"
+              ? prefs.notifySoundEnabled
+              : s.notifySoundEnabled,
+          notifyQuietHoursEnabled:
+            typeof prefs.notifyQuietHoursEnabled === "boolean"
+              ? prefs.notifyQuietHoursEnabled
+              : s.notifyQuietHoursEnabled,
+          notifyQuietStartHour:
+            typeof prefs.notifyQuietStartHour === "number"
+              ? Math.min(23, Math.max(0, Math.round(prefs.notifyQuietStartHour)))
+              : s.notifyQuietStartHour,
+          notifyQuietEndHour:
+            typeof prefs.notifyQuietEndHour === "number"
+              ? Math.min(23, Math.max(0, Math.round(prefs.notifyQuietEndHour)))
+              : s.notifyQuietEndHour,
           coalesceExploration:
             typeof prefs.coalesceExploration === "boolean"
               ? prefs.coalesceExploration
@@ -6425,6 +11195,7 @@ export const orbitActions = {
               : s.draftUseWorktree,
           draftMode:
             prefs.draftMode === "default" ||
+            prefs.draftMode === "auto" ||
             prefs.draftMode === "plan" ||
             prefs.draftMode === "accept_edits" ||
             prefs.draftMode === "full_access"
@@ -6566,6 +11337,12 @@ export const orbitActions = {
         enterToSend: state.enterToSend,
         notifyOnApproval: state.notifyOnApproval,
         notifyOnTurnComplete: state.notifyOnTurnComplete,
+        notifyOnAgentError: state.notifyOnAgentError,
+        notifyOnGoalFinished: state.notifyOnGoalFinished,
+        notifySoundEnabled: state.notifySoundEnabled,
+        notifyQuietHoursEnabled: state.notifyQuietHoursEnabled,
+        notifyQuietStartHour: state.notifyQuietStartHour,
+        notifyQuietEndHour: state.notifyQuietEndHour,
         coalesceExploration: state.coalesceExploration,
         worktreeBranchPrefix: state.worktreeBranchPrefix,
         draftUseWorktree: state.draftUseWorktree,
@@ -6697,10 +11474,40 @@ async function pushCloudPrefPatch(patch: Record<string, unknown>): Promise<void>
 }
 
 let nextFileFocusNonce = 1;
+const MAX_LSP_DIAGNOSTICS_CACHE_ENTRIES = 40;
+const MAX_LSP_SERVERS_CACHE_ENTRIES = 16;
+const MAX_LIFECYCLE_HOOKS_CACHE_ENTRIES = 16;
+let nextLspGotoSeq = 0;
+const lspDiagSeqByKey = new Map<string, number>();
+const lspServersSeqByKey = new Map<string, number>();
+const browserReqSeqByHost = new Map<string, number>();
+const lifecycleHooksSeqByKey = new Map<string, number>();
+const eventTriggersSeqByHost = new Map<string, number>();
+const guardianReqSeqByHost = new Map<string, number>();
+const imChannelsReqSeqByHost = new Map<string, number>();
+
+function upsertLruRecord<T>(
+  record: Record<string, T>,
+  key: string,
+  value: T,
+  maxEntries: number,
+): Record<string, T> {
+  const next: Record<string, T> = {};
+  const entries = Object.entries(record).filter(([k]) => k !== key);
+  const start = Math.max(0, entries.length - (maxEntries - 1));
+  for (let i = start; i < entries.length; i += 1) {
+    next[entries[i][0]] = entries[i][1];
+  }
+  next[key] = value;
+  return next;
+}
 
 registerOrbitLinkOpener({
   openFile(rawPath, opts) {
     orbitActions.openFileInSidePanel(rawPath, opts);
+  },
+  prefetchFile(rawPath, opts) {
+    orbitActions.prefetchWorkspaceFile(rawPath, opts);
   },
   openBrowser(url) {
     orbitActions.openBrowserTab(url);
@@ -6735,6 +11542,10 @@ if (hmrData?.wasInitialized) {
 
 if (viteHot) {
   viteHot.dispose((data) => {
+    draftPersistence.flushNow();
+    data.draftUpdatedAtByScope = draftPersistence.exportUpdatedAtByScope();
+    draftPersistence.dispose();
+
     disposed = true;
     data.state = state;
     data.terminalChannels = terminalChannels;
@@ -6747,6 +11558,10 @@ if (viteHot) {
     }
     if (typeof window !== "undefined") {
       window.removeEventListener("beforeunload", beforeUnloadListener);
+      window.removeEventListener("focus", handleAppFocusGitRefresh);
+    }
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", handleVisibilityGitRefresh);
     }
     if (savePrefsTimer !== null) {
       clearTimeout(savePrefsTimer);
@@ -6760,6 +11575,13 @@ if (viteHot) {
       window.clearTimeout(gitChangedDebounceTimer);
       gitChangedDebounceTimer = null;
     }
+    for (const gate of autoGitRefreshGates.values()) {
+      if (typeof window !== "undefined") {
+        if (gate.timerId !== null) window.clearTimeout(gate.timerId);
+        if (gate.trailingTimerId !== null) window.clearTimeout(gate.trailingTimerId);
+      }
+    }
+    autoGitRefreshGates.clear();
     for (const entry of pendingSeenTimers.values()) {
       if (typeof window !== "undefined") {
         window.clearTimeout(entry.timerId);
@@ -6797,6 +11619,17 @@ function subscribeComposerDraft(onDraftChange: () => void): () => void {
   };
 }
 
+function subscribeDraftPresence(onPresenceChange: () => void): () => void {
+  draftPresenceListeners.add(onPresenceChange);
+  return () => {
+    draftPresenceListeners.delete(onPresenceChange);
+  };
+}
+
+function noopSubscribe(): () => void {
+  return () => {};
+}
+
 export function useOrbitSelector<T>(selector: (s: OrbitUiState) => T): T {
   return useSyncExternalStore(subscribeStore, () => selector(state));
 }
@@ -6809,5 +11642,17 @@ export function useComposerDraft(scopeKey: string): string {
   return useSyncExternalStore(
     subscribeComposerDraft,
     () => state.composerDrafts[scopeKey] ?? "",
+  );
+}
+
+/**
+ * Ultra-lightweight boolean subscription for sidebar thread rows:
+ * Fires ONLY when a scope transitions between empty and non-empty unsent draft (never per-keystroke),
+ * and skips subscription completely while a row is `selected` (`enabled = false`).
+ */
+export function useHasThreadDraft(scopeKey: string, enabled = true): boolean {
+  return useSyncExternalStore(
+    enabled ? subscribeDraftPresence : noopSubscribe,
+    () => (enabled ? hasNonEmptyScopeDraft(state, scopeKey) : false),
   );
 }

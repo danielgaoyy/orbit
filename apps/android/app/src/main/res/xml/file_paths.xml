@@ -3,4 +3,7 @@
     <cache-path
         name="orbit_camera"
         path="orbit_camera/" />
+    <cache-path
+        name="orbit_exports"
+        path="orbit_exports/" />
 </paths>

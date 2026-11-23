@@ -23,6 +23,7 @@ import {
   Target,
   Users,
 } from "lucide-react";
+import { useImeCompositionGuard } from "@/lib/ime";
 import {
   type RichBlockView,
   type WorkspaceEventRecord,
@@ -328,6 +329,8 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   const [editingGoal, setEditingGoal] = useState(false);
   const [titleDraft, setTitleDraft] = useState(workspace?.title ?? "");
   const [editingTitle, setEditingTitle] = useState(false);
+  const titleIme = useImeCompositionGuard();
+  const goalIme = useImeCompositionGuard();
   const [activityExpanded, setActivityExpanded] = useState(false);
   const [sectionBlocks, setSectionBlocks] = useState<Record<string, RichBlockView[]>>({});
 
@@ -460,7 +463,9 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
               value={titleDraft}
               onChange={(e) => setTitleDraft(e.target.value)}
               onBlur={() => void handleSaveTitle()}
+              {...titleIme.compositionProps}
               onKeyDown={(e) => {
+                if (titleIme.shouldIgnoreKeyDown(e)) return;
                 if (e.key === "Enter") void handleSaveTitle();
                 if (e.key === "Escape") {
                   setTitleDraft(workspace?.title ?? "");
@@ -553,7 +558,9 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                 autoFocus
                 value={goalDraft}
                 onChange={(e) => setGoalDraft(e.target.value)}
+                {...goalIme.compositionProps}
                 onKeyDown={(e) => {
+                  if (goalIme.shouldIgnoreKeyDown(e)) return;
                   if (e.key === "Enter") void handleSaveGoal();
                   if (e.key === "Escape") setEditingGoal(false);
                 }}

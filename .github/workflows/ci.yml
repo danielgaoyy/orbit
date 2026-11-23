@@ -29,6 +29,39 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  windows-rust-and-desktop-check:
+    name: Windows Rust Check, Tests & Tauri Desktop Build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Cargo check & tests on Windows
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          cargo check --workspace --all-targets
+          cargo build -p orbit-cli --bin orbit
+          cargo test --workspace -- --skip live_devbox_ssh_one_click_e2e
+      - name: Build Desktop frontend & check Tauri Windows crate
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          npm --prefix apps/desktop ci
+          npm --prefix apps/desktop run build
+          cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+
   desktop-frontend-build:
     name: Desktop Frontend Typecheck & Build
     runs-on: ubuntu-latest

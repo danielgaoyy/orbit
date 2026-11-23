@@ -49,6 +49,14 @@ impl SlashDirective {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastModeSlashAction {
+    Toggle,
+    Enable,
+    Disable,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientPlatform {
@@ -73,6 +81,22 @@ pub struct SlashCommandView {
 
 pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
     let all = vec![
+        SlashCommandView {
+            id: "fork".into(),
+            command: "/fork".into(),
+            label: "Fork Conversation".into(),
+            description: "Branch chat here, or `/fork worktree` in a new git worktree".into(),
+            shortcut_key: None,
+            icon_key: "fork".into(),
+            keywords: vec![
+                "fork".into(),
+                "branch".into(),
+                "clone".into(),
+                "split".into(),
+                "worktree".into(),
+            ],
+            desktop_only: false,
+        },
         SlashCommandView {
             id: "btw".into(),
             command: "/btw".into(),
@@ -101,6 +125,23 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
                 "design".into(),
                 "architect".into(),
                 "checklist".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
+            id: "goal".into(),
+            command: "/goal".into(),
+            label: "Autonomous Goal Loop".into(),
+            description: "Run unattended verification iterations until criteria or command passes"
+                .into(),
+            shortcut_key: None,
+            icon_key: "goal".into(),
+            keywords: vec![
+                "goal".into(),
+                "autonomous".into(),
+                "unattended".into(),
+                "loop".into(),
+                "verify".into(),
             ],
             desktop_only: false,
         },
@@ -173,6 +214,56 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
                 "summarize".into(),
                 "context".into(),
                 "memory".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
+            id: "export".into(),
+            command: "/export".into(),
+            label: "Export Conversation".into(),
+            description: "Export conversation as Markdown, JSON, or HTML".into(),
+            shortcut_key: None,
+            icon_key: "export".into(),
+            keywords: vec![
+                "export".into(),
+                "save".into(),
+                "download".into(),
+                "markdown".into(),
+                "json".into(),
+                "html".into(),
+                "transcript".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
+            id: "copy".into(),
+            command: "/copy".into(),
+            label: "Copy Code Block".into(),
+            description: "Pick a code block or copy the last assistant reply".into(),
+            shortcut_key: None,
+            icon_key: "copy".into(),
+            keywords: vec![
+                "copy".into(),
+                "code".into(),
+                "snippet".into(),
+                "block".into(),
+                "clipboard".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
+            id: "fast".into(),
+            command: "/fast".into(),
+            label: "Toggle Fast Mode".into(),
+            description: "Toggle Fast output mode".into(),
+            shortcut_key: None,
+            icon_key: "zap".into(),
+            keywords: vec![
+                "fast".into(),
+                "speed".into(),
+                "turbo".into(),
+                "quick".into(),
+                "latency".into(),
             ],
             desktop_only: false,
         },
@@ -390,6 +481,88 @@ pub fn parse_leading_slash_directive(raw_text: &str) -> (Option<SlashDirective>,
     (None, trimmed.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedForkCommand {
+    pub worktree: bool,
+    pub branch: Option<String>,
+    pub initial_prompt: Option<String>,
+}
+
+/// Parse `/fork`, `/fork worktree`, `/fork wt`, `/fork --worktree`, optionally followed by
+/// `--branch <name>` and/or an initial follow-up prompt.
+pub fn parse_leading_fork_command(raw_text: &str) -> Option<ParsedForkCommand> {
+    let trimmed = raw_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "/fork" {
+        return Some(ParsedForkCommand {
+            worktree: false,
+            branch: None,
+            initial_prompt: None,
+        });
+    }
+    if !lower.starts_with("/fork") {
+        return None;
+    }
+    let after = trimmed.get(5..)?;
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+
+    let mut rest = after.trim();
+    let mut worktree = false;
+    let mut branch: Option<String> = None;
+
+    // Consume leading `worktree` / `wt` / `--worktree` token if present
+    let first_tok = rest.split_whitespace().next().unwrap_or("");
+    let first_lower = first_tok.to_ascii_lowercase();
+    if matches!(first_lower.as_str(), "worktree" | "wt" | "--worktree") {
+        worktree = true;
+        rest = rest[first_tok.len()..].trim();
+    }
+
+    // Consume optional `--branch <name>` token
+    if let Some(after_flag) = rest
+        .strip_prefix("--branch")
+        .filter(|s| s.starts_with(char::is_whitespace))
+    {
+        let after_ws = after_flag.trim_start();
+        if let Some(br_tok) = after_ws.split_whitespace().next()
+            && !br_tok.is_empty()
+        {
+            worktree = true;
+            branch = Some(br_tok.to_string());
+            rest = after_ws[br_tok.len()..].trim();
+        }
+    }
+
+    let initial_prompt = (!rest.is_empty()).then(|| rest.to_string());
+    Some(ParsedForkCommand {
+        worktree,
+        branch,
+        initial_prompt,
+    })
+}
+
+pub fn parse_fast_mode_slash_command(raw_text: &str) -> Option<FastModeSlashAction> {
+    let trimmed = raw_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "/fast" {
+        return Some(FastModeSlashAction::Toggle);
+    }
+    if lower.starts_with("/fast")
+        && let Some(after) = trimmed.get(5..)
+        && after.starts_with(char::is_whitespace)
+    {
+        return match after.trim().to_ascii_lowercase().as_str() {
+            "" => Some(FastModeSlashAction::Toggle),
+            "on" | "true" | "enable" | "enabled" | "1" => Some(FastModeSlashAction::Enable),
+            "off" | "false" | "disable" | "disabled" | "0" => Some(FastModeSlashAction::Disable),
+            _ => None,
+        };
+    }
+    None
+}
+
 pub fn parse_leading_btw_question(raw_text: &str) -> Option<String> {
     let trimmed = raw_text.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -474,6 +647,18 @@ pub enum ComposerContextInput {
         path: String,
         filename: String,
     },
+    Pdf {
+        path: String,
+        filename: String,
+    },
+    Audio {
+        path: String,
+        filename: String,
+    },
+    Video {
+        path: String,
+        filename: String,
+    },
     StagedFile {
         path: String,
         filename: String,
@@ -500,6 +685,22 @@ pub enum ComposerContextInput {
         handle: String,
         #[serde(default)]
         summary: String,
+    },
+    CodeSymbol {
+        name: String,
+        #[serde(default)]
+        symbol_kind: String,
+        path: String,
+        start_line: u32,
+        end_line: u32,
+        #[serde(default)]
+        signature: Option<String>,
+        #[serde(default)]
+        container: Option<String>,
+        #[serde(default)]
+        language: String,
+        #[serde(default)]
+        snippet: Option<String>,
     },
 }
 
@@ -547,7 +748,35 @@ pub struct ComposedPromptView {
     pub is_compact: bool,
     pub is_btw: bool,
     pub btw_question: Option<String>,
+    #[serde(default)]
+    pub is_fork: bool,
+    #[serde(default)]
+    pub fork_worktree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode_action: Option<FastModeSlashAction>,
     pub is_empty: bool,
+}
+
+fn inferred_staged_media_kind(filename: &str, path: &str) -> Option<&'static str> {
+    let candidate = if filename.trim().is_empty() {
+        path.trim()
+    } else {
+        filename.trim()
+    };
+    let ext = candidate.rsplit('.').next()?.to_ascii_lowercase();
+    if !candidate.contains('.') {
+        return None;
+    }
+    match ext.as_str() {
+        "pdf" => Some("pdf"),
+        "mp3" | "wav" | "m4a" | "aac" | "ogg" | "flac" | "opus" | "weba" => Some("audio"),
+        "mp4" | "mov" | "m4v" | "webm" | "mkv" => Some("video"),
+        _ => None,
+    }
 }
 
 fn clip_utf8_prefix(raw: &str, max_bytes: usize) -> &str {
@@ -561,12 +790,155 @@ fn clip_utf8_prefix(raw: &str, max_bytes: usize) -> &str {
     &raw[..end]
 }
 
+fn escape_xml_attr(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\r' => out.push_str("&#13;"),
+            '\n' => out.push_str("&#10;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn sanitize_fence_language(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-' | '#'))
+        .take(24)
+        .collect()
+}
+
+fn dynamic_backtick_fence(body: &str) -> String {
+    let mut max_run = 0usize;
+    let mut cur = 0usize;
+    for b in body.bytes() {
+        if b == b'`' {
+            cur += 1;
+            if cur > max_run {
+                max_run = cur;
+            }
+        } else {
+            cur = 0;
+        }
+    }
+    "`".repeat(max_run.max(2) + 1)
+}
+
+fn neutralize_symbol_ref_close_tag(body: &str) -> String {
+    const NEEDLE: &str = "</symbol_ref";
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains(NEEDLE) {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len() + 8);
+    let mut cursor = 0usize;
+    while let Some(rel_pos) = lower[cursor..].find(NEEDLE) {
+        let abs_pos = cursor + rel_pos;
+        out.push_str(&body[cursor..abs_pos]);
+        // Insert a backslash after `<` to prevent premature tag breakout while keeping code readable
+        out.push_str("<\\");
+        out.push_str(&body[abs_pos + 1..abs_pos + NEEDLE.len()]);
+        cursor = abs_pos + NEEDLE.len();
+    }
+    out.push_str(&body[cursor..]);
+    out
+}
+
+fn is_mention_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+}
+
+/// Returns `true` when `token` (e.g. `@run`) appears in `text` on clean token boundaries
+/// (not immediately followed by `[A-Za-z0-9_$]`, `::`, or `:L<digit>`).
+fn contains_mention_token(text: &str, token: &str) -> bool {
+    if token.is_empty() || text.is_empty() {
+        return false;
+    }
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find(token) {
+        let start = search_from + rel;
+        let end = start + token.len();
+        let left_ok = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_mention_ident_char(c));
+        let rest = &text[end..];
+        let right_ok = match rest.chars().next() {
+            None => true,
+            Some(c) if is_mention_ident_char(c) => false,
+            Some(':') => {
+                if rest.starts_with("::") {
+                    false
+                } else if let Some(after_l) = rest.strip_prefix(":L") {
+                    !after_l.chars().next().is_some_and(|d| d.is_ascii_digit())
+                } else {
+                    true
+                }
+            }
+            Some(_) => true,
+        };
+        if left_ok && right_ok {
+            return true;
+        }
+        if let Some(ch) = text[start..].chars().next() {
+            search_from = start + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    false
+}
+
 pub fn compose_prompt(
     req: &ComposePromptRequest,
     fallback_working_diff: Option<&str>,
     fallback_staged_diff: Option<&str>,
 ) -> ComposedPromptView {
     let raw_trimmed = req.raw_text.trim();
+    if req.explicit_directive.is_none()
+        && let Some(fork_cmd) = parse_leading_fork_command(raw_trimmed)
+    {
+        return ComposedPromptView {
+            wire_prompt: String::new(),
+            display_prompt: String::new(),
+            badges: Vec::new(),
+            effective_directive: None,
+            is_compact: false,
+            is_btw: false,
+            btw_question: None,
+            is_fork: true,
+            fork_worktree: fork_cmd.worktree,
+            fork_branch: fork_cmd.branch,
+            fork_prompt: fork_cmd.initial_prompt,
+            fast_mode_action: None,
+            is_empty: false,
+        };
+    }
+    if req.explicit_directive.is_none()
+        && let Some(action) = parse_fast_mode_slash_command(raw_trimmed)
+    {
+        return ComposedPromptView {
+            wire_prompt: String::new(),
+            display_prompt: String::new(),
+            badges: Vec::new(),
+            effective_directive: None,
+            is_compact: false,
+            is_btw: false,
+            btw_question: None,
+            is_fork: false,
+            fork_worktree: false,
+            fork_branch: None,
+            fork_prompt: None,
+            fast_mode_action: Some(action),
+            is_empty: false,
+        };
+    }
     if req.explicit_directive.is_none()
         && let Some(btw_q) = parse_leading_btw_question(raw_trimmed)
     {
@@ -578,6 +950,11 @@ pub fn compose_prompt(
             is_compact: false,
             is_btw: true,
             btw_question: Some(btw_q),
+            is_fork: false,
+            fork_worktree: false,
+            fork_branch: None,
+            fork_prompt: None,
+            fast_mode_action: None,
             is_empty: false,
         };
     }
@@ -603,7 +980,7 @@ pub fn compose_prompt(
                     format!("/compact {clean_user_text}")
                 }
             }
-            ProviderKind::Codex => {
+            _ => {
                 let instr = build_workflow_instruction(SlashDirective::Compact);
                 if clean_user_text.is_empty() {
                     instr.to_string()
@@ -620,6 +997,11 @@ pub fn compose_prompt(
             is_compact: true,
             is_btw: false,
             btw_question: None,
+            is_fork: false,
+            fork_worktree: false,
+            fork_branch: None,
+            fork_prompt: None,
+            fast_mode_action: None,
             is_empty: false,
         };
     }
@@ -650,6 +1032,11 @@ pub fn compose_prompt(
             is_compact: false,
             is_btw: false,
             btw_question: None,
+            is_fork: false,
+            fork_worktree: false,
+            fork_branch: None,
+            fork_prompt: None,
+            fast_mode_action: None,
             is_empty: true,
         };
     }
@@ -664,6 +1051,9 @@ pub fn compose_prompt(
     }
 
     let mut image_paths: Vec<String> = Vec::new();
+    let mut pdf_paths: Vec<String> = Vec::new();
+    let mut audio_paths: Vec<String> = Vec::new();
+    let mut video_paths: Vec<String> = Vec::new();
     let mut staged_file_paths: Vec<String> = Vec::new();
     let mut workspace_file_paths: Vec<String> = Vec::new();
     let mut context_blocks: Vec<String> = Vec::new();
@@ -679,7 +1069,7 @@ pub fn compose_prompt(
                 });
                 image_paths.push(path.clone());
             }
-            ComposerContextInput::StagedFile { path, filename } => {
+            ComposerContextInput::Pdf { path, filename } => {
                 let lbl = if filename.trim().is_empty() {
                     basename_of_path(path)
                 } else {
@@ -687,11 +1077,81 @@ pub fn compose_prompt(
                 };
                 let clean_path = path.trim();
                 badges.push(PromptBadge {
-                    kind: "file".into(),
+                    kind: "pdf".into(),
                     label: lbl,
                     path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
                 });
-                staged_file_paths.push(path.clone());
+                pdf_paths.push(path.clone());
+            }
+            ComposerContextInput::Audio { path, filename } => {
+                let lbl = if filename.trim().is_empty() {
+                    basename_of_path(path)
+                } else {
+                    filename.clone()
+                };
+                let clean_path = path.trim();
+                badges.push(PromptBadge {
+                    kind: "audio".into(),
+                    label: lbl,
+                    path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                });
+                audio_paths.push(path.clone());
+            }
+            ComposerContextInput::Video { path, filename } => {
+                let lbl = if filename.trim().is_empty() {
+                    basename_of_path(path)
+                } else {
+                    filename.clone()
+                };
+                let clean_path = path.trim();
+                badges.push(PromptBadge {
+                    kind: "video".into(),
+                    label: lbl,
+                    path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                });
+                video_paths.push(path.clone());
+            }
+            ComposerContextInput::StagedFile { path, filename } => {
+                let lbl = if filename.trim().is_empty() {
+                    basename_of_path(path)
+                } else {
+                    filename.clone()
+                };
+                let clean_path = path.trim();
+                match inferred_staged_media_kind(&lbl, path) {
+                    Some("pdf") => {
+                        badges.push(PromptBadge {
+                            kind: "pdf".into(),
+                            label: lbl,
+                            path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                        });
+                        pdf_paths.push(path.clone());
+                    }
+                    Some("audio") => {
+                        badges.push(PromptBadge {
+                            kind: "audio".into(),
+                            label: lbl,
+                            path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                        });
+                        audio_paths.push(path.clone());
+                    }
+                    Some("video") => {
+                        badges.push(PromptBadge {
+                            kind: "video".into(),
+                            label: lbl,
+                            path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                        });
+                        video_paths.push(path.clone());
+                    }
+                    _ => {
+                        badges.push(PromptBadge {
+                            kind: "file".into(),
+                            label: lbl,
+                            path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                        });
+                        staged_file_paths.push(path.clone());
+                    }
+                }
             }
             ComposerContextInput::WorkspaceFile { path } => {
                 let base = basename_of_path(path);
@@ -780,6 +1240,80 @@ pub fn compose_prompt(
                     ));
                 }
             }
+            ComposerContextInput::CodeSymbol {
+                name,
+                symbol_kind,
+                path,
+                start_line,
+                end_line,
+                signature,
+                container,
+                language,
+                snippet,
+            } => {
+                let clean_name = name.trim();
+                let clean_path = path.trim();
+                let clean_kind = if symbol_kind.trim().is_empty() {
+                    "symbol"
+                } else {
+                    symbol_kind.trim()
+                };
+                let safe_start = (*start_line).max(1);
+                let safe_end = (*end_line).max(safe_start);
+                let loc = format!("{clean_path}:{safe_start}");
+                let base_token = format!("@{clean_name}");
+                let container_token = container
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|c| format!("@{c}::{clean_name}"));
+                let line_token = format!("@{clean_name}:L{safe_start}");
+                let inline_mentioned = !clean_name.is_empty()
+                    && (contains_mention_token(&clean_user_text, &base_token)
+                        || container_token
+                            .as_deref()
+                            .is_some_and(|t| contains_mention_token(&clean_user_text, t))
+                        || contains_mention_token(&clean_user_text, &line_token));
+                if !clean_name.is_empty() && !inline_mentioned {
+                    badges.push(PromptBadge {
+                        kind: "symbol".into(),
+                        label: base_token,
+                        path: (!clean_path.is_empty()).then_some(loc),
+                    });
+                }
+                let container_attr = container
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|c| format!(" container=\"{}\"", escape_xml_attr(c)))
+                    .unwrap_or_default();
+                let lines_attr = if safe_end > safe_start {
+                    format!("L{safe_start}-L{safe_end}")
+                } else {
+                    format!("L{safe_start}")
+                };
+                let lang_tag = sanitize_fence_language(language);
+                let body = if let Some(code) = snippet.as_deref().filter(|s| !s.trim().is_empty()) {
+                    let clipped = clip_utf8_prefix(code.trim_end(), 8_000);
+                    let safe_body = neutralize_symbol_ref_close_tag(clipped);
+                    let fence = dynamic_backtick_fence(&safe_body);
+                    format!("{fence}{lang_tag}\n{safe_body}\n{fence}")
+                } else if let Some(sig) = signature.as_deref().filter(|s| !s.trim().is_empty()) {
+                    let clipped = clip_utf8_prefix(sig.trim(), 1_000);
+                    let safe_sig = neutralize_symbol_ref_close_tag(clipped);
+                    let fence = dynamic_backtick_fence(&safe_sig);
+                    format!("{fence}{lang_tag}\n{safe_sig}\n{fence}")
+                } else {
+                    let fallback = format!("Symbol `{clean_name}` at `{clean_path}:{lines_attr}`");
+                    neutralize_symbol_ref_close_tag(&fallback)
+                };
+                context_blocks.push(format!(
+                    "<SYMBOL_REF path=\"{}\" lines=\"{lines_attr}\" kind=\"{}\" name=\"{}\"{container_attr}>\n{body}\n</SYMBOL_REF>",
+                    escape_xml_attr(clean_path),
+                    escape_xml_attr(clean_kind),
+                    escape_xml_attr(clean_name),
+                ));
+            }
         }
     }
 
@@ -789,6 +1323,33 @@ pub fn compose_prompt(
             image_paths
                 .iter()
                 .map(|p| format!("Attached image file: `{p}`"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    if !pdf_paths.is_empty() {
+        ordered_blocks.push(
+            pdf_paths
+                .iter()
+                .map(|p| format!("Attached PDF file: `{p}`"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    if !audio_paths.is_empty() {
+        ordered_blocks.push(
+            audio_paths
+                .iter()
+                .map(|p| format!("Attached audio file: `{p}`"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    if !video_paths.is_empty() {
+        ordered_blocks.push(
+            video_paths
+                .iter()
+                .map(|p| format!("Attached video file: `{p}`"))
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
@@ -879,6 +1440,11 @@ pub fn compose_prompt(
         is_compact: false,
         is_btw: false,
         btw_question: None,
+        is_fork: false,
+        fork_worktree: false,
+        fork_branch: None,
+        fork_prompt: None,
+        fast_mode_action: None,
         is_empty: false,
     }
 }
@@ -935,13 +1501,21 @@ pub struct WorkspacePeerMentionInput {
     pub status_label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathRuleMentionInput {
+    pub name: String,
+    pub description: String,
+    pub relative_path: String,
+    pub trigger_label: String,
+}
+
 pub fn rank_mention_candidates(
     query: &str,
     workspace_files: &[String],
     git_files: &[(String, String)],
     limit: usize,
 ) -> Vec<MentionCandidateView> {
-    rank_mention_candidates_with_peers(query, workspace_files, git_files, &[], limit)
+    rank_mention_candidates_with_peers_and_rules(query, workspace_files, git_files, &[], &[], limit)
 }
 
 pub fn rank_mention_candidates_with_peers(
@@ -951,9 +1525,82 @@ pub fn rank_mention_candidates_with_peers(
     workspace_peers: &[WorkspacePeerMentionInput],
     limit: usize,
 ) -> Vec<MentionCandidateView> {
+    rank_mention_candidates_with_peers_and_rules(
+        query,
+        workspace_files,
+        git_files,
+        workspace_peers,
+        &[],
+        limit,
+    )
+}
+
+pub fn rank_mention_candidates_with_peers_and_rules(
+    query: &str,
+    workspace_files: &[String],
+    git_files: &[(String, String)],
+    workspace_peers: &[WorkspacePeerMentionInput],
+    path_rules: &[PathRuleMentionInput],
+    limit: usize,
+) -> Vec<MentionCandidateView> {
     let max_items = if limit == 0 { 40 } else { limit.min(200) };
     let q = query.trim().to_ascii_lowercase();
     let mut out: Vec<MentionCandidateView> = Vec::new();
+
+    if !path_rules.is_empty() {
+        let rule_query = q.strip_prefix("rule:");
+        let mut rule_candidates: Vec<MentionCandidateView> = Vec::new();
+        for rule in path_rules {
+            let name_lower = rule.name.to_ascii_lowercase();
+            let desc_lower = rule.description.to_ascii_lowercase();
+            let full_slug = format!("rule:{name_lower}");
+            let score = if let Some(rq) = rule_query {
+                if rq.is_empty() {
+                    1030
+                } else if name_lower == rq {
+                    1060
+                } else if name_lower.starts_with(rq) {
+                    1045
+                } else if name_lower.contains(rq) || desc_lower.contains(rq) {
+                    1025
+                } else {
+                    -1
+                }
+            } else if q.is_empty() {
+                -1
+            } else if "rule:".starts_with(&q) || full_slug.starts_with(&q) {
+                1015
+            } else if name_lower == q {
+                950
+            } else if name_lower.starts_with(&q) {
+                940
+            } else if full_slug.contains(&q) {
+                930
+            } else {
+                -1
+            };
+            if score >= 0 {
+                let token = format!("@rule:{}", rule.name);
+                let subtitle = if !rule.description.trim().is_empty() {
+                    rule.description.trim().to_string()
+                } else {
+                    format!("{} · {}", rule.trigger_label, rule.relative_path)
+                };
+                rule_candidates.push(MentionCandidateView {
+                    key: format!("rule::{}", rule.relative_path),
+                    kind: "path_rule".into(),
+                    token_label: token.clone(),
+                    title: token,
+                    subtitle,
+                    file_path: rule.relative_path.clone(),
+                    git_status: rule.trigger_label.clone(),
+                    score,
+                });
+            }
+        }
+        rule_candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
+        out.extend(rule_candidates);
+    }
 
     if !workspace_peers.is_empty() {
         let mut peer_candidates: Vec<MentionCandidateView> = Vec::new();
@@ -1360,6 +2007,315 @@ mod tests {
         assert!(
             build_workflow_instruction(SlashDirective::OrbitAdvisor)
                 .contains("command=\"/orbit-advisor\"")
+        );
+    }
+
+    #[test]
+    fn fork_slash_command_parses_same_dir_worktree_branch_and_prompt() {
+        let catalog = slash_commands(ClientPlatform::Desktop);
+        assert!(
+            catalog
+                .iter()
+                .any(|c| c.id == "fork" && c.command == "/fork")
+        );
+        assert!(!filter_slash_commands("fork", ClientPlatform::Ios).is_empty());
+
+        let same_dir = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::ClaudeCode,
+                raw_text: "  /fork  ".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert!(same_dir.is_fork);
+        assert!(!same_dir.fork_worktree);
+        assert!(same_dir.fork_branch.is_none());
+        assert!(same_dir.fork_prompt.is_none());
+        assert!(!same_dir.is_empty);
+
+        let wt = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::Codex,
+                raw_text: "/fork worktree --branch feat/alt Try implementing approach B".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert!(wt.is_fork);
+        assert!(wt.fork_worktree);
+        assert_eq!(wt.fork_branch.as_deref(), Some("feat/alt"));
+        assert_eq!(
+            wt.fork_prompt.as_deref(),
+            Some("Try implementing approach B")
+        );
+
+        let wt_only = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::Antigravity,
+                raw_text: "/fork worktree".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert!(wt_only.is_fork);
+        assert!(wt_only.fork_worktree);
+        assert!(wt_only.fork_branch.is_none());
+        assert!(wt_only.fork_prompt.is_none());
+
+        // Non-fork command prefix does not false-trigger
+        assert!(parse_leading_fork_command("/forking something").is_none());
+    }
+
+    #[test]
+    fn fast_mode_slash_command_parses_and_filters() {
+        let filtered = filter_slash_commands("fast", ClientPlatform::Desktop);
+        assert!(
+            filtered
+                .iter()
+                .any(|c| c.id == "fast" && c.command == "/fast")
+        );
+        assert_eq!(
+            parse_fast_mode_slash_command("/fast"),
+            Some(FastModeSlashAction::Toggle)
+        );
+        assert_eq!(
+            parse_fast_mode_slash_command("  /FAST  on "),
+            Some(FastModeSlashAction::Enable)
+        );
+        assert_eq!(
+            parse_fast_mode_slash_command("/fast off"),
+            Some(FastModeSlashAction::Disable)
+        );
+        assert_eq!(parse_fast_mode_slash_command("/faster"), None);
+        assert_eq!(parse_fast_mode_slash_command("/fast invalid arg"), None);
+
+        let composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::Codex,
+                raw_text: "/fast on".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(composed.fast_mode_action, Some(FastModeSlashAction::Enable));
+        assert!(!composed.is_empty);
+        assert!(composed.wire_prompt.is_empty());
+    }
+
+    #[test]
+    fn compose_prompt_emits_canonical_pdf_audio_video_lines_and_badges() {
+        let composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::ClaudeCode,
+                raw_text: "Summarize these attachments".into(),
+                explicit_directive: None,
+                host_id: Some("h1".into()),
+                cwd: Some("/repo".into()),
+                contexts: vec![
+                    ComposerContextInput::Pdf {
+                        path: "/tmp/att/spec.pdf".into(),
+                        filename: "spec.pdf".into(),
+                    },
+                    ComposerContextInput::Audio {
+                        path: "/tmp/att/note.mp3".into(),
+                        filename: "note.mp3".into(),
+                    },
+                    ComposerContextInput::Video {
+                        path: "/tmp/att/demo.mp4".into(),
+                        filename: "demo.mp4".into(),
+                    },
+                    ComposerContextInput::StagedFile {
+                        path: "/tmp/att/clip.webm".into(),
+                        filename: "clip.webm".into(),
+                    },
+                ],
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+
+        assert!(
+            composed
+                .wire_prompt
+                .contains("Attached PDF file: `/tmp/att/spec.pdf`")
+        );
+        assert!(
+            composed
+                .wire_prompt
+                .contains("Attached audio file: `/tmp/att/note.mp3`")
+        );
+        assert!(
+            composed
+                .wire_prompt
+                .contains("Attached video file: `/tmp/att/demo.mp4`")
+        );
+        assert!(
+            composed
+                .wire_prompt
+                .contains("Attached video file: `/tmp/att/clip.webm`")
+        );
+        assert_eq!(composed.badges.len(), 4);
+        assert_eq!(composed.badges[0].kind, "pdf");
+        assert_eq!(composed.badges[1].kind, "audio");
+        assert_eq!(composed.badges[2].kind, "video");
+        assert_eq!(composed.badges[3].kind, "video");
+    }
+
+    #[test]
+    fn compose_prompt_renders_code_symbol_ref_blocks_and_inline_badge_suppression() {
+        let composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::ClaudeCode,
+                raw_text: "Explain how @search_workspace_symbols ranks hits".into(),
+                explicit_directive: None,
+                host_id: Some("h1".into()),
+                cwd: Some("/repo".into()),
+                contexts: vec![
+                    ComposerContextInput::CodeSymbol {
+                        name: "search_workspace_symbols".into(),
+                        symbol_kind: "fn".into(),
+                        path: "crates/orbit-daemon/src/symbols.rs".into(),
+                        start_line: 42,
+                        end_line: 46,
+                        signature: Some("pub async fn search_workspace_symbols(...)".into()),
+                        container: Some("WorkspaceSymbolIndex".into()),
+                        language: "rust".into(),
+                        snippet: Some(
+                            "42 | pub async fn search_workspace_symbols() {\n43 | }\n".into(),
+                        ),
+                    },
+                    ComposerContextInput::CodeSymbol {
+                        name: "OrbitEngine".into(),
+                        symbol_kind: "struct".into(),
+                        path: "crates/orbit-daemon/src/lib.rs".into(),
+                        start_line: 10,
+                        end_line: 10,
+                        signature: Some("pub struct OrbitEngine".into()),
+                        container: None,
+                        language: "rust".into(),
+                        snippet: None,
+                    },
+                ],
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+
+        assert!(composed.wire_prompt.contains(
+            "<SYMBOL_REF path=\"crates/orbit-daemon/src/symbols.rs\" lines=\"L42-L46\" kind=\"fn\" name=\"search_workspace_symbols\" container=\"WorkspaceSymbolIndex\">"
+        ));
+        assert!(
+            composed
+                .wire_prompt
+                .contains("42 | pub async fn search_workspace_symbols() {")
+        );
+        assert!(composed.wire_prompt.contains(
+            "<SYMBOL_REF path=\"crates/orbit-daemon/src/lib.rs\" lines=\"L10\" kind=\"struct\" name=\"OrbitEngine\">"
+        ));
+        assert!(composed.wire_prompt.contains("pub struct OrbitEngine"));
+        // Inline `@search_workspace_symbols` suppresses duplicate badge; non-inline `OrbitEngine` emits badge
+        assert_eq!(composed.badges.len(), 1);
+        assert_eq!(composed.badges[0].kind, "symbol");
+        assert_eq!(composed.badges[0].label, "@OrbitEngine");
+        assert_eq!(
+            composed.badges[0].path.as_deref(),
+            Some("crates/orbit-daemon/src/lib.rs:10")
+        );
+    }
+
+    #[test]
+    fn compose_prompt_escapes_symbol_xml_attributes_fences_and_token_boundaries() {
+        let long_sig = format!("fn evil<T>(a: &str) -> \"ok\" {}", "x".repeat(1400));
+        let composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::ClaudeCode,
+                raw_text: "Inspect @run_turn without mentioning the shorter symbol".into(),
+                explicit_directive: None,
+                host_id: Some("h1".into()),
+                cwd: Some("/repo".into()),
+                contexts: vec![
+                    ComposerContextInput::CodeSymbol {
+                        name: "run".into(),
+                        symbol_kind: "fn<\"&>".into(),
+                        path: "src/a&b\"<c>\n.rs".into(),
+                        start_line: 0,
+                        end_line: 0,
+                        signature: Some("fn run()".into()),
+                        container: Some("Box<T & \"U\">\r\nInner".into()),
+                        language: "rust\n```</SYMBOL_REF>".into(),
+                        snippet: Some(
+                            "1 | ```\n2 | let x = \"</SYMBOL_REF> and </symbol_ref>\";\n3 | ```"
+                                .into(),
+                        ),
+                    },
+                    ComposerContextInput::CodeSymbol {
+                        name: "sig_only".into(),
+                        symbol_kind: "fn".into(),
+                        path: "src/sig.rs".into(),
+                        start_line: 5,
+                        end_line: 5,
+                        signature: Some(long_sig),
+                        container: None,
+                        language: "c++".into(),
+                        snippet: None,
+                    },
+                ],
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+
+        // XML attributes fully escaped (&, ", <, >, \r, \n)
+        assert!(composed.wire_prompt.contains(
+            "path=\"src/a&amp;b&quot;&lt;c&gt;&#10;.rs\" lines=\"L1\" kind=\"fn&lt;&quot;&amp;&gt;\" name=\"run\" container=\"Box&lt;T &amp; &quot;U&quot;&gt;&#13;&#10;Inner\""
+        ));
+        // Dynamic 4-backtick fence wraps triple-backtick snippet & sanitized language tag
+        assert!(composed.wire_prompt.contains("````rustSYMBOL_REF\n"));
+        assert!(composed.wire_prompt.contains("\n````\n</SYMBOL_REF>"));
+        // Embedded `</SYMBOL_REF>` and `</symbol_ref>` neutralized inside snippet body
+        assert!(!composed.wire_prompt.contains("let x = \"</SYMBOL_REF>"));
+        assert!(composed.wire_prompt.contains("<\\/SYMBOL_REF>"));
+        assert!(composed.wire_prompt.contains("<\\/symbol_ref>"));
+        // Signature fallback clipped to <= 1_000 bytes
+        assert!(composed.wire_prompt.contains("```c++\nfn evil<T>"));
+        assert!(composed.wire_prompt.len() < 2_500);
+        // `@run_turn` must NOT suppress the badge for `@run`
+        assert!(
+            composed
+                .badges
+                .iter()
+                .any(|b| b.kind == "symbol" && b.label == "@run")
         );
     }
 }

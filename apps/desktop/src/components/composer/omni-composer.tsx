@@ -14,6 +14,7 @@ import {
   FileSearch,
   FoldVertical,
   GripVertical,
+  Image as ImageIcon,
   Layers,
   ListTodo,
   Paperclip,
@@ -21,6 +22,7 @@ import {
   Send,
   Sparkles,
   SquareSlash,
+  Target,
   Users,
   X,
 } from "lucide-react";
@@ -28,6 +30,7 @@ import {
   collapseStrippedToken,
   normalizePermissionMode,
 } from "@/components/composer/composer-constants";
+import { ContextOccupancyPill } from "@/components/composer/context-occupancy-pill";
 import { ComposerHeroHeader } from "@/components/composer/composer-hero-header";
 import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
 import { ComposerModelPicker } from "@/components/composer/composer-model-picker";
@@ -42,9 +45,17 @@ import {
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import {
+  mergeMentionCandidates,
+  parseSymbolMentionQuery,
+  resolveDisambiguatedSymbolToken,
+  workspaceSymbolToMentionCandidate,
+} from "@/lib/symbol-mentions";
+import {
   type ClipboardImagePayload,
   type GitFileEntry,
+  type ManagedSkillRecord,
   type MentionCandidateView,
+  type PromptBadge,
   type QueuedPromptView,
   type SessionMode,
   type SlashCommandView,
@@ -54,6 +65,11 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
+  getCachedPromptImage,
+  loadPromptImage,
+  lookupRecentSentTurnImage,
+} from "@/lib/prompt-image-cache";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -61,9 +77,11 @@ import {
   DropdownMenuTrigger,
   SimpleTooltip,
 } from "@/components/ui/overlays";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   type ContextMentionItem,
   type DiffQuoteSnippet,
+  type InlineMentionTarget,
   type PastedAttachment,
   type QueuedPromptItem,
   composerScopeKey,
@@ -82,6 +100,100 @@ const EMPTY_SERVER_QUEUED: readonly QueuedPromptView[] = [];
 const EMPTY_FILES: readonly string[] = [];
 const EMPTY_GIT_FILES: readonly GitFileEntry[] = [];
 const EMPTY_MENTIONS: MentionCandidateView[] = [];
+const EMPTY_MANAGED_SKILLS: readonly ManagedSkillRecord[] = [];
+const MAX_QUEUED_IMAGE_THUMBS = 3;
+
+/**
+ * Compact `20×20` inline image thumbnail for queued follow-up rows.
+ * Sized strictly inside the `28px` queue row so rows with and without images share identical height.
+ */
+const QueuedImageThumb = memo(function QueuedImageThumb({
+  badge,
+  displayText,
+  imageIndex,
+  hostId,
+  agentId,
+  cwd,
+  overflowCount = 0,
+  tooltip,
+}: {
+  badge: PromptBadge;
+  displayText: string;
+  imageIndex: number;
+  hostId: string;
+  agentId: string | null;
+  cwd: string;
+  overflowCount?: number;
+  tooltip: string;
+}) {
+  const recent = useMemo(
+    () =>
+      !badge.path
+        ? lookupRecentSentTurnImage(hostId, agentId, displayText, imageIndex, badge.label)
+        : null,
+    [badge.path, badge.label, displayText, imageIndex, hostId, agentId],
+  );
+  const effectivePath = badge.path?.trim() || recent?.path?.trim() || null;
+
+  const resolveSyncUrl = (): string | null => {
+    if (effectivePath && hostId) {
+      const cached = getCachedPromptImage(hostId, effectivePath);
+      if (cached?.status === "ready") return cached.url;
+    }
+    return recent?.previewUrl ?? null;
+  };
+
+  const [url, setUrl] = useState<string | null>(resolveSyncUrl);
+
+  useEffect(() => {
+    const sync = resolveSyncUrl();
+    if (sync) {
+      setUrl(sync);
+      return;
+    }
+    if (!effectivePath || !hostId) {
+      setUrl(null);
+      return;
+    }
+    let cancelled = false;
+    void loadPromptImage(hostId, cwd || "~", effectivePath).then((entry) => {
+      if (cancelled) return;
+      if (entry.status === "ready") {
+        setUrl(entry.url);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostId, agentId, cwd, effectivePath, badge.label]);
+
+  return (
+    <span
+      title={tooltip}
+      className="bg-muted/70 relative inline-flex size-[20px] shrink-0 items-center justify-center overflow-hidden rounded-[5px] border border-black/[0.08] dark:border-white/[0.11]"
+    >
+      {url ? (
+        <img
+          src={url}
+          alt={badge.label}
+          decoding="async"
+          draggable={false}
+          onError={() => setUrl(null)}
+          className="size-full object-cover"
+        />
+      ) : (
+        <ImageIcon className="text-muted-foreground/70 size-3 stroke-[1.7]" />
+      )}
+      {overflowCount > 0 && (
+        <span className="tabular-nums absolute inset-0 flex items-center justify-center bg-black/55 font-mono text-[9.5px] leading-none font-semibold text-white">
+          +{overflowCount}
+        </span>
+      )}
+    </span>
+  );
+});
+const EMPTY_INLINE_MENTIONS: readonly InlineMentionTarget[] = [];
 
 const IMAGE_URI_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|svg|avif|ico)(?:[?#].*)?$/i;
 
@@ -127,12 +239,57 @@ export const OmniComposer = memo(function OmniComposer({
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const activePathRules = useOrbitSelector((s) =>
+    s.selectedHostId
+      ? s.pathRulesByScope[`${s.selectedHostId}::${s.selectedWorkspaceCwd || "~"}`]
+      : undefined,
+  );
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const draftMode = useOrbitSelector((s) => s.draftMode);
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const promptHistory = useOrbitSelector((s) => s.promptHistory);
   const slashCommands = useOrbitSelector((s) => s.slashCommands);
+  const managedSkills = useOrbitSelector((s) =>
+    s.selectedHostId
+      ? (s.hostDetails[s.selectedHostId]?.managed_skills ?? EMPTY_MANAGED_SKILLS)
+      : EMPTY_MANAGED_SKILLS,
+  );
   const ime = useImeCompositionGuard();
+
+  // Keep host/project managed skills hydrated for slash command discovery
+  useEffect(() => {
+    if (!selectedHostId) return;
+    const scopedCwd = selectedCwd && selectedCwd !== "~" ? selectedCwd : null;
+    void orbitIpc.listManagedSkills(selectedHostId, scopedCwd).catch(() => {});
+  }, [selectedHostId, selectedCwd]);
+
+  const effectiveSlashCommands = useMemo<SlashCommandView[]>(() => {
+    const disabledSlugs = new Set(
+      managedSkills.filter((s) => !s.enabled).map((s) => s.slug.toLowerCase()),
+    );
+    const visibleBuiltins =
+      disabledSlugs.size > 0
+        ? slashCommands.filter((c) => !disabledSlugs.has(c.id.toLowerCase()))
+        : slashCommands;
+    const existingCommands = new Set(visibleBuiltins.map((c) => c.command.toLowerCase()));
+    const skillEntries: SlashCommandView[] = [];
+    for (const skill of managedSkills) {
+      if (!skill.enabled) continue;
+      const cmd = `/${skill.slug}`;
+      if (existingCommands.has(cmd.toLowerCase())) continue;
+      skillEntries.push({
+        id: `skill:${skill.slug}`,
+        command: cmd,
+        label: skill.name,
+        description: skill.description || `Invoke ${skill.name} skill`,
+        shortcut_key: null,
+        icon_key: "skill",
+        keywords: ["skills", "skill", skill.slug, skill.name, ...skill.triggers],
+        desktop_only: false,
+      });
+    }
+    return skillEntries.length > 0 ? [...visibleBuiltins, ...skillEntries] : visibleBuiltins;
+  }, [slashCommands, managedSkills]);
 
   // Primitive/narrow selectors instead of subscribing to full `HostDetailView`
   const hasCurrentAgent = useOrbitSelector((s) =>
@@ -186,6 +343,9 @@ export const OmniComposer = memo(function OmniComposer({
   const contexts = useOrbitSelector(
     (s) => s.contextItems[composerScopeKey(s)] ?? EMPTY_CONTEXTS,
   );
+  const inlineMentions = useOrbitSelector(
+    (s) => s.inlineMentions[composerScopeKey(s)] ?? EMPTY_INLINE_MENTIONS,
+  );
   const pastes = useOrbitSelector(
     (s) => s.pastedAttachments[composerScopeKey(s)] ?? EMPTY_PASTES,
   );
@@ -226,7 +386,7 @@ export const OmniComposer = memo(function OmniComposer({
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const mirrorTextareaRef = useRef<HTMLDivElement | null>(null);
-  const lastTextareaHeightRef = useRef<number>(46);
+  const lastTextareaHeightRef = useRef<number>(38);
   const [composerWidthPx, setComposerWidthPx] = useState(0);
   const [isCompactBar, setIsCompactBar] = useState(false);
   const draftTextRef = useRef<string>(draftText);
@@ -239,6 +399,39 @@ export const OmniComposer = memo(function OmniComposer({
 
   const [cursorOffset, setCursorOffset] = useState<number>(0);
   const [directiveIndentPx, setDirectiveIndentPx] = useState<number>(0);
+  const goalIme = useImeCompositionGuard();
+  const [goalPopoverOpen, setGoalPopoverOpen] = useState(false);
+  const [goalObjective, setGoalObjective] = useState("");
+  const [goalVerifyCommand, setGoalVerifyCommand] = useState("");
+  const [goalMaxIterations, setGoalMaxIterations] = useState("10");
+  const [goalSubmitting, setGoalSubmitting] = useState(false);
+
+  // Close the inline Goal popover whenever the user switches host or active agent
+  useEffect(() => {
+    setGoalPopoverOpen(false);
+  }, [selectedHostId, selectedAgentId]);
+
+  const submitGoalPopover = useCallback(() => {
+    if (!selectedHostId || !selectedAgentId || !goalObjective.trim() || goalSubmitting) return;
+    setGoalSubmitting(true);
+    const parsedIter = Number.parseInt(goalMaxIterations, 10);
+    const clampedIter = Number.isFinite(parsedIter) ? Math.max(1, Math.min(50, parsedIter)) : 10;
+    void orbitActions
+      .startGoalRun({
+        hostId: selectedHostId,
+        agentId: selectedAgentId,
+        objective: goalObjective.trim(),
+        verifyCommand: goalVerifyCommand.trim() || null,
+        maxIterations: clampedIter,
+      })
+      .then((created) => {
+        if (created) {
+          setGoalPopoverOpen(false);
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        }
+      })
+      .finally(() => setGoalSubmitting(false));
+  }, [selectedHostId, selectedAgentId, goalObjective, goalVerifyCommand, goalMaxIterations, goalSubmitting]);
   const [queueDrag, setQueueDrag] = useState<{
     fromIndex: number;
     overIndex: number;
@@ -345,23 +538,29 @@ export const OmniComposer = memo(function OmniComposer({
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [rankedMentions, setRankedMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
+  const [symbolMentions, setSymbolMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
   const mentionReqSeqRef = useRef<number>(0);
+  const symbolReqSeqRef = useRef<number>(0);
 
   const activeMode: SessionMode = normalizePermissionMode(
     !isDraft && activeAgentMode ? activeAgentMode : draftMode,
   );
 
-  // Warm workspace file list lazily so `@` mentions feel instantaneous
+  // Warm workspace file list and path-scoped rules lazily so `@` and `@rule:` mentions feel instantaneous
   useEffect(() => {
-    if (!selectedHostId || !selectedCwd || selectedCwd === "~") return;
+    if (!selectedHostId) return;
+    const effectiveCwd = selectedCwd || "~";
     const timer = window.setTimeout(() => {
-      void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
+      if (selectedCwd && selectedCwd !== "~") {
+        void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
+      }
+      void orbitActions.refreshPathRules(selectedHostId, effectiveCwd);
     }, 180);
     return () => window.clearTimeout(timer);
   }, [selectedHostId, selectedCwd]);
 
-  const minTextareaHeight = 46;
-  const maxTextareaHeight = 220;
+  const minTextareaHeight = 38;
+  const maxTextareaHeight = 212;
 
   useLayoutEffect(() => {
     if (!slashDirective) {
@@ -402,9 +601,9 @@ export const OmniComposer = memo(function OmniComposer({
     if (!el) return;
 
     if (draftText.length === 0 && !slashDirective) {
-      if (lastTextareaHeightRef.current !== minTextareaHeight || el.style.height !== "46px") {
+      if (lastTextareaHeightRef.current !== minTextareaHeight || el.style.height !== "38px") {
         lastTextareaHeightRef.current = minTextareaHeight;
-        el.style.height = "46px";
+        el.style.height = "38px";
       }
       if (el.style.overflowY !== "hidden") {
         el.style.overflowY = "hidden";
@@ -414,11 +613,21 @@ export const OmniComposer = memo(function OmniComposer({
 
     const mirror = mirrorTextareaRef.current;
     if (!mirror) return;
-    const measured = Math.max(mirror.offsetHeight, mirror.scrollHeight);
-    const nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
+    let measured = Math.max(mirror.offsetHeight, mirror.scrollHeight);
+    let nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
     if (lastTextareaHeightRef.current !== nextHeight || el.style.height !== `${nextHeight}px`) {
       lastTextareaHeightRef.current = nextHeight;
       el.style.height = `${nextHeight}px`;
+    }
+    // Guard against subtle WKWebView wrapping differences between the off-flow div mirror and
+    // native textarea (e.g. CJK line breaks) so wrapped lines never clip while overflow-y is hidden.
+    if (measured <= maxTextareaHeight && el.scrollHeight > nextHeight + 1) {
+      measured = el.scrollHeight;
+      nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
+      if (lastTextareaHeightRef.current !== nextHeight || el.style.height !== `${nextHeight}px`) {
+        lastTextareaHeightRef.current = nextHeight;
+        el.style.height = `${nextHeight}px`;
+      }
     }
     const nextOverflow = measured > maxTextareaHeight ? "auto" : "hidden";
     if (el.style.overflowY !== nextOverflow) {
@@ -427,8 +636,27 @@ export const OmniComposer = memo(function OmniComposer({
   }, [draftText, scopeKey, slashDirective, directiveIndentPx, composerWidthPx]);
 
   useEffect(() => {
-    return orbitActions.onComposerFocusRequest(() => {
-      textareaRef.current?.focus();
+    return orbitActions.onComposerFocusRequest((opts) => {
+      const el = textareaRef.current;
+      if (!el) return;
+      const active = document.activeElement;
+      if (
+        opts?.onlyIfIdle &&
+        active instanceof HTMLElement &&
+        active !== el &&
+        (active.tagName === "INPUT" ||
+          active.tagName === "TEXTAREA" ||
+          active.tagName === "SELECT" ||
+          active.isContentEditable)
+      ) {
+        return;
+      }
+      const wasFocused = active === el;
+      el.focus({ preventScroll: true });
+      if (!wasFocused) {
+        const end = el.value.length;
+        el.setSelectionRange(end, end);
+      }
     });
   }, []);
 
@@ -442,10 +670,10 @@ export const OmniComposer = memo(function OmniComposer({
     const query = match[1];
     const tokenKey = `slash:${slashIndex}:${query}`;
     if (dismissedToken === tokenKey) return null;
-    const items = filterSlashCommands(slashCommands, query);
+    const items = filterSlashCommands(effectiveSlashCommands, query);
     if (items.length === 0) return null;
     return { slashIndex, endIndex: safeOffset, query, tokenKey, items };
-  }, [draftText, cursorOffset, dismissedToken, slashCommands]);
+  }, [draftText, cursorOffset, dismissedToken, effectiveSlashCommands]);
 
   const mentionTrigger = useMemo(() => {
     if (slashTrigger || !draftText.includes("@")) return null;
@@ -460,8 +688,13 @@ export const OmniComposer = memo(function OmniComposer({
     return { atIndex, endIndex: safeOffset, query, tokenKey };
   }, [slashTrigger, draftText, cursorOffset, dismissedToken]);
 
+  const parsedSymbolTrigger = useMemo(
+    () => (mentionTrigger ? parseSymbolMentionQuery(mentionTrigger.query) : null),
+    [mentionTrigger],
+  );
+
   useEffect(() => {
-    if (!mentionTrigger || !selectedHostId) {
+    if (!mentionTrigger || !selectedHostId || parsedSymbolTrigger?.symbolOnly) {
       mentionReqSeqRef.current += 1;
       setRankedMentions(EMPTY_MENTIONS);
       return;
@@ -492,14 +725,77 @@ export const OmniComposer = memo(function OmniComposer({
       });
   }, [
     mentionTrigger,
+    parsedSymbolTrigger,
     selectedHostId,
     selectedCwd,
     workspaceFiles,
     gitFiles,
+    activePathRules,
     activeWorkspaceId,
     isDraft,
     selectedAgentId,
   ]);
+
+  // Immediately clear any cached symbol results when switching hosts, workspaces, or threads
+  useEffect(() => {
+    symbolReqSeqRef.current += 1;
+    setSymbolMentions(EMPTY_MENTIONS);
+  }, [selectedHostId, selectedCwd, scopeKey]);
+
+  // Debounced (`120ms`) workspace symbol fuzzy search with stale-response & unmount cancellation guard
+  useEffect(() => {
+    if (
+      !mentionTrigger ||
+      !parsedSymbolTrigger ||
+      !selectedHostId ||
+      !selectedCwd ||
+      selectedCwd === "~" ||
+      (!parsedSymbolTrigger.symbolOnly && parsedSymbolTrigger.query.length === 0)
+    ) {
+      symbolReqSeqRef.current += 1;
+      setSymbolMentions(EMPTY_MENTIONS);
+      return;
+    }
+
+    const reqId = symbolReqSeqRef.current + 1;
+    symbolReqSeqRef.current = reqId;
+    const hostId = selectedHostId;
+    const cwd = selectedCwd;
+    const query = parsedSymbolTrigger.query;
+    const limit = parsedSymbolTrigger.symbolOnly ? 20 : 8;
+
+    const timer = window.setTimeout(() => {
+      void orbitIpc
+        .searchWorkspaceSymbols(hostId, cwd, query, limit)
+        .then((res) => {
+          if (symbolReqSeqRef.current !== reqId) return;
+          const mapped = (res.symbols ?? []).map((entry, idx) =>
+            workspaceSymbolToMentionCandidate(entry, idx),
+          );
+          setSymbolMentions(mapped);
+        })
+        .catch(() => {
+          if (symbolReqSeqRef.current === reqId) {
+            setSymbolMentions(EMPTY_MENTIONS);
+          }
+        });
+    }, 120);
+
+    return () => {
+      symbolReqSeqRef.current += 1;
+      window.clearTimeout(timer);
+    };
+  }, [mentionTrigger, parsedSymbolTrigger, selectedHostId, selectedCwd]);
+
+  const combinedMentions = useMemo(() => {
+    if (!mentionTrigger) return EMPTY_MENTIONS;
+    return mergeMentionCandidates(
+      rankedMentions,
+      symbolMentions,
+      Boolean(parsedSymbolTrigger?.symbolOnly),
+      16,
+    );
+  }, [mentionTrigger, rankedMentions, symbolMentions, parsedSymbolTrigger]);
 
   const hasSubstantiveInput =
     draftText.trim().length > 0 ||
@@ -534,14 +830,35 @@ export const OmniComposer = memo(function OmniComposer({
     setMenuHighlightIdx(0);
 
     switch (cmd.id) {
+      case "fork":
+        if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
+          const nextText = stripped ? `/fork ${stripped}` : "/fork ";
+          orbitActions.setComposerDraft(nextText);
+          setCursorOffset(nextText.length);
+        } else {
+          orbitActions.showToast("Start an active session first to fork");
+          return;
+        }
+        break;
       case "btw":
         orbitActions.openSideQuestionTab();
         return;
       case "plan":
         orbitActions.setSlashDirective("plan");
         break;
+      case "goal":
+        if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
+          setGoalObjective(stripped);
+          setGoalVerifyCommand("");
+          setGoalMaxIterations("10");
+          setGoalPopoverOpen(true);
+          orbitActions.setComposerDraft("");
+          return;
+        }
+        orbitActions.showToast("Start an active session first to run /goal");
+        return;
       case "auto":
-        handleSelectMode("accept_edits");
+        handleSelectMode("auto");
         break;
       case "supervised":
         handleSelectMode("default");
@@ -568,6 +885,23 @@ export const OmniComposer = memo(function OmniComposer({
           orbitActions.showToast("Start an active session first to compact context");
         }
         break;
+      case "export":
+        if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
+          orbitActions.openExportDialog(selectedHostId, selectedAgentId);
+          return;
+        }
+        orbitActions.showToast("Start an active session first to export");
+        break;
+      case "copy":
+        if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
+          void orbitActions.openCopyCodeBlocksModal(selectedHostId, selectedAgentId);
+          return;
+        }
+        orbitActions.showToast("Start an active session first to copy");
+        break;
+      case "fast":
+        orbitActions.toggleActiveFastMode();
+        break;
       case "orbit":
       case "orbit-handoff":
       case "orbit-committee":
@@ -583,6 +917,28 @@ export const OmniComposer = memo(function OmniComposer({
       case "settings":
         orbitActions.openSettings();
         return;
+      default:
+        if (cmd.id.startsWith("skill:")) {
+          const slug = cmd.id.slice("skill:".length);
+          const directive = `Use skill /${slug} (${cmd.label}): `;
+          const before = stripped.slice(0, joined.cursor);
+          const after = stripped.slice(joined.cursor);
+          const needsLeadingSpace = before.length > 0 && !/\s$/.test(before);
+          const inserted = `${needsLeadingSpace ? " " : ""}${directive}`;
+          const nextText = `${before}${inserted}${after.replace(/^[ \t]+/, "")}`;
+          const nextCursor = before.length + inserted.length;
+          orbitActions.setComposerDraft(nextText);
+          setCursorOffset(nextCursor);
+          requestAnimationFrame(() => {
+            const el = textareaRef.current;
+            if (el) {
+              el.focus();
+              el.setSelectionRange(nextCursor, nextCursor);
+            }
+          });
+          return;
+        }
+        break;
     }
 
     requestAnimationFrame(() => {
@@ -617,7 +973,33 @@ export const OmniComposer = memo(function OmniComposer({
       });
     };
 
-    if (candidate.kind === "file") {
+    if (candidate.kind === "code_symbol") {
+      const symbolName = candidate.title;
+      const startLine = candidate.start_line ?? 1;
+      const token = resolveDisambiguatedSymbolToken(
+        {
+          symbolName,
+          path: candidate.file_path,
+          startLine,
+          container: candidate.container ?? null,
+        },
+        inlineMentions,
+        draftText,
+      );
+      orbitActions.registerInlineMention({
+        token,
+        kind: "code_symbol",
+        path: candidate.file_path,
+        startLine,
+        endLine: candidate.end_line ?? startLine,
+        symbolName,
+        symbolKind: candidate.symbol_kind ?? "symbol",
+        signature: candidate.signature ?? null,
+        container: candidate.container ?? null,
+        language: candidate.language ?? "",
+      });
+      insertInlineToken(token);
+    } else if (candidate.kind === "file") {
       const filePath = candidate.file_path || candidate.title;
       const slashIdx = filePath.lastIndexOf("/");
       const basename = slashIdx >= 0 ? filePath.slice(slashIdx + 1) : filePath;
@@ -639,6 +1021,9 @@ export const OmniComposer = memo(function OmniComposer({
       });
       insertInlineToken(token);
     } else if (candidate.kind === "workspace_peer") {
+      const token = candidate.token_label || candidate.title;
+      insertInlineToken(token);
+    } else if (candidate.kind === "path_rule") {
       const token = candidate.token_label || candidate.title;
       insertInlineToken(token);
     } else if (candidate.kind === "terminal_output") {
@@ -756,24 +1141,22 @@ export const OmniComposer = memo(function OmniComposer({
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     pasteHandledForCtrlVRef.current = true;
     const items = Array.from(e.clipboardData.items ?? []);
-    const imageFiles: File[] = [];
+    const pastedFiles: File[] = [];
     for (const it of items) {
-      if (it.kind === "file" && it.type.startsWith("image/")) {
+      if (it.kind === "file") {
         const f = it.getAsFile();
-        if (f) imageFiles.push(f);
+        if (f) pastedFiles.push(f);
       }
     }
-    if (imageFiles.length === 0) {
+    if (pastedFiles.length === 0) {
       for (const f of Array.from(e.clipboardData.files ?? [])) {
-        if (f.type.startsWith("image/")) {
-          imageFiles.push(f);
-        }
+        pastedFiles.push(f);
       }
     }
-    if (imageFiles.length > 0) {
+    if (pastedFiles.length > 0) {
       e.preventDefault();
-      for (const img of imageFiles) {
-        void orbitActions.stageAndAttachFile(img);
+      for (const file of pastedFiles) {
+        void orbitActions.stageAndAttachFile(file);
       }
       return;
     }
@@ -895,8 +1278,8 @@ export const OmniComposer = memo(function OmniComposer({
       return;
     }
 
-    if (mentionTrigger && rankedMentions.length > 0) {
-      const len = rankedMentions.length;
+    if (mentionTrigger && combinedMentions.length > 0) {
+      const len = combinedMentions.length;
       const safeIdx = Math.min(menuHighlightIdx, len - 1);
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -910,7 +1293,7 @@ export const OmniComposer = memo(function OmniComposer({
       }
       if (e.key === "Enter" || e.key === "Tab") {
         e.preventDefault();
-        executeMentionSelect(rankedMentions[safeIdx]);
+        executeMentionSelect(combinedMentions[safeIdx]);
         return;
       }
       if (e.key === "Escape") {
@@ -1013,10 +1396,18 @@ export const OmniComposer = memo(function OmniComposer({
           }}
         />
 
-        {/* Queued Follow-Up Strip when Agent is Running */}
+        {/* Queued Follow-Up Strip when Agent is Running (fits 5 rows cleanly, scrolls beyond 5 with dedicated scrollbar gutter) */}
         {queued.length > 0 && (
-          <div className="approval-dock-surface orbit-stage-enter space-y-0.5 rounded-[14px] px-2 py-1.5 text-[12.5px]">
-            {queued.map((qItem, idx) => {
+          <div className="approval-dock-surface orbit-stage-enter overflow-hidden rounded-[14px] text-[12.5px]">
+            <ScrollArea
+              className="w-full"
+              viewportClassName={cn(
+                "max-h-[160px] overscroll-contain py-1.5 pl-2",
+                queued.length > 5 ? "pr-3.5" : "pr-2",
+              )}
+              contentClassName="space-y-0.5"
+            >
+              {queued.map((qItem, idx) => {
               const canDrag = queued.length > 1;
               const isDragged = queueDrag !== null && queueDrag.fromIndex === idx;
               let translateY = 0;
@@ -1038,6 +1429,24 @@ export const OmniComposer = memo(function OmniComposer({
                 }
               }
 
+              const imageBadges = qItem.badges.filter((b) => b.kind === "image");
+              const otherBadges = qItem.badges.filter((b) => b.kind !== "image");
+              const visibleImages = imageBadges.slice(0, MAX_QUEUED_IMAGE_THUMBS);
+              const extraImageCount = Math.max(0, imageBadges.length - MAX_QUEUED_IMAGE_THUMBS);
+              const visibleOtherBadges = otherBadges.slice(0, 2);
+              const hiddenOtherBadgeCount = Math.max(
+                0,
+                otherBadges.length - visibleOtherBadges.length,
+              );
+              const trimmedDisplayText = qItem.displayText?.trim() ?? "";
+              const hasDisplayText = trimmedDisplayText.length > 0;
+              const imageOnlyLabel =
+                !hasDisplayText && otherBadges.length === 0 && imageBadges.length > 0
+                  ? imageBadges.length === 1
+                    ? "1 image"
+                    : `${imageBadges.length} images`
+                  : "";
+
               return (
                 <div
                   key={qItem.id}
@@ -1051,7 +1460,7 @@ export const OmniComposer = memo(function OmniComposer({
                       : undefined
                   }
                   className={cn(
-                    "group/qrow flex h-[28px] items-center justify-between gap-2 rounded-[8px] px-2 select-none",
+                    "group/qrow flex h-[28px] min-w-0 items-center justify-between gap-2 overflow-hidden rounded-[8px] px-2 select-none",
                     isDragged
                       ? "bg-elevated/95 ring-border/75 relative z-10 cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.08)] ring-1 dark:shadow-[0_4px_14px_rgba(0,0,0,0.34)]"
                       : cn(
@@ -1062,7 +1471,7 @@ export const OmniComposer = memo(function OmniComposer({
                         ),
                   )}
                 >
-                  <div className="flex min-w-0 flex-1 items-center gap-2">
+                  <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
                     {canDrag ? (
                       <>
                         <CornerDownRight
@@ -1081,17 +1490,63 @@ export const OmniComposer = memo(function OmniComposer({
                     ) : (
                       <CornerDownRight className="text-muted-foreground/60 size-3.5 shrink-0 stroke-[1.8]" />
                     )}
-                    {qItem.badges.map((b, bIdx) => (
+                    {visibleImages.length > 0 && (
+                      <div className="flex shrink-0 items-center gap-1">
+                        {visibleImages.map((imgBadge, imgIdx) => {
+                          const isLastWithOverflow =
+                            imgIdx === visibleImages.length - 1 && extraImageCount > 0;
+                          return (
+                            <QueuedImageThumb
+                              key={`qimg-${imgBadge.path ?? imgBadge.label}-${imgIdx}`}
+                              badge={imgBadge}
+                              displayText={trimmedDisplayText}
+                              imageIndex={imgIdx}
+                              hostId={selectedHostId}
+                              agentId={selectedAgentId}
+                              cwd={selectedCwd || "~"}
+                              overflowCount={isLastWithOverflow ? extraImageCount : 0}
+                              tooltip={
+                                isLastWithOverflow
+                                  ? `${imageBadges.length} images attached`
+                                  : imgBadge.label
+                              }
+                            />
+                          );
+                        })}
+                      </div>
+                    )}
+                    {visibleOtherBadges.map((b, bIdx) => (
                       <span
                         key={`${b.kind}-${bIdx}`}
-                        className="bg-muted text-foreground/80 shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px]"
+                        title={b.label}
+                        className={cn(
+                          "bg-muted text-foreground/80 min-w-0 shrink truncate rounded px-1.5 py-0.5 font-mono text-[11px]",
+                          hasDisplayText ? "max-w-[110px]" : "max-w-[160px]",
+                        )}
                       >
                         {b.label}
                       </span>
                     ))}
-                    {qItem.displayText && (
-                      <span className="text-foreground/86 truncate">{qItem.displayText}</span>
+                    {hiddenOtherBadgeCount > 0 && (
+                      <span
+                        title={otherBadges.map((b) => b.label).join(", ")}
+                        className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 font-mono text-[10.5px]"
+                      >
+                        +{hiddenOtherBadgeCount}
+                      </span>
                     )}
+                    {hasDisplayText ? (
+                      <span
+                        title={qItem.displayText}
+                        className="text-foreground/86 min-w-[64px] flex-1 truncate"
+                      >
+                        {qItem.displayText}
+                      </span>
+                    ) : imageOnlyLabel ? (
+                      <span className="text-foreground/82 min-w-[48px] flex-1 truncate">
+                        {imageOnlyLabel}
+                      </span>
+                    ) : null}
                   </div>
                   <div
                     className={cn(
@@ -1130,6 +1585,7 @@ export const OmniComposer = memo(function OmniComposer({
                 </div>
               );
             })}
+            </ScrollArea>
           </div>
         )}
 
@@ -1156,10 +1612,103 @@ export const OmniComposer = memo(function OmniComposer({
             />
           )}
 
-          {mentionTrigger && rankedMentions.length > 0 && (
+          {goalPopoverOpen && selectedHostId && selectedAgentId && (
+            <div
+              onKeyDown={(e) => {
+                if (goalIme.shouldIgnoreKeyDown(e)) return;
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setGoalPopoverOpen(false);
+                  requestAnimationFrame(() => textareaRef.current?.focus());
+                }
+              }}
+              className="bg-popover text-popover-foreground floating-surface orbit-inline-menu-up absolute right-0 bottom-full left-0 z-40 mb-2 rounded-[14px] border border-black/[0.09] p-3 dark:border-white/[0.10]"
+            >
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-[12px] font-medium">
+                  <Target className="text-muted-foreground size-3.5 stroke-[1.75]" />
+                  <span>Autonomous Goal</span>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Close goal config"
+                  onClick={() => {
+                    setGoalPopoverOpen(false);
+                    requestAnimationFrame(() => textareaRef.current?.focus());
+                  }}
+                  className="text-muted-foreground hover:text-foreground inline-flex size-5 cursor-pointer items-center justify-center rounded-md transition-colors"
+                >
+                  <X className="size-3.5" />
+                </button>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <input
+                  autoFocus
+                  value={goalObjective}
+                  onChange={(e) => setGoalObjective(e.target.value)}
+                  {...goalIme.compositionProps}
+                  onKeyDown={(e) => {
+                    if (goalIme.shouldIgnoreKeyDown(e)) return;
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      submitGoalPopover();
+                    }
+                  }}
+                  placeholder="Objective (e.g. Make all unit tests pass)"
+                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/30 h-8 w-full rounded-lg border px-2.5 text-[12.5px] outline-none"
+                />
+                <div className="flex items-center gap-2">
+                  <input
+                    value={goalVerifyCommand}
+                    onChange={(e) => setGoalVerifyCommand(e.target.value)}
+                    {...goalIme.compositionProps}
+                    onKeyDown={(e) => {
+                      if (goalIme.shouldIgnoreKeyDown(e)) return;
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        submitGoalPopover();
+                      }
+                    }}
+                    placeholder="Verify command (optional, e.g. cargo test)"
+                    className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/30 h-7 min-w-0 flex-1 rounded-lg border px-2.5 font-mono text-[11.5px] outline-none"
+                  />
+                  <label className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[11.5px]">
+                    <span>Max iter</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={50}
+                      value={goalMaxIterations}
+                      onChange={(e) => setGoalMaxIterations(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (goalIme.shouldIgnoreKeyDown(e)) return;
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          submitGoalPopover();
+                        }
+                      }}
+                      className="border-border bg-canvas text-foreground focus:border-foreground/30 h-7 w-14 rounded-lg border px-2 text-center font-mono text-[11.5px] outline-none"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    disabled={!goalObjective.trim() || goalSubmitting}
+                    onClick={submitGoalPopover}
+                    className="bg-foreground text-background hover:opacity-90 h-7 shrink-0 cursor-pointer rounded-lg px-3 text-[12px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    Start
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {mentionTrigger && combinedMentions.length > 0 && (
             <MentionMenu
-              items={rankedMentions}
-              activeIndex={Math.min(menuHighlightIdx, rankedMentions.length - 1)}
+              items={combinedMentions}
+              activeIndex={Math.min(menuHighlightIdx, combinedMentions.length - 1)}
               onHoverIndex={setMenuHighlightIdx}
               onSelect={executeMentionSelect}
             />
@@ -1176,7 +1725,7 @@ export const OmniComposer = memo(function OmniComposer({
           >
             {isDraggingOver && (
               <div className="bg-background/85 text-foreground pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px]">
-                Drop images or files to attach
+                Drop images, PDF, audio, video, or files to attach
               </div>
             )}
 
@@ -1184,7 +1733,7 @@ export const OmniComposer = memo(function OmniComposer({
             <ContextTray contexts={contexts} quotes={quotes} pastes={pastes} />
 
             {/* Auto-growing Prose Textarea + Off-Flow Mirror Sizer + Inline Slash Token + Placeholder */}
-            <div className="relative">
+            <div className="relative overflow-hidden">
               {slashDirective && (
                 <span
                   ref={directivePrefixRef}
@@ -1233,7 +1782,7 @@ export const OmniComposer = memo(function OmniComposer({
                     ? { textIndent: `${directiveIndentPx}px` }
                     : undefined
                 }
-                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] py-[13px] text-[15px] leading-[20px] whitespace-pre-wrap break-words"
+                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[13px] pb-[5px] text-[15px] leading-[20px] whitespace-pre-wrap break-words"
               >
                 {draftText}
                 {"\u200b"}
@@ -1275,15 +1824,16 @@ export const OmniComposer = memo(function OmniComposer({
                   }
                 }}
                 onPaste={handlePaste}
+                onBlur={ime.reset}
                 {...ime.compositionProps}
                 onKeyDown={handleKeyDown}
                 rows={1}
-                className="text-foreground block min-h-[46px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] py-[13px] text-[15px] leading-[20px] outline-none"
+                className="text-foreground block min-h-[38px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[13px] pb-[5px] text-[15px] leading-[20px] outline-none"
               />
             </div>
 
             {/* Bottom Control Bar (`34px` uniform control rhythm) */}
-            <div className="flex items-center justify-between gap-2 px-2.5 pt-0 pb-2">
+            <div className="flex items-center justify-between gap-2 px-2.5 pt-2 pb-2">
               <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">
                 {/* 1. `[+]` Add Context Menu (`34×34` -> Files, Mentions, Actions) */}
                 <DropdownMenu>
@@ -1333,12 +1883,13 @@ export const OmniComposer = memo(function OmniComposer({
                   </DropdownMenuContent>
                 </DropdownMenu>
 
-                {/* 2. Isolated Agent + Model + Thinking Mode Selector */}
+                {/* 2. Isolated Agent + Model + Thinking / Fast Selector */}
                 <ComposerModelPicker />
               </div>
 
-              {/* Right Cluster: Isolated Access Permissions Selector + `34×34` Primary Action Circle */}
-              <div className="flex shrink-0 items-center gap-1.5">
+              {/* Right Cluster: Ambient Context Ring + Access Permissions Selector + `34×34` Primary Action Circle */}
+              <div className="flex shrink-0 items-center gap-1">
+                <ContextOccupancyPill />
                 <ComposerModePicker
                   mode={activeMode}
                   onSelectMode={handleSelectMode}

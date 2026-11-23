@@ -30,18 +30,28 @@ export function encodeHostPairingUri(host: HostCardView): string {
 export function ToggleSwitch({
   checked,
   onChange,
+  disabled = false,
+  ariaLabel,
+  "aria-label": ariaLabelAttr,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+  "aria-label"?: string;
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
-      onClick={() => onChange(!checked)}
+      aria-label={ariaLabel ?? ariaLabelAttr}
+      disabled={disabled}
+      onClick={() => {
+        if (!disabled) onChange(!checked);
+      }}
       className={cn(
-        "relative inline-flex h-[22px] w-[38px] shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors duration-150",
+        "relative inline-flex h-[22px] w-[38px] shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50",
         checked ? "bg-foreground" : "bg-muted-foreground/25",
       )}
     >

@@ -1,3 +1,4 @@
+mod acp_cli;
 mod cloud_sync_cli;
 mod mcp_bridge;
 mod orchestration_cli;
@@ -24,17 +25,22 @@ use orbit_protocol::{
     ActiveTurnBehavior, AgentStatus, ProviderKind, SessionMode, TimelinePayload, ToolCallDetail,
     WireMessage, WorktreeCreateMode,
 };
-use orbit_providers::{discover_installed_providers, probe_all_provider_quotas};
+use orbit_providers::{
+    discover_installed_providers, probe_all_provider_quotas, resolve_login_shell_env,
+    set_snapshot_orbit_home, shell_snapshot_stats,
+};
 use orbit_relay::{RelayConfig, RelayPersistedConfig, run_relay};
 use orbit_relay_transport::{is_ssh_relay_url, redact_relay_url};
 use orbit_shim::{ShimSpawnSpec, run_shim};
 use uuid::Uuid;
 
+use crate::acp_cli::{AcpAction, cmd_acp};
 use crate::orchestration_cli::{
-    CliBehavior, CliEffort, ConfigAction, HeartbeatAction, HostAction, PermitAction, ProfileAction,
-    ScheduleAction, ScriptAction, SkillAction, TerminalAction, WorkspaceAction, cmd_config,
-    cmd_heartbeat, cmd_host, cmd_inspect, cmd_permit, cmd_profile, cmd_schedule, cmd_script,
-    cmd_simple_agent_op, cmd_skill, cmd_terminal, cmd_wait, cmd_workspace, resolve_server_url,
+    AgentAction, CliBehavior, CliEffort, ConfigAction, HeartbeatAction, HostAction, PermitAction,
+    ProfileAction, ScheduleAction, ScriptAction, SkillAction, TerminalAction, WorkspaceAction,
+    cmd_agent, cmd_config, cmd_fork_agent, cmd_heartbeat, cmd_host, cmd_inspect, cmd_permit,
+    cmd_profile, cmd_schedule, cmd_script, cmd_simple_agent_op, cmd_skill, cmd_terminal, cmd_wait,
+    cmd_workspace, resolve_server_url,
 };
 use crate::service::{
     PortOwnership, RelayProbeOutcome, ServiceRole, check_local_health, default_daemon_listen,
@@ -48,7 +54,7 @@ use crate::ssh_config::{discover_ssh_hosts, provision_relay_via_ssh};
 #[command(
     name = "orbit",
     version,
-    about = "Ultra-fast Multi-Host AI Coding Agent Orchestrator (Antigravity, Codex, Claude Code)"
+    about = "Ultra-fast Multi-Host AI Coding Agent Orchestrator (13 Native Coding Agents)"
 )]
 struct Cli {
     /// Override Orbit state directory (defaults to `~/.orbit`).
@@ -75,9 +81,34 @@ struct Cli {
 pub enum CliProvider {
     #[value(alias = "agy")]
     Antigravity,
+    #[value(alias = "openai")]
     Codex,
-    #[value(alias = "claude")]
+    #[value(name = "claude_code", alias = "claude-code", alias = "claude")]
     ClaudeCode,
+    #[value(name = "opencode", alias = "open-code", alias = "open_code")]
+    OpenCode,
+    #[value(name = "gemini_cli", alias = "gemini-cli", alias = "gemini")]
+    GeminiCli,
+    #[value(name = "cursor_agent", alias = "cursor-agent", alias = "cursor")]
+    CursorAgent,
+    #[value(name = "copilot", alias = "github-copilot", alias = "github_copilot")]
+    Copilot,
+    Goose,
+    #[value(name = "pi", alias = "pi-coding-agent")]
+    Pi,
+    #[value(name = "kimi", alias = "kimi-cli", alias = "kimi_cli")]
+    Kimi,
+    Cline,
+    #[value(
+        name = "mistral_vibe",
+        alias = "mistral-vibe",
+        alias = "vibe",
+        alias = "vibe-acp"
+    )]
+    MistralVibe,
+    #[value(name = "augment", alias = "auggie", alias = "augment-code")]
+    Augment,
+    Acp,
 }
 
 impl From<CliProvider> for ProviderKind {
@@ -86,6 +117,17 @@ impl From<CliProvider> for ProviderKind {
             CliProvider::Antigravity => ProviderKind::Antigravity,
             CliProvider::Codex => ProviderKind::Codex,
             CliProvider::ClaudeCode => ProviderKind::ClaudeCode,
+            CliProvider::OpenCode => ProviderKind::OpenCode,
+            CliProvider::GeminiCli => ProviderKind::GeminiCli,
+            CliProvider::CursorAgent => ProviderKind::CursorAgent,
+            CliProvider::Copilot => ProviderKind::Copilot,
+            CliProvider::Goose => ProviderKind::Goose,
+            CliProvider::Pi => ProviderKind::Pi,
+            CliProvider::Kimi => ProviderKind::Kimi,
+            CliProvider::Cline => ProviderKind::Cline,
+            CliProvider::MistralVibe => ProviderKind::MistralVibe,
+            CliProvider::Augment => ProviderKind::Augment,
+            CliProvider::Acp => ProviderKind::Acp,
         }
     }
 }
@@ -93,6 +135,7 @@ impl From<CliProvider> for ProviderKind {
 #[derive(Clone, Copy, ValueEnum)]
 pub enum CliMode {
     Default,
+    Auto,
     AcceptEdits,
     Plan,
     FullAccess,
@@ -102,6 +145,7 @@ impl From<CliMode> for SessionMode {
     fn from(v: CliMode) -> Self {
         match v {
             CliMode::Default => SessionMode::Default,
+            CliMode::Auto => SessionMode::Auto,
             CliMode::AcceptEdits => SessionMode::AcceptEdits,
             CliMode::Plan => SessionMode::Plan,
             CliMode::FullAccess => SessionMode::FullAccess,
@@ -279,12 +323,21 @@ enum Commands {
     Run {
         #[arg(short, long, value_enum, default_value = "antigravity")]
         provider: CliProvider,
+        /// ACP registry agent ID when `--provider acp` is selected (e.g. `opencode`, `gemini-cli`, or custom ID).
+        #[arg(long)]
+        acp_agent: Option<String>,
         #[arg(short, long, value_enum, default_value = "accept-edits")]
         mode: CliMode,
         #[arg(long)]
         model: Option<String>,
         #[arg(long, value_enum)]
         effort: Option<CliEffort>,
+        /// Enable Fast output mode (lower latency, higher quota usage) when supported by the model.
+        #[arg(long, conflicts_with = "no_fast")]
+        fast: bool,
+        /// Explicitly disable Fast output mode (overrides a fast-enabled Agent Profile).
+        #[arg(long, conflicts_with = "fast")]
+        no_fast: bool,
         /// Apply a saved Agent Profile ID (fills provider/model/effort/mode/system prompt/MCP policy).
         #[arg(long)]
         profile: Option<String>,
@@ -362,6 +415,29 @@ enum Commands {
     /// Read timeline history of an agent from an Orbit Daemon.
     Logs { agent_id: String },
 
+    /// Fork/branch an existing agent conversation in the same directory or into a new git worktree.
+    Fork {
+        agent_id: String,
+        #[arg(long = "at-seq")]
+        at_seq: Option<u64>,
+        #[arg(long)]
+        worktree: bool,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long = "base-ref")]
+        base_ref: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+
+    /// Agent conversation & lifecycle utilities (`orbit agent export|fork ...`).
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
     /// Manage workspaces and isolated git worktrees.
     Workspace {
         #[command(subcommand)]
@@ -422,6 +498,12 @@ enum Commands {
         action: SkillAction,
     },
 
+    /// Manage curated & custom Universal ACP coding agents (`orbit acp list | add | remove | test | refresh`).
+    Acp {
+        #[command(subcommand)]
+        action: AcpAction,
+    },
+
     /// Stdio-to-HTTP MCP 2025-03-26 JSON-RPC bridge connecting external MCP clients to the local Orbit Daemon.
     Mcp {
         #[arg(long)]
@@ -445,12 +527,34 @@ fn resolve_home(override_home: Option<PathBuf>) -> PathBuf {
         return h;
     }
     std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".orbit")
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        // Windows MSVC defaults to a 1 MiB main thread stack (vs 8 MiB on macOS/Linux),
+        // which can overflow (`0xc00000fd`) in `clap::Parser` or large async futures in debug builds.
+        let handle = std::thread::Builder::new()
+            .name("orbit-main".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(main_impl)?;
+        match handle.join() {
+            Ok(res) => res,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        main_impl()
+    }
+}
+
+fn main_impl() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let rt = match &cli.command {
         Commands::Daemon { action: None, .. } | Commands::Relay { .. } => {
@@ -459,6 +563,7 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(4);
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(workers)
+                .thread_stack_size(8 * 1024 * 1024)
                 .enable_all()
                 .build()?
         }
@@ -466,13 +571,14 @@ fn main() -> anyhow::Result<()> {
             .enable_all()
             .build()?,
     };
-    rt.block_on(run_cli(cli))
+    rt.block_on(Box::pin(run_cli(cli)))
 }
 
 async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let home_dir = resolve_home(cli.home);
     let json_mode = cli.json;
     let via_relay = cli.via_relay;
+    let explicit_server = cli.server.clone();
     let server = resolve_server_url(&home_dir, cli.server);
 
     let is_mcp_stdio = matches!(cli.command, Commands::Mcp { .. });
@@ -503,6 +609,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Doctor => {
+            set_snapshot_orbit_home(&home_dir);
+            let _ = resolve_login_shell_env().await;
+            let snap_stats = shell_snapshot_stats();
+
             let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
             let persisted = DaemonPersistedConfig::load(&home_dir);
             let fallback_port = persisted
@@ -538,6 +648,21 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     "Relay Route  : (not configured — LAN/Tailscale only; run `orbit use-relay <HOST:PORT>`)"
                 ),
             }
+            if snap_stats.warm {
+                println!(
+                    "Shell Cache  : {} ({} vars, age {}s, hits {}, misses {})",
+                    snap_stats.shell,
+                    snap_stats.var_count,
+                    snap_stats.age_secs.unwrap_or(0),
+                    snap_stats.hits,
+                    snap_stats.misses
+                );
+            } else {
+                println!(
+                    "Shell Cache  : {} (cold, errors {}, hits {}, misses {})",
+                    snap_stats.shell, snap_stats.probe_errors, snap_stats.hits, snap_stats.misses
+                );
+            }
 
             println!("\nDiscovered Coding Agent CLIs:");
             let providers = discover_installed_providers();
@@ -546,7 +671,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             } else {
                 for p in providers {
                     println!(
-                        "  [✓] {:<13} -> {} ({})",
+                        "  [✓] {:<15} -> {} ({})",
                         p.kind.display_name(),
                         p.executable_path.display(),
                         p.protocol_transport
@@ -1110,9 +1235,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
         Commands::Run {
             provider,
+            acp_agent,
             mode,
             model,
             effort,
+            fast,
+            no_fast,
             profile,
             cwd,
             workspace,
@@ -1136,6 +1264,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 .ok()
                 .filter(|s| !s.trim().is_empty());
             let effective_notify = notify_on_finish.or_else(|| env_caller.as_ref().map(|_| true));
+            let effective_provider = if acp_agent.is_some() {
+                ProviderKind::Acp
+            } else {
+                provider.into()
+            };
 
             let client = connect_cli_server(&server, via_relay).await?;
             let mut sub_rx = client.subscribe();
@@ -1148,9 +1281,16 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         cwd: target_cwd.to_string_lossy().to_string(),
                         extra_dirs: Vec::new(),
                         title,
-                        provider: provider.into(),
+                        provider: effective_provider,
                         model,
                         effort: effort.map(Into::into),
+                        fast_mode: if no_fast {
+                            Some(false)
+                        } else if fast {
+                            Some(true)
+                        } else {
+                            None
+                        },
                         mode: mode.into(),
                         initial_prompt: prompt,
                         initial_display_prompt: None,
@@ -1169,6 +1309,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         branch,
                         handle: None,
                         auto_cluster: None,
+                        acp_agent_id: acp_agent,
                     },
                     Duration::from_secs(45),
                     |w| {
@@ -1398,6 +1539,24 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
+        Commands::Fork {
+            agent_id,
+            at_seq,
+            worktree,
+            branch,
+            base_ref,
+            title,
+            prompt,
+        } => {
+            cmd_fork_agent(
+                &server, via_relay, json_mode, agent_id, at_seq, worktree, branch, base_ref, title,
+                prompt,
+            )
+            .await?;
+        }
+        Commands::Agent { action } => {
+            cmd_agent(&server, via_relay, json_mode, action).await?;
+        }
         Commands::Workspace { action } => {
             cmd_workspace(&server, via_relay, json_mode, action).await?;
         }
@@ -1428,6 +1587,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Skill { action } => {
             cmd_skill(&server, via_relay, json_mode, action).await?;
         }
+        Commands::Acp { action } => {
+            cmd_acp(
+                &home_dir,
+                explicit_server.as_deref(),
+                &server,
+                via_relay,
+                json_mode,
+                action,
+            )
+            .await?;
+        }
         Commands::Mcp {
             caller_agent_id,
             url,
@@ -1436,8 +1606,16 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Shim { socket, spec_json } => {
-            let spec: ShimSpawnSpec = serde_json::from_str(&spec_json)?;
-            run_shim(&socket, spec).await?;
+            let err_sidecar = socket.with_extension("err");
+            let parsed = serde_json::from_str::<ShimSpawnSpec>(&spec_json);
+            let res: anyhow::Result<()> = match parsed {
+                Ok(spec) => run_shim(&socket, spec).await.map_err(Into::into),
+                Err(e) => Err(e.into()),
+            };
+            if let Err(ref e) = res {
+                let _ = std::fs::write(&err_sidecar, format!("{e:#}"));
+            }
+            res?;
         }
     }
 

@@ -1,10 +1,11 @@
-import { Shield, ShieldCheck, ShieldOff } from "lucide-react";
+import { FilePenLine, Shield, ShieldCheck, ShieldOff } from "lucide-react";
 import { defaultEffortDescription, formatEffortLabel } from "@/lib/model-catalog";
-import type {
-  ProviderKind,
-  ReasoningEffort,
-  SessionMode,
-  ThinkingOptionSpec,
+import {
+  PROVIDER_LIST,
+  type ProviderKind,
+  type ReasoningEffort,
+  type SessionMode,
+  type ThinkingOptionSpec,
 } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
 
@@ -24,11 +25,8 @@ export function conciseThinkingDescription(opt: ThinkingOptionSpec): string {
   return defaultEffortDescription(opt.effort);
 }
 
-export const PROVIDERS: { id: ProviderKind; label: string; shortLabel: string }[] = [
-  { id: "claude_code", label: "Claude Code", shortLabel: "Claude" },
-  { id: "codex", label: "Codex", shortLabel: "Codex" },
-  { id: "antigravity", label: "Antigravity", shortLabel: "Antigravity" },
-];
+export const PROVIDERS: readonly { id: ProviderKind; label: string; shortLabel: string }[] =
+  PROVIDER_LIST;
 
 export const PERMISSION_MODES: {
   id: Exclude<SessionMode, "plan" | { custom: string }>;
@@ -39,6 +37,11 @@ export const PERMISSION_MODES: {
     id: "default",
     label: "Always Ask",
     desc: "Require approval before file edits and commands",
+  },
+  {
+    id: "auto",
+    label: "Auto",
+    desc: "Auto-approve safe reads & tests, ask on risky actions",
   },
   {
     id: "accept_edits",
@@ -63,6 +66,8 @@ export function modeLabel(mode: SessionMode): string {
     case "plan":
     case "default":
       return "Always Ask";
+    case "auto":
+      return "Auto";
     case "accept_edits":
       return "Accept Edits";
     case "full_access":
@@ -79,8 +84,10 @@ export function ModeIcon({ mode, className }: { mode: SessionMode; className?: s
     case "plan":
     case "default":
       return <Shield className={cn("size-[15px] stroke-[1.75]", className)} />;
-    case "accept_edits":
+    case "auto":
       return <ShieldCheck className={cn("size-[15px] stroke-[1.75]", className)} />;
+    case "accept_edits":
+      return <FilePenLine className={cn("size-[15px] stroke-[1.75]", className)} />;
     case "full_access":
       return <ShieldOff className={cn("size-[15px] stroke-[1.75]", className)} />;
   }

@@ -113,6 +113,42 @@ fn spawn_bounded_stderr_reader(
     })
 }
 
+fn resolve_side_question_backend(
+    requested: ProviderKind,
+    requested_model: Option<String>,
+) -> Result<(ProviderKind, PathBuf, Option<String>), String> {
+    if matches!(
+        requested,
+        ProviderKind::ClaudeCode | ProviderKind::Codex | ProviderKind::Antigravity
+    ) {
+        let executable = find_provider_executable(requested).ok_or_else(|| {
+            format!(
+                "{} binary (`{}`) not found on host PATH",
+                requested.display_name(),
+                requested.default_binary()
+            )
+        })?;
+        return Ok((requested, executable, requested_model));
+    }
+
+    // For ACP/Pi providers without an ephemeral zero-tool side-question CLI mode,
+    // gracefully fall back to the first installed core provider with its default model.
+    for fallback in [
+        ProviderKind::ClaudeCode,
+        ProviderKind::Codex,
+        ProviderKind::Antigravity,
+    ] {
+        if let Some(executable) = find_provider_executable(fallback) {
+            return Ok((fallback, executable, None));
+        }
+    }
+
+    Err(format!(
+        "Ephemeral side questions (/btw) are not yet natively supported on {} and no fallback CLI (Claude Code, Codex, or Antigravity) was found on host PATH",
+        requested.display_name()
+    ))
+}
+
 /// Execute a single non-persistent side question and stream incremental text deltas through `delta_tx`.
 /// Returns the final accumulated Markdown answer.
 pub async fn run_side_question(
@@ -123,13 +159,8 @@ pub async fn run_side_question(
         return Err("Side question cannot be empty".to_string());
     }
 
-    let executable = find_provider_executable(spec.provider).ok_or_else(|| {
-        format!(
-            "{} binary (`{}`) not found on host PATH",
-            spec.provider.display_name(),
-            spec.provider.default_binary()
-        )
-    })?;
+    let (effective_provider, executable, effective_model) =
+        resolve_side_question_backend(spec.provider, spec.model)?;
 
     let prompt = build_side_question_prompt(&spec.question, &spec.context_summary);
     let cwd = if spec.cwd.is_dir() {
@@ -139,16 +170,24 @@ pub async fn run_side_question(
     };
 
     let fut = async {
-        match spec.provider {
+        match effective_provider {
             ProviderKind::ClaudeCode => {
-                run_claude_side_question(executable, cwd, spec.model, prompt, delta_tx).await
+                run_claude_side_question(executable, cwd, effective_model, prompt, delta_tx).await
             }
             ProviderKind::Codex => {
-                run_codex_side_question(executable, cwd, spec.model, prompt, delta_tx).await
+                run_codex_side_question(executable, cwd, effective_model, prompt, delta_tx).await
             }
             ProviderKind::Antigravity => {
-                run_agy_side_question(executable, cwd, spec.model, prompt, delta_tx).await
+                run_agy_side_question(executable, cwd, effective_model, prompt, delta_tx).await
             }
+            ProviderKind::Acp => Err(
+                "Ephemeral side questions (/btw) are only supported on native Claude Code, Codex, and Antigravity sessions."
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "Side questions are not supported on {}",
+                other.display_name()
+            )),
         }
     };
 
@@ -170,13 +209,8 @@ pub async fn run_ephemeral_text_prompt(
     if prompt.trim().is_empty() {
         return Err("Ephemeral prompt cannot be empty".to_string());
     }
-    let executable = find_provider_executable(provider).ok_or_else(|| {
-        format!(
-            "{} binary (`{}`) not found on host PATH",
-            provider.display_name(),
-            provider.default_binary()
-        )
-    })?;
+    let (effective_provider, executable, effective_model) =
+        resolve_side_question_backend(provider, model)?;
     let safe_cwd = if cwd.is_dir() {
         cwd
     } else {
@@ -188,16 +222,25 @@ pub async fn run_ephemeral_text_prompt(
 
     let bounded_secs = timeout_secs.clamp(5, 180);
     let fut = async {
-        match provider {
+        match effective_provider {
             ProviderKind::ClaudeCode => {
-                run_claude_side_question(executable, safe_cwd, model, prompt, delta_tx).await
+                run_claude_side_question(executable, safe_cwd, effective_model, prompt, delta_tx)
+                    .await
             }
             ProviderKind::Codex => {
-                run_codex_side_question(executable, safe_cwd, model, prompt, delta_tx).await
+                run_codex_side_question(executable, safe_cwd, effective_model, prompt, delta_tx)
+                    .await
             }
             ProviderKind::Antigravity => {
-                run_agy_side_question(executable, safe_cwd, model, prompt, delta_tx).await
+                run_agy_side_question(executable, safe_cwd, effective_model, prompt, delta_tx).await
             }
+            ProviderKind::Acp => {
+                Err("Ephemeral text prompts are not supported on generic ACP agents.".to_string())
+            }
+            other => Err(format!(
+                "Ephemeral text prompts are not supported on {}",
+                other.display_name()
+            )),
         }
     };
 
@@ -235,6 +278,7 @@ async fn run_claude_side_question(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -337,6 +381,7 @@ async fn run_codex_side_question(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -467,6 +512,7 @@ async fn run_agy_side_question(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
 
     let mut child = cmd
         .spawn()

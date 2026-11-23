@@ -305,6 +305,7 @@ export const SubagentsTrack = memo(function SubagentsTrack({
               const isAwaiting = sa.status === "awaiting_permission";
               const isRunning = sa.status === "running";
               const isFailed = sa.status === "failed";
+              const isCanceled = sa.status === "canceled";
               const canManage = Boolean(sa.isManaged && sa.childAgentId);
 
               return (
@@ -339,6 +340,8 @@ export const SubagentsTrack = memo(function SubagentsTrack({
                       <OrbitSpinner size={12} className="text-foreground/75 shrink-0" />
                     ) : isFailed ? (
                       <AlertTriangle className="text-rose-500 size-[12px] shrink-0" />
+                    ) : isCanceled ? (
+                      <span className="bg-muted-foreground/45 size-[6.5px] shrink-0 rounded-full" />
                     ) : (
                       <Check className="text-emerald-500 size-[12px] shrink-0" />
                     )}
@@ -352,7 +355,9 @@ export const SubagentsTrack = memo(function SubagentsTrack({
                               ? "Running"
                               : isFailed
                                 ? "Failed"
-                                : "Completed"}
+                                : isCanceled
+                                  ? "Canceled"
+                                  : "Completed"}
                         </span>
                         {sa.remoteHostName && <span>· {sa.remoteHostName}</span>}
                       </div>

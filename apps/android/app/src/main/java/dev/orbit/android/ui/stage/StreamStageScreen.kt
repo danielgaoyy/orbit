@@ -99,6 +99,12 @@ fun StreamStageScreen(
     onOpenPairSheet: () -> Unit,
     onOpenTerminal: () -> Unit = {},
     onOpenSettings: () -> Unit = {},
+    onOpenSideQuestion: () -> Unit = {},
+    onOpenAutomations: () -> Unit = {},
+    onOpenWorkspaceBoard: () -> Unit = {},
+    onOpenArchived: () -> Unit = {},
+    onOpenForkDialog: () -> Unit = {},
+    onExportTranscript: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
@@ -385,6 +391,7 @@ fun StreamStageScreen(
                 onOpenContextPicker = onOpenContextPicker,
                 onOpenModelSelector = onOpenModelSelector,
                 onSelectMode = { store.selectSessionMode(it) },
+                onToggleFastMode = { store.toggleFastMode() },
                 onRequestRefreshFiles = { store.refreshWorkspaceFiles() },
                 onAddFileMention = { store.addFileMention(it) },
                 onRemoveFileMention = { store.removeFileMention(it) },
@@ -414,6 +421,12 @@ fun StreamStageScreen(
                         cmd = cmd,
                         onOpenTerminal = onOpenTerminal,
                         onOpenSettings = onOpenSettings,
+                        onOpenSideQuestion = onOpenSideQuestion,
+                        onOpenAutomations = onOpenAutomations,
+                        onOpenWorkspaceBoard = onOpenWorkspaceBoard,
+                        onOpenArchived = onOpenArchived,
+                        onOpenFork = onOpenForkDialog,
+                        onExportTranscript = onExportTranscript,
                     )
                 },
             )

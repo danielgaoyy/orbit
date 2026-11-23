@@ -11,6 +11,8 @@ import {
   RotateCcw,
   Save,
 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { SettingSelect, type SettingSelectOption } from "@/components/settings/settings-primitives";
@@ -869,11 +871,12 @@ export function InstructionsSection() {
                         <span>Revert</span>
                       </button>
                     )}
-                    <button
+                    <Button
                       type="button"
+                      size="xs"
                       disabled={saving || fileLoading || (!dirty && loadedExists)}
                       onClick={() => void handleSave(false)}
-                      className="bg-foreground text-background hover:bg-foreground/90 inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-[11.5px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
+                      className="gap-1.5 text-[11.5px]"
                     >
                       {saving ? (
                         <Loader2 className="h-3 w-3 animate-spin" />
@@ -881,8 +884,8 @@ export function InstructionsSection() {
                         <Save className="h-3 w-3" />
                       )}
                       <span>{loadedExists ? "Save" : "Create"}</span>
-                      <span className="opacity-65">{mod}S</span>
-                    </button>
+                      <ShortcutKbd keys={`${mod}S`} size="xs" variant="inverted" />
+                    </Button>
                   </div>
                 </div>
 

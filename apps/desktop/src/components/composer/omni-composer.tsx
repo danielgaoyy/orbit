@@ -73,6 +73,7 @@ import {
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
@@ -1385,7 +1386,7 @@ export const OmniComposer = memo(function OmniComposer({
         variant === "docked" ? "shrink-0 px-[24px] pt-0 pb-4" : "px-0",
       )}
     >
-      <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,768px)] flex-col gap-2">
+      <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,740px)] flex-col gap-2">
         <input
           ref={fileInputRef}
           type="file"
@@ -1852,36 +1853,29 @@ export const OmniComposer = memo(function OmniComposer({
                     align="start"
                     side="top"
                     finalFocus={false}
-                    className="w-[180px] p-1.5"
+                    className="min-w-[168px]"
                   >
-                    <DropdownMenuLabel>{t("composer.addContext")}</DropdownMenuLabel>
-                    <DropdownMenuItem
-                      onSelect={() => fileInputRef.current?.click()}
-                      className="py-1.5"
-                    >
-                      <span className="flex items-center gap-2.5">
-                        <Paperclip className="text-muted-foreground size-4 stroke-[1.75]" />
-                        <span className="text-[13px]">{t("composer.files")}</span>
-                      </span>
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={triggerAtMentionFromButton}
-                      className="py-1.5"
-                    >
-                      <span className="flex items-center gap-2.5">
-                        <AtSign className="text-muted-foreground size-4 stroke-[1.75]" />
-                        <span className="text-[13px]">{t("composer.mentions")}</span>
-                      </span>
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={triggerSlashActionsFromButton}
-                      className="py-1.5"
-                    >
-                      <span className="flex items-center gap-2.5">
-                        <SquareSlash className="text-muted-foreground size-4 stroke-[1.75]" />
-                        <span className="text-[13px]">{t("composer.actions")}</span>
-                      </span>
-                    </DropdownMenuItem>
+                    <DropdownMenuGroup>
+                      <DropdownMenuLabel>{t("composer.addContext")}</DropdownMenuLabel>
+                      <DropdownMenuItem onSelect={() => fileInputRef.current?.click()}>
+                        <span className="flex items-center gap-2 whitespace-nowrap">
+                          <Paperclip className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                          <span>{t("composer.files")}</span>
+                        </span>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={triggerAtMentionFromButton}>
+                        <span className="flex items-center gap-2 whitespace-nowrap">
+                          <AtSign className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                          <span>{t("composer.mentions")}</span>
+                        </span>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={triggerSlashActionsFromButton}>
+                        <span className="flex items-center gap-2 whitespace-nowrap">
+                          <SquareSlash className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                          <span>{t("composer.actions")}</span>
+                        </span>
+                      </DropdownMenuItem>
+                    </DropdownMenuGroup>
                   </DropdownMenuContent>
                 </DropdownMenu>
 
@@ -1907,9 +1901,9 @@ export const OmniComposer = memo(function OmniComposer({
                         void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
                       }
                     }}
-                    className="orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] hover:bg-black/[0.10] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]"
+                    className="orbit-press bg-surface-recessed hover:bg-accent inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full"
                   >
-                    <span className="size-[11px] rounded-[2.5px] bg-[#EF4444]" />
+                    <span className="bg-signal-danger size-[11px] rounded-[2.5px]" />
                   </button>
                 ) : (
                   <button
@@ -1924,8 +1918,8 @@ export const OmniComposer = memo(function OmniComposer({
                     className={cn(
                       "orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full",
                       hasPayload
-                        ? "bg-[#141416] text-white hover:bg-[#27272A] dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
-                        : "text-foreground/30 pointer-events-none bg-black/[0.055] dark:bg-white/[0.08] dark:text-white/30",
+                        ? "bg-action-primary text-action-primary-fg hover:opacity-90"
+                        : "text-ink-muted bg-surface-recessed pointer-events-none opacity-65",
                     )}
                   >
                     <ArrowUp className="size-[17px] stroke-[2.15]" />

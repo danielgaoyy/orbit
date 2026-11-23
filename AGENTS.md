@@ -29,7 +29,7 @@
 | 你准备做什么（触发场景） | 动手前**必须**先读的权威文档 / Skill |
 | --- | --- |
 | 任何提交、创建 PR、版本号升级或切 Tag 发版 | [`docs/engineering/git-pr-release-workflow.md`](docs/engineering/git-pr-release-workflow.md) |
-| 任何 UI / 布局 / 样式 / 交互组件改动（`apps/`） | [`.agents/skills/interface-design/SKILL.md`](.agents/skills/interface-design/SKILL.md) + [`docs/design/README.md`](docs/design/README.md)（若存在 `.interface-design/system.md` 需一并读取） |
+| 任何 UI / 布局 / 样式 / 交互组件改动（`apps/`） | [`.agents/skills/interface-design/SKILL.md`](.agents/skills/interface-design/SKILL.md) + [`.agents/skills/shadcn/SKILL.md`](.agents/skills/shadcn/SKILL.md) + [`docs/design/README.md`](docs/design/README.md)（及 `.interface-design/system.md`） |
 | 修改跨端 FFI / Tauri IPC / Stage / Sidebar / 共享状态 | [`docs/CLIENT_BRIDGE_ARCHITECTURE.md`](docs/CLIENT_BRIDGE_ARCHITECTURE.md) |
 | 修改 Daemon / Shim / Provider 驱动 / 消息防错位 / 尾部分页 | [`docs/architecture/daemon-shim-providers.md`](docs/architecture/daemon-shim-providers.md) |
 | 修改 Mission Workspace 多 Agent 协作 / Board / Worktree / 定时器 | [`docs/architecture/mission-workspace-collab.md`](docs/architecture/mission-workspace-collab.md) |

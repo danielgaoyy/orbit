@@ -23,9 +23,12 @@ import {
 } from "lucide-react";
 import { DiffFilesViewer, type ReviewCommentDraft } from "@/components/diff-viewer";
 import { CreatePrDialog } from "@/components/side-panel/create-pr-dialog";
+import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Textarea } from "@/components/ui/textarea";
 import {
   buildSingleHunkPatch,
   deriveDefaultPrTitle,
@@ -991,14 +994,14 @@ export const ReviewTab = memo(function ReviewTab({
           )}
 
           {(fileSelectorItems.length > 3 || fileQuery.length > 0) && (
-            <div className="bg-muted/60 border-border/70 flex h-[26px] items-center gap-1.5 rounded-md border px-2">
-              <Search className="text-muted-foreground h-[12px] w-[12px] shrink-0" />
-              <input
+            <div className="relative">
+              <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 h-[12px] w-[12px] -translate-y-1/2" />
+              <Input
                 type="text"
                 value={fileQuery}
                 onChange={(e) => setFileQuery(e.target.value)}
                 placeholder={t("review.filterFilesPlaceholder")}
-                className="text-foreground placeholder:text-muted-foreground min-w-0 flex-1 bg-transparent text-[11.5px] outline-none"
+                className="h-[26px] rounded-[6px] pl-7 text-[11.5px]"
               />
             </div>
           )}
@@ -1228,7 +1231,7 @@ export const ReviewTab = memo(function ReviewTab({
 
           {commitBarExpanded && (
             <div className="mt-2 space-y-2">
-              <textarea
+              <Textarea
                 rows={2}
                 disabled={isCommitting}
                 value={commitMessage}
@@ -1246,7 +1249,7 @@ export const ReviewTab = memo(function ReviewTab({
                     ? t("review.amendPlaceholder", { shortcut: commitShortcutLabel })
                     : t("review.commitPlaceholder", { shortcut: commitShortcutLabel })
                 }
-                className="border-border bg-muted/35 text-foreground placeholder:text-muted-foreground focus:bg-background focus:border-foreground/25 max-h-[120px] min-h-[52px] w-full resize-y rounded-lg border px-2.5 py-1.5 text-[12px] leading-relaxed transition-colors outline-none disabled:opacity-55"
+                className="max-h-[120px] min-h-[52px] resize-y px-2.5 py-1.5 text-[12px] leading-relaxed"
               />
 
               {!amendCommit && stagedCount === 0 && (
@@ -1256,12 +1259,13 @@ export const ReviewTab = memo(function ReviewTab({
               )}
 
               <div className="flex items-center justify-between gap-2">
-                <button
+                <Button
                   type="button"
+                  size="xs"
                   disabled={!canCommit}
                   title={commitDisabledHint}
                   onClick={() => void handleCommit()}
-                  className="bg-foreground text-background inline-flex h-[28px] cursor-pointer items-center justify-center gap-1.5 rounded-lg px-3 text-[12px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-40"
+                  className="h-[28px] gap-1.5 px-3 text-[12px]"
                 >
                   {isCommitting ? (
                     <Loader2 className="h-[12px] w-[12px] animate-spin" />
@@ -1269,15 +1273,17 @@ export const ReviewTab = memo(function ReviewTab({
                     <GitCommitHorizontal className="h-[13px] w-[13px]" />
                   )}
                   <span>{amendCommit ? t("review.amendCommit") : t("review.commit")}</span>
-                </button>
+                </Button>
 
                 <div className="flex items-center gap-1.5">
-                  <button
+                  <Button
                     type="button"
+                    variant="outline"
+                    size="xs"
                     disabled={isPushing}
                     title={t("review.pushTitle")}
                     onClick={() => void handlePush()}
-                    className="border-border bg-background text-foreground/85 hover:bg-accent hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
+                    className="h-[28px] px-2.5 text-[12px]"
                   >
                     {isPushing ? (
                       <Loader2 className="h-[12px] w-[12px] animate-spin" />
@@ -1290,16 +1296,18 @@ export const ReviewTab = memo(function ReviewTab({
                         ↑{aheadCount}
                       </span>
                     )}
-                  </button>
+                  </Button>
 
-                  <button
+                  <Button
                     type="button"
+                    variant="outline"
+                    size="xs"
                     onClick={() => setPrDialogOpen(true)}
-                    className="border-border bg-background text-foreground/85 hover:bg-accent hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+                    className="h-[28px] gap-1.5 px-2.5 text-[12px]"
                   >
                     <GitPullRequest className="h-[12px] w-[12px]" />
                     <span>{t("review.createPr")}</span>
-                  </button>
+                  </Button>
                 </div>
               </div>
             </div>

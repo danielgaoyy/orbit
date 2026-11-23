@@ -1,13 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertCircle, GitPullRequest, Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
-import { Checkbox } from "@/components/ui/checkbox";
+import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { orbitIpc, type GitCreatePrResult } from "@/lib/orbit-ipc";
@@ -123,15 +128,10 @@ export function CreatePrDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-3">
-          <div className="space-y-1">
-            <label
-              htmlFor="orbit-pr-title"
-              className="text-foreground/85 block text-[11.5px] font-medium"
-            >
-              {t("review.prTitleLabel")}
-            </label>
-            <input
+        <FieldGroup className="gap-3">
+          <Field>
+            <FieldLabel htmlFor="orbit-pr-title">{t("review.prTitleLabel")}</FieldLabel>
+            <Input
               id="orbit-pr-title"
               type="text"
               autoFocus
@@ -147,18 +147,12 @@ export function CreatePrDialog({
                 }
               }}
               placeholder={t("review.prTitlePlaceholder")}
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground focus:border-foreground/30 h-[32px] w-full rounded-lg border px-2.5 text-[12.5px] transition-colors outline-none disabled:opacity-55"
             />
-          </div>
+          </Field>
 
-          <div className="space-y-1">
-            <label
-              htmlFor="orbit-pr-body"
-              className="text-foreground/85 block text-[11.5px] font-medium"
-            >
-              {t("review.prBodyLabel")}
-            </label>
-            <textarea
+          <Field>
+            <FieldLabel htmlFor="orbit-pr-body">{t("review.prBodyLabel")}</FieldLabel>
+            <Textarea
               id="orbit-pr-body"
               rows={5}
               disabled={submitting}
@@ -173,18 +167,13 @@ export function CreatePrDialog({
                 }
               }}
               placeholder={t("review.prBodyPlaceholder")}
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground focus:border-foreground/30 w-full resize-y rounded-lg border px-2.5 py-2 text-[12.5px] leading-relaxed transition-colors outline-none disabled:opacity-55"
+              className="resize-y leading-relaxed"
             />
-          </div>
+          </Field>
 
-          <div className="space-y-1">
-            <label
-              htmlFor="orbit-pr-base"
-              className="text-foreground/85 block text-[11.5px] font-medium"
-            >
-              {t("review.prBaseLabel")}
-            </label>
-            <input
+          <Field>
+            <FieldLabel htmlFor="orbit-pr-base">{t("review.prBaseLabel")}</FieldLabel>
+            <Input
               id="orbit-pr-base"
               type="text"
               disabled={submitting}
@@ -199,11 +188,11 @@ export function CreatePrDialog({
                 }
               }}
               placeholder={t("review.prBasePlaceholder")}
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground focus:border-foreground/30 h-[30px] w-full rounded-lg border px-2.5 font-mono text-[12px] transition-colors outline-none disabled:opacity-55"
+              className="h-[30px] font-mono text-[12px]"
             />
-          </div>
+          </Field>
 
-          <label className="text-foreground/85 flex cursor-pointer items-center gap-2 pt-0.5 text-[12px] select-none">
+          <Field orientation="horizontal" className="justify-start gap-2 pt-0.5">
             <Checkbox
               id="orbit-pr-draft"
               size="sm"
@@ -211,39 +200,39 @@ export function CreatePrDialog({
               disabled={submitting}
               onCheckedChange={setDraft}
             />
-            <span>{t("review.prDraftLabel")}</span>
-          </label>
-        </div>
+            <FieldLabel htmlFor="orbit-pr-draft" className="cursor-pointer font-normal">
+              {t("review.prDraftLabel")}
+            </FieldLabel>
+          </Field>
+        </FieldGroup>
 
         {errorMessage && (
-          <div
-            role="alert"
-            className="flex items-start gap-2 rounded-[10px] border border-rose-500/25 bg-rose-500/[0.08] px-3 py-2 text-[12px] leading-relaxed text-rose-600 dark:text-rose-300"
-          >
+          <FieldError className="border-signal-danger-border bg-signal-danger-bg flex items-start gap-2 rounded-[10px] border px-3 py-2 leading-relaxed">
             <AlertCircle className="mt-0.5 h-[13.5px] w-[13.5px] shrink-0" />
             <span className="selectable-text min-w-0 break-words">{errorMessage}</span>
-          </div>
+          </FieldError>
         )}
 
-        <div className="flex items-center justify-end gap-2 pt-0.5">
-          <button
+        <DialogFooter className="pt-0.5">
+          <Button
             type="button"
+            variant="outline"
+            size="sm"
             disabled={submitting}
             onClick={() => onOpenChange(false)}
-            className="border-border bg-background text-foreground/80 hover:bg-accent hover:text-foreground inline-flex h-[30px] cursor-pointer items-center justify-center rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
           >
             {t("common.cancel")}
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
+            size="sm"
             disabled={!canSubmit}
             onClick={() => void handleSubmit()}
-            className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center justify-center gap-1.5 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-40"
           >
             {submitting && <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />}
             <span>{draft ? t("review.prSubmitDraft") : t("review.prSubmit")}</span>
-          </button>
-        </div>
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

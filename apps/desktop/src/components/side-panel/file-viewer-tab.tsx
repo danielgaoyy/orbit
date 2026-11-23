@@ -38,6 +38,7 @@ import {
 } from "@/lib/file-viewer-shortcuts";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
+import { SimpleTooltip } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { formatFileSizeCompact } from "@/lib/session-insights";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
@@ -798,24 +799,25 @@ export const FileViewerTab = memo(function FileViewerTab({
                 View
               </button>
               {isEditable && (
-                <button
-                  type="button"
-                  title={`Edit file (${mod}E)`}
-                  onClick={() => {
-                    setFindOpen(false);
-                    setPendingMarkdownTarget(null);
-                    orbitActions.enterFileEditMode(hostId, cwd, path);
-                  }}
-                  className={cn(
-                    "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
-                    isEditMode
-                      ? "bg-background text-foreground shadow-2xs"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  <Pencil className="h-[11px] w-[11px]" />
-                  Edit
-                </button>
+                <SimpleTooltip label="Edit file" shortcut={`${mod}E`}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFindOpen(false);
+                      setPendingMarkdownTarget(null);
+                      orbitActions.enterFileEditMode(hostId, cwd, path);
+                    }}
+                    className={cn(
+                      "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
+                      isEditMode
+                        ? "bg-background text-foreground shadow-2xs"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <Pencil className="h-[11px] w-[11px]" />
+                    Edit
+                  </button>
+                </SimpleTooltip>
               )}
             </div>
           ) : (
@@ -833,46 +835,48 @@ export const FileViewerTab = memo(function FileViewerTab({
                 >
                   View
                 </button>
-                <button
-                  type="button"
-                  title={`Edit file (${mod}E)`}
-                  onClick={() => {
-                    setFindOpen(false);
-                    orbitActions.enterFileEditMode(hostId, cwd, path);
-                  }}
-                  className={cn(
-                    "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
-                    isEditMode
-                      ? "bg-background text-foreground shadow-2xs"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  Edit
-                </button>
+                <SimpleTooltip label="Edit file" shortcut={`${mod}E`}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFindOpen(false);
+                      orbitActions.enterFileEditMode(hostId, cwd, path);
+                    }}
+                    className={cn(
+                      "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
+                      isEditMode
+                        ? "bg-background text-foreground shadow-2xs"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    Edit
+                  </button>
+                </SimpleTooltip>
               </div>
             )
           )}
 
           {isEditMode && (
-            <button
-              type="button"
-              title={`Save file (${mod}S)`}
-              disabled={draft?.saving || !isDirty}
-              onClick={() => void orbitActions.saveWorkspaceFile(hostId, cwd, path, false)}
-              className={cn(
-                "inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors disabled:cursor-default disabled:opacity-45",
-                isDirty
-                  ? "bg-foreground text-background hover:opacity-90"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
-              )}
-            >
-              {draft?.saving ? (
-                <Loader2 className="h-[12px] w-[12px] animate-spin" />
-              ) : (
-                <Save className="h-[12px] w-[12px]" />
-              )}
-              Save
-            </button>
+            <SimpleTooltip label="Save file" shortcut={`${mod}S`}>
+              <button
+                type="button"
+                disabled={draft?.saving || !isDirty}
+                onClick={() => void orbitActions.saveWorkspaceFile(hostId, cwd, path, false)}
+                className={cn(
+                  "inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium transition-colors disabled:cursor-default disabled:opacity-45",
+                  isDirty
+                    ? "bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover"
+                    : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                )}
+              >
+                {draft?.saving ? (
+                  <Loader2 className="h-[12px] w-[12px] animate-spin" />
+                ) : (
+                  <Save className="h-[12px] w-[12px]" />
+                )}
+                Save
+              </button>
+            </SimpleTooltip>
           )}
 
           {hasGitDiff && (
@@ -904,19 +908,20 @@ export const FileViewerTab = memo(function FileViewerTab({
           {data?.content_kind === "text" && (
             <>
               {!isEditMode && (
-                <button
-                  type="button"
-                  title={`Find in file (${mod}F)`}
-                  onClick={openFind}
-                  className={cn(
-                    "inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors",
-                    findOpen
-                      ? "bg-accent text-foreground"
-                      : "text-muted-foreground hover:bg-accent hover:text-foreground",
-                  )}
-                >
-                  <Search className="h-[13px] w-[13px]" />
-                </button>
+                <SimpleTooltip label="Find in file" shortcut={`${mod}F`}>
+                  <button
+                    type="button"
+                    onClick={openFind}
+                    className={cn(
+                      "inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors",
+                      findOpen
+                        ? "bg-accent text-foreground"
+                        : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                    )}
+                  >
+                    <Search className="h-[13px] w-[13px]" />
+                  </button>
+                </SimpleTooltip>
               )}
               <button
                 type="button"

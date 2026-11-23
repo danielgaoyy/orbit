@@ -27,7 +27,9 @@ import { ArtifactSandboxFrame } from "@/components/artifacts/artifact-sandbox-fr
 import { formatArtifactInlineComment } from "@/components/artifacts/mcp-app-bridge";
 import { DiagramBlock } from "@/components/diagram-block";
 import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
+import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Textarea } from "@/components/ui/textarea";
 import { resolveTokenColor } from "@/lib/code-highlight";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
@@ -275,7 +277,7 @@ const InlineArtifactCommentComposer = memo(function InlineArtifactCommentCompose
           {excerpt}
         </div>
       )}
-      <textarea
+      <Textarea
         autoFocus
         rows={2}
         value={text}
@@ -292,24 +294,15 @@ const InlineArtifactCommentComposer = memo(function InlineArtifactCommentCompose
           }
         }}
         placeholder="Comment on this artifact for the agent… (Enter to attach)"
-        className="border-border bg-background text-foreground placeholder:text-muted-foreground w-full resize-none rounded-md border px-2 py-1.5 text-[12px] leading-relaxed outline-none focus:border-foreground/30"
+        className="min-h-[54px] resize-none rounded-[6px] px-2 py-1.5 text-[12px] leading-relaxed"
       />
       <div className="mt-1.5 flex items-center justify-end gap-1.5">
-        <button
-          type="button"
-          onClick={onCancel}
-          className="text-muted-foreground hover:text-foreground cursor-pointer rounded-md px-2 py-0.5 text-[11.5px]"
-        >
+        <Button type="button" variant="ghost" size="xs" onClick={onCancel}>
           Cancel
-        </button>
-        <button
-          type="button"
-          disabled={!text.trim()}
-          onClick={submit}
-          className="bg-foreground text-background cursor-pointer rounded-md px-2.5 py-0.5 text-[11.5px] font-medium transition-opacity hover:opacity-90 disabled:cursor-default disabled:opacity-40"
-        >
+        </Button>
+        <Button type="button" size="xs" disabled={!text.trim()} onClick={submit}>
           Attach comment
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -842,7 +835,7 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
           ) : (
             <button
               type="button"
-              title="Delete artifact"
+              title="Delete"
               disabled={!currentDetail || deleting}
               onClick={() => setConfirmDeleteOpen(true)}
               className="text-muted-foreground hover:text-rose-500 inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] disabled:opacity-40 dark:hover:bg-white/[0.07]"

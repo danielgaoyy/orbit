@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Archive, MoreHorizontal } from "lucide-react";
 import {
   type AgentCardView,
@@ -12,20 +12,25 @@ import { splitHighlightSegments } from "@/lib/fuzzy-match";
 import type { MenuAnchorBox } from "@/components/sidebar/sidebar-menus";
 import {
   ConversationStatusGlyph,
-  formatCompactRelativeTime,
+  SidebarRelativeTime,
 } from "@/components/sidebar/sidebar-primitives";
+import type { ThreadDragSource } from "@/components/sidebar/use-sidebar-drag";
+import { IconButton } from "@/components/ui/icon-button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { orbitActions, useHasThreadDraft } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-const DRAFT_BADGE_CLASS = "text-muted-foreground/70 text-[11px] font-medium leading-none";
+const DRAFT_BADGE_CLASS = "text-ink-muted text-[11px] font-medium leading-none";
 
 export interface SidebarConversationRowProps {
   threadKey: string;
+  navId: string;
   host: HostCardView;
   agent: AgentCardView;
   projectName: string;
   effectiveTitle: string;
+  /** Optional subtle project context tag (used in Attention & multi-project Pinned rows) */
+  contextLabel?: string;
   isWorktree: boolean;
   isPinned: boolean;
   isUnread: boolean;
@@ -34,14 +39,30 @@ export interface SidebarConversationRowProps {
   keyboardFocused?: boolean;
   highlightIndices?: readonly number[];
   isChild: boolean;
+  /** True when rendered inside a Group's own vertical-rail container (compact gutter, no duplicate border-l) */
+  inGroupRail?: boolean;
   peerHandle?: string | null;
-  nowMs: number;
   menuOpen: boolean;
   isRenaming: boolean;
-  rowRef?: (el: HTMLDivElement | null) => void;
+  /** Drag metadata primitives (kept flat so React.memo stays intact across renders) */
+  dragProjectId?: string;
+  dragScopeKey?: string;
+  dragWorkspaceId?: string | null;
   isDragging?: boolean;
   dropIndicator?: "before" | "after" | null;
-  onThreadPointerDown?: (e: React.PointerEvent<HTMLDivElement>) => void;
+  onRegisterNavRow?: (navId: string, el: HTMLElement | null) => void;
+  onRegisterThreadRow?: (
+    refKey: string,
+    entry: {
+      hostId: string;
+      projectId: string;
+      agentId: string;
+      scopeKey: string;
+      workspaceId: string | null;
+    } | null,
+    el: HTMLDivElement | null,
+  ) => void;
+  onStartThreadDrag?: (e: React.PointerEvent<HTMLDivElement>, source: ThreadDragSource) => void;
   shouldSuppressClick?: () => boolean;
   onOpenMenu: (
     threadKey: string,
@@ -57,10 +78,12 @@ export interface SidebarConversationRowProps {
 
 export const SidebarConversationRow = memo(function SidebarConversationRow({
   threadKey,
+  navId,
   host,
   agent,
   projectName,
   effectiveTitle,
+  contextLabel,
   isWorktree,
   isPinned,
   isUnread,
@@ -69,14 +92,18 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   keyboardFocused = false,
   highlightIndices,
   isChild,
+  inGroupRail = false,
   peerHandle,
-  nowMs,
   menuOpen,
   isRenaming,
-  rowRef,
+  dragProjectId,
+  dragScopeKey,
+  dragWorkspaceId = null,
   isDragging = false,
   dropIndicator = null,
-  onThreadPointerDown,
+  onRegisterNavRow,
+  onRegisterThreadRow,
+  onStartThreadDrag,
   shouldSuppressClick,
   onOpenMenu,
   onStartRename,
@@ -85,16 +112,17 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   const [renameDraft, setRenameDraft] = useState(effectiveTitle);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const renameCancelledRef = useRef(false);
+  const renameCommittedRef = useRef(false);
   const ime = useImeCompositionGuard();
   const { t } = useI18n();
 
   const isForegroundRunning = isAgentForegroundRunning(agent);
-  const relativeLabel = formatCompactRelativeTime(agent.updated_at_rfc3339, nowMs);
   const hasUnsentDraft = useHasThreadDraft(threadKey, !selected);
 
   useEffect(() => {
     if (!isRenaming) return;
     renameCancelledRef.current = false;
+    renameCommittedRef.current = false;
     setRenameDraft(effectiveTitle);
     const raf = window.requestAnimationFrame(() => {
       renameInputRef.current?.focus();
@@ -103,7 +131,63 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
     return () => window.cancelAnimationFrame(raf);
   }, [isRenaming, effectiveTitle]);
 
+  const setCombinedRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      onRegisterNavRow?.(navId, el);
+      if (onRegisterThreadRow && dragProjectId && dragScopeKey) {
+        const refKey = `${host.host_id}::${agent.agent_id}`;
+        onRegisterThreadRow(
+          refKey,
+          {
+            hostId: host.host_id,
+            projectId: dragProjectId,
+            agentId: agent.agent_id,
+            scopeKey: dragScopeKey,
+            workspaceId: dragWorkspaceId,
+          },
+          el,
+        );
+      }
+    },
+    [
+      onRegisterNavRow,
+      navId,
+      onRegisterThreadRow,
+      dragProjectId,
+      dragScopeKey,
+      dragWorkspaceId,
+      host.host_id,
+      agent.agent_id,
+    ],
+  );
+
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (isRenaming || !onStartThreadDrag || !dragProjectId || !dragScopeKey) return;
+      onStartThreadDrag(e, {
+        hostId: host.host_id,
+        projectId: dragProjectId,
+        agentId: agent.agent_id,
+        title: effectiveTitle,
+        scopeKey: dragScopeKey,
+        workspaceId: dragWorkspaceId,
+      });
+    },
+    [
+      isRenaming,
+      onStartThreadDrag,
+      dragProjectId,
+      dragScopeKey,
+      dragWorkspaceId,
+      host.host_id,
+      agent.agent_id,
+      effectiveTitle,
+    ],
+  );
+
   const commitRename = () => {
+    if (renameCommittedRef.current) return;
+    renameCommittedRef.current = true;
     if (renameCancelledRef.current) {
       renameCancelledRef.current = false;
       onFinishRename();
@@ -113,9 +197,11 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
     onFinishRename();
   };
 
-  const showSemanticBadge = Boolean(peerHandle && !isGenericHarnessHandle(peerHandle));
+  const semanticHandleLabel =
+    peerHandle && !isGenericHarnessHandle(peerHandle) ? `@${peerHandle}` : null;
   const hoverTooltip = [
-    isPinned ? `${effectiveTitle} · ${projectName}` : effectiveTitle,
+    isPinned || contextLabel ? `${effectiveTitle} · ${projectName}` : effectiveTitle,
+    semanticHandleLabel,
     hasUnsentDraft ? t("sidebar.unsentDraft") : null,
     agent.task_summary ? agent.task_summary : null,
   ]
@@ -124,8 +210,8 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
 
   return (
     <div
-      ref={rowRef}
-      onPointerDown={isRenaming ? undefined : onThreadPointerDown}
+      ref={setCombinedRef}
+      onPointerDown={onStartThreadDrag ? handlePointerDown : undefined}
       title={hoverTooltip}
       onClick={() => {
         if (shouldSuppressClick?.()) return;
@@ -145,15 +231,14 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
       }}
       className={cn(
         "group/item relative flex h-[30px] cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 transition-colors",
-        isChild && "ml-[24px] border-l border-black/[0.08] pl-2.5 dark:border-white/[0.10]",
+        isChild && !inGroupRail && "border-border-subtle ml-[24px] border-l pl-2.5",
         isDragging && "opacity-45",
         selected
-          ? "text-foreground bg-black/[0.06] font-medium dark:bg-white/[0.085]"
+          ? "bg-accent text-ink-primary font-medium"
           : isUnread
-            ? "text-foreground font-medium hover:bg-black/[0.038] dark:hover:bg-white/[0.05]"
-            : "text-foreground/76 hover:text-foreground hover:bg-black/[0.038] dark:hover:bg-white/[0.05]",
-        keyboardFocused &&
-          "bg-black/[0.055] text-foreground ring-foreground/20 ring-1 ring-inset dark:bg-white/[0.085]",
+            ? "text-ink-primary hover:bg-accent/55 font-medium"
+            : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
+        keyboardFocused && "bg-accent text-ink-primary ring-border-strong ring-1 ring-inset",
       )}
     >
       {dropIndicator === "before" && (
@@ -162,9 +247,15 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
       {dropIndicator === "after" && (
         <div className="bg-primary pointer-events-none absolute right-1.5 -bottom-[1px] left-1.5 z-20 h-[2px] rounded-full" />
       )}
-      {/* Left `16×16` Status Gutter (`x = 24px` center) + Title (`x = 42px` left edge) */}
-      <div className="flex min-w-0 flex-1 items-center gap-2.5">
-        {!isChild ? (
+
+      {/* Left Status Gutter (`16×16` on top-level rows; zero blank gutter on idle grouped/child rows) + Title */}
+      <div
+        className={cn(
+          "flex min-w-0 flex-1 items-center",
+          inGroupRail || isChild ? "gap-1.5" : "gap-2.5",
+        )}
+      >
+        {!isChild && !inGroupRail ? (
           <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
             <ConversationStatusGlyph
               agent={agent}
@@ -201,7 +292,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
                 onFinishRename();
               }
             }}
-            className="bg-background text-foreground ring-foreground/25 -mx-1.5 h-[22px] w-full min-w-0 rounded-[5px] px-1.5 text-[13.5px] font-normal ring-1 outline-none"
+            className="bg-surface-base text-ink-primary ring-border-strong -mx-1.5 h-[22px] w-full min-w-0 rounded-[5px] px-1.5 text-[13px] font-normal ring-1 outline-none"
           />
         ) : (
           <span
@@ -209,41 +300,45 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
               e.stopPropagation();
               onStartRename(threadKey);
             }}
-            className="flex min-w-0 items-center gap-1.5 truncate text-[13.5px]"
+            className="min-w-0 flex-1 truncate text-[13px]"
           >
-            {showSemanticBadge && (
-              <span className="bg-black/[0.06] text-foreground/75 max-w-20 shrink-0 truncate rounded px-1 py-[1px] text-[10.5px] font-medium dark:bg-white/[0.09]">
-                {peerHandle}
-              </span>
-            )}
-            <span className="truncate">
-              {highlightIndices && highlightIndices.length > 0
-                ? splitHighlightSegments(effectiveTitle, highlightIndices).map((seg, idx) =>
-                    seg.matched ? (
-                      <mark
-                        key={idx}
-                        className="text-foreground rounded-[2px] bg-foreground/[0.08] font-semibold dark:bg-foreground/[0.15]"
-                      >
-                        {seg.text}
-                      </mark>
-                    ) : (
-                      <span key={idx}>{seg.text}</span>
-                    ),
-                  )
-                : effectiveTitle}
-            </span>
+            {highlightIndices && highlightIndices.length > 0
+              ? splitHighlightSegments(effectiveTitle, highlightIndices).map((seg, idx) =>
+                  seg.matched ? (
+                    <mark
+                      key={idx}
+                      className="text-ink-primary bg-ink-primary/10 rounded-[2px] font-semibold"
+                    >
+                      {seg.text}
+                    </mark>
+                  ) : (
+                    <span key={idx}>{seg.text}</span>
+                  ),
+                )
+              : effectiveTitle}
           </span>
         )}
       </div>
 
-      {/* Right Slot: Resting Loading / Draft / Relative Time ↔ Hover Actions */}
+      {/* Right Slot: natural resting width (maximizes title readability) ↔ hover action buttons */}
       {!isRenaming && (
-        <div className="flex min-w-[46px] shrink-0 items-center justify-end">
+        <div className="flex shrink-0 items-center justify-end gap-1.5">
+          {contextLabel && (
+            <span
+              className={cn(
+                "text-ink-faint max-w-[74px] truncate text-[11px] leading-none",
+                menuOpen ? "hidden" : "inline group-hover/item:hidden",
+              )}
+            >
+              {contextLabel}
+            </span>
+          )}
+
           {isForegroundRunning || hasRunningSubagents ? (
             <span
-              title={!isForegroundRunning && hasRunningSubagents ? "Subagent running" : undefined}
+              title={!isForegroundRunning && hasRunningSubagents ? t("sidebar.subagentRunning") : undefined}
               className={cn(
-                "text-foreground/65 items-center justify-center gap-1.5 pr-0.5",
+                "text-ink-secondary items-center justify-center gap-1.5",
                 menuOpen ? "hidden" : "inline-flex group-hover/item:hidden",
               )}
             >
@@ -265,14 +360,13 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
               {t("sidebar.draft")}
             </span>
           ) : (
-            <span
+            <SidebarRelativeTime
+              rfc3339={agent.updated_at_rfc3339}
               className={cn(
-                "text-muted-foreground/58 tabular-nums text-[12px] leading-none",
+                "text-ink-faint tabular-nums text-[11.5px] leading-none",
                 menuOpen ? "hidden" : "group-hover/item:hidden",
               )}
-            >
-              {relativeLabel}
-            </span>
+            />
           )}
 
           <div
@@ -283,17 +377,16 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
             )}
             onClick={(e) => e.stopPropagation()}
           >
-            <button
-              type="button"
-              title={t("sidebar.archiveConversation")}
+            <IconButton
+              size="xs"
+              tooltip={t("sidebar.archiveConversation")}
               onClick={() => orbitActions.archiveThread(host.host_id, agent.agent_id)}
-              className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
             >
-              <Archive className="h-[13.5px] w-[13.5px] stroke-[1.75]" />
-            </button>
+              <Archive className="size-[13px] stroke-[1.75]" />
+            </IconButton>
 
-            <button
-              type="button"
+            <IconButton
+              size="xs"
               aria-label={t("sidebar.conversationOptions")}
               onClick={(e) => {
                 const r = e.currentTarget.getBoundingClientRect();
@@ -304,10 +397,9 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
                   height: r.height,
                 });
               }}
-              className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
             >
-              <MoreHorizontal className="h-[13.5px] w-[13.5px]" />
-            </button>
+              <MoreHorizontal className="size-[13.5px]" />
+            </IconButton>
           </div>
         </div>
       )}

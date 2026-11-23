@@ -20,7 +20,18 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog-tabs";
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import {
   type ImChannelRecord,
   type ImConnectionStatus,
@@ -214,10 +225,10 @@ function IdChipInput({
   };
 
   return (
-    <div className="space-y-1.5">
-      <label className="text-foreground block text-[12px] font-medium">{label}</label>
+    <Field>
+      <FieldLabel className="text-ink-primary">{label}</FieldLabel>
       <div className="flex items-center gap-1.5">
-        <input
+        <Input
           type="text"
           value={draft}
           onChange={(e) => onDraftChange(e.target.value)}
@@ -230,17 +241,18 @@ function IdChipInput({
             }
           }}
           placeholder={placeholder}
-          className="border-border bg-background text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/35 h-[30px] flex-1 rounded-lg border px-2.5 font-mono text-[12px] outline-none"
+          className="h-[30px] flex-1 font-mono text-[12px]"
         />
-        <button
+        <Button
           type="button"
+          variant="outline"
+          size="sm"
           onClick={flushDraft}
           disabled={!draft.trim()}
-          className="border-border bg-background text-foreground hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
         >
           <Plus className="h-[12px] w-[12px]" />
           Add
-        </button>
+        </Button>
       </div>
       {values.length > 0 && (
         <div className="flex flex-wrap gap-1 pt-0.5">
@@ -262,7 +274,7 @@ function IdChipInput({
           ))}
         </div>
       )}
-    </div>
+    </Field>
   );
 }
 
@@ -375,258 +387,245 @@ function ChannelModal({
   const displayError = localError ?? serverError;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 backdrop-blur-[2px]"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !saving) onClose();
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !saving) onClose();
       }}
     >
-      <div className="border-border bg-background flex max-h-[86vh] w-full max-w-[520px] flex-col overflow-hidden rounded-[14px] border shadow-2xl">
-        <div className="border-border flex items-center justify-between border-b px-5 py-3.5">
-          <div>
-            <h3 className="text-foreground text-[14.5px] font-semibold">
-              {isEditing ? "Edit IM Channel" : "Add IM Channel"}
-            </h3>
-            <p className="text-muted-foreground mt-0.5 text-[11.5px]">{meta.transportHint}</p>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={saving}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent flex h-7 w-7 cursor-pointer items-center justify-center rounded-lg transition-colors"
-            aria-label="Close"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
+      <DialogContent className="flex max-h-[86vh] max-w-[520px] flex-col overflow-hidden p-0">
+        <DialogHeader className="border-border-subtle border-b px-5 py-3.5">
+          <DialogTitle>{isEditing ? "Edit IM Channel" : "Add IM Channel"}</DialogTitle>
+          <DialogDescription>{meta.transportHint}</DialogDescription>
+        </DialogHeader>
 
-        <div className="space-y-4 overflow-y-auto px-5 py-4">
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="space-y-1.5">
-              <label className="text-foreground block text-[12px] font-medium">Platform</label>
-              <SettingSelect
-                value={form.platform}
-                options={PLATFORM_OPTIONS}
-                disabled={isEditing || saving}
-                triggerClassName="w-full"
-                onChange={(platform) => setForm((f) => ({ ...f, platform }))}
-              />
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-foreground block text-[12px] font-medium">Channel Name</label>
-              <input
-                type="text"
-                value={form.name}
-                disabled={saving}
-                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                placeholder={`e.g. ${meta.label} Ops`}
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/35 h-[30px] w-full rounded-lg border px-2.5 text-[12.5px] outline-none"
-              />
-            </div>
-          </div>
-
-          <div className="border-border bg-muted/20 space-y-3 rounded-xl border p-3.5">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-foreground text-[12px] font-medium">Credentials</span>
-              {isEditing && (form.hasExistingPrimary || form.hasExistingSigning) && (
-                <label className="text-muted-foreground flex cursor-pointer items-center gap-1.5 text-[11px] select-none">
-                  <Checkbox
-                    size="sm"
-                    checked={form.clearExistingSecrets}
-                    onCheckedChange={(checked) =>
-                      setForm((f) => ({ ...f, clearExistingSecrets: checked }))
-                    }
-                  />
-                  <span>Overwrite / clear saved secrets</span>
-                </label>
-              )}
-            </div>
-
-            {meta.showAppId && (
-              <div className="space-y-1">
-                <label className="text-muted-foreground block text-[11.5px] font-medium">
-                  {meta.appIdLabel}
-                </label>
-                <input
-                  type="text"
-                  value={form.appId}
-                  disabled={saving}
-                  onChange={(e) => setForm((f) => ({ ...f, appId: e.target.value }))}
-                  placeholder={meta.appIdPlaceholder}
-                  className="border-border bg-background text-foreground placeholder:text-muted-foreground/55 h-[30px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none"
+        <div className="orbit-native-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 py-4">
+          <FieldGroup className="gap-4">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field>
+                <FieldLabel className="text-ink-primary">Platform</FieldLabel>
+                <SettingSelect
+                  value={form.platform}
+                  options={PLATFORM_OPTIONS}
+                  disabled={isEditing || saving}
+                  triggerClassName="w-full"
+                  onChange={(platform) => setForm((f) => ({ ...f, platform }))}
                 />
-              </div>
-            )}
+              </Field>
 
-            <div className="space-y-1">
-              <div className="flex items-center justify-between">
-                <label className="text-muted-foreground text-[11.5px] font-medium">
-                  {meta.primaryLabel}
-                </label>
-                {isEditing && form.maskedPrimary && !form.clearExistingSecrets && (
-                  <span className="text-muted-foreground font-mono text-[10.5px]">
-                    Saved: {form.maskedPrimary}
-                  </span>
+              <Field>
+                <FieldLabel htmlFor="im-channel-name" className="text-ink-primary">
+                  Channel Name
+                </FieldLabel>
+                <Input
+                  id="im-channel-name"
+                  type="text"
+                  value={form.name}
+                  disabled={saving}
+                  onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+                  placeholder={`e.g. ${meta.label} Ops`}
+                />
+              </Field>
+            </div>
+
+            <div className="border-border bg-muted/20 rounded-xl border p-3.5">
+              <FieldGroup className="gap-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-foreground text-[12px] font-medium">Credentials</span>
+                  {isEditing && (form.hasExistingPrimary || form.hasExistingSigning) && (
+                    <label className="text-muted-foreground flex cursor-pointer items-center gap-1.5 text-[11px] select-none">
+                      <Checkbox
+                        size="sm"
+                        checked={form.clearExistingSecrets}
+                        onCheckedChange={(checked) =>
+                          setForm((f) => ({ ...f, clearExistingSecrets: checked }))
+                        }
+                      />
+                      <span>Overwrite / clear saved secrets</span>
+                    </label>
+                  )}
+                </div>
+
+                {meta.showAppId && (
+                  <Field>
+                    <FieldLabel htmlFor="im-app-id" className="text-[11.5px]">
+                      {meta.appIdLabel}
+                    </FieldLabel>
+                    <Input
+                      id="im-app-id"
+                      type="text"
+                      value={form.appId}
+                      disabled={saving}
+                      onChange={(e) => setForm((f) => ({ ...f, appId: e.target.value }))}
+                      placeholder={meta.appIdPlaceholder}
+                      className="font-mono text-[12px]"
+                    />
+                  </Field>
                 )}
-              </div>
-              <input
-                type="password"
-                value={form.primarySecret}
+
+                <Field>
+                  <div className="flex items-center justify-between">
+                    <FieldLabel htmlFor="im-primary-secret" className="text-[11.5px]">
+                      {meta.primaryLabel}
+                    </FieldLabel>
+                    {isEditing && form.maskedPrimary && !form.clearExistingSecrets && (
+                      <span className="text-muted-foreground font-mono text-[10.5px]">
+                        Saved: {form.maskedPrimary}
+                      </span>
+                    )}
+                  </div>
+                  <Input
+                    id="im-primary-secret"
+                    type="password"
+                    value={form.primarySecret}
+                    disabled={saving}
+                    onChange={(e) => setForm((f) => ({ ...f, primarySecret: e.target.value }))}
+                    placeholder={
+                      isEditing && form.hasExistingPrimary && !form.clearExistingSecrets
+                        ? "Leave blank to keep saved secret"
+                        : meta.primaryPlaceholder
+                    }
+                    className="font-mono text-[12px]"
+                  />
+                </Field>
+
+                <Field>
+                  <div className="flex items-center justify-between">
+                    <FieldLabel htmlFor="im-signing-secret" className="text-[11.5px]">
+                      {meta.signingLabel}
+                    </FieldLabel>
+                    {isEditing && form.maskedSigning && !form.clearExistingSecrets && (
+                      <span className="text-muted-foreground font-mono text-[10.5px]">
+                        Saved: {form.maskedSigning}
+                      </span>
+                    )}
+                  </div>
+                  <Input
+                    id="im-signing-secret"
+                    type="password"
+                    value={form.signingSecret}
+                    disabled={saving}
+                    onChange={(e) => setForm((f) => ({ ...f, signingSecret: e.target.value }))}
+                    placeholder={
+                      isEditing && form.hasExistingSigning && !form.clearExistingSecrets
+                        ? "Leave blank to keep saved secret"
+                        : meta.signingPlaceholder
+                    }
+                    className="font-mono text-[12px]"
+                  />
+                  <FieldDescription className="text-[11px]">
+                    {meta.signingRequiredHint}
+                  </FieldDescription>
+                </Field>
+              </FieldGroup>
+            </div>
+
+            <FieldGroup className="gap-3">
+              <IdChipInput
+                label="Allowed Chat / Channel IDs"
+                placeholder={meta.chatPlaceholder}
+                values={form.allowedChatIds}
+                draft={chatDraft}
+                onDraftChange={setChatDraft}
+                onChange={(allowedChatIds) => setForm((f) => ({ ...f, allowedChatIds }))}
+              />
+              <IdChipInput
+                label="Allowed User IDs"
+                placeholder={meta.userPlaceholder}
+                values={form.allowedUserIds}
+                draft={userDraft}
+                onDraftChange={setUserDraft}
+                onChange={(allowedUserIds) => setForm((f) => ({ ...f, allowedUserIds }))}
+              />
+              <FieldDescription className="text-[11px]">
+                Default-deny: inbound commands are rejected until at least one chat ID or user ID is
+                allowlisted.
+              </FieldDescription>
+            </FieldGroup>
+
+            <Field>
+              <FieldLabel htmlFor="im-default-workspace" className="text-ink-primary">
+                Default Workspace
+              </FieldLabel>
+              <Input
+                id="im-default-workspace"
+                type="text"
+                list="orbit-im-workspaces"
+                value={form.defaultWorkspaceCwd}
                 disabled={saving}
-                onChange={(e) => setForm((f) => ({ ...f, primarySecret: e.target.value }))}
-                placeholder={
-                  isEditing && form.hasExistingPrimary && !form.clearExistingSecrets
-                    ? "Leave blank to keep saved secret"
-                    : meta.primaryPlaceholder
-                }
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/55 h-[30px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none"
+                onChange={(e) => setForm((f) => ({ ...f, defaultWorkspaceCwd: e.target.value }))}
+                placeholder="/path/to/registered/workspace"
+                className="font-mono text-[12px]"
+              />
+              {workspaceOptions.length > 0 && (
+                <datalist id="orbit-im-workspaces">
+                  {workspaceOptions.map((dir) => (
+                    <option key={dir} value={dir} />
+                  ))}
+                </datalist>
+              )}
+            </Field>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field>
+                <FieldLabel className="text-ink-primary">Default Provider</FieldLabel>
+                <SettingSelect
+                  value={form.defaultProvider}
+                  options={providerOptions}
+                  disabled={saving}
+                  triggerClassName="w-full"
+                  onChange={(defaultProvider) => setForm((f) => ({ ...f, defaultProvider }))}
+                />
+              </Field>
+              <Field>
+                <FieldLabel className="text-ink-primary">Default Mode</FieldLabel>
+                <SettingSelect
+                  value={toPresetSessionMode(form.defaultMode)}
+                  options={MODE_OPTIONS}
+                  disabled={saving}
+                  triggerClassName="w-full"
+                  onChange={(defaultMode) => setForm((f) => ({ ...f, defaultMode }))}
+                />
+              </Field>
+            </div>
+
+            <div className="border-border flex items-center justify-between rounded-xl border px-3.5 py-2.5">
+              <div className="pr-3">
+                <div className="text-foreground text-[12.5px] font-medium">
+                  Forward Tool Approvals
+                </div>
+                <div className="text-muted-foreground text-[11px]">
+                  Send interactive approve / deny cards to this channel when bound agents request
+                  permission.
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={form.forwardApprovals}
+                disabled={saving}
+                ariaLabel="Forward tool approvals"
+                onChange={(forwardApprovals) => setForm((f) => ({ ...f, forwardApprovals }))}
               />
             </div>
 
-            <div className="space-y-1">
-              <div className="flex items-center justify-between">
-                <label className="text-muted-foreground text-[11.5px] font-medium">
-                  {meta.signingLabel}
-                </label>
-                {isEditing && form.maskedSigning && !form.clearExistingSecrets && (
-                  <span className="text-muted-foreground font-mono text-[10.5px]">
-                    Saved: {form.maskedSigning}
-                  </span>
-                )}
-              </div>
-              <input
-                type="password"
-                value={form.signingSecret}
-                disabled={saving}
-                onChange={(e) => setForm((f) => ({ ...f, signingSecret: e.target.value }))}
-                placeholder={
-                  isEditing && form.hasExistingSigning && !form.clearExistingSecrets
-                    ? "Leave blank to keep saved secret"
-                    : meta.signingPlaceholder
-                }
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/55 h-[30px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none"
-              />
-              <p className="text-muted-foreground/80 text-[11px]">{meta.signingRequiredHint}</p>
-            </div>
-          </div>
-
-          <div className="space-y-3">
-            <IdChipInput
-              label="Allowed Chat / Channel IDs"
-              placeholder={meta.chatPlaceholder}
-              values={form.allowedChatIds}
-              draft={chatDraft}
-              onDraftChange={setChatDraft}
-              onChange={(allowedChatIds) => setForm((f) => ({ ...f, allowedChatIds }))}
-            />
-            <IdChipInput
-              label="Allowed User IDs"
-              placeholder={meta.userPlaceholder}
-              values={form.allowedUserIds}
-              draft={userDraft}
-              onDraftChange={setUserDraft}
-              onChange={(allowedUserIds) => setForm((f) => ({ ...f, allowedUserIds }))}
-            />
-            <p className="text-muted-foreground text-[11px] leading-snug">
-              Default-deny: inbound commands are rejected until at least one chat ID or user ID is
-              allowlisted.
-            </p>
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="text-foreground block text-[12px] font-medium">
-              Default Workspace
-            </label>
-            <input
-              type="text"
-              list="orbit-im-workspaces"
-              value={form.defaultWorkspaceCwd}
-              disabled={saving}
-              onChange={(e) => setForm((f) => ({ ...f, defaultWorkspaceCwd: e.target.value }))}
-              placeholder="/path/to/registered/workspace"
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground/55 h-[30px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none"
-            />
-            {workspaceOptions.length > 0 && (
-              <datalist id="orbit-im-workspaces">
-                {workspaceOptions.map((dir) => (
-                  <option key={dir} value={dir} />
-                ))}
-              </datalist>
+            {displayError && (
+              <FieldError className="rounded-lg border border-rose-500/25 bg-rose-500/8 px-3 py-2">
+                {displayError}
+              </FieldError>
             )}
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="space-y-1.5">
-              <label className="text-foreground block text-[12px] font-medium">
-                Default Provider
-              </label>
-              <SettingSelect
-                value={form.defaultProvider}
-                options={providerOptions}
-                disabled={saving}
-                triggerClassName="w-full"
-                onChange={(defaultProvider) => setForm((f) => ({ ...f, defaultProvider }))}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-foreground block text-[12px] font-medium">Default Mode</label>
-              <SettingSelect
-                value={toPresetSessionMode(form.defaultMode)}
-                options={MODE_OPTIONS}
-                disabled={saving}
-                triggerClassName="w-full"
-                onChange={(defaultMode) => setForm((f) => ({ ...f, defaultMode }))}
-              />
-            </div>
-          </div>
-
-          <div className="border-border flex items-center justify-between rounded-xl border px-3.5 py-2.5">
-            <div className="pr-3">
-              <div className="text-foreground text-[12.5px] font-medium">
-                Forward Tool Approvals
-              </div>
-              <div className="text-muted-foreground text-[11px]">
-                Send interactive approve / deny cards to this channel when bound agents request
-                permission.
-              </div>
-            </div>
-            <ToggleSwitch
-              checked={form.forwardApprovals}
-              disabled={saving}
-              ariaLabel="Forward tool approvals"
-              onChange={(forwardApprovals) => setForm((f) => ({ ...f, forwardApprovals }))}
-            />
-          </div>
-
-          {displayError && (
-            <div className="rounded-lg border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-[12px] text-rose-700 dark:text-rose-300">
-              {displayError}
-            </div>
-          )}
+          </FieldGroup>
         </div>
 
-        <div className="border-border flex items-center justify-end gap-2 border-t px-5 py-3">
-          <button
-            type="button"
-            disabled={saving}
-            onClick={onClose}
-            className="border-border bg-background text-foreground hover:bg-accent h-[30px] cursor-pointer rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
-          >
+        <DialogFooter className="border-border-subtle border-t px-5 py-3">
+          <Button type="button" variant="outline" size="sm" disabled={saving} onClick={onClose}>
             Cancel
-          </button>
-          <button
-            type="button"
-            disabled={saving}
-            onClick={() => void handleSave()}
-            className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:opacity-50"
-          >
+          </Button>
+          <Button type="button" size="sm" disabled={saving} onClick={() => void handleSave()}>
             {saving && <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />}
             {isEditing ? "Save Changes" : "Create Channel"}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -994,7 +993,7 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
                           type="button"
                           disabled={!isOnline}
                           onClick={() => setConfirmDeleteId(ch.channel_id)}
-                          title="Delete channel"
+                          title="Delete"
                           className="text-muted-foreground hover:bg-rose-500/10 hover:text-rose-600 flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md transition-colors"
                         >
                           <Trash2 className="h-[12.5px] w-[12.5px]" />
@@ -1014,25 +1013,26 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
                   {isTesting && (
                     <div className="border-border bg-muted/25 space-y-2 rounded-lg border p-3">
                       <div className="flex flex-col gap-2 sm:flex-row">
-                        <input
+                        <Input
                           type="text"
                           value={testChatId}
                           onChange={(e) => setTestChatId(e.target.value)}
                           placeholder={`Target Chat ID (${meta.chatPlaceholder})`}
-                          className="border-border bg-background text-foreground h-[28px] w-full rounded-md border px-2.5 font-mono text-[11.5px] outline-none sm:w-[190px]"
+                          className="h-[28px] w-full font-mono text-[11.5px] sm:w-[190px]"
                         />
-                        <input
+                        <Input
                           type="text"
                           value={testMessage}
                           onChange={(e) => setTestMessage(e.target.value)}
                           placeholder="Test message"
-                          className="border-border bg-background text-foreground h-[28px] flex-1 rounded-md border px-2.5 text-[11.5px] outline-none"
+                          className="h-[28px] flex-1 text-[11.5px]"
                         />
-                        <button
+                        <Button
                           type="button"
+                          size="xs"
                           disabled={testBusy || !testChatId.trim()}
                           onClick={() => void handleSendTest(ch)}
-                          className="bg-foreground text-background inline-flex h-[28px] shrink-0 cursor-pointer items-center justify-center gap-1 rounded-md px-3 text-[11.5px] font-medium disabled:opacity-45"
+                          className="h-[28px] shrink-0 px-3"
                         >
                           {testBusy ? (
                             <Loader2 className="h-3 w-3 animate-spin" />
@@ -1040,7 +1040,7 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
                             <Send className="h-3 w-3" />
                           )}
                           Send
-                        </button>
+                        </Button>
                       </div>
                       {lastTest && (
                         <div

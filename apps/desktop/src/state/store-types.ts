@@ -306,7 +306,13 @@ export interface SideQuestionEntry {
   providerLabel: string;
 }
 
-export type OverviewSectionId = "review" | "files" | "terminal" | "tasks" | "subagents";
+export type OverviewSectionId =
+  | "review"
+  | "files"
+  | "terminal"
+  | "tasks"
+  | "subagents"
+  | "touched_files";
 
 export type ReviewScope = "working_tree" | "session_turns";
 export type DiffLayoutMode = "unified" | "split";
@@ -315,6 +321,7 @@ export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
 export type WorkspacePanelMode = "conversation" | "automations";
 export type TerminalCursorStyle = "bar" | "block" | "underline";
+export type TerminalThemeMode = "harmonized" | "high_contrast";
 export type SidebarProjectSort = "recent" | "alphabetical" | "manual";
 export type SidebarThreadFilter = "all" | "active_unread";
 
@@ -364,6 +371,11 @@ export type WindowedAgentStageView = AgentStageView & {
   oldest_loaded_seq?: number;
 };
 
+export interface StageRunningSubagentRef {
+  child_agent_id?: string | null;
+  provider_subagent_id?: string | null;
+}
+
 export interface OrbitUiState {
   fleet: FleetOverviewView;
   fleetHydrated: boolean;
@@ -406,6 +418,7 @@ export interface OrbitUiState {
   // Incremental stage projections keyed by `hostId::agentId` + Rust sidebar tree + slash commands
   stages: Record<string, WindowedAgentStageView>;
   sidebarView: FleetSidebarView | null;
+  stageRunningSubagentMeta: Record<string, readonly StageRunningSubagentRef[]>;
   slashCommands: SlashCommandView[];
   rewoundSessions: Record<string, true>;
 
@@ -446,7 +459,6 @@ export interface OrbitUiState {
   collapsedHostIds: Record<string, boolean>;
   collapsedProjectIds: Record<string, boolean>;
   collapsedWorkspaceIds: Record<string, boolean>;
-  collapsedInboxProjectIds: Record<string, boolean>;
   hiddenProjectKeys: Record<string, boolean>;
   threadCustomTitles: Record<string, string>;
   archivedThreads: Record<string, ArchivedThreadEntry>;
@@ -454,6 +466,7 @@ export interface OrbitUiState {
   threadManualOrder: Record<string, string[]>;
   sidebarProjectSort: SidebarProjectSort;
   sidebarThreadFilter: SidebarThreadFilter;
+  sidebarFilterFocusNonce: number;
 
   // Persistent Multi-Slot PTY Sessions (rendered inside Side Panel Terminal tab)
   terminalTabs: TerminalTabSession[];
@@ -604,6 +617,7 @@ export interface OrbitUiState {
   terminalFontSize: number;
   terminalCursorStyle: TerminalCursorStyle;
   terminalScrollback: number;
+  terminalThemeMode: TerminalThemeMode;
 }
 
 export interface PersistedPrefs {
@@ -624,6 +638,7 @@ export interface PersistedPrefs {
   terminalFontSize?: number;
   terminalCursorStyle?: TerminalCursorStyle;
   terminalScrollback?: number;
+  terminalThemeMode?: TerminalThemeMode;
   sidebarOpen?: boolean;
   sidebarWidth?: number;
   hiddenProjectKeys?: Record<string, boolean>;
@@ -632,7 +647,7 @@ export interface PersistedPrefs {
   archivedThreads?: Record<string, ArchivedThreadEntry>;
   archivedSubagents?: Record<string, true>;
   collapsedProjectIds?: Record<string, boolean>;
-  collapsedInboxProjectIds?: Record<string, boolean>;
+  collapsedWorkspaceIds?: Record<string, boolean>;
   seenAgentSeqs?: Record<string, number>;
   threadManualOrder?: Record<string, string[]>;
   sidebarProjectSort?: SidebarProjectSort;

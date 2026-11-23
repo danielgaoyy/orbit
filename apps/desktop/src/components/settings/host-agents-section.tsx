@@ -21,7 +21,10 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   PROVIDER_LIST,
   formatProviderShortLabel,
@@ -442,11 +445,10 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
         {addingProfile && (
           <div className="border-border bg-elevated/70 space-y-3 rounded-xl border p-3.5 text-[12.5px]">
             <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-              <input
+              <Input
                 value={profName}
                 onChange={(e) => setProfName(e.target.value)}
                 placeholder="Profile Name (e.g. Claude Architect)"
-                className="border-border bg-canvas rounded-lg border px-2.5 py-1.5 outline-none"
               />
               <SettingSelect<ProviderKind>
                 align="start"
@@ -456,11 +458,10 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
                 triggerClassName="w-full min-w-0 bg-canvas"
                 onChange={(provider) => setProfProvider(provider)}
               />
-              <input
+              <Input
                 value={profModel}
                 onChange={(e) => setProfModel(e.target.value)}
                 placeholder="Model slug (optional)"
-                className="border-border bg-canvas rounded-lg border px-2.5 py-1.5 outline-none"
               />
               <SettingSelect<PresetSessionMode>
                 align="start"
@@ -471,24 +472,23 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
                 onChange={(mode) => setProfMode(mode)}
               />
             </div>
-            <input
+            <Input
               value={profWhenToUse}
               onChange={(e) => setProfWhenToUse(e.target.value)}
               placeholder="When to use (helps orchestrators pick this profile automatically)"
-              className="border-border bg-canvas w-full rounded-lg border px-2.5 py-1.5 outline-none"
             />
-            <textarea
+            <Textarea
               rows={2}
               value={profSystemPrompt}
               onChange={(e) => setProfSystemPrompt(e.target.value)}
               placeholder="System prompt append (optional)"
-              className="border-border bg-canvas w-full rounded-lg border px-2.5 py-1.5 outline-none"
+              className="min-h-[60px]"
             />
-            <input
+            <Input
               value={profDisabledTools}
               onChange={(e) => setProfDisabledTools(e.target.value)}
               placeholder="Disabled MCP tools (comma-separated, e.g. delete_agent,kill_terminal)"
-              className="border-border bg-canvas w-full rounded-lg border px-2.5 py-1.5 font-mono text-[11.5px] outline-none"
+              className="font-mono text-[11.5px]"
             />
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-4">
@@ -721,26 +721,22 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
             ))
           )}
 
-          <div className="border-border flex flex-wrap items-center gap-2 border-t px-4 py-3">
-            <input
+          <div className="flex flex-wrap items-center gap-2 px-4 py-3">
+            <Input
               value={peerLabel}
               onChange={(e) => setPeerLabel(e.target.value)}
               placeholder="Label (optional)"
-              className="border-border bg-canvas w-36 rounded-lg border px-2.5 py-1.5 text-[12px] outline-none"
+              className="h-[30px] w-36 text-[12px]"
             />
-            <input
+            <Input
               value={peerUri}
               onChange={(e) => setPeerUri(e.target.value)}
               placeholder="Paste orbit://pair/... URI from another daemon"
-              className="border-border bg-canvas min-w-[200px] flex-1 rounded-lg border px-2.5 py-1.5 font-mono text-[12px] outline-none"
+              className="h-[30px] min-w-[200px] flex-1 font-mono text-[12px]"
             />
-            <button
-              type="button"
-              onClick={() => void handleAddPeer()}
-              className="bg-foreground text-background cursor-pointer rounded-lg px-3 py-1.5 text-[12px] font-medium"
-            >
+            <Button type="button" size="sm" onClick={() => void handleAddPeer()}>
               Add Peer
-            </button>
+            </Button>
           </div>
         </SettingCard>
       </div>
@@ -756,7 +752,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
             : "Delete agent profile?"
         }
         description="Orchestrating agents on this host will no longer be able to delegate tasks using this profile."
-        confirmLabel="Delete profile"
+        confirmLabel="Delete"
         tone="danger"
         onConfirm={async () => {
           if (!pendingDeleteProfile) return;

@@ -7,7 +7,6 @@ import {
   Copy,
   FolderPlus,
   Laptop,
-  Loader2,
   MessageSquarePlus,
   Plus,
   QrCode,
@@ -20,13 +19,19 @@ import {
   HostStatusIndicator,
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
   DialogDescription,
   DialogHeader,
   DialogTitle,
+  Tabs,
+  TabsList,
+  TabsTrigger,
 } from "@/components/ui/dialog-tabs";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useI18n } from "@/lib/i18n";
 import { type LocalMachineInfo, type ProviderReadinessInfo, orbitIpc } from "@/lib/orbit-ipc";
@@ -226,43 +231,44 @@ function OnboardingGuideBody() {
           </DialogDescription>
         </DialogHeader>
 
-        {/* Minimalist 3-Step Segmented Switcher */}
-        <div
-          role="tablist"
-          aria-label={t("onboarding.title")}
-          className="bg-muted/80 mt-4 grid grid-cols-3 gap-1 rounded-[10px] p-1"
+        {/* Official shadcn Tabs 3-Step Switcher */}
+        <Tabs
+          value={String(step)}
+          onValueChange={(next) => {
+            if (typeof next === "string") {
+              setStep(Number(next) as StepIndex);
+            }
+          }}
+          className="mt-4"
         >
-          {steps.map((s) => {
-            const active = step === s.idx;
-            return (
-              <button
-                key={s.idx}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                onClick={() => setStep(s.idx)}
-                className={cn(
-                  "flex cursor-pointer items-center justify-center gap-1.5 rounded-[7px] px-2.5 py-1.5 text-[12px] font-medium transition-colors",
-                  active
-                    ? "bg-background text-foreground shadow-2xs"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                <span
-                  className={cn(
-                    "inline-flex h-[16px] w-[16px] items-center justify-center rounded-full font-mono text-[10.5px]",
-                    active
-                      ? "bg-foreground text-background"
-                      : "bg-foreground/10 text-muted-foreground",
-                  )}
+          <TabsList
+            aria-label={t("onboarding.title")}
+            className="grid h-auto w-full grid-cols-3 gap-1 rounded-[10px] p-1"
+          >
+            {steps.map((s) => {
+              const active = step === s.idx;
+              return (
+                <TabsTrigger
+                  key={s.idx}
+                  value={String(s.idx)}
+                  className="h-[28px] rounded-[7px] px-2.5 text-[12px]"
                 >
-                  {s.idx + 1}
-                </span>
-                <span>{s.label}</span>
-              </button>
-            );
-          })}
-        </div>
+                  <span
+                    className={cn(
+                      "inline-flex h-[16px] w-[16px] items-center justify-center rounded-full font-mono text-[10.5px]",
+                      active
+                        ? "bg-action-primary-bg text-action-primary-fg"
+                        : "bg-border-default/60 text-ink-muted",
+                    )}
+                  >
+                    {s.idx + 1}
+                  </span>
+                  <span>{s.label}</span>
+                </TabsTrigger>
+              );
+            })}
+          </TabsList>
+        </Tabs>
       </div>
 
       {/* Step Content */}
@@ -300,29 +306,30 @@ function OnboardingGuideBody() {
                       <div className="min-w-0">
                         <div className="text-foreground flex items-center gap-1.5 text-[13px] font-medium">
                           <span className="truncate">{localMachine.hostname}</span>
-                          <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10.5px]">
+                          <Badge variant="secondary" className="px-1.5 py-0 text-[10.5px]">
                             {t("common.local")}
-                          </span>
+                          </Badge>
                         </div>
                         <div className="text-muted-foreground truncate text-[11.5px]">
                           {t("onboarding.connectLocalHint")}
                         </div>
                       </div>
-                      <button
+                      <Button
                         type="button"
+                        size="sm"
                         disabled={connectingLocal}
                         onClick={() => void handleConnectLocal()}
-                        className="bg-foreground text-background inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-45"
+                        className="shrink-0"
                       >
                         {connectingLocal && (
-                          <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />
+                          <OrbitSpinner size={12.5} className="size-[12.5px]" />
                         )}
                         <span>
                           {connectingLocal
                             ? t("onboarding.connectingLocal")
                             : t("onboarding.connectThisMachine")}
                         </span>
-                      </button>
+                      </Button>
                     </div>
                   )}
                 </div>
@@ -342,9 +349,9 @@ function OnboardingGuideBody() {
                               {host.display_name}
                             </span>
                             {isLocal && (
-                              <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10.5px]">
+                              <Badge variant="secondary" className="px-1.5 py-0 text-[10.5px]">
                                 {t("common.local")}
-                              </span>
+                              </Badge>
                             )}
                           </div>
                           <div className="text-muted-foreground mt-0.5 flex items-center gap-1.5 text-[11.5px]">
@@ -365,46 +372,56 @@ function OnboardingGuideBody() {
             </div>
 
             {localConnectError && (
-              <div className="selectable-text px-0.5 text-[12px] text-rose-500">
+              <div className="selectable-text text-signal-danger px-0.5 text-[12px]">
                 {localConnectError}
               </div>
             )}
 
             <div className="flex flex-wrap items-center gap-2">
               {orderedHosts.length > 0 && (
-                <button
+                <Button
                   type="button"
+                  variant="outline"
+                  size="sm"
                   disabled={reconnecting}
                   onClick={() => void handleReconnectAll()}
-                  className="border-border hover:bg-accent inline-flex h-[32px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:opacity-50"
+                  className="h-[32px] text-[12.5px]"
                 >
-                  <RefreshCw className={cn("h-[13px] w-[13px]", reconnecting && "animate-spin")} />
+                  <RefreshCw className={cn("size-[13px]", reconnecting && "animate-spin")} />
                   <span>{t("banner.reconnect")}</span>
-                </button>
+                </Button>
               )}
               {orderedHosts.length > 0 && localMachine && !localAlreadyPaired && (
-                <button
+                <Button
                   type="button"
+                  variant="outline"
+                  size="sm"
                   disabled={connectingLocal}
                   onClick={() => void handleConnectLocal()}
-                  className="border-border hover:bg-accent inline-flex h-[32px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:opacity-50"
+                  className="h-[32px] text-[12.5px]"
                 >
-                  <Laptop className="h-[13px] w-[13px]" />
+                  {connectingLocal ? (
+                    <OrbitSpinner size={13} className="size-[13px]" />
+                  ) : (
+                    <Laptop className="size-[13px]" />
+                  )}
                   <span>
                     {connectingLocal
                       ? t("onboarding.connectingLocal")
                       : t("onboarding.connectThisMachine")}
                   </span>
-                </button>
+                </Button>
               )}
-              <button
+              <Button
                 type="button"
+                variant="outline"
+                size="sm"
                 onClick={handleAddRemoteHost}
-                className="border-border hover:bg-accent inline-flex h-[32px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
+                className="h-[32px] text-[12.5px]"
               >
-                <Plus className="h-[13px] w-[13px]" />
+                <Plus className="size-[13px]" />
                 <span>{t("onboarding.addRemoteHost")}</span>
-              </button>
+              </Button>
             </div>
           </div>
         )}
@@ -420,15 +437,17 @@ function OnboardingGuideBody() {
                   {t("onboarding.step2Desc")}
                 </p>
               </div>
-              <button
+              <Button
                 type="button"
+                variant="outline"
+                size="xs"
                 disabled={probing}
                 onClick={() => void runProbe()}
-                className="border-border hover:bg-accent inline-flex h-[28px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
+                className="h-[28px] shrink-0 gap-1.5 rounded-lg"
               >
-                <RefreshCw className={cn("h-[12.5px] w-[12.5px]", probing && "animate-spin")} />
+                <RefreshCw className={cn("size-[12.5px]", probing && "animate-spin")} />
                 <span>{t("common.refresh")}</span>
-              </button>
+              </Button>
             </div>
 
             {providers.length > 0 && !probeError && (
@@ -443,22 +462,24 @@ function OnboardingGuideBody() {
             <div className="border-border bg-background/60 overflow-hidden rounded-[12px] border">
               {probing && providers.length === 0 ? (
                 <div className="text-muted-foreground flex items-center gap-2.5 px-4 py-5 text-[12.5px]">
-                  <Loader2 className="h-[14px] w-[14px] animate-spin" />
+                  <OrbitSpinner size={14} />
                   <span>{t("onboarding.probingClis")}</span>
                 </div>
               ) : probeError ? (
                 <div className="text-muted-foreground flex items-center justify-between gap-3 px-4 py-4 text-[12.5px]">
                   <span className="inline-flex items-center gap-2">
-                    <AlertCircle className="h-[14px] w-[14px] text-rose-500" />
+                    <AlertCircle className="text-signal-danger h-[14px] w-[14px]" />
                     <span>{t("onboarding.probeFailed")}</span>
                   </span>
-                  <button
+                  <Button
                     type="button"
+                    variant="outline"
+                    size="xs"
                     onClick={() => void runProbe()}
-                    className="border-border hover:bg-accent cursor-pointer rounded-md border px-2 py-1 text-[11.5px] font-medium"
+                    className="text-[11.5px]"
                   >
                     {t("common.retry")}
-                  </button>
+                  </Button>
                 </div>
               ) : (
                 <ScrollArea viewportClassName="max-h-[268px]">
@@ -485,22 +506,16 @@ function OnboardingGuideBody() {
                               <span className="text-foreground truncate text-[13px] font-medium">
                                 {item.display_name}
                               </span>
-                              <span
-                                className={cn(
-                                  "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
-                                  isReady
-                                    ? "bg-emerald-500/12 text-emerald-700 dark:text-emerald-400"
-                                    : needsLogin
-                                      ? "bg-amber-500/12 text-amber-700 dark:text-amber-400"
-                                      : "bg-muted text-muted-foreground",
-                                )}
+                              <Badge
+                                variant={isReady ? "success" : needsLogin ? "warning" : "secondary"}
+                                className="rounded-full text-[10.5px]"
                               >
                                 {isReady
                                   ? t("onboarding.statusReady")
                                   : needsLogin
                                     ? t("onboarding.statusLoginRequired")
                                     : t("onboarding.statusNotInstalled")}
-                              </span>
+                              </Badge>
                             </div>
 
                             {actionCmd && (
@@ -511,25 +526,27 @@ function OnboardingGuideBody() {
                           </div>
 
                           {actionCmd ? (
-                            <button
+                            <Button
                               type="button"
+                              variant="outline"
+                              size="xs"
                               title={
                                 !item.installed
                                   ? t("onboarding.copyInstallCmd")
                                   : t("onboarding.copyLoginCmd")
                               }
                               onClick={() => void copyCommand(cmdKey, actionCmd)}
-                              className="border-border hover:bg-accent inline-flex h-[26px] shrink-0 cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium transition-colors"
+                              className="shrink-0 gap-1 px-2 text-[11.5px]"
                             >
                               {isCopied ? (
-                                <Check className="h-[11.5px] w-[11.5px] text-emerald-500" />
+                                <Check className="text-signal-success size-[11.5px]" />
                               ) : (
-                                <Copy className="text-muted-foreground h-[11.5px] w-[11.5px]" />
+                                <Copy className="text-muted-foreground size-[11.5px]" />
                               )}
                               <span>{isCopied ? t("common.copied") : t("common.copy")}</span>
-                            </button>
+                            </Button>
                           ) : (
-                            <Check className="h-[14px] w-[14px] shrink-0 text-emerald-600 dark:text-emerald-400" />
+                            <Check className="text-signal-success h-[14px] w-[14px] shrink-0" />
                           )}
                         </div>
                       );
@@ -631,41 +648,47 @@ function OnboardingGuideBody() {
       <div className="border-border flex items-center justify-between border-t px-6 py-3.5">
         <div>
           {step === 0 ? (
-            <button
+            <Button
               type="button"
+              variant="ghost"
+              size="sm"
               onClick={() => orbitActions.closeOnboardingGuide(true)}
-              className="text-muted-foreground hover:text-foreground cursor-pointer rounded-md px-2 py-1 text-[12.5px] font-medium transition-colors"
+              className="px-2 text-[12.5px]"
             >
               {t("onboarding.skip")}
-            </button>
+            </Button>
           ) : (
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={() => setStep((prev) => (prev > 0 ? ((prev - 1) as StepIndex) : 0))}
-              className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
+              className="text-[12.5px]"
             >
               {t("onboarding.back")}
-            </button>
+            </Button>
           )}
         </div>
 
         <div className="flex items-center gap-2">
           {step < 2 ? (
-            <button
+            <Button
               type="button"
+              size="sm"
               onClick={() => setStep((prev) => (prev < 2 ? ((prev + 1) as StepIndex) : 2))}
-              className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90"
+              className="px-3.5 text-[12.5px]"
             >
               {t("onboarding.next")}
-            </button>
+            </Button>
           ) : (
-            <button
+            <Button
               type="button"
+              size="sm"
               onClick={() => orbitActions.closeOnboardingGuide(true)}
-              className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90"
+              className="px-3.5 text-[12.5px]"
             >
               {t("onboarding.done")}
-            </button>
+            </Button>
           )}
         </div>
       </div>

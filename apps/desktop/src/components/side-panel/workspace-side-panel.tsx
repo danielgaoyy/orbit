@@ -7,7 +7,6 @@ import {
   FileDiff,
   FileText,
   Globe,
-  Layers,
   MessageCircleQuestion,
   Plus,
   SquareTerminal,
@@ -29,6 +28,8 @@ import { SidePanelLaunchpad } from "@/components/side-panel/side-panel-launchpad
 import { WorkspaceScriptsPopover } from "@/components/side-panel/scripts-panel";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
+import { SubagentAvatar } from "@/components/ui/subagent-avatar";
+import { selectSessionSubagents } from "@/state/selectors/session-selectors";
 import { type MessageKey, useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import {
@@ -39,6 +40,51 @@ import {
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+
+const SubagentSidePanelTabAvatar = memo(function SubagentSidePanelTabAvatar({
+  tab,
+}: {
+  tab: SidePanelTab;
+}) {
+  const hostId = useOrbitSelector((s) => s.selectedHostId);
+  const parentAgentId = useOrbitSelector((s) => tab.parentAgentId ?? s.selectedAgentId);
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const fleet = useOrbitSelector((s) => s.fleet);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
+  const parentStage = useOrbitSelector((s) =>
+    hostId && parentAgentId ? (s.stages[`${hostId}::${parentAgentId}`] ?? null) : null,
+  );
+
+  const summary = selectSessionSubagents(
+    {
+      hostDetails,
+      fleet,
+      archivedSubagents,
+      stages: hostId && parentAgentId && parentStage ? { [`${hostId}::${parentAgentId}`]: parentStage } : {},
+    },
+    hostId,
+    parentAgentId,
+  );
+
+  const matched = summary.all.find(
+    (sa) =>
+      (tab.childAgentId && sa.childAgentId === tab.childAgentId) ||
+      (tab.providerSubagentId && sa.providerSubagentId === tab.providerSubagentId) ||
+      (tab.subagentCallId && sa.callId === tab.subagentCallId),
+  );
+
+  const fallbackSeed =
+    tab.childAgentId || tab.providerSubagentId || tab.subagentCallId || tab.title;
+
+  return (
+    <SubagentAvatar
+      character={matched?.character}
+      seedKey={fallbackSeed}
+      status={matched?.status ?? "completed"}
+      size="xs"
+    />
+  );
+});
 
 function SidePanelTabIcon({ tab }: { tab: SidePanelTab }) {
   switch (tab.kind) {
@@ -57,7 +103,7 @@ function SidePanelTabIcon({ tab }: { tab: SidePanelTab }) {
     case "side_question":
       return <MessageCircleQuestion className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
     case "subagent":
-      return <Layers className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
+      return <SubagentSidePanelTabAvatar tab={tab} />;
     case "board":
       return <FileText className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
     case "peer":
@@ -256,7 +302,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         visibility: panelVisible ? "visible" : "hidden",
       }}
       className={cn(
-        "orbit-panel-right border-border bg-canvas absolute inset-y-0 right-0 z-20 flex h-full shrink-0 flex-col overflow-hidden border-l outline-none [contain:layout_style] select-none",
+        "orbit-panel-right border-border-subtle bg-surface-base absolute inset-y-0 right-0 z-20 flex h-full shrink-0 flex-col overflow-hidden border-l outline-none [contain:layout_style] select-none",
         !shouldOpen && "pointer-events-none",
       )}
     >
@@ -270,7 +316,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
           onDoubleClick={handleEqualizeSidePanel}
           className="group/sash absolute top-0 left-0 z-20 flex h-full w-[6px] cursor-col-resize justify-start"
         >
-          <div className="group-hover/sash:bg-primary/45 group-active/sash:bg-primary/65 h-full w-[2px] transition-colors duration-150" />
+          <div className="group-hover/sash:bg-border-strong group-active/sash:bg-ink-muted h-full w-[1.5px] transition-colors duration-150" />
         </div>
       )}
 
@@ -281,7 +327,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         {shouldRenderBody && (
           <>
             {/* Flush 40px Two-State Side Panel Header Bar (No-Tab vs With-Tab) */}
-      <div className="@container flex h-[40px] min-w-0 shrink-0 items-center gap-1 pl-2 pr-[44px] shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.055)] dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.06)]">
+      <div className="@container border-border-subtle flex h-[40px] min-w-0 shrink-0 items-center gap-1 border-b pl-2 pr-[44px]">
         {tabs.length > 0 ? (
           <>
             <div

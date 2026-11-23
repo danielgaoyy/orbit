@@ -10,6 +10,7 @@ import {
 import { LOCALES, type OrbitLocale, useI18n } from "@/lib/i18n";
 import {
   type TerminalCursorStyle,
+  type TerminalThemeMode,
   type ThemeMode,
   orbitActions,
   useOrbitSelector,
@@ -22,13 +23,13 @@ const MAX_TERMINAL_FONT_PX = 18;
 function ThemePreviewSwatch({ mode }: { mode: ThemeMode }) {
   if (mode === "light") {
     return (
-      <div className="flex h-[42px] w-full overflow-hidden rounded-[8px] border border-black/[0.08] bg-white">
-        <div className="w-[30%] border-r border-black/[0.06] bg-[#F6F7F9] p-1.5">
+      <div className="flex h-[42px] w-full overflow-hidden rounded-[8px] border border-black/[0.08] bg-[#FCFCFE]">
+        <div className="w-[30%] border-r border-black/[0.06] bg-[#F5F6F8] p-1.5">
           <div className="h-1 w-4 rounded-full bg-black/15" />
           <div className="mt-1.5 h-1 w-6 rounded-full bg-black/10" />
         </div>
         <div className="flex-1 p-2">
-          <div className="h-1.5 w-10 rounded-full bg-black/18" />
+          <div className="h-1.5 w-10 rounded-full bg-black/20" />
           <div className="mt-1.5 h-1 w-14 rounded-full bg-black/10" />
         </div>
       </div>
@@ -36,13 +37,13 @@ function ThemePreviewSwatch({ mode }: { mode: ThemeMode }) {
   }
   if (mode === "dark") {
     return (
-      <div className="flex h-[42px] w-full overflow-hidden rounded-[8px] border border-white/[0.10] bg-[#1A1C20]">
-        <div className="w-[30%] border-r border-white/[0.08] bg-[#14161A] p-1.5">
+      <div className="flex h-[42px] w-full overflow-hidden rounded-[8px] border border-white/[0.10] bg-[#17181E]">
+        <div className="w-[30%] border-r border-white/[0.07] bg-[#121318] p-1.5">
           <div className="h-1 w-4 rounded-full bg-white/25" />
           <div className="mt-1.5 h-1 w-6 rounded-full bg-white/14" />
         </div>
         <div className="flex-1 p-2">
-          <div className="h-1.5 w-10 rounded-full bg-white/28" />
+          <div className="h-1.5 w-10 rounded-full bg-white/30" />
           <div className="mt-1.5 h-1 w-14 rounded-full bg-white/14" />
         </div>
       </div>
@@ -50,17 +51,17 @@ function ThemePreviewSwatch({ mode }: { mode: ThemeMode }) {
   }
   return (
     <div className="flex h-[42px] w-full overflow-hidden rounded-[8px] border border-black/[0.10] dark:border-white/[0.10]">
-      <div className="flex w-1/2 bg-white">
-        <div className="w-[45%] border-r border-black/[0.06] bg-[#F6F7F9] p-1.5">
+      <div className="flex w-1/2 bg-[#FCFCFE]">
+        <div className="w-[45%] border-r border-black/[0.06] bg-[#F5F6F8] p-1.5">
           <div className="h-1 w-3 rounded-full bg-black/15" />
         </div>
         <div className="flex-1 p-1.5">
-          <div className="h-1.5 w-5 rounded-full bg-black/18" />
+          <div className="h-1.5 w-5 rounded-full bg-black/20" />
         </div>
       </div>
-      <div className="flex w-1/2 bg-[#1A1C20]">
+      <div className="flex w-1/2 bg-[#17181E]">
         <div className="flex-1 p-1.5">
-          <div className="h-1.5 w-6 rounded-full bg-white/28" />
+          <div className="h-1.5 w-6 rounded-full bg-white/30" />
           <div className="mt-1.5 h-1 w-8 rounded-full bg-white/14" />
         </div>
       </div>
@@ -75,6 +76,7 @@ export function AppearanceSection() {
   const terminalFontSize = useOrbitSelector((s) => s.terminalFontSize);
   const terminalCursorStyle = useOrbitSelector((s) => s.terminalCursorStyle);
   const terminalScrollback = useOrbitSelector((s) => s.terminalScrollback);
+  const terminalThemeMode = useOrbitSelector((s) => s.terminalThemeMode);
 
   const languageOptions = useMemo<SettingSelectOption<OrbitLocale>[]>(
     () =>
@@ -102,6 +104,19 @@ export function AppearanceSection() {
       value: "split",
       label: t("settings.diffSplit"),
       description: t("settings.diffSplitDesc"),
+    },
+  ];
+
+  const terminalThemeOptions: SettingSelectOption<TerminalThemeMode>[] = [
+    {
+      value: "harmonized",
+      label: t("settings.terminalThemeHarmonized"),
+      description: t("settings.terminalThemeHarmonizedDesc"),
+    },
+    {
+      value: "high_contrast",
+      label: t("settings.terminalThemeHighContrast"),
+      description: t("settings.terminalThemeHighContrastDesc"),
     },
   ];
 
@@ -156,10 +171,10 @@ export function AppearanceSection() {
                   type="button"
                   onClick={() => orbitActions.setTheme(opt.id)}
                   className={cn(
-                    "flex cursor-pointer flex-col items-center gap-2 rounded-[11px] border p-2.5 transition-colors",
+                    "flex cursor-pointer flex-col items-center gap-2 rounded-[10px] border p-2.5 transition-colors",
                     active
-                      ? "border-foreground/35 bg-accent/60 text-foreground"
-                      : "border-border hover:border-foreground/18 text-muted-foreground hover:text-foreground",
+                      ? "border-border-strong bg-accent/65 text-ink-primary"
+                      : "border-border-subtle hover:border-border-default text-ink-muted hover:text-ink-primary",
                   )}
                 >
                   <ThemePreviewSwatch mode={opt.id} />
@@ -196,6 +211,18 @@ export function AppearanceSection() {
         <SettingGroupLabel>{t("settings.groupTerminal")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
+            title={t("settings.terminalTheme")}
+            description={t("settings.terminalThemeDesc")}
+          >
+            <SettingSelect
+              value={terminalThemeMode}
+              options={terminalThemeOptions}
+              onChange={(themeMode) => orbitActions.setTerminalPrefs({ themeMode })}
+              menuClassName="w-[256px]"
+            />
+          </SettingRow>
+
+          <SettingRow
             title={t("settings.fontSize")}
             description={t("settings.fontSizeDesc")}
           >
@@ -204,7 +231,7 @@ export function AppearanceSection() {
                 type="button"
                 disabled={terminalFontSize <= MIN_TERMINAL_FONT_PX}
                 onClick={() => orbitActions.setTerminalPrefs({ fontSize: terminalFontSize - 1 })}
-                className="border-border hover:bg-accent inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-lg border font-mono text-[13px] transition-colors disabled:pointer-events-none disabled:opacity-35"
+                className="border-border-subtle hover:bg-accent inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] border font-mono text-[13px] transition-colors disabled:pointer-events-none disabled:opacity-35"
               >
                 -
               </button>
@@ -215,7 +242,7 @@ export function AppearanceSection() {
                 type="button"
                 disabled={terminalFontSize >= MAX_TERMINAL_FONT_PX}
                 onClick={() => orbitActions.setTerminalPrefs({ fontSize: terminalFontSize + 1 })}
-                className="border-border hover:bg-accent inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-lg border font-mono text-[13px] transition-colors disabled:pointer-events-none disabled:opacity-35"
+                className="border-border-subtle hover:bg-accent inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] border font-mono text-[13px] transition-colors disabled:pointer-events-none disabled:opacity-35"
               >
                 +
               </button>

@@ -7,7 +7,6 @@ import {
   Plus,
   RefreshCw,
   Trash2,
-  X,
 } from "lucide-react";
 import {
   SettingCard,
@@ -17,6 +16,20 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  Tabs,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/dialog-tabs";
+import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import type {
   PathScopedRule,
   RuleScope,
@@ -247,48 +260,33 @@ function RuleEditorModal({
   };
 
   return (
-    <div
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) requestClose();
+    <Dialog
+      open
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen) requestClose();
       }}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 backdrop-blur-[2px]"
     >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={editing ? "Edit rule" : "New rule"}
-        className="border-border bg-elevated text-foreground floating-surface flex max-h-[88vh] w-full max-w-[540px] flex-col overflow-hidden rounded-[14px] border p-0"
+      <DialogContent
+        closeDisabled={busy}
+        className="flex max-h-[88vh] max-w-[540px] flex-col gap-0 p-0"
       >
-        <div className="flex items-center justify-between gap-2 px-5 pt-5 pb-4">
-          <div className="min-w-0">
-            <h3 className="text-[15px] font-semibold tracking-[-0.01em]">
-              {editing ? `Edit ${editing.name}` : "New Path Rule"}
-            </h3>
-            {editing && (
-              <p className="text-muted-foreground truncate font-mono text-[11.5px]">
-                {editing.relative_path}
-              </p>
-            )}
-          </div>
-          <button
-            type="button"
-            aria-label="Close"
-            disabled={busy}
-            onClick={requestClose}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[8px] transition-colors"
-          >
-            <X className="h-[14px] w-[14px]" />
-          </button>
-        </div>
+        <DialogHeader className="px-5 pt-5 pr-12 pb-4">
+          <DialogTitle>{editing ? `Edit ${editing.name}` : "New Path Rule"}</DialogTitle>
+          {editing && (
+            <DialogDescription className="truncate font-mono text-[11.5px]">
+              {editing.relative_path}
+            </DialogDescription>
+          )}
+        </DialogHeader>
 
         <form
           onSubmit={(e) => void handleSubmit(e)}
           className="orbit-native-scroll flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto overscroll-contain px-5 pb-5"
         >
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="space-y-1">
-              <label className="text-muted-foreground block text-[12px] font-medium">Name</label>
-              <input
+            <Field>
+              <FieldLabel>Name</FieldLabel>
+              <Input
                 type="text"
                 value={name}
                 disabled={Boolean(editing) || busy}
@@ -297,12 +295,12 @@ function RuleEditorModal({
                   setConfirmDiscard(false);
                 }}
                 placeholder="rust-guidelines"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 h-[32px] w-full rounded-[8px] border px-2.5 font-mono text-[12.5px] outline-none disabled:opacity-55"
+                className="font-mono"
               />
-            </div>
+            </Field>
 
-            <div className="space-y-1">
-              <label className="text-muted-foreground block text-[12px] font-medium">Scope</label>
+            <Field>
+              <FieldLabel>Scope</FieldLabel>
               <SettingSelect
                 value={scope}
                 options={scopeOptions}
@@ -313,46 +311,36 @@ function RuleEditorModal({
                 }}
                 triggerClassName="h-[32px] w-full"
               />
-            </div>
+            </Field>
           </div>
 
-          <div className="space-y-1.5">
+          <Field>
             <div className="flex items-center justify-between">
-              <label className="text-muted-foreground text-[12px] font-medium">Trigger Mode</label>
-              <span className="text-muted-foreground text-[11.5px]">{activeHint}</span>
+              <FieldLabel>Trigger Mode</FieldLabel>
+              <span className="text-ink-muted text-[11.5px]">{activeHint}</span>
             </div>
-            <div className="border-border bg-background/70 grid grid-cols-4 gap-1 rounded-[9px] border p-1">
-              {TRIGGER_GROUPS.map((g) => {
-                const selected = triggerMode === g.mode;
-                return (
-                  <button
-                    key={g.mode}
-                    type="button"
-                    disabled={busy}
-                    onClick={() => {
-                      setTriggerMode(g.mode);
-                      setConfirmDiscard(false);
-                    }}
-                    className={cn(
-                      "h-[27px] cursor-pointer rounded-[6px] text-[12px] font-medium transition-colors",
-                      selected
-                        ? "bg-foreground text-background"
-                        : "text-muted-foreground hover:text-foreground hover:bg-accent/60",
-                    )}
-                  >
+            <Tabs
+              value={triggerMode}
+              onValueChange={(next) => {
+                setTriggerMode(next as RuleTriggerMode);
+                setConfirmDiscard(false);
+              }}
+            >
+              <TabsList className="grid w-full grid-cols-4">
+                {TRIGGER_GROUPS.map((g) => (
+                  <TabsTrigger key={g.mode} value={g.mode} disabled={busy} className="text-[12px]">
                     {g.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </Tabs>
+          </Field>
 
           {triggerMode === "glob_auto_attach" && (
-            <div className="space-y-1">
-              <label className="text-muted-foreground block text-[12px] font-medium">
-                Glob Patterns
-              </label>
-              <input
+            <Field>
+              <FieldLabel htmlFor="rule-globs">Glob Patterns</FieldLabel>
+              <Input
+                id="rule-globs"
                 type="text"
                 value={globsText}
                 disabled={busy}
@@ -361,21 +349,20 @@ function RuleEditorModal({
                   setConfirmDiscard(false);
                 }}
                 placeholder="**/*.rs, !**/tests/**"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 h-[32px] w-full rounded-[8px] border px-2.5 font-mono text-[12px] outline-none"
+                className="font-mono text-[12px]"
               />
-              <p className="text-muted-foreground text-[11px]">
+              <FieldDescription className="text-[11px]">
                 Comma-separated globs. Supports <code className="font-mono">**</code>,{" "}
                 <code className="font-mono">{"{ts,tsx}"}</code>, and{" "}
                 <code className="font-mono">!negation</code>.
-              </p>
-            </div>
+              </FieldDescription>
+            </Field>
           )}
 
-          <div className="space-y-1">
-            <label className="text-muted-foreground block text-[12px] font-medium">
-              Description
-            </label>
-            <input
+          <Field>
+            <FieldLabel htmlFor="rule-description">Description</FieldLabel>
+            <Input
+              id="rule-description"
               type="text"
               value={description}
               disabled={busy}
@@ -388,20 +375,18 @@ function RuleEditorModal({
                   ? "When should the agent read this rule?"
                   : "Short summary (optional)"
               }
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 h-[32px] w-full rounded-[8px] border px-2.5 text-[12.5px] outline-none"
             />
-          </div>
+          </Field>
 
-          <div className="space-y-1">
+          <Field>
             <div className="flex items-center justify-between">
-              <label className="text-muted-foreground text-[12px] font-medium">
-                Rule Instructions (Markdown)
-              </label>
-              <span className="text-muted-foreground text-[11px] tabular-nums">
+              <FieldLabel htmlFor="rule-body">Rule Instructions (Markdown)</FieldLabel>
+              <span className="text-ink-muted text-[11px] tabular-nums">
                 ~{approxTokens.toLocaleString()} tok
               </span>
             </div>
-            <textarea
+            <Textarea
+              id="rule-body"
               value={body}
               disabled={busy}
               onChange={(e) => {
@@ -410,12 +395,12 @@ function RuleEditorModal({
               }}
               rows={8}
               placeholder="Write concise, actionable engineering constraints..."
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/35 min-h-[150px] w-full resize-y rounded-[9px] border p-2.5 font-mono text-[12px] leading-relaxed outline-none"
+              className="min-h-[150px] resize-y font-mono text-[12px] leading-relaxed"
             />
-          </div>
+          </Field>
 
-          <div className="flex items-center justify-between pt-0.5">
-            <span className="text-muted-foreground text-[12.5px]">Enabled</span>
+          <Field orientation="horizontal" className="pt-0.5">
+            <FieldLabel className="text-[12.5px] font-normal">Enabled</FieldLabel>
             <ToggleSwitch
               checked={enabled}
               disabled={busy}
@@ -425,7 +410,7 @@ function RuleEditorModal({
               }}
               ariaLabel="Enable rule"
             />
-          </div>
+          </Field>
 
           {error && (
             <div className="rounded-[8px] border border-red-500/30 bg-red-500/8 px-3 py-2 text-[12px] text-red-600 dark:text-red-400">
@@ -437,20 +422,22 @@ function RuleEditorModal({
             <div className="flex items-center justify-between gap-2 rounded-[8px] border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12px]">
               <span className="text-amber-700 dark:text-amber-300">Discard unsaved changes?</span>
               <div className="flex items-center gap-1.5">
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="xs"
                   onClick={() => setConfirmDiscard(false)}
-                  className="text-muted-foreground hover:text-foreground h-[26px] cursor-pointer rounded-[6px] px-2 text-[11.5px] font-medium"
                 >
                   Keep editing
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
+                  size="xs"
                   onClick={onClose}
-                  className="h-[26px] cursor-pointer rounded-[6px] bg-amber-600 px-2.5 text-[11.5px] font-medium text-white hover:bg-amber-700"
+                  className="bg-amber-600 text-white hover:bg-amber-700"
                 >
                   Discard
-                </button>
+                </Button>
               </div>
             </div>
           )}
@@ -458,61 +445,56 @@ function RuleEditorModal({
           <div className="border-border mt-1 flex items-center justify-between gap-2 border-t pt-3.5">
             <div>
               {editing && !confirmDelete && (
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="sm"
                   disabled={busy}
                   onClick={() => setConfirmDelete(true)}
-                  className="text-muted-foreground hover:text-red-600 dark:hover:text-red-400 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[8px] px-2 text-[12px] font-medium transition-colors"
+                  className="text-muted-foreground hover:text-red-600 dark:hover:text-red-400"
                 >
                   <Trash2 className="h-[13.5px] w-[13.5px]" />
                   Delete
-                </button>
+                </Button>
               )}
               {editing && confirmDelete && (
                 <div className="flex items-center gap-1.5">
-                  <button
+                  <Button
                     type="button"
+                    variant="destructive"
+                    size="sm"
                     disabled={busy}
                     onClick={() => void handleDelete()}
-                    className="inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[8px] bg-red-600 px-2.5 text-[12px] font-medium text-white hover:bg-red-700 disabled:opacity-50"
                   >
                     {deleting && <Loader2 className="h-3 w-3 animate-spin" />}
-                    Confirm Delete
-                  </button>
-                  <button
+                    Delete
+                  </Button>
+                  <Button
                     type="button"
+                    variant="ghost"
+                    size="sm"
                     disabled={busy}
                     onClick={() => setConfirmDelete(false)}
-                    className="text-muted-foreground hover:text-foreground h-[30px] cursor-pointer rounded-[8px] px-2 text-[12px]"
                   >
                     Keep
-                  </button>
+                  </Button>
                 </div>
               )}
             </div>
 
             <div className="flex items-center gap-2">
-              <button
-                type="button"
-                disabled={busy}
-                onClick={requestClose}
-                className="border-border bg-background hover:bg-accent/70 h-[31px] cursor-pointer rounded-[8px] border px-3 text-[12.5px] font-medium transition-colors"
-              >
+              <Button type="button" variant="outline" size="sm" disabled={busy} onClick={requestClose}>
                 Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={busy}
-                className="bg-foreground text-background hover:opacity-90 inline-flex h-[31px] cursor-pointer items-center gap-1.5 rounded-[8px] px-3.5 text-[12.5px] font-medium transition-opacity disabled:opacity-50"
-              >
+              </Button>
+              <Button type="submit" size="sm" disabled={busy}>
                 {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                 Save Rule
-              </button>
+              </Button>
             </div>
           </div>
         </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

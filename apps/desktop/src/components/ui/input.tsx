@@ -1,26 +1,17 @@
 import * as React from "react";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
+/**
+ * Official shadcn/ui `<Input>` primitive styled with Orbit's surface & border tokens.
+ */
 function Input({ className, type, ...props }: React.ComponentProps<"input">) {
   return (
     <input
       type={type}
       data-slot="input"
       className={cn(
-        "border-input placeholder:text-muted-foreground flex h-[34px] w-full min-w-0 rounded-lg border bg-transparent px-3 py-1 text-[13px] shadow-2xs transition-colors outline-none focus-visible:border-foreground/30 disabled:pointer-events-none disabled:opacity-50",
-        className,
-      )}
-      {...props}
-    />
-  );
-}
-
-function Textarea({ className, ...props }: React.ComponentProps<"textarea">) {
-  return (
-    <textarea
-      data-slot="textarea"
-      className={cn(
-        "border-input placeholder:text-muted-foreground flex min-h-16 w-full rounded-lg border bg-transparent px-3 py-2 text-[13px] shadow-2xs transition-colors outline-none focus-visible:border-foreground/30 disabled:opacity-50",
+        "border-border-subtle bg-surface-base text-ink-primary placeholder:text-ink-faint focus-visible:border-border-strong focus-visible:ring-ring/30 flex h-[32px] w-full min-w-0 rounded-[8px] border px-2.5 py-1 text-[12.5px] shadow-2xs transition-colors outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-50",
         className,
       )}
       {...props}

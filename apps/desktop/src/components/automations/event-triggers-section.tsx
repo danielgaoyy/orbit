@@ -22,16 +22,21 @@ import {
   type TriggerSourceKind,
   type UpsertEventTriggerRequest,
 } from "@/lib/orbit-ipc";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
+import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Textarea } from "@/components/ui/textarea";
 import {
   SettingSelect,
   ToggleSwitch,
@@ -820,10 +825,10 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                           </button>
                         </SimpleTooltip>
 
-                        <SimpleTooltip label="Delete trigger">
+                        <SimpleTooltip label="Delete">
                           <button
                             type="button"
-                            aria-label="Delete trigger"
+                            aria-label="Delete"
                             onClick={() => setConfirmDeleteId(trigger.trigger_id)}
                             className="text-muted-foreground/75 hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500"
                           >
@@ -934,44 +939,46 @@ export const EventTriggersSection = memo(function EventTriggersSection({
           </DialogHeader>
 
           <ScrollArea viewportClassName="max-h-[min(72vh,580px)] px-5 pb-4">
-            <div className="flex flex-col gap-3.5">
+            <FieldGroup>
               <div className="grid grid-cols-2 gap-3">
-                <label className="flex flex-col gap-1.5 text-[12px]">
-                  <span className="text-muted-foreground font-medium">Name</span>
-                  <input
+                <Field>
+                  <FieldLabel htmlFor="trigger-name">Name</FieldLabel>
+                  <Input
+                    id="trigger-name"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
                     placeholder="PR Auto-Review"
-                    className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[34px] w-full rounded-lg border px-3 text-[12.5px] outline-none"
+                    className="h-[34px] px-3"
                   />
-                </label>
+                </Field>
 
-                <label className="flex flex-col gap-1.5 text-[12px]">
-                  <span className="text-muted-foreground font-medium">Source</span>
+                <Field>
+                  <FieldLabel>Source</FieldLabel>
                   <SettingSelect
                     value={source}
                     onChange={handleSourceChange}
                     options={SOURCE_OPTIONS}
                   />
-                </label>
+                </Field>
               </div>
 
-              <label className="flex flex-col gap-1.5 text-[12px]">
-                <span className="text-muted-foreground font-medium">
+              <Field>
+                <FieldLabel htmlFor="trigger-event-filters">
                   Event filters{" "}
                   <span className="font-normal opacity-70">(comma-separated, blank = all)</span>
-                </span>
-                <input
+                </FieldLabel>
+                <Input
+                  id="trigger-event-filters"
                   value={eventFiltersText}
                   onChange={(e) => setEventFiltersText(e.target.value)}
                   placeholder="pull_request.opened, issues.*"
-                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[34px] w-full rounded-lg border px-3 font-mono text-[12px] outline-none"
+                  className="h-[34px] px-3 font-mono text-[12px]"
                 />
-              </label>
+              </Field>
 
-              <div className="flex flex-col gap-1.5 text-[12px]">
+              <Field>
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-muted-foreground font-medium">
+                  <FieldLabel htmlFor="trigger-secret">
                     Signing secret{" "}
                     <span className="font-normal opacity-70">
                       {keepExistingSecret
@@ -980,7 +987,7 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                           ? "(required for inbound webhooks)"
                           : "(required · HMAC-SHA256 / Bearer)"}
                     </span>
-                  </span>
+                  </FieldLabel>
                   {editingTrigger?.has_secret && keepExistingSecret && !secret.trim() && (
                     <button
                       type="button"
@@ -991,7 +998,8 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                     </button>
                   )}
                 </div>
-                <input
+                <Input
+                  id="trigger-secret"
                   type="password"
                   value={secret}
                   onChange={(e) => {
@@ -1004,9 +1012,9 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                     }
                   }}
                   placeholder={keepExistingSecret ? "••••" : "whsec_..."}
-                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[34px] w-full rounded-lg border px-3 font-mono text-[12px] outline-none"
+                  className="h-[34px] px-3 font-mono text-[12px]"
                 />
-              </div>
+              </Field>
 
               {/* Optional GitHub PR Polling Fallback */}
               {source === "github" && (
@@ -1028,28 +1036,34 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                   </div>
 
                   {pollEnabled && (
-                    <div className="space-y-2.5 pt-1">
+                    <FieldGroup className="gap-2.5 pt-1">
                       <div className="grid grid-cols-[1fr_110px] gap-2.5">
-                        <label className="flex flex-col gap-1 text-[11.5px]">
-                          <span className="text-muted-foreground font-medium">Repository</span>
-                          <input
+                        <Field>
+                          <FieldLabel htmlFor="trigger-poll-repo" className="text-[11.5px]">
+                            Repository
+                          </FieldLabel>
+                          <Input
+                            id="trigger-poll-repo"
                             value={pollRepo}
                             onChange={(e) => setPollRepo(e.target.value)}
                             placeholder="owner/repo"
-                            className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none"
+                            className="font-mono text-[12px]"
                           />
-                        </label>
-                        <label className="flex flex-col gap-1 text-[11.5px]">
-                          <span className="text-muted-foreground font-medium">Interval (s)</span>
-                          <input
+                        </Field>
+                        <Field>
+                          <FieldLabel htmlFor="trigger-poll-interval" className="text-[11.5px]">
+                            Interval (s)
+                          </FieldLabel>
+                          <Input
+                            id="trigger-poll-interval"
                             type="number"
                             min={30}
                             max={3600}
                             value={pollIntervalSecs}
                             onChange={(e) => setPollIntervalSecs(e.target.value)}
-                            className="border-border bg-canvas text-foreground focus:border-foreground/30 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none"
+                            className="font-mono text-[12px]"
                           />
-                        </label>
+                        </Field>
                       </div>
 
                       <div className="flex flex-wrap items-center gap-3.5 text-[11.5px]">
@@ -1079,16 +1093,16 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                         </label>
                       </div>
 
-                      <div className="flex flex-col gap-1 text-[11.5px]">
+                      <Field>
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-muted-foreground font-medium">
+                          <FieldLabel htmlFor="trigger-github-token" className="text-[11.5px]">
                             GitHub token{" "}
                             <span className="font-normal opacity-70">
                               {keepExistingToken
                                 ? "(stored · leave blank to keep)"
                                 : "(optional · required for private repos)"}
                             </span>
-                          </span>
+                          </FieldLabel>
                           {editingTrigger?.github_poll?.has_token &&
                             keepExistingToken &&
                             !githubToken.trim() && (
@@ -1101,7 +1115,8 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                               </button>
                             )}
                         </div>
-                        <input
+                        <Input
+                          id="trigger-github-token"
                           type="password"
                           value={githubToken}
                           onChange={(e) => {
@@ -1114,117 +1129,120 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                             }
                           }}
                           placeholder={keepExistingToken ? "••••" : "ghp_..."}
-                          className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[32px] w-full rounded-lg border px-2.5 font-mono text-[12px] outline-none"
+                          className="font-mono text-[12px]"
                         />
-                      </div>
-                    </div>
+                      </Field>
+                    </FieldGroup>
                   )}
                 </div>
               )}
 
               {/* Dispatch Target */}
-              <label className="flex flex-col gap-1.5 text-[12px]">
-                <span className="text-muted-foreground font-medium">Dispatch target</span>
+              <Field>
+                <FieldLabel>Dispatch target</FieldLabel>
                 <SettingSelect
                   value={targetKind}
                   onChange={setTargetKind}
                   options={TARGET_KIND_OPTIONS}
                 />
-              </label>
+              </Field>
 
               {targetKind === "existing_agent" ? (
-                <label className="flex flex-col gap-1.5 text-[12px]">
-                  <span className="text-muted-foreground font-medium">Target agent</span>
+                <Field>
+                  <FieldLabel>Target agent</FieldLabel>
                   <SettingSelect
                     value={targetAgentId}
                     onChange={setTargetAgentId}
                     options={agentOptions}
                     placeholder="Select active agent"
                   />
-                </label>
+                </Field>
               ) : (
-                <div className="space-y-3">
-                  <label className="flex flex-col gap-1.5 text-[12px]">
-                    <span className="text-muted-foreground font-medium">Project workspace</span>
+                <FieldGroup className="gap-3">
+                  <Field>
+                    <FieldLabel>Project workspace</FieldLabel>
                     <SettingSelect
                       value={targetCwd}
                       onChange={setTargetCwd}
                       options={projectOptions}
                       placeholder="Select workspace"
                     />
-                  </label>
+                  </Field>
 
                   <div className="grid grid-cols-2 gap-3">
-                    <label className="flex flex-col gap-1.5 text-[12px]">
-                      <span className="text-muted-foreground font-medium">Provider</span>
+                    <Field>
+                      <FieldLabel>Provider</FieldLabel>
                       <SettingSelect
                         value={targetProvider}
                         onChange={setTargetProvider}
                         options={providerOptions}
                       />
-                    </label>
-                    <label className="flex flex-col gap-1.5 text-[12px]">
-                      <span className="text-muted-foreground font-medium">Permissions</span>
+                    </Field>
+                    <Field>
+                      <FieldLabel>Permissions</FieldLabel>
                       <SettingSelect
                         value={targetMode}
                         onChange={setTargetMode}
                         options={PERMISSION_OPTIONS}
                       />
-                    </label>
+                    </Field>
                   </div>
 
-                  <label className="flex flex-col gap-1.5 text-[12px]">
-                    <span className="text-muted-foreground font-medium">
+                  <Field>
+                    <FieldLabel htmlFor="trigger-target-model">
                       Model <span className="font-normal opacity-70">(optional)</span>
-                    </span>
-                    <input
+                    </FieldLabel>
+                    <Input
+                      id="trigger-target-model"
                       value={targetModel}
                       onChange={(e) => setTargetModel(e.target.value)}
                       placeholder="Provider default"
-                      className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[34px] w-full rounded-lg border px-3 font-mono text-[12px] outline-none"
+                      className="h-[34px] px-3 font-mono text-[12px]"
                     />
-                  </label>
-                </div>
+                  </Field>
+                </FieldGroup>
               )}
 
-              <label className="flex flex-col gap-1.5 text-[12px]">
-                <span className="text-muted-foreground font-medium">Prompt template</span>
-                <textarea
+              <Field>
+                <FieldLabel htmlFor="trigger-prompt-template">Prompt template</FieldLabel>
+                <Textarea
+                  id="trigger-prompt-template"
                   rows={4}
                   value={promptTemplate}
                   onChange={(e) => setPromptTemplate(e.target.value)}
-                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 w-full resize-none rounded-lg border px-3 py-2 font-mono text-[12px] outline-none"
+                  className="resize-none font-mono text-[12px]"
                 />
-                <span className="text-muted-foreground/70 font-mono text-[10.5px]">
+                <FieldDescription className="font-mono text-[10.5px]">
                   Variables: {"{{source}} {{event}} {{title}} {{body}} {{url}} {{actor}} {{repo}}"}
-                </span>
-              </label>
+                </FieldDescription>
+              </Field>
 
-              <div className="flex items-center justify-between pt-0.5">
-                <span className="text-muted-foreground text-[12px] font-medium">Enabled</span>
+              <Field orientation="horizontal" className="pt-0.5">
+                <FieldLabel>Enabled</FieldLabel>
                 <ToggleSwitch checked={enabled} onChange={setEnabled} ariaLabel="Trigger enabled" />
-              </div>
-            </div>
+              </Field>
+            </FieldGroup>
           </ScrollArea>
 
-          <div className="border-border/70 flex items-center justify-end gap-2 border-t px-5 py-3">
-            <button
+          <DialogFooter className="border-border-subtle border-t px-5 py-3">
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               disabled={saving}
               onClick={() => setDialogOpen(false)}
-              className="text-muted-foreground hover:text-foreground h-[30px] cursor-pointer rounded-lg px-3 text-[12.5px] font-medium transition-colors disabled:opacity-40"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
+              size="sm"
               disabled={saving}
               onClick={() => void handleSubmit()}
-              className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity disabled:opacity-40"
             >
               {saving ? "Saving…" : editingTrigger ? "Save changes" : "Create trigger"}
-            </button>
-          </div>
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

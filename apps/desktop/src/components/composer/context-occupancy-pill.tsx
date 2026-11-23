@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { FoldVertical } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import type { ContextOccupancyBreakdown } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { useI18n } from "@/lib/i18n";
@@ -381,19 +382,21 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
 
               {/* Quick /compact trigger when context is tight */}
               {pct >= 75 && (
-                <div className="border-border/50 border-t pt-2">
-                  <button
+                <div className="border-border-subtle border-t pt-2">
+                  <Button
                     type="button"
+                    variant="outline"
+                    size="xs"
                     onClick={() => {
                       clearTimers();
                       setOpen(false);
                       void orbitActions.submitSlashCompact();
                     }}
-                    className="border-border hover:bg-accent text-foreground inline-flex h-[28px] w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg border px-2.5 text-[11.5px] font-medium transition-colors"
+                    className="h-[28px] w-full gap-1.5 text-[11.5px]"
                   >
                     <FoldVertical className="size-3.5 stroke-[1.8]" />
                     <span>{t("composer.compactContext")}</span>
-                  </button>
+                  </Button>
                 </div>
               )}
             </div>

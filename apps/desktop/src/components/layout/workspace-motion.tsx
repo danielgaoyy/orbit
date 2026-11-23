@@ -20,9 +20,10 @@ export type ShellMotionPhase = "idle" | "prep" | "playing";
 const PANEL_EASE = "cubic-bezier(0.32, 0.72, 0, 1)";
 const OVERVIEW_OPACITY_IN = "opacity 210ms cubic-bezier(0.25, 1, 0.5, 1)";
 const OVERVIEW_OPACITY_OUT = "opacity 175ms cubic-bezier(0.4, 0, 0.2, 1)";
-const STAGE_MAX_WIDTH_PX = 768;
+const STAGE_MAX_WIDTH_PX = 740;
 const STAGE_MIN_LOCK_WIDTH_PX = 240;
 const STAGE_H_PADDING_PX = 48;
+const OVERVIEW_DOCK_RESERVE_PX = 304;
 
 function availStageContent(V: number, t: ShellGeometryTuple): number {
   return Math.max(0, V - t.L - t.W - t.D - STAGE_H_PADDING_PX);
@@ -172,8 +173,11 @@ function evalBreakpoints(params: {
     sidePanelPrefWidth: params.sidePanelWidth,
   });
   const centerW = panes.centerWidthPx;
-  const canDockOverview = params.prevCanDock ? centerW >= 1000 : centerW >= 1040;
-  const D = params.hasActiveSession && canDockOverview && params.overviewDesktopOpenPref ? 324 : 0;
+  const canDockOverview = params.prevCanDock ? centerW >= 980 : centerW >= 1020;
+  const D =
+    params.hasActiveSession && canDockOverview && params.overviewDesktopOpenPref
+      ? OVERVIEW_DOCK_RESERVE_PX
+      : 0;
   const effectiveContentW = centerW - D;
   const isStageWide = params.prevIsWide ? effectiveContentW >= 776 : effectiveContentW >= 800;
   return { canDockOverview, isStageWide };
@@ -317,7 +321,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     return {
       L: flags.sidebarOpen ? panes.leftWidthPx : 0,
       W: flags.shouldRightOpen ? panes.rightWidthPx : 0,
-      D: flags.dockedOverview ? 324 : 0,
+      D: flags.dockedOverview ? OVERVIEW_DOCK_RESERVE_PX : 0,
     };
   };
 
@@ -602,7 +606,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     const overviewReservePx =
       phase === "idle"
         ? dockedOverview
-          ? 324
+          ? OVERVIEW_DOCK_RESERVE_PX
           : 0
         : isFluidWidthMotion
           ? phase === "prep"

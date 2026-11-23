@@ -22,6 +22,7 @@ import type {
   SettingsSection,
   SettingsSectionTarget,
   TerminalCursorStyle,
+  TerminalThemeMode,
   ThemeMode,
   ToastAction,
 } from "../store-types";
@@ -59,13 +60,15 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
       const nextFontSize = fresh.terminalFontSize ?? getState().terminalFontSize;
       const nextCursor = fresh.terminalCursorStyle ?? getState().terminalCursorStyle;
       const nextScrollback = fresh.terminalScrollback ?? getState().terminalScrollback;
+      const nextTerminalThemeMode = fresh.terminalThemeMode ?? getState().terminalThemeMode;
       if (
         nextLocale === getState().locale &&
         nextTheme === getState().theme &&
         nextResolved === getState().resolvedTheme &&
         nextFontSize === getState().terminalFontSize &&
         nextCursor === getState().terminalCursorStyle &&
-        nextScrollback === getState().terminalScrollback
+        nextScrollback === getState().terminalScrollback &&
+        nextTerminalThemeMode === getState().terminalThemeMode
       ) {
         return;
       }
@@ -77,6 +80,7 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
         terminalFontSize: nextFontSize,
         terminalCursorStyle: nextCursor,
         terminalScrollback: nextScrollback,
+        terminalThemeMode: nextTerminalThemeMode,
       }));
     },
 
@@ -261,6 +265,7 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
       fontSize?: number;
       cursorStyle?: TerminalCursorStyle;
       scrollback?: number;
+      themeMode?: TerminalThemeMode;
     }): void {
       setState(
         (s) => ({
@@ -274,6 +279,7 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
             patch.scrollback !== undefined
               ? Math.min(50000, Math.max(500, patch.scrollback))
               : s.terminalScrollback,
+          terminalThemeMode: patch.themeMode ?? s.terminalThemeMode,
         }),
         true,
       );

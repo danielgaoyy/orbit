@@ -9,6 +9,7 @@ import {
 import { resolveTokenColor } from "@/lib/code-highlight";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { formatFileSizeCompact } from "@/lib/session-insights";
 import { cn } from "@/lib/utils";
 
@@ -652,7 +653,10 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
           ) : conflict ? (
             <span className="text-amber-600 dark:text-amber-400">Conflict</span>
           ) : dirty ? (
-            <span>Unsaved · {mod}S</span>
+            <span className="inline-flex items-center gap-1.5">
+              <span>Unsaved</span>
+              <ShortcutKbd keys={`${mod}S`} size="xs" variant="subtle" />
+            </span>
           ) : (
             <span className="opacity-70">Saved</span>
           )}

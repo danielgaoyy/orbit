@@ -41,17 +41,22 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isBareHomeDir, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Textarea } from "@/components/ui/textarea";
 import {
   SettingSelect,
   ToggleSwitch,
@@ -1264,10 +1269,10 @@ export function AutomationsView() {
                             </button>
                           </div>
                         ) : (
-                          <SimpleTooltip label="Delete heartbeat">
+                          <SimpleTooltip label="Delete">
                             <button
                               type="button"
-                              aria-label="Delete heartbeat"
+                              aria-label="Delete"
                               onClick={() => requestDeleteConfirm(hb.schedule_id)}
                               className="text-muted-foreground/75 hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-rose-500"
                             >
@@ -1709,9 +1714,9 @@ export function AutomationsView() {
             </DialogDescription>
           </DialogHeader>
 
-          <div className="flex flex-col gap-3.5 px-5 pb-4">
-            <label className="flex flex-col gap-1.5 text-[12px]">
-              <span className="text-muted-foreground font-medium">Agent</span>
+          <FieldGroup className="px-5 pb-4">
+            <Field>
+              <FieldLabel>Agent</FieldLabel>
               <SettingSelect
                 value={timerAgentId}
                 onChange={setTimerAgentId}
@@ -1722,10 +1727,10 @@ export function AutomationsView() {
                 }))}
                 placeholder="Select agent"
               />
-            </label>
+            </Field>
 
-            <div className="flex flex-col gap-1.5 text-[12px]">
-              <span className="text-muted-foreground font-medium">Delay (seconds)</span>
+            <Field>
+              <FieldLabel htmlFor="timer-delay-secs">Delay (seconds)</FieldLabel>
               <div className="flex items-center gap-1.5">
                 {[
                   { label: "1m", secs: "60" },
@@ -1734,33 +1739,31 @@ export function AutomationsView() {
                   { label: "30m", secs: "1800" },
                   { label: "1h", secs: "3600" },
                 ].map((preset) => (
-                  <button
+                  <Button
                     key={preset.secs}
                     type="button"
+                    variant={timerDurationSec === preset.secs ? "secondary" : "outline"}
+                    size="xs"
                     onClick={() => setTimerDurationSec(preset.secs)}
-                    className={cn(
-                      "h-[28px] cursor-pointer rounded-md border px-2 text-[11.5px] font-medium transition-colors",
-                      timerDurationSec === preset.secs
-                        ? "border-foreground/35 bg-accent text-foreground"
-                        : "border-border/75 text-muted-foreground hover:text-foreground",
-                    )}
+                    className="h-[28px] px-2 text-[11.5px]"
                   >
                     {preset.label}
-                  </button>
+                  </Button>
                 ))}
-                <input
+                <Input
+                  id="timer-delay-secs"
                   type="number"
                   min={1}
                   max={86400}
                   value={timerDurationSec}
                   onChange={(e) => setTimerDurationSec(e.target.value)}
-                  className="border-border bg-canvas text-foreground focus:border-foreground/30 ml-auto h-[28px] w-[84px] rounded-md border px-2 font-mono text-[12px] outline-none"
+                  className="ml-auto h-[28px] w-[84px] px-2 font-mono text-[12px]"
                 />
               </div>
-            </div>
+            </Field>
 
-            <label className="flex flex-col gap-1.5 text-[12px]">
-              <span className="text-muted-foreground font-medium">Early-cancel condition</span>
+            <Field>
+              <FieldLabel>Early-cancel condition</FieldLabel>
               <SettingSelect
                 value={timerConditionKind}
                 onChange={(val) => {
@@ -1776,53 +1779,56 @@ export function AutomationsView() {
                   { value: "never", label: "Never (fixed timer)" },
                 ]}
               />
-            </label>
+            </Field>
 
             {(timerConditionKind === "sender" || timerConditionKind === "file_changed") && (
-              <label className="flex flex-col gap-1.5 text-[12px]">
-                <span className="text-muted-foreground font-medium">
+              <Field>
+                <FieldLabel htmlFor="timer-condition-arg">
                   {timerConditionKind === "sender" ? "Sender Agent ID" : "Relative Workspace Path"}
-                </span>
-                <input
+                </FieldLabel>
+                <Input
+                  id="timer-condition-arg"
                   value={timerConditionArg}
                   onChange={(e) => setTimerConditionArg(e.target.value)}
                   placeholder={
                     timerConditionKind === "sender" ? "e.g. ag_12345678" : "e.g. dist/build.log"
                   }
-                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[34px] w-full rounded-lg border px-3 font-mono text-[12px] outline-none"
+                  className="h-[34px] px-3 font-mono text-[12px]"
                 />
-              </label>
+              </Field>
             )}
 
-            <label className="flex flex-col gap-1.5 text-[12px]">
-              <span className="text-muted-foreground font-medium">Wakeup prompt</span>
-              <textarea
+            <Field>
+              <FieldLabel htmlFor="timer-wakeup-prompt">Wakeup prompt</FieldLabel>
+              <Textarea
+                id="timer-wakeup-prompt"
                 rows={3}
                 value={timerPrompt}
                 onChange={(e) => setTimerPrompt(e.target.value)}
                 placeholder="What should the agent check if this timer elapses?"
-                className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 w-full resize-none rounded-lg border px-3 py-2 text-[12.5px] outline-none"
+                className="resize-none"
               />
-            </label>
-          </div>
+            </Field>
+          </FieldGroup>
 
-          <div className="border-border/70 flex items-center justify-end gap-2 border-t px-5 py-3">
-            <button
+          <DialogFooter className="border-border-subtle border-t px-5 py-3">
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={() => setTimerDialogOpen(false)}
-              className="text-muted-foreground hover:text-foreground h-[30px] cursor-pointer rounded-lg px-3 text-[12.5px] font-medium transition-colors"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
+              size="sm"
               disabled={timerSubmitting}
               onClick={() => void submitConditionalTimer()}
-              className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity disabled:opacity-40"
             >
               {timerSubmitting ? "Arming…" : "Arm timer"}
-            </button>
-          </div>
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -1843,22 +1849,24 @@ export function AutomationsView() {
           </DialogHeader>
 
           <ScrollArea viewportClassName="max-h-[min(70vh,560px)] px-5 pb-4">
-            <div className="flex flex-col gap-3.5">
+            <FieldGroup>
               {/* Primary 1: Name (optional — auto-derived from prompt if blank) */}
-              <label className="flex flex-col gap-1.5 text-[12px]">
-                <span className="text-muted-foreground font-medium">Name</span>
-                <input
+              <Field>
+                <FieldLabel htmlFor="schedule-name">Name</FieldLabel>
+                <Input
+                  id="schedule-name"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="Optional — auto-named from prompt"
-                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[34px] w-full rounded-lg border px-3 text-[13px] transition-colors outline-none"
+                  className="h-[34px] px-3 text-[13px]"
                 />
-              </label>
+              </Field>
 
               {/* Primary 2: Prompt */}
-              <label className="flex flex-col gap-1.5 text-[12px]">
-                <span className="text-muted-foreground font-medium">Prompt</span>
-                <textarea
+              <Field>
+                <FieldLabel htmlFor="schedule-prompt">Prompt</FieldLabel>
+                <Textarea
+                  id="schedule-prompt"
                   autoFocus
                   rows={4}
                   value={prompt}
@@ -1870,9 +1878,9 @@ export function AutomationsView() {
                     }
                   }}
                   placeholder="Describe what the agent should check or run each time…"
-                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 w-full resize-none rounded-lg border px-3 py-2.5 text-[13px] leading-relaxed transition-colors outline-none"
+                  className="resize-none py-2.5 text-[13px] leading-relaxed"
                 />
-              </label>
+              </Field>
 
               {/* Primary 3 & 4: Project + Schedule */}
               <div
@@ -1882,8 +1890,8 @@ export function AutomationsView() {
                 )}
               >
                 {!editingSchedule && projectSelectOptions.length > 0 && (
-                  <div className="flex flex-col gap-1.5 text-[12px]">
-                    <span className="text-muted-foreground font-medium">Project</span>
+                  <Field>
+                    <FieldLabel>Project</FieldLabel>
                     <SettingSelect
                       value={effectiveProjectPath}
                       options={projectSelectOptions}
@@ -1894,11 +1902,11 @@ export function AutomationsView() {
                       triggerClassName="w-full h-[34px] min-w-0"
                       menuClassName="w-[260px]"
                     />
-                  </div>
+                  </Field>
                 )}
 
-                <div className="flex flex-col gap-1.5 text-[12px]">
-                  <span className="text-muted-foreground font-medium">Schedule</span>
+                <Field>
+                  <FieldLabel>Schedule</FieldLabel>
                   <SettingSelect
                     value={schedulePreset}
                     options={SCHEDULE_PRESET_OPTIONS}
@@ -1911,25 +1919,26 @@ export function AutomationsView() {
                     triggerClassName="w-full h-[34px] min-w-0"
                     menuClassName="w-52"
                   />
-                </div>
+                </Field>
               </div>
 
               {/* Conditional Custom Cron input (only shown when "Custom cron…" is picked) */}
               {schedulePreset === CUSTOM_CRON_VALUE && (
-                <label className="flex flex-col gap-1.5 text-[12px]">
-                  <span className="text-muted-foreground flex items-center justify-between font-medium">
-                    <span>Cron expression</span>
-                    <span className="text-muted-foreground/70 font-normal">
+                <Field>
+                  <div className="flex items-center justify-between">
+                    <FieldLabel htmlFor="schedule-custom-cron">Cron expression</FieldLabel>
+                    <span className="text-muted-foreground/70 text-[11.5px] font-normal">
                       {humanCronPreview}
                     </span>
-                  </span>
-                  <input
+                  </div>
+                  <Input
+                    id="schedule-custom-cron"
                     value={customCronExpr}
                     onChange={(e) => setCustomCronExpr(e.target.value)}
                     placeholder="*/30 * * * * or daily 09:30"
-                    className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/50 focus:border-foreground/30 h-[34px] w-full rounded-lg border px-3 font-mono text-[12px] transition-colors outline-none"
+                    className="h-[34px] px-3 font-mono text-[12px]"
                   />
-                </label>
+                </Field>
               )}
 
               {/* Progressive Disclosure: Single-line Advanced summary */}
@@ -2056,27 +2065,28 @@ export function AutomationsView() {
                   </div>
                 )}
               </div>
-            </div>
+            </FieldGroup>
           </ScrollArea>
 
-          <div className="border-border/70 flex items-center justify-end gap-2 border-t px-5 py-3">
-            <button
+          <DialogFooter className="border-border-subtle border-t px-5 py-3">
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={() => setDialogOpen(false)}
-              className="border-border text-foreground/80 hover:bg-accent hover:text-foreground h-[30px] cursor-pointer rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
+              size="sm"
               disabled={submitting || !effectiveCronExpr || !prompt.trim()}
               onClick={() => void handleSubmitDialog()}
-              className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-45"
             >
               {submitting && <OrbitSpinner size={12} />}
               <span>{editingSchedule ? "Save" : "Create"}</span>
-            </button>
-          </div>
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </ScrollArea>

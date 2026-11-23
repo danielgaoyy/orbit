@@ -55,6 +55,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   selectedWorkspaceCwd: "fleet",
   isDraftNewSession: "fleet",
   sidebarView: "fleet",
+  stageRunningSubagentMeta: "fleet",
   sshHosts: "fleet",
   externalEditors: "fleet",
   isBrowserOffline: "fleet",
@@ -124,7 +125,6 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   collapsedHostIds: "sidebar",
   collapsedProjectIds: "sidebar",
   collapsedWorkspaceIds: "sidebar",
-  collapsedInboxProjectIds: "sidebar",
   hiddenProjectKeys: "sidebar",
   threadCustomTitles: "sidebar",
   archivedThreads: "sidebar",
@@ -132,6 +132,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   threadManualOrder: "sidebar",
   sidebarProjectSort: "sidebar",
   sidebarThreadFilter: "sidebar",
+  sidebarFilterFocusNonce: "sidebar",
 
   // terminal
   terminalTabs: "terminal",
@@ -157,6 +158,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   terminalFontSize: "preferences",
   terminalCursorStyle: "preferences",
   terminalScrollback: "preferences",
+  terminalThemeMode: "preferences",
 
   // updater
   appVersion: "updater",

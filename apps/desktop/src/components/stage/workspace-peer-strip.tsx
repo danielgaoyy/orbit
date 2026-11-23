@@ -24,10 +24,13 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { normalizeProjectPath } from "@/lib/projects";
+import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { Select, type SelectOption } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Popover,
   PopoverContent,
@@ -606,7 +609,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
     : "";
 
   return (
-    <div className="@container bg-canvas z-10 flex h-[30px] min-w-0 shrink-0 items-center justify-between gap-1.5 overflow-hidden px-2.5 shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.05)] select-none dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.055)] @[520px]:gap-2 @[520px]:px-3">
+    <div className="@container bg-surface-base border-border-subtle z-10 flex h-[30px] min-w-0 shrink-0 items-center justify-between gap-1.5 overflow-hidden border-b px-2.5 select-none @[520px]:gap-2 @[520px]:px-3">
       {/* Left: Quiet Group Switcher + Scrollable Sibling Thread Tabs + Pinned Add Button */}
       <div className="flex min-w-0 flex-1 items-center gap-1.5">
         <Popover open={groupSwitcherOpen} onOpenChange={setGroupSwitcherOpen}>
@@ -656,7 +659,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   </button>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <input
+                  <Input
                     value={groupRenameDraft}
                     onChange={(e) => setGroupRenameDraft(e.target.value)}
                     {...ime.compositionProps}
@@ -668,16 +671,17 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       }
                     }}
                     placeholder={t("peerStrip.groupNameInputPlaceholder")}
-                    className="border-border bg-canvas text-foreground h-[26px] min-w-0 flex-1 rounded-md border px-2 text-[12px] outline-none"
+                    className="h-[26px] flex-1 rounded-[6px] px-2 text-[12px]"
                   />
-                  <button
+                  <Button
                     type="button"
+                    size="xs"
                     disabled={!groupRenameDraft.trim() || groupRenameDraft.trim() === workspace.title}
                     onClick={() => void handleRenameCurrentGroup()}
-                    className="bg-foreground text-background inline-flex h-[26px] shrink-0 cursor-pointer items-center rounded-md px-2 text-[11.5px] font-medium disabled:opacity-35"
+                    className="h-[26px] shrink-0 px-2 text-[11.5px]"
                   >
                     {t("peerStrip.save")}
-                  </button>
+                  </Button>
                 </div>
               </div>
             )}
@@ -740,7 +744,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                 <span>{t("peerStrip.newGroup")}</span>
               </div>
               <div className="flex items-center gap-1.5">
-                <input
+                <Input
                   value={newGroupTitle}
                   onChange={(e) => setNewGroupTitle(e.target.value)}
                   {...ime.compositionProps}
@@ -752,16 +756,17 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     }
                   }}
                   placeholder={t("peerStrip.groupNamePlaceholder")}
-                  className="border-border bg-canvas text-foreground h-[26px] min-w-0 flex-1 rounded-md border px-2 text-[12px] outline-none"
+                  className="h-[26px] flex-1 rounded-[6px] px-2 text-[12px]"
                 />
-                <button
+                <Button
                   type="button"
+                  size="xs"
                   disabled={!newGroupTitle.trim()}
                   onClick={() => void handleCreateAndMoveGroup()}
-                  className="bg-foreground text-background inline-flex h-[26px] shrink-0 cursor-pointer items-center rounded-md px-2 text-[11.5px] font-medium disabled:opacity-35"
+                  className="h-[26px] shrink-0 px-2 text-[11.5px]"
                 >
                   {t("peerStrip.create")}
-                </button>
+                </Button>
               </div>
             </div>
 
@@ -1006,11 +1011,11 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                 {t("peerStrip.customTask")}
               </div>
               <div className="grid grid-cols-2 gap-1.5">
-                <input
+                <Input
                   value={customHandle}
                   onChange={(e) => setCustomHandle(e.target.value)}
                   placeholder={t("peerStrip.labelPlaceholder")}
-                  className="border-border bg-canvas text-foreground rounded-md border px-2 py-1 text-[12px] outline-none"
+                  className="h-[28px] rounded-[6px] px-2 text-[12px]"
                 />
                 <Select<ProviderKind>
                   size="compact"
@@ -1026,12 +1031,12 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   onChange={(provider) => setCustomProvider(provider)}
                 />
               </div>
-              <textarea
+              <Textarea
                 rows={2}
                 value={customPrompt}
                 onChange={(e) => setCustomPrompt(e.target.value)}
                 placeholder={t("peerStrip.customPromptPlaceholder")}
-                className="border-border bg-canvas text-foreground w-full resize-none rounded-md border p-2 text-[12px] outline-none"
+                className="min-h-[54px] resize-none rounded-[6px] p-2 text-[12px]"
               />
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
@@ -1056,11 +1061,12 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     </label>
                   )}
                 </div>
-                <button
+                <Button
                   type="button"
+                  size="xs"
                   disabled={!customPrompt.trim() || spawning}
                   onClick={() => void launchCustomPeer()}
-                  className="bg-foreground text-background inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2.5 text-[12px] font-medium disabled:opacity-40"
+                  className="h-[26px] gap-1 px-2.5 text-[12px]"
                 >
                   {spawning ? (
                     <Loader2 className="h-[12px] w-[12px] animate-spin" />
@@ -1068,7 +1074,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     <Plus className="h-[12px] w-[12px]" />
                   )}
                   <span>{t("common.start")}</span>
-                </button>
+                </Button>
               </div>
             </div>
           </PopoverContent>

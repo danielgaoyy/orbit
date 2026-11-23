@@ -5,7 +5,6 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
-  Loader2,
   QrCode,
   Radio,
   RefreshCw,
@@ -20,7 +19,10 @@ import {
   SettingSectionHeader,
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Input } from "@/components/ui/input";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import {
@@ -172,8 +174,10 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                   : t("settings.remoteOrbitDaemon")
             }
           >
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={() => {
                 void orbitIpc.connectHost(host.host_id);
                 void orbitIpc.refreshHost(host.host_id);
@@ -181,11 +185,11 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                   t("settings.reconnectingHost", { host: host.display_name }),
                 );
               }}
-              className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+              className="px-2.5"
             >
-              <RefreshCw className="h-[13px] w-[13px]" />
+              <RefreshCw className="size-[13px]" />
               <span>{t("banner.reconnect")}</span>
-            </button>
+            </Button>
           </SettingRow>
 
           <SettingRow
@@ -193,31 +197,35 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             description={t("settings.mobilePairingDesc")}
           >
             <div className="flex items-center gap-1.5">
-              <button
+              <Button
                 type="button"
+                variant="outline"
+                size="sm"
                 onClick={() => setPairingQrOpen(true)}
-                className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+                className="px-2.5"
               >
-                <QrCode className="text-muted-foreground h-[13px] w-[13px]" />
+                <QrCode className="text-muted-foreground size-[13px]" />
                 <span>{t("settings.showQr")}</span>
-              </button>
-              <button
+              </Button>
+              <Button
                 type="button"
+                variant="outline"
+                size="sm"
                 onClick={() => {
                   void orbitIpc
                     .exportHostPairingUri(host.host_id)
                     .then((uri) => copyValue("uri", uri))
                     .catch((err) => orbitActions.showToast(String(err)));
                 }}
-                className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+                className="px-2.5"
               >
                 {copiedField === "uri" ? (
-                  <Check className="h-[13px] w-[13px] text-emerald-500" />
+                  <Check className="text-signal-success size-[13px]" />
                 ) : (
-                  <Copy className="text-muted-foreground h-[13px] w-[13px]" />
+                  <Copy className="text-muted-foreground size-[13px]" />
                 )}
                 <span>{copiedField === "uri" ? t("common.copied") : t("settings.copyUri")}</span>
-              </button>
+              </Button>
             </div>
           </SettingRow>
 
@@ -238,36 +246,40 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           >
             <div className="flex items-center gap-1.5">
               {fleet.hosts.length > 1 && (
-                <button
+                <Button
                   type="button"
+                  variant="outline"
+                  size="sm"
                   disabled={isFleetBusy}
                   onClick={() => void orbitActions.upgradeAllConnectedHosts()}
-                  className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
+                  className="px-2.5"
                 >
                   {isFleetBusy ? (
-                    <Loader2 className="h-[13px] w-[13px] animate-spin" />
+                    <OrbitSpinner size={13} className="size-[13px]" />
                   ) : (
-                    <ArrowUpCircle className="h-[13.5px] w-[13.5px]" />
+                    <ArrowUpCircle className="size-[13.5px]" />
                   )}
                   <span>
                     {isFleetBusy
                       ? t("settings.updatingAllHosts")
                       : t("settings.updateAllHosts")}
                   </span>
-                </button>
+                </Button>
               )}
-              <button
+              <Button
                 type="button"
+                variant="outline"
+                size="sm"
                 disabled={upgrading || isFleetBusy}
                 onClick={() => void handleUpgradeDaemon()}
-                className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
+                className="px-2.5"
               >
                 {upgrading ? (
-                  <Loader2 className="h-[13px] w-[13px] animate-spin" />
+                  <OrbitSpinner size={13} className="size-[13px]" />
                 ) : isDaemonOutdated ? (
-                  <ArrowUpCircle className="h-[13.5px] w-[13.5px]" />
+                  <ArrowUpCircle className="size-[13.5px]" />
                 ) : (
-                  <RefreshCw className="h-[13px] w-[13px]" />
+                  <RefreshCw className="size-[13px]" />
                 )}
                 <span>
                   {upgrading
@@ -278,7 +290,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                         ? t("settings.restart")
                         : t("common.update")}
                 </span>
-              </button>
+              </Button>
             </div>
           </SettingRow>
         </SettingCard>
@@ -298,9 +310,9 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               >
                 <span className="truncate">{host.host_id}</span>
                 {copiedField === "id" ? (
-                  <Check className="h-[12.5px] w-[12.5px] shrink-0 text-emerald-500" />
+                  <Check className="text-signal-success size-[12.5px] shrink-0" />
                 ) : (
-                  <Copy className="text-muted-foreground h-[12.5px] w-[12.5px] shrink-0 opacity-70" />
+                  <Copy className="text-muted-foreground size-[12.5px] shrink-0 opacity-70" />
                 )}
               </button>
             </div>
@@ -314,9 +326,9 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               >
                 <span className="truncate">{host.daemon_pubkey_b64.slice(0, 26)}…</span>
                 {copiedField === "pubkey" ? (
-                  <Check className="h-[12.5px] w-[12.5px] shrink-0 text-emerald-500" />
+                  <Check className="text-signal-success size-[12.5px] shrink-0" />
                 ) : (
-                  <Copy className="text-muted-foreground h-[12.5px] w-[12.5px] shrink-0 opacity-70" />
+                  <Copy className="text-muted-foreground size-[12.5px] shrink-0 opacity-70" />
                 )}
               </button>
             </div>
@@ -340,7 +352,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           </p>
 
           <div className="flex flex-wrap gap-2">
-            <input
+            <Input
               type="text"
               value={relayInput}
               onChange={(e) => setRelayInput(e.target.value)}
@@ -350,35 +362,37 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                 if (e.key === "Enter" && relayDirty) void handleSaveRelay(false);
               }}
               placeholder="wss://relay.example.com"
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground h-[34px] min-w-[200px] flex-1 rounded-lg border px-3 font-mono text-[12.5px] outline-none focus:border-foreground/30"
+              className="h-[34px] min-w-[200px] flex-1 px-3 font-mono"
             />
-            <button
+            <Button
               type="button"
               disabled={!relayDirty}
               onClick={() => void handleSaveRelay(false)}
-              className="bg-foreground text-background inline-flex h-[34px] cursor-pointer items-center rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-40"
+              className="h-[34px] px-3.5"
             >
               Save
-            </button>
+            </Button>
             {fleet.hosts.length > 1 && relayInput.trim() && (
-              <button
+              <Button
                 type="button"
+                variant="outline"
                 disabled={sharingRelay}
                 onClick={() => void handleShareRelayAllHosts()}
-                className="border-border hover:bg-accent inline-flex h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:opacity-50"
+                className="h-[34px] gap-1.5 px-3 text-[12.5px]"
               >
-                {sharingRelay && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                {sharingRelay && <OrbitSpinner size={13.5} className="size-[13.5px]" />}
                 <span>Share with All Hosts</span>
-              </button>
+              </Button>
             )}
             {host.relay_url && (
-              <button
+              <Button
                 type="button"
+                variant="outline"
                 onClick={() => void handleSaveRelay(true)}
-                className="border-border hover:bg-accent inline-flex h-[34px] cursor-pointer items-center rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
+                className="h-[34px] px-3"
               >
                 Clear
-              </button>
+              </Button>
             )}
           </div>
 
@@ -410,19 +424,21 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                           {s.display_target}
                         </span>
                       </div>
-                      <button
+                      <Button
                         type="button"
+                        variant="outline"
+                        size="xs"
                         disabled={deployingSsh !== null}
                         onClick={() => void handleDeploySshRelay(s)}
-                        className="border-border hover:bg-accent inline-flex h-[26px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md border px-2.5 text-[11.5px] font-medium transition-colors disabled:opacity-50"
+                        className="shrink-0 gap-1.5 text-[11.5px]"
                       >
                         {deployingSsh === s.alias ? (
-                          <Loader2 className="h-[12px] w-[12px] animate-spin" />
+                          <OrbitSpinner size={12} className="size-3" />
                         ) : (
-                          <Radio className="h-[12px] w-[12px]" />
+                          <Radio className="size-3" />
                         )}
                         <span>Deploy</span>
-                      </button>
+                      </Button>
                     </div>
                   ))}
                 </div>
@@ -444,14 +460,16 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           title="Remove host"
           description="Unpair this machine from Orbit Desktop."
         >
-          <button
+          <Button
             type="button"
+            variant="outline"
+            size="sm"
             onClick={() => setConfirmRemoveOpen(true)}
-            className="inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border border-rose-500/25 px-3 text-[12px] font-medium text-rose-600 transition-colors hover:bg-rose-500/10 dark:text-rose-400"
+            className="border-signal-danger-border text-signal-danger hover:bg-signal-danger-bg hover:text-signal-danger"
           >
-            <Trash2 className="h-[13px] w-[13px]" />
+            <Trash2 className="size-[13px]" />
             <span>Remove</span>
-          </button>
+          </Button>
         </SettingRow>
       </SettingCard>
 
@@ -460,7 +478,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         onOpenChange={setConfirmRemoveOpen}
         title={`Remove ${host.display_name}?`}
         description="Unpairs this machine from Orbit Desktop. Running agents and shells on the host keep running, and you can pair it again later."
-        confirmLabel="Remove host"
+        confirmLabel="Remove"
         tone="danger"
         onConfirm={handleRemoveHost}
       />

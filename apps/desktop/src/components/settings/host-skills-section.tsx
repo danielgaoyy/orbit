@@ -21,7 +21,10 @@ import {
   SettingSectionHeader,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { isImeKeyEvent } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import {
@@ -640,7 +643,7 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
           </div>
 
           <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-            <input
+            <Input
               value={newName}
               onChange={(e) => {
                 const next = e.target.value;
@@ -648,51 +651,50 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
                 if (!slugTouched) setNewSlug(slugifyName(next));
               }}
               placeholder="Name (e.g. Release Checklist)"
-              className="border-border bg-canvas rounded-lg border px-2.5 py-1.5 outline-none"
             />
-            <input
+            <Input
               value={newSlug}
               onChange={(e) => {
                 setSlugTouched(true);
                 setNewSlug(e.target.value.toLowerCase());
               }}
               placeholder="slug (e.g. release-checklist)"
-              className="border-border bg-canvas rounded-lg border px-2.5 py-1.5 font-mono text-[12px] outline-none"
+              className="font-mono text-[12px]"
             />
           </div>
 
-          <input
+          <Input
             value={newDesc}
             onChange={(e) => setNewDesc(e.target.value)}
             placeholder="Short description"
-            className="border-border bg-canvas w-full rounded-lg border px-2.5 py-1.5 outline-none"
           />
 
-          <textarea
+          <Textarea
             rows={5}
             value={newBody}
             onChange={(e) => setNewBody(e.target.value)}
             placeholder="Markdown instructions (YAML frontmatter is added automatically if omitted)"
-            className="border-border bg-canvas w-full rounded-lg border px-2.5 py-2 font-mono text-[12px] leading-relaxed outline-none"
+            className="font-mono text-[12px] leading-relaxed"
           />
 
           <div className="flex items-center justify-end gap-2">
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={() => setActiveDrawer("none")}
-              className="border-border hover:bg-accent cursor-pointer rounded-lg border px-2.5 py-1 text-[12px]"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
+              size="sm"
               disabled={creating}
               onClick={() => void handleCreateSkill()}
-              className="bg-foreground text-background inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-3 py-1 text-[12px] font-medium disabled:opacity-50"
             >
               {creating && <Loader2 className="h-3 w-3 animate-spin" />}
               <span>Create Skill</span>
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -702,14 +704,16 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
         <div className="border-border bg-background/80 space-y-3 rounded-[13px] border p-4 text-[12.5px]">
           <div className="flex items-center justify-between">
             <span className="text-foreground text-[13px] font-medium">Import Markdown</span>
-            <button
+            <Button
               type="button"
+              variant="ghost"
+              size="icon"
               aria-label="Close import drawer"
               onClick={() => setActiveDrawer("none")}
-              className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-1"
+              className="h-[24px] w-[24px]"
             >
               <X className="h-3.5 w-3.5" />
-            </button>
+            </Button>
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -734,39 +738,40 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
                 );
               })}
             </div>
-            <input
+            <Input
               value={importSlugOverride}
               onChange={(e) => setImportSlugOverride(e.target.value.toLowerCase())}
               placeholder="Slug override (optional)"
-              className="border-border bg-canvas w-48 rounded-lg border px-2.5 py-1 font-mono text-[11.5px] outline-none"
+              className="h-[30px] w-48 font-mono text-[11.5px]"
             />
           </div>
 
-          <textarea
+          <Textarea
             rows={5}
             value={importSource}
             onChange={(e) => setImportSource(e.target.value)}
             placeholder="Paste SKILL.md Markdown content, or enter a local .md path inside your active workspace or skills directory"
-            className="border-border bg-canvas w-full rounded-lg border px-2.5 py-2 font-mono text-[12px] leading-relaxed outline-none"
+            className="font-mono text-[12px] leading-relaxed"
           />
 
           <div className="flex items-center justify-end gap-2">
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={() => setActiveDrawer("none")}
-              className="border-border hover:bg-accent cursor-pointer rounded-lg border px-2.5 py-1 text-[12px]"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
+              size="sm"
               disabled={importing}
               onClick={() => void handleImportSkill()}
-              className="bg-foreground text-background inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-3 py-1 text-[12px] font-medium disabled:opacity-50"
             >
               {importing && <Loader2 className="h-3 w-3 animate-spin" />}
               <span>Import Skill</span>
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -775,11 +780,11 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
       <div className="space-y-2.5">
         <div className="relative">
           <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2" />
-          <input
+          <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search skills by name, slug, or trigger…"
-            className="border-border bg-background/60 text-foreground placeholder:text-muted-foreground/75 h-[34px] w-full rounded-[10px] border pr-8 pl-8.5 text-[12.5px] outline-none focus:border-foreground/30"
+            className="h-[34px] pr-8 pl-8.5"
           />
           {search && (
             <button
@@ -954,20 +959,24 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
                             </button>
                             {deletingThis ? (
                               <div className="flex items-center gap-1">
-                                <button
+                                <Button
                                   type="button"
+                                  variant="destructive"
+                                  size="sm"
                                   onClick={() => void handleDeleteSkill(skill)}
-                                  className="cursor-pointer rounded-md bg-rose-600 px-2 py-1 text-[11.5px] font-medium text-white hover:bg-rose-700"
+                                  className="h-[26px] px-2 text-[11.5px]"
                                 >
-                                  Confirm Delete
-                                </button>
-                                <button
+                                  Delete
+                                </Button>
+                                <Button
                                   type="button"
+                                  variant="outline"
+                                  size="sm"
                                   onClick={() => setConfirmDeleteId(null)}
-                                  className="border-border hover:bg-accent cursor-pointer rounded-md border px-2 py-1 text-[11.5px]"
+                                  className="h-[26px] px-2 text-[11.5px]"
                                 >
                                   Cancel
-                                </button>
+                                </Button>
                               </div>
                             ) : (
                               <button
@@ -1055,7 +1064,7 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
                       </div>
                     ) : skill.editable ? (
                       <div className="space-y-1.5">
-                        <textarea
+                        <Textarea
                           rows={12}
                           value={editorContent}
                           onChange={(e) => setEditorContent(e.target.value)}
@@ -1071,7 +1080,7 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
                             }
                           }}
                           spellCheck={false}
-                          className="border-border bg-canvas text-foreground w-full rounded-lg border p-3 font-mono text-[12px] leading-relaxed outline-none focus:border-foreground/30"
+                          className="p-3 font-mono text-[12px] leading-relaxed"
                         />
                         <div className="text-muted-foreground/75 flex items-center justify-between text-[11px]">
                           <span className="inline-flex items-center gap-1">

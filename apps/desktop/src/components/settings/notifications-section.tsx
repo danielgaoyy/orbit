@@ -9,7 +9,10 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import { useI18n } from "@/lib/i18n";
 import { playSoftNotificationChime } from "@/lib/notification-sound";
 import type { PushPlatform, PushPreferences } from "@/lib/orbit-ipc";
@@ -237,28 +240,30 @@ export function NotificationsSection() {
           >
             {permission === "granted" ? (
               <div className="flex items-center gap-2.5">
-                <button
+                <Button
                   type="button"
+                  variant="outline"
+                  size="xs"
                   onClick={() => orbitActions.sendTestDesktopNotification()}
-                  className="border-border text-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.06] inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+                  className="h-[28px] gap-1.5"
                 >
                   <Send className="h-[12px] w-[12px]" />
                   <span>Test</span>
-                </button>
-                <span className="inline-flex items-center gap-1.5 text-[12.5px] font-medium text-emerald-600 dark:text-emerald-400">
+                </Button>
+                <span className="text-signal-success inline-flex items-center gap-1.5 text-[12.5px] font-medium">
                   <Check className="h-[14px] w-[14px]" />
                   Enabled
                 </span>
               </div>
             ) : permission === "default" ? (
-              <button
+              <Button
                 type="button"
+                size="sm"
                 onClick={() => void ensurePermissionIfDefault()}
-                className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium transition-opacity hover:opacity-90"
               >
                 <Bell className="h-[13.5px] w-[13.5px]" />
                 <span>Enable</span>
-              </button>
+              </Button>
             ) : (
               <span className="text-muted-foreground text-[12.5px]">
                 {permission === "denied" ? "Blocked" : "Unavailable"}
@@ -509,15 +514,12 @@ export function NotificationsSection() {
             </div>
           </SettingRow>
 
-          <div className="space-y-3 px-4 py-3.5">
-            <div className="space-y-1.5">
-              <label
-                htmlFor="push-gateway-url"
-                className="text-foreground block text-[13px] font-medium"
-              >
+          <FieldGroup className="gap-3 px-4 py-3.5">
+            <Field>
+              <FieldLabel htmlFor="push-gateway-url" className="text-ink-primary text-[13px]">
                 Push gateway URL
-              </label>
-              <input
+              </FieldLabel>
+              <Input
                 id="push-gateway-url"
                 type="url"
                 value={draftPrefs.push_gateway_url ?? ""}
@@ -526,18 +528,14 @@ export function NotificationsSection() {
                   updateDraftPrefs((p) => ({ ...p, push_gateway_url: e.target.value }))
                 }
                 placeholder="https://push.example.com/v1/dispatch"
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 text-[12.5px] outline-none focus:border-foreground/40 disabled:opacity-55"
               />
-            </div>
+            </Field>
 
-            <div className="space-y-1.5">
+            <Field>
               <div className="flex items-center justify-between">
-                <label
-                  htmlFor="push-gateway-token"
-                  className="text-foreground block text-[13px] font-medium"
-                >
+                <FieldLabel htmlFor="push-gateway-token" className="text-ink-primary text-[13px]">
                   Gateway Bearer token
-                </label>
+                </FieldLabel>
                 {draftPrefs.has_gateway_auth_token && !clearStoredToken && isPushReady && (
                   <button
                     type="button"
@@ -551,7 +549,7 @@ export function NotificationsSection() {
                   </button>
                 )}
               </div>
-              <input
+              <Input
                 id="push-gateway-token"
                 type="password"
                 value={gatewayTokenInput}
@@ -566,9 +564,8 @@ export function NotificationsSection() {
                     ? "Stored token kept unless replaced"
                     : "Optional Bearer token"
                 }
-                className="border-border bg-background text-foreground placeholder:text-muted-foreground/60 h-[32px] w-full rounded-lg border px-2.5 text-[12.5px] outline-none focus:border-foreground/40 disabled:opacity-55"
               />
-            </div>
+            </Field>
 
             <div className="flex items-center justify-between pt-1">
               <span className="text-muted-foreground text-[12px]">
@@ -581,26 +578,27 @@ export function NotificationsSection() {
                       : "HTTPS only with DNS-pinned SSRF protection."}
               </span>
               <div className="flex items-center gap-2">
-                <button
+                <Button
                   type="button"
+                  variant="outline"
+                  size="sm"
                   disabled={!isPushReady || pushEntry?.testing || devices.length === 0}
                   onClick={() => void orbitActions.testPushNotification(activeHostId, null)}
-                  className="border-border text-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.06] inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <Send className="h-[12.5px] w-[12.5px]" />
                   <span>{pushEntry?.testing ? "Sending…" : "Test Notification"}</span>
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
+                  size="sm"
                   disabled={!isPushReady || pushEntry?.saving}
                   onClick={() => void handleSaveMobilePrefs()}
-                  className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12px] font-medium transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <span>{pushEntry?.saving ? "Saving…" : "Save"}</span>
-                </button>
+                </Button>
               </div>
             </div>
-          </div>
+          </FieldGroup>
         </SettingCard>
       </div>
 

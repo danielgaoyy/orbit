@@ -25,7 +25,6 @@ import {
   GitCompareArrows,
   GitFork,
   ListTodo,
-  Loader2,
   Music,
   Quote,
   Sparkles,
@@ -36,6 +35,8 @@ import {
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { Button } from "@/components/ui/button";
+import { DiffStat } from "@/components/ui/diff-stat";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import {
   Dialog,
   DialogContent,
@@ -46,6 +47,7 @@ import {
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
@@ -543,29 +545,21 @@ export const ForkActionButton = memo(function ForkActionButton({
           </DropdownMenuTrigger>
         )}
       />
-      <DropdownMenuContent
-        align={align}
-        sideOffset={6}
-        className="w-max min-w-[168px] rounded-[11px] p-1"
-      >
-        <DropdownMenuItem
-          onSelect={() => onFork(false)}
-          className="cursor-pointer rounded-[8px] px-2.5 py-1.5 text-[12.5px]"
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <GitFork className="text-muted-foreground size-[13px] shrink-0 stroke-[1.8]" />
-            <span>Fork here</span>
-          </span>
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onSelect={() => onFork(true)}
-          className="cursor-pointer rounded-[8px] px-2.5 py-1.5 text-[12.5px]"
-        >
-          <span className="flex items-center gap-2 whitespace-nowrap">
-            <GitBranch className="text-muted-foreground size-[13px] shrink-0 stroke-[1.8]" />
-            <span>Fork in new worktree</span>
-          </span>
-        </DropdownMenuItem>
+      <DropdownMenuContent align={align} sideOffset={6} className="min-w-[168px]">
+        <DropdownMenuGroup>
+          <DropdownMenuItem onSelect={() => onFork(false)}>
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <GitFork className="text-ink-muted size-[13px] stroke-[1.8]" />
+              <span>Fork here</span>
+            </span>
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onFork(true)}>
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <GitBranch className="text-ink-muted size-[13px] stroke-[1.8]" />
+              <span>Fork in new worktree</span>
+            </span>
+          </DropdownMenuItem>
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -926,19 +920,12 @@ export const TurnChangesBar = memo(function TurnChangesBar({
       <button
         type="button"
         onClick={() => orbitActions.openInspectorForFile(primaryPath, "session_turns")}
-        className="border-border bg-elevated hover:bg-accent/65 inline-flex max-w-full cursor-pointer items-center gap-2.5 rounded-full border px-3 py-1 text-[12.5px] transition-colors"
+        className="border-border-subtle bg-surface-raised hover:bg-accent/70 hover:border-border-default inline-flex max-w-full cursor-pointer items-center gap-2 rounded-full border px-3 py-1 text-[12px] transition-colors"
       >
-        <FileCode2 className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
-        <span className="text-foreground/88 truncate font-medium">{label}</span>
-        {(totalAdd > 0 || totalDel > 0) && (
-          <span className="tabular-nums flex shrink-0 items-center gap-1.5 font-mono text-[11.5px]">
-            {totalAdd > 0 && (
-              <span className="text-emerald-600 dark:text-emerald-400">+{totalAdd}</span>
-            )}
-            {totalDel > 0 && <span className="text-rose-600 dark:text-rose-400">-{totalDel}</span>}
-          </span>
-        )}
-        <span className="text-muted-foreground shrink-0 text-[12px]">Review ▸</span>
+        <FileCode2 className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+        <span className="text-ink-primary truncate font-medium">{label}</span>
+        <DiffStat additions={totalAdd} deletions={totalDel} />
+        <span className="text-ink-tertiary shrink-0 text-[11px]">Review ▸</span>
       </button>
     </div>
   );
@@ -976,20 +963,20 @@ export const ForkedFromBanner = memo(function ForkedFromBanner({
   );
 
   return (
-    <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,768px)] items-center px-[10px] pt-2 pb-0.5">
+    <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,740px)] items-center px-[10px] pt-2 pb-0.5">
       {canJump ? (
         <button
           type="button"
           onClick={() => orbitActions.selectAgent(hostId, sourceId)}
-          className="text-muted-foreground/75 hover:text-foreground inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-md py-0.5 text-[11.5px] leading-tight transition-colors"
+          className="text-ink-tertiary hover:text-ink-primary inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-[6px] py-0.5 text-[11px] leading-tight transition-colors"
         >
           <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-70" />
           <span className="truncate">
-            Forked from <span className="text-foreground/80 font-medium">{parentTitle}</span>
+            Forked from <span className="text-ink-primary font-medium">{parentTitle}</span>
           </span>
         </button>
       ) : (
-        <span className="text-muted-foreground/65 inline-flex max-w-full items-center gap-1.5 py-0.5 text-[11.5px] leading-tight">
+        <span className="text-ink-muted inline-flex max-w-full items-center gap-1.5 py-0.5 text-[11px] leading-tight">
           <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-60" />
           <span className="truncate">Forked from {parentTitle}</span>
         </span>
@@ -1110,14 +1097,7 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
                         {showRelPath ? file.displayPath : file.basename}
                       </span>
                       {(file.additions > 0 || file.deletions > 0) && (
-                        <span className="tabular-nums flex shrink-0 items-center gap-1.5 font-mono text-[12px]">
-                          <span className="text-emerald-600 dark:text-emerald-400">
-                            +{file.additions}
-                          </span>
-                          <span className="text-rose-600 dark:text-rose-400">
-                            -{file.deletions}
-                          </span>
-                        </span>
+                        <DiffStat additions={file.additions} deletions={file.deletions} />
                       )}
                     </div>
                   );
@@ -1160,7 +1140,7 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
             onClick={() => onConfirm(effectiveRestore)}
             className="gap-1.5"
           >
-            {submitting && <Loader2 className="size-3.5 animate-spin" />}
+            {submitting && <OrbitSpinner size={13} />}
             <span>Confirm</span>
             {!submitting && <span className="text-[11px] opacity-75">↵</span>}
           </Button>

@@ -10,8 +10,9 @@
 
 1. **完整读取 [`.agents/skills/interface-design/SKILL.md`](../../.agents/skills/interface-design/SKILL.md)**（PR #40 引入的官方 Craft-First 界面设计 Skill）。
    - 严禁依赖通用模板默认风格；每次构建新组件前，需明确意图（Intent）、唯一视觉焦点（Hierarchy）、配色逻辑（Palette）、深度策略（Depth）、表面层级（Surfaces）、字阶/字重（Typography）与栅格密度（Spacing）。
-2. **检查设计记忆文件 `.interface-design/system.md`**：
-   - 若仓库中已存在 `.interface-design/system.md`，必须一并读取并严格复用其中已确定的间距基准、色板 Token、圆角/阴影层级与组件模式，防止风格漂移。
+2. **检查设计记忆文件 `.interface-design/system.md` 与组件 Skill [`.agents/skills/shadcn/SKILL.md`](../../.agents/skills/shadcn/SKILL.md)**：
+   - 仓库已内置 `.interface-design/system.md`（*Orbital Quiet Precision* 设计令牌、圆角/阴影层级与空间契约），修改 UI 前必须一并读取并严格复用；
+   - 桌面端（`apps/desktop`）遵循 shadcn/ui Primitive-First 原则：编写界面前先查阅 `apps/desktop/src/components/ui/` 与 `.agents/skills/shadcn/SKILL.md`，优先组合官方原语（`Button`、`Input`、`Textarea`、`FieldGroup`/`Field`、`Switch`、`Dialog`、`DropdownMenu`、`IconButton`、`OrbitSpinner` 等），避免重复手写基础控件。
 3. **跨端组件对齐**：
    - 同时阅读 [`docs/CLIENT_BRIDGE_ARCHITECTURE.md`](../CLIENT_BRIDGE_ARCHITECTURE.md)，确保业务数据（Sidebar、Stage、模型列表、Slash/Mention、Diagram 渲染等）一律由 `orbit-client-core` 计算下发，客户端只负责薄层原生渲染与平台手势/动效。
 

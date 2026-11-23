@@ -2291,9 +2291,13 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     async renameWorkspace(hostId: string, workspaceId: string, title: string): Promise<void> {
       const trimmed = title.trim();
       if (!trimmed) return;
-      await orbitIpc.renameWorkspace(hostId, workspaceId, trimmed);
-      ctx.actions.refreshSidebarView();
-      notifyToast(t("store.workspaceRenamed", { title: trimmed }));
+      try {
+        await orbitIpc.renameWorkspace(hostId, workspaceId, trimmed);
+        ctx.actions.refreshSidebarView();
+        notifyToast(t("store.workspaceRenamed", { title: trimmed }));
+      } catch (err) {
+        notifyToast(t("store.failedRenameGroup", { detail: String(err) }));
+      }
     },
 
 
@@ -2307,16 +2311,20 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     }): Promise<void> {
       const trimmed = params.title.trim();
       if (!trimmed) return;
-      await orbitIpc.createMissionWorkspace({
-        hostId: params.hostId,
-        sourceCwd: params.sourceCwd,
-        title: trimmed,
-        missionGoal: params.missionGoal ?? null,
-        isolation: params.isolation ?? "local",
-        worktreeBranch: params.worktreeBranch ?? null,
-      });
-      ctx.actions.refreshSidebarView();
-      notifyToast(t("store.workspaceCreated", { title: trimmed }));
+      try {
+        await orbitIpc.createMissionWorkspace({
+          hostId: params.hostId,
+          sourceCwd: params.sourceCwd,
+          title: trimmed,
+          missionGoal: params.missionGoal ?? null,
+          isolation: params.isolation ?? "local",
+          worktreeBranch: params.worktreeBranch ?? null,
+        });
+        ctx.actions.refreshSidebarView();
+        notifyToast(t("store.workspaceCreated", { title: trimmed }));
+      } catch (err) {
+        notifyToast(t("store.failedCreateGroup", { detail: String(err) }));
+      }
     },
 
 
@@ -2324,14 +2332,21 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       hostId: string,
       workspaceId: string,
       keepAgentsUnclassified = false,
+      opts?: { emptyDelete?: boolean },
     ): Promise<void> {
-      await orbitIpc.archiveWorkspace(hostId, workspaceId, keepAgentsUnclassified);
-      ctx.actions.refreshSidebarView();
-      notifyToast(
-        keepAgentsUnclassified
-          ? t("store.workspaceDisbanded")
-          : t("store.workspaceArchived"),
-      );
+      try {
+        await orbitIpc.archiveWorkspace(hostId, workspaceId, keepAgentsUnclassified);
+        ctx.actions.refreshSidebarView();
+        notifyToast(
+          opts?.emptyDelete
+            ? t("store.workspaceDeleted")
+            : keepAgentsUnclassified
+              ? t("store.workspaceDisbanded")
+              : t("store.workspaceArchived"),
+        );
+      } catch (err) {
+        notifyToast(t("store.failedUpdateGroup", { detail: String(err) }));
+      }
     },
 
 
@@ -2341,17 +2356,21 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       targetWorkspaceId?: string | null,
       opts?: { newWorkspaceTitle?: string | null; makeUnclassified?: boolean },
     ): Promise<void> {
-      await orbitIpc.moveAgentToWorkspace(hostId, agentId, targetWorkspaceId ?? null, opts);
-      ctx.actions.refreshSidebarView();
-      notifyToast(
-        opts?.makeUnclassified
-          ? t("store.movedToUnfiled")
-          : targetWorkspaceId
-            ? t("store.movedToWorkspace")
-            : opts?.newWorkspaceTitle
-              ? t("store.movedToNewWorkspace", { title: opts.newWorkspaceTitle })
-              : t("store.movedToStandaloneWorkspace"),
-      );
+      try {
+        await orbitIpc.moveAgentToWorkspace(hostId, agentId, targetWorkspaceId ?? null, opts);
+        ctx.actions.refreshSidebarView();
+        notifyToast(
+          opts?.makeUnclassified
+            ? t("store.movedToUnfiled")
+            : targetWorkspaceId
+              ? t("store.movedToWorkspace")
+              : opts?.newWorkspaceTitle
+                ? t("store.movedToNewWorkspace", { title: opts.newWorkspaceTitle })
+                : t("store.movedToStandaloneWorkspace"),
+        );
+      } catch (err) {
+        notifyToast(t("store.failedMoveConversation", { detail: String(err) }));
+      }
     },
 
 
@@ -2361,18 +2380,26 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       agentIds: string[] = [],
       autoApply = true,
     ): Promise<void> {
-      await orbitIpc.organizeProjectWorkspaces(hostId, projectRoot, agentIds, autoApply);
-      notifyToast(
-        agentIds.length === 1
-          ? t("store.organizingSingleSession")
-          : t("store.organizingUnfiledSessions"),
-      );
+      try {
+        await orbitIpc.organizeProjectWorkspaces(hostId, projectRoot, agentIds, autoApply);
+        notifyToast(
+          agentIds.length === 1
+            ? t("store.organizingSingleSession")
+            : t("store.organizingUnfiledSessions"),
+        );
+      } catch (err) {
+        notifyToast(t("store.failedOrganizeConversations", { detail: String(err) }));
+      }
     },
 
 
     async summarizeAgent(hostId: string, agentId: string): Promise<void> {
-      await orbitIpc.summarizeAgent(hostId, agentId);
-      notifyToast(t("store.summarizingSession"));
+      try {
+        await orbitIpc.summarizeAgent(hostId, agentId);
+        notifyToast(t("store.summarizingSession"));
+      } catch (err) {
+        notifyToast(t("store.failedSummarizeConversation", { detail: String(err) }));
+      }
     },
 
 
@@ -2385,14 +2412,18 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       lockHandle?: boolean;
       lockTitle?: boolean;
     }): Promise<void> {
-      await orbitIpc.updateAgentIdentity(params);
-      ctx.actions.refreshSidebarView();
-      if (params.handle) {
-        notifyToast(
-          t("store.updatedSessionTag", { handle: params.handle.trim().replace(/^@+/, "") }),
-        );
-      } else if (params.taskSummary !== undefined) {
-        notifyToast(t("store.updatedSessionSummary"));
+      try {
+        await orbitIpc.updateAgentIdentity(params);
+        ctx.actions.refreshSidebarView();
+        if (params.handle) {
+          notifyToast(
+            t("store.updatedSessionTag", { handle: params.handle.trim().replace(/^@+/, "") }),
+          );
+        } else if (params.taskSummary !== undefined) {
+          notifyToast(t("store.updatedSessionSummary"));
+        }
+      } catch (err) {
+        notifyToast(t("store.failedUpdateConversation", { detail: String(err) }));
       }
     },
 
@@ -2402,9 +2433,13 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       sourceWorkspaceId: string,
       targetWorkspaceId: string,
     ): Promise<void> {
-      await orbitIpc.mergeWorkspaces(hostId, sourceWorkspaceId, targetWorkspaceId);
-      ctx.actions.refreshSidebarView();
-      notifyToast("Workspaces merged");
+      try {
+        await orbitIpc.mergeWorkspaces(hostId, sourceWorkspaceId, targetWorkspaceId);
+        ctx.actions.refreshSidebarView();
+        notifyToast(t("store.workspaceMerged"));
+      } catch (err) {
+        notifyToast(t("store.failedMergeGroups", { detail: String(err) }));
+      }
     },
 
 

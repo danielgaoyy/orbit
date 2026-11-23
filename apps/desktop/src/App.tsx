@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { ExternalLink, PanelLeft, PanelRight } from "lucide-react";
+import { PanelLeft, PanelRight } from "lucide-react";
 import { resyncAllAmbientAnimations } from "@/lib/animation-sync";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/command/command-palette";
@@ -26,8 +26,11 @@ import { FleetSidebar } from "@/components/sidebar/fleet-sidebar";
 import { RemoteFolderPickerDialog } from "@/components/sidebar/remote-folder-picker-dialog";
 import { StreamStage } from "@/components/stage/stream-stage";
 import { WorkspacePeerStrip } from "@/components/stage/workspace-peer-strip";
-import { SimpleTooltip, TooltipProvider } from "@/components/ui/overlays";
+import { IconButton } from "@/components/ui/icon-button";
+import { TooltipProvider } from "@/components/ui/overlays";
 import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
+import { ToastViewport } from "@/components/ui/toast-viewport";
+import { SIDEBAR_DEFAULT_WIDTH_PX } from "@/lib/workspace-layout";
 import {
   isConfirmDialogOpen,
   modSymbol,
@@ -294,43 +297,13 @@ function MainDesktopApp() {
         <MediaPreviewModal />
 
         {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit, Actions & Undo Archive */}
-        {renderedToast && (
-          <div
-            className={cn(
-              "bg-elevated text-foreground floating-surface fixed right-4 bottom-4 z-50 flex items-center gap-2.5 rounded-xl border border-black/[0.08] px-3.5 py-2 text-[13px] dark:border-white/[0.10]",
-              lastArchivedUndo || renderedToastAction ? "pointer-events-auto" : "pointer-events-none",
-              toastExiting ? "orbit-toast-exit" : "orbit-toast-enter",
-            )}
-          >
-            <span>{renderedToast}</span>
-            {renderedToastAction && (
-              <button
-                type="button"
-                onClick={() => {
-                  if (renderedToastAction.url) {
-                    void orbitIpc.openExternalBrowserUrl(renderedToastAction.url);
-                  }
-                  renderedToastAction.onClick?.();
-                }}
-                className="text-primary hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[12px] font-medium transition-colors"
-              >
-                <span>{renderedToastAction.label}</span>
-                {renderedToastAction.url && (
-                  <ExternalLink className="h-[11.5px] w-[11.5px] shrink-0" />
-                )}
-              </button>
-            )}
-            {lastArchivedUndo && (
-              <button
-                type="button"
-                onClick={() => orbitActions.undoLastArchive()}
-                className="text-primary hover:bg-accent cursor-pointer rounded-md px-2 py-0.5 text-[12px] font-medium transition-colors"
-              >
-                Undo
-              </button>
-            )}
-          </div>
-        )}
+        <ToastViewport
+          message={renderedToast}
+          action={renderedToastAction}
+          undoEntry={lastArchivedUndo}
+          exiting={toastExiting}
+          onUndoArchive={() => orbitActions.undoLastArchive()}
+        />
       </MarkdownThemeProvider>
     </TooltipProvider>
   );
@@ -385,7 +358,9 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
     }
     e.preventDefault();
     const startX = e.clientX;
-    const startW = Math.round(sidebarElRef.current?.getBoundingClientRect().width ?? 256);
+    const startW = Math.round(
+      sidebarElRef.current?.getBoundingClientRect().width ?? SIDEBAR_DEFAULT_WIDTH_PX,
+    );
     let latestW = startW;
     let hasMoved = false;
     let rafId: number | null = null;
@@ -437,7 +412,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
       {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow pointer events during resize */}
       {isResizingSidebar && <div className="fixed inset-0 z-50 cursor-col-resize select-none" />}
 
-      <div className="bg-canvas text-foreground relative flex h-screen w-screen overflow-clip">
+      <div className="bg-surface-base text-ink-primary relative flex h-screen w-screen overflow-clip">
         {/* Single Stationary Titlebar Sidebar Toggle (`⌘B`) — optically centered with macOS traffic lights */}
         {!isSettingsOpen && (
           <div
@@ -446,19 +421,15 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
               isMac ? "left-[80px] translate-y-[1px]" : "left-[12px]",
             )}
           >
-            <SimpleTooltip
-              label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+            <IconButton
+              size="md"
+              tooltip={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
               shortcut={`${mod}B`}
+              onClick={() => orbitActions.toggleSidebar()}
+              className="pointer-events-auto"
             >
-              <button
-                type="button"
-                aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
-                onClick={() => orbitActions.toggleSidebar()}
-                className="text-foreground/64 hover:text-foreground pointer-events-auto inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-              >
-                <PanelLeft className="h-[16px] w-[16px] stroke-[1.75]" />
-              </button>
-            </SimpleTooltip>
+              <PanelLeft className="size-[16px] stroke-[1.75]" />
+            </IconButton>
           </div>
         )}
 
@@ -470,28 +441,20 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
               isMac && "translate-y-[1px]",
             )}
           >
-            <SimpleTooltip
-              label={sidePanelOpen ? "Hide side panel" : "Show side panel"}
+            <IconButton
+              size="md"
+              active={sidePanelOpen}
+              tooltip={sidePanelOpen ? "Hide side panel" : "Show side panel"}
               shortcut={`${mod}\\`}
+              onClick={() => orbitActions.toggleSidePanel()}
+              className="pointer-events-auto"
             >
-              <button
-                type="button"
-                aria-label={sidePanelOpen ? "Hide side panel" : "Show side panel"}
-                onClick={() => orbitActions.toggleSidePanel()}
-                className={cn(
-                  "pointer-events-auto inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",
-                  sidePanelOpen
-                    ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
-                    : "text-foreground/64 hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
-                )}
-              >
-                <PanelRight className="h-[16px] w-[16px] stroke-[1.75]" />
-              </button>
-            </SimpleTooltip>
+              <PanelRight className="size-[16px] stroke-[1.75]" />
+            </IconButton>
           </div>
         )}
 
-        {/* 1. Left Unified Fleet Sidebar (`⌘B`) — Pure GPU translate3d Layer */}
+        {/* 1. Left Unified Fleet Sidebar (`⌘B`) — Same-Hue Canvas + 1px Hairline Border */}
         <div
           ref={sidebarElRef}
           inert={!sidebarOpen}
@@ -506,7 +469,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
             visibility: leftVisible ? "visible" : "hidden",
           }}
           className={cn(
-            "orbit-panel-left bg-sidebar absolute inset-y-0 left-0 z-20 h-full shrink-0 overflow-hidden [contain:layout_style] [backface-visibility:hidden]",
+            "orbit-panel-left bg-surface-base border-border-subtle absolute inset-y-0 left-0 z-20 h-full shrink-0 overflow-hidden border-r [contain:layout_style] [backface-visibility:hidden]",
             !sidebarOpen && "pointer-events-none",
           )}
         >
@@ -521,7 +484,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
               onDoubleClick={resetSidebarWidth}
               className="group/sash absolute top-0 right-0 z-20 flex h-full w-[6px] cursor-col-resize justify-end"
             >
-              <div className="group-hover/sash:bg-primary/45 group-active/sash:bg-primary/65 h-full w-[2px] transition-colors duration-150" />
+              <div className="group-hover/sash:bg-border-strong group-active/sash:bg-ink-muted h-full w-[1.5px] transition-colors duration-150" />
             </div>
           )}
         </div>

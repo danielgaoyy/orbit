@@ -220,7 +220,7 @@ export const ConversationComposer = memo(function ConversationComposer({
                   variant === "compact" ? "size-[30px]" : "size-8.5",
                 )}
               >
-                <span className="size-[11px] rounded-[2.5px] bg-[#EF4444]" />
+                <span className="bg-signal-danger size-[11px] rounded-[2.5px]" />
               </button>
             ) : (
               <button
@@ -236,8 +236,8 @@ export const ConversationComposer = memo(function ConversationComposer({
                   "orbit-press inline-flex shrink-0 cursor-pointer items-center justify-center rounded-full",
                   variant === "compact" ? "size-[30px]" : "size-8.5",
                   canSend
-                    ? "bg-[#141416] text-white hover:bg-[#27272A] dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
-                    : "text-foreground/30 pointer-events-none bg-black/[0.055] dark:bg-white/[0.08] dark:text-white/30",
+                    ? "bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover"
+                    : "text-ink-faint pointer-events-none bg-accent/60",
                 )}
               >
                 <ArrowUp

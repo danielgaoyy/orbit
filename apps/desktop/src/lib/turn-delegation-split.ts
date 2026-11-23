@@ -30,6 +30,28 @@ export interface FallbackDispatchCallInfo {
   status: "running" | "completed" | "failed" | "denied";
 }
 
+export interface StateChangeMilestoneInfo {
+  callId: string;
+  kind: "timer" | "handoff";
+  label: string;
+  preview: string;
+  status: "running" | "completed" | "failed" | "denied";
+}
+
+export function classifyStateChangeMilestoneTool(toolName: string): "timer" | "handoff" | null {
+  const stripped = toolName.trim().replace(/^run\s+/i, "");
+  if (!stripped) return null;
+  const firstToken = (stripped.split(/\s+/)[0] ?? "").toLowerCase();
+  const leaf = firstToken.split(/[:/.]|__/).pop() ?? firstToken;
+  if (leaf === "schedule" || leaf === "orbit_timer" || leaf === "mcp_orbit_orbit_timer") {
+    return "timer";
+  }
+  if (leaf === "handoff_worktree" || leaf === "mcp_orbit_handoff_worktree") {
+    return "handoff";
+  }
+  return null;
+}
+
 function stableTimelineItemKey(item: TimelineItemView): string {
   switch (item.item_type) {
     case "user_prompt":
@@ -69,7 +91,10 @@ export function isDelegationMilestoneToolCall(
     return !isLegacyPlaceholder;
   }
   if (item.detail.kind === "generic") {
-    return classifyGenericSubagentTool(item.detail.tool_name) !== null;
+    return (
+      classifyGenericSubagentTool(item.detail.tool_name) !== null ||
+      classifyStateChangeMilestoneTool(item.detail.tool_name) !== null
+    );
   }
   return false;
 }
@@ -188,6 +213,75 @@ export function extractFallbackDispatchCall(
 
   return {
     callId: item.call_id || `dispatch-${item.seq}`,
+    label,
+    preview,
+    status: item.status,
+  };
+}
+
+/**
+ * Extracts concise milestone metadata for session-level state-changing tools
+ * (`schedule`, `orbit_timer`, `handoff_worktree`) surfaced outside folded step groups.
+ */
+export function extractStateChangeMilestoneCall(
+  item: ToolCallTimelineItem,
+): StateChangeMilestoneInfo | null {
+  if (item.detail.kind !== "generic") return null;
+  const kind = classifyStateChangeMilestoneTool(item.detail.tool_name);
+  if (!kind) return null;
+
+  let label = kind === "timer" ? "Armed timer" : "Worktree handoff";
+  let preview = "";
+  const rawArgs = item.detail.arguments_json.trim();
+  if (rawArgs.startsWith("{")) {
+    try {
+      const parsed: unknown = JSON.parse(rawArgs);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const obj = parsed as Record<string, unknown>;
+        if (kind === "timer") {
+          const action = typeof obj.action === "string" ? obj.action.trim().toLowerCase() : "";
+          const secs =
+            typeof obj.duration_seconds === "number"
+              ? obj.duration_seconds
+              : typeof obj.DurationSeconds === "number"
+                ? obj.DurationSeconds
+                : null;
+          const cron =
+            typeof obj.CronExpression === "string" && obj.CronExpression.trim()
+              ? obj.CronExpression.trim()
+              : null;
+          if (action === "cancel") {
+            label = "Canceled timer";
+          } else if (cron) {
+            label = `Scheduled (${cron})`;
+          } else if (secs !== null && secs > 0) {
+            label = `Timer (${formatDurationCompact(secs * 1000)})`;
+          }
+          const prompt =
+            typeof obj.prompt === "string"
+              ? obj.prompt.trim()
+              : typeof obj.Prompt === "string"
+                ? obj.Prompt.trim()
+                : "";
+          preview = prompt;
+        } else {
+          const dryRun = obj.dry_run === true;
+          const dir =
+            typeof obj.direction === "string" && obj.direction === "local_to_worktree"
+              ? "local → worktree"
+              : "worktree → local";
+          label = dryRun ? `Preview handoff (${dir})` : `Handoff (${dir})`;
+          preview = typeof obj.branch === "string" ? obj.branch.trim() : "";
+        }
+      }
+    } catch {
+      // Ignore partial JSON while streaming
+    }
+  }
+
+  return {
+    callId: item.call_id || `milestone-${item.seq}`,
+    kind,
     label,
     preview,
     status: item.status,

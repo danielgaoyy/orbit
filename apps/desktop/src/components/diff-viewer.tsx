@@ -14,6 +14,8 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import { resolveTokenColor } from "@/lib/code-highlight";
 import { extractFileHunks, type IndexedDiffHunk } from "@/lib/git-patch";
 import { useI18n } from "@/lib/i18n";
@@ -314,7 +316,7 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
           <X className="h-3 w-3" />
         </button>
       </div>
-      <textarea
+      <Textarea
         autoFocus
         rows={2}
         value={text}
@@ -331,24 +333,15 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
           }
         }}
         placeholder="Add a review comment for the agent… (Enter to save draft)"
-        className="border-border bg-background text-foreground placeholder:text-muted-foreground w-full resize-none rounded-md border px-2 py-1.5 text-[12px] leading-relaxed outline-none focus:border-foreground/30"
+        className="min-h-[54px] resize-none rounded-[6px] px-2 py-1.5 text-[12px] leading-relaxed"
       />
       <div className="mt-1.5 flex items-center justify-end gap-1.5">
-        <button
-          type="button"
-          onClick={onCancel}
-          className="text-muted-foreground hover:text-foreground cursor-pointer rounded-md px-2 py-0.5 text-[11.5px]"
-        >
+        <Button type="button" variant="ghost" size="xs" onClick={onCancel}>
           Cancel
-        </button>
-        <button
-          type="button"
-          disabled={!text.trim()}
-          onClick={submit}
-          className="bg-foreground text-background cursor-pointer rounded-md px-2.5 py-0.5 text-[11.5px] font-medium transition-opacity hover:opacity-90 disabled:cursor-default disabled:opacity-40"
-        >
+        </Button>
+        <Button type="button" size="xs" disabled={!text.trim()} onClick={submit}>
           Add comment
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -653,7 +646,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
         return (
           <div
             className={cn(
-              "border-border group/diffhdr flex h-[38px] w-full items-center justify-between gap-2 border bg-zinc-100/90 px-3 transition-colors hover:bg-zinc-200/60 dark:bg-[#101622] dark:hover:bg-[#141c2b]",
+              "border-border-subtle group/diffhdr bg-surface-raised hover:bg-accent/70 flex h-[38px] w-full items-center justify-between gap-2 border px-3 transition-colors",
               row.collapsed ? "rounded-lg" : "rounded-t-lg",
             )}
           >
@@ -845,7 +838,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             ? "bg-emerald-500/[0.11] dark:bg-emerald-500/[0.10]"
             : line.kind === "removed"
               ? "bg-rose-500/[0.10] dark:bg-rose-500/[0.10]"
-              : "bg-zinc-50/80 text-zinc-700 dark:bg-[#0B0F17] dark:text-zinc-300/90";
+              : "bg-surface-recessed text-ink-secondary";
         const prefix = line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " ";
         const side: "old" | "new" = line.kind === "removed" ? "old" : "new";
         const targetLn = side === "old" ? line.old_line : (line.new_line ?? line.old_line);
@@ -950,7 +943,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
         return (
           <div
             className={cn(
-              "border-border divide-border selectable-text grid w-full grid-cols-2 divide-x border-x bg-zinc-50/80 font-mono text-[12px] leading-[20px] dark:bg-[#0B0F17]",
+              "border-border-subtle divide-border-subtle selectable-text bg-surface-recessed grid w-full grid-cols-2 divide-x border-x font-mono text-[12px] leading-[20px]",
               isLastInFile && "overflow-hidden rounded-b-lg border-b",
             )}
           >
@@ -1163,7 +1156,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
 
       case "omission":
         return (
-          <div className="border-border text-muted-foreground rounded-b-lg border bg-zinc-50/80 px-3 py-1.5 text-center font-mono text-[11.5px] select-none dark:bg-[#0B0F17]">
+          <div className="border-border-subtle text-ink-muted bg-surface-recessed rounded-b-lg border px-3 py-1.5 text-center font-mono text-[11.5px] select-none">
             {row.notice}
           </div>
         );

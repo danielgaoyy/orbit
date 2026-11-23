@@ -8,8 +8,8 @@
    - 默认文案使用克制英文（`src/lib/i18n/locales/en.ts`），并在同一改动内同步更新 `zh-CN.ts` 与 `ja.ts` 的全部 Key 与占位符（由 `i18n.test.ts` 强制校验）。
 3. **Tauri IPC 双向同步**：
    - 修改 `src-tauri/src/` 下的 `#[tauri::command]`、事件枚举或版本号回退时，必须同步更新 `src/lib/orbit-ipc.ts` 与 `scripts/smoke-render.mjs` 中的 mock。
-4. **技术栈与 Token 复用**：
-   - 遵循 Tailwind CSS v4 + Base UI（`@base-ui/react`）+ 既有语义 CSS Token；复用 `src/components/ui/` 与 `settings-primitives.tsx`，禁止硬编码打破深浅色切换的颜色字面量。
+4. **技术栈、shadcn/ui 优先与 Token 复用**：
+   - 遵循 Tailwind CSS v4 + shadcn/ui（Base UI `@base-ui/react`）+ 既有语义 CSS Token；动手前先读 [`.agents/skills/shadcn/SKILL.md`](../../.agents/skills/shadcn/SKILL.md) 并检查 `src/components/ui/`（如 `Button`、`Input`、`FieldGroup`/`Field`、`Dialog`、`DropdownMenu`、`IconButton`、`OrbitSpinner`）与 `settings-primitives.tsx`，优先复用并组合官方组件，禁止重复手写原生基础控件或硬编码打破深浅色切换的颜色字面量。
 5. **提交前必跑检查**：
    ```bash
    cd apps/desktop

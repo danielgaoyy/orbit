@@ -4,6 +4,7 @@ After=network-online.target
 
 [Service]
 Type=simple
+KillMode=process
 ExecStart=%h/.local/bin/orbit daemon --listen 127.0.0.1:6868
 Restart=always
 RestartSec=2

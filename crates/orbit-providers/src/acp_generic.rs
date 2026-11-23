@@ -140,6 +140,7 @@ async fn spawn_fresh_acp_shim(
         args: spec.args.clone(),
         cwd: cfg.cwd.clone(),
         env,
+        cleanup_paths: Vec::new(),
     };
 
     spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &shim_spec)
@@ -2166,6 +2167,7 @@ done
             args: vec![],
             cwd: dir.clone(),
             env: HashMap::new(),
+            cleanup_paths: Vec::new(),
         };
         let shim_task = tokio::spawn(async move {
             let _ = orbit_shim::run_shim(&shim_sock_bg, shim_spec).await;
@@ -2203,6 +2205,7 @@ done
             executable: mock_bin.clone(),
             orbit_exe: PathBuf::from("orbit"),
             shim_socket: sock_path.clone(),
+            runtime_dir: dir.clone(),
             cwd: dir.clone(),
             extra_dirs: vec![],
             attachments_dir: None,
@@ -2470,6 +2473,7 @@ done
             executable: PathBuf::from("/bin/echo"),
             orbit_exe: PathBuf::from("orbit"),
             shim_socket: PathBuf::from("/tmp/x.sock"),
+            runtime_dir: PathBuf::from("/tmp"),
             cwd: PathBuf::from("/tmp"),
             extra_dirs: vec![],
             attachments_dir: None,
@@ -2649,6 +2653,7 @@ done
             args: vec![],
             cwd: dir.clone(),
             env: HashMap::new(),
+            cleanup_paths: Vec::new(),
         };
         let shim_task = tokio::spawn(async move {
             let _ = orbit_shim::run_shim(&shim_sock_bg, shim_spec).await;
@@ -2683,6 +2688,7 @@ done
             executable: mock_bin.clone(),
             orbit_exe: PathBuf::from("orbit"),
             shim_socket: sock_path.clone(),
+            runtime_dir: dir.clone(),
             cwd: dir.clone(),
             extra_dirs: vec![],
             attachments_dir: None,

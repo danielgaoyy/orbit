@@ -334,6 +334,10 @@ pub struct DaemonPersistedConfig {
     pub orchestration: OrchestrationConfig,
 }
 
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    orbit_shim::ensure_private_dir(dir)
+}
+
 impl DaemonPersistedConfig {
     pub fn load(home_dir: &Path) -> Self {
         std::fs::read_to_string(home_dir.join("config.json"))
@@ -343,7 +347,7 @@ impl DaemonPersistedConfig {
     }
 
     pub fn save(&self, home_dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(home_dir)?;
+        ensure_private_dir(home_dir)?;
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         let config_path = home_dir.join("config.json");
         std::fs::write(&config_path, raw)?;
@@ -466,10 +470,9 @@ impl DaemonRuntime {
     /// and tests). Call [`DaemonRuntime::activate_server`] after binding the TCP listener to start
     /// shim recovery, connected hosts, finish subscriptions, scheduler, and idle cleanup.
     pub async fn bootstrap(home_dir: &Path) -> anyhow::Result<Arc<Self>> {
-        std::fs::create_dir_all(home_dir)?;
-        #[cfg(unix)]
-        enforce_unix_permissions(home_dir, 0o700)?;
-        std::fs::create_dir_all(home_dir.join("shims"))?;
+        ensure_private_dir(home_dir)?;
+        ensure_private_dir(&home_dir.join("shims"))?;
+        ensure_private_dir(&home_dir.join("runtime"))?;
         orbit_providers::set_snapshot_orbit_home(home_dir);
 
         let keypair_path = home_dir.join("host-keypair.json");
@@ -7335,6 +7338,45 @@ mod self_upgrade_tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bootstrap_hardens_orbit_home_shims_and_runtime_dirs_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::temp_dir().join(format!("orbit-home-perm-test-{}", Uuid::new_v4()));
+        let shims = home.join("shims");
+        let runtime_dir = home.join("runtime");
+        std::fs::create_dir_all(&shims).expect("create shims");
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime");
+        for dir in [&home, &shims, &runtime_dir] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .expect("set initial 0755 perms");
+        }
+
+        let _rt = DaemonRuntime::bootstrap(&home)
+            .await
+            .expect("bootstrap daemon");
+
+        for (label, dir) in [
+            ("ORBIT_HOME", &home),
+            ("shims", &shims),
+            ("runtime", &runtime_dir),
+        ] {
+            let mode = std::fs::metadata(dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "{label} directory must be hardened to 0700, got {:o}",
+                mode
+            );
         }
 
         let _ = std::fs::remove_dir_all(&home);

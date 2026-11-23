@@ -161,6 +161,7 @@ pub async fn spawn_codex_session(
             args: build_codex_launch_args(cfg.fast_mode),
             cwd: cfg.cwd.clone(),
             env,
+            cleanup_paths: Vec::new(),
         };
 
         let mut fresh = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
@@ -2331,6 +2332,7 @@ mod tests {
             executable: PathBuf::from("/usr/bin/codex"),
             orbit_exe: PathBuf::from("/usr/bin/orbit"),
             shim_socket: PathBuf::from("/tmp/codex.sock"),
+            runtime_dir: std::env::temp_dir(),
             cwd: PathBuf::from("/repo"),
             extra_dirs: Vec::new(),
             attachments_dir: None,

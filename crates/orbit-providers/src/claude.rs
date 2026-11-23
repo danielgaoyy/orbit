@@ -1,7 +1,8 @@
 //! Native Rust driver for Anthropic Claude Code (`claude` bidirectional `stream-json` Control Protocol
 //! + `~/.claude/.credentials.json` / macOS Keychain OAuth Usage).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -22,7 +23,192 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::attachments::build_claude_content_blocks_async;
-use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
+use crate::driver::{
+    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, ProviderSessionHandle, SessionLaunchConfig,
+};
+
+const CLAUDE_MCP_FILE_PREFIX: &str = "claude-mcp-";
+const CLAUDE_MCP_FILE_SUFFIX: &str = ".json";
+
+struct ClaudeMcpConfigGuard {
+    path: Option<PathBuf>,
+}
+
+impl ClaudeMcpConfigGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn into_path(mut self) -> Option<PathBuf> {
+        self.path.take()
+    }
+}
+
+impl Drop for ClaudeMcpConfigGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn resolve_absolute_runtime_dir(runtime_dir: &Path) -> Result<PathBuf, String> {
+    let abs = if runtime_dir.is_absolute() {
+        runtime_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to resolve current working directory: {e}"))?
+            .join(runtime_dir)
+    };
+    Ok(std::fs::canonicalize(&abs).unwrap_or(abs))
+}
+
+fn sanitize_mcp_agent_id(agent_id: &str) -> String {
+    let cleaned: String = agent_id
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "agent".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn extract_claude_mcp_config_agent_id(file_name: &str) -> Option<&str> {
+    let stem = file_name
+        .strip_prefix(CLAUDE_MCP_FILE_PREFIX)?
+        .strip_suffix(CLAUDE_MCP_FILE_SUFFIX)?;
+    // Canonical hyphenated UUID is 36 ASCII bytes preceded by '-'.
+    if stem.len() <= 37 {
+        return None;
+    }
+    let sep_idx = stem.len() - 37;
+    if stem.as_bytes().get(sep_idx) != Some(&b'-') {
+        return None;
+    }
+    let uuid_part = &stem[sep_idx + 1..];
+    Uuid::parse_str(uuid_part).ok()?;
+    Some(&stem[..sep_idx])
+}
+
+/// Write a private MCP config JSON file under `<runtime_dir>/claude-mcp-<agent_id>-<uuid>.json`
+/// so the Orbit MCP Bearer token is never exposed on `claude`'s process `argv`.
+///
+/// - On Unix, `<runtime_dir>` is created/verified as a real, current-UID-owned `0700` directory
+///   and the file is opened directly via `create_new(true)` with mode `0600` before writing.
+/// - On Windows (with workspace `unsafe_code = "deny"`), `<runtime_dir>` resides under the current
+///   user's private Orbit profile directory (`%USERPROFILE%\.orbit\runtime`) with exclusive
+///   `create_new(true)` creation.
+/// - Always returns an absolute path so relative `--home` flags work regardless of `claude`'s `cwd`.
+fn write_claude_mcp_config_file(
+    runtime_dir: &Path,
+    agent_id: &str,
+    mcp: &OrbitMcpLaunchSpec,
+) -> Result<ClaudeMcpConfigGuard, String> {
+    orbit_shim::ensure_private_dir(runtime_dir)
+        .map_err(|e| format!("failed to prepare private Orbit runtime dir: {e}"))?;
+    let abs_runtime_dir = resolve_absolute_runtime_dir(runtime_dir)?;
+
+    let mcp_json = json!({
+        "mcpServers": {
+            mcp.server_name.clone(): {
+                "type": "http",
+                "url": mcp.http_url,
+                "headers": {
+                    "Authorization": format!("Bearer {}", mcp.bearer_token)
+                }
+            }
+        }
+    })
+    .to_string();
+
+    let safe_id = sanitize_mcp_agent_id(agent_id);
+    let uuid = Uuid::new_v4();
+    let final_path = abs_runtime_dir.join(format!(
+        "{CLAUDE_MCP_FILE_PREFIX}{safe_id}-{uuid}{CLAUDE_MCP_FILE_SUFFIX}"
+    ));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let mut file = opts
+        .open(&final_path)
+        .map_err(|e| format!("failed to create private claude MCP config file: {e}"))?;
+    // Attach cleanup guard immediately so any subsequent error unlinks the newly created file.
+    let guard = ClaudeMcpConfigGuard::new(final_path);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("failed to enforce 0600 on claude MCP config file: {e}"))?;
+    }
+    file.write_all(mcp_json.as_bytes())
+        .map_err(|e| format!("failed to write private claude MCP config file: {e}"))?;
+    drop(file);
+
+    Ok(guard)
+}
+
+/// Snapshot existing `claude-mcp-<agent_id>-<uuid>.json` files inside `runtime_dir` BEFORE startup
+/// recovery spawns any new agent tasks.
+pub fn snapshot_claude_mcp_config_files(runtime_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(name_str) = name.to_str()
+            && extract_claude_mcp_config_agent_id(name_str).is_some()
+        {
+            out.push(entry.path());
+        }
+    }
+    out
+}
+
+/// Remove ONLY pre-snapshotted `claude-mcp-<agent_id>-<uuid>.json` candidate files whose agent did
+/// not survive daemon restart (never touching fresh files written by newly launching agents).
+pub fn reap_snapshotted_claude_mcp_configs(
+    candidates: &[PathBuf],
+    surviving_agent_ids: &HashSet<String>,
+) -> usize {
+    let surviving_sanitized: HashSet<String> = surviving_agent_ids
+        .iter()
+        .map(|id| sanitize_mcp_agent_id(id))
+        .collect();
+    let mut removed = 0usize;
+    for path in candidates {
+        let Some(name_str) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Some(file_agent_id) = extract_claude_mcp_config_agent_id(name_str)
+            && !surviving_sanitized.contains(file_agent_id)
+            && std::fs::remove_file(path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
 
 enum ClaudeSessionStartMode<'a> {
     Fresh(&'a str),
@@ -130,6 +316,7 @@ pub fn claude_model_supports_fast_mode(model_id: &str) -> bool {
 fn build_claude_launch_args(
     cfg: &SessionLaunchConfig,
     start_mode: ClaudeSessionStartMode<'_>,
+    mcp_config_path: Option<&Path>,
 ) -> Vec<String> {
     let perm_mode = claude_mode_flag(&cfg.mode);
 
@@ -168,21 +355,9 @@ fn build_claude_launch_args(
         args.push("--add-dir".to_string());
         args.push(extra.to_string_lossy().to_string());
     }
-    if let Some(ref mcp) = cfg.mcp_spec {
-        let mcp_json = json!({
-            "mcpServers": {
-                mcp.server_name.clone(): {
-                    "type": "http",
-                    "url": mcp.http_url,
-                    "headers": {
-                        "Authorization": format!("Bearer {}", mcp.bearer_token)
-                    }
-                }
-            }
-        })
-        .to_string();
+    if let Some(path) = mcp_config_path {
         args.push("--mcp-config".to_string());
-        args.push(mcp_json);
+        args.push(path.to_string_lossy().to_string());
     }
     if let Some(ref sys_append) = cfg.system_prompt_append
         && !sys_append.trim().is_empty()
@@ -213,7 +388,16 @@ async fn spawn_claude_shim_and_init(
     cfg: &SessionLaunchConfig,
     start_mode: ClaudeSessionStartMode<'_>,
 ) -> Result<orbit_shim::ShimClient, String> {
-    let args = build_claude_launch_args(cfg, start_mode);
+    let mcp_guard = match cfg.mcp_spec {
+        Some(ref mcp) => Some(write_claude_mcp_config_file(
+            &cfg.runtime_dir,
+            &cfg.agent_id,
+            mcp,
+        )?),
+        None => None,
+    };
+    let mcp_path_opt = mcp_guard.as_ref().and_then(ClaudeMcpConfigGuard::path);
+    let args = build_claude_launch_args(cfg, start_mode, mcp_path_opt);
 
     let mut env = cfg.extra_env.clone();
     env.insert("CLAUDE_CODE_ENTRYPOINT".into(), "sdk-ts".into());
@@ -238,6 +422,9 @@ async fn spawn_claude_shim_and_init(
     }
     crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
 
+    let cleanup_paths = mcp_path_opt
+        .map(|p| vec![p.to_path_buf()])
+        .unwrap_or_default();
     let spec = ShimSpawnSpec {
         shim_id: format!("claude_{}", cfg.agent_id),
         mode: ShimMode::Stdio,
@@ -245,11 +432,18 @@ async fn spawn_claude_shim_and_init(
         args,
         cwd: cfg.cwd.clone(),
         env,
+        cleanup_paths,
     };
 
     let mut fresh = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
         .await
         .map_err(|e| format!("failed to spawn claude shim: {e}"))?;
+
+    // `orbit shim` now owns the live child process and will unlink `spec.cleanup_paths`
+    // immediately after the child actually exits (surviving daemon restarts/reattaches).
+    if let Some(guard) = mcp_guard {
+        let _ = guard.into_path();
+    }
 
     // Send mandatory `initialize` control_request handshake
     let init_req = json!({
@@ -666,7 +860,11 @@ async fn run_claude_actor(
     loop {
         tokio::select! {
             maybe_cmd = cmd_rx.recv() => {
-                let Some(cmd) = maybe_cmd else { break; };
+                let Some(cmd) = maybe_cmd else {
+                    // Daemon disconnected without killing the shim (e.g. hot-restart):
+                    // leave the MCP config path intact while the detached shim stays alive.
+                    break;
+                };
                 match cmd {
                     DriverCommand::SendPrompt { turn_id, mut prompt, behavior } => {
                         if inject_handoff_on_next_prompt {
@@ -2447,6 +2645,7 @@ mod tests {
             executable: PathBuf::from("/bin/true"),
             orbit_exe: PathBuf::from("/bin/true"),
             shim_socket: std::env::temp_dir().join("orbit_claude_unused.sock"),
+            runtime_dir: std::env::temp_dir().join("orbit_claude_test_runtime"),
             cwd: std::env::temp_dir(),
             extra_dirs: vec![],
             attachments_dir: None,
@@ -2482,6 +2681,7 @@ mod tests {
             executable: PathBuf::from("/usr/bin/claude"),
             orbit_exe: PathBuf::from("/usr/bin/orbit"),
             shim_socket: PathBuf::from("/tmp/claude.sock"),
+            runtime_dir: std::env::temp_dir().join("orbit_claude_sample_runtime"),
             cwd: PathBuf::from("/repo"),
             extra_dirs: Vec::new(),
             attachments_dir: None,
@@ -2511,8 +2711,11 @@ mod tests {
     #[test]
     fn build_claude_launch_args_uses_equals_resume_and_fork_session() {
         let cfg = test_claude_cfg(Some("parent-sess-123"), false);
-        let args =
-            build_claude_launch_args(&cfg, ClaudeSessionStartMode::ForkFrom("parent-sess-123"));
+        let args = build_claude_launch_args(
+            &cfg,
+            ClaudeSessionStartMode::ForkFrom("parent-sess-123"),
+            None,
+        );
         assert!(args.iter().any(|a| a == "--resume=parent-sess-123"));
         assert!(args.iter().any(|a| a == "--fork-session"));
         assert!(!args.iter().any(|a| a.starts_with("--session-id")));
@@ -2609,12 +2812,18 @@ mod tests {
 
     #[test]
     fn launch_args_include_settings_only_when_fast_mode_enabled() {
-        let off_args =
-            build_claude_launch_args(&sample_cfg(false), ClaudeSessionStartMode::Fresh("sess-1"));
+        let off_args = build_claude_launch_args(
+            &sample_cfg(false),
+            ClaudeSessionStartMode::Fresh("sess-1"),
+            None,
+        );
         assert!(!off_args.iter().any(|a| a.starts_with("--settings")));
 
-        let on_args =
-            build_claude_launch_args(&sample_cfg(true), ClaudeSessionStartMode::Fresh("sess-1"));
+        let on_args = build_claude_launch_args(
+            &sample_cfg(true),
+            ClaudeSessionStartMode::Fresh("sess-1"),
+            None,
+        );
         let idx = on_args
             .iter()
             .position(|a| a == "--settings")
@@ -3101,5 +3310,278 @@ mod tests {
             extract_claude_message_prompt_tokens(&assistant_ev),
             Some(40_000)
         );
+    }
+
+    #[test]
+    fn claude_mcp_config_writes_0600_file_passes_absolute_path_not_bearer_token_and_cleans_up() {
+        let home_dir = std::env::temp_dir().join(format!(
+            "orbit_claude_mcp_cfg_test_{}",
+            Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let runtime_dir = home_dir.join("runtime");
+
+        let secret_token = "mcp-secret-bearer-token-9a8b7c6d5e4f";
+        let mcp = OrbitMcpLaunchSpec {
+            server_name: "orbit".into(),
+            http_url: "http://127.0.0.1:6868/mcp/agents?caller_agent_id=ag_test_1".into(),
+            bearer_token: secret_token.into(),
+            stdio_command: PathBuf::from("/usr/local/bin/orbit"),
+            stdio_args: vec!["mcp".into()],
+        };
+
+        let guard = write_claude_mcp_config_file(&runtime_dir, "ag_test_1", &mcp)
+            .expect("write private mcp config");
+        let cfg_path = guard.path().expect("guard path").to_path_buf();
+        assert!(cfg_path.is_file(), "mcp config file must exist on disk");
+        assert!(
+            cfg_path.is_absolute(),
+            "mcp config path passed to claude must be absolute: {}",
+            cfg_path.display()
+        );
+        let canonical_runtime = std::fs::canonicalize(&runtime_dir).unwrap_or(runtime_dir.clone());
+        assert_eq!(
+            cfg_path.parent(),
+            Some(canonical_runtime.as_path()),
+            "mcp config must be created inside runtime_dir"
+        );
+        let file_name = cfg_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf8 filename");
+        assert!(file_name.starts_with("claude-mcp-ag_test_1-"));
+        assert!(file_name.ends_with(".json"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let runtime_mode = std::fs::metadata(&runtime_dir)
+                .expect("runtime meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                runtime_mode, 0o700,
+                "runtime dir must be 0700, got {:o}",
+                runtime_mode
+            );
+            let file_mode = std::fs::metadata(&cfg_path)
+                .expect("file meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                file_mode, 0o600,
+                "claude MCP config file must be 0600, got {:o}",
+                file_mode
+            );
+        }
+
+        let raw = std::fs::read_to_string(&cfg_path).expect("read mcp config");
+        let parsed: Value = serde_json::from_str(&raw).expect("valid mcp json");
+        assert_eq!(
+            parsed.pointer("/mcpServers/orbit/headers/Authorization"),
+            Some(&json!(format!("Bearer {secret_token}")))
+        );
+        assert_eq!(
+            parsed.pointer("/mcpServers/orbit/url"),
+            Some(&json!(mcp.http_url))
+        );
+
+        let mut cfg = sample_cfg(false);
+        cfg.mcp_spec = Some(mcp.clone());
+        let args = build_claude_launch_args(
+            &cfg,
+            ClaudeSessionStartMode::Fresh("sess-mcp-1"),
+            guard.path(),
+        );
+        let flag_idx = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config flag");
+        assert_eq!(args[flag_idx + 1], cfg_path.to_string_lossy());
+        assert!(
+            !args.iter().any(|a| a.contains(secret_token)),
+            "claude argv must NEVER contain the MCP bearer token: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("Authorization")),
+            "claude argv must NEVER contain inline Authorization header: {args:?}"
+        );
+
+        drop(guard);
+        assert!(
+            !cfg_path.exists(),
+            "dropping ClaudeMcpConfigGuard must delete the private MCP config file"
+        );
+
+        // Verify relative runtime_dir still resolves to an absolute path for --mcp-config.
+        let rel_dir = PathBuf::from(format!("target/.tmp-rel-rt-{}", Uuid::new_v4().simple()));
+        let rel_guard = write_claude_mcp_config_file(&rel_dir, "ag_rel", &mcp)
+            .expect("write relative runtime_dir mcp config");
+        assert!(
+            rel_guard.path().expect("rel path").is_absolute(),
+            "relative runtime_dir must resolve to an absolute --mcp-config path"
+        );
+        drop(rel_guard);
+        let _ = std::fs::remove_dir_all(&rel_dir);
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shim_owns_mcp_config_cleanup_across_reconnect_and_snapshot_reaper_avoids_races() {
+        let short_id: String = Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect();
+        let home_dir = std::env::temp_dir().join(format!("oc_mc_{short_id}"));
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let shims_dir = home_dir.join("shims");
+        let runtime_dir = home_dir.join("runtime");
+        std::fs::create_dir_all(&shims_dir).expect("mkdir shims");
+        let sock_path = shims_dir.join("e.sock");
+
+        let mcp = OrbitMcpLaunchSpec {
+            server_name: "orbit".into(),
+            http_url: "http://127.0.0.1:6868/mcp/agents?caller_agent_id=ag-exit-1".into(),
+            bearer_token: "exit-cleanup-secret-token".into(),
+            stdio_command: PathBuf::from("/usr/local/bin/orbit"),
+            stdio_args: vec!["mcp".into()],
+        };
+        let live_cfg_path = write_claude_mcp_config_file(&runtime_dir, "ag-exit-1", &mcp)
+            .expect("write mcp config")
+            .into_path()
+            .expect("path");
+        // Sibling generation file for the same agent_id MUST NOT be deleted by this shim.
+        let sibling_gen_path = write_claude_mcp_config_file(&runtime_dir, "ag-exit-1", &mcp)
+            .expect("write sibling gen config")
+            .into_path()
+            .expect("sibling path");
+        assert!(live_cfg_path.exists());
+        assert!(sibling_gen_path.exists());
+
+        // Run a real in-process `orbit_shim::run_shim` hosting `/bin/cat` with `cleanup_paths`.
+        let shim_spec = ShimSpawnSpec {
+            shim_id: "claude_ag-exit-1".into(),
+            mode: ShimMode::Stdio,
+            program: "/bin/cat".into(),
+            args: vec![],
+            cwd: home_dir.clone(),
+            env: HashMap::new(),
+            cleanup_paths: vec![live_cfg_path.clone()],
+        };
+        let sock_bg = sock_path.clone();
+        let shim_task = tokio::spawn(async move {
+            orbit_shim::run_shim(&sock_bg, shim_spec)
+                .await
+                .expect("run shim");
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 1. Connect, disconnect (simulating daemon hot-restart), verify file stays intact.
+        {
+            let client1 = orbit_shim::ShimClient::connect(&sock_path)
+                .await
+                .expect("connect 1");
+            drop(client1);
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            live_cfg_path.exists(),
+            "MCP config file must survive daemon disconnect/reattach while shim child is alive"
+        );
+
+        // 2. Reattach via `run_claude_actor` (is_reattached = true), send Shutdown -> shim kills
+        //    child and unlinks ONLY `live_cfg_path` after the child exits!
+        let reattached = orbit_shim::connect_existing_shim_after(&sock_path, Some(0))
+            .await
+            .expect("reattach");
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (evt_tx, mut evt_rx) = mpsc::channel(16);
+        let mut cfg = sample_cfg(false);
+        cfg.agent_id = "ag-exit-1".into();
+        cfg.shim_socket = sock_path.clone();
+        cfg.runtime_dir = runtime_dir.clone();
+
+        let actor = tokio::spawn(run_claude_actor(
+            cfg,
+            "sess-exit-1".into(),
+            reattached,
+            true,
+            false,
+            false,
+            None,
+            cmd_rx,
+            evt_tx,
+        ));
+        cmd_tx
+            .send(DriverCommand::Shutdown)
+            .await
+            .expect("shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
+        while evt_rx.try_recv().is_ok() {}
+
+        assert!(
+            !live_cfg_path.exists(),
+            "shim must unlink its exact MCP config file after child exits (even after reattach)"
+        );
+        assert!(
+            sibling_gen_path.exists(),
+            "exit of one shim generation must NEVER delete another generation's MCP config file"
+        );
+        let _ = std::fs::remove_file(&sibling_gen_path);
+
+        // 3. Verify snapshot-based startup reaper:
+        //    - Keeps files for surviving/protected agents (including hyphenated UUID IDs)
+        //    - Reaps pre-snapshotted stale files
+        //    - NEVER deletes fresh files created AFTER the snapshot by newly launching recovery tasks!
+        let keep_path = write_claude_mcp_config_file(
+            &runtime_dir,
+            "550e8400-e29b-41d4-a716-446655440000",
+            &mcp,
+        )
+        .expect("write surviving config")
+        .into_path()
+        .expect("keep path");
+        let stale_path = write_claude_mcp_config_file(&runtime_dir, "ag_dead_99", &mcp)
+            .expect("write stale")
+            .into_path()
+            .expect("stale path");
+
+        let candidates = snapshot_claude_mcp_config_files(&runtime_dir);
+
+        // Simulate a recovery task launching a brand-new session for `ag_dead_99` AFTER snapshot!
+        let fresh_after_snapshot = write_claude_mcp_config_file(&runtime_dir, "ag_dead_99", &mcp)
+            .expect("write fresh post-snapshot config")
+            .into_path()
+            .expect("fresh path");
+
+        let mut surviving = HashSet::new();
+        surviving.insert("550e8400-e29b-41d4-a716-446655440000".to_string());
+        let reaped = reap_snapshotted_claude_mcp_configs(&candidates, &surviving);
+        assert_eq!(reaped, 1);
+        assert!(
+            keep_path.exists(),
+            "surviving agent MCP config must survive"
+        );
+        assert!(
+            !stale_path.exists(),
+            "pre-snapshotted stale MCP config must be reaped"
+        );
+        assert!(
+            fresh_after_snapshot.exists(),
+            "fresh config created after startup snapshot must NEVER be deleted by reaper"
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
     }
 }

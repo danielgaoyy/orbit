@@ -39,6 +39,9 @@ pub struct SessionLaunchConfig {
     pub executable: PathBuf,
     pub orbit_exe: PathBuf,
     pub shim_socket: PathBuf,
+    /// Resolved private runtime directory (`$ORBIT_HOME/runtime`) for ephemeral per-session files
+    /// (such as private `0600` Claude MCP configs).
+    pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
     pub extra_dirs: Vec<PathBuf>,
     pub attachments_dir: Option<PathBuf>,

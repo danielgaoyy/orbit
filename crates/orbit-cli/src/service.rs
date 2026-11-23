@@ -458,19 +458,12 @@ fn ensure_linux_user_linger_best_effort() {
     }
 }
 
-fn install_systemd_user_service(
+fn render_systemd_user_unit(
     role: ServiceRole,
     exe: &Path,
     home_dir: &Path,
     path_env: &str,
-) -> anyhow::Result<()> {
-    let user_home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    let systemd_dir = user_home.join(".config/systemd/user");
-    fs::create_dir_all(&systemd_dir)?;
-
-    let unit_file = systemd_dir.join(format!("{}.service", role.unit_name()));
+) -> String {
     let log_file = role.log_file(home_dir);
     // Keep detached `orbit shim` agent sessions alive across `orbit-daemon` restarts/upgrades.
     let kill_mode_line = if role == ServiceRole::Daemon {
@@ -478,7 +471,7 @@ fn install_systemd_user_service(
     } else {
         ""
     };
-    let content = format!(
+    format!(
         "[Unit]\n\
          Description={desc}\n\
          After=network-online.target\n\
@@ -501,7 +494,23 @@ fn install_systemd_user_service(
         home = home_dir.display(),
         sub = role.subcommand_arg(),
         log = log_file.display(),
-    );
+    )
+}
+
+fn install_systemd_user_service(
+    role: ServiceRole,
+    exe: &Path,
+    home_dir: &Path,
+    path_env: &str,
+) -> anyhow::Result<()> {
+    let user_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let systemd_dir = user_home.join(".config/systemd/user");
+    fs::create_dir_all(&systemd_dir)?;
+
+    let unit_file = systemd_dir.join(format!("{}.service", role.unit_name()));
+    let content = render_systemd_user_unit(role, exe, home_dir, path_env);
     fs::write(&unit_file, content)?;
 
     let unit_name = format!("{}.service", role.unit_name());
@@ -539,19 +548,17 @@ fn macos_plist_path(role: ServiceRole) -> Option<PathBuf> {
     })
 }
 
-fn install_macos_launch_agent(
+fn render_macos_launch_agent_plist(
     role: ServiceRole,
     exe: &Path,
     home_dir: &Path,
     path_env: &str,
-) -> anyhow::Result<()> {
-    let plist_path =
-        macos_plist_path(role).ok_or_else(|| anyhow::anyhow!("HOME is not set for LaunchAgent"))?;
-    if let Some(parent) = plist_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+) -> String {
     let log_file = role.log_file(home_dir);
-    let plist = format!(
+    // Detached `orbit shim` processes already run in their own process group (`process_group(0)`),
+    // so launchd must NOT set `AbandonProcessGroup` (which would disable cleanup of unrelated
+    // daemon children sharing the job's process group).
+    format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\">\n\
@@ -587,7 +594,21 @@ fn install_macos_launch_agent(
         home = home_dir.display(),
         sub = role.subcommand_arg(),
         log = log_file.display(),
-    );
+    )
+}
+
+fn install_macos_launch_agent(
+    role: ServiceRole,
+    exe: &Path,
+    home_dir: &Path,
+    path_env: &str,
+) -> anyhow::Result<()> {
+    let plist_path =
+        macos_plist_path(role).ok_or_else(|| anyhow::anyhow!("HOME is not set for LaunchAgent"))?;
+    if let Some(parent) = plist_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let plist = render_macos_launch_agent_plist(role, exe, home_dir, path_env);
     fs::write(&plist_path, plist)?;
 
     let _ = Command::new("launchctl")
@@ -1134,6 +1155,26 @@ mod tests {
         assert!(
             !ws_seen.load(std::sync::atomic::Ordering::SeqCst),
             "probe_daemon_port must never send a credentialed WS probe to an unidentified HTTP service"
+        );
+    }
+
+    #[test]
+    fn test_service_templates_systemd_kill_mode_and_clean_launchd_plist() {
+        let exe = Path::new("/usr/local/bin/orbit");
+        let home = Path::new("/Users/tester/.orbit");
+        let path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+
+        let daemon_plist =
+            render_macos_launch_agent_plist(ServiceRole::Daemon, exe, home, path_env);
+        assert!(
+            !daemon_plist.contains("AbandonProcessGroup"),
+            "daemon launchd plist must NOT set AbandonProcessGroup (shims already detach via process_group(0)):\n{daemon_plist}"
+        );
+
+        let daemon_unit = render_systemd_user_unit(ServiceRole::Daemon, exe, home, path_env);
+        assert!(
+            daemon_unit.contains("KillMode=process\n"),
+            "daemon systemd unit must set KillMode=process:\n{daemon_unit}"
         );
     }
 }

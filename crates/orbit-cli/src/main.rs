@@ -32,7 +32,7 @@ use orbit_providers::{
 };
 use orbit_relay::{RelayConfig, RelayPersistedConfig, run_relay};
 use orbit_relay_transport::{is_ssh_relay_url, redact_relay_url};
-use orbit_shim::{ShimSpawnSpec, run_shim};
+use orbit_shim::{read_spawn_spec_from_stdin, run_shim};
 use uuid::Uuid;
 
 use crate::acp_cli::{AcpAction, cmd_acp};
@@ -522,13 +522,11 @@ enum Commands {
         url: Option<String>,
     },
 
-    /// Internal detached process supervisor invoked by `orbit daemon`.
+    /// Internal detached process supervisor invoked by `orbit daemon` (reads `ShimSpawnSpec` JSON from stdin).
     #[command(hide = true)]
     Shim {
         #[arg(long)]
         socket: PathBuf,
-        #[arg(long)]
-        spec_json: String,
     },
 }
 
@@ -1629,10 +1627,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             mcp_bridge::run_mcp_stdio_bridge(&home_dir, caller_agent_id, url).await?;
         }
 
-        Commands::Shim { socket, spec_json } => {
+        Commands::Shim { socket } => {
             let err_sidecar = socket.with_extension("err");
-            let parsed = serde_json::from_str::<ShimSpawnSpec>(&spec_json);
-            let res: anyhow::Result<()> = match parsed {
+            let res: anyhow::Result<()> = match read_spawn_spec_from_stdin() {
                 Ok(spec) => run_shim(&socket, spec).await.map_err(Into::into),
                 Err(e) => Err(e.into()),
             };
@@ -3235,5 +3232,24 @@ mod tests {
         // Wildcard bind enumerates LAN endpoints (at least one endpoint returned).
         let wildcard = advertised_direct_endpoints(std::net::IpAddr::from([0, 0, 0, 0]), 6868);
         assert!(!wildcard.is_empty());
+    }
+
+    #[test]
+    fn shim_subcommand_accepts_socket_and_rejects_legacy_spec_json_argv() {
+        let ok = Cli::try_parse_from(["orbit", "shim", "--socket", "/tmp/test.sock"]);
+        assert!(ok.is_ok(), "orbit shim --socket <path> must parse cleanly");
+
+        let rejected = Cli::try_parse_from([
+            "orbit",
+            "shim",
+            "--socket",
+            "/tmp/test.sock",
+            "--spec-json",
+            "{}",
+        ]);
+        assert!(
+            rejected.is_err(),
+            "legacy insecure --spec-json CLI flag must be removed"
+        );
     }
 }

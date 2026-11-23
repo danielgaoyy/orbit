@@ -679,3 +679,168 @@ async fn e2e_relay_pop_blocks_daemon_hijack_while_legitimate_client_succeeds() {
     relay_handle.abort();
     let _ = std::fs::remove_dir_all(&temp_home);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn detached_orbit_shim_isolates_process_group_hides_argv_secrets_and_survives_reconnect() {
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let orbit_exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_orbit"));
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home = base_tmp.join(format!("orb_sh_{short_id}"));
+    let shims_dir = temp_home.join("shims");
+    let sock_path = shims_dir.join("cat.sock");
+
+    let secret = "orbit-live-shim-secret-token-4f3e2d1c";
+    let mut env = HashMap::new();
+    env.insert("ORBIT_SECRET_TEST".into(), secret.into());
+    let runtime_dir = temp_home.join("runtime");
+    std::fs::create_dir_all(&runtime_dir).expect("mkdir runtime");
+    let cleanup_file = runtime_dir.join("claude-mcp-detached-test.json");
+    std::fs::write(&cleanup_file, "{\"secret\":true}").expect("write cleanup file");
+    let spec = orbit_shim::ShimSpawnSpec {
+        shim_id: "detached_survival_test".into(),
+        mode: orbit_shim::ShimMode::Stdio,
+        program: "/bin/cat".into(),
+        args: vec![],
+        cwd: base_tmp.clone(),
+        env,
+        cleanup_paths: vec![cleanup_file.clone()],
+    };
+
+    let mut client1 = orbit_shim::spawn_detached_shim(&orbit_exe, &sock_path, &spec)
+        .await
+        .expect("spawn real detached orbit shim");
+
+    // Verify hardened Unix permissions on shims/ (0700) and .sock (0600)
+    assert_eq!(
+        std::fs::metadata(&shims_dir)
+            .expect("shims meta")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&sock_path)
+            .expect("sock meta")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    // Read recorded shim PID from `.pid` sidecar and verify:
+    // 1) Process group is detached (`pgid == shim_pid`, separate from parent process group).
+    // 2) Process argv contains ZERO secrets and ZERO `--spec-json`.
+    let pid_raw =
+        std::fs::read_to_string(orbit_shim::pid_file_path(&sock_path)).expect("read pid sidecar");
+    let pid_json: serde_json::Value = serde_json::from_str(&pid_raw).expect("parse pid sidecar");
+    let shim_pid = pid_json["shim_pid"].as_u64().expect("shim_pid") as u32;
+
+    let ps_pgid = std::process::Command::new("ps")
+        .args(["-p", &shim_pid.to_string(), "-o", "pgid="])
+        .output()
+        .expect("ps pgid");
+    let shim_pgid: u32 = String::from_utf8_lossy(&ps_pgid.stdout)
+        .trim()
+        .parse()
+        .expect("parse shim pgid");
+    assert_eq!(
+        shim_pgid, shim_pid,
+        "detached orbit shim must lead its own process group (pgid == shim_pid)"
+    );
+
+    let ps_cmd = std::process::Command::new("ps")
+        .args(["-p", &shim_pid.to_string(), "-o", "command="])
+        .output()
+        .expect("ps command");
+    let shim_cmdline = String::from_utf8_lossy(&ps_cmd.stdout);
+    assert!(
+        !shim_cmdline.contains(secret),
+        "live shim argv must NEVER expose secrets: {shim_cmdline}"
+    );
+    assert!(
+        !shim_cmdline.contains("--spec-json"),
+        "live shim argv must NEVER contain --spec-json: {shim_cmdline}"
+    );
+
+    // Exchange frame 1 and disconnect client1 (simulating daemon restart/exit)
+    client1
+        .write_stdin_line("before-reconnect")
+        .await
+        .expect("write 1");
+    let seq1 = match tokio::time::timeout(Duration::from_secs(3), client1.rx.recv())
+        .await
+        .expect("timeout 1")
+        .expect("frame 1")
+    {
+        orbit_shim::ShimFrame::StdoutLine { line, seq } => {
+            assert_eq!(line, "before-reconnect");
+            seq.expect("seq 1")
+        }
+        other => panic!("unexpected frame 1: {other:?}"),
+    };
+    drop(client1);
+
+    // Verify the exact same shim PID is still alive after client disconnect
+    let alive_check = std::process::Command::new("kill")
+        .args(["-0", &shim_pid.to_string()])
+        .status()
+        .expect("kill -0");
+    assert!(
+        alive_check.success(),
+        "detached shim PID {shim_pid} must stay alive after client disconnect"
+    );
+
+    // Reconnect with cursor to the same surviving shim PID and continue live I/O
+    let mut client2 = orbit_shim::connect_existing_shim_after(&sock_path, Some(seq1))
+        .await
+        .expect("reconnect to surviving shim");
+    client2
+        .write_stdin_line("after-reconnect")
+        .await
+        .expect("write 2");
+    match tokio::time::timeout(Duration::from_secs(3), client2.rx.recv())
+        .await
+        .expect("timeout 2")
+        .expect("frame 2")
+    {
+        orbit_shim::ShimFrame::StdoutLine { line, seq } => {
+            assert_eq!(line, "after-reconnect");
+            assert_eq!(seq, Some(seq1 + 1));
+        }
+        other => panic!("unexpected frame 2: {other:?}"),
+    }
+
+    // Confirm PID sidecar still belongs to the exact same shim PID and cleanup file is still
+    // intact while the child process is running across reconnect.
+    let pid_raw_after =
+        std::fs::read_to_string(orbit_shim::pid_file_path(&sock_path)).expect("read pid after");
+    let pid_json_after: serde_json::Value =
+        serde_json::from_str(&pid_raw_after).expect("parse pid after");
+    assert_eq!(
+        pid_json_after["shim_pid"].as_u64(),
+        Some(u64::from(shim_pid))
+    );
+    assert!(
+        cleanup_file.exists(),
+        "shim must keep cleanup_paths intact across client disconnect/reconnect while child lives"
+    );
+
+    client2
+        .kill_and_wait(Duration::from_secs(2))
+        .await
+        .expect("kill surviving shim");
+    assert!(
+        !cleanup_file.exists(),
+        "shim must unlink cleanup_paths right after its child exits (even after reconnect)"
+    );
+    let _ = std::fs::remove_dir_all(&temp_home);
+}

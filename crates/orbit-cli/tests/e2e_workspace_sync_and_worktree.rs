@@ -42,10 +42,12 @@ def parse_args():
     i = 0
     while i < len(args):
         if args[i] == "--mcp-config" and i + 1 < len(args):
-            try:
-                mcp_cfg = json.loads(args[i + 1])
-            except Exception:
-                mcp_cfg = None
+            raw_mcp = args[i + 1]
+            if not os.path.isfile(raw_mcp):
+                sys.stderr.write(f"expected --mcp-config to be a readable file path, got: {raw_mcp}\n")
+                sys.exit(2)
+            with open(raw_mcp, "r", encoding="utf-8") as fh:
+                mcp_cfg = json.load(fh)
             i += 2
         elif args[i].startswith("--session-id="):
             session_id = args[i].split("=", 1)[1]

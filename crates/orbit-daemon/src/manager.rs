@@ -485,18 +485,53 @@ impl AgentOrchestrator {
                 entry.ingest_abort.abort();
             }
         }
-        kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
+        if let Ok(sock) = self.shim_socket_path("a", agent_id) {
+            kill_existing_shim(&sock).await;
+        }
         kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
         self.clear_pending_requests(agent_id).await;
         self.keep_awake.mark_agent_idle(agent_id);
         next_gen
     }
 
+    fn claude_runtime_dir(&self) -> PathBuf {
+        let dir = self.home_dir.join("runtime");
+        let abs = if dir.is_absolute() {
+            dir
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&dir))
+                .unwrap_or(dir)
+        };
+        std::fs::canonicalize(&abs).unwrap_or(abs)
+    }
+
     /// Activate live shim reattachment and startup agent recovery once the Daemon HTTP/WS listener
     /// is bound (must NOT be called from short-lived CLI read commands like `orbit pair`).
     pub async fn activate_runtime(self: &Arc<Self>) {
+        // Snapshot pre-existing Claude MCP config files BEFORE recovery can spawn new sessions
+        // so the startup reaper can never delete fresh files written by newly launching agents.
+        let runtime_dir = self.claude_runtime_dir();
+        let mcp_reap_candidates = tokio::task::spawn_blocking(move || {
+            orbit_providers::snapshot_claude_mcp_config_files(&runtime_dir)
+        })
+        .await
+        .unwrap_or_default();
+
         self.reattach_surviving_terminals().await;
-        self.reattach_or_recover_agents().await;
+        if let Some(protected_agent_ids) = self.reattach_or_recover_agents().await
+            && !mcp_reap_candidates.is_empty()
+        {
+            tokio::task::spawn_blocking(move || {
+                let reaped = orbit_providers::reap_snapshotted_claude_mcp_configs(
+                    &mcp_reap_candidates,
+                    &protected_agent_ids,
+                );
+                if reaped > 0 {
+                    info!(reaped, "Reaped stale Claude MCP config files on startup");
+                }
+            });
+        }
         let pool = Arc::clone(&self.worktree_pool);
         tokio::spawn(async move {
             let pruned = pool.prune_stale_standbys().await;
@@ -517,26 +552,22 @@ impl AgentOrchestrator {
         }
     }
 
-    /// Resolve a Unix Domain Socket path guaranteed to fit comfortably under Linux's 108-byte
-    /// `sun_path` limit (even under deeply nested `$ORBIT_HOME` paths).
-    fn shim_socket_path(&self, kind_prefix: &str, id: &str) -> PathBuf {
+    /// Resolve a Unix Domain Socket path guaranteed to fit within platform `sun_path` limits
+    /// (104 bytes on Darwin, 108 bytes on Linux), falling back to a verified per-UID `0700` dir.
+    fn shim_socket_path(&self, kind_prefix: &str, id: &str) -> std::io::Result<PathBuf> {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(id.as_bytes());
         let dig = h.finalize();
         let short_id: String = dig[..8].iter().map(|b| format!("{b:02x}")).collect();
         let filename = format!("{kind_prefix}_{short_id}.sock");
-        let candidate = self.home_dir.join("shims").join(&filename);
-        if candidate.to_string_lossy().len() <= 98 {
-            return candidate;
-        }
+
         let mut hh = Sha256::new();
         hh.update(self.home_dir.to_string_lossy().as_bytes());
         let hdig = hh.finalize();
         let home_tag: String = hdig[..4].iter().map(|b| format!("{b:02x}")).collect();
-        let fallback_dir = std::env::temp_dir().join("orbit-s");
-        let _ = std::fs::create_dir_all(&fallback_dir);
-        fallback_dir.join(format!("{home_tag}_{filename}"))
+
+        orbit_shim::resolve_private_shim_socket_path(&self.home_dir, &filename, &home_tag)
     }
 
     fn legacy_shim_socket_path(&self, legacy_prefix: &str, id: &str) -> PathBuf {
@@ -551,12 +582,11 @@ impl AgentOrchestrator {
             return;
         };
         for term in saved {
-            let primary = self.shim_socket_path("p", &term.terminal_id);
+            let primary = self.shim_socket_path("p", &term.terminal_id).ok();
             let legacy = self.legacy_shim_socket_path("pty", &term.terminal_id);
-            let connected = if primary.exists() {
-                connect_existing_shim(&primary).await
-            } else {
-                None
+            let connected = match primary {
+                Some(ref p) if p.exists() => connect_existing_shim(p).await,
+                _ => None,
             };
             let connected = match connected {
                 Some(c) => Some(c),
@@ -591,22 +621,47 @@ impl AgentOrchestrator {
 
     /// Re-attach to surviving agent shims across daemon hot-upgrades, and optionally
     /// resume previously `Running` agents if `orchestration.resume_on_startup` is enabled.
-    async fn reattach_or_recover_agents(self: &Arc<Self>) {
-        let Ok(agents) = self.store.list_agents_filtered(None, false, true, None) else {
-            return;
+    /// Returns `Some(protected_agent_ids)` whose pre-snapshotted MCP configs must NOT be swept
+    /// (live shims, transient reattach failures, archived agents with live/uncertain sockets,
+    /// agents already registered in `live_agents`, or agents with uncertain socket/pid liveness),
+    /// or `None` if reading the agent store failed (in which case startup reaping is skipped).
+    async fn reattach_or_recover_agents(
+        self: &Arc<Self>,
+    ) -> Option<std::collections::HashSet<String>> {
+        let mut protected_agents = std::collections::HashSet::new();
+        let Ok(agents) = self.store.list_agents_filtered(None, true, true, None) else {
+            return None;
         };
         let cfg = self.orch_config.read().await.clone();
 
         for ag in agents {
-            let primary = self.shim_socket_path("a", &ag.agent_id);
+            let primary = self.shim_socket_path("a", &ag.agent_id).ok();
             let legacy = self.legacy_shim_socket_path("agent", &ag.agent_id);
-            let surviving_sock = if primary.exists() && probe_existing_shim(&primary).await {
-                Some(primary)
+            let surviving_sock = if let Some(ref p) = primary
+                && p.exists()
+                && probe_existing_shim(p).await
+            {
+                Some(p.clone())
             } else if legacy.exists() && probe_existing_shim(&legacy).await {
-                Some(legacy)
+                Some(legacy.clone())
             } else {
                 None
             };
+            // Protect any agent whose shim is live OR whose socket/pid liveness could not be
+            // disproved (path error or non-refused timeout leaving socket or `.pid` file on disk).
+            if primary.is_none()
+                || surviving_sock.is_some()
+                || primary
+                    .as_ref()
+                    .is_some_and(|p| p.exists() || orbit_shim::pid_file_path(p).exists())
+                || legacy.exists()
+                || orbit_shim::pid_file_path(&legacy).exists()
+            {
+                protected_agents.insert(ag.agent_id.clone());
+            }
+            if ag.archived_at.is_some() {
+                continue;
+            }
             let was_running = ag.status.is_foreground_busy();
 
             if surviving_sock.is_some()
@@ -667,6 +722,10 @@ impl AgentOrchestrator {
                 }
             }
         }
+        for live_id in self.live_agents.read().await.keys() {
+            protected_agents.insert(live_id.clone());
+        }
+        Some(protected_agents)
     }
 
     // --- Workspace Lifecycle ---
@@ -4509,7 +4568,7 @@ impl AgentOrchestrator {
         reattach_existing_shim: bool,
         expected_gen: u64,
     ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
-        let primary_sock = self.shim_socket_path("a", &summary.agent_id);
+        let primary_sock = self.shim_socket_path("a", &summary.agent_id)?;
         let legacy_sock = self.legacy_shim_socket_path("agent", &summary.agent_id);
         let shim_socket =
             if reattach_existing_shim && !primary_sock.exists() && legacy_sock.exists() {
@@ -4651,6 +4710,7 @@ impl AgentOrchestrator {
             executable,
             orbit_exe: self.orbit_exe.clone(),
             shim_socket,
+            runtime_dir: self.claude_runtime_dir(),
             cwd: PathBuf::from(&summary.cwd),
             extra_dirs,
             attachments_dir: Some(attachments_dir),
@@ -5657,7 +5717,7 @@ impl AgentOrchestrator {
     ) -> anyhow::Result<TerminalSummary> {
         let term_id = format!("term_{}", Uuid::new_v4().simple());
         let shell = crate::platform::default_shell_program();
-        let sock_path = self.shim_socket_path("p", &term_id);
+        let sock_path = self.shim_socket_path("p", &term_id)?;
         let candidate_cwd = crate::expand_host_path(&cwd);
         let resolved_cwd = if candidate_cwd.is_dir() {
             candidate_cwd
@@ -5681,6 +5741,7 @@ impl AgentOrchestrator {
             args,
             cwd: resolved_cwd,
             env,
+            cleanup_paths: Vec::new(),
         };
 
         let shim = spawn_detached_shim(&self.orbit_exe, &sock_path, &spec).await?;
@@ -7573,6 +7634,178 @@ mod fast_mode_orchestrator_tests {
             orbit_protocol::GuardianDecision::RequireHuman
         );
         assert_eq!(assess.classifier_tier, "fail_closed");
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_mcp_reaper_protects_live_transient_and_archived_uncertain_agents() {
+        let short_id: String = Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect();
+        let home_dir = std::env::temp_dir().join(format!("od_mr_{short_id}"));
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let ws_dir = home_dir.join("repo");
+        let runtime_dir = home_dir.join("runtime");
+        std::fs::create_dir_all(&ws_dir).expect("create ws");
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("store"));
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_test".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            crate::hooks::HooksEngine::new(home_dir.clone()),
+        )
+        .await;
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_mr1".into(),
+                title: "Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+
+        let mk_agent =
+            |id: &str, provider: ProviderKind, archived: bool, acp_id: Option<&str>| AgentSummary {
+                agent_id: id.into(),
+                workspace_id: "ws_mr1".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                title: id.into(),
+                provider,
+                model: None,
+                effort: None,
+                fast_mode: false,
+                mode: SessionMode::Auto,
+                status: AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 0,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: archived.then_some(now),
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
+                read_seq: 0,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: acp_id.map(ToOwned::to_owned),
+            };
+
+        // 1. Live shim whose reattach fails transiently (nonexistent ACP agent executable).
+        store
+            .upsert_agent(
+                &mk_agent(
+                    "ag_live_fail",
+                    ProviderKind::Acp,
+                    false,
+                    Some("nonexistent-acp-xyz"),
+                ),
+                None,
+            )
+            .expect("upsert live_fail");
+        let live_sock = orch
+            .shim_socket_path("a", "ag_live_fail")
+            .expect("live sock path");
+        let _live_listener = orbit_shim::ShimListener::bind(&live_sock)
+            .await
+            .expect("bind live mock shim");
+
+        // 2. Archived agent whose `.pid` sidecar is still present (uncertain liveness).
+        store
+            .upsert_agent(
+                &mk_agent("ag_arch_pid", ProviderKind::ClaudeCode, true, None),
+                None,
+            )
+            .expect("upsert arch_pid");
+        let arch_sock = orch
+            .shim_socket_path("a", "ag_arch_pid")
+            .expect("arch sock path");
+        std::fs::write(
+            orbit_shim::pid_file_path(&arch_sock),
+            "{\"shim_pid\":999999}",
+        )
+        .expect("write arch pid sidecar");
+
+        // 3. Dead agent with neither socket nor pid sidecar.
+        store
+            .upsert_agent(
+                &mk_agent("ag_dead", ProviderKind::ClaudeCode, false, None),
+                None,
+            )
+            .expect("upsert dead");
+
+        // Create pre-snapshotted Claude MCP config files for all three.
+        let mk_mcp = |aid: &str| {
+            let p = runtime_dir.join(format!("claude-mcp-{aid}-{}.json", Uuid::new_v4()));
+            std::fs::write(&p, "{\"mcpServers\":{}}").expect("write mcp");
+            p
+        };
+        let live_fail_cfg = mk_mcp("ag_live_fail");
+        let arch_pid_cfg = mk_mcp("ag_arch_pid");
+        let dead_cfg = mk_mcp("ag_dead");
+
+        let candidates = orbit_providers::snapshot_claude_mcp_config_files(&runtime_dir);
+        let protected = orch
+            .reattach_or_recover_agents()
+            .await
+            .expect("store query succeeded");
+        assert!(
+            protected.contains("ag_live_fail"),
+            "agent with live shim must stay protected even when reattach fails transiently"
+        );
+        assert!(
+            protected.contains("ag_arch_pid"),
+            "archived agent with remaining pid sidecar must stay protected"
+        );
+        assert!(
+            !protected.contains("ag_dead"),
+            "dead agent with no socket/pid must be eligible for stale MCP reaping"
+        );
+
+        let reaped = orbit_providers::reap_snapshotted_claude_mcp_configs(&candidates, &protected);
+        assert_eq!(reaped, 1);
+        assert!(live_fail_cfg.exists());
+        assert!(arch_pid_cfg.exists());
+        assert!(!dead_cfg.exists());
 
         let _ = std::fs::remove_dir_all(&home_dir);
     }

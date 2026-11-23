@@ -445,6 +445,8 @@ pub struct AgentCardView {
     pub is_running: bool,
     #[serde(default)]
     pub has_background_tasks: bool,
+    #[serde(default)]
+    pub has_running_subagents: bool,
     pub is_awaiting_permission: bool,
     pub parent_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1972,6 +1974,7 @@ impl OrbitAppCore {
         let guard = self.hosts.read().ok()?;
         let state = guard.get(host_id)?;
         let prefs_guard = self.thread_prefs.read().ok();
+        let active_subagent_parents = collect_parents_with_running_subagents(&guard);
         let mut agents: Vec<AgentCardView> = state
             .agents
             .values()
@@ -1979,7 +1982,9 @@ impl OrbitAppCore {
                 let pref = prefs_guard
                     .as_ref()
                     .and_then(|p| p.get(&(host_id.to_string(), a.agent_id.clone())));
-                agent_to_card_view(a, pref)
+                let has_running_subagents =
+                    active_subagent_parents.contains(&(host_id.to_string(), a.agent_id.clone()));
+                agent_to_card_view_with_subagents(a, pref, has_running_subagents)
             })
             .collect();
         agents.sort_by(|a, b| b.updated_at_rfc3339.cmp(&a.updated_at_rfc3339));
@@ -2062,7 +2067,9 @@ impl OrbitAppCore {
                 let pref = prefs_guard
                     .as_ref()
                     .and_then(|p| p.get(&(host_id.to_string(), ag.agent_id.clone())));
-                agent_to_card_view(ag, pref)
+                let has_running_subagents =
+                    agent_has_running_subagents(&read_guard, host_id, &ag.agent_id);
+                agent_to_card_view_with_subagents(ag, pref, has_running_subagents)
             });
             return reader(current_agent_card.as_ref(), Some(cached));
         }
@@ -2070,6 +2077,7 @@ impl OrbitAppCore {
         let Ok(mut guard) = self.hosts.write() else {
             return reader(None, None);
         };
+        let active_subagent_parents = collect_parents_with_running_subagents(&guard);
         let Some(host_state) = guard.get_mut(host_id) else {
             return reader(None, None);
         };
@@ -2081,7 +2089,9 @@ impl OrbitAppCore {
             let pref = prefs_guard
                 .as_ref()
                 .and_then(|p| p.get(&(host_id.to_string(), ag.agent_id.clone())));
-            agent_to_card_view(ag, pref)
+            let has_running_subagents =
+                active_subagent_parents.contains(&(host_id.to_string(), ag.agent_id.clone()));
+            agent_to_card_view_with_subagents(ag, pref, has_running_subagents)
         };
 
         let current_agent_card = host_state.agents.get(agent_id).map(&card_for);
@@ -2337,7 +2347,7 @@ impl OrbitAppCore {
         agent_id: &str,
         since_revision: u64,
     ) -> crate::stage::AgentStageDeltaView {
-        self.agent_stage_delta_with_aux(host_id, agent_id, since_revision, None)
+        self.agent_stage_delta_with_options(host_id, agent_id, since_revision, None, None)
     }
 
     pub fn agent_stage_delta_with_aux(
@@ -2347,6 +2357,23 @@ impl OrbitAppCore {
         since_revision: u64,
         since_aux_revision: Option<u64>,
     ) -> crate::stage::AgentStageDeltaView {
+        self.agent_stage_delta_with_options(
+            host_id,
+            agent_id,
+            since_revision,
+            since_aux_revision,
+            None,
+        )
+    }
+
+    pub fn agent_stage_delta_with_options(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        since_revision: u64,
+        since_aux_revision: Option<u64>,
+        tail_turn_limit: Option<usize>,
+    ) -> crate::stage::AgentStageDeltaView {
         self.ensure_stage_fresh_and_read(host_id, agent_id, |agent, cached| {
             let Some(c) = cached else {
                 return crate::stage::AgentStageDeltaView {
@@ -2354,6 +2381,7 @@ impl OrbitAppCore {
                     host_id: host_id.to_string(),
                     agent: agent.cloned(),
                     replace_from_turn_index: 0,
+                    window_start_turn_index: 0,
                     changed_turns: Vec::new(),
                     total_turn_count: 0,
                     pending_permissions: Vec::new(),
@@ -2376,6 +2404,7 @@ impl OrbitAppCore {
                     host_id: host_id.to_string(),
                     agent: agent.cloned(),
                     replace_from_turn_index: total_turns as u32,
+                    window_start_turn_index: 0,
                     changed_turns: Vec::new(),
                     total_turn_count: total_turns as u32,
                     pending_permissions: if aux_unchanged {
@@ -2410,16 +2439,22 @@ impl OrbitAppCore {
                 || since_revision < c.last_reset_revision
                 || since_revision < c.history_floor_revision;
 
-            let replace_from = if needs_reset {
-                0
+            let (replace_from, window_start) = if needs_reset {
+                let start = match tail_turn_limit {
+                    Some(limit) if limit > 0 && total_turns > limit => total_turns - limit,
+                    _ => 0,
+                };
+                (start, start)
             } else {
-                c.delta_history
+                let from = c
+                    .delta_history
                     .iter()
                     .filter(|(rev, _)| *rev > since_revision)
                     .map(|(_, idx)| *idx)
                     .min()
                     .unwrap_or(total_turns)
-                    .min(total_turns)
+                    .min(total_turns);
+                (from, 0)
             };
 
             let aux_unchanged = !needs_reset
@@ -2430,6 +2465,7 @@ impl OrbitAppCore {
                 host_id: host_id.to_string(),
                 agent: agent.cloned(),
                 replace_from_turn_index: replace_from as u32,
+                window_start_turn_index: window_start as u32,
                 changed_turns: c.turns[replace_from..].to_vec(),
                 total_turn_count: total_turns as u32,
                 pending_permissions: if aux_unchanged {
@@ -2457,6 +2493,29 @@ impl OrbitAppCore {
                 aux_revision: c.aux_revision,
                 aux_unchanged,
             }
+        })
+    }
+
+    pub fn agent_stage_turns_slice(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        start_turn_index: usize,
+        count: usize,
+    ) -> Vec<crate::stage::StageTurnView> {
+        if count == 0 {
+            return Vec::new();
+        }
+        self.ensure_stage_fresh_and_read(host_id, agent_id, |_agent, cached| {
+            let Some(c) = cached else {
+                return Vec::new();
+            };
+            let total = c.turns.len();
+            if start_turn_index >= total {
+                return Vec::new();
+            }
+            let end = start_turn_index.saturating_add(count).min(total);
+            c.turns[start_turn_index..end].to_vec()
         })
     }
 
@@ -2489,6 +2548,7 @@ impl OrbitAppCore {
                 reset: false,
             };
         };
+        let has_running_subagents = agent_has_running_subagents(&guard, host_id, agent_id);
         let Some(host_state) = guard.get_mut(host_id) else {
             return AgentTimelineDeltaView {
                 revision: rev,
@@ -2511,7 +2571,7 @@ impl OrbitAppCore {
                 let pref = prefs_guard
                     .as_ref()
                     .and_then(|p| p.get(&(host_id.to_string(), a.agent_id.clone())));
-                agent_to_card_view(a, pref)
+                agent_to_card_view_with_subagents(a, pref, has_running_subagents)
             })
         };
         let agent_cwd = agent_card.as_ref().map(|a| a.cwd.clone());
@@ -2724,6 +2784,7 @@ impl OrbitAppCore {
         let conflict_cutoff_ms = (unix_ms_now() as i64).saturating_sub(15 * 60 * 1000);
 
         if let Some(ref hg) = hosts_guard {
+            let active_subagent_parents = collect_parents_with_running_subagents(hg);
             for (hid, state) in hg.iter() {
                 let agents_with_order: Vec<(AgentCardView, i64)> = state
                     .agents
@@ -2736,7 +2797,12 @@ impl OrbitAppCore {
                             .map(|p| p.pinned_order)
                             .unwrap_or(0)
                             .max(a.pinned_order);
-                        (agent_to_card_view(a, pref), order)
+                        let has_running_subagents =
+                            active_subagent_parents.contains(&(hid.clone(), a.agent_id.clone()));
+                        (
+                            agent_to_card_view_with_subagents(a, pref, has_running_subagents),
+                            order,
+                        )
                     })
                     .collect();
 
@@ -5202,16 +5268,39 @@ impl OrbitAppCore {
                     subagents,
                     ..
                 } => {
+                    let prev_had_running = state
+                        .provider_subagents
+                        .get(&parent_agent_id)
+                        .is_some_and(|subs| {
+                            subs.iter().any(|s| {
+                                s.status == orbit_protocol::ProviderSubagentStatus::Running
+                            })
+                        });
+                    let next_had_running = subagents
+                        .iter()
+                        .any(|s| s.status == orbit_protocol::ProviderSubagentStatus::Running);
                     state.mark_stage_meta_dirty(&parent_agent_id);
                     push_notify_timeline(parent_agent_id.clone());
                     state.provider_subagents.insert(parent_agent_id, subagents);
                     state.enforce_provider_subagent_timeline_bounds(None);
+                    if prev_had_running != next_had_running {
+                        notify_fleet = true;
+                    }
                     notify_host = true;
                 }
                 WireMessage::ProviderSubagentUpdated { subagent } => {
                     let parent_id = subagent.parent_agent_id.clone();
                     let finished =
                         subagent.status != orbit_protocol::ProviderSubagentStatus::Running;
+                    let prev_had_running =
+                        state
+                            .provider_subagents
+                            .get(&parent_id)
+                            .is_some_and(|subs| {
+                                subs.iter().any(|s| {
+                                    s.status == orbit_protocol::ProviderSubagentStatus::Running
+                                })
+                            });
                     let list = state
                         .provider_subagents
                         .entry(parent_id.clone())
@@ -5224,11 +5313,17 @@ impl OrbitAppCore {
                     } else {
                         list.push(subagent);
                     }
+                    let next_had_running = list
+                        .iter()
+                        .any(|s| s.status == orbit_protocol::ProviderSubagentStatus::Running);
                     if finished {
                         state.enforce_provider_subagent_timeline_bounds(None);
                     }
                     state.mark_stage_meta_dirty(&parent_id);
                     push_notify_timeline(parent_id);
+                    if prev_had_running != next_had_running {
+                        notify_fleet = true;
+                    }
                     notify_host = true;
                 }
                 WireMessage::ProviderSubagentTimelineCatchup {
@@ -5352,7 +5447,12 @@ impl OrbitAppCore {
                             pinned_order: existing_pref.map(|p| p.pinned_order).unwrap_or(0),
                             updated_at_ms: existing_pref.map(|p| p.updated_at_ms).unwrap_or(0),
                         };
-                        agent_to_card_view(&agent, Some(&reset_pref))
+                        let has_running_subagents = host_agent_has_running_subagents(state, &ag_id);
+                        agent_to_card_view_with_subagents(
+                            &agent,
+                            Some(&reset_pref),
+                            has_running_subagents,
+                        )
                     };
                     let mut ordered = events;
                     ordered.sort_by_key(|e| e.seq);
@@ -5450,10 +5550,14 @@ impl OrbitAppCore {
                     let live_seq = event.seq;
                     let is_status_changed =
                         matches!(event.payload, TimelinePayload::StatusChanged { .. });
+                    let mut parent_to_notify_meta: Option<String> = None;
                     if let TimelinePayload::StatusChanged { ref status } = event.payload
                         && let Some(ag) = state.agents.get_mut(&agent_id)
                     {
                         ag.status = status.clone();
+                        if ag.parent_host_id.as_deref().is_none_or(|ph| ph == host_id) {
+                            parent_to_notify_meta = ag.parent_agent_id.clone();
+                        }
                         notify_fleet = true;
                         notify_host = true;
                     }
@@ -5470,6 +5574,10 @@ impl OrbitAppCore {
                     state.mark_stage_dirty_with_aux(&agent_id, dirty_idx, false, aux_dirty);
                     if is_status_changed {
                         state.mark_stage_meta_dirty(&agent_id);
+                        if let Some(pid) = parent_to_notify_meta {
+                            state.mark_stage_meta_dirty(&pid);
+                            push_notify_timeline(pid);
+                        }
                     }
                     // Only advance the persistent contiguous cursor once this connection has
                     // completed TimelineCatchup for `agent_id`; never jump over an un-synced gap.
@@ -18142,70 +18250,119 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
                 return idx;
             }
         }
-        TimelinePayload::AssistantMessage { item_id, .. } if !item_id.is_empty() => {
+        TimelinePayload::AssistantMessage {
+            item_id,
+            text,
+            streaming,
+        } if !item_id.is_empty() => {
             let raw_id = strip_segment_scope(item_id).to_string();
-            let collides_earlier = is_legacy_shared_item_id(&raw_id)
-                || list[..seg_start_idx].iter().any(|ev| {
-                    matches!(
-                        &ev.payload,
-                        TimelinePayload::AssistantMessage { item_id: eid, .. }
-                            if strip_segment_scope(eid) == raw_id
-                    )
-                });
-            let effective_id = if collides_earlier {
-                format!("{raw_id}@s{seg_boundary_seq}")
-            } else {
-                raw_id
-            };
-            *item_id = effective_id.clone();
+            if is_legacy_shared_item_id(&raw_id) {
+                let effective_id = format!("{raw_id}@s{seg_boundary_seq}");
+                *item_id = effective_id.clone();
 
-            if let Some((rel_idx, prev)) = list[seg_start_idx..active_end]
-                .iter_mut()
-                .enumerate()
-                .rev()
-                .find(|(_, prev_ev)| {
-                    matches!(
-                        &prev_ev.payload,
-                        TimelinePayload::AssistantMessage { item_id: existing_id, .. }
-                            if existing_id == &effective_id
-                    )
-                })
-            {
-                *prev = incoming;
-                return seg_start_idx + rel_idx;
+                if let Some((rel_idx, prev)) = list[seg_start_idx..active_end]
+                    .iter_mut()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, prev_ev)| {
+                        matches!(
+                            &prev_ev.payload,
+                            TimelinePayload::AssistantMessage { item_id: existing_id, .. }
+                                if existing_id == &effective_id
+                        )
+                    })
+                {
+                    *prev = incoming;
+                    return seg_start_idx + rel_idx;
+                }
+            } else {
+                *item_id = raw_id.clone();
+                if let Some((idx, prev)) =
+                    list[..active_end]
+                        .iter_mut()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, prev_ev)| {
+                            matches!(
+                                &prev_ev.payload,
+                                TimelinePayload::AssistantMessage { item_id: existing_id, .. }
+                                    if strip_segment_scope(existing_id) == raw_id
+                            )
+                        })
+                {
+                    if idx >= seg_start_idx {
+                        *prev = incoming;
+                    } else if let TimelinePayload::AssistantMessage {
+                        text: prev_text,
+                        streaming: prev_streaming,
+                        ..
+                    } = &mut prev.payload
+                    {
+                        // Cross-segment / cross-turn in-place update: preserve original slot
+                        // before any later UserPrompt/ToolCall and settle streaming cleanly.
+                        if incoming.seq == 0 || prev.seq == 0 || incoming.seq >= prev.seq {
+                            if !text.is_empty() || prev_text.is_empty() {
+                                *prev_text = std::mem::take(text);
+                            }
+                            *prev_streaming = if idx < turn_start_idx {
+                                false
+                            } else {
+                                *streaming
+                            };
+                        }
+                    }
+                    return idx;
+                }
             }
         }
-        TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
+        TimelinePayload::AssistantThinking { item_id, text } if !item_id.is_empty() => {
             let raw_id = strip_segment_scope(item_id).to_string();
-            let collides_earlier = is_legacy_shared_item_id(&raw_id)
-                || list[..seg_start_idx].iter().any(|ev| {
-                    matches!(
-                        &ev.payload,
-                        TimelinePayload::AssistantThinking { item_id: eid, .. }
-                            if strip_segment_scope(eid) == raw_id
-                    )
-                });
-            let effective_id = if collides_earlier {
-                format!("{raw_id}@s{seg_boundary_seq}")
-            } else {
-                raw_id
-            };
-            *item_id = effective_id.clone();
+            if is_legacy_shared_item_id(&raw_id) {
+                let effective_id = format!("{raw_id}@s{seg_boundary_seq}");
+                *item_id = effective_id.clone();
 
-            if let Some((rel_idx, prev)) = list[seg_start_idx..active_end]
-                .iter_mut()
-                .enumerate()
-                .rev()
-                .find(|(_, prev_ev)| {
-                    matches!(
-                        &prev_ev.payload,
-                        TimelinePayload::AssistantThinking { item_id: existing_id, .. }
-                            if existing_id == &effective_id
-                    )
-                })
-            {
-                *prev = incoming;
-                return seg_start_idx + rel_idx;
+                if let Some((rel_idx, prev)) = list[seg_start_idx..active_end]
+                    .iter_mut()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, prev_ev)| {
+                        matches!(
+                            &prev_ev.payload,
+                            TimelinePayload::AssistantThinking { item_id: existing_id, .. }
+                                if existing_id == &effective_id
+                        )
+                    })
+                {
+                    *prev = incoming;
+                    return seg_start_idx + rel_idx;
+                }
+            } else {
+                *item_id = raw_id.clone();
+                if let Some((idx, prev)) =
+                    list[..active_end]
+                        .iter_mut()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, prev_ev)| {
+                            matches!(
+                                &prev_ev.payload,
+                                TimelinePayload::AssistantThinking { item_id: existing_id, .. }
+                                    if strip_segment_scope(existing_id) == raw_id
+                            )
+                        })
+                {
+                    if idx >= seg_start_idx {
+                        *prev = incoming;
+                    } else if let TimelinePayload::AssistantThinking {
+                        text: prev_text, ..
+                    } = &mut prev.payload
+                        && (incoming.seq == 0 || prev.seq == 0 || incoming.seq >= prev.seq)
+                        && (!text.is_empty() || prev_text.is_empty())
+                    {
+                        *prev_text = std::mem::take(text);
+                    }
+                    return idx;
+                }
             }
         }
         TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
@@ -18650,7 +18807,104 @@ fn agent_stage_meta_unchanged(prev: &AgentSummary, next: &AgentSummary) -> bool 
             == serde_json::to_string(&next.cluster_suggestion).ok()
 }
 
+fn agent_status_is_active_for_subagent(status: &AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Initializing
+            | AgentStatus::Running { .. }
+            | AgentStatus::AutonomousWakeup { .. }
+            | AgentStatus::AwaitingPermission { .. }
+    )
+}
+
+fn collect_parents_with_running_subagents(
+    hosts: &HashMap<String, HostMemoryState>,
+) -> HashSet<(String, String)> {
+    let mut active_parents: HashSet<(String, String)> = HashSet::new();
+    for (child_host_id, host_state) in hosts {
+        for ag in host_state.agents.values() {
+            if ag.archived_at.is_none()
+                && agent_status_is_active_for_subagent(&ag.status)
+                && let Some(ref parent_id) = ag.parent_agent_id
+            {
+                let target_host = ag
+                    .parent_host_id
+                    .as_deref()
+                    .unwrap_or(child_host_id.as_str());
+                active_parents.insert((target_host.to_string(), parent_id.clone()));
+            }
+        }
+        for (parent_agent_id, subs) in &host_state.provider_subagents {
+            if subs
+                .iter()
+                .any(|ps| ps.status == orbit_protocol::ProviderSubagentStatus::Running)
+            {
+                active_parents.insert((child_host_id.clone(), parent_agent_id.clone()));
+            }
+        }
+    }
+    active_parents
+}
+
+fn agent_has_running_subagents(
+    hosts: &HashMap<String, HostMemoryState>,
+    parent_host_id: &str,
+    parent_agent_id: &str,
+) -> bool {
+    if hosts.get(parent_host_id).is_some_and(|hs| {
+        hs.provider_subagents
+            .get(parent_agent_id)
+            .is_some_and(|subs| {
+                subs.iter()
+                    .any(|ps| ps.status == orbit_protocol::ProviderSubagentStatus::Running)
+            })
+    }) {
+        return true;
+    }
+    hosts.iter().any(|(child_host_id, hs)| {
+        hs.agents.values().any(|ag| {
+            ag.archived_at.is_none()
+                && agent_status_is_active_for_subagent(&ag.status)
+                && ag.parent_agent_id.as_deref() == Some(parent_agent_id)
+                && match ag.parent_host_id.as_deref() {
+                    Some(ph) => ph == parent_host_id,
+                    None => child_host_id == parent_host_id,
+                }
+        })
+    })
+}
+
+fn host_agent_has_running_subagents(state: &HostMemoryState, parent_agent_id: &str) -> bool {
+    if state
+        .provider_subagents
+        .get(parent_agent_id)
+        .is_some_and(|subs| {
+            subs.iter()
+                .any(|ps| ps.status == orbit_protocol::ProviderSubagentStatus::Running)
+        })
+    {
+        return true;
+    }
+    state.agents.values().any(|ag| {
+        ag.archived_at.is_none()
+            && agent_status_is_active_for_subagent(&ag.status)
+            && ag.parent_agent_id.as_deref() == Some(parent_agent_id)
+            && ag
+                .parent_host_id
+                .as_deref()
+                .is_none_or(|ph| ph == state.profile.host_id)
+    })
+}
+
 fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> AgentCardView {
+    agent_to_card_view_with_subagents(a, pref, false)
+}
+
+fn agent_to_card_view_with_subagents(
+    a: &AgentSummary,
+    pref: Option<&ClientThreadPref>,
+    has_running_subagents: bool,
+) -> AgentCardView {
     let (status_label, is_running, has_background_tasks, is_awaiting_permission) = match &a.status {
         AgentStatus::Initializing => ("Starting".to_string(), true, false, false),
         AgentStatus::Idle => ("Idle".to_string(), false, false, false),
@@ -18706,6 +18960,7 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         status_label,
         is_running,
         has_background_tasks,
+        has_running_subagents,
         is_awaiting_permission,
         parent_agent_id: a.parent_agent_id.clone(),
         parent_host_id: a.parent_host_id.clone(),
@@ -23375,5 +23630,502 @@ mod tests {
                 .clear();
         }
         assert!(core.export_host_pairing_uri("host_export_1").is_err());
+    }
+
+    #[test]
+    fn has_running_subagents_tracks_orbit_children_cross_host_and_provider_subagents() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+
+        let make_host = |host_id: &str| {
+            HostMemoryState::new(SavedHostProfile {
+                host_id: host_id.into(),
+                hostname: format!("{host_id}.local"),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            })
+        };
+
+        let make_summary = |agent_id: &str,
+                            status: AgentStatus,
+                            parent_agent_id: Option<&str>,
+                            parent_host_id: Option<&str>,
+                            archived: bool| AgentSummary {
+            agent_id: agent_id.into(),
+            workspace_id: "ws_1".into(),
+            title: format!("Agent {agent_id}"),
+            cwd: "/repo".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Default,
+            status,
+            created_at: now,
+            updated_at: now,
+            latest_seq: 1,
+            read_seq: 1,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+            timeline_epoch: 1,
+            archived_at: archived.then_some(now),
+            parent_agent_id: parent_agent_id.map(ToOwned::to_owned),
+            parent_host_id: parent_host_id.map(ToOwned::to_owned),
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: None,
+            queued_prompts: Vec::new(),
+        };
+
+        {
+            let mut h1 = make_host("h1");
+            h1.agents.insert(
+                "ag_parent".into(),
+                make_summary("ag_parent", AgentStatus::Idle, None, None, false),
+            );
+            let h2 = make_host("h2");
+            let mut hosts = core.hosts.write().expect("hosts write");
+            hosts.insert("h1".into(), h1);
+            hosts.insert("h2".into(), h2);
+        }
+
+        let parent_has_sub = |core: &OrbitAppCore| -> (bool, bool, bool) {
+            let detail = core.host_detail("h1").expect("h1 detail");
+            let in_detail = detail
+                .agents
+                .iter()
+                .find(|a| a.agent_id == "ag_parent")
+                .expect("parent in detail")
+                .has_running_subagents;
+            let sidebar = core.fleet_sidebar(
+                crate::sidebar::SidebarProjectSort::Recent,
+                crate::sidebar::SidebarThreadFilter::All,
+                "",
+                Some("h1"),
+                Some("ag_parent"),
+                Some("/repo"),
+            );
+            let in_sidebar = sidebar
+                .projects
+                .iter()
+                .flat_map(|p| p.conversations.iter())
+                .find(|c| c.agent.agent_id == "ag_parent")
+                .expect("parent in sidebar")
+                .agent
+                .has_running_subagents;
+            let in_stage = core
+                .agent_stage_delta("h1", "ag_parent", 0)
+                .agent
+                .expect("parent in stage")
+                .has_running_subagents;
+            (in_detail, in_sidebar, in_stage)
+        };
+
+        // Initially Idle with no subagents -> false everywhere
+        assert_eq!(parent_has_sub(&core), (false, false, false));
+
+        // 1. Running same-host child Orbit agent -> true across detail, sidebar, stage
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::AgentUpdated {
+                agent: make_summary(
+                    "ag_child_local",
+                    AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    Some("ag_parent"),
+                    None,
+                    false,
+                ),
+            },
+        );
+        assert_eq!(parent_has_sub(&core), (true, true, true));
+
+        // Archiving the running child clears the indicator
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::AgentUpdated {
+                agent: make_summary(
+                    "ag_child_local",
+                    AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    Some("ag_parent"),
+                    None,
+                    true,
+                ),
+            },
+        );
+        assert_eq!(parent_has_sub(&core), (false, false, false));
+
+        // 2. Running cross-host child Orbit agent targeting h1/ag_parent -> true
+        core.handle_inbound_wire(
+            "h2",
+            WireMessage::AgentUpdated {
+                agent: make_summary(
+                    "ag_child_remote",
+                    AgentStatus::AwaitingPermission {
+                        turn_id: "t_perm".into(),
+                        request_id: "perm_1".into(),
+                    },
+                    Some("ag_parent"),
+                    Some("h1"),
+                    false,
+                ),
+            },
+        );
+        assert_eq!(parent_has_sub(&core), (true, true, true));
+
+        // Child completes to Idle -> false
+        core.handle_inbound_wire(
+            "h2",
+            WireMessage::AgentUpdated {
+                agent: make_summary(
+                    "ag_child_remote",
+                    AgentStatus::Idle,
+                    Some("ag_parent"),
+                    Some("h1"),
+                    false,
+                ),
+            },
+        );
+        assert_eq!(parent_has_sub(&core), (false, false, false));
+
+        // 3. Running provider-native subagent -> true, then Completed -> false
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::ProviderSubagentUpdated {
+                subagent: orbit_protocol::ProviderSubagentDescriptor {
+                    subagent_id: "ps_1".into(),
+                    parent_agent_id: "ag_parent".into(),
+                    parent_subagent_id: None,
+                    title: "Codebase Researcher".into(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Running,
+                    created_at: now,
+                    updated_at: now,
+                },
+            },
+        );
+        assert_eq!(parent_has_sub(&core), (true, true, true));
+
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::ProviderSubagentUpdated {
+                subagent: orbit_protocol::ProviderSubagentDescriptor {
+                    subagent_id: "ps_1".into(),
+                    parent_agent_id: "ag_parent".into(),
+                    parent_subagent_id: None,
+                    title: "Codebase Researcher".into(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Completed,
+                    created_at: now,
+                    updated_at: now,
+                },
+            },
+        );
+        assert_eq!(parent_has_sub(&core), (false, false, false));
+    }
+
+    #[test]
+    fn agent_stage_delta_tail_window_and_turns_slice_pagination() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+
+        let mut mem = HostMemoryState::new(SavedHostProfile {
+            host_id: "h_win".into(),
+            hostname: "win-box".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 7474,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            pairing_secret: String::new(),
+            pairing_secret_updated_at_ms: 0,
+            state: HostConnectionState::OnlineDirect,
+        });
+
+        // Build 12 turns (24 events)
+        let mut events = Vec::new();
+        for t in 0..12u64 {
+            events.push(TimelineEvent {
+                seq: t * 2 + 1,
+                epoch: 1,
+                agent_id: "ag_win".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: format!("u_{t}"),
+                    text: format!("Prompt #{t}"),
+                    badges: Vec::new(),
+                },
+            });
+            events.push(TimelineEvent {
+                seq: t * 2 + 2,
+                epoch: 1,
+                agent_id: "ag_win".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: format!("a_{t}"),
+                    text: format!("Reply #{t}"),
+                    streaming: false,
+                },
+            });
+        }
+        mem.timelines.insert("ag_win".into(), events);
+        core.hosts
+            .write()
+            .expect("hosts write")
+            .insert("h_win".into(), mem);
+
+        // Initial windowed delta with tail_turn_limit = Some(4) returns only turns 8..12
+        let d0 = core.agent_stage_delta_with_options("h_win", "ag_win", 0, None, Some(4));
+        assert!(d0.reset);
+        assert_eq!(d0.total_turn_count, 12);
+        assert_eq!(d0.window_start_turn_index, 8);
+        assert_eq!(d0.replace_from_turn_index, 8);
+        assert_eq!(d0.changed_turns.len(), 4);
+        assert_eq!(d0.changed_turns[0].turn_index, 8);
+        assert_eq!(d0.changed_turns[3].turn_index, 11);
+
+        // Paginate earlier turns with agent_stage_turns_slice
+        let page1 = core.agent_stage_turns_slice("h_win", "ag_win", 4, 4);
+        assert_eq!(page1.len(), 4);
+        assert_eq!(page1[0].turn_index, 4);
+        assert_eq!(page1[3].turn_index, 7);
+
+        let page0 = core.agent_stage_turns_slice("h_win", "ag_win", 0, 4);
+        assert_eq!(page0.len(), 4);
+        assert_eq!(page0[0].turn_index, 0);
+        assert_eq!(page0[3].turn_index, 3);
+
+        // Clamping & out-of-bounds safety
+        let clamped = core.agent_stage_turns_slice("h_win", "ag_win", 10, 10);
+        assert_eq!(clamped.len(), 2);
+        assert_eq!(clamped[0].turn_index, 10);
+        assert_eq!(clamped[1].turn_index, 11);
+        assert!(
+            core.agent_stage_turns_slice("h_win", "ag_win", 99, 5)
+                .is_empty()
+        );
+        assert!(
+            core.agent_stage_turns_slice("h_win", "ag_win", 0, 0)
+                .is_empty()
+        );
+
+        // Incremental delta after windowed reset reports window_start_turn_index = 0 and only changed tail
+        core.handle_inbound_wire(
+            "h_win",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 25,
+                    epoch: 1,
+                    agent_id: "ag_win".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: "u_12".into(),
+                        text: "Prompt #12".into(),
+                        badges: Vec::new(),
+                    },
+                },
+            },
+        );
+        let d1 = core.agent_stage_delta_with_options(
+            "h_win",
+            "ag_win",
+            d0.revision,
+            Some(d0.aux_revision),
+            Some(4),
+        );
+        assert!(!d1.reset);
+        assert_eq!(d1.window_start_turn_index, 0);
+        assert_eq!(d1.total_turn_count, 13);
+        assert_eq!(d1.replace_from_turn_index, 11);
+        assert!(d1.changed_turns.iter().any(|t| t.turn_index == 12));
+    }
+
+    #[test]
+    fn coalesce_timeline_updates_existing_item_id_in_place_across_user_prompt() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+
+        let mem = HostMemoryState::new(SavedHostProfile {
+            host_id: "h_dedup".into(),
+            hostname: "dedup-box".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 7474,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            pairing_secret: String::new(),
+            pairing_secret_updated_at_ms: 0,
+            state: HostConnectionState::OnlineDirect,
+        });
+        core.hosts
+            .write()
+            .expect("hosts write")
+            .insert("h_dedup".into(), mem);
+
+        // Turn 1: UserPrompt -> Thinking -> streaming AssistantMessage (`msg_turn_1`)
+        for ev in [
+            TimelineEvent {
+                seq: 1,
+                epoch: 1,
+                agent_id: "ag_dedup".into(),
+                turn_id: Some("t1".into()),
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "First question".into(),
+                    badges: Vec::new(),
+                },
+            },
+            TimelineEvent {
+                seq: 2,
+                epoch: 1,
+                agent_id: "ag_dedup".into(),
+                turn_id: Some("t1".into()),
+                timestamp: now,
+                payload: TimelinePayload::AssistantThinking {
+                    item_id: "th_turn_1".into(),
+                    text: "Initial thought".into(),
+                },
+            },
+            TimelineEvent {
+                seq: 3,
+                epoch: 1,
+                agent_id: "ag_dedup".into(),
+                turn_id: Some("t1".into()),
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "msg_turn_1".into(),
+                    text: "Partial answer".into(),
+                    streaming: true,
+                },
+            },
+            // Intervening Turn 2 UserPrompt arrives before Turn 1's late final events
+            TimelineEvent {
+                seq: 4,
+                epoch: 1,
+                agent_id: "ag_dedup".into(),
+                turn_id: Some("t2".into()),
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: "u2".into(),
+                    text: "Follow-up question".into(),
+                    badges: Vec::new(),
+                },
+            },
+        ] {
+            core.handle_inbound_wire("h_dedup", WireMessage::TimelineLive { event: ev });
+        }
+
+        // Prime stage cache before late Turn 1 completions arrive
+        let before = core.agent_stage_delta("h_dedup", "ag_dedup", 0);
+        assert_eq!(before.changed_turns.len(), 2);
+        assert!(before.changed_turns[0].has_active_item);
+
+        // Late finalizations for `th_turn_1` and `msg_turn_1` arrive AFTER Turn 2's UserPrompt
+        core.handle_inbound_wire(
+            "h_dedup",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 5,
+                    epoch: 1,
+                    agent_id: "ag_dedup".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantThinking {
+                        item_id: "th_turn_1".into(),
+                        text: "Initial thought refined".into(),
+                    },
+                },
+            },
+        );
+        core.handle_inbound_wire(
+            "h_dedup",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 6,
+                    epoch: 1,
+                    agent_id: "ag_dedup".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "msg_turn_1".into(),
+                        text: "Partial answer completed.".into(),
+                        streaming: false,
+                    },
+                },
+            },
+        );
+
+        // Verify raw timeline kept original positions and did NOT duplicate `msg_turn_1` or `th_turn_1`
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let list = hosts
+                .get("h_dedup")
+                .expect("host")
+                .timelines
+                .get("ag_dedup")
+                .expect("timeline");
+            assert_eq!(
+                list.len(),
+                4,
+                "must update in place without adding duplicates"
+            );
+            assert!(matches!(
+                &list[1].payload,
+                TimelinePayload::AssistantThinking { item_id, text }
+                    if item_id == "th_turn_1" && text == "Initial thought refined"
+            ));
+            assert!(matches!(
+                &list[2].payload,
+                TimelinePayload::AssistantMessage { item_id, text, streaming: false }
+                    if item_id == "msg_turn_1" && text == "Partial answer completed."
+            ));
+            assert!(matches!(
+                &list[3].payload,
+                TimelinePayload::UserPrompt { message_id, .. } if message_id == "u2"
+            ));
+        }
+
+        // Verify stage reflects Turn 1 settled cleanly and Turn 2 has zero duplicated Turn 1 reply
+        let stage = core.agent_stage("h_dedup", "ag_dedup");
+        assert_eq!(stage.turns.len(), 2);
+        assert!(!stage.turns[0].has_active_item);
+        assert!(matches!(
+            &stage.turns[0].terminal_reply,
+            Some(TimelineItemView::AssistantMessage { item_id, text, streaming: false, .. })
+                if item_id == "msg_turn_1" && text == "Partial answer completed."
+        ));
+        assert!(stage.turns[1].live_segments.is_empty());
+        assert!(stage.turns[1].terminal_reply.is_none());
     }
 }

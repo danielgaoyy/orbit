@@ -1111,6 +1111,7 @@ export interface AgentCardView {
   status_label: string;
   is_running: boolean;
   has_background_tasks?: boolean;
+  has_running_subagents?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
   parent_host_id?: string | null;
@@ -2155,6 +2156,11 @@ export type TurnLiveSegmentView =
       item: TimelineItemView;
     }
   | {
+      kind: "agent_message";
+      key: string;
+      item: TimelineItemView;
+    }
+  | {
       kind: "notice";
       key: string;
       item: TimelineItemView;
@@ -2247,6 +2253,8 @@ export interface AgentStageView {
   host_id: string;
   agent: AgentCardView | null;
   turns: StageTurnView[];
+  window_start_turn_index?: number;
+  total_turn_count?: number;
   pending_permissions: TimelineItemView[];
   pending_questions: TimelineItemView[];
   session_turn_diffs: DiffFileView[];
@@ -2260,6 +2268,7 @@ export interface AgentStageDeltaView {
   host_id: string;
   agent: AgentCardView | null;
   replace_from_turn_index: number;
+  window_start_turn_index?: number;
   changed_turns: StageTurnView[];
   total_turn_count: number;
   pending_permissions: TimelineItemView[];
@@ -2913,6 +2922,7 @@ export const orbitIpc = {
     agentId: string,
     sinceRevision: number,
     sinceAuxRevision?: number | null,
+    tailTurnLimit?: number | null,
   ): Promise<AgentStageDeltaView> {
     if (!isTauriRuntime()) {
       return {
@@ -2920,6 +2930,7 @@ export const orbitIpc = {
         host_id: hostId,
         agent: null,
         replace_from_turn_index: 0,
+        window_start_turn_index: 0,
         changed_turns: [],
         total_turn_count: 0,
         pending_permissions: [],
@@ -2942,6 +2953,22 @@ export const orbitIpc = {
       agentId,
       sinceRevision,
       sinceAuxRevision: sinceAuxRevision ?? null,
+      tailTurnLimit: tailTurnLimit ?? null,
+    });
+  },
+
+  async getAgentStageTurnsSlice(
+    hostId: string,
+    agentId: string,
+    startTurnIndex: number,
+    count: number,
+  ): Promise<StageTurnView[]> {
+    if (!isTauriRuntime()) return [];
+    return invoke("get_agent_stage_turns_slice", {
+      hostId,
+      agentId,
+      startTurnIndex,
+      count,
     });
   },
 

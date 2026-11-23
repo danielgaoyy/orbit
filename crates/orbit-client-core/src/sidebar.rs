@@ -329,6 +329,7 @@ fn matches_conversation_filter(
         SidebarThreadFilter::ActiveUnread => {
             conv.agent.is_running
                 || conv.agent.has_background_tasks
+                || conv.agent.has_running_subagents
                 || conv.agent.is_awaiting_permission
                 || conv.is_unread
         }
@@ -986,7 +987,11 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 let peer_count = convs.len() as u32;
                 let running_count = convs
                     .iter()
-                    .filter(|c| c.agent.is_running || c.agent.is_awaiting_permission)
+                    .filter(|c| {
+                        c.agent.is_running
+                            || c.agent.has_running_subagents
+                            || c.agent.is_awaiting_permission
+                    })
                     .count() as u32;
                 let unread_count = convs.iter().filter(|c| c.is_unread).count() as u32;
                 let title = ws_meta
@@ -1304,6 +1309,7 @@ mod tests {
             },
             is_running,
             has_background_tasks: false,
+            has_running_subagents: false,
             is_awaiting_permission,
             parent_agent_id: None,
             parent_host_id: None,

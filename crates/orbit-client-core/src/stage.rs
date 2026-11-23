@@ -5,8 +5,8 @@
 use std::collections::{HashMap, HashSet};
 
 use orbit_protocol::{
-    GitStatusSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus, ToolCallDetail,
-    ToolCallStatus,
+    AgentMessageKind, GitStatusSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus,
+    ToolCallDetail, ToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +111,10 @@ pub enum TurnLiveSegmentView {
         has_running_step: bool,
     },
     AssistantMessage {
+        key: String,
+        item: TimelineItemView,
+    },
+    AgentMessage {
         key: String,
         item: TimelineItemView,
     },
@@ -270,6 +274,8 @@ pub struct AgentStageDeltaView {
     pub host_id: String,
     pub agent: Option<AgentCardView>,
     pub replace_from_turn_index: u32,
+    #[serde(default)]
+    pub window_start_turn_index: u32,
     pub changed_turns: Vec<StageTurnView>,
     pub total_turn_count: u32,
     pub pending_permissions: Vec<TimelineItemView>,
@@ -1396,10 +1402,18 @@ pub fn process_timeline_turns_slice(
             continue;
         }
 
-        if matches!(
-            item,
-            TimelineItemView::UserPrompt { .. } | TimelineItemView::AgentMessage { .. }
-        ) {
+        let starts_new_turn = match &item {
+            TimelineItemView::UserPrompt { .. } => true,
+            TimelineItemView::AgentMessage { kind, .. } => {
+                !(has_open_turn
+                    && matches!(
+                        kind,
+                        AgentMessageKind::FinishNotification | AgentMessageKind::Heartbeat
+                    ))
+            }
+            _ => false,
+        };
+        if starts_new_turn {
             flush_turn(
                 &mut turns,
                 &mut turn_item_starts,
@@ -1687,6 +1701,10 @@ fn finalize_turn(
             continue;
         }
 
+        if matches!(it, TimelineItemView::AgentMessage { .. }) {
+            continue;
+        }
+
         non_notice_body.push(it.clone());
     }
 
@@ -1893,6 +1911,13 @@ fn build_live_segments(
                 };
                 raw_segments.push(TurnLiveSegmentView::AssistantMessage {
                     key: msg_key,
+                    item: it.clone(),
+                });
+            }
+            TimelineItemView::AgentMessage { .. } => {
+                flush_steps(&mut raw_segments, &mut step_buf, true, Some(it));
+                raw_segments.push(TurnLiveSegmentView::AgentMessage {
+                    key: stable_timeline_item_key(it),
                     item: it.clone(),
                 });
             }
@@ -2346,6 +2371,567 @@ pub(crate) fn parse_legacy_bg_task_metadata(
     Some((task_id.to_string(), label, log_path))
 }
 
+fn truncate_with_ellipsis(raw: &str, max_chars: usize) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let keep = max_chars.saturating_sub(1);
+    let prefix: String = collapsed.chars().take(keep).collect();
+    format!("{}…", prefix.trim_end())
+}
+
+fn is_env_assignment_token(tok: &str) -> bool {
+    let Some((lhs, _)) = tok.split_once('=') else {
+        return false;
+    };
+    !lhs.is_empty()
+        && lhs
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_shell_like_text(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if starts_with_ignore_ascii_case(trimmed, "sleep ")
+        || starts_with_ignore_ascii_case(trimmed, "cd ")
+        || starts_with_ignore_ascii_case(trimmed, "set -")
+        || starts_with_ignore_ascii_case(trimmed, "export ")
+        || trimmed.starts_with("/bin/")
+        || trimmed.starts_with("/usr/bin/")
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("$ ")
+        || trimmed.contains("&&")
+        || trimmed.contains("||")
+        || trimmed.contains('|')
+        || trimmed.contains("$(")
+        || trimmed.contains(';')
+    {
+        return true;
+    }
+    let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+    if is_env_assignment_token(first_tok) {
+        return true;
+    }
+    matches!(
+        first_tok,
+        "gh" | "cargo"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "bun"
+            | "npx"
+            | "vitest"
+            | "vite"
+            | "next"
+            | "tsc"
+            | "node"
+            | "git"
+            | "pytest"
+            | "python"
+            | "python3"
+            | "uv"
+            | "go"
+            | "xcodebuild"
+            | "gradle"
+            | "gradlew"
+            | "docker"
+            | "kubectl"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "env"
+            | "nohup"
+            | "timeout"
+            | "caffeinate"
+    )
+}
+
+fn format_timer_or_cron_label(label: &str) -> Option<String> {
+    let trimmed = label.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("Timer:")
+        .or_else(|| trimmed.strip_prefix("timer:"))
+    {
+        let rest = rest.trim();
+        let (dur_part, prompt_part) = match rest.split_once(',') {
+            Some((d, tail)) => {
+                let prompt = tail
+                    .trim()
+                    .strip_prefix("Prompt:")
+                    .or_else(|| tail.trim().strip_prefix("prompt:"))
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty());
+                (d.trim(), prompt)
+            }
+            None => (rest, None),
+        };
+        if dur_part.is_empty() {
+            return Some("Timer".to_string());
+        }
+        if let Some(p) = prompt_part {
+            let first_line = p
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !collapsed.is_empty() && collapsed.chars().count() <= 24 {
+                return Some(truncate_with_ellipsis(
+                    &format!("Timer · {dur_part} · {collapsed}"),
+                    48,
+                ));
+            }
+        }
+        return Some(truncate_with_ellipsis(&format!("Timer · {dur_part}"), 48));
+    }
+    if starts_with_ignore_ascii_case(trimmed, "cron:") {
+        return Some("Scheduled task".to_string());
+    }
+    None
+}
+
+fn split_shell_chain_segments(raw: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            current.push(ch);
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            current.push(ch);
+            continue;
+        }
+        if !in_single && !in_double {
+            if ch == '\n' || ch == ';' {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    segments.push(trimmed.to_string());
+                }
+                current.clear();
+                continue;
+            }
+            if ch == '&' && chars.peek() == Some(&'&') {
+                let _ = chars.next();
+                let trimmed = current.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    segments.push(trimmed.to_string());
+                }
+                current.clear();
+                continue;
+            }
+        }
+        current.push(ch);
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+        segments.push(trimmed.to_string());
+    }
+    segments
+}
+
+fn strip_unquoted_pipe_and_redirects(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut hit_redirect = false;
+
+    for ch in seg.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            out.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            out.push(ch);
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            out.push(ch);
+            continue;
+        }
+        if !in_single && !in_double {
+            if ch == '|' {
+                break;
+            }
+            if ch == '>' {
+                hit_redirect = true;
+                break;
+            }
+        }
+        out.push(ch);
+    }
+
+    if hit_redirect {
+        let trimmed = out.trim_end();
+        let cleaned = trimmed
+            .strip_suffix('&')
+            .or_else(|| {
+                let last = trimmed.chars().next_back()?;
+                if !last.is_ascii_digit() {
+                    return None;
+                }
+                let before = &trimmed[..trimmed.len() - last.len_utf8()];
+                if before.is_empty() || before.chars().next_back().is_some_and(char::is_whitespace)
+                {
+                    Some(before)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(trimmed);
+        cleaned.trim().to_string()
+    } else {
+        out.trim().to_string()
+    }
+}
+
+fn unwrap_shell_dash_c(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let mut parts = trimmed.splitn(3, char::is_whitespace);
+    let bin = parts.next()?;
+    let bin_name = bin.rsplit('/').next().unwrap_or(bin);
+    if !matches!(bin_name, "sh" | "bash" | "zsh") {
+        return None;
+    }
+    let flag = parts.next()?.trim();
+    if !matches!(flag, "-c" | "-lc" | "-cl") {
+        return None;
+    }
+    let body = parts.next()?.trim();
+    let unwrapped = if (body.starts_with('"') && body.ends_with('"') && body.len() >= 2)
+        || (body.starts_with('\'') && body.ends_with('\'') && body.len() >= 2)
+    {
+        &body[1..body.len() - 1]
+    } else {
+        body
+    };
+    (!unwrapped.trim().is_empty()).then(|| unwrapped.trim().to_string())
+}
+
+fn strip_leading_env_and_wrappers(seg: &str) -> String {
+    let mut tokens: Vec<&str> = seg
+        .trim()
+        .trim_start_matches("$ ")
+        .split_whitespace()
+        .collect();
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let tok = tokens[idx];
+        if is_env_assignment_token(tok) {
+            idx += 1;
+            continue;
+        }
+        if matches!(tok, "env" | "nohup" | "time" | "exec") {
+            idx += 1;
+            continue;
+        }
+        if tok == "caffeinate" {
+            idx += 1;
+            while idx < tokens.len() && tokens[idx].starts_with('-') {
+                idx += 1;
+            }
+            continue;
+        }
+        if tok == "timeout" {
+            idx += 1;
+            while idx < tokens.len() && tokens[idx].starts_with('-') {
+                idx += 1;
+            }
+            if idx < tokens.len() {
+                idx += 1; // skip duration token
+            }
+            continue;
+        }
+        break;
+    }
+    tokens.drain(..idx);
+    tokens.join(" ")
+}
+
+fn is_shell_setup_boilerplate(cleaned_seg: &str) -> bool {
+    let first = cleaned_seg.split_whitespace().next().unwrap_or("");
+    matches!(
+        first,
+        "cd" | "sleep" | "set" | "export" | "unset" | "ulimit" | "umask" | "true" | ":"
+    )
+}
+
+fn extract_primary_shell_command(raw: &str) -> String {
+    let unwrapped = unwrap_shell_dash_c(raw);
+    let source = unwrapped.as_deref().unwrap_or(raw);
+    let segments = split_shell_chain_segments(source);
+    for seg in &segments {
+        let stripped = strip_leading_env_and_wrappers(seg);
+        if stripped.is_empty() || is_shell_setup_boilerplate(&stripped) {
+            continue;
+        }
+        return stripped;
+    }
+    segments
+        .last()
+        .map(|s| strip_leading_env_and_wrappers(s))
+        .unwrap_or_default()
+}
+
+fn extract_cargo_package_arg(tokens: &[&str]) -> Option<String> {
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let tok = tokens[idx];
+        if (tok == "-p" || tok == "--package")
+            && let Some(pkg) = tokens.get(idx + 1)
+            && !pkg.starts_with('-')
+            && !pkg.is_empty()
+        {
+            return Some((*pkg).to_string());
+        }
+        if let Some(pkg) = tok.strip_prefix("--package=")
+            && !pkg.is_empty()
+        {
+            return Some(pkg.to_string());
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn summarize_shell_command(raw_command: &str) -> Option<String> {
+    let primary_full = extract_primary_shell_command(raw_command);
+    if primary_full.is_empty() {
+        return None;
+    }
+    let primary_cmd = strip_unquoted_pipe_and_redirects(&primary_full);
+    let tokens: Vec<&str> = primary_cmd.split_whitespace().collect();
+    let first = *tokens.first()?;
+    let bin = first.rsplit('/').next().unwrap_or(first);
+
+    match bin {
+        "gh" => match (tokens.get(1).copied(), tokens.get(2).copied()) {
+            (Some("pr"), Some("checks")) => {
+                let is_watch = tokens.iter().any(|t| *t == "--watch" || *t == "-w");
+                let pr_num = tokens[3..].iter().find_map(|t| {
+                    let clean = t.trim_start_matches('#');
+                    (!clean.is_empty() && clean.chars().all(|c| c.is_ascii_digit()))
+                        .then_some(clean)
+                });
+                let verb = if is_watch { "Watch" } else { "Check" };
+                return Some(match pr_num {
+                    Some(n) => format!("{verb} PR #{n} CI"),
+                    None => format!("{verb} PR CI"),
+                });
+            }
+            (Some("run"), Some("watch")) => return Some("Watch GitHub Actions".to_string()),
+            (Some("pr"), Some("create")) => return Some("Create pull request".to_string()),
+            (Some("pr"), Some("merge")) => return Some("Merge pull request".to_string()),
+            _ => {}
+        },
+        "cargo" => {
+            let sub = tokens.get(1).copied().unwrap_or("");
+            let sub2 = tokens.get(2).copied().unwrap_or("");
+            let pkg = extract_cargo_package_arg(&tokens);
+            let with_pkg = |base: &str| match &pkg {
+                Some(p) => truncate_with_ellipsis(&format!("{base} ({p})"), 48),
+                None => base.to_string(),
+            };
+            match (sub, sub2) {
+                ("tauri", "build") => return Some("Build Desktop app".to_string()),
+                ("tauri", "dev") => return Some("Run dev server".to_string()),
+                ("test", _) => return Some(with_pkg("Run Rust tests")),
+                ("clippy", _) => return Some(with_pkg("Lint Rust")),
+                ("build", _) => return Some(with_pkg("Build Rust")),
+                ("run", _) => return Some("Run local app".to_string()),
+                _ => {}
+            }
+        }
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            let sub = tokens.get(1).copied().unwrap_or("");
+            let script = if sub == "run" {
+                tokens.get(2).copied().unwrap_or("")
+            } else {
+                sub
+            };
+            let script_arg = if sub == "run" {
+                tokens.get(3).copied().unwrap_or("")
+            } else {
+                tokens.get(2).copied().unwrap_or("")
+            };
+            match script {
+                "test" | "vitest" => return Some("Run frontend tests".to_string()),
+                "tauri" if script_arg == "build" => return Some("Build Desktop app".to_string()),
+                "tauri" if script_arg == "dev" => return Some("Run dev server".to_string()),
+                "build" => return Some("Build frontend".to_string()),
+                "typecheck" | "tsc" => return Some("Typecheck frontend".to_string()),
+                "dev" | "start" | "preview" => return Some("Run dev server".to_string()),
+                _ => {}
+            }
+        }
+        "npx" => match (tokens.get(1).copied(), tokens.get(2).copied()) {
+            (Some("vitest"), _) => return Some("Run frontend tests".to_string()),
+            (Some("vite"), Some("build")) => return Some("Build frontend".to_string()),
+            (Some("vite"), _) | (Some("next"), Some("dev")) => {
+                return Some("Run dev server".to_string());
+            }
+            (Some("tsc"), _) => return Some("Typecheck frontend".to_string()),
+            (Some("tauri"), Some("build")) => return Some("Build Desktop app".to_string()),
+            (Some("tauri"), Some("dev")) => return Some("Run dev server".to_string()),
+            _ => {}
+        },
+        "vitest" => return Some("Run frontend tests".to_string()),
+        "vite" => {
+            if tokens.get(1).copied() == Some("build") {
+                return Some("Build frontend".to_string());
+            }
+            return Some("Run dev server".to_string());
+        }
+        "next" => {
+            if tokens.get(1).copied() == Some("dev") {
+                return Some("Run dev server".to_string());
+            }
+            if tokens.get(1).copied() == Some("build") {
+                return Some("Build frontend".to_string());
+            }
+        }
+        "tsc" => return Some("Typecheck frontend".to_string()),
+        "node" => {
+            if tokens.contains(&"--test") {
+                return Some("Run frontend tests".to_string());
+            }
+        }
+        "git" => {
+            if matches!(tokens.get(1).copied(), Some("push" | "pull" | "fetch")) {
+                return Some("Sync Git remote".to_string());
+            }
+        }
+        "pytest" => return Some("Run Python tests".to_string()),
+        "python" | "python3" => {
+            if tokens.windows(2).any(|w| w == ["-m", "pytest"]) {
+                return Some("Run Python tests".to_string());
+            }
+            return Some("Run Python script".to_string());
+        }
+        "uv" => {
+            if tokens.contains(&"pytest") {
+                return Some("Run Python tests".to_string());
+            }
+        }
+        "go" => match tokens.get(1).copied() {
+            Some("test") => return Some("Run Go tests".to_string()),
+            Some("build") => return Some("Build Go project".to_string()),
+            _ => {}
+        },
+        "xcodebuild" => return Some("Build iOS / macOS app".to_string()),
+        "gradle" | "gradlew" => return Some("Build Android app".to_string()),
+        "docker" => return Some("Run container task".to_string()),
+        "kubectl" => return Some("Run Kubernetes task".to_string()),
+        _ => {}
+    }
+
+    Some(truncate_with_ellipsis(&primary_cmd, 44))
+}
+
+/// Deterministic, zero-API-quota human-readable title formatter for asynchronous background tasks.
+pub fn summarize_background_task_title(
+    label: Option<&str>,
+    command: Option<&str>,
+    summary_title: &str,
+) -> String {
+    let clean_label = label.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(lbl) = clean_label
+        && !is_shell_like_text(lbl)
+    {
+        if let Some(formatted) = format_timer_or_cron_label(lbl) {
+            return formatted;
+        }
+        return truncate_with_ellipsis(lbl, 48);
+    }
+
+    if let Some(cmd) = command.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(summarized) = summarize_shell_command(cmd)
+    {
+        return summarized;
+    }
+
+    if let Some(lbl) = clean_label
+        && let Some(summarized) = summarize_shell_command(lbl)
+    {
+        return summarized;
+    }
+
+    let clean_summary = summary_title.trim();
+    if !clean_summary.is_empty()
+        && !clean_summary.eq_ignore_ascii_case("run shell")
+        && !clean_summary.eq_ignore_ascii_case("shell")
+    {
+        if is_shell_like_text(clean_summary)
+            && let Some(summarized) = summarize_shell_command(clean_summary)
+        {
+            return summarized;
+        }
+        return truncate_with_ellipsis(clean_summary, 48);
+    }
+
+    "Background task".to_string()
+}
+
+fn is_generic_subagent_role(role: &str) -> bool {
+    let trimmed = role.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("subagent")
+}
+
+fn derive_subagent_title_from_prompt(prompt: &str) -> Option<String> {
+    let first_line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let cleaned = strip_markdown_line_prefix(first_line);
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(truncate_with_ellipsis(&collapsed, 36))
+}
+
+fn resolve_subagent_display_role(raw_role: &str, prompt_or_subtitle: Option<&str>) -> String {
+    let trimmed = raw_role.trim();
+    if !is_generic_subagent_role(trimmed) {
+        return trimmed.to_string();
+    }
+    if let Some(derived) = prompt_or_subtitle.and_then(derive_subagent_title_from_prompt) {
+        return derived;
+    }
+    "Subagent".to_string()
+}
+
 /// Derive compact, deduplicated session inventory (touched files, genuinely asynchronous active
 /// background tasks, subagents, and detected localhost preview URLs) from the active timeline &
 /// host state.
@@ -2460,11 +3046,10 @@ pub fn derive_session_insights(
                                 key,
                                 SessionSubagentEntryView {
                                     id: call_id.clone(),
-                                    role: if role.is_empty() {
-                                        "Subagent".to_string()
-                                    } else {
-                                        role.clone()
-                                    },
+                                    role: resolve_subagent_display_role(
+                                        role,
+                                        Some(prompt_preview.as_str()),
+                                    ),
                                     prompt_preview: prompt_preview.clone(),
                                     status: *status,
                                     child_agent_id: child_agent_id.clone(),
@@ -2518,38 +3103,43 @@ pub fn derive_session_insights(
                                     .map(str::trim)
                                     .find(|l| !l.is_empty())
                                     .unwrap_or("");
-                                let title = clean_label
-                                    .or_else(|| (!first_line.is_empty()).then_some(first_line))
+                                let title = summarize_background_task_title(
+                                    clean_label,
+                                    Some(command.as_str()),
+                                    summary_title,
+                                );
+                                let subtitle = shell_cwd
+                                    .as_deref()
+                                    .map(|c| strip_workspace_prefix(c, cwd))
+                                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&title))
                                     .or_else(|| {
-                                        (!summary_title.trim().is_empty())
-                                            .then_some(summary_title.trim())
+                                        (!first_line.is_empty()
+                                            && !first_line.eq_ignore_ascii_case(&title))
+                                        .then(|| truncate_with_ellipsis(first_line, 56))
+                                        .filter(|s| !s.eq_ignore_ascii_case(&title))
                                     })
-                                    .unwrap_or("Background command")
-                                    .to_string();
-                                let subtitle = if clean_label.is_some()
-                                    && !first_line.is_empty()
-                                    && first_line != title
-                                {
-                                    first_line.to_string()
-                                } else {
-                                    shell_cwd
-                                        .as_deref()
-                                        .map(|c| strip_workspace_prefix(c, cwd))
-                                        .filter(|s| !s.is_empty())
-                                        .unwrap_or_else(|| "Background task".to_string())
-                                };
+                                    .unwrap_or_else(|| {
+                                        if title.eq_ignore_ascii_case("Background task") {
+                                            String::new()
+                                        } else {
+                                            "Background task".to_string()
+                                        }
+                                    });
                                 let cmd_opt = (!command.trim().is_empty()).then(|| command.clone());
                                 (title, subtitle, cmd_opt, output_preview.clone())
                             }
                             _ => {
-                                let title = clean_label
-                                    .or_else(|| {
-                                        (!summary_title.trim().is_empty())
-                                            .then_some(summary_title.trim())
-                                    })
-                                    .unwrap_or("Background task")
-                                    .to_string();
-                                (title, "Background task".to_string(), None, None)
+                                let title = summarize_background_task_title(
+                                    clean_label,
+                                    None,
+                                    summary_title,
+                                );
+                                let subtitle = if title.eq_ignore_ascii_case("Background task") {
+                                    String::new()
+                                } else {
+                                    "Background task".to_string()
+                                };
+                                (title, subtitle, None, None)
                             }
                         };
 
@@ -2625,16 +3215,24 @@ pub fn derive_session_insights(
                 if let Some(existing) = subagent_map.get_mut(&ag.agent_id) {
                     existing.status = status;
                     existing.child_agent_id = Some(ag.agent_id.clone());
+                    if is_generic_subagent_role(&existing.role) {
+                        existing.role = resolve_subagent_display_role(
+                            &ag.title,
+                            ag.task_summary
+                                .as_deref()
+                                .or((!existing.prompt_preview.is_empty())
+                                    .then_some(existing.prompt_preview.as_str())),
+                        );
+                    }
                 } else {
                     subagent_map.insert(
                         ag.agent_id.clone(),
                         SessionSubagentEntryView {
                             id: ag.agent_id.clone(),
-                            role: if ag.title.is_empty() {
-                                "Subagent".to_string()
-                            } else {
-                                ag.title.clone()
-                            },
+                            role: resolve_subagent_display_role(
+                                &ag.title,
+                                ag.task_summary.as_deref(),
+                            ),
                             prompt_preview: ag.status_label.clone(),
                             status,
                             child_agent_id: Some(ag.agent_id.clone()),
@@ -2699,8 +3297,14 @@ pub fn derive_session_insights(
             {
                 existing.child_agent_id = None;
             }
-            if !ps.title.trim().is_empty() && existing.role == "Subagent" {
-                existing.role = ps.title.clone();
+            if is_generic_subagent_role(&existing.role) {
+                let fallback_prompt = ps
+                    .subtitle
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .or((!existing.prompt_preview.trim().is_empty())
+                        .then_some(existing.prompt_preview.as_str()));
+                existing.role = resolve_subagent_display_role(&ps.title, fallback_prompt);
             }
             if existing.prompt_preview.is_empty()
                 && let Some(sub) = ps.subtitle.as_deref().filter(|s| !s.trim().is_empty())
@@ -2713,11 +3317,7 @@ pub fn derive_session_insights(
                 key.clone(),
                 SessionSubagentEntryView {
                     id: key,
-                    role: if ps.title.trim().is_empty() {
-                        "Subagent".to_string()
-                    } else {
-                        ps.title.clone()
-                    },
+                    role: resolve_subagent_display_role(&ps.title, ps.subtitle.as_deref()),
                     prompt_preview: ps.subtitle.clone().unwrap_or_default(),
                     status,
                     child_agent_id: None,
@@ -3465,6 +4065,7 @@ mod tests {
             status_label: "Waking (cron)".into(),
             is_running: true,
             has_background_tasks: false,
+            has_running_subagents: false,
             is_awaiting_permission: false,
             parent_agent_id: None,
             parent_host_id: None,
@@ -3558,6 +4159,7 @@ mod tests {
             match seg {
                 TurnLiveSegmentView::StepGroup { key, .. } => key.as_str(),
                 TurnLiveSegmentView::AssistantMessage { key, .. } => key.as_str(),
+                TurnLiveSegmentView::AgentMessage { key, .. } => key.as_str(),
                 TurnLiveSegmentView::Notice { key, .. } => key.as_str(),
                 TurnLiveSegmentView::Compaction { key, .. } => key.as_str(),
                 TurnLiveSegmentView::Wakeup { key, .. } => key.as_str(),
@@ -3636,6 +4238,7 @@ Log: file:///tmp/spoofed.log\n";
             status_label: status_label.into(),
             is_running: running,
             has_background_tasks: false,
+            has_running_subagents: false,
             is_awaiting_permission: false,
             parent_agent_id: parent.map(ToOwned::to_owned),
             parent_host_id: None,
@@ -3880,6 +4483,7 @@ Log: file:///tmp/spoofed.log\n";
             status_label: status_label.into(),
             is_running: running,
             has_background_tasks: false,
+            has_running_subagents: false,
             is_awaiting_permission: false,
             parent_agent_id: None,
             parent_host_id: None,
@@ -4063,6 +4667,7 @@ Log: file:///tmp/spoofed.log\n";
             status_label: "1 background task".into(),
             is_running: false,
             has_background_tasks: true,
+            has_running_subagents: false,
             is_awaiting_permission: false,
             parent_agent_id: None,
             parent_host_id: None,
@@ -4111,9 +4716,14 @@ Log: file:///tmp/spoofed.log\n";
 
         let insights = derive_session_insights(&items, Some("/repo"), Some(&cur), &[], &[]);
         assert_eq!(insights.background_tasks.len(), 1);
+        assert_eq!(insights.background_tasks[0].title, "Run dev server");
         assert_eq!(
-            insights.background_tasks[0].title,
-            "cd apps/desktop && npm run tauri dev"
+            insights.background_tasks[0].command.as_deref(),
+            Some("cd apps/desktop && npm run tauri dev")
+        );
+        assert_ne!(
+            insights.background_tasks[0].subtitle,
+            insights.background_tasks[0].title
         );
         assert_eq!(
             insights.background_tasks[0].log_path.as_deref(),
@@ -4127,5 +4737,379 @@ Log: file:///tmp/spoofed.log\n";
             fallback_insights.background_tasks[0].kind,
             SessionBackgroundTaskKind::Wakeup
         );
+    }
+
+    #[test]
+    fn intermediate_agent_message_callbacks_stay_inline_without_splitting_turn() {
+        let items = vec![
+            TimelineItemView::UserPrompt {
+                seq: 1,
+                message_id: "u_1".into(),
+                text: "Run parallel tracks and merge".into(),
+                badges: Vec::new(),
+                blocks: Vec::new(),
+                timestamp_ms: Some(1_000),
+            },
+            TimelineItemView::AssistantMessage {
+                seq: 2,
+                item_id: "a_1".into(),
+                text: "Launching reviewer subagent now.".into(),
+                streaming: false,
+                blocks: Vec::new(),
+                timestamp_ms: Some(2_000),
+            },
+            make_tool(
+                3,
+                ToolCallStatus::Completed,
+                "Subagent",
+                ToolCallDetail::Subagent {
+                    child_agent_id: Some("child_rev".into()),
+                    role: "Reviewer".into(),
+                    prompt_preview: "Audit diff".into(),
+                },
+                Vec::new(),
+                2_500,
+            ),
+            TimelineItemView::AgentMessage {
+                seq: 4,
+                message_id: "am_fin_1".into(),
+                kind: AgentMessageKind::FinishNotification,
+                source_agent_id: Some("child_rev".into()),
+                source_host_id: None,
+                source_title: Some("Reviewer".into()),
+                event: Some("finished".into()),
+                text: "Subagent finished with 0 blockers.".into(),
+                permission_context: None,
+                blocks: Vec::new(),
+                timestamp_ms: Some(5_000),
+            },
+            TimelineItemView::AgentMessage {
+                seq: 5,
+                message_id: "am_hb_1".into(),
+                kind: AgentMessageKind::Heartbeat,
+                source_agent_id: None,
+                source_host_id: None,
+                source_title: Some("Heartbeat".into()),
+                event: Some("heartbeat".into()),
+                text: "Still verifying CI".into(),
+                permission_context: None,
+                blocks: Vec::new(),
+                timestamp_ms: Some(6_000),
+            },
+            TimelineItemView::AssistantMessage {
+                seq: 6,
+                item_id: "a_2".into(),
+                text: "All tracks merged cleanly!".into(),
+                streaming: false,
+                blocks: Vec::new(),
+                timestamp_ms: Some(7_000),
+            },
+            // Standalone DirectMessage from a peer still starts a new turn
+            TimelineItemView::AgentMessage {
+                seq: 7,
+                message_id: "am_dm_1".into(),
+                kind: AgentMessageKind::DirectMessage,
+                source_agent_id: Some("peer_backend".into()),
+                source_host_id: None,
+                source_title: Some("backend".into()),
+                event: None,
+                text: "API contract updated".into(),
+                permission_context: None,
+                blocks: Vec::new(),
+                timestamp_ms: Some(9_000),
+            },
+            TimelineItemView::AssistantMessage {
+                seq: 8,
+                item_id: "a_3".into(),
+                text: "Acknowledged peer update.".into(),
+                streaming: false,
+                blocks: Vec::new(),
+                timestamp_ms: Some(10_000),
+            },
+        ];
+
+        let (turns, _, _, _) = process_timeline_for_stage(&items, Some("/repo"));
+        assert_eq!(
+            turns.len(),
+            2,
+            "FinishNotification & Heartbeat must stay inline while DirectMessage opens a new turn"
+        );
+
+        let t0 = &turns[0];
+        assert!(t0.user_prompt.is_some());
+        assert!(t0.agent_message.is_none());
+        assert_eq!(t0.live_segments.len(), 5);
+        assert!(matches!(
+            &t0.live_segments[0],
+            TurnLiveSegmentView::AssistantMessage { key, .. } if key == "msg-a_1"
+        ));
+        assert!(matches!(
+            &t0.live_segments[1],
+            TurnLiveSegmentView::StepGroup {
+                has_following_content: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &t0.live_segments[2],
+            TurnLiveSegmentView::AgentMessage { key, item: TimelineItemView::AgentMessage { kind: AgentMessageKind::FinishNotification, .. } }
+                if key == "am-am_fin_1"
+        ));
+        assert!(matches!(
+            &t0.live_segments[3],
+            TurnLiveSegmentView::AgentMessage { key, item: TimelineItemView::AgentMessage { kind: AgentMessageKind::Heartbeat, .. } }
+                if key == "am-am_hb_1"
+        ));
+        assert!(matches!(
+            &t0.live_segments[4],
+            TurnLiveSegmentView::AssistantMessage { key, .. } if key == "msg-a_2"
+        ));
+        assert!(matches!(
+            &t0.terminal_reply,
+            Some(TimelineItemView::AssistantMessage { item_id, .. }) if item_id == "a_2"
+        ));
+        assert!(matches!(
+            &t0.last_assistant_reply,
+            Some(TimelineItemView::AssistantMessage { item_id, .. }) if item_id == "a_2"
+        ));
+        assert!(
+            t0.folded_steps
+                .iter()
+                .all(|it| !matches!(it, TimelineItemView::AgentMessage { .. })),
+            "AgentMessage milestones should not pollute folded_steps"
+        );
+
+        // Turn 2 opened by standalone DirectMessage
+        let t1 = &turns[1];
+        assert!(t1.user_prompt.is_none());
+        assert!(matches!(
+            &t1.agent_message,
+            Some(TimelineItemView::AgentMessage {
+                kind: AgentMessageKind::DirectMessage,
+                ..
+            })
+        ));
+        assert_eq!(t1.live_segments.len(), 1);
+
+        // When no turn is open yet, a leading FinishNotification still opens a turn cleanly
+        let leading_only = vec![items[3].clone(), items[5].clone()];
+        let (leading_turns, _, _, _) = process_timeline_for_stage(&leading_only, Some("/repo"));
+        assert_eq!(leading_turns.len(), 1);
+        assert!(leading_turns[0].agent_message.is_some());
+    }
+
+    #[test]
+    fn summarize_background_task_title_and_subagent_fallback_are_deterministic() {
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("sleep 10 && gh pr checks 37 --watch --interval 30"),
+                "Run shell"
+            ),
+            "Watch PR #37 CI"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                Some("sleep 10 && gh pr checks 37 --watch --interval 30"),
+                Some("sleep 10 && gh pr checks 37 --watch --interval 30"),
+                "Run shell"
+            ),
+            "Watch PR #37 CI"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("gh pr checks 42"), "Run shell"),
+            "Check PR #42 CI"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("gh pr checks 42 2>&1 | tail -n 20"),
+                "Run shell"
+            ),
+            "Check PR #42 CI"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("gh pr checks 42 >/tmp/ci.log"),
+                "Run shell"
+            ),
+            "Check PR #42 CI"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("gh run watch 998123"), "Run shell"),
+            "Watch GitHub Actions"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("gh pr create --fill"), "Run shell"),
+            "Create pull request"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("gh pr merge 37 --squash"), "Run shell"),
+            "Merge pull request"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("cd /repo && RUST_LOG=info cargo test -p orbit-client-core"),
+                "Run shell"
+            ),
+            "Run Rust tests (orbit-client-core)"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("set -e && cargo clippy -p orbit-daemon --all-targets"),
+                "Run shell"
+            ),
+            "Lint Rust (orbit-daemon)"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("cargo tauri build"), "Run shell"),
+            "Build Desktop app"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("cargo build --release"), "Run shell"),
+            "Build Rust"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("pnpm test --run"), "Run shell"),
+            "Run frontend tests"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("node --test foo.test.mjs"), "Run shell"),
+            "Run frontend tests"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("cd apps/desktop && npx tsc --noEmit"),
+                "Run shell"
+            ),
+            "Typecheck frontend"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("npm run build"), "Run shell"),
+            "Build frontend"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("next dev -p 3000"), "Run shell"),
+            "Run dev server"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("cargo run -p orbit-cli -- doctor"),
+                "Run shell"
+            ),
+            "Run local app"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("git push origin main"), "Run shell"),
+            "Sync Git remote"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("pytest -q tests/"), "Run shell"),
+            "Run Python tests"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("python3 scripts/sync.py"), "Run shell"),
+            "Run Python script"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("go test ./..."), "Run shell"),
+            "Run Go tests"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("go build ./cmd/app"), "Run shell"),
+            "Build Go project"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("xcodebuild -scheme Orbit build"),
+                "Run shell"
+            ),
+            "Build iOS / macOS app"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("./gradlew assembleRelease"), "Run shell"),
+            "Build Android app"
+        );
+        assert_eq!(
+            summarize_background_task_title(None, Some("docker compose up -d"), "Run shell"),
+            "Run container task"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("kubectl apply -f deploy.yaml"),
+                "Run shell"
+            ),
+            "Run Kubernetes task"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                Some(
+                    "Timer: 5m, Prompt: Check long running deploy across staging and prod clusters"
+                ),
+                None,
+                "schedule"
+            ),
+            "Timer · 5m"
+        );
+        assert_eq!(
+            summarize_background_task_title(Some("Timer: 5m, Prompt: Check CI"), None, "schedule"),
+            "Timer · 5m · Check CI"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                Some("Cron: */5 * * * *, Prompt: Poll health"),
+                None,
+                "schedule"
+            ),
+            "Scheduled task"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                Some("Render demo video"),
+                Some("ffmpeg -i in.mp4 out.mp4"),
+                "Run shell"
+            ),
+            "Render demo video"
+        );
+        assert_eq!(
+            summarize_background_task_title(
+                None,
+                Some("TMPDIR=/tmp sleep 5 && cd /repo && custom-indexer --reindex"),
+                "Run shell"
+            ),
+            "custom-indexer --reindex"
+        );
+
+        // Generic subagent role derives concise title from prompt_preview
+        let items = vec![make_tool(
+            1,
+            ToolCallStatus::Running,
+            "Subagent",
+            ToolCallDetail::Subagent {
+                child_agent_id: None,
+                role: "Subagent".into(),
+                prompt_preview:
+                    "## Audit OAuth token refresh edge cases across mobile and desktop\nSecond line"
+                        .into(),
+            },
+            Vec::new(),
+            1_000,
+        )];
+        let insights = derive_session_insights(&items, Some("/repo"), None, &[], &[]);
+        assert_eq!(insights.subagents.len(), 1);
+        assert_ne!(insights.subagents[0].role, "Subagent");
+        assert!(
+            insights.subagents[0]
+                .role
+                .starts_with("Audit OAuth token refresh")
+        );
+        assert!(insights.subagents[0].role.chars().count() <= 36);
     }
 }

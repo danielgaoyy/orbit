@@ -10,6 +10,7 @@ import {
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { useI18n } from "@/lib/i18n";
 import type { PushPlatform, PushPreferences } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -204,6 +205,7 @@ export function NotificationsSection() {
     }
   };
 
+  const { t } = useI18n();
   const isBlocked = permission === "denied" || permission === "unsupported";
   const devices = pushEntry?.devices ?? [];
   const isHostOnline =
@@ -214,8 +216,8 @@ export function NotificationsSection() {
   return (
     <div className="space-y-6">
       <SettingSectionHeader
-        title="Notifications"
-        description="Desktop alerts and zero-knowledge mobile push across your hosts."
+        title={t("settings.notificationsTitle")}
+        description={t("settings.notificationsDesc")}
       />
 
       {/* Desktop System Permission */}

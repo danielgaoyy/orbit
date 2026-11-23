@@ -50,6 +50,7 @@ import {
 } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
+import { type MessageKey, useI18n } from "@/lib/i18n";
 import type { HostCardView } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import {
@@ -78,7 +79,7 @@ type RailNavId =
 interface RailItemSpec {
   id: RailNavId;
   group: "app" | "agents" | "fleet";
-  label: string;
+  labelKey: MessageKey;
   icon: React.ComponentType<{ className?: string }>;
   keywords: string[];
   requiresHost?: boolean;
@@ -89,43 +90,60 @@ const RAIL_ITEMS: RailItemSpec[] = [
   {
     id: "general",
     group: "app",
-    label: "General",
+    labelKey: "settings.navGeneral",
     icon: Settings2,
-    keywords: ["general", "enter", "editor", "worktree", "branch", "update", "version"],
+    keywords: ["general", "enter", "editor", "worktree", "branch", "update", "version", "通用", "一般"],
   },
   {
     id: "appearance",
     group: "app",
-    label: "Appearance",
+    labelKey: "settings.navAppearance",
     icon: Palette,
-    keywords: ["appearance", "theme", "dark", "light", "font", "diff", "terminal", "cursor"],
+    keywords: [
+      "appearance",
+      "theme",
+      "dark",
+      "light",
+      "language",
+      "locale",
+      "i18n",
+      "font",
+      "diff",
+      "terminal",
+      "cursor",
+      "外观",
+      "语言",
+      "主题",
+      "外観",
+      "言語",
+    ],
   },
   {
     id: "notifications",
     group: "app",
-    label: "Notifications",
+    labelKey: "settings.navNotifications",
     icon: Bell,
-    keywords: ["notifications", "push", "apns", "fcm", "harmony", "quiet hours", "sound", "alert"],
+    keywords: ["notifications", "push", "apns", "fcm", "harmony", "quiet hours", "sound", "alert", "通知"],
   },
   {
     id: "shortcuts",
     group: "app",
-    label: "Shortcuts",
+    labelKey: "settings.navShortcuts",
     icon: Keyboard,
-    keywords: ["shortcuts", "keybindings", "hotkeys", "keyboard"],
+    keywords: ["shortcuts", "keybindings", "hotkeys", "keyboard", "快捷键", "ショートカット"],
   },
   {
     id: "sync_data",
     group: "app",
-    label: "Sync & Data",
+    labelKey: "settings.navSyncData",
     icon: Cloud,
-    keywords: ["cloud", "sync", "gist", "backup", "archived", "archive", "history", "data"],
+    keywords: ["cloud", "sync", "gist", "backup", "archived", "archive", "history", "data", "同步", "归档", "同期"],
   },
   // Agents (4)
   {
     id: "models_agents",
     group: "agents",
-    label: "Models & Agents",
+    labelKey: "settings.navModelsAgents",
     icon: Cpu,
     requiresHost: true,
     keywords: [
@@ -141,27 +159,29 @@ const RAIL_ITEMS: RailItemSpec[] = [
       "fast",
       "keep awake",
       "orchestrator",
+      "模型",
+      "代理",
     ],
   },
   {
     id: "context",
     group: "agents",
-    label: "Context",
+    labelKey: "settings.navContext",
     icon: BookOpen,
-    keywords: ["context", "instructions", "agents.md", "claude.md", "rules", "glob", "skills"],
+    keywords: ["context", "instructions", "agents.md", "claude.md", "rules", "glob", "skills", "上下文", "规则", "技能"],
   },
   {
     id: "extensions",
     group: "agents",
-    label: "Extensions",
+    labelKey: "settings.navExtensions",
     icon: Plug,
     requiresHost: true,
-    keywords: ["extensions", "mcp", "servers", "hooks", "lifecycle", "lsp", "language servers"],
+    keywords: ["extensions", "mcp", "servers", "hooks", "lifecycle", "lsp", "language servers", "扩展"],
   },
   {
     id: "guardian",
     group: "agents",
-    label: "Guardian",
+    labelKey: "settings.navGuardian",
     icon: ShieldCheck,
     requiresHost: true,
     keywords: ["guardian", "auto", "approval", "safety", "risk", "policy", "security", "blocked"],
@@ -170,25 +190,25 @@ const RAIL_ITEMS: RailItemSpec[] = [
   {
     id: "usage",
     group: "fleet",
-    label: "Usage",
+    labelKey: "settings.navUsage",
     icon: Activity,
     requiresHost: true,
-    keywords: ["usage", "tokens", "cost", "spend", "quotas", "insights", "analytics"],
+    keywords: ["usage", "tokens", "cost", "spend", "quotas", "insights", "analytics", "用量", "使用量"],
   },
   {
     id: "channels",
     group: "fleet",
-    label: "Channels",
+    labelKey: "settings.navChannels",
     icon: MessageSquare,
     requiresHost: true,
-    keywords: ["channels", "im", "lark", "feishu", "slack", "telegram", "discord", "bot"],
+    keywords: ["channels", "im", "lark", "feishu", "slack", "telegram", "discord", "bot", "频道", "飞书"],
   },
   {
     id: "hosts",
     group: "fleet",
-    label: "Hosts",
+    labelKey: "settings.navHosts",
     icon: Server,
-    keywords: ["hosts", "connection", "remote", "ssh", "relay", "pair", "pairing", "mobile", "add host"],
+    keywords: ["hosts", "connection", "remote", "ssh", "relay", "pair", "pairing", "mobile", "add host", "主机", "ホスト"],
   },
 ];
 
@@ -346,6 +366,7 @@ function SettingsSubTabBar({
 }
 
 export function SettingsView({ closing = false }: { closing?: boolean }) {
+  const { locale, t } = useI18n();
   const section = useOrbitSelector((s) => s.settingsSection);
   const fleet = useOrbitSelector((s) => s.fleet);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
@@ -471,10 +492,11 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
     return RAIL_ITEMS.filter((item) => {
       if (item.requiresHost && !activeHost) return false;
       if (!normalizedFilter) return true;
-      if (item.label.toLowerCase().includes(normalizedFilter)) return true;
+      if (t(item.labelKey).toLowerCase().includes(normalizedFilter)) return true;
       return item.keywords.some((k) => k.includes(normalizedFilter));
     });
-  }, [activeHost, normalizedFilter]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeHost, normalizedFilter, locale]);
 
   const appItems = visibleRailItems.filter((i) => i.group === "app");
   const agentItems = visibleRailItems.filter((i) => i.group === "agents");
@@ -513,7 +535,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
       <div
         role="dialog"
         aria-modal="true"
-        aria-label="Settings"
+        aria-label={t("settings.title")}
         style={{
           animation: closing
             ? "orbit-modal-card-out 155ms var(--ease-exit) forwards"
@@ -523,7 +545,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
       >
         <button
           type="button"
-          aria-label="Close settings"
+          aria-label={t("settings.closeSettings")}
           onClick={() => orbitActions.closeSettings()}
           className="text-muted-foreground hover:text-foreground hover:bg-accent absolute top-4 right-4 z-10 inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-[9px] transition-colors"
         >
@@ -533,7 +555,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
         {/* Left Settings Rail (232px) — Full-bleed ScrollArea so scrollbar hugs border without overlapping items */}
         <aside className="border-border bg-sidebar/75 flex w-[232px] shrink-0 flex-col border-r py-4">
           <div className="px-5 pb-2.5 text-[14.5px] font-semibold tracking-[-0.01em]">
-            Settings
+            {t("settings.title")}
           </div>
 
           <div className="mb-3 px-3">
@@ -543,14 +565,14 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                 type="text"
                 value={filterQuery}
                 onChange={(e) => setFilterQuery(e.target.value)}
-                placeholder="Search settings…"
-                aria-label="Search settings"
+                placeholder={t("settings.searchPlaceholder")}
+                aria-label={t("settings.searchAria")}
                 className="border-border/75 bg-background/65 text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/25 h-[28px] w-full rounded-[8px] border pr-6 pl-7 text-[12px] outline-none transition-colors"
               />
               {filterQuery && (
                 <button
                   type="button"
-                  aria-label="Clear settings search"
+                  aria-label={t("settings.clearSearch")}
                   onClick={() => setFilterQuery("")}
                   className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2 cursor-pointer rounded p-0.5"
                 >
@@ -565,12 +587,12 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               {appItems.length > 0 && (
                 <div className="space-y-0.5">
                   <div className="text-muted-foreground/75 px-2.5 pb-0.5 text-[11px] font-medium">
-                    App
+                    {t("settings.groupApp")}
                   </div>
                   {appItems.map((item) => (
                     <SettingsRailButton
                       key={item.id}
-                      label={item.label}
+                      label={t(item.labelKey)}
                       icon={item.icon}
                       active={activeRailId === item.id}
                       badge={renderRailBadge(item.id)}
@@ -587,7 +609,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                     <DropdownMenuTrigger asChild>
                       <button
                         type="button"
-                        aria-label="Switch host"
+                        aria-label={t("settings.switchHost")}
                         className="border-border/80 bg-background/70 hover:bg-accent/70 focus-visible:ring-foreground/20 flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] border px-2.5 text-left transition-colors outline-none focus-visible:ring-1"
                       >
                         <span className="flex min-w-0 flex-1 items-center gap-2">
@@ -597,7 +619,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                           </span>
                           {isLocalHostCard(activeHost) && (
                             <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium">
-                              Local
+                              {t("common.local")}
                             </span>
                           )}
                         </span>
@@ -649,7 +671,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                       >
                         <span className="flex items-center gap-2">
                           <Plus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.85]" />
-                          <span className="text-[12.5px]">Connect Host</span>
+                          <span className="text-[12.5px]">{t("settings.connectHost")}</span>
                         </span>
                       </DropdownMenuItem>
                     </DropdownMenuContent>
@@ -660,12 +682,12 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               {agentItems.length > 0 && (
                 <div className={cn("space-y-0.5", !isMultiOrRemoteMode && "border-border/60 border-t pt-3")}>
                   <div className="text-muted-foreground/75 px-2.5 pb-0.5 text-[11px] font-medium">
-                    Agents
+                    {t("settings.groupAgents")}
                   </div>
                   {agentItems.map((item) => (
                     <SettingsRailButton
                       key={item.id}
-                      label={item.label}
+                      label={t(item.labelKey)}
                       icon={item.icon}
                       active={activeRailId === item.id}
                       onClick={() => navigateRailItem(item.id)}
@@ -677,12 +699,12 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               {fleetItems.length > 0 && (
                 <div className="border-border/60 space-y-0.5 border-t pt-3">
                   <div className="text-muted-foreground/75 px-2.5 pb-0.5 text-[11px] font-medium">
-                    Operations & Fleet
+                    {t("settings.groupFleet")}
                   </div>
                   {fleetItems.map((item) => (
                     <SettingsRailButton
                       key={item.id}
-                      label={item.label}
+                      label={t(item.labelKey)}
                       icon={item.icon}
                       active={activeRailId === item.id}
                       onClick={() => navigateRailItem(item.id)}
@@ -693,7 +715,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
 
               {visibleRailItems.length === 0 && (
                 <div className="text-muted-foreground/75 px-2.5 py-6 text-center text-[12px]">
-                  No matching settings
+                  {t("settings.noMatches")}
                 </div>
               )}
             </nav>
@@ -709,9 +731,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               <SettingsSubTabBar
                 activeId="instructions"
                 tabs={[
-                  { id: "instructions", label: "Instructions" },
-                  { id: "rules", label: "Rules" },
-                  { id: "skills", label: "Skills" },
+                  { id: "instructions", label: t("settings.subTabInstructions") },
+                  { id: "rules", label: t("settings.subTabRules") },
+                  { id: "skills", label: t("settings.subTabSkills") },
                 ]}
                 onSelect={(tabId) => {
                   if (tabId === "instructions") orbitActions.setSettingsSection("instructions");
@@ -723,7 +745,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               />
             )}
             <div key={section} className="orbit-stage-enter min-h-0 flex-1">
-              <PanelErrorBoundary panelName="Project Instructions">
+              <PanelErrorBoundary panelName={t("settings.subTabInstructions")}>
                 <InstructionsSection />
               </PanelErrorBoundary>
             </div>
@@ -736,8 +758,8 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                 <SettingsSubTabBar
                   activeId={section === "archived" ? "archived" : "cloud_sync"}
                   tabs={[
-                    { id: "cloud_sync", label: "Cloud Sync" },
-                    { id: "archived", label: "Archived", count: archivedCount },
+                    { id: "cloud_sync", label: t("settings.subTabCloudSync") },
+                    { id: "archived", label: t("settings.subTabArchived"), count: archivedCount },
                   ]}
                   onSelect={(tabId) =>
                     orbitActions.setSettingsSection(
@@ -751,8 +773,8 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                 <SettingsSubTabBar
                   activeId={resolvedHost?.tab === "acp" ? "acp" : "agents"}
                   tabs={[
-                    { id: "agents", label: "Providers & Runtime" },
-                    { id: "acp", label: "ACP Registry" },
+                    { id: "agents", label: t("settings.subTabProvidersRuntime") },
+                    { id: "acp", label: t("settings.subTabAcpRegistry") },
                   ]}
                   onSelect={(tabId) =>
                     orbitActions.setSettingsSection(
@@ -766,9 +788,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                 <SettingsSubTabBar
                   activeId={resolvedHost?.tab === "skills" ? "skills" : "rules"}
                   tabs={[
-                    { id: "instructions", label: "Instructions" },
-                    { id: "rules", label: "Rules" },
-                    { id: "skills", label: "Skills" },
+                    { id: "instructions", label: t("settings.subTabInstructions") },
+                    { id: "rules", label: t("settings.subTabRules") },
+                    { id: "skills", label: t("settings.subTabSkills") },
                   ]}
                   onSelect={(tabId) => {
                     if (tabId === "instructions") orbitActions.setSettingsSection("instructions");
@@ -790,9 +812,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                         : "mcp"
                   }
                   tabs={[
-                    { id: "mcp", label: "MCP Servers" },
-                    { id: "hooks", label: "Hooks" },
-                    { id: "lsp", label: "Language Servers" },
+                    { id: "mcp", label: t("settings.subTabMcpServers") },
+                    { id: "hooks", label: t("settings.subTabHooks") },
+                    { id: "lsp", label: t("settings.subTabLanguageServers") },
                   ]}
                   onSelect={(tabId) =>
                     orbitActions.setSettingsSection(

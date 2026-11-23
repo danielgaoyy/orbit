@@ -47,7 +47,8 @@ import {
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
-import { adaptTokenColor } from "@/lib/code-highlight";
+import { DARK_PLAIN_TOKEN_FG, LIGHT_PLAIN_TOKEN_FG, resolveTokenColor } from "@/lib/code-highlight";
+import { useI18n } from "@/lib/i18n";
 import { parseAnsiLogLines, resolveAnsiColor } from "@/lib/ansi";
 import { cn } from "@/lib/utils";
 
@@ -60,6 +61,7 @@ export const FileViewerTab = memo(function FileViewerTab({
   const fallbackCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme);
   const isDark = resolvedTheme === "dark";
+  const { t } = useI18n();
 
   const hostId = tab.hostId ?? fallbackHostId ?? "";
   const cwd = tab.cwd ?? fallbackCwd ?? "~";
@@ -323,7 +325,18 @@ export const FileViewerTab = memo(function FileViewerTab({
     const raw = data.content.split(/\r?\n/);
     return raw.map((text, idx) => ({
       line_number: idx + 1,
-      tokens: text.length > 0 ? [{ text, fg_hex: "#E2E8F0", bold: false, italic: false }] : [],
+      tokens:
+        text.length > 0
+          ? [
+              {
+                text,
+                fg_hex: DARK_PLAIN_TOKEN_FG,
+                light_fg_hex: LIGHT_PLAIN_TOKEN_FG,
+                bold: false,
+                italic: false,
+              },
+            ]
+          : [],
     }));
   }, [isCodeViewActive, data]);
 
@@ -1369,7 +1382,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                     </span>
                     <button
                       type="button"
-                      title="Quote line into Composer"
+                      title={t("sidePanel.quoteLineTooltip")}
                       onClick={() => {
                         const rawLineText = line.tokens.map((t) => t.text).join("");
                         orbitActions.quoteDiffLineToComposer(relPath, line.line_number, rawLineText);
@@ -1390,7 +1403,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                                 data-tok-line={isLspEligible ? line.line_number : undefined}
                                 data-tok-col={isLspEligible ? tokStartCol : undefined}
                                 style={{
-                                  color: adaptTokenColor(tok.fg_hex, isDark),
+                                  color: resolveTokenColor(tok, isDark),
                                   fontWeight: tok.bold ? 600 : undefined,
                                   fontStyle: tok.italic ? "italic" : undefined,
                                 }}
@@ -1408,7 +1421,7 @@ export const FileViewerTab = memo(function FileViewerTab({
 
           {/* Subtle bottom metadata strip (keeps top 36px breadcrumb bar airy & restrained) */}
           <div className="border-border/60 text-muted-foreground/70 tabular-nums flex h-[22px] shrink-0 items-center justify-between gap-2 border-t px-3 font-mono text-[10.5px] select-none">
-            <span>{baseCodeLines.length.toLocaleString()} lines</span>
+            <span>{t("common.linesCount", { count: baseCodeLines.length.toLocaleString() })}</span>
             <div className="flex items-center gap-2.5">
               <span>{data.language.toUpperCase()}</span>
               <span>{formatFileSizeCompact(data.size_bytes)}</span>

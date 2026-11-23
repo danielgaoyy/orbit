@@ -7997,7 +7997,7 @@ impl OrbitAppCore {
             request_id: Some(req_id),
             project_root: project_root.to_string(),
             phase: orbit_protocol::WorkspaceOrganizePhase::Running,
-            message: "正在触发 AI 上下文理解与 Workspace 归类…".into(),
+            message: "Analyzing conversation context and organizing workspaces…".into(),
             created_workspaces: 0,
             grouped_agents: 0,
             summarized_agents: 0,

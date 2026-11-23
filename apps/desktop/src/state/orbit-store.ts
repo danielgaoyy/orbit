@@ -1,6 +1,13 @@
 import { useSyncExternalStore } from "react";
 import { PROVIDERS } from "@/components/composer/composer-constants";
 import {
+  type OrbitLocale,
+  getLocale,
+  resolveLocale,
+  setLocale as setI18nLocale,
+  t,
+} from "@/lib/i18n";
+import {
   createDraftPersistenceController,
   hasNonEmptyScopeDraft,
 } from "@/lib/draft-persistence";
@@ -746,6 +753,7 @@ export interface OrbitUiState {
   >;
 
   // User ergonomic & ADE preferences
+  locale: OrbitLocale;
   theme: ThemeMode;
   resolvedTheme: ResolvedTheme;
   enterToSend: boolean;
@@ -768,6 +776,7 @@ export interface OrbitUiState {
 const PREFS_STORAGE_KEY = "orbit.desktop.prefs.v3";
 
 interface PersistedPrefs {
+  locale?: OrbitLocale;
   theme?: ThemeMode;
   enterToSend?: boolean;
   notifyOnApproval?: boolean;
@@ -835,6 +844,7 @@ function writePrefsNow(snap: OrbitUiState): void {
   }
   try {
     const payload: PersistedPrefs = {
+      locale: snap.locale,
       theme: snap.theme,
       enterToSend: snap.enterToSend,
       notifyOnApproval: snap.notifyOnApproval,
@@ -1174,6 +1184,7 @@ const defaultInitialState: OrbitUiState = {
   cloudSyncDeviceFlow: null,
   cloudSyncLastResult: null,
 
+  locale: initialPrefs.locale ? resolveLocale(initialPrefs.locale) : getLocale(),
   theme: initialTheme,
   resolvedTheme: initialResolvedTheme,
   enterToSend: initialPrefs.enterToSend ?? true,
@@ -2474,8 +2485,8 @@ export const orbitActions = {
       const detail =
         err instanceof Error ? err.message : typeof err === "string" ? err.trim() : "";
       const errMsg = detail
-        ? `检查更新失败: ${detail}`
-        : "暂时无法检查更新，请稍后重试。";
+        ? t("store.checkUpdateFailed", { detail })
+        : t("store.checkUpdateFallback");
       setState((s) => ({
         ...s,
         checkingReleaseUpdate: false,
@@ -2499,7 +2510,7 @@ export const orbitActions = {
         ...s.fleetUpdate,
         phase: "upgrading_desktop",
         targetVersion: normalizeSemver(release.latest_version) ?? s.fleetUpdate.targetVersion,
-        desktopStatus: `正在下载 Orbit v${release.latest_version} 安装包…`,
+        desktopStatus: t("store.downloadingDesktop", { version: release.latest_version }),
         desktopProgress: 0.02,
         desktopError: null,
         pendingDesktopUpdate: false,
@@ -2515,7 +2526,7 @@ export const orbitActions = {
           ? pct > 0 && pct < 100
             ? `${ev.status} (${pct}%)`
             : ev.status
-          : `正在更新桌面端 (${pct}%)…`;
+          : t("store.updatingDesktopPct", { percent: pct });
         setState((s) => ({
           ...s,
           fleetUpdate: {
@@ -2532,8 +2543,8 @@ export const orbitActions = {
       const detail =
         err instanceof Error ? err.message : typeof err === "string" ? err.trim() : "";
       const errMsg = detail
-        ? `桌面端更新失败: ${detail}`
-        : "桌面端更新失败，请稍后重试或手动下载。";
+        ? t("store.desktopUpdateFailed", { detail })
+        : t("store.desktopUpdateFallback");
       setState((s) => ({
         ...s,
         fleetUpdate: {
@@ -2577,7 +2588,7 @@ export const orbitActions = {
 
     // Unreachable remote host without SSH fallback cannot be upgraded while offline.
     if (!isLocal && !isOnline && !host.ssh_alias) {
-      const reason = "主机离线，已跳过";
+      const reason = t("store.hostOfflineSkipped");
       setState((s) => ({
         ...s,
         hostUpgradeStates: {
@@ -2699,8 +2710,10 @@ export const orbitActions = {
         if (!opts?.silent) {
           notifyToast(
             res.status === "updated"
-              ? `已更新本机服务${resolvedVer ? `至 v${resolvedVer}` : ""}`
-              : "已重启本机 Orbit 服务",
+              ? t("store.localServiceUpdated", {
+                  version: resolvedVer ? ` (v${resolvedVer})` : "",
+                })
+              : t("store.localServiceRestarted"),
           );
         }
         return { ok: true, version: resolvedVer };
@@ -2748,7 +2761,10 @@ export const orbitActions = {
       }));
       if (!opts?.silent) {
         notifyToast(
-          `已更新 ${host.display_name}${resolvedVer ? ` 至 v${resolvedVer}` : ""}`,
+          t("store.hostUpdated", {
+            host: host.display_name,
+            version: resolvedVer ? ` (v${resolvedVer})` : "",
+          }),
         );
       }
       return { ok: true, version: resolvedVer };
@@ -2770,7 +2786,7 @@ export const orbitActions = {
         },
       }));
       if (!opts?.silent) {
-        notifyToast(`${host.display_name} 更新失败: ${msg}`);
+        notifyToast(t("store.hostUpdateFailed", { host: host.display_name, detail: msg }));
       }
       return { ok: false, error: msg, version: fromVersion };
     }
@@ -2802,7 +2818,7 @@ export const orbitActions = {
         desktopProgress: null,
         desktopError: null,
         startedAt: Date.now(),
-        summaryMessage: "正在检查最新版本并同步全部主机状态…",
+        summaryMessage: t("store.checkingFleetStatus"),
         pendingDesktopUpdate: false,
       },
     }));
@@ -2858,7 +2874,7 @@ export const orbitActions = {
               mode: "wire",
               fromVersion: normDaemon,
               toVersion: normDaemon,
-              error: "主机离线，已跳过",
+              error: t("store.hostOfflineSkipped"),
               startedAt: Date.now(),
               finishedAt: Date.now(),
             },
@@ -2895,10 +2911,14 @@ export const orbitActions = {
 
     // Nothing to update anywhere
     if (hostsToUpgrade.length === 0 && !desktopNeedsUpdate) {
+      const versionTag = targetVersion ? ` (v${targetVersion})` : "";
       const msg =
         skippedOffline > 0
-          ? `在线主机均已是最新${targetVersion ? ` v${targetVersion}` : ""}，${skippedOffline} 台离线主机已跳过。`
-          : `本机与全部已联通机器均已是最新版本${targetVersion ? ` (v${targetVersion})` : ""}。`;
+          ? t("store.fleetOnlineUpToDateOfflineSkipped", {
+              version: versionTag,
+              count: skippedOffline,
+            })
+          : t("store.fleetAllUpToDate", { version: versionTag });
       setState((s) => ({
         ...s,
         fleetUpdate: {
@@ -2923,7 +2943,10 @@ export const orbitActions = {
           ...s.fleetUpdate,
           phase: "upgrading_hosts",
           targetVersion,
-          summaryMessage: `正在并行更新 ${hostsToUpgrade.length} 台主机${targetVersion ? `至 v${targetVersion}` : ""}（运行中的会话不受影响）…`,
+          summaryMessage: t("store.fleetUpgradingHosts", {
+            count: hostsToUpgrade.length,
+            version: targetVersion ? ` (v${targetVersion})` : "",
+          }),
           pendingDesktopUpdate: desktopNeedsUpdate,
         },
       }));
@@ -2955,7 +2978,15 @@ export const orbitActions = {
     // Phase 2: Desktop self-update (exits & relaunches Desktop + syncs bundled local daemon)
     if (desktopNeedsUpdate && releaseInfo) {
       if (failed > 0) {
-        const pausedMsg = `已完成 ${succeeded} 台主机更新，${failed} 台失败${skippedOffline > 0 ? `，${skippedOffline} 台离线跳过` : ""}。可先重试失败主机，或直接继续更新本机桌面端。`;
+        const offlineSuffix =
+          skippedOffline > 0
+            ? t("store.fleetPausedOfflineSuffix", { count: skippedOffline })
+            : "";
+        const pausedMsg = t("store.fleetPausedWithFailures", {
+          succeeded,
+          failed,
+          offline: offlineSuffix,
+        });
         setState((s) => ({
           ...s,
           fleetUpdate: {
@@ -2966,7 +2997,7 @@ export const orbitActions = {
             pendingDesktopUpdate: true,
           },
         }));
-        notifyToast(`有 ${failed} 台主机更新失败，已暂停桌面端重启`);
+        notifyToast(t("store.fleetPausedToast", { count: failed }));
         return;
       }
 
@@ -2975,14 +3006,17 @@ export const orbitActions = {
     }
 
     const parts: string[] = [];
-    if (succeeded > 0) parts.push(`成功更新 ${succeeded} 台`);
-    if (alreadyUpToDate > 0) parts.push(`${alreadyUpToDate} 台已是最新`);
-    if (skippedOffline > 0) parts.push(`${skippedOffline} 台离线跳过`);
-    if (failed > 0) parts.push(`${failed} 台失败`);
+    if (succeeded > 0) parts.push(t("store.fleetPartSucceeded", { count: succeeded }));
+    if (alreadyUpToDate > 0) parts.push(t("store.fleetPartCurrent", { count: alreadyUpToDate }));
+    if (skippedOffline > 0) parts.push(t("store.fleetPartOffline", { count: skippedOffline }));
+    if (failed > 0) parts.push(t("store.fleetPartFailed", { count: failed }));
     const summary =
       parts.length > 0
-        ? `全集群更新完成：${parts.join("，")}${targetVersion ? `（目标 v${targetVersion}）` : ""}。`
-        : "全集群更新完成。";
+        ? t("store.fleetUpdateCompleteParts", {
+            parts: parts.join(", "),
+            version: targetVersion ? ` (v${targetVersion})` : "",
+          })
+        : t("store.fleetUpdateComplete");
 
     setState((s) => ({
       ...s,
@@ -10616,6 +10650,13 @@ export const orbitActions = {
     setState((s) => ({ ...s, relayDialogOpen: open }));
   },
 
+  setLocale(locale: OrbitLocale): void {
+    const resolved = resolveLocale(locale);
+    setI18nLocale(resolved);
+    setState((s) => ({ ...s, locale: resolved }), true);
+    void pushCloudPrefPatch({ locale: resolved });
+  },
+
   setTheme(theme: ThemeMode): void {
     const resolved = resolveTheme(theme);
     applyDocumentTheme(resolved);
@@ -10826,7 +10867,11 @@ export const orbitActions = {
       true,
     );
     if (!target.childAgentId) {
-      notifyToast(`已归档子代理${target.role ? `「${target.role}」` : ""}`);
+      notifyToast(
+        t("store.archivedSubagent", {
+          role: target.role ? ` "${target.role}"` : "",
+        }),
+      );
     }
   },
 
@@ -10870,7 +10915,7 @@ export const orbitActions = {
       },
       true,
     );
-    notifyToast(`已归档 ${targets.length} 个已完成子代理`);
+    notifyToast(t("store.archivedFinishedSubagents", { count: targets.length }));
   },
 
   openArtifactsTab(opts?: {
@@ -11031,7 +11076,7 @@ export const orbitActions = {
     if (!trimmed) return;
     await orbitIpc.renameWorkspace(hostId, workspaceId, trimmed);
     orbitActions.refreshSidebarView();
-    notifyToast(`Workspace 已重命名为 "${trimmed}"`);
+    notifyToast(t("store.workspaceRenamed", { title: trimmed }));
   },
 
   async createMissionWorkspace(params: {
@@ -11053,7 +11098,7 @@ export const orbitActions = {
       worktreeBranch: params.worktreeBranch ?? null,
     });
     orbitActions.refreshSidebarView();
-    notifyToast(`已创建 Workspace「${trimmed}」`);
+    notifyToast(t("store.workspaceCreated", { title: trimmed }));
   },
 
   async archiveWorkspace(
@@ -11065,8 +11110,8 @@ export const orbitActions = {
     orbitActions.refreshSidebarView();
     notifyToast(
       keepAgentsUnclassified
-        ? "已解散 Workspace，会话已移回「待归类」"
-        : "已归档 Workspace",
+        ? t("store.workspaceDisbanded")
+        : t("store.workspaceArchived"),
     );
   },
 
@@ -11080,12 +11125,12 @@ export const orbitActions = {
     orbitActions.refreshSidebarView();
     notifyToast(
       opts?.makeUnclassified
-        ? "已移回「待归类」"
+        ? t("store.movedToUnfiled")
         : targetWorkspaceId
-          ? "已切换会话到目标 Workspace"
+          ? t("store.movedToWorkspace")
           : opts?.newWorkspaceTitle
-            ? `已新建并移入「${opts.newWorkspaceTitle}」`
-            : "已移入独立 Workspace",
+            ? t("store.movedToNewWorkspace", { title: opts.newWorkspaceTitle })
+            : t("store.movedToStandaloneWorkspace"),
     );
   },
 
@@ -11097,13 +11142,15 @@ export const orbitActions = {
   ): Promise<void> {
     await orbitIpc.organizeProjectWorkspaces(hostId, projectRoot, agentIds, autoApply);
     notifyToast(
-      agentIds.length === 1 ? "AI 正在理解会话并归类…" : "AI 正在自动归类待归类会话…",
+      agentIds.length === 1
+        ? t("store.organizingSingleSession")
+        : t("store.organizingUnfiledSessions"),
     );
   },
 
   async summarizeAgent(hostId: string, agentId: string): Promise<void> {
     await orbitIpc.summarizeAgent(hostId, agentId);
-    notifyToast("AI 正在生成会话标签与摘要…");
+    notifyToast(t("store.summarizingSession"));
   },
 
   async updateAgentIdentity(params: {
@@ -11118,9 +11165,11 @@ export const orbitActions = {
     await orbitIpc.updateAgentIdentity(params);
     orbitActions.refreshSidebarView();
     if (params.handle) {
-      notifyToast(`已更新会话标签为「${params.handle.trim().replace(/^@+/, "")}」`);
+      notifyToast(
+        t("store.updatedSessionTag", { handle: params.handle.trim().replace(/^@+/, "") }),
+      );
     } else if (params.taskSummary !== undefined) {
-      notifyToast("已更新会话摘要");
+      notifyToast(t("store.updatedSessionSummary"));
     }
   },
 
@@ -11174,6 +11223,13 @@ export const orbitActions = {
     try {
       const prefs = await orbitIpc.cloudSyncGetPreferences();
       if (!prefs || Object.keys(prefs).length === 0) return;
+      let nextLocale: OrbitLocale | null = null;
+      if (prefs.locale === "en" || prefs.locale === "zh-CN" || prefs.locale === "ja") {
+        nextLocale = prefs.locale;
+      }
+      if (nextLocale) {
+        setI18nLocale(nextLocale);
+      }
       let nextTheme: ThemeMode | null = null;
       if (prefs.theme === "system" || prefs.theme === "light" || prefs.theme === "dark") {
         nextTheme = prefs.theme;
@@ -11184,6 +11240,7 @@ export const orbitActions = {
       setState(
         (s) => ({
           ...s,
+          locale: nextLocale ?? s.locale,
           theme: nextTheme ?? s.theme,
           resolvedTheme: nextTheme ? resolveTheme(nextTheme) : s.resolvedTheme,
           enterToSend: typeof prefs.enterToSend === "boolean" ? prefs.enterToSend : s.enterToSend,
@@ -11371,6 +11428,7 @@ export const orbitActions = {
     try {
       // Seed current local syncable prefs before first unlock so a brand-new vault captures them
       await orbitIpc.cloudSyncUpdatePreferences({
+        locale: state.locale,
         theme: state.theme,
         enterToSend: state.enterToSend,
         notifyOnApproval: state.notifyOnApproval,

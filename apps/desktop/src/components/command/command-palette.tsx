@@ -41,6 +41,7 @@ import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog-tabs"
 import { Kbd, ShortcutKbd } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useImeCompositionGuard } from "@/lib/ime";
+import { type MessageKey, type TranslationParams, useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import { type ConversationSearchHit, orbitIpc } from "@/lib/orbit-ipc";
 import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-store";
@@ -48,6 +49,7 @@ import { cn } from "@/lib/utils";
 
 interface PaletteItem {
   id: string;
+  sectionKey: MessageKey;
   section: string;
   title: string;
   subtitle?: string;
@@ -80,26 +82,29 @@ const SHORT_DATE_WITH_YEAR =
     ? new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "2-digit" })
     : null;
 
-function formatCompactRelativeTime(iso: string | null | undefined): string | undefined {
+function formatCompactRelativeTime(
+  iso: string | null | undefined,
+  t: (key: MessageKey, params?: TranslationParams) => string,
+): string | undefined {
   if (!iso) return undefined;
   const ts = Date.parse(iso);
   if (Number.isNaN(ts)) return undefined;
   const now = Date.now();
   const diffSec = Math.max(0, Math.floor((now - ts) / 1000));
-  if (diffSec < 60) return "just now";
+  if (diffSec < 60) return t("palette.justNow");
   const mins = Math.floor(diffSec / 60);
-  if (mins < 60) return `${mins}m ago`;
+  if (mins < 60) return t("palette.minutesAgo", { n: mins });
   const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
+  if (hours < 24) return t("palette.hoursAgo", { n: hours });
   const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
+  if (days < 30) return t("palette.daysAgo", { n: days });
   try {
     const d = new Date(ts);
     const sameYear = d.getFullYear() === new Date(now).getFullYear();
     const fmt = sameYear ? SHORT_DATE_SAME_YEAR : SHORT_DATE_WITH_YEAR;
-    return fmt ? fmt.format(d) : `${days}d ago`;
+    return fmt ? fmt.format(d) : t("palette.daysAgo", { n: days });
   } catch {
-    return `${days}d ago`;
+    return t("palette.daysAgo", { n: days });
   }
 }
 
@@ -132,10 +137,13 @@ function renderHighlightedSnippet(snippet: string): ReactNode {
   return parts.length > 0 ? parts : snippet;
 }
 
-function formatRolePrefix(role?: string): string | null {
-  if (role === "user") return "You: ";
-  if (role === "tool") return "Tool: ";
-  if (role === "agent") return "Agent: ";
+function formatRolePrefix(
+  role: string | undefined,
+  t: (key: MessageKey) => string,
+): string | null {
+  if (role === "user") return t("palette.roleYou");
+  if (role === "tool") return t("palette.roleTool");
+  if (role === "agent") return t("palette.roleAgent");
   return null;
 }
 
@@ -151,6 +159,7 @@ export function CommandPalette() {
 }
 
 function CommandPaletteDialog() {
+  const { t } = useI18n();
   const fleet = useOrbitSelector((s) => s.fleet);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
@@ -231,7 +240,8 @@ function CommandPaletteDialog() {
         if (ag.is_awaiting_permission && !archivedThreads[tKey]) {
           list.push({
             id: `attn-${h.host_id}-${ag.agent_id}`,
-            section: "Needs Your Approval",
+            sectionKey: "palette.sectionApproval",
+            section: t("palette.sectionApproval"),
             title: threadCustomTitles[tKey] || ag.title,
             subtitle: `${h.display_name} · ${ag.cwd}`,
             shortcut: `${mod}⇧A`,
@@ -245,21 +255,27 @@ function CommandPaletteDialog() {
     }
 
     // 2. Core Workspace & Layout Actions
+    const actionsSection = t("palette.sectionActions");
+    const openInSection = t("palette.sectionOpenIn");
+    const settingsSection = t("palette.sectionSettings");
+    const fleetSection = t("palette.sectionFleet");
     list.push(
       {
         id: "act-new-thread",
-        section: "Actions",
-        title: "New Conversation",
-        subtitle: "Open launchpad and focus Composer",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("common.newConversation"),
+        subtitle: t("palette.newConversationSub"),
         shortcut: `${mod}N`,
         icon: <Plus className="size-3.5" />,
         run: () => orbitActions.startNewThreadDraft(),
       },
       {
         id: "act-add-project",
-        section: "Actions",
-        title: "Add Project Folder…",
-        subtitle: "Choose a repository directory from your machine or remote host",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.addProjectFolder"),
+        subtitle: t("palette.addProjectFolderSub"),
         icon: <FolderPlus className="size-3.5" />,
         run: () => {
           orbitActions.setCommandPaletteOpen(false);
@@ -268,26 +284,29 @@ function CommandPaletteDialog() {
       },
       {
         id: "act-automations",
-        section: "Actions",
-        title: "Open Automations",
-        subtitle: "Repeatable engineering workflows and checks",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.openAutomations"),
+        subtitle: t("palette.openAutomationsSub"),
         icon: <Clock className="size-3.5" />,
         run: () => orbitActions.openAutomations(),
       },
       {
         id: "act-cycle-mode",
-        section: "Actions",
-        title: "Cycle Access Permissions",
-        subtitle: "Always Ask ⇄ Auto ⇄ Accept Edits ⇄ Full Access",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.cyclePermissions"),
+        subtitle: t("palette.cyclePermissionsSub"),
         shortcut: "⇧Tab",
         icon: <Sparkles className="size-3.5" />,
         run: () => orbitActions.cycleActiveMode(),
       },
       {
         id: "act-toggle-fast",
-        section: "Actions",
-        title: "Toggle Fast Output Mode",
-        subtitle: "Lower latency, higher quota usage (when supported by active model)",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.toggleFastMode"),
+        subtitle: t("palette.toggleFastModeSub"),
         icon: <Zap className="size-3.5" />,
         run: () => orbitActions.toggleActiveFastMode(),
       },
@@ -295,9 +314,10 @@ function CommandPaletteDialog() {
         ? [
             {
               id: "act-fork-thread",
-              section: "Actions",
-              title: "Fork Current Conversation",
-              subtitle: "Branch this session into a new thread",
+              sectionKey: "palette.sectionActions" as const,
+              section: actionsSection,
+              title: t("palette.forkCurrent"),
+              subtitle: t("palette.forkCurrentSub"),
               icon: <GitFork className="size-3.5" />,
               run: () => {
                 void orbitActions.forkAgent({
@@ -308,17 +328,19 @@ function CommandPaletteDialog() {
             },
             {
               id: "act-export-thread",
-              section: "Actions",
-              title: "Export Conversation…",
-              subtitle: "Save transcript as Markdown, JSON, or standalone HTML",
+              sectionKey: "palette.sectionActions" as const,
+              section: actionsSection,
+              title: t("palette.exportConversation"),
+              subtitle: t("palette.exportConversationSub"),
               icon: <Download className="size-3.5" />,
               run: () => orbitActions.openExportDialog(selectedHostId, selectedAgentId),
             },
             {
               id: "act-copy-code-block",
-              section: "Actions",
-              title: "Copy Code Block…",
-              subtitle: "Pick and copy any fenced code block from this session",
+              sectionKey: "palette.sectionActions" as const,
+              section: actionsSection,
+              title: t("palette.copyCodeBlock"),
+              subtitle: t("palette.copyCodeBlockSub"),
               icon: <Code2 className="size-3.5" />,
               run: () => {
                 void orbitActions.openCopyCodeBlocksModal(selectedHostId, selectedAgentId);
@@ -330,9 +352,10 @@ function CommandPaletteDialog() {
         ? [
             {
               id: "act-open-artifacts",
-              section: "Actions",
-              title: "Open Artifacts",
-              subtitle: "Inspect saved documents, diagrams, and interactive MCP Apps",
+              sectionKey: "palette.sectionActions" as const,
+              section: actionsSection,
+              title: t("palette.openArtifacts"),
+              subtitle: t("palette.openArtifactsSub"),
               icon: <Blocks className="size-3.5" />,
               run: () => orbitActions.openArtifactsTab({ hostId: selectedHostId }),
             },
@@ -340,24 +363,27 @@ function CommandPaletteDialog() {
         : []),
       {
         id: "act-toggle-overview",
-        section: "Actions",
-        title: "Toggle Stage Overview Panel",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.toggleOverview"),
         shortcut: `${mod}⌥O`,
         icon: <LayoutList className="size-3.5" />,
         run: () => orbitActions.toggleOverviewPanel(),
       },
       {
         id: "act-toggle-side-panel",
-        section: "Actions",
-        title: "Toggle Right Side Panel",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.toggleSidePanel"),
         shortcut: `${mod}\\`,
         icon: <PanelRight className="size-3.5" />,
         run: () => orbitActions.toggleSidePanel(),
       },
       {
         id: "act-quick-open-file",
-        section: "Actions",
-        title: "Open File in Side Panel…",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.openFileInSidePanel"),
         shortcut: `${mod}P`,
         icon: <Search className="size-3.5" />,
         run: () => {
@@ -367,54 +393,61 @@ function CommandPaletteDialog() {
       },
       {
         id: "act-files-explorer",
-        section: "Actions",
-        title: "Open Workspace Files Explorer",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.openFilesExplorer"),
         icon: <FolderTree className="size-3.5" />,
         run: () => orbitActions.openFilesExplorerTab(),
       },
       {
         id: "act-project-instructions",
-        section: "Actions",
-        title: "Project Instructions",
-        subtitle: "Inspect & edit CLAUDE.md, AGENTS.md, local overrides, and @imports",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.projectInstructions"),
+        subtitle: t("palette.projectInstructionsSub"),
         icon: <FileCode2 className="size-3.5" />,
         run: () => orbitActions.openProjectInstructions(),
       },
       {
         id: "act-toggle-diff",
-        section: "Actions",
-        title: "Toggle Diff Review Tab",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.toggleDiffReview"),
         shortcut: `${mod}D`,
         icon: <GitCompareArrows className="size-3.5" />,
         run: () => orbitActions.toggleReviewTab(),
       },
       {
         id: "act-toggle-term",
-        section: "Actions",
-        title: "Toggle Persistent PTY Terminal Tab",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.toggleTerminal"),
         shortcut: `${mod}J`,
         icon: <SquareTerminal className="size-3.5" />,
         run: () => orbitActions.toggleTerminalTab(),
       },
       {
         id: "act-open-browser",
-        section: "Actions",
-        title: "Open Browser Preview Tab",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.openBrowserPreview"),
         icon: <Globe className="size-3.5" />,
         run: () => orbitActions.openBrowserTab(),
       },
       {
         id: "act-side-question",
-        section: "Actions",
-        title: "Ask Side Question (/btw)",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.askSideQuestion"),
         shortcut: `${mod};`,
         icon: <MessageCircleQuestion className="size-3.5" />,
         run: () => orbitActions.openSideQuestionTab(),
       },
       {
         id: "act-toggle-sidebar",
-        section: "Actions",
-        title: "Toggle Fleet Sidebar",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.toggleSidebar"),
         shortcut: `${mod}B`,
         icon: <PanelLeft className="size-3.5" />,
         run: () => orbitActions.toggleSidebar(),
@@ -425,8 +458,9 @@ function CommandPaletteDialog() {
     for (const ed of externalEditors) {
       list.push({
         id: `editor-${ed.kind}`,
-        section: "Open Workspace In",
-        title: `Open in ${ed.label}`,
+        sectionKey: "palette.sectionOpenIn",
+        section: openInSection,
+        title: t("palette.openInEditor", { editor: ed.label }),
         shortcut: ed.kind === "cursor" ? `${mod}O` : undefined,
         icon: <FolderOpen className="size-3.5" />,
         run: () => void orbitActions.openWorkspaceInEditor(ed.kind),
@@ -443,10 +477,11 @@ function CommandPaletteDialog() {
         const effectiveTitle = threadCustomTitles[tKey] || ag.title;
         list.push({
           id: `thread-${h.host_id}-${ag.agent_id}`,
-          section: isArchived ? "Archived Sessions" : "Sessions",
+          sectionKey: isArchived ? "palette.sectionArchived" : "palette.sectionSessions",
+          section: isArchived ? t("palette.sectionArchived") : t("palette.sectionSessions"),
           title: effectiveTitle,
           subtitle: `${h.display_name} · ${ag.provider_label} · ${ag.cwd}`,
-          relativeTime: formatCompactRelativeTime(ag.updated_at_rfc3339),
+          relativeTime: formatCompactRelativeTime(ag.updated_at_rfc3339, t),
           threadKey: tKey,
           icon: <Server className="size-3.5 opacity-70" />,
           run: () => orbitActions.selectAgent(h.host_id, ag.agent_id),
@@ -459,26 +494,29 @@ function CommandPaletteDialog() {
     list.push(
       {
         id: "settings-open",
-        section: "Settings & Fleet",
-        title: "Open Settings",
-        subtitle: "General, Appearance, Notifications, Models & Agents, Context, Extensions, Hosts",
+        sectionKey: "palette.sectionSettings",
+        section: settingsSection,
+        title: t("palette.openSettings"),
+        subtitle: t("palette.openSettingsSub"),
         shortcut: `${mod},`,
         icon: <Settings2 className="size-3.5" />,
         run: () => orbitActions.openSettings("general"),
       },
       {
         id: "settings-archived",
-        section: "Settings & Fleet",
-        title: "Open Archived Conversations",
-        subtitle: "Search, restore, or permanently delete archived threads",
+        sectionKey: "palette.sectionSettings",
+        section: settingsSection,
+        title: t("palette.openArchived"),
+        subtitle: t("palette.openArchivedSub"),
         icon: <Archive className="size-3.5" />,
         run: () => orbitActions.openSettings("archived"),
       },
       {
         id: "fleet-pair",
-        section: "Settings & Fleet",
-        title: "Settings: Hosts & Pairing",
-        subtitle: "Inspect host status, pair mobile devices, or connect a remote SSH host",
+        sectionKey: "palette.sectionSettings",
+        section: settingsSection,
+        title: t("palette.settingsHosts"),
+        subtitle: t("palette.settingsHostsSub"),
         icon: <Radio className="size-3.5" />,
         run: () =>
           orbitActions.openSettings(
@@ -489,49 +527,55 @@ function CommandPaletteDialog() {
         ? [
             {
               id: "fleet-quotas",
-              section: "Settings & Fleet",
-              title: "Settings: Models, Providers & ACP Agents",
-              subtitle: "Configure native providers, profiles, and 34 ACP agent registry",
+              sectionKey: "palette.sectionSettings" as const,
+              section: settingsSection,
+              title: t("palette.settingsModels"),
+              subtitle: t("palette.settingsModelsSub"),
               icon: <Plug className="size-3.5" />,
               run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:agents`),
             },
             {
               id: "settings-usage",
-              section: "Settings & Fleet",
-              title: "Settings: Usage & Quotas",
-              subtitle: "Token spend, daily trends, and quota depletion forecast",
+              sectionKey: "palette.sectionSettings" as const,
+              section: settingsSection,
+              title: t("palette.settingsUsage"),
+              subtitle: t("palette.settingsUsageSub"),
               icon: <Activity className="size-3.5" />,
               run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:usage`),
             },
             {
               id: "settings-rules",
-              section: "Settings & Fleet",
-              title: "Settings: Path-Scoped Rules & Skills",
-              subtitle: "Manage glob-scoped rules, skills, and project instructions",
+              sectionKey: "palette.sectionSettings" as const,
+              section: settingsSection,
+              title: t("palette.settingsRules"),
+              subtitle: t("palette.settingsRulesSub"),
               icon: <BookOpen className="size-3.5" />,
               run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:rules`),
             },
             {
               id: "settings-mcp",
-              section: "Settings & Fleet",
-              title: "Settings: MCP Servers, Hooks & LSP",
-              subtitle: "Manage external MCP servers, lifecycle hooks, and language servers",
+              sectionKey: "palette.sectionSettings" as const,
+              section: settingsSection,
+              title: t("palette.settingsMcp"),
+              subtitle: t("palette.settingsMcpSub"),
               icon: <Webhook className="size-3.5" />,
               run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:mcp`),
             },
             {
               id: "settings-guardian",
-              section: "Settings & Fleet",
-              title: "Settings: Guardian Auto-Approval",
-              subtitle: "Configure AI risk policies, trusted prefixes, and blocked patterns",
+              sectionKey: "palette.sectionSettings" as const,
+              section: settingsSection,
+              title: t("palette.settingsGuardian"),
+              subtitle: t("palette.settingsGuardianSub"),
               icon: <ShieldCheck className="size-3.5" />,
               run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:guardian`),
             },
             {
               id: "settings-im",
-              section: "Settings & Fleet",
-              title: "Settings: IM Channels (Lark, Slack, Telegram, Discord)",
-              subtitle: "Configure bidirectional chat bots and remote tool approval cards",
+              sectionKey: "palette.sectionSettings" as const,
+              section: settingsSection,
+              title: t("palette.settingsIm"),
+              subtitle: t("palette.settingsImSub"),
               icon: <MessageSquare className="size-3.5" />,
               run: () => orbitActions.openSettings(`host:${effectiveSettingsHostId}:im_channels`),
             },
@@ -539,32 +583,37 @@ function CommandPaletteDialog() {
         : []),
       {
         id: "pref-theme-system",
-        section: "Settings & Fleet",
-        title: "Appearance: Follow System",
-        subtitle: theme === "system" ? "Currently active" : "Auto-sync with macOS / OS appearance",
+        sectionKey: "palette.sectionSettings",
+        section: settingsSection,
+        title: t("palette.themeFollowSystem"),
+        subtitle:
+          theme === "system" ? t("palette.themeCurrentlyActive") : t("palette.themeFollowSystemSub"),
         icon: <Monitor className="size-3.5" />,
         run: () => orbitActions.setTheme("system"),
       },
       {
         id: "pref-theme-light",
-        section: "Settings & Fleet",
-        title: "Appearance: Light Mode",
+        sectionKey: "palette.sectionSettings",
+        section: settingsSection,
+        title: t("palette.themeLight"),
         icon: <Sun className="size-3.5" />,
         run: () => orbitActions.setTheme("light"),
       },
       {
         id: "pref-theme-dark",
-        section: "Settings & Fleet",
-        title: "Appearance: Dark Mode",
+        sectionKey: "palette.sectionSettings",
+        section: settingsSection,
+        title: t("palette.themeDark"),
         icon: <Moon className="size-3.5" />,
         run: () => orbitActions.setTheme("dark"),
       },
       {
         id: "pref-enter",
-        section: "Settings & Fleet",
+        sectionKey: "palette.sectionSettings",
+        section: settingsSection,
         title: enterToSend
-          ? `Require ${mod}Enter to Send Prompts`
-          : "Use Enter to Send Prompts",
+          ? t("palette.requireModEnter", { mod })
+          : t("palette.useEnterToSend"),
         icon: <Sparkles className="size-3.5" />,
         run: () => orbitActions.setEnterToSend(!enterToSend),
       },
@@ -573,8 +622,9 @@ function CommandPaletteDialog() {
     if (selectedHostId) {
       list.push({
         id: "fleet-refresh",
-        section: "Fleet & Preferences",
-        title: "Reconnect & Refresh Current Host",
+        sectionKey: "palette.sectionFleet",
+        section: fleetSection,
+        title: t("palette.reconnectCurrentHost"),
         icon: <RefreshCw className="size-3.5" />,
         run: () => {
           void orbitIpc.connectHost(selectedHostId);
@@ -597,6 +647,7 @@ function CommandPaletteDialog() {
     threadCustomTitles,
     archivedThreads,
     mod,
+    t,
   ]);
 
   const filtered = useMemo<PaletteItem[]>(() => {
@@ -634,7 +685,7 @@ function CommandPaletteDialog() {
         snippet: hit.snippet,
         snippetRole: hit.role,
         metaBadge,
-        relativeTime: formatCompactRelativeTime(hit.updated_at_rfc3339) ?? item.relativeTime,
+        relativeTime: formatCompactRelativeTime(hit.updated_at_rfc3339, t) ?? item.relativeTime,
         run: () => orbitActions.selectAgent(hit.host_id, hit.agent_id, hit.seq),
       };
     });
@@ -647,12 +698,13 @@ function CommandPaletteDialog() {
       const customTitle = threadCustomTitles[tKey];
       extraMessageItems.push({
         id: `msg-${hit.host_id}-${hit.agent_id}-${hit.seq}`,
-        section: "Messages",
-        title: customTitle || hit.title || "Conversation",
+        sectionKey: "palette.sectionMessages",
+        section: t("palette.sectionMessages"),
+        title: customTitle || hit.title || t("common.conversation"),
         snippet: hit.snippet,
         snippetRole: hit.role,
         metaBadge: buildMetaBadge(hit, isMultiHost),
-        relativeTime: formatCompactRelativeTime(hit.updated_at_rfc3339),
+        relativeTime: formatCompactRelativeTime(hit.updated_at_rfc3339, t),
         threadKey: tKey,
         icon:
           hit.role === "tool" ? (
@@ -670,7 +722,8 @@ function CommandPaletteDialog() {
 
     // Place Messages cleanly below Commands/Conversations and ahead of Settings & Fleet
     const settingsIdx = enrichedLocal.findIndex(
-      (it) => it.section === "Settings & Fleet" || it.section === "Fleet & Preferences",
+      (it) =>
+        it.sectionKey === "palette.sectionSettings" || it.sectionKey === "palette.sectionFleet",
     );
     if (settingsIdx === -1) {
       return [...enrichedLocal, ...extraMessageItems];
@@ -680,7 +733,7 @@ function CommandPaletteDialog() {
       ...extraMessageItems,
       ...enrichedLocal.slice(settingsIdx),
     ];
-  }, [allItems, query, messageResult, threadCustomTitles, isMultiHost]);
+  }, [allItems, query, messageResult, threadCustomTitles, isMultiHost, t]);
 
   useEffect(() => {
     setActiveIndex(0);
@@ -723,7 +776,7 @@ function CommandPaletteDialog() {
 
   return (
     <>
-      <DialogTitle className="sr-only">Orbit Command Palette</DialogTitle>
+      <DialogTitle className="sr-only">{t("palette.title")}</DialogTitle>
       <div className="border-border flex h-[46px] items-center gap-2.5 border-b px-4">
         <Search className="text-muted-foreground h-[16px] w-[16px] shrink-0" />
         <input
@@ -739,7 +792,7 @@ function CommandPaletteDialog() {
             ime.compositionProps.onCompositionEnd();
           }}
           onKeyDown={handleKeyDown}
-          placeholder="Search messages, sessions, or commands..."
+          placeholder={t("palette.placeholder")}
           className="text-foreground placeholder:text-muted-foreground w-full bg-transparent text-[14px] outline-none"
         />
         <Kbd>Esc</Kbd>
@@ -749,15 +802,15 @@ function CommandPaletteDialog() {
         {filtered.length === 0 ? (
           <div className="text-muted-foreground py-8 text-center text-[13px]">
             {isSearchingMessages
-              ? "Searching messages…"
-              : "No matching messages, commands, or sessions."}
+              ? t("palette.searchingMessages")
+              : t("palette.noMatches")}
           </div>
         ) : (
           filtered.map((item, idx) => {
             const prevSection = idx > 0 ? filtered[idx - 1].section : null;
             const showSection = item.section !== prevSection;
             const selected = idx === activeIndex;
-            const rolePrefix = formatRolePrefix(item.snippetRole);
+            const rolePrefix = formatRolePrefix(item.snippetRole, t);
 
             return (
               <div key={item.id}>

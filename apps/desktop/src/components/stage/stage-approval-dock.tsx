@@ -23,6 +23,7 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isImeKeyEvent, useImeCompositionGuard } from "@/lib/ime";
+import { type MessageKey, useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import {
   isAlwaysDecision,
@@ -64,12 +65,15 @@ const GENERIC_SUMMARY_KEYS = [
   "title",
 ];
 
-function formatDecisionLabel(dec: string): string {
+function formatDecisionLabel(
+  dec: string,
+  t: (key: MessageKey) => string,
+): string {
   const norm = dec.trim().toLowerCase();
-  if (norm === "allow" || norm === "allow_once" || norm === "accept") return "Allow";
-  if (norm === "allow_always" || norm === "always") return "Always allow";
-  if (norm === "deny" || norm === "reject" || norm === "reject_once") return "Deny";
-  if (norm === "decline") return "Decline";
+  if (norm === "allow" || norm === "allow_once" || norm === "accept") return t("approval.allow");
+  if (norm === "allow_always" || norm === "always") return t("approval.alwaysAllow");
+  if (norm === "deny" || norm === "reject" || norm === "reject_once") return t("approval.deny");
+  if (norm === "decline") return t("approval.decline");
   const words = dec.replace(/_+/g, " ").trim();
   return words ? words.charAt(0).toUpperCase() + words.slice(1) : dec;
 }
@@ -93,18 +97,19 @@ function formatOptionDisplay(raw: string): { label: string; recommended: boolean
 function describePermissionTarget(
   detail: ToolCallDetail,
   cwd: string,
+  t: (key: MessageKey) => string,
 ): PermissionTargetPresentation {
   switch (detail.kind) {
     case "shell": {
       const cmd = detail.command.trim();
       const needsExpand = cmd.includes("\n") || cmd.length > 110;
       return {
-        kindLabel: "Shell",
+        kindLabel: t("approval.shell"),
         icon: Terminal,
-        preview: cmd || "(empty command)",
+        preview: cmd || t("approval.emptyCommand"),
         isShell: true,
         expandableContent: needsExpand ? cmd : null,
-        expandLabel: "Show full command",
+        expandLabel: t("approval.showFullCommand"),
         isDiff: false,
       };
     }
@@ -112,47 +117,47 @@ function describePermissionTarget(
       const rel = stripWorkspacePrefix(detail.path, cwd) || detail.path;
       const diff = detail.unified_diff?.trim() || null;
       return {
-        kindLabel: "Edit",
+        kindLabel: t("approval.edit"),
         icon: FilePenLine,
         preview: rel,
         isShell: false,
         expandableContent: diff,
-        expandLabel: "View diff",
+        expandLabel: t("approval.viewDiff"),
         isDiff: true,
       };
     }
     case "file_read": {
       const rel = stripWorkspacePrefix(detail.path, cwd) || detail.path;
       return {
-        kindLabel: "Read",
+        kindLabel: t("approval.read"),
         icon: FileText,
         preview: rel,
         isShell: false,
         expandableContent: null,
-        expandLabel: "Show details",
+        expandLabel: t("approval.showDetails"),
         isDiff: false,
       };
     }
     case "search": {
       const scopeRel = detail.scope ? stripWorkspacePrefix(detail.scope, cwd) || detail.scope : "";
       return {
-        kindLabel: "Search",
+        kindLabel: t("approval.search"),
         icon: Search,
         preview: scopeRel ? `${detail.query} in ${scopeRel}` : detail.query,
         isShell: false,
         expandableContent: null,
-        expandLabel: "Show details",
+        expandLabel: t("approval.showDetails"),
         isDiff: false,
       };
     }
     case "subagent": {
       return {
-        kindLabel: "Subagent",
+        kindLabel: t("approval.subagent"),
         icon: Bot,
-        preview: detail.role || "Subagent",
+        preview: detail.role || t("approval.subagent"),
         isShell: false,
         expandableContent: detail.prompt_preview?.trim() || null,
-        expandLabel: "Show prompt",
+        expandLabel: t("approval.showPrompt"),
         isDiff: false,
       };
     }
@@ -195,12 +200,12 @@ function describePermissionTarget(
       }
 
       return {
-        kindLabel: "Tool",
+        kindLabel: t("approval.tool"),
         icon: Shield,
         preview: summary ? `${detail.tool_name} · ${summary}` : detail.tool_name,
         isShell: false,
         expandableContent,
-        expandLabel: "Show arguments",
+        expandLabel: t("approval.showArguments"),
         isDiff: false,
       };
     }
@@ -218,6 +223,7 @@ function DecisionQueueStepper({
   onPrev: () => void;
   onNext: () => void;
 }) {
+  const { t } = useI18n();
   if (total <= 1) return null;
 
   return (
@@ -225,7 +231,7 @@ function DecisionQueueStepper({
       <button
         type="button"
         onClick={onPrev}
-        aria-label="Previous pending request"
+        aria-label={t("approval.previousRequest")}
         className="text-muted-foreground hover:text-foreground inline-flex size-5.5 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-black/[0.05] dark:hover:bg-white/[0.08]"
       >
         <ChevronLeft className="size-3.5 stroke-[1.9]" />
@@ -236,7 +242,7 @@ function DecisionQueueStepper({
       <button
         type="button"
         onClick={onNext}
-        aria-label="Next pending request"
+        aria-label={t("approval.nextRequest")}
         className="text-muted-foreground hover:text-foreground inline-flex size-5.5 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-black/[0.05] dark:hover:bg-white/[0.08]"
       >
         <ChevronRight className="size-3.5 stroke-[1.9]" />
@@ -305,6 +311,7 @@ function PermissionApprovalCard({
   onStepPrev: () => void;
   onStepNext: () => void;
 }) {
+  const { t } = useI18n();
   const mod = modSymbol();
   const [expanded, setExpanded] = useState(false);
   const [submittingDecision, setSubmittingDecision] = useState<string | null>(null);
@@ -324,8 +331,8 @@ function PermissionApprovalCard({
   const primaryDenyChoice = decisions.find((d) => isDenyDecision(d)) ?? null;
 
   const target = useMemo(
-    () => describePermissionTarget(perm.detail, cwd),
-    [perm.detail, cwd],
+    () => describePermissionTarget(perm.detail, cwd, t),
+    [perm.detail, cwd, t],
   );
   const KindIcon = target.icon;
 
@@ -336,7 +343,7 @@ function PermissionApprovalCard({
       await orbitIpc.resolvePermission(hostId, agentId, perm.request_id, dec);
     } catch (err) {
       setSubmittingDecision(null);
-      orbitActions.showToast(`Permission action failed: ${String(err)}`);
+      orbitActions.showToast(t("approval.permissionFailed", { error: String(err) }));
     }
   };
 
@@ -378,12 +385,12 @@ function PermissionApprovalCard({
             <ShieldAlert className="size-3.5 shrink-0 stroke-[1.8]" />
             <span className="shrink-0 whitespace-nowrap font-medium">
               {perm.guardian_assessment.risk_level === "critical"
-                ? "Critical risk"
+                ? t("approval.criticalRisk")
                 : perm.guardian_assessment.risk_level === "high"
-                  ? "High risk"
+                  ? t("approval.highRisk")
                   : perm.guardian_assessment.risk_level === "medium"
-                    ? "Medium risk"
-                    : "Low risk"}
+                    ? t("approval.mediumRisk")
+                    : t("approval.lowRisk")}
             </span>
             <span className="shrink-0 opacity-45">·</span>
             <span
@@ -416,7 +423,7 @@ function PermissionApprovalCard({
                   expanded && "rotate-180",
                 )}
               />
-              <span>{expanded ? "Hide" : target.expandLabel}</span>
+              <span>{expanded ? t("common.hide") : target.expandLabel}</span>
             </button>
             {expanded && (
               <PermissionDetailExpanded
@@ -435,7 +442,7 @@ function PermissionApprovalCard({
           const isPrimaryAllow = dec === primaryAllowChoice;
           const isMatchedAlways = dec === primaryAlwaysChoice;
           const isMatchedDeny = dec === primaryDenyChoice;
-          const label = formatDecisionLabel(dec);
+          const label = formatDecisionLabel(dec, t);
           const disabled = submittingDecision !== null;
 
           const buttonEl = (
@@ -502,6 +509,7 @@ function StickyQuestionDockCard({
   onStepPrev: () => void;
   onStepNext: () => void;
 }) {
+  const { t } = useI18n();
   const mod = modSymbol();
   const [selections, setSelections] = useState<Record<number, string[]>>({});
   const [customAnswers, setCustomAnswers] = useState<Record<number, string>>({});
@@ -557,7 +565,7 @@ function StickyQuestionDockCard({
       await orbitIpc.answerQuestion(hostId, agentId, requestId, orderedAnswers);
     } catch (err) {
       setSubmitting(false);
-      orbitActions.showToast(`Failed to submit response: ${String(err)}`);
+      orbitActions.showToast(t("approval.submitFailed", { error: String(err) }));
     }
   };
 
@@ -590,7 +598,7 @@ function StickyQuestionDockCard({
           <span className="size-1.5 shrink-0 rounded-full bg-amber-500/80" />
           <MessageCircleQuestion className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
           <span className="text-foreground/90 truncate text-[12.5px] font-medium">
-            Clarification needed
+            {t("approval.clarificationNeeded")}
           </span>
         </div>
 
@@ -640,7 +648,9 @@ function StickyQuestionDockCard({
                     <span>{q.question}</span>
                   </div>
                   {q.is_multi_select && (
-                    <div className="text-muted-foreground text-[11.5px]">Select all that apply</div>
+                    <div className="text-muted-foreground text-[11.5px]">
+                      {t("approval.selectAllThatApply")}
+                    </div>
                   )}
                 </div>
 
@@ -682,7 +692,7 @@ function StickyQuestionDockCard({
                           <span>{label}</span>
                           {recommended && (
                             <span className="text-muted-foreground ml-1.5 inline-flex items-center rounded-full bg-black/[0.055] px-1.5 py-0.5 align-middle text-[10.5px] leading-none font-medium dark:bg-white/[0.085]">
-                              Recommended
+                              {t("common.recommended")}
                             </span>
                           )}
                         </span>
@@ -722,13 +732,17 @@ function StickyQuestionDockCard({
                           }
                         }
                       }}
-                      placeholder={q.options.length > 0 ? "Other…" : "Type your answer…"}
+                      placeholder={
+                        q.options.length > 0
+                          ? t("approval.otherPlaceholder")
+                          : t("approval.typeAnswerPlaceholder")
+                      }
                       className="text-foreground placeholder:text-muted-foreground/55 w-full bg-transparent text-[13px] leading-[1.45] outline-none disabled:cursor-not-allowed disabled:opacity-60"
                     />
                     {customVal.length > 0 && !submitting && (
                       <button
                         type="button"
-                        aria-label="Clear custom answer"
+                        aria-label={t("approval.clearCustomAnswer")}
                         onClick={() => handleCustomChange(qIdx, "", q.is_multi_select)}
                         className="text-muted-foreground hover:text-foreground inline-flex size-4 shrink-0 cursor-pointer items-center justify-center rounded-full"
                       >
@@ -745,7 +759,9 @@ function StickyQuestionDockCard({
 
       <div className="flex items-center justify-between gap-2 border-t border-black/[0.05] px-4 py-2.5 dark:border-white/[0.055]">
         <span className="text-muted-foreground/70 text-[11.5px]">
-          {canSubmit ? `${mod}↵ to submit` : "Choose an option or write a reply"}
+          {canSubmit
+            ? t("approval.submitShortcut", { shortcut: `${mod}↵` })
+            : t("approval.chooseOptionOrWrite")}
         </span>
         <button
           type="button"
@@ -753,7 +769,7 @@ function StickyQuestionDockCard({
           onClick={() => void handleSubmit()}
           className="orbit-press inline-flex h-7.5 cursor-pointer items-center rounded-full bg-[#141416] px-3.5 text-[12.5px] font-medium text-white hover:bg-[#27272A] disabled:cursor-not-allowed disabled:opacity-35 dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
         >
-          {submitting ? "Submitting…" : "Submit"}
+          {submitting ? t("common.submitting") : t("common.submit")}
         </button>
       </div>
     </div>

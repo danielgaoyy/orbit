@@ -6,7 +6,7 @@ import {
   type WorkspaceFileConflict,
   orbitIpc,
 } from "@/lib/orbit-ipc";
-import { adaptTokenColor } from "@/lib/code-highlight";
+import { resolveTokenColor } from "@/lib/code-highlight";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import { formatFileSizeCompact } from "@/lib/session-insights";
@@ -582,7 +582,7 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
                         <span
                           key={tIdx}
                           style={{
-                            color: adaptTokenColor(tok.fg_hex, isDark),
+                            color: resolveTokenColor(tok, isDark),
                             fontStyle: tok.italic ? "italic" : undefined,
                           }}
                         >

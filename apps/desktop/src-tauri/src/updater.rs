@@ -127,7 +127,7 @@ async fn resolve_latest_tag_via_web_redirect() -> Result<String, String> {
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
         .build()
-        .map_err(|e| format!("初始化重定向客户端失败: {e}"))?;
+        .map_err(|e| format!("Failed to initialize redirect client: {e}"))?;
 
     let latest_web_url = format!("https://github.com/{GITHUB_REPO}/releases/latest");
 
@@ -155,19 +155,19 @@ async fn resolve_latest_tag_via_web_redirect() -> Result<String, String> {
                 }
                 if !use_head {
                     return Err(format!(
-                        "GitHub Releases 重定向未包含版本标签 (HTTP {})",
+                        "GitHub Releases redirect did not include a version tag (HTTP {})",
                         resp.status()
                     ));
                 }
             }
             Err(e) if !use_head => {
-                return Err(format!("连接 GitHub Releases 失败: {e}"));
+                return Err(format!("Failed to connect to GitHub Releases: {e}"));
             }
             Err(_) => {}
         }
     }
 
-    Err("无法从 GitHub Releases 重定向解析最新版本".to_string())
+    Err("Unable to resolve latest release tag from GitHub Releases redirect".to_string())
 }
 
 async fn fetch_release_json(
@@ -183,19 +183,21 @@ async fn fetch_release_json(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("连接 GitHub API 失败: {e}"))?;
+        .map_err(|e| format!("Failed to connect to GitHub API: {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         if status.as_u16() == 403 {
-            return Err("GitHub API 触发速率限制 (HTTP 403)".to_string());
+            return Err("GitHub API rate limit exceeded (HTTP 403)".to_string());
         }
-        return Err(format!("GitHub API 返回状态异常: HTTP {status}"));
+        return Err(format!(
+            "GitHub API returned unexpected status: HTTP {status}"
+        ));
     }
 
     resp.json::<serde_json::Value>()
         .await
-        .map_err(|e| format!("解析版本信息失败: {e}"))
+        .map_err(|e| format!("Failed to parse release metadata: {e}"))
 }
 
 pub async fn check_latest_release() -> Result<ReleaseUpdateInfo, String> {
@@ -242,11 +244,11 @@ pub async fn check_latest_release() -> Result<ReleaseUpdateInfo, String> {
                 .timeout(Duration::from_secs(12))
                 .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
                 .build()
-                .map_err(|e| format!("初始化更新客户端失败: {e}"))?;
+                .map_err(|e| format!("Failed to initialize update client: {e}"))?;
             let api_url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
             match fetch_release_json(&client, &api_url).await {
                 Ok(json) => Ok(parse_github_release_json(&json, CURRENT_APP_VERSION)),
-                Err(api_err) => Err(format!("{web_err}；API 回退亦失败: {api_err}")),
+                Err(api_err) => Err(format!("{web_err}; API fallback also failed: {api_err}")),
             }
         }
     }
@@ -354,7 +356,10 @@ pub async fn perform_one_click_update(
     if cfg!(target_os = "windows") {
         return update_windows_installer_and_relaunch(&release, &on_progress).await;
     }
-    Err(format!("当前平台请前往 {} 下载安装", release.html_url))
+    Err(format!(
+        "Automatic updates are not supported on this platform. Download from {}",
+        release.html_url
+    ))
 }
 
 fn emit_progress(
@@ -379,7 +384,7 @@ async fn download_with_progress(
     emit_progress(
         on_progress,
         0.03,
-        format!("正在连接 GitHub Release 下载 {tag_name}…"),
+        format!("Connecting to GitHub Releases for {tag_name}…"),
         false,
     );
 
@@ -387,31 +392,37 @@ async fn download_with_progress(
         .connect_timeout(Duration::from_secs(15))
         .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
         .build()
-        .map_err(|e| format!("创建下载连接失败: {e}"))?;
+        .map_err(|e| format!("Failed to create download client: {e}"))?;
 
     let resp = client
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("下载请求失败: {e}"))?;
+        .map_err(|e| format!("Download request failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("下载安装包失败 (HTTP {})", resp.status()));
+        return Err(format!(
+            "Failed to download installer (HTTP {})",
+            resp.status()
+        ));
     }
 
     let total_bytes = resp.content_length().unwrap_or(0);
     let mut received_bytes: u64 = 0;
-    let mut file = tokio::fs::File::create(dest_path)
-        .await
-        .map_err(|e| format!("无法写入临时安装包 {}: {e}", dest_path.display()))?;
+    let mut file = tokio::fs::File::create(dest_path).await.map_err(|e| {
+        format!(
+            "Failed to create temporary installer {}: {e}",
+            dest_path.display()
+        )
+    })?;
 
     let mut stream = resp.bytes_stream();
     let mut last_emit_bytes: u64 = 0;
 
     while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res.map_err(|e| format!("网络流式下载中断: {e}"))?;
+        let chunk = chunk_res.map_err(|e| format!("Download stream interrupted: {e}"))?;
         file.write_all(&chunk)
             .await
-            .map_err(|e| format!("写入安装包失败: {e}"))?;
+            .map_err(|e| format!("Failed to write installer: {e}"))?;
         received_bytes += chunk.len() as u64;
 
         if received_bytes.saturating_sub(last_emit_bytes) >= 128 * 1024
@@ -425,14 +436,14 @@ async fn download_with_progress(
                 emit_progress(
                     on_progress,
                     0.05 + ratio * 0.80,
-                    format!("正在下载 {tag_name} ({mb_done:.1} / {mb_total:.1} MB)…"),
+                    format!("Downloading {tag_name} ({mb_done:.1} / {mb_total:.1} MB)…"),
                     false,
                 );
             } else {
                 emit_progress(
                     on_progress,
                     0.50,
-                    format!("正在下载 {tag_name} ({mb_done:.1} MB)…"),
+                    format!("Downloading {tag_name} ({mb_done:.1} MB)…"),
                     false,
                 );
             }
@@ -441,7 +452,7 @@ async fn download_with_progress(
 
     file.flush()
         .await
-        .map_err(|e| format!("刷新临时文件失败: {e}"))?;
+        .map_err(|e| format!("Failed to flush temporary installer: {e}"))?;
     Ok(())
 }
 
@@ -475,7 +486,7 @@ fn spawn_detached_shell(script: &str) -> Result<(), String> {
 
         cmd.spawn()
             .map(|_| ())
-            .map_err(|e| format!("无法拉起后台更新进程: {e}"))
+            .map_err(|e| format!("Failed to launch background updater: {e}"))
     }
     #[cfg(not(unix))]
     {
@@ -493,7 +504,7 @@ async fn update_windows_installer_and_relaunch(
         .as_deref()
         .filter(|s| !s.is_empty())
         .or_else(|| release.windows_msi_url.as_deref().filter(|s| !s.is_empty()))
-        .ok_or_else(|| "未找到 Windows 安装包下载链接".to_string())?;
+        .ok_or_else(|| "No Windows installer URL found for this release".to_string())?;
 
     let ext = if installer_url.to_ascii_lowercase().ends_with(".msi") {
         "msi"
@@ -514,7 +525,7 @@ async fn update_windows_installer_and_relaunch(
         on_progress,
     )
     .await?;
-    emit_progress(on_progress, 0.96, "正在启动 Windows 安装程序…", true);
+    emit_progress(on_progress, 0.96, "Launching Windows installer…", true);
 
     let mut cmd = if ext == "msi" {
         let mut c = Command::new("msiexec");
@@ -532,7 +543,7 @@ async fn update_windows_installer_and_relaunch(
         cmd.creation_flags(0x0000_0200);
     }
     cmd.spawn()
-        .map_err(|e| format!("无法启动 Windows 安装程序: {e}"))?;
+        .map_err(|e| format!("Failed to launch Windows installer: {e}"))?;
 
     tokio::time::sleep(Duration::from_millis(280)).await;
     std::process::exit(0);
@@ -546,7 +557,7 @@ async fn update_macos_dmg_and_relaunch(
         .macos_dmg_url
         .as_deref()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "未找到 macOS 安装包下载链接".to_string())?;
+        .ok_or_else(|| "No macOS installer URL found for this release".to_string())?;
 
     let tmp_dir = std::env::temp_dir();
     let my_pid = std::process::id();
@@ -555,8 +566,14 @@ async fn update_macos_dmg_and_relaunch(
 
     download_with_progress(dmg_url, &release.tag_name, &dmg_path, on_progress).await?;
 
-    emit_progress(on_progress, 0.90, "正在挂载并校验 macOS 安装包…", false);
-    std::fs::create_dir_all(&mount_dir).map_err(|e| format!("创建挂载目录失败: {e}"))?;
+    emit_progress(
+        on_progress,
+        0.90,
+        "Mounting and verifying macOS package…",
+        false,
+    );
+    std::fs::create_dir_all(&mount_dir)
+        .map_err(|e| format!("Failed to create mount directory: {e}"))?;
 
     let attach_out = tokio::process::Command::new("hdiutil")
         .args([
@@ -569,11 +586,11 @@ async fn update_macos_dmg_and_relaunch(
         ])
         .output()
         .await
-        .map_err(|e| format!("调用 hdiutil 失败: {e}"))?;
+        .map_err(|e| format!("Failed to invoke hdiutil: {e}"))?;
 
     if !attach_out.status.success() {
         return Err(format!(
-            "挂载 DMG 失败: {}",
+            "Failed to mount DMG: {}",
             String::from_utf8_lossy(&attach_out.stderr).trim()
         ));
     }
@@ -601,14 +618,17 @@ async fn update_macos_dmg_and_relaunch(
         let _ = Command::new("hdiutil")
             .args(["detach", &mount_dir.to_string_lossy(), "-force", "-quiet"])
             .status();
-        return Err("安装包内未找到 Orbit.app".into());
+        return Err("Orbit.app was not found inside the downloaded package".into());
     };
 
     let target_app = resolve_target_macos_app_bundle();
     emit_progress(
         on_progress,
         0.98,
-        format!("正在自动替换 {} 并重启新版 Orbit…", target_app.display()),
+        format!(
+            "Installing to {} and restarting Orbit…",
+            target_app.display()
+        ),
         true,
     );
 
@@ -664,7 +684,7 @@ async fn update_linux_deb_and_relaunch(
         release.linux_x64_deb_url.as_deref()
     }
     .filter(|s| !s.is_empty())
-    .ok_or_else(|| "未找到当前架构的 Linux 桌面安装包链接".to_string())?;
+    .ok_or_else(|| "No Linux desktop package URL found for this architecture".to_string())?;
 
     let tmp_dir = std::env::temp_dir();
     let my_pid = std::process::id();
@@ -673,8 +693,14 @@ async fn update_linux_deb_and_relaunch(
 
     download_with_progress(deb_url, &release.tag_name, &deb_path, on_progress).await?;
 
-    emit_progress(on_progress, 0.90, "正在解包校验 Linux 安装包…", false);
-    std::fs::create_dir_all(&stage_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+    emit_progress(
+        on_progress,
+        0.90,
+        "Extracting and verifying Linux package…",
+        false,
+    );
+    std::fs::create_dir_all(&stage_dir)
+        .map_err(|e| format!("Failed to create temporary directory: {e}"))?;
 
     let extract_out = tokio::process::Command::new("dpkg-deb")
         .args([
@@ -684,22 +710,27 @@ async fn update_linux_deb_and_relaunch(
         ])
         .output()
         .await
-        .map_err(|e| format!("调用 dpkg-deb 解包失败: {e}"))?;
+        .map_err(|e| format!("Failed to invoke dpkg-deb: {e}"))?;
     if !extract_out.status.success() {
         return Err(format!(
-            "解包 .deb 失败: {}",
+            "Failed to extract .deb package: {}",
             String::from_utf8_lossy(&extract_out.stderr).trim()
         ));
     }
 
     let extracted_bin = stage_dir.join("usr/bin/orbit-desktop");
     if !extracted_bin.is_file() {
-        return Err("安装包内未找到 usr/bin/orbit-desktop".into());
+        return Err("usr/bin/orbit-desktop was not found inside the downloaded package".into());
     }
 
     let cur_exe =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/orbit-desktop"));
-    emit_progress(on_progress, 0.98, "正在自动替换并重启新版 Orbit…", true);
+    emit_progress(
+        on_progress,
+        0.98,
+        "Installing update and restarting Orbit…",
+        true,
+    );
 
     let sq_deb = shell_single_quote(&deb_path.to_string_lossy());
     let sq_stage = shell_single_quote(&stage_dir.to_string_lossy());

@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { t } from "@/lib/i18n";
 
 export type ProviderKind =
   | "antigravity"
@@ -776,7 +777,7 @@ export function semanticAgentTabLabel(
   if (titleSource && !isGenericHarnessHandle(titleSource)) {
     return titleSource.length > 18 ? `${titleSource.slice(0, 17)}…` : titleSource;
   }
-  return "新会话";
+  return t("common.newSession");
 }
 
 export interface SpawnWorkspacePeerRequest {
@@ -1530,6 +1531,7 @@ export interface InlineSpanView {
 export interface HighlightedTokenView {
   text: string;
   fg_hex: string;
+  light_fg_hex?: string;
   bold: boolean;
   italic: boolean;
 }
@@ -4281,6 +4283,7 @@ export const orbitIpc = {
               {
                 text: "// Desktop runtime required to read host files.",
                 fg_hex: "#94A3B8",
+                light_fg_hex: "#6E7781",
                 bold: false,
                 italic: false,
               },
@@ -4714,7 +4717,15 @@ export const orbitIpc = {
     if (!isTauriRuntime()) {
       return content.split(/\r?\n/).map((line, i) => ({
         line_number: i + 1,
-        tokens: [{ text: line, fg_hex: "#E2E8F0", bold: false, italic: false }],
+        tokens: [
+          {
+            text: line,
+            fg_hex: "#E2E8F0",
+            light_fg_hex: "#24292F",
+            bold: false,
+            italic: false,
+          },
+        ],
       }));
     }
     return invoke<HighlightedLineView[]>("highlight_workspace_code", {

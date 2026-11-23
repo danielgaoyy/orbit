@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import {
   SettingCard,
   SettingGroupLabel,
@@ -6,6 +7,7 @@ import {
   SettingSelect,
   type SettingSelectOption,
 } from "@/components/settings/settings-primitives";
+import { LOCALES, type OrbitLocale, useI18n } from "@/lib/i18n";
 import {
   type TerminalCursorStyle,
   type ThemeMode,
@@ -13,30 +15,6 @@ import {
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
-
-const THEME_OPTIONS: { id: ThemeMode; label: string }[] = [
-  { id: "system", label: "System" },
-  { id: "light", label: "Light" },
-  { id: "dark", label: "Dark" },
-];
-
-const DIFF_LAYOUT_OPTIONS: SettingSelectOption<"unified" | "split">[] = [
-  { value: "unified", label: "Unified", description: "Single inline column" },
-  { value: "split", label: "Split", description: "Side-by-side comparison" },
-];
-
-const CURSOR_STYLE_OPTIONS: SettingSelectOption<TerminalCursorStyle>[] = [
-  { value: "bar", label: "Bar" },
-  { value: "block", label: "Block" },
-  { value: "underline", label: "Underline" },
-];
-
-const SCROLLBACK_OPTIONS: SettingSelectOption<number>[] = [
-  { value: 2000, label: "2,000 lines", mono: true },
-  { value: 5000, label: "5,000 lines", mono: true },
-  { value: 10000, label: "10,000 lines", mono: true },
-  { value: 25000, label: "25,000 lines", mono: true },
-];
 
 const MIN_TERMINAL_FONT_PX = 10;
 const MAX_TERMINAL_FONT_PX = 18;
@@ -91,25 +69,86 @@ function ThemePreviewSwatch({ mode }: { mode: ThemeMode }) {
 }
 
 export function AppearanceSection() {
+  const { locale, t } = useI18n();
   const theme = useOrbitSelector((s) => s.theme);
   const diffLayout = useOrbitSelector((s) => s.diffLayout);
   const terminalFontSize = useOrbitSelector((s) => s.terminalFontSize);
   const terminalCursorStyle = useOrbitSelector((s) => s.terminalCursorStyle);
   const terminalScrollback = useOrbitSelector((s) => s.terminalScrollback);
 
+  const languageOptions = useMemo<SettingSelectOption<OrbitLocale>[]>(
+    () =>
+      LOCALES.map((item) => ({
+        value: item.id,
+        label: item.nativeName,
+        description: item.nativeName !== item.englishName ? item.englishName : undefined,
+      })),
+    [],
+  );
+
+  const themeOptions: { id: ThemeMode; label: string }[] = [
+    { id: "system", label: t("settings.themeSystem") },
+    { id: "light", label: t("settings.themeLight") },
+    { id: "dark", label: t("settings.themeDark") },
+  ];
+
+  const diffLayoutOptions: SettingSelectOption<"unified" | "split">[] = [
+    {
+      value: "unified",
+      label: t("settings.diffUnified"),
+      description: t("settings.diffUnifiedDesc"),
+    },
+    {
+      value: "split",
+      label: t("settings.diffSplit"),
+      description: t("settings.diffSplitDesc"),
+    },
+  ];
+
+  const cursorStyleOptions: SettingSelectOption<TerminalCursorStyle>[] = [
+    { value: "bar", label: t("settings.cursorBar") },
+    { value: "block", label: t("settings.cursorBlock") },
+    { value: "underline", label: t("settings.cursorUnderline") },
+  ];
+
+  const scrollbackOptions: SettingSelectOption<number>[] = [
+    { value: 2000, label: t("settings.scrollbackLines", { count: "2,000" }), mono: true },
+    { value: 5000, label: t("settings.scrollbackLines", { count: "5,000" }), mono: true },
+    { value: 10000, label: t("settings.scrollbackLines", { count: "10,000" }), mono: true },
+    { value: 25000, label: t("settings.scrollbackLines", { count: "25,000" }), mono: true },
+  ];
+
   return (
     <div className="space-y-6">
       <SettingSectionHeader
-        title="Appearance"
-        description="Theme, diff view, and integrated terminal."
+        title={t("settings.appearanceTitle")}
+        description={t("settings.appearanceDesc")}
       />
+
+      {/* Interface Language */}
+      <div className="space-y-2">
+        <SettingGroupLabel>{t("settings.groupInterface")}</SettingGroupLabel>
+        <SettingCard>
+          <SettingRow
+            title={t("settings.language")}
+            description={t("settings.languageDesc")}
+          >
+            <SettingSelect
+              value={locale}
+              options={languageOptions}
+              onChange={(nextLocale) => orbitActions.setLocale(nextLocale)}
+              menuClassName="w-[216px]"
+            />
+          </SettingRow>
+        </SettingCard>
+      </div>
 
       {/* Theme */}
       <div className="space-y-2">
-        <SettingGroupLabel>Theme</SettingGroupLabel>
+        <SettingGroupLabel>{t("settings.groupTheme")}</SettingGroupLabel>
         <SettingCard>
           <div className="grid grid-cols-3 gap-3 p-4">
-            {THEME_OPTIONS.map((opt) => {
+            {themeOptions.map((opt) => {
               const active = theme === opt.id;
               return (
                 <button
@@ -136,15 +175,15 @@ export function AppearanceSection() {
 
       {/* Code Review */}
       <div className="space-y-2">
-        <SettingGroupLabel>Code Review</SettingGroupLabel>
+        <SettingGroupLabel>{t("settings.groupCodeReview")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
-            title="Diff layout"
-            description="Default view in the Diff Review panel."
+            title={t("settings.diffLayout")}
+            description={t("settings.diffLayoutDesc")}
           >
             <SettingSelect
               value={diffLayout}
-              options={DIFF_LAYOUT_OPTIONS}
+              options={diffLayoutOptions}
               onChange={(layout) => orbitActions.setDiffLayout(layout)}
               menuClassName="w-[216px]"
             />
@@ -154,11 +193,11 @@ export function AppearanceSection() {
 
       {/* Integrated Terminal */}
       <div className="space-y-2">
-        <SettingGroupLabel>Terminal</SettingGroupLabel>
+        <SettingGroupLabel>{t("settings.groupTerminal")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
-            title="Font size"
-            description="Text size inside the integrated terminal."
+            title={t("settings.fontSize")}
+            description={t("settings.fontSizeDesc")}
           >
             <div className="flex items-center gap-1.5">
               <button
@@ -183,18 +222,24 @@ export function AppearanceSection() {
             </div>
           </SettingRow>
 
-          <SettingRow title="Cursor style" description="Shape of the active terminal cursor.">
+          <SettingRow
+            title={t("settings.cursorStyle")}
+            description={t("settings.cursorStyleDesc")}
+          >
             <SettingSelect
               value={terminalCursorStyle}
-              options={CURSOR_STYLE_OPTIONS}
+              options={cursorStyleOptions}
               onChange={(cursorStyle) => orbitActions.setTerminalPrefs({ cursorStyle })}
             />
           </SettingRow>
 
-          <SettingRow title="Scrollback" description="Lines kept in terminal history.">
+          <SettingRow
+            title={t("settings.scrollback")}
+            description={t("settings.scrollbackDesc")}
+          >
             <SettingSelect
               value={terminalScrollback}
-              options={SCROLLBACK_OPTIONS}
+              options={scrollbackOptions}
               onChange={(scrollback) => orbitActions.setTerminalPrefs({ scrollback })}
             />
           </SettingRow>

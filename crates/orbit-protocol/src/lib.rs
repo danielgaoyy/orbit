@@ -504,7 +504,7 @@ pub struct WorkspaceSummary {
     /// Whether this workspace has absorbed auto-clustered sessions.
     #[serde(default)]
     pub auto_clustered: bool,
-    /// `true` for explicit/curated Mission Workspaces; `false` for unclassified inbox containers (`待归类`).
+    /// `true` for explicit/curated Mission Workspaces; `false` for unfiled inbox containers.
     #[serde(default)]
     pub is_curated: bool,
 }
@@ -521,7 +521,7 @@ pub struct DiscoveredProject {
     pub nested_git_repos: Vec<NestedGitRepo>,
 }
 
-/// Directory entry for interactive remote/local folder browsing (`+ 添加工作目录`).
+/// Directory entry for interactive remote/local folder browsing (`+ Add project folder`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryEntry {
     pub name: String,
@@ -970,7 +970,7 @@ pub enum WireMessage {
     ArchiveWorkspace {
         request_id: Uuid,
         workspace_id: String,
-        /// When `true`, disbands the workspace and moves its active conversations back to `待归类` instead of archiving them.
+        /// When `true`, disbands the workspace and moves its active conversations back to unfiled inbox instead of archiving them.
         #[serde(default)]
         keep_agents_unclassified: bool,
     },
@@ -1885,12 +1885,12 @@ pub enum WireMessage {
     MoveAgentToWorkspace {
         request_id: Uuid,
         agent_id: String,
-        /// Target workspace ID; `None` splits the agent into a fresh curated Mission Workspace (or `待归类` when `make_unclassified == true`).
+        /// Target workspace ID; `None` splits the agent into a fresh curated Mission Workspace (or unfiled inbox when `make_unclassified == true`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_workspace_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         new_workspace_title: Option<String>,
-        /// When `true`, removes the agent from its curated Mission Workspace and places it in `待归类`.
+        /// When `true`, removes the agent from its curated Mission Workspace and places it in the unfiled inbox.
         #[serde(default)]
         make_unclassified: bool,
     },

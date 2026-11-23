@@ -1,5 +1,6 @@
 import * as React from "react";
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Copy, RotateCw } from "lucide-react";
+import { subscribeLocale, t } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 export interface PanelErrorBoundaryProps {
@@ -35,7 +36,7 @@ function formatBoundaryError(
   componentStack: string | null,
 ): { message: string; details: string } {
   let name = "Error";
-  let rawMessage = "An unexpected rendering error occurred.";
+  let rawMessage = t("errorBoundary.unexpectedError");
   let stack = "";
 
   if (error instanceof Error) {
@@ -72,10 +73,19 @@ export class PanelErrorBoundary extends React.Component<
   PanelErrorBoundaryState
 > {
   private copiedTimer: number | null = null;
+  private unsubscribeLocale: (() => void) | null = null;
 
   constructor(props: PanelErrorBoundaryProps) {
     super(props);
     this.state = INITIAL_STATE;
+  }
+
+  componentDidMount(): void {
+    this.unsubscribeLocale = subscribeLocale(() => {
+      if (this.state.hasError) {
+        this.forceUpdate();
+      }
+    });
   }
 
   static getDerivedStateFromError(error: unknown): Partial<PanelErrorBoundaryState> {
@@ -108,6 +118,8 @@ export class PanelErrorBoundary extends React.Component<
 
   componentWillUnmount(): void {
     this.clearCopiedTimer();
+    this.unsubscribeLocale?.();
+    this.unsubscribeLocale = null;
   }
 
   private clearCopiedTimer(): void {
@@ -170,7 +182,7 @@ export class PanelErrorBoundary extends React.Component<
             </div>
             <div className="min-w-0 flex-1 space-y-1">
               <h3 className="text-foreground text-[13px] leading-snug font-semibold tracking-[-0.01em]">
-                {panelName} couldn&apos;t render
+                {t("errorBoundary.couldNotRender", { panel: panelName })}
               </h3>
               <p className="text-muted-foreground text-[12px] leading-[1.5] break-words">
                 {summary.message}
@@ -189,7 +201,7 @@ export class PanelErrorBoundary extends React.Component<
               ) : (
                 <ChevronRight className="size-[13px]" />
               )}
-              <span>Technical details</span>
+              <span>{t("errorBoundary.technicalDetails")}</span>
             </button>
 
             {detailsOpen && (
@@ -206,7 +218,7 @@ export class PanelErrorBoundary extends React.Component<
               className="bg-foreground text-background inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium transition-opacity hover:opacity-90"
             >
               <RotateCw className="size-[12px]" />
-              <span>Reload panel</span>
+              <span>{t("errorBoundary.reloadPanel")}</span>
             </button>
 
             <button
@@ -217,12 +229,12 @@ export class PanelErrorBoundary extends React.Component<
               {copied ? (
                 <>
                   <Check className="size-[12px] text-emerald-500" />
-                  <span>Copied</span>
+                  <span>{t("errorBoundary.copied")}</span>
                 </>
               ) : (
                 <>
                   <Copy className="size-[12px]" />
-                  <span>Copy details</span>
+                  <span>{t("errorBoundary.copyDetails")}</span>
                 </>
               )}
             </button>

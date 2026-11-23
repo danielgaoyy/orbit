@@ -19,6 +19,7 @@ import {
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import {
   type SshHostItem,
@@ -34,6 +35,7 @@ import {
 } from "@/state/orbit-store";
 
 export function HostConnectionSection({ hostId }: { hostId: string }) {
+  const { t } = useI18n();
   const fleet = useOrbitSelector((s) => s.fleet);
   const sshHosts = useOrbitSelector((s) => s.sshHosts);
   const appVersion = useOrbitSelector((s) => s.appVersion);
@@ -121,29 +123,31 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   return (
     <div className="space-y-6">
       <SettingSectionHeader
-        title="Connection"
-        description="Network status, identity, mobile pairing, and relay."
+        title={t("settings.connectionTitle")}
+        description={t("settings.connectionDesc")}
         badge={
           <span className="bg-muted text-muted-foreground inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11.5px] font-medium">
             <HostStatusIndicator state={host.connection_state} />
             <span>{host.display_name}</span>
-            {isLocal && <span className="text-muted-foreground/70">· Local</span>}
+            {isLocal && (
+              <span className="text-muted-foreground/70">· {t("common.local")}</span>
+            )}
           </span>
         }
       />
 
       {/* Status & Actions */}
       <div className="space-y-2">
-        <SettingGroupLabel>Status</SettingGroupLabel>
+        <SettingGroupLabel>{t("settings.groupStatus")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
             title={hostConnectionLabel(host.connection_state)}
             description={
               isLocal
-                ? "Running locally on this device."
+                ? t("settings.runningLocally")
                 : host.ssh_alias
-                  ? `Connected via SSH host ${host.ssh_alias}.`
-                  : "Remote Orbit daemon."
+                  ? t("settings.connectedViaSsh", { alias: host.ssh_alias })
+                  : t("settings.remoteOrbitDaemon")
             }
           >
             <button
@@ -151,18 +155,20 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               onClick={() => {
                 void orbitIpc.connectHost(host.host_id);
                 void orbitIpc.refreshHost(host.host_id);
-                orbitActions.showToast(`Reconnecting ${host.display_name}…`);
+                orbitActions.showToast(
+                  t("settings.reconnectingHost", { host: host.display_name }),
+                );
               }}
               className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
             >
               <RefreshCw className="h-[13px] w-[13px]" />
-              <span>Reconnect</span>
+              <span>{t("banner.reconnect")}</span>
             </button>
           </SettingRow>
 
           <SettingRow
-            title="Mobile pairing"
-            description="Copy pairing URI for Orbit mobile apps."
+            title={t("settings.mobilePairing")}
+            description={t("settings.mobilePairingDesc")}
           >
             <button
               type="button"
@@ -179,20 +185,23 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               ) : (
                 <Copy className="text-muted-foreground h-[13px] w-[13px]" />
               )}
-              <span>{copiedField === "uri" ? "Copied" : "Copy URI"}</span>
+              <span>{copiedField === "uri" ? t("common.copied") : t("settings.copyUri")}</span>
             </button>
           </SettingRow>
 
           <SettingRow
-            title={isLocal ? "Local service" : "Host service"}
+            title={isLocal ? t("settings.localService") : t("settings.hostService")}
             description={
               normDaemon
                 ? isDaemonOutdated && targetVersion
-                  ? `Running v${normDaemon} · v${targetVersion} available (active sessions stay running).`
-                  : `Running v${normDaemon} · Up to date.`
+                  ? t("settings.runningVersionOutdated", {
+                      current: normDaemon,
+                      target: targetVersion,
+                    })
+                  : t("settings.runningVersionCurrent", { current: normDaemon })
                 : isLocal
-                  ? "Keep the local Orbit background service synced with Desktop."
-                  : "Orbit background service on this host."
+                  ? t("settings.localServiceDesc")
+                  : t("settings.hostServiceDesc")
             }
           >
             <div className="flex items-center gap-1.5">
@@ -208,7 +217,11 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                   ) : (
                     <ArrowUpCircle className="h-[13.5px] w-[13.5px]" />
                   )}
-                  <span>{isFleetBusy ? "更新全部中…" : "更新全部机器"}</span>
+                  <span>
+                    {isFleetBusy
+                      ? t("settings.updatingAllHosts")
+                      : t("settings.updateAllHosts")}
+                  </span>
                 </button>
               )}
               <button
@@ -226,12 +239,12 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                 )}
                 <span>
                   {upgrading
-                    ? "Updating…"
+                    ? t("common.updating")
                     : isDaemonOutdated
-                      ? "Update"
+                      ? t("common.update")
                       : isLocal
-                        ? "Restart"
-                        : "Update"}
+                        ? t("settings.restart")
+                        : t("common.update")}
                 </span>
               </button>
             </div>

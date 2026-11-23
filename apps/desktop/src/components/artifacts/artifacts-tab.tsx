@@ -28,7 +28,8 @@ import { formatArtifactInlineComment } from "@/components/artifacts/mcp-app-brid
 import { DiagramBlock } from "@/components/diagram-block";
 import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { adaptTokenColor } from "@/lib/code-highlight";
+import { resolveTokenColor } from "@/lib/code-highlight";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import {
   type ArtifactDetail,
@@ -319,6 +320,7 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme);
   const isDark = resolvedTheme === "dark";
+  const { t } = useI18n();
 
   // Prefer active composer's host so multi-host comments/actions always match the active session
   const hostId = selectedHostId || tab.hostId || "";
@@ -701,10 +703,11 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2.5 px-6 text-center">
         <Blocks className="text-muted-foreground/45 h-7 w-7 stroke-[1.5]" />
-        <div className="text-foreground/85 text-[13px] font-medium">No artifacts yet</div>
+        <div className="text-foreground/85 text-[13px] font-medium">
+          {t("sidePanel.noArtifacts")}
+        </div>
         <p className="text-muted-foreground max-w-[260px] text-[12px] leading-relaxed">
-          Interactive HTML, MCP Apps, diagrams, and documents published in this workspace appear
-          here.
+          {t("sidePanel.noArtifactsDesc")}
         </p>
         <button
           type="button"
@@ -712,7 +715,7 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
           className="border-border hover:bg-accent text-muted-foreground hover:text-foreground mt-1 inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] transition-colors"
         >
           <RefreshCw className="h-3 w-3" />
-          <span>Refresh</span>
+          <span>{t("common.refresh")}</span>
         </button>
       </div>
     );
@@ -738,7 +741,7 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
               />
             )}
             <span className="text-foreground truncate text-[12.5px] font-medium">
-              {activeSummary?.title ?? "Select artifact"}
+              {activeSummary?.title ?? t("sidePanel.selectArtifact")}
             </span>
             {activeSummary && (
               <span className="text-muted-foreground/75 shrink-0 font-mono text-[11px]">
@@ -758,7 +761,13 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
 
         {/* Segmented Preview | Source | History */}
         <div className="bg-muted/65 flex shrink-0 items-center rounded-md p-0.5 text-[11px]">
-          {(["preview", "source", "history"] as const).map((mode) => (
+          {(
+            [
+              { mode: "preview", label: t("sidePanel.viewPreview") },
+              { mode: "source", label: t("sidePanel.viewSource") },
+              { mode: "history", label: t("sidePanel.viewHistory") },
+            ] as const
+          ).map(({ mode, label }) => (
             <button
               key={mode}
               type="button"
@@ -773,7 +782,7 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
               {mode === "preview" && <Eye className="h-3 w-3" />}
               {mode === "source" && <Code2 className="h-3 w-3" />}
               {mode === "history" && <History className="h-3 w-3" />}
-              <span className="capitalize">{mode}</span>
+              <span>{label}</span>
             </button>
           ))}
         </div>
@@ -1052,7 +1061,7 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
                           <span
                             key={ti}
                             style={{
-                              color: adaptTokenColor(tok.fg_hex, isDark),
+                              color: resolveTokenColor(tok, isDark),
                               fontWeight: tok.bold ? 600 : undefined,
                               fontStyle: tok.italic ? "italic" : undefined,
                             }}

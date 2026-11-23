@@ -856,7 +856,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
             }
         }
 
-        // Apply conversation filter + search query + Curated Mission Workspace & Unclassified (`待归类`) grouping
+        // Apply conversation filter + search query + Curated Mission Workspace & Unfiled grouping
         for (group_idx, mut group) in host_groups.into_iter().enumerate() {
             group
                 .conversations
@@ -931,7 +931,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 group.sort_weight_ms = max_thread_ts;
             }
 
-            // Partition conversations into Curated Mission Workspaces vs Unclassified (`待归类`)
+            // Partition conversations into Curated Mission Workspaces vs Unfiled inbox
             let mut curated_ws_buckets: HashMap<String, Vec<SidebarConversationView>> =
                 HashMap::new();
             let mut curated_ws_seen: HashSet<String> = HashSet::new();

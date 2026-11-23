@@ -1145,7 +1145,7 @@ impl AgentOrchestrator {
                 .send(DaemonBroadcast::WorkspaceScriptUpdated(updated));
         }
 
-        // 2. Either disband (move active conversations to `待归类`) or soft-archive all active agents
+        // 2. Either disband (move active conversations to unfiled inbox) or soft-archive all active agents
         let agents = self
             .store
             .list_agents_filtered(Some(workspace_id), false, true, None)?;
@@ -3224,7 +3224,7 @@ impl AgentOrchestrator {
             None,
             TimelinePayload::Notice {
                 level: "info".into(),
-                message: format!("已切换至 {switched_label} 接力当前对话"),
+                message: format!("Switched to {switched_label} to continue this conversation"),
             },
         ) {
             let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));

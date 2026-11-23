@@ -1,6 +1,7 @@
 import { memo, useEffect, useState } from "react";
 import { AlertTriangle, RefreshCw, WifiOff, X } from "lucide-react";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { useI18n } from "@/lib/i18n";
 import { compareSemver, normalizeSemver } from "@/lib/orbit-ipc";
 import {
   orbitActions,
@@ -9,6 +10,7 @@ import {
 } from "@/state/orbit-store";
 
 export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
+  const { t } = useI18n();
   const isBrowserOffline = useOrbitSelector((s) => s.isBrowserOffline);
   const appVersion = useOrbitSelector((s) => s.appVersion);
   const releaseUpdateInfo = useOrbitSelector((s) => s.releaseUpdateInfo);
@@ -50,9 +52,7 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
       >
         <div className="flex min-w-0 items-center gap-2">
           <WifiOff className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
-          <span className="truncate">
-            Network offline — upstream model requests may fail or stall until connection recovers.
-          </span>
+          <span className="truncate">{t("banner.networkOffline")}</span>
         </div>
       </div>
     );
@@ -68,10 +68,13 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
     ).length;
     const label =
       fleetUpdate.phase === "upgrading_desktop"
-        ? (fleetUpdate.desktopStatus ?? "正在更新本机桌面端并重启…")
+        ? (fleetUpdate.desktopStatus ?? t("banner.updatingDesktop"))
         : upgradingCount > 0
-          ? `正在并行更新 ${upgradingCount} 台已联通主机${fleetUpdate.targetVersion ? `至 v${fleetUpdate.targetVersion}` : ""}… 运行中的会话不受影响`
-          : (fleetUpdate.summaryMessage ?? "正在更新全部已联通机器…");
+          ? t("banner.updatingHosts", {
+              count: upgradingCount,
+              version: fleetUpdate.targetVersion ? ` (v${fleetUpdate.targetVersion})` : "",
+            })
+          : (fleetUpdate.summaryMessage ?? t("banner.updatingFleet"));
     return (
       <div
         role="status"
@@ -86,7 +89,7 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
           onClick={() => orbitActions.openSettings("general")}
           className="text-foreground/80 hover:text-foreground hover:bg-accent shrink-0 cursor-pointer rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors"
         >
-          查看进度
+          {t("banner.viewProgress")}
         </button>
       </div>
     );
@@ -105,8 +108,7 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
       >
         <OrbitSpinner size={12} className="text-muted-foreground/80 shrink-0" />
         <span className="truncate">
-          Updating <span className="text-foreground/85 font-medium">{selectedHost.display_name}</span>{" "}
-          in background… Running tasks stay uninterrupted.
+          {t("banner.updatingHostInBackground", { host: selectedHost.display_name })}
         </span>
       </div>
     );
@@ -123,7 +125,7 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
         <div className="flex min-w-0 items-center gap-2">
           <AlertTriangle className="size-3.5 shrink-0 text-rose-600 dark:text-rose-400" />
           <span className="truncate">
-            Disconnected from <span className="font-medium">{selectedHost.display_name}</span>
+            {t("banner.disconnectedFrom", { host: selectedHost.display_name })}
             {errSnippet ? ` · ${errSnippet}` : ""}
           </span>
         </div>
@@ -141,7 +143,7 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
             className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-rose-500/30 bg-background/60 px-2 py-0.5 text-[12px] font-medium transition-colors hover:bg-background disabled:opacity-60"
           >
             <RefreshCw className={reconnecting ? "size-3 animate-spin" : "size-3"} />
-            <span>{reconnecting ? "Reconnecting…" : "Reconnect"}</span>
+            <span>{reconnecting ? t("banner.reconnecting") : t("banner.reconnect")}</span>
           </button>
         </div>
       </div>
@@ -154,7 +156,9 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
       selectedHost.connection_state === "connecting_relay")
   ) {
     const modeLabel =
-      selectedHost.connection_state === "connecting_relay" ? "via Relay" : "directly";
+      selectedHost.connection_state === "connecting_relay"
+        ? t("banner.viaRelay")
+        : t("banner.directly");
     return (
       <div
         role="status"
@@ -162,9 +166,7 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
       >
         <OrbitSpinner size={12} className="text-muted-foreground/80 shrink-0" />
         <span className="truncate">
-          Connecting to{" "}
-          <span className="text-foreground/85 font-medium">{selectedHost.display_name}</span>{" "}
-          {modeLabel}…
+          {t("banner.connectingTo", { host: selectedHost.display_name, mode: modeLabel })}
         </span>
       </div>
     );
@@ -213,9 +215,10 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
       >
         <div className="flex min-w-0 items-center gap-2">
           <span className="truncate">
-            <span className="text-foreground/85 font-medium">{selectedHost.display_name}</span> is
-            on an older version (<span className="font-mono">v{normDaemon}</span>) — update to unlock
-            the latest features.
+            {t("banner.hostOlderVersion", {
+              host: selectedHost.display_name,
+              version: normDaemon,
+            })}
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-1">
@@ -225,7 +228,7 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
               onClick={() => void orbitActions.upgradeAllConnectedHosts()}
               className="text-sky-600 hover:bg-sky-500/12 dark:text-sky-400 inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors"
             >
-              <span>更新全部 ({outdatedFleetHostsCount} 台)</span>
+              <span>{t("banner.updateAllCount", { count: outdatedFleetHostsCount })}</span>
             </button>
           )}
           <button
@@ -238,11 +241,13 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
             }
             className="text-foreground/85 hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors"
           >
-            <span>{upgradeState?.status === "failed" ? "Retry update" : "Update"}</span>
+            <span>
+              {upgradeState?.status === "failed" ? t("banner.retryUpdate") : t("common.update")}
+            </span>
           </button>
           <button
             type="button"
-            aria-label="Dismiss update notice"
+            aria-label={t("banner.dismissNotice")}
             onClick={() => orbitActions.dismissVersionMismatch(selectedHost.host_id, normDaemon)}
             className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex size-5 cursor-pointer items-center justify-center rounded-md transition-colors"
           >

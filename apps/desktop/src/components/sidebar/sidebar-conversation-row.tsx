@@ -7,6 +7,7 @@ import {
   isGenericHarnessHandle,
 } from "@/lib/orbit-ipc";
 import { useImeCompositionGuard } from "@/lib/ime";
+import { useI18n } from "@/lib/i18n";
 import type { MenuAnchorBox } from "@/components/sidebar/sidebar-menus";
 import {
   ConversationStatusGlyph,
@@ -78,6 +79,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const renameCancelledRef = useRef(false);
   const ime = useImeCompositionGuard();
+  const { t } = useI18n();
 
   const isForegroundRunning = isAgentForegroundRunning(agent);
   const relativeLabel = formatCompactRelativeTime(agent.updated_at_rfc3339, nowMs);
@@ -107,7 +109,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   const showSemanticBadge = Boolean(peerHandle && !isGenericHarnessHandle(peerHandle));
   const hoverTooltip = [
     isPinned ? `${effectiveTitle} · ${projectName}` : effectiveTitle,
-    hasUnsentDraft ? "Unsent draft" : null,
+    hasUnsentDraft ? t("sidebar.unsentDraft") : null,
     agent.task_summary ? agent.task_summary : null,
   ]
     .filter(Boolean)
@@ -222,7 +224,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
             >
               {hasUnsentDraft && (
                 <span data-draft-indicator="true" className={DRAFT_BADGE_CLASS}>
-                  Draft
+                  {t("sidebar.draft")}
                 </span>
               )}
               <OrbitSpinner size={13.5} />
@@ -235,7 +237,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
                 menuOpen ? "hidden" : "group-hover/item:hidden",
               )}
             >
-              Draft
+              {t("sidebar.draft")}
             </span>
           ) : (
             <span
@@ -258,7 +260,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
           >
             <button
               type="button"
-              title="Archive conversation"
+              title={t("sidebar.archiveConversation")}
               onClick={() => orbitActions.archiveThread(host.host_id, agent.agent_id)}
               className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
             >
@@ -267,7 +269,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
 
             <button
               type="button"
-              aria-label="Conversation options"
+              aria-label={t("sidebar.conversationOptions")}
               onClick={(e) => {
                 const r = e.currentTarget.getBoundingClientRect();
                 onOpenMenu(threadKey, host, agent, isPinned, isUnread, {

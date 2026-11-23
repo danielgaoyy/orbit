@@ -9,6 +9,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
 import type { TerminalSummary } from "@/lib/orbit-ipc";
+import { useI18n } from "@/lib/i18n";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -33,6 +34,7 @@ export const TerminalTab = memo(function TerminalTab({
   selectedHostId: string;
   visible: boolean;
 }) {
+  const { t } = useI18n();
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
   const activeTerminalTabKey = useOrbitSelector((s) => s.activeTerminalTabKey);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
@@ -173,7 +175,7 @@ export const TerminalTab = memo(function TerminalTab({
           <Suspense
             fallback={
               <div className="text-muted-foreground flex h-full items-center justify-center text-[12.5px]">
-                Initializing WebGL terminal…
+                {t("sidePanel.initializingTerminal")}
               </div>
             }
           >
@@ -190,13 +192,13 @@ export const TerminalTab = memo(function TerminalTab({
         )}
         {hostTabs.length === 0 && (
           <div className="bg-sidebar text-muted-foreground absolute inset-0 z-10 flex h-full flex-col items-center justify-center gap-2 text-[12.5px]">
-            <span>No active shell on this host.</span>
+            <span>{t("sidePanel.noActiveShell")}</span>
             <button
               type="button"
               onClick={() => orbitActions.spawnNewTerminalTab(selectedHostId, selectedCwd || "~")}
               className="border-border bg-elevated text-foreground hover:bg-accent orbit-press cursor-pointer rounded-lg border px-3 py-1.5 text-[12px] font-medium"
             >
-              Launch Shell
+              {t("sidePanel.launchShell")}
             </button>
           </div>
         )}
@@ -208,9 +210,11 @@ export const TerminalTab = memo(function TerminalTab({
           if (!open) setPendingCloseTab(null);
         }}
         title={
-          pendingCloseTab ? `Close "${pendingCloseTab.title}"?` : "Close terminal shell?"
+          pendingCloseTab
+            ? t("sidePanel.closeShellTitle", { title: pendingCloseTab.title })
+            : t("sidePanel.closeShellFallbackTitle")
         }
-        description="Detach hides this tab while keeping the shell process running in the background so you can re-attach anytime. Kill terminates the shell process immediately."
+        description={t("sidePanel.closeShellDesc")}
         detail={
           pendingCloseTab ? (
             <span className="font-mono text-[11.5px]">
@@ -219,7 +223,7 @@ export const TerminalTab = memo(function TerminalTab({
           ) : undefined
         }
         secondaryAction={{
-          label: "Detach",
+          label: t("sidePanel.detach"),
           variant: "default",
           onClick: async () => {
             if (!pendingCloseTab) return;
@@ -229,11 +233,13 @@ export const TerminalTab = memo(function TerminalTab({
               pendingCloseTab.terminalId,
             );
             if (detached) {
-              orbitActions.showToast(`Detached ${pendingCloseTab.title} — kept running in background`);
+              orbitActions.showToast(
+                t("sidePanel.detachedToast", { title: pendingCloseTab.title }),
+              );
             }
           },
         }}
-        confirmLabel="Kill shell"
+        confirmLabel={t("sidePanel.killShell")}
         tone="danger"
         defaultAction="secondary"
         onConfirm={async () => {

@@ -43,6 +43,7 @@ import {
   filterSlashCommands,
 } from "@/components/composer/slash-menu";
 import { useImeCompositionGuard } from "@/lib/ime";
+import { useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import {
   mergeMentionCandidates,
@@ -236,6 +237,7 @@ export const OmniComposer = memo(function OmniComposer({
   variant = "docked",
   occluding = false,
 }: OmniComposerProps) {
+  const { t } = useI18n();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
@@ -1443,8 +1445,8 @@ export const OmniComposer = memo(function OmniComposer({
               const imageOnlyLabel =
                 !hasDisplayText && otherBadges.length === 0 && imageBadges.length > 0
                   ? imageBadges.length === 1
-                    ? "1 image"
-                    : `${imageBadges.length} images`
+                    ? t("composer.imageCountOne")
+                    : t("composer.imageCountMany", { count: imageBadges.length })
                   : "";
 
               return (
@@ -1507,7 +1509,7 @@ export const OmniComposer = memo(function OmniComposer({
                               overflowCount={isLastWithOverflow ? extraImageCount : 0}
                               tooltip={
                                 isLastWithOverflow
-                                  ? `${imageBadges.length} images attached`
+                                  ? t("composer.imagesAttached", { count: imageBadges.length })
                                   : imgBadge.label
                               }
                             />
@@ -1554,27 +1556,27 @@ export const OmniComposer = memo(function OmniComposer({
                       queueDrag && "pointer-events-none opacity-45",
                     )}
                   >
-                    <SimpleTooltip label="Send now (interrupts current turn)">
+                    <SimpleTooltip label={t("composer.sendNowTooltip")}>
                       <button
                         type="button"
                         onClick={() => void orbitActions.flushQueuedPromptImmediately(idx, qItem.id)}
                         className="text-foreground/82 hover:text-foreground inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11.5px] font-medium transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
                       >
-                        Send
+                        {t("common.send")}
                       </button>
                     </SimpleTooltip>
                     <button
                       type="button"
-                      aria-label="Edit queued message"
+                      aria-label={t("composer.editQueuedAria")}
                       onClick={() => orbitActions.popQueuedToDraft(idx, qItem.id)}
                       className="text-muted-foreground hover:text-foreground inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11.5px] font-medium transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
                     >
-                      Edit
+                      {t("common.edit")}
                     </button>
-                    <SimpleTooltip label="Remove">
+                    <SimpleTooltip label={t("composer.remove")}>
                       <button
                         type="button"
-                        aria-label="Remove queued message"
+                        aria-label={t("composer.removeQueuedAria")}
                         onClick={() => orbitActions.removeQueuedPrompt(idx, qItem.id)}
                         className="text-muted-foreground hover:text-foreground inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
                       >
@@ -1628,11 +1630,11 @@ export const OmniComposer = memo(function OmniComposer({
               <div className="mb-2 flex items-center justify-between gap-2">
                 <div className="flex items-center gap-1.5 text-[12px] font-medium">
                   <Target className="text-muted-foreground size-3.5 stroke-[1.75]" />
-                  <span>Autonomous Goal</span>
+                  <span>{t("composer.autonomousGoal")}</span>
                 </div>
                 <button
                   type="button"
-                  aria-label="Close goal config"
+                  aria-label={t("composer.closeGoalConfig")}
                   onClick={() => {
                     setGoalPopoverOpen(false);
                     requestAnimationFrame(() => textareaRef.current?.focus());
@@ -1656,7 +1658,7 @@ export const OmniComposer = memo(function OmniComposer({
                       submitGoalPopover();
                     }
                   }}
-                  placeholder="Objective (e.g. Make all unit tests pass)"
+                  placeholder={t("composer.goalObjectivePlaceholder")}
                   className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/30 h-8 w-full rounded-lg border px-2.5 text-[12.5px] outline-none"
                 />
                 <div className="flex items-center gap-2">
@@ -1671,11 +1673,11 @@ export const OmniComposer = memo(function OmniComposer({
                         submitGoalPopover();
                       }
                     }}
-                    placeholder="Verify command (optional, e.g. cargo test)"
+                    placeholder={t("composer.goalVerifyPlaceholder")}
                     className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/30 h-7 min-w-0 flex-1 rounded-lg border px-2.5 font-mono text-[11.5px] outline-none"
                   />
                   <label className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[11.5px]">
-                    <span>Max iter</span>
+                    <span>{t("composer.maxIter")}</span>
                     <input
                       type="number"
                       min={1}
@@ -1698,7 +1700,7 @@ export const OmniComposer = memo(function OmniComposer({
                     onClick={submitGoalPopover}
                     className="bg-foreground text-background hover:opacity-90 h-7 shrink-0 cursor-pointer rounded-lg px-3 text-[12px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-45"
                   >
-                    Start
+                    {t("common.start")}
                   </button>
                 </div>
               </div>
@@ -1725,7 +1727,7 @@ export const OmniComposer = memo(function OmniComposer({
           >
             {isDraggingOver && (
               <div className="bg-background/85 text-foreground pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px]">
-                Drop images, PDF, audio, video, or files to attach
+                {t("composer.dropToAttach")}
               </div>
             )}
 
@@ -1769,7 +1771,7 @@ export const OmniComposer = memo(function OmniComposer({
                   aria-hidden="true"
                   className="text-foreground/45 pointer-events-none absolute top-[13px] right-[14px] left-[14px] truncate text-[15px] leading-[20px] select-none"
                 >
-                  Ask anything, @ to mention, / for actions
+                  {t("composer.placeholder")}
                 </div>
               )}
 
@@ -1791,7 +1793,7 @@ export const OmniComposer = memo(function OmniComposer({
               <textarea
                 ref={textareaRef}
                 value={draftText}
-                aria-label="Prompt input"
+                aria-label={t("composer.promptInputAria")}
                 style={
                   slashDirective && directiveIndentPx > 0
                     ? { textIndent: `${directiveIndentPx}px` }
@@ -1840,7 +1842,7 @@ export const OmniComposer = memo(function OmniComposer({
                   <DropdownMenuTrigger asChild>
                     <button
                       type="button"
-                      title="Add context"
+                      title={t("composer.addContextTitle")}
                       className="text-foreground/70 hover:text-foreground inline-flex size-8.5 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
                     >
                       <Plus className="size-[18px] stroke-[1.75]" />
@@ -1852,14 +1854,14 @@ export const OmniComposer = memo(function OmniComposer({
                     finalFocus={false}
                     className="w-[180px] p-1.5"
                   >
-                    <DropdownMenuLabel>Add Context</DropdownMenuLabel>
+                    <DropdownMenuLabel>{t("composer.addContext")}</DropdownMenuLabel>
                     <DropdownMenuItem
                       onSelect={() => fileInputRef.current?.click()}
                       className="py-1.5"
                     >
                       <span className="flex items-center gap-2.5">
                         <Paperclip className="text-muted-foreground size-4 stroke-[1.75]" />
-                        <span className="text-[13px]">Files</span>
+                        <span className="text-[13px]">{t("composer.files")}</span>
                       </span>
                     </DropdownMenuItem>
                     <DropdownMenuItem
@@ -1868,7 +1870,7 @@ export const OmniComposer = memo(function OmniComposer({
                     >
                       <span className="flex items-center gap-2.5">
                         <AtSign className="text-muted-foreground size-4 stroke-[1.75]" />
-                        <span className="text-[13px]">Mentions</span>
+                        <span className="text-[13px]">{t("composer.mentions")}</span>
                       </span>
                     </DropdownMenuItem>
                     <DropdownMenuItem
@@ -1877,7 +1879,7 @@ export const OmniComposer = memo(function OmniComposer({
                     >
                       <span className="flex items-center gap-2.5">
                         <SquareSlash className="text-muted-foreground size-4 stroke-[1.75]" />
-                        <span className="text-[13px]">Actions</span>
+                        <span className="text-[13px]">{t("composer.actions")}</span>
                       </span>
                     </DropdownMenuItem>
                   </DropdownMenuContent>
@@ -1899,7 +1901,7 @@ export const OmniComposer = memo(function OmniComposer({
                 {isTurnBusy && !hasPayload ? (
                   <button
                     type="button"
-                    title="Stop generation"
+                    title={t("composer.stopGeneration")}
                     onClick={() => {
                       if (selectedAgentId) {
                         void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
@@ -1913,7 +1915,11 @@ export const OmniComposer = memo(function OmniComposer({
                   <button
                     type="button"
                     disabled={!hasPayload}
-                    title={isTurnBusy ? `Queue follow-up (${modSymbol()}↵ to send now)` : "Send"}
+                    title={
+                      isTurnBusy
+                        ? t("composer.queueFollowUp", { shortcut: `${modSymbol()}↵` })
+                        : t("common.send")
+                    }
                     onClick={() => void orbitActions.submitComposer(false)}
                     className={cn(
                       "orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full",

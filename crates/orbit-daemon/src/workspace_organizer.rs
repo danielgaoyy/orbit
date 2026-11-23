@@ -4,7 +4,7 @@
 //! against the host's installed provider CLI (`claude`, `agy`, or `codex`) to:
 //! 1. Understand each conversation's real intent and generate a concise semantic tab label (`handle`)
 //!    + 1-line live status summary (`task_summary`) — eliminating generic harness names like `@agy`.
-//! 2. Classify unclassified (`待归类`) sessions into existing curated Mission Workspaces or group
+//! 2. Classify unfiled sessions into existing curated Mission Workspaces or group
 //!    cohesive sessions into newly created curated Mission Workspaces (always reversible).
 //!
 //! Falls back gracefully to a fast deterministic lexical/file-overlap organizer when running under
@@ -638,7 +638,7 @@ fn build_summarize_prompt(agent: &AgentSummary, snippet: &AgentContextSnippet) -
     format!(
         "You are Orbit's ultra-fast conversation identity summarizer.\n\
          Given the coding conversation context below, return ONLY a valid JSON object (no markdown, no explanation) with keys:\n\
-         - \"handle\": ultra-concise semantic tab label (2-8 Chinese chars or 1-2 short English words, e.g. \"跨端同步\", \"剪贴板修复\", \"oauth-fix\", \"rate-limiter\"). NEVER use generic tool/model names like agy, claude, codex, peer, lead, agent, chat.\n\
+         - \"handle\": ultra-concise semantic tab label (1-2 short words or 2-8 CJK chars matching the user's language, e.g. \"sync-fix\", \"clipboard\", \"oauth-flow\", \"rate-limiter\"). NEVER use generic tool/model names like agy, claude, codex, peer, lead, agent, chat.\n\
          - \"title\": crisp concise thread title (<= 48 chars, matching the user's language, plain text with no surrounding quotes or markdown).\n\
          - \"task_summary\": single crisp sentence summarizing what this conversation is doing or achieved (<= 48 Chinese chars or <= 84 English chars, matching the user's language).\n\
          Do NOT call any tools or read any files.\n\n\
@@ -1150,7 +1150,7 @@ pub async fn organize_project_workspaces(
             request_id,
             project_root: project_root.to_string(),
             phase: WorkspaceOrganizePhase::Running,
-            message: "AI 归类任务正在进行中…".into(),
+            message: "Workspace organization is already running…".into(),
             created_workspaces: 0,
             grouped_agents: 0,
             summarized_agents: 0,
@@ -1168,7 +1168,7 @@ pub async fn organize_project_workspaces(
         request_id,
         project_root: project_root.to_string(),
         phase: WorkspaceOrganizePhase::Running,
-        message: "正在理解对话上下文并规划 Workspace…".into(),
+        message: "Analyzing conversation context and planning workspaces…".into(),
         created_workspaces: 0,
         grouped_agents: 0,
         summarized_agents: 0,
@@ -1192,7 +1192,7 @@ pub async fn organize_project_workspaces(
                 request_id,
                 project_root: project_root.to_string(),
                 phase: WorkspaceOrganizePhase::Failed,
-                message: format!("AI 归类失败：{err}"),
+                message: format!("Workspace organization failed: {err}"),
                 created_workspaces: 0,
                 grouped_agents: 0,
                 summarized_agents: 0,
@@ -1256,7 +1256,7 @@ async fn organize_project_workspaces_inner(
             request_id,
             project_root: project_root.to_string(),
             phase: WorkspaceOrganizePhase::Completed,
-            message: "暂无待归类会话".into(),
+            message: "No unfiled conversations to organize".into(),
             created_workspaces: 0,
             grouped_agents: 0,
             summarized_agents: 0,
@@ -1467,7 +1467,7 @@ async fn organize_project_workspaces_inner(
                         .reason
                         .clone()
                         .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| "AI 自动归类到该 Workspace".into()),
+                        .unwrap_or_else(|| "Automatically grouped into this workspace".into()),
                     auto_applied: true,
                     previous_workspace_id: Some(prev_ws_id.clone()),
                 };
@@ -1511,7 +1511,7 @@ async fn organize_project_workspaces_inner(
                         .reason
                         .clone()
                         .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| "AI 推荐归入该 Workspace".into()),
+                        .unwrap_or_else(|| "Suggested for this workspace".into()),
                     auto_applied: false,
                     previous_workspace_id: None,
                 };
@@ -1545,13 +1545,33 @@ async fn organize_project_workspaces_inner(
     }
 
     let msg = if grouped_agents > 0 || created_workspaces > 0 {
+        let ws_word = if created_workspaces == 1 {
+            "workspace"
+        } else {
+            "workspaces"
+        };
+        let conv_word = if grouped_agents == 1 {
+            "conversation"
+        } else {
+            "conversations"
+        };
+        let sum_word = if summarized_agents == 1 {
+            "summary"
+        } else {
+            "summaries"
+        };
         format!(
-            "已完成：新建 {created_workspaces} 个 Workspace，归类 {grouped_agents} 个会话，更新 {summarized_agents} 条摘要"
+            "Done: created {created_workspaces} {ws_word}, grouped {grouped_agents} {conv_word}, updated {summarized_agents} {sum_word}"
         )
     } else if summarized_agents > 0 {
-        format!("已更新 {summarized_agents} 个会话摘要（当前无跨会话合并项）")
+        let sum_word = if summarized_agents == 1 {
+            "summary"
+        } else {
+            "summaries"
+        };
+        format!("Updated {summarized_agents} conversation {sum_word} — no new groups needed")
     } else {
-        "AI 归类检查完成".into()
+        "Workspace organization complete".into()
     };
 
     Ok(WorkspaceOrganizeEvent {

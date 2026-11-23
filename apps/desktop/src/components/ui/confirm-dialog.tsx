@@ -1,6 +1,7 @@
 import * as React from "react";
 import { Dialog as BaseDialog } from "@base-ui/react/dialog";
 import { AlertCircle, Loader2 } from "lucide-react";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 export type ConfirmDefaultAction = "confirm" | "secondary" | "cancel";
@@ -38,13 +39,16 @@ export function ConfirmDialog({
   title,
   description,
   detail,
-  confirmLabel = "Confirm",
-  cancelLabel = "Cancel",
+  confirmLabel,
+  cancelLabel,
   tone = "default",
   secondaryAction,
   defaultAction = "confirm",
   onConfirm,
 }: ConfirmDialogProps) {
+  const { t } = useI18n();
+  const resolvedConfirmLabel = confirmLabel ?? t("common.confirm");
+  const resolvedCancelLabel = cancelLabel ?? t("common.cancel");
   const [submitting, setSubmitting] = React.useState<"confirm" | "secondary" | null>(null);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const mountedRef = React.useRef(true);
@@ -85,7 +89,7 @@ export function ConfirmDialog({
       } catch (err) {
         if (mountedRef.current && actionGenRef.current === gen) {
           const message = err instanceof Error ? err.message : String(err);
-          setErrorMessage(message.trim() || "Action failed. Please try again.");
+          setErrorMessage(message.trim() || t("common.actionFailed"));
         }
       } finally {
         if (mountedRef.current && actionGenRef.current === gen) {
@@ -186,7 +190,7 @@ export function ConfirmDialog({
               onClick={() => handleOpenChange(false)}
               className="border-border bg-background text-foreground/80 hover:bg-accent hover:text-foreground focus-visible:ring-foreground/20 inline-flex h-[30px] cursor-pointer items-center justify-center rounded-lg border px-3 text-[12.5px] font-medium transition-colors outline-none focus-visible:ring-2 disabled:pointer-events-none disabled:opacity-45"
             >
-              {cancelLabel}
+              {resolvedCancelLabel}
             </button>
 
             {secondaryAction && (
@@ -224,7 +228,7 @@ export function ConfirmDialog({
               {submitting === "confirm" && (
                 <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />
               )}
-              <span>{confirmLabel}</span>
+              <span>{resolvedConfirmLabel}</span>
             </button>
           </div>
         </BaseDialog.Popup>

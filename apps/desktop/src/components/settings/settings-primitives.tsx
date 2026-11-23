@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Loader2, ShieldCheck } from "lucide-react";
 import { Select, type SelectOption, type SelectProps } from "@/components/ui/select";
+import { t, useI18n } from "@/lib/i18n";
 import type { HostConnectionState } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
 
@@ -133,19 +134,20 @@ export function SettingRow({
 }
 
 export function HostStatusIndicator({ state }: { state: HostConnectionState }) {
+  const { t: translate } = useI18n();
   switch (state) {
     case "online_direct":
       return (
         <span
           className="h-[6px] w-[6px] shrink-0 rounded-full bg-emerald-500"
-          title="Online"
+          title={translate("common.online")}
         />
       );
     case "online_relay":
       return (
         <ShieldCheck
           className="h-[12px] w-[12px] shrink-0 text-indigo-500 dark:text-indigo-400"
-          aria-label="Relay"
+          aria-label={translate("common.relay")}
         />
       );
     case "connecting_direct":
@@ -155,7 +157,7 @@ export function HostStatusIndicator({ state }: { state: HostConnectionState }) {
       return (
         <span
           className="h-[6px] w-[6px] shrink-0 rounded-full bg-zinc-400/70"
-          title="Offline"
+          title={translate("common.offline")}
         />
       );
   }
@@ -164,13 +166,13 @@ export function HostStatusIndicator({ state }: { state: HostConnectionState }) {
 export function hostConnectionLabel(state: HostConnectionState): string {
   switch (state) {
     case "online_direct":
-      return "Online · Direct";
+      return t("settings.onlineDirect");
     case "online_relay":
-      return "Online · E2EE Relay";
+      return t("settings.onlineRelay");
     case "connecting_direct":
     case "connecting_relay":
-      return "Connecting";
+      return t("settings.statusConnecting");
     default:
-      return "Offline";
+      return t("settings.statusOffline");
   }
 }

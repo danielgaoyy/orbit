@@ -69,7 +69,7 @@ use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
-    extract_ws_port, normalize_relay_input, read_local_workspace_file,
+    extract_ws_port, normalize_relay_input, read_local_daemon_identity, read_local_workspace_file,
     read_local_workspace_file_with_writable, stage_local_attachment,
 };
 use crate::render::{
@@ -1674,9 +1674,14 @@ impl OrbitAppCore {
             }
         }
 
+        let local_identity = read_local_daemon_identity();
+
         let mut initial_hosts = HashMap::new();
         if let Ok(saved) = store.list_client_hosts() {
             for h in saved {
+                let is_saved_local = local_identity
+                    .as_ref()
+                    .is_some_and(|(id, pubkey)| *id == h.host_id && *pubkey == h.daemon_pubkey_b64);
                 let profile = SavedHostProfile {
                     host_id: h.host_id.clone(),
                     hostname: h.display_name,
@@ -1693,6 +1698,7 @@ impl OrbitAppCore {
                     state: HostConnectionState::Disconnected,
                 };
                 let mut mem = HostMemoryState::new(profile);
+                mem.is_local = is_saved_local;
                 if let Ok(ws_list) = store.list_replica_workspaces(&h.host_id) {
                     mem.workspaces = ws_list;
                 }
@@ -4145,6 +4151,17 @@ impl OrbitAppCore {
         self.pair_host_internal(&uri, Some((alias.to_string(), remote_port)))
     }
 
+    /// Explicitly ensure the local Orbit daemon is running and pair this machine into the fleet.
+    /// Never called automatically on startup; invoked only on explicit user opt-in.
+    pub fn pair_local_host_blocking(self: &Arc<Self>) -> Result<HostCardView, ClientCoreError> {
+        let uri = discover_local_daemon_pairing_uri().ok_or_else(|| {
+            ClientCoreError::Handshake(
+                "Local Orbit daemon is not installed or failed to start. Install `orbit` CLI or run `orbit daemon up`.".to_string(),
+            )
+        })?;
+        self.pair_host_internal(&uri, None)
+    }
+
     fn pair_host_internal(
         self: &Arc<Self>,
         pairing_uri: &str,
@@ -4152,6 +4169,10 @@ impl OrbitAppCore {
     ) -> Result<HostCardView, ClientCoreError> {
         let offer = PairingOffer::from_qr_uri(pairing_uri)?;
         let detected_port = extract_ws_port(&offer.direct_endpoints);
+        let is_local_daemon = ssh_info.is_none()
+            && read_local_daemon_identity().is_some_and(|(id, pubkey)| {
+                id == offer.host_id && pubkey == offer.daemon_pubkey_b64
+            });
         let (card, stored) = {
             let mut guard = self
                 .hosts
@@ -4174,6 +4195,13 @@ impl OrbitAppCore {
                 .unwrap_or(HostRouteMode::Auto);
             let custom_direct_endpoint =
                 prev.and_then(|h| h.profile.custom_direct_endpoint.clone());
+            let mut direct_endpoints = offer.direct_endpoints;
+            if is_local_daemon {
+                let loopback = format!("ws://127.0.0.1:{remote_port}/ws");
+                if !direct_endpoints.contains(&loopback) {
+                    direct_endpoints.insert(0, loopback);
+                }
+            }
 
             let pairing_secret_updated_at_ms = match prev {
                 Some(h)
@@ -4194,7 +4222,7 @@ impl OrbitAppCore {
                 remote_daemon_port: remote_port,
                 custom_direct_endpoint,
                 daemon_pubkey_b64: offer.daemon_pubkey_b64,
-                direct_endpoints: offer.direct_endpoints,
+                direct_endpoints,
                 relay_url: offer.relay_url,
                 pairing_secret: offer.pairing_secret,
                 pairing_secret_updated_at_ms,
@@ -4204,6 +4232,9 @@ impl OrbitAppCore {
                 .entry(offer.host_id.clone())
                 .or_insert_with(|| HostMemoryState::new(profile.clone()));
             entry.profile = profile;
+            if is_local_daemon {
+                entry.is_local = true;
+            }
             entry.ssh_heal_attempted = false;
             (entry.to_card(), entry.to_stored_host())
         };
@@ -25361,5 +25392,11 @@ mod tests {
                     } if url == &ssh_uri
                 ))
         );
+    }
+
+    #[test]
+    fn open_in_memory_without_local_discovery_starts_empty() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
+        assert!(core.fleet_overview().hosts.is_empty());
     }
 }

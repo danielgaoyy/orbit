@@ -752,7 +752,7 @@ public final class OrbitIosStore: ObservableObject {
                 throw OrbitStorageError.applicationSupportUnavailable
             }
             let dbURL = try OrbitStorageProtection.prepareProtectedDatabaseURL(in: appSupportDir)
-            let instance = try OrbitMobileCore.openWithOptions(dbPath: dbURL.path, autoDiscoverLocal: true)
+            let instance = try OrbitMobileCore.openWithOptions(dbPath: dbURL.path, autoDiscoverLocal: false)
             self.core = instance
 
             if !UserDefaults.standard.bool(forKey: Self.migratedThreadPrefsDefaultsKey) {

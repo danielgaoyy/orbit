@@ -2061,6 +2061,12 @@ export interface SshHostItem {
   display_target: string;
 }
 
+export interface LocalMachineInfo {
+  hostname: string;
+  host_id: string | null;
+  os_arch: string;
+}
+
 export interface StagedAttachmentInfo {
   path: string;
   filename: string;
@@ -3198,6 +3204,15 @@ export const orbitIpc = {
       sshAlias,
       remotePort: remotePort ?? null,
     });
+  },
+
+  getLocalMachineInfo: async (): Promise<LocalMachineInfo | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<LocalMachineInfo>("get_local_machine_info");
+  },
+
+  pairLocalHost: async (): Promise<HostCardView> => {
+    return invoke<HostCardView>("pair_local_host");
   },
 
   updateHostConfig: async (params: {

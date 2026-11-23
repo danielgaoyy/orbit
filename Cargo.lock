@@ -2345,6 +2345,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbit-uniffi-bindgen"
+version = "0.9.9"
+dependencies = [
+ "uniffi",
+]
+
+[[package]]
 name = "p256"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

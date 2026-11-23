@@ -18,7 +18,7 @@
 | --- | --- | --- | --- | --- |
 | `AGENTS.md` | `**` | 每次进入仓库开始任何任务时必读 | 5 条架构与安全红线、PR-First 流程铁律、任务触发路由表（硬上限 ≤ 140 行 / 8 KB） | 修改核心红线、发版流程或新增专题/领域文档入口 |
 | `README.md` | `README.md` | 对外介绍能力矩阵、快速安装与源码构建命令时 | 项目对外总览、Quick Start 与各端构建命令索引 | 增减支持平台、主流 Provider 或变更仓库总览文档链接 |
-| `ARCHITECTURE.md` | `crates/**`, `apps/**` | 首次理解全栈分层与 12 个 crate / 4 个 app 拓扑关系时 | 宏观系统拓扑图与四端/多 crate 职责边界总览 | 新增/移除 crate 或 app、调整系统核心协议或 UI 基础库选型 |
+| `ARCHITECTURE.md` | `crates/**`, `apps/**` | 首次理解全栈分层与 13 个 crate / 4 个 app 拓扑关系时 | 宏观系统拓扑图与四端/多 crate 职责边界总览 | 新增/移除 crate 或 app、调整系统核心协议或 UI 基础库选型 |
 | `CONTRIBUTING.md` | `**` | 提交 PR、检查环境依赖或核对开源协作规范时 | PR 规范、本地环境前置依赖与验证命令清单 | 修改构建先决条件、CI 检查门禁或 PR 提交规范 |
 | `SECURITY.md` | `crates/orbit-crypto/**`, `crates/orbit-relay/**`, `crates/orbit-daemon/**`, `deploy/install*.sh` | 修改认证、`pairing_secret`、Noise 握手、Relay 准入、自更新校验或私钥处理前 | 威胁模型、密码学基线、供应链校验与漏洞私密披露流程 | 变更加密序言/原语、鉴权方式、安全边界或支持版本矩阵 |
 | `CODE_OF_CONDUCT.md` | `CODE_OF_CONDUCT.md` | 处理社区行为规范与治理争议时 | 开源社区行为准则（Contributor Covenant v2.1） | 变更社区治理联系方式或行为准则条款 |

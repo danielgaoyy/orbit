@@ -11,6 +11,7 @@ members = [
     "crates/orbit-relay-transport",
     "crates/orbit-client-core",
     "crates/orbit-ffi-uniffi",
+    "crates/orbit-uniffi-bindgen",
     "crates/orbit-ffi-ohos",
     "crates/orbit-cli",
 ]

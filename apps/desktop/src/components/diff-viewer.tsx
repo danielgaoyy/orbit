@@ -5,12 +5,18 @@ import {
   ChevronDown,
   ChevronRight,
   FileCode2,
+  Loader2,
   MessageSquarePlus,
   MessageSquareText,
+  Minus,
+  Plus,
+  RotateCcw,
   Trash2,
   X,
 } from "lucide-react";
 import { resolveTokenColor } from "@/lib/code-highlight";
+import { extractFileHunks, type IndexedDiffHunk } from "@/lib/git-patch";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import type {
   DiffFileView,
@@ -42,6 +48,7 @@ interface ActiveCommentTarget {
 interface SplitRow {
   kind: "header" | "pair";
   headerText?: string;
+  headerLineIdx?: number;
   left?: DiffLineView;
   right?: DiffLineView;
 }
@@ -59,7 +66,10 @@ type DiffVirtualRow =
   | {
       kind: "hunk_header";
       key: string;
+      file: DiffFileView;
       content: string;
+      hunk: IndexedDiffHunk | null;
+      hunkKey: string;
     }
   | {
       kind: "unified_line";
@@ -111,7 +121,7 @@ function buildSplitRows(lines: DiffLineView[]): SplitRow[] {
       continue;
     }
     if (cur.kind === "hunk_header") {
-      rows.push({ kind: "header", headerText: cur.content });
+      rows.push({ kind: "header", headerText: cur.content, headerLineIdx: i });
       i += 1;
       continue;
     }
@@ -349,7 +359,7 @@ function estimateRowHeight(row: DiffVirtualRow): number {
     case "file_header":
       return 38;
     case "hunk_header":
-      return 24;
+      return 28;
     case "unified_line":
     case "split_pair":
       return 20;
@@ -373,12 +383,22 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   collapsedPaths,
   viewedPaths,
   comments,
+  gitWriteMode = null,
+  busyPaths,
+  busyHunkKeys,
+  untrackedPaths,
   onToggleCollapse,
   onToggleViewed,
   onQuoteLine,
   onAddComment,
   onDeleteComment,
   onOpenFile,
+  onStageFile,
+  onUnstageFile,
+  onDiscardFile,
+  onStageHunk,
+  onUnstageHunk,
+  onDiscardHunk,
 }: {
   files: DiffFileView[];
   layout?: DiffLayoutMode;
@@ -388,13 +408,24 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   collapsedPaths?: ReadonlySet<string>;
   viewedPaths?: ReadonlySet<string>;
   comments?: readonly ReviewCommentDraft[];
+  gitWriteMode?: "unstaged" | "staged" | null;
+  busyPaths?: ReadonlySet<string>;
+  busyHunkKeys?: ReadonlySet<string>;
+  untrackedPaths?: ReadonlySet<string>;
   onToggleCollapse?: (path: string) => void;
   onToggleViewed?: (path: string) => void;
   onQuoteLine?: (path: string, lineNumber: number | null, code: string) => void;
   onAddComment?: (draft: Omit<ReviewCommentDraft, "id">) => void;
   onDeleteComment?: (id: string) => void;
   onOpenFile?: (path: string, focusLine?: number | null) => void;
+  onStageFile?: (path: string) => void;
+  onUnstageFile?: (path: string) => void;
+  onDiscardFile?: (path: string) => void;
+  onStageHunk?: (path: string, hunk: IndexedDiffHunk) => void;
+  onUnstageHunk?: (path: string, hunk: IndexedDiffHunk) => void;
+  onDiscardHunk?: (path: string, hunk: IndexedDiffHunk) => void;
 }) {
+  const { t } = useI18n();
   const isDark = useOrbitSelector((s) => s.resolvedTheme === "dark");
   const [localCollapsed, setLocalCollapsed] = useState<Set<string>>(() => new Set());
   const [activeComment, setActiveComment] = useState<ActiveCommentTarget | null>(null);
@@ -461,6 +492,13 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
         const tail = file.lines[file.lines.length - 1];
         const omissionNotice =
           tail && tail.kind === "meta" && tail.content.startsWith("…") ? tail.content : null;
+        let hunksByLineIdx: Map<number, IndexedDiffHunk> | null = null;
+        if (gitWriteMode) {
+          hunksByLineIdx = new Map();
+          for (const h of extractFileHunks(file)) {
+            hunksByLineIdx.set(h.headerLineIndex, h);
+          }
+        }
 
         if (layout === "unified") {
           const visibleLines: { line: DiffLineView; idx: number }[] = [];
@@ -473,7 +511,15 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             const { line, idx } = visibleLines[vIdx];
             const isLast = vIdx === visibleLines.length - 1 && !omissionNotice;
             if (line.kind === "hunk_header") {
-              out.push({ kind: "hunk_header", key: `uh:${fileKey}:${idx}`, content: line.content });
+              const hunk = hunksByLineIdx?.get(idx) ?? null;
+              out.push({
+                kind: "hunk_header",
+                key: `uh:${fileKey}:${idx}`,
+                file,
+                content: line.content,
+                hunk,
+                hunkKey: `${file.path}::${idx}`,
+              });
             } else {
               out.push({
                 kind: "unified_line",
@@ -514,10 +560,15 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             const sr = splitRows[rIdx];
             const isLast = rIdx === splitRows.length - 1 && !omissionNotice;
             if (sr.kind === "header") {
+              const headerIdx = sr.headerLineIdx ?? -1;
+              const hunk = hunksByLineIdx?.get(headerIdx) ?? null;
               out.push({
                 kind: "hunk_header",
                 key: `sh:${fileKey}:${rIdx}`,
+                file,
                 content: sr.headerText ?? "",
+                hunk,
+                hunkKey: `${file.path}::${headerIdx}`,
               });
             } else {
               out.push({
@@ -572,7 +623,15 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
       }
     }
     return out;
-  }, [files, layout, effectiveCollapsed, viewedPaths, commentsByFileAndAnchor, activeComment]);
+  }, [
+    files,
+    layout,
+    effectiveCollapsed,
+    viewedPaths,
+    commentsByFileAndAnchor,
+    activeComment,
+    gitWriteMode,
+  ]);
 
   const virtualizer = useVirtualizer({
     count: virtualized ? flatRows.length : 0,
@@ -589,7 +648,8 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
       case "file_spacer":
         return <div className="h-3" />;
 
-      case "file_header":
+      case "file_header": {
+        const fileBusy = Boolean(busyPaths?.has(row.file.path));
         return (
           <div
             className={cn(
@@ -621,7 +681,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 </span>
               )}
             </button>
-            <div className="tabular-nums flex shrink-0 items-center gap-2 font-mono text-[12px]">
+            <div className="tabular-nums flex shrink-0 items-center gap-1.5 font-mono text-[12px]">
               {row.file.additions > 0 && (
                 <span className="text-emerald-600 dark:text-emerald-400">
                   +{row.file.additions}
@@ -630,10 +690,58 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
               {row.file.deletions > 0 && (
                 <span className="text-rose-600 dark:text-rose-400">-{row.file.deletions}</span>
               )}
+              {gitWriteMode === "unstaged" && (onStageFile || onDiscardFile) && (
+                <div className="flex items-center gap-1 font-sans">
+                  {onStageFile && (
+                    <button
+                      type="button"
+                      disabled={fileBusy}
+                      title={t("review.stageFileTitle", { path: row.file.path })}
+                      onClick={() => onStageFile(row.file.path)}
+                      className="border-border text-muted-foreground hover:border-emerald-500/35 hover:bg-emerald-500/[0.10] hover:text-emerald-700 dark:hover:text-emerald-300 inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md border px-1.5 text-[11px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
+                    >
+                      {fileBusy ? (
+                        <Loader2 className="h-[11px] w-[11px] animate-spin" />
+                      ) : (
+                        <Plus className="h-[11px] w-[11px]" />
+                      )}
+                      <span>{t("review.stage")}</span>
+                    </button>
+                  )}
+                  {onDiscardFile && (
+                    <button
+                      type="button"
+                      disabled={fileBusy}
+                      title={t("review.discardFileTitle", { path: row.file.path })}
+                      onClick={() => onDiscardFile(row.file.path)}
+                      className="border-border text-muted-foreground hover:border-rose-500/35 hover:bg-rose-500/[0.10] hover:text-rose-600 dark:hover:text-rose-300 inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md border px-1.5 text-[11px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
+                    >
+                      <RotateCcw className="h-[10.5px] w-[10.5px]" />
+                      <span>{t("review.discard")}</span>
+                    </button>
+                  )}
+                </div>
+              )}
+              {gitWriteMode === "staged" && onUnstageFile && (
+                <button
+                  type="button"
+                  disabled={fileBusy}
+                  title={t("review.unstageFileTitle", { path: row.file.path })}
+                  onClick={() => onUnstageFile(row.file.path)}
+                  className="border-border text-muted-foreground hover:bg-black/[0.06] hover:text-foreground dark:hover:bg-white/[0.08] inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md border px-1.5 font-sans text-[11px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
+                >
+                  {fileBusy ? (
+                    <Loader2 className="h-[11px] w-[11px] animate-spin" />
+                  ) : (
+                    <Minus className="h-[11px] w-[11px]" />
+                  )}
+                  <span>{t("review.unstage")}</span>
+                </button>
+              )}
               {onToggleViewed && (
                 <button
                   type="button"
-                  title={row.viewed ? "Mark as unviewed" : "Mark as viewed"}
+                  title={row.viewed ? t("review.markUnviewed") : t("review.markViewed")}
                   onClick={() => onToggleViewed(row.file.path)}
                   className={cn(
                     "inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md border px-1.5 font-sans text-[11px] transition-colors",
@@ -643,13 +751,13 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                   )}
                 >
                   <Check className="h-[11px] w-[11px]" />
-                  <span>Viewed</span>
+                  <span>{t("review.viewed")}</span>
                 </button>
               )}
               {onOpenFile && (
                 <button
                   type="button"
-                  title="Open full file"
+                  title={t("review.openFullFile")}
                   onClick={() => onOpenFile(row.file.path)}
                   className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md opacity-70 transition-[color,background-color,opacity] hover:bg-black/[0.06] hover:opacity-100 dark:hover:bg-white/[0.08]"
                 >
@@ -659,13 +767,76 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             </div>
           </div>
         );
+      }
 
-      case "hunk_header":
+      case "hunk_header": {
+        const isUntracked = Boolean(untrackedPaths?.has(row.file.path));
+        const hunkBusy = Boolean(busyHunkKeys?.has(row.hunkKey) || busyPaths?.has(row.file.path));
+        const hunk = row.hunk;
+        const canActOnHunk = Boolean(gitWriteMode && hunk && !isUntracked);
         return (
-          <div className="border-border border-x bg-sky-500/[0.09] px-3 py-0.5 font-mono text-[11.5px] leading-[1.6] text-sky-800 select-none dark:bg-sky-500/[0.08] dark:text-sky-300/90">
-            {row.content}
+          <div className="border-border group/hunk flex h-[28px] items-center justify-between gap-2 border-x bg-sky-500/[0.08] px-3 font-mono text-[11.5px] text-sky-800 select-none dark:bg-sky-500/[0.08] dark:text-sky-300/90">
+            <span className="min-w-0 flex-1 truncate">{row.content}</span>
+            {canActOnHunk && hunk && (
+              <div className="flex shrink-0 items-center gap-1 font-sans">
+                {hunk.truncated ? (
+                  <span
+                    title={t("review.hunkTruncatedHint")}
+                    className="text-muted-foreground px-1 text-[10.5px] opacity-70"
+                  >
+                    …
+                  </span>
+                ) : gitWriteMode === "unstaged" ? (
+                  <>
+                    {onStageHunk && (
+                      <button
+                        type="button"
+                        disabled={hunkBusy}
+                        onClick={() => onStageHunk(row.file.path, hunk)}
+                        className="text-sky-800/80 hover:bg-emerald-500/[0.15] hover:text-emerald-700 dark:text-sky-200/80 dark:hover:bg-emerald-400/[0.16] dark:hover:text-emerald-300 inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 text-[10.5px] font-medium opacity-80 transition-[color,background-color,opacity] group-hover/hunk:opacity-100 focus-visible:opacity-100 disabled:pointer-events-none disabled:opacity-45"
+                      >
+                        {hunkBusy ? (
+                          <Loader2 className="h-[10.5px] w-[10.5px] animate-spin" />
+                        ) : (
+                          <Plus className="h-[10.5px] w-[10.5px]" />
+                        )}
+                        <span>{t("review.stageHunk")}</span>
+                      </button>
+                    )}
+                    {onDiscardHunk && (
+                      <button
+                        type="button"
+                        disabled={hunkBusy}
+                        onClick={() => onDiscardHunk(row.file.path, hunk)}
+                        className="text-sky-800/75 hover:bg-rose-500/[0.15] hover:text-rose-600 dark:text-sky-200/75 dark:hover:bg-rose-400/[0.16] dark:hover:text-rose-300 inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 text-[10.5px] font-medium opacity-80 transition-[color,background-color,opacity] group-hover/hunk:opacity-100 focus-visible:opacity-100 disabled:pointer-events-none disabled:opacity-45"
+                      >
+                        <RotateCcw className="h-[10px] w-[10px]" />
+                        <span>{t("review.discardHunk")}</span>
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  onUnstageHunk && (
+                    <button
+                      type="button"
+                      disabled={hunkBusy}
+                      onClick={() => onUnstageHunk(row.file.path, hunk)}
+                      className="text-sky-800/80 hover:bg-black/[0.08] hover:text-foreground dark:text-sky-200/80 dark:hover:bg-white/[0.10] dark:hover:text-foreground inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 text-[10.5px] font-medium opacity-80 transition-[color,background-color,opacity] group-hover/hunk:opacity-100 focus-visible:opacity-100 disabled:pointer-events-none disabled:opacity-45"
+                    >
+                      {hunkBusy ? (
+                        <Loader2 className="h-[10.5px] w-[10.5px] animate-spin" />
+                      ) : (
+                        <Minus className="h-[10.5px] w-[10.5px]" />
+                      )}
+                      <span>{t("review.unstageHunk")}</span>
+                    </button>
+                  )
+                )}
+              </div>
+            )}
           </div>
         );
+      }
 
       case "unified_line": {
         const { line, file, fileKey, lineIdx, isLastInFile } = row;

@@ -538,6 +538,12 @@ export interface InstructionsTarget {
   cwd: string;
 }
 
+export interface ToastAction {
+  label: string;
+  url?: string;
+  onClick?: () => void;
+}
+
 export interface OrbitUiState {
   fleet: FleetOverviewView;
   fleetHydrated: boolean;
@@ -655,6 +661,7 @@ export interface OrbitUiState {
   externalEditors: ExternalEditorInfo[];
   externalMcpServersByHost: Record<string, ExternalMcpServerRecord[]>;
   toastNotice: string | null;
+  toastAction: ToastAction | null;
   lastArchivedUndo: UndoArchiveEntry | null;
   appVersion: string | null;
   isBrowserOffline: boolean;
@@ -1165,6 +1172,7 @@ const defaultInitialState: OrbitUiState = {
   externalEditors: [],
   externalMcpServersByHost: {},
   toastNotice: null,
+  toastAction: null,
   lastArchivedUndo: null,
   appVersion: null,
   isBrowserOffline: typeof navigator !== "undefined" ? !navigator.onLine : false,
@@ -1966,16 +1974,26 @@ function dispatchDesktopNotification(opts: {
   }
 }
 
-function notifyToast(msg: string, undo?: UndoArchiveEntry | null): void {
+function notifyToast(
+  msg: string,
+  undo?: UndoArchiveEntry | null,
+  action?: ToastAction | null,
+): void {
   if (toastTimer) clearTimeout(toastTimer);
   setState((s) => ({
     ...s,
     toastNotice: msg,
     lastArchivedUndo: undo ?? null,
+    toastAction: action ?? null,
   }));
   toastTimer = setTimeout(() => {
-    setState((s) => ({ ...s, toastNotice: null, lastArchivedUndo: null }));
-  }, undo ? 6000 : 3000);
+    setState((s) => ({
+      ...s,
+      toastNotice: null,
+      lastArchivedUndo: null,
+      toastAction: null,
+    }));
+  }, undo ? 6000 : action ? 8000 : 3000);
 }
 
 function resolveAvailableDraftProvider(
@@ -10266,7 +10284,7 @@ export const orbitActions = {
   },
 
   setDiffStaged(staged: boolean): void {
-    setState((s) => ({ ...s, diffStaged: staged }));
+    setState((s) => ({ ...s, diffStaged: staged, selectedDiffPath: null }));
     if (state.selectedHostId && state.selectedWorkspaceCwd) {
       void orbitActions.refreshGit(
         state.selectedHostId,
@@ -10321,6 +10339,19 @@ export const orbitActions = {
     await orbitIpc.fetchGitStatus(hostId, cwd);
     await orbitIpc.fetchGitDiff(hostId, cwd, path, staged);
     await orbitActions.loadGitReviewSnapshot(hostId, cwd, path);
+  },
+
+  async refreshGitReview(
+    hostId: string,
+    cwd: string,
+    opts?: { path?: string | null; staged?: boolean; clearSelectedPath?: boolean },
+  ): Promise<void> {
+    const staged = opts?.staged ?? state.diffStaged;
+    const path = opts?.clearSelectedPath ? null : (opts?.path ?? state.selectedDiffPath);
+    if (opts?.clearSelectedPath && state.selectedDiffPath !== null) {
+      setState((s) => ({ ...s, selectedDiffPath: null }));
+    }
+    await orbitActions.refreshGit(hostId, cwd, path, staged);
   },
 
   async loadGitReviewSnapshot(hostId: string, cwd: string, path: string | null): Promise<void> {
@@ -11299,8 +11330,8 @@ export const orbitActions = {
     return optimisticId;
   },
 
-  showToast(msg: string): void {
-    notifyToast(msg);
+  showToast(msg: string, action?: ToastAction | null): void {
+    notifyToast(msg, null, action ?? null);
   },
 
   // --- Zero-Server E2EE Cloud Sync Actions ---

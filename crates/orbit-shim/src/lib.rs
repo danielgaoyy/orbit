@@ -1773,7 +1773,10 @@ pub async fn spawn_detached_shim(
 
     let mut tokio_cmd = Command::from(build_detached_shim_command(orbit_exe, socket_path));
     tokio_cmd.kill_on_drop(false);
-    let mut child_guard = SpawnedChildGuard::new(tokio_cmd.spawn()?, socket_path.to_path_buf());
+    let mut child_guard = SpawnedChildGuard::new(
+        spawn_command_retrying_busy(&mut tokio_cmd).await?,
+        socket_path.to_path_buf(),
+    );
 
     let mut child_stdin = child_guard.take_stdin().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, "missing shim stdin pipe")
@@ -1962,6 +1965,27 @@ pub async fn cleanup_stale_shim_sockets(shims_dir: &Path) -> usize {
     removed
 }
 
+/// Retry `tokio::process::Command::spawn` on transient `ExecutableFileBusy` (`ETXTBSY`) errors
+/// caused on Linux when another thread in a multi-threaded process forks while a freshly written
+/// executable or script file descriptor is still closing.
+async fn spawn_command_retrying_busy(cmd: &mut Command) -> std::io::Result<tokio::process::Child> {
+    const MAX_ATTEMPTS: usize = 10;
+    let mut attempt = 0usize;
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(20 * attempt as u64)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), ShimError> {
     let mut pre_spawn_cleanup = PreSpawnCleanupGuard::new(&spec.cleanup_paths);
     prepare_socket_path(socket_path)?;
@@ -1986,7 +2010,7 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
         cmd.creation_flags(WIN_CREATE_NEW_PROCESS_GROUP | WIN_CREATE_NO_WINDOW);
     }
 
-    let mut child = cmd.spawn()?;
+    let mut child = spawn_command_retrying_busy(&mut cmd).await?;
     pre_spawn_cleanup.disarm();
     let child_pid = child.id();
     #[cfg(unix)]

@@ -2700,10 +2700,16 @@ mod tests {
         spec: ShimSpawnSpec,
     ) -> (tokio::task::JoinHandle<()>, ShimClient) {
         let sock_bg = sock_path.clone();
+        let (err_tx, mut err_rx) = tokio::sync::oneshot::channel::<String>();
         let handle = tokio::spawn(async move {
-            let _ = orbit_shim::run_shim(&sock_bg, spec).await;
+            if let Err(err) = orbit_shim::run_shim(&sock_bg, spec).await {
+                let _ = err_tx.send(err.to_string());
+            }
         });
         for _ in 0..400 {
+            if let Ok(err) = err_rx.try_recv() {
+                panic!("in-process orbit shim exited before ready: {err}");
+            }
             if sock_path.exists()
                 && let Ok(client) = ShimClient::connect(&sock_path).await
             {

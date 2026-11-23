@@ -27,6 +27,14 @@ val hasReleaseSigning = !releaseKeystorePath.isNullOrBlank() &&
     !releaseKeyAlias.isNullOrBlank() &&
     !releaseKeyPassword.isNullOrBlank()
 
+val configuredAbis = providers.gradleProperty("orbitAndroidAbis")
+    .orNull
+    ?.split(",")
+    ?.map { it.trim() }
+    ?.filter { it.isNotEmpty() }
+    ?.takeIf { it.isNotEmpty() }
+    ?: listOf("arm64-v8a", "x86_64")
+
 android {
     namespace = "dev.orbit.android"
     compileSdk = 36
@@ -35,11 +43,11 @@ android {
         applicationId = "dev.orbit.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 9008
-        versionName = "0.9.8"
+        versionCode = 9009
+        versionName = "0.9.9"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += configuredAbis
         }
     }
 

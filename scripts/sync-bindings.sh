@@ -20,13 +20,13 @@ if [ ! -f "$LIB_PATH" ]; then
 fi
 
 mkdir -p "$REPO_ROOT/apps/ios/Generated"
-cargo run -p orbit-ffi-uniffi --bin uniffi-bindgen -- generate \
+cargo run -p orbit-uniffi-bindgen --bin uniffi-bindgen -- generate \
   --library "$LIB_PATH" \
   --language swift \
   --out-dir "$REPO_ROOT/apps/ios/Generated"
 
 mkdir -p "$REPO_ROOT/apps/android/app/src/main/java"
-cargo run -p orbit-ffi-uniffi --bin uniffi-bindgen -- generate \
+cargo run -p orbit-uniffi-bindgen --bin uniffi-bindgen -- generate \
   --library "$LIB_PATH" \
   --language kotlin \
   --no-format \

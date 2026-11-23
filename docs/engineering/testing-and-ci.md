@@ -26,7 +26,13 @@
    - `ios-build-and-simulator-smoke`（macOS）：XCFramework + `xcodegen` + Simulator UI/Logic smoke
    - Android UniFFI & Debug APK build
 
-In Release ([`release.yml`](../../.github/workflows/release.yml))，所有跨平台包构建任务（CLI / Desktop / Android / iOS / HarmonyOS）必须以 `needs: [rust-quality-and-unit, e2e-regression-matrix]`（前端包再加 `desktop-frontend-quality`）为门禁。
+In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight ([`testflight.yml`](../../.github/workflows/testflight.yml))：
+
+- **全量门禁后置并行**：`release.yml` 中所有跨平台构建任务（Linux CLI、macOS/Linux/Windows Desktop、Android、iOS、HarmonyOS）与 `rust-quality-and-unit`、`e2e-regression-matrix`、`desktop-frontend-quality` 从 `t = 0` **并发启动**，由最终的 `publish-github-release` 通过 `needs:` 统一拦截——任何质量、E2E 或前端烟测失败均不会创建 GitHub Release。
+- **合并 macOS / Windows CLI 与 Desktop 产物**：`build-macos-desktop` 与 `build-windows-desktop` 构建 `orbit` sidecar 后顺带上传 `orbit-cli-macos-arm64` 与 `orbit-windows-x86_64.exe`，消除重复冷编译并减少 1 个 macOS Runner 槽位占用；`build-host-binaries` 仅负责 Linux (`x86_64` / `aarch64`) 静态二进制。
+- **轻量 UniFFI Bindgen 与 Release 精简切片**：独立 `crates/orbit-uniffi-bindgen` 负责生成 Swift/Kotlin 绑定，避免移动构建时重编宿主 debug `orbit-ffi-uniffi`；`release.yml` 与 `testflight.yml` 通过 `./apps/ios/scripts/build-rust-xcframework.sh --device-only` 仅构建真机 `aarch64-apple-ios` 切片，Android Release 通过 `./apps/android/scripts/build-rust-android.sh --arm64-only` 搭配 `-PorbitAndroidAbis=arm64-v8a` 仅打 `arm64-v8a` 真机 APK（`ci.yml` 仍保留 iOS Simulator 与 Android 双 ABI 检查）。
+- **TestFlight Ubuntu 凭据预检**：`testflight.yml` 先在 `ubuntu-latest` 执行 `check-credentials`，缺失 Apple Secrets 时直接跳过，避免空占 `macos-latest` 队列。
+- **统一编译并发与双层缓存**：CI/Release/TestFlight 统一设置 `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`（保留 `lto = "thin"`）；各 Rust Job 标准化 `Swatinem/rust-cache@v2` 的 `shared-key` 并限定 `save-if: ${{ github.ref == 'refs/heads/main' }}`，避免 `v*` Tag 缓存互相不可读及撑爆 10 GB 配额；Desktop 打包 Job 与 Windows CI 额外通过 `mozilla-actions/sccache-action` 使用本地临时 `SCCACHE_DIR` 在同 Job 的 `orbit-cli` 与 `apps/desktop/src-tauri`（对齐 `[profile.release]`）间复用 ~405 个重叠 crate 的编译缓存。
 
 ---
 

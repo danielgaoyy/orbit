@@ -33,6 +33,7 @@ orbit/
 │   ├── orbit-relay-transport/# 共享 Relay 与 ssh+relay 隧道客户端传输层
 │   ├── orbit-client-core/    # 全端共享 MVU 状态机 + 连接池 + Markdown/Highlight/Diff/VT100 引擎
 │   ├── orbit-ffi-uniffi/     # UniFFI v0.32 绑定导出（服务 iOS SwiftUI & Android Compose）
+│   ├── orbit-uniffi-bindgen/ # 轻量独立 UniFFI CLI 绑定生成器（避免移动构建重编宿主 Core）
 │   ├── orbit-ffi-ohos/       # ohos-rs (napi-ohos) 绑定导出（服务 HarmonyOS 7+ ArkUI V2）
 │   └── orbit-cli/            # 多合一单静态二进制 CLI (daemon / shim / relay / client)
 └── apps/

@@ -11,6 +11,7 @@ members = [
     "crates/orbit-relay-transport",
     "crates/orbit-client-core",
     "crates/orbit-ffi-uniffi",
+    "crates/orbit-uniffi-bindgen",
     "crates/orbit-ffi-ohos",
     "crates/orbit-cli",
 ]
@@ -19,7 +20,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.9.8"
+version = "0.9.9"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 

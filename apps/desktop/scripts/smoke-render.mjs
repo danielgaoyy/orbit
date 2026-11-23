@@ -47,7 +47,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
     custom_direct_endpoint: null,
     via_ssh_tunnel: false,
     last_ping_ms: 1,
-    daemon_version: "0.9.3",
+    daemon_version: "0.9.8",
     os_arch: "darwin/aarch64",
     daemon_pubkey_b64: "",
     direct_endpoints: ["127.0.0.1:6868"],
@@ -58,6 +58,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
     workspace_count: 1,
     agent_count: 1,
     pending_approval_count: 0,
+    supports_server_queue: true,
   };
 
   const mockWorkspace = {
@@ -116,9 +117,9 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
         case "subscribe_core_events":
           return null;
         case "get_bridge_info":
-          return { protocol_version: 2, core_version: "0.9.3", capabilities: [] };
+          return { protocol_version: 2, core_version: "0.9.8", capabilities: [] };
         case "get_app_version":
-          return "0.9.3";
+          return "0.9.8";
         case "list_external_editors":
         case "list_ssh_hosts":
         case "get_fallback_provider_catalogs":
@@ -188,8 +189,12 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             host_id: "host_smoke_1",
             agent: mockAgent,
             replace_from_turn_index: 0,
+            window_start_turn_index: 0,
             changed_turns: [],
             total_turn_count: 0,
+            has_older_turns: false,
+            has_older_history: false,
+            oldest_loaded_seq: 0,
             pending_permissions: [],
             pending_questions: [],
             session_turn_diffs: [],
@@ -197,8 +202,12 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             latest_seq: 0,
             reset: true,
             aux_revision: 1,
-            aux_changed: true,
+            aux_unchanged: false,
           };
+        case "get_agent_stage_turns_slice":
+          return [];
+        case "load_older_agent_timeline":
+          return true;
         case "get_git_review":
           return {
             revision: 1,
@@ -232,6 +241,159 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
     },
   };
 })();`;
+
+const MOCK_TAURI_PAGINATED_INIT_SCRIPT = (() => {
+  const makeParagraph = (text) => [
+    {
+      kind: "paragraph",
+      spans: [
+        {
+          text,
+          bold: false,
+          italic: false,
+          strikethrough: false,
+          inline_code: false,
+          link_url: null,
+        },
+      ],
+    },
+  ];
+  const zeroCounts = {
+    edited_file_count: 0,
+    created_file_count: 0,
+    command_count: 0,
+    read_file_count: 0,
+    search_count: 0,
+    subagent_count: 0,
+    mcp_server_count: 0,
+    other_tool_count: 0,
+    thought_count: 0,
+    narration_count: 0,
+    action_steps: 0,
+    total_steps: 0,
+    failed_count: 0,
+    denied_count: 0,
+    unrecovered_failure_count: 0,
+    additions: 0,
+    deletions: 0,
+  };
+  const turns = [117, 118, 119].map((idx) => {
+    const promptSeq = idx * 3;
+    const replySeq = idx * 3 + 1;
+    const promptText = `Paginated prompt turn ${idx}`;
+    const replyText = `Paginated response ${idx}`;
+    const replyItem = {
+      item_type: "assistant_message",
+      seq: replySeq,
+      item_id: `m_pag_${idx}`,
+      text: replyText,
+      streaming: false,
+      blocks: makeParagraph(replyText),
+      timestamp_ms: 1732360001000 + idx * 1000,
+    };
+    return {
+      key: `turn-${idx}`,
+      turn_index: idx,
+      anchor_seq: promptSeq,
+      user_prompt: {
+        item_type: "user_prompt",
+        seq: promptSeq,
+        message_id: `u_pag_${idx}`,
+        text: promptText,
+        badges: [],
+        blocks: makeParagraph(promptText),
+        timestamp_ms: 1732360000000 + idx * 1000,
+      },
+      agent_message: null,
+      is_compaction_command: false,
+      folded_steps: [],
+      work_counts: zeroCounts,
+      work_summary_label: "",
+      work_summary_live_label: "",
+      work_summary_live_detail: null,
+      work_summary_includes_failure: false,
+      thought_duration_ms: null,
+      work_duration_ms: null,
+      turn_duration_ms: null,
+      terminal_reply: replyItem,
+      last_assistant_reply: {
+        ...replyItem,
+        blocks: [],
+      },
+      notices: [],
+      compactions: [],
+      live_segments: [
+        {
+          kind: "assistant_message",
+          key: `seg_m_${idx}`,
+          item: replyItem,
+        },
+      ],
+      turn_diffs: [],
+      has_error: false,
+      has_unrecovered_error: false,
+      has_active_item: false,
+      started_at_ms: 1732360000000 + idx * 1000,
+      completed_at_ms: 1732360001000 + idx * 1000,
+    };
+  });
+  const baseScript = MOCK_TAURI_INIT_SCRIPT.slice(0, -5);
+  return `${baseScript}
+  const origInvoke = window.__TAURI_INTERNALS__.invoke;
+  window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
+    if (cmd === "get_agent_stage_delta") {
+      return {
+        revision: 4,
+        host_id: "host_smoke_1",
+        agent: {
+          agent_id: "ag_smoke_1",
+          workspace_id: "ws_smoke_1",
+          cwd: "/tmp/smoke",
+          title: "Smoke Session",
+          provider: "codex",
+          provider_label: "Codex",
+          model: null,
+          effort: null,
+          mode: "auto",
+          status_label: "Idle",
+          is_running: false,
+          is_awaiting_permission: false,
+          parent_agent_id: null,
+          latest_seq: 358,
+          updated_at_rfc3339: "2026-11-23T00:00:00Z",
+          is_pinned: false,
+          seen_seq: 358,
+          is_unread: false,
+        },
+        replace_from_turn_index: 117,
+        window_start_turn_index: 117,
+        changed_turns: ${JSON.stringify(turns)},
+        total_turn_count: 120,
+        has_older_turns: true,
+        has_older_history: true,
+        oldest_loaded_seq: 350,
+        pending_permissions: [],
+        pending_questions: [],
+        session_turn_diffs: [],
+        insights: {
+          touched_files: [],
+          background_tasks: [],
+          subagents: [],
+          detected_local_urls: [],
+        },
+        latest_seq: 358,
+        reset: true,
+        aux_revision: 1,
+        aux_unchanged: false,
+      };
+    }
+    if (cmd === "get_agent_stage_turns_slice" || cmd === "load_older_agent_timeline") {
+      return cmd === "load_older_agent_timeline" ? true : [];
+    }
+    return origInvoke(cmd, args);
+  };
+})();`;
+})();
 
 function findChromeBinary() {
   const envBin = process.env.CHROME_BIN;
@@ -727,6 +889,26 @@ async function main() {
           if (!health.hasMain || !health.hasTextarea) {
             errs.push(
               `Expected active conversation landmarks missing (hasMain=${health.hasMain}, hasTextarea=${health.hasTextarea}).`,
+            );
+          }
+          return errs;
+        },
+      }),
+      await runPass({
+        port,
+        serverUrl,
+        name: "mocked-tauri-paginated-large-session",
+        initScript: MOCK_TAURI_PAGINATED_INIT_SCRIPT,
+        assertHealth: (health) => {
+          const errs = [];
+          if (!health.hasMain || !health.hasTextarea) {
+            errs.push(
+              `Expected paginated conversation landmarks missing (hasMain=${health.hasMain}, hasTextarea=${health.hasTextarea}).`,
+            );
+          }
+          if (!health.bodyText.includes("Paginated response 119")) {
+            errs.push(
+              `Expected tail paginated assistant response to render in DOM, got: ${JSON.stringify(health.bodyText)}`,
             );
           }
           return errs;

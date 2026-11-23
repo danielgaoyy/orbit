@@ -17,7 +17,7 @@ use crate::{
 pub const LABEL_HANDLE_ALIASES: &str = "orbit.handle_aliases";
 const MAX_HANDLE_ALIASES: usize = 8;
 
-fn record_previous_handle_alias(
+pub(crate) fn record_previous_handle_alias(
     labels: &mut std::collections::HashMap<String, String>,
     old_handle: &str,
     new_handle: &str,
@@ -1492,6 +1492,145 @@ mod tests {
             !back_aliases
                 .iter()
                 .any(|a| a.eq_ignore_ascii_case("alias-8"))
+        );
+    }
+
+    #[test]
+    fn update_agent_fields_records_previous_handle_aliases_with_and_without_labels() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_upd_alias".into(),
+                title: "Alias Update".into(),
+                cwd: "/repo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let mut initial_labels = std::collections::HashMap::new();
+        initial_labels.insert("role".into(), "worker".into());
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_upd_alias".into(),
+                    workspace_id: "ws_upd_alias".into(),
+                    cwd: "/repo".into(),
+                    title: "Worker Session".into(),
+                    provider: orbit_protocol::ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: orbit_protocol::SessionMode::AcceptEdits,
+                    status: orbit_protocol::AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: initial_labels,
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("beta".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("agent");
+
+        // Rename via update_agent_fields with `labels = None` -> must still record `"beta"`
+        store
+            .update_agent_fields(
+                "ag_upd_alias",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("beta-renamed"),
+                None,
+                None,
+            )
+            .expect("rename without labels");
+        let after_first = store
+            .get_agent("ag_upd_alias")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(after_first.handle.as_deref(), Some("beta-renamed"));
+        assert_eq!(
+            after_first
+                .labels
+                .get(LABEL_HANDLE_ALIASES)
+                .map(String::as_str),
+            Some("beta")
+        );
+        assert_eq!(
+            after_first.labels.get("role").map(String::as_str),
+            Some("worker")
+        );
+
+        // Rename again WITH `labels = Some(...)` and `title = Some(...)` -> single SQL update must keep both
+        let mut extra_labels = std::collections::HashMap::new();
+        extra_labels.insert("orbit.title_locked".into(), "1".into());
+        store
+            .update_agent_fields(
+                "ag_upd_alias",
+                Some("Renamed Title"),
+                None,
+                None,
+                None,
+                Some(&extra_labels),
+                Some("beta-v3"),
+                None,
+                None,
+            )
+            .expect("rename with labels");
+        let after_second = store
+            .get_agent("ag_upd_alias")
+            .expect("get 2")
+            .expect("exists 2");
+        assert_eq!(after_second.title, "Renamed Title");
+        assert_eq!(after_second.handle.as_deref(), Some("beta-v3"));
+        assert_eq!(
+            after_second
+                .labels
+                .get("orbit.title_locked")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            after_second
+                .labels
+                .get(LABEL_HANDLE_ALIASES)
+                .map(String::as_str),
+            Some("beta-renamed,beta")
         );
     }
 }

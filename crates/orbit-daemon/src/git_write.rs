@@ -1735,6 +1735,7 @@ mod tests {
         run_git_ok(dir, &["config", "user.email", "test@orbit.local"]).await;
         run_git_ok(dir, &["config", "user.name", "Orbit Tester"]).await;
         run_git_ok(dir, &["config", "commit.gpgsign", "false"]).await;
+        run_git_ok(dir, &["config", "core.autocrlf", "false"]).await;
     }
 
     #[tokio::test]
@@ -1834,28 +1835,40 @@ mod tests {
         let tmp = TempDirGuard::new("git-literal-glob");
         init_test_repo(tmp.path()).await;
 
+        // Character-class globs `[1]` and `[0-9]` are valid filenames on all platforms (including
+        // Windows NTFS) and match `file1.txt` whenever `GIT_LITERAL_PATHSPECS=1` is missing.
         std::fs::write(tmp.path().join("file1.txt"), "v1\n").expect("write file1");
-        std::fs::write(tmp.path().join("file?.txt"), "q1\n").expect("write literal ?");
-        std::fs::write(tmp.path().join("file*.txt"), "s1\n").expect("write literal *");
+        std::fs::write(tmp.path().join("file[1].txt"), "b1\n").expect("write literal [1]");
+        std::fs::write(tmp.path().join("file[0-9].txt"), "r1\n").expect("write literal [0-9]");
+        #[cfg(unix)]
+        {
+            std::fs::write(tmp.path().join("file?.txt"), "q1\n").expect("write literal ?");
+            std::fs::write(tmp.path().join("file*.txt"), "s1\n").expect("write literal *");
+        }
         stage_files(tmp.path(), &[], true).await.expect("stage all");
         commit_changes(tmp.path(), "initial", false)
             .await
             .expect("commit");
 
         std::fs::write(tmp.path().join("file1.txt"), "dirty1\n").expect("dirty file1");
-        std::fs::write(tmp.path().join("file?.txt"), "dirtyq\n").expect("dirty ?");
-        std::fs::write(tmp.path().join("file*.txt"), "dirtys\n").expect("dirty *");
+        std::fs::write(tmp.path().join("file[1].txt"), "dirtyb\n").expect("dirty [1]");
+        std::fs::write(tmp.path().join("file[0-9].txt"), "dirtyr\n").expect("dirty [0-9]");
+        #[cfg(unix)]
+        {
+            std::fs::write(tmp.path().join("file?.txt"), "dirtyq\n").expect("dirty ?");
+            std::fs::write(tmp.path().join("file*.txt"), "dirtys\n").expect("dirty *");
+        }
 
-        // Stage ONLY literal `file?.txt` — `file1.txt` and `file*.txt` must remain unstaged!
-        stage_files(tmp.path(), &["file?.txt".into()], false)
+        // Stage ONLY literal `file[1].txt` — `file1.txt` and `file[0-9].txt` must remain unstaged!
+        stage_files(tmp.path(), &["file[1].txt".into()], false)
             .await
-            .expect("stage literal ?");
+            .expect("stage literal [1]");
         let status = inspect_git_status(tmp.path()).await;
         assert!(
             status
                 .files
                 .iter()
-                .any(|f| f.path == "file?.txt" && f.staged)
+                .any(|f| f.path == "file[1].txt" && f.staged)
         );
         assert!(
             status
@@ -1867,21 +1880,61 @@ mod tests {
             status
                 .files
                 .iter()
-                .any(|f| f.path == "file*.txt" && !f.staged)
+                .any(|f| f.path == "file[0-9].txt" && !f.staged)
         );
 
-        // Discard ONLY literal `file*.txt` — `file1.txt` must keep its dirty edit!
-        discard_files(tmp.path(), &["file*.txt".into()], false)
+        // Discard ONLY literal `file[0-9].txt` — `file1.txt` must keep its dirty edit!
+        discard_files(tmp.path(), &["file[0-9].txt".into()], false)
             .await
-            .expect("discard literal *");
+            .expect("discard literal [0-9]");
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("file*.txt")).expect("read *"),
-            "s1\n"
+            std::fs::read_to_string(tmp.path().join("file[0-9].txt")).expect("read [0-9]"),
+            "r1\n"
         );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("file1.txt")).expect("read file1"),
             "dirty1\n"
         );
+
+        #[cfg(unix)]
+        {
+            // Stage ONLY literal `file?.txt` — `file1.txt` and `file*.txt` must remain unstaged!
+            stage_files(tmp.path(), &["file?.txt".into()], false)
+                .await
+                .expect("stage literal ?");
+            let status = inspect_git_status(tmp.path()).await;
+            assert!(
+                status
+                    .files
+                    .iter()
+                    .any(|f| f.path == "file?.txt" && f.staged)
+            );
+            assert!(
+                status
+                    .files
+                    .iter()
+                    .any(|f| f.path == "file1.txt" && !f.staged)
+            );
+            assert!(
+                status
+                    .files
+                    .iter()
+                    .any(|f| f.path == "file*.txt" && !f.staged)
+            );
+
+            // Discard ONLY literal `file*.txt` — `file1.txt` must keep its dirty edit!
+            discard_files(tmp.path(), &["file*.txt".into()], false)
+                .await
+                .expect("discard literal *");
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("file*.txt")).expect("read *"),
+                "s1\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("file1.txt")).expect("read file1"),
+                "dirty1\n"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1899,26 +1952,46 @@ mod tests {
 
         std::fs::write(tmp.path().join("report"), "dirty\n").expect("dirty report");
 
-        // Requesting `"report "` (trailing space) must NOT silently trim and discard `"report"`!
-        let err = discard_files(tmp.path(), &["report ".into()], true)
-            .await
-            .expect_err("trailing space path must not resolve to trimmed path");
-        assert!(matches!(err, GitWriteError::InvalidPath { .. }));
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("report")).expect("read report"),
-            "dirty\n"
-        );
+        // Requesting `"report "` (trailing space) or `" report"` (leading space) must NOT
+        // silently trim and discard `"report"`!
+        for padded in ["report ", " report"] {
+            let err = discard_files(tmp.path(), &[padded.into()], true)
+                .await
+                .expect_err("whitespace-padded path must not resolve to trimmed path");
+            assert!(matches!(err, GitWriteError::InvalidPath { .. }));
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("report")).expect("read report"),
+                "dirty\n"
+            );
+        }
 
-        // And if a literal `"report "` file exists, discarding it must leave `"report"` untouched.
-        std::fs::write(tmp.path().join("report "), "scratch\n").expect("write report space");
-        discard_files(tmp.path(), &["report ".into()], true)
+        // Leading-space filenames are valid across Unix and Windows; discarding `" report"`
+        // must leave `"report"` untouched.
+        std::fs::write(tmp.path().join(" report"), "scratch-leading\n")
+            .expect("write leading space report");
+        discard_files(tmp.path(), &[" report".into()], true)
             .await
-            .expect("discard literal trailing-space file");
-        assert!(!tmp.path().join("report ").exists());
+            .expect("discard literal leading-space file");
+        assert!(!tmp.path().join(" report").exists());
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("report")).expect("read report untouched"),
             "dirty\n"
         );
+
+        // Win32 silently strips trailing spaces when creating files, so only test a literal
+        // trailing-space file on non-Windows filesystems.
+        #[cfg(not(windows))]
+        {
+            std::fs::write(tmp.path().join("report "), "scratch\n").expect("write report space");
+            discard_files(tmp.path(), &["report ".into()], true)
+                .await
+                .expect("discard literal trailing-space file");
+            assert!(!tmp.path().join("report ").exists());
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("report")).expect("read report untouched"),
+                "dirty\n"
+            );
+        }
     }
 
     #[tokio::test]

@@ -2131,18 +2131,15 @@ async fn open_detached_terminal_window(
 
     let app_url =
         build_detached_terminal_url(trimmed_host, trimmed_tid, &effective_title, cwd.as_deref());
-    let mut builder =
-        WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(PathBuf::from(app_url)))
-            .title(&effective_title)
-            .inner_size(860.0, 540.0)
-            .min_inner_size(460.0, 300.0);
+    let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(PathBuf::from(app_url)))
+        .title(&effective_title)
+        .inner_size(860.0, 540.0)
+        .min_inner_size(460.0, 300.0);
 
     #[cfg(target_os = "macos")]
-    {
-        builder = builder
-            .title_bar_style(tauri::TitleBarStyle::Overlay)
-            .hidden_title(true);
-    }
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
 
     builder
         .build()

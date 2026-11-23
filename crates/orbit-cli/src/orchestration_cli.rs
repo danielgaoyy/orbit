@@ -1750,6 +1750,7 @@ pub async fn cmd_profile(
                 mcp_policy: McpToolPolicy {
                     enabled: !disable_mcp,
                     disabled_tools,
+                    ..McpToolPolicy::default()
                 },
                 created_at: now,
                 updated_at: now,

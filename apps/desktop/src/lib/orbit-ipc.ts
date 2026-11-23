@@ -817,6 +817,8 @@ export interface PendingPermissionSummary {
 export interface McpToolPolicy {
   enabled: boolean;
   disabled_tools: string[];
+  enabled_packs?: string[] | null;
+  disabled_packs?: string[];
 }
 
 export interface AgentProfile {
@@ -1210,6 +1212,7 @@ export type TimerCondition =
   | { kind: "any_message" }
   | { kind: "sender"; sender_id: string }
   | { kind: "all_subagents_settled" }
+  | { kind: "all_peers_settled" }
   | { kind: "file_changed"; path: string };
 
 export type ConditionalTimerState =
@@ -1242,6 +1245,8 @@ export function formatTimerConditionLabel(condition: TimerCondition): string {
       return `until ${condition.sender_id}`;
     case "all_subagents_settled":
       return "until subagents settle";
+    case "all_peers_settled":
+      return "until workspace peers settle";
     case "file_changed": {
       const leaf = condition.path.split(/[\\/]/).pop() || condition.path;
       return `until ${leaf} changes`;

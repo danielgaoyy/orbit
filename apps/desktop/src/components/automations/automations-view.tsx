@@ -480,6 +480,9 @@ export function AutomationsView() {
       case "all_subagents_settled":
         condition = { kind: "all_subagents_settled" };
         break;
+      case "all_peers_settled":
+        condition = { kind: "all_peers_settled" };
+        break;
       case "sender": {
         const sid = timerConditionArg.trim();
         if (!sid) {
@@ -1767,6 +1770,7 @@ export function AutomationsView() {
                 options={[
                   { value: "any_message", label: "Any incoming message" },
                   { value: "all_subagents_settled", label: "All subagents settled" },
+                  { value: "all_peers_settled", label: "All workspace peers settled" },
                   { value: "sender", label: "Message from specific sender" },
                   { value: "file_changed", label: "Workspace file changed" },
                   { value: "never", label: "Never (fixed timer)" },

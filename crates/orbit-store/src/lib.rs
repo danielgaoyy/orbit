@@ -3498,6 +3498,7 @@ mod tests {
             mcp_policy: orbit_protocol::McpToolPolicy {
                 enabled: true,
                 disabled_tools: vec!["create_agent".into()],
+                ..orbit_protocol::McpToolPolicy::default()
             },
             created_at: now,
             updated_at: now,

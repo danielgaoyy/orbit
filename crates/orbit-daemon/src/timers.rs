@@ -660,6 +660,61 @@ impl ConditionalTimerEngine {
         canceled
     }
 
+    /// Cancel all matching `TimerCondition::AllPeersSettled` armed timers inside `workspace_id`
+    /// whose owner now observes all sibling peers in settled state (`Idle` / `Error` / `Closed`).
+    pub async fn notify_workspace_peer_settled(
+        &self,
+        workspace_id: &str,
+        settled_agent_id: &str,
+    ) -> Vec<ConditionalTimerRecord> {
+        let store_list = Arc::clone(&self.store);
+        let Ok(Ok(armed)) =
+            tokio::task::spawn_blocking(move || store_list.list_armed_conditional_timers(None))
+                .await
+        else {
+            return Vec::new();
+        };
+
+        let mut canceled = Vec::new();
+        for timer in armed {
+            if timer.condition != TimerCondition::AllPeersSettled
+                || timer.workspace_id != workspace_id
+                || timer.agent_id == settled_agent_id
+            {
+                continue;
+            }
+            if !self
+                .orchestrator
+                .are_all_workspace_peers_settled(&timer.agent_id)
+            {
+                continue;
+            }
+            if let Ok(Some(updated)) = self
+                .cancel_timer_internal(
+                    &timer.timer_id,
+                    ConditionalTimerState::CanceledEarly,
+                    "Canceled early: all workspace peers settled",
+                )
+                .await
+            {
+                let body = format!(
+                    "[Conditional Timer {} · Early Wakeup: all workspace peers settled]\n\n{}",
+                    updated.timer_id, updated.prompt
+                );
+                if let Err(err) = (self.dispatcher)(updated.clone(), body).await {
+                    warn!(
+                        timer_id = %updated.timer_id,
+                        agent_id = %updated.agent_id,
+                        error = %err,
+                        "Failed to dispatch all_peers early wakeup"
+                    );
+                }
+                canceled.push(updated);
+            }
+        }
+        canceled
+    }
+
     /// Cancel all armed timers belonging to an agent (e.g. when the agent is archived or deleted).
     pub async fn cancel_all_for_agent(&self, agent_id: &str, reason: &str) {
         let store_list = Arc::clone(&self.store);
@@ -1673,5 +1728,61 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert_eq!(bad_rec.state, ConditionalTimerState::CanceledEarly);
+    }
+
+    #[tokio::test]
+    async fn all_peers_settled_barrier_wakes_waiting_peer_early() {
+        let tmp = TestTempDir::new();
+        let ws_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir");
+        let (store, _orch, engine, dispatches, count) =
+            setup_test_engine_with_delay(tmp.path(), &ws_dir, Duration::ZERO).await;
+
+        let peer_b = make_agent(
+            "ag_peer_b",
+            "ws_timer_test",
+            &ws_dir,
+            None,
+            AgentStatus::Running {
+                turn_id: "t_b1".into(),
+            },
+        );
+        store.upsert_agent(&peer_b, None).expect("upsert peer b");
+
+        let timer = engine
+            .create_timer(
+                "ag_timer_main",
+                30,
+                "All peers settled; proceed to merge.".into(),
+                TimerCondition::AllPeersSettled,
+            )
+            .await
+            .expect("arm all_peers timer");
+
+        // While peer_b is still Running, notifying settled for another id must not fire early.
+        let premature = engine
+            .notify_workspace_peer_settled("ws_timer_test", "ag_other")
+            .await;
+        assert!(premature.is_empty());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        store
+            .update_agent_status("ag_peer_b", &AgentStatus::Idle)
+            .expect("peer b idle");
+        let canceled = engine
+            .notify_workspace_peer_settled("ws_timer_test", "ag_peer_b")
+            .await;
+        assert_eq!(canceled.len(), 1);
+        assert_eq!(canceled[0].state, ConditionalTimerState::CanceledEarly);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        let captured = dispatches.lock().await;
+        assert_eq!(captured[0].0, timer.timer_id);
+        assert!(captured[0].1.contains("all workspace peers settled"));
+        assert!(
+            captured[0]
+                .1
+                .contains("All peers settled; proceed to merge.")
+        );
     }
 }

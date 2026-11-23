@@ -1714,6 +1714,64 @@ pub fn match_rules_for_workspace(
     )
 }
 
+/// Session-deduplicated variant of [`match_rules_for_workspace`].
+///
+/// Tracks `(rule.id -> sha256(trigger_mode + body))` in `already_injected` so unmodified
+/// `Always` / `GlobAutoAttach` / `AgentDecided` rules are injected only once per session (keeping
+/// later turns clean for LLM prompt caching). Explicit `@rule:<name>` manual mentions still re-inject
+/// on demand.
+pub fn match_rules_for_workspace_dedup(
+    orbit_home: &Path,
+    cwd: Option<&Path>,
+    active_paths: &[String],
+    manual_rule_names: &[String],
+    already_injected: &mut std::collections::HashMap<String, String>,
+) -> MatchedPathRulesResult {
+    let discovered = discover_path_rules(orbit_home, cwd);
+    if discovered.rules.is_empty() {
+        return MatchedPathRulesResult::default();
+    }
+    let manual_set: HashSet<String> = manual_rule_names
+        .iter()
+        .map(|n| n.trim().trim_start_matches("@rule:").to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    let mut rule_hashes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(discovered.rules.len());
+    let mut filtered_rules: Vec<PathScopedRule> = Vec::with_capacity(discovered.rules.len());
+    for rule in &discovered.rules {
+        let content_hash =
+            sha256_hex(format!("{:?}\n{}", rule.trigger_mode, rule.body.trim()).as_bytes());
+        let is_manual = manual_set.contains(&rule.name.to_ascii_lowercase())
+            || manual_set.contains(&rule.id.to_ascii_lowercase());
+        let unchanged = already_injected
+            .get(&rule.id)
+            .is_some_and(|prev| prev == &content_hash);
+        if is_manual || !unchanged {
+            rule_hashes.insert(rule.id.clone(), content_hash);
+            filtered_rules.push(rule.clone());
+        }
+    }
+
+    if filtered_rules.is_empty() {
+        return MatchedPathRulesResult::default();
+    }
+
+    let result = match_and_build_rules_injection(
+        &filtered_rules,
+        active_paths,
+        manual_rule_names,
+        PATH_RULES_HARD_CAP_TOKENS,
+    );
+    for m in &result.matched {
+        if let Some(h) = rule_hashes.get(&m.id) {
+            already_injected.insert(m.id.clone(), h.clone());
+        }
+    }
+    result
+}
+
 /// Extract active workspace file paths and `@rule:<name>` tokens from a user prompt and its badges.
 pub fn extract_prompt_rule_signals(
     prompt: &str,
@@ -2523,6 +2581,56 @@ Run release verification steps.
         assert_eq!(
             manual,
             vec!["rust-strict".to_string(), "release-gate".to_string()]
+        );
+    }
+
+    #[test]
+    fn match_rules_for_workspace_dedup_suppresses_unchanged_rules_on_subsequent_turns() {
+        let dir = tempdir().expect("tempdir");
+        let orbit_home = dir.path().join("orbit_home");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&orbit_home).expect("mkdir orbit_home");
+        fs::create_dir_all(repo.join(".orbit/rules")).expect("mkdir rules");
+
+        let rule_path = repo.join(".orbit/rules/rust-style.md");
+        fs::write(
+            &rule_path,
+            "---\ndescription: Rust rules\npaths:\n  - \"src/**/*.rs\"\n---\n\nNever use unwrap.\n",
+        )
+        .expect("write rule");
+
+        let mut seen = std::collections::HashMap::new();
+        let active = vec!["src/lib.rs".to_string()];
+
+        // Turn 1: injects rule
+        let r1 = match_rules_for_workspace_dedup(&orbit_home, Some(&repo), &active, &[], &mut seen);
+        assert!(r1.injected_markdown.contains("Never use unwrap."));
+        assert_eq!(seen.len(), 1);
+
+        // Turn 2 with same edited file: 0 bytes re-injected
+        let r2 = match_rules_for_workspace_dedup(&orbit_home, Some(&repo), &active, &[], &mut seen);
+        assert!(r2.injected_markdown.is_empty());
+
+        // Turn 3 if user explicitly requests @rule:rust-style -> re-injected on demand
+        let r3 = match_rules_for_workspace_dedup(
+            &orbit_home,
+            Some(&repo),
+            &active,
+            &["rust-style".to_string()],
+            &mut seen,
+        );
+        assert!(r3.injected_markdown.contains("Never use unwrap."));
+
+        // Turn 4 if rule content changes on disk -> automatically re-injected
+        fs::write(
+            &rule_path,
+            "---\ndescription: Rust rules\npaths:\n  - \"src/**/*.rs\"\n---\n\nNever use unwrap or expect in prod.\n",
+        )
+        .expect("update rule");
+        let r4 = match_rules_for_workspace_dedup(&orbit_home, Some(&repo), &active, &[], &mut seen);
+        assert!(
+            r4.injected_markdown
+                .contains("Never use unwrap or expect in prod.")
         );
     }
 }

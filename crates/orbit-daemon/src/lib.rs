@@ -324,6 +324,7 @@ impl DaemonRuntime {
                 Box::pin(async move { orch.dispatch_coalesced_batch(batch).await })
             }),
         );
+        orchestrator.set_message_delivery(delivery.clone()).await;
 
         let connected_hosts = ConnectedHostsManager::new(host_id.clone(), store.clone());
         let finish_subs = FinishSubscriptionManager::new(
@@ -1628,6 +1629,7 @@ async fn handle_wire_rpc(
                 let reply = match orch
                     .execute_worktree_handoff(crate::manager::ExecuteWorktreeHandoffSpec {
                         workspace_id,
+                        source_agent_id: None,
                         direction,
                         mode,
                         target_workspace_id,

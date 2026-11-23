@@ -817,17 +817,77 @@ impl OrbitStore {
         updated_by: Option<&str>,
         board_path: Option<&str>,
     ) -> Result<WorkspaceBoardSnapshot, StoreError> {
+        let owned = content.to_string();
+        match self.upsert_workspace_board_with_cas(
+            workspace_id,
+            None,
+            updated_by,
+            board_path,
+            move |_| owned,
+        )? {
+            Ok(snap) | Err(snap) => Ok(snap),
+        }
+    }
+
+    /// Atomically inspect and update `workspace_boards` within a single SQLite transaction,
+    /// optionally enforcing optimistic concurrency (`expected_revision`).
+    ///
+    /// Returns `Ok(Ok(snapshot))` on commit, or `Ok(Err(current_snapshot))` when
+    /// `expected_revision` mismatches the current database revision (leaving the row untouched).
+    pub fn upsert_workspace_board_with_cas<F>(
+        &self,
+        workspace_id: &str,
+        expected_revision: Option<u64>,
+        updated_by: Option<&str>,
+        board_path: Option<&str>,
+        build_content: F,
+    ) -> Result<Result<WorkspaceBoardSnapshot, WorkspaceBoardSnapshot>, StoreError>
+    where
+        F: FnOnce(Option<&str>) -> String,
+    {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
-        let prev_rev: i64 = tx
+        type ExistingBoardRow = (String, i64, Option<String>, Option<String>, String);
+        let existing_row: Option<ExistingBoardRow> = tx
             .query_row(
-                "SELECT revision FROM workspace_boards WHERE workspace_id = ?1",
+                "SELECT content, revision, updated_by, board_path, updated_at
+                 FROM workspace_boards WHERE workspace_id = ?1",
                 params![workspace_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
-            .optional()?
+            .optional()?;
+
+        let prev_rev = existing_row
+            .as_ref()
+            .map(|r| r.1.max(0) as u64)
             .unwrap_or(0);
-        let next_rev = prev_rev.saturating_add(1);
+        if let Some(exp) = expected_revision
+            && prev_rev != exp
+        {
+            let current_snapshot = match existing_row {
+                Some((cur_content, cur_rev, cur_by, cur_path, cur_ts)) => WorkspaceBoardSnapshot {
+                    workspace_id: workspace_id.to_string(),
+                    content: cur_content,
+                    revision: cur_rev.max(0) as u64,
+                    updated_by: cur_by,
+                    updated_at: parse_ts(&cur_ts),
+                    board_path: cur_path,
+                },
+                None => WorkspaceBoardSnapshot {
+                    workspace_id: workspace_id.to_string(),
+                    content: String::new(),
+                    revision: 0,
+                    updated_by: None,
+                    updated_at: Utc::now(),
+                    board_path: board_path.map(ToOwned::to_owned),
+                },
+            };
+            return Ok(Err(current_snapshot));
+        }
+
+        let existing_content = existing_row.as_ref().map(|r| r.0.as_str());
+        let final_content = build_content(existing_content);
+        let next_rev = (prev_rev as i64).saturating_add(1);
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         tx.execute(
@@ -842,7 +902,7 @@ impl OrbitStore {
                 updated_at = excluded.updated_at",
             params![
                 workspace_id,
-                content,
+                final_content,
                 next_rev,
                 updated_by,
                 board_path,
@@ -862,14 +922,14 @@ impl OrbitStore {
             .optional()?
             .flatten();
         tx.commit()?;
-        Ok(WorkspaceBoardSnapshot {
+        Ok(Ok(WorkspaceBoardSnapshot {
             workspace_id: workspace_id.to_string(),
-            content: content.to_string(),
+            content: final_content,
             revision: next_rev as u64,
             updated_by: updated_by.map(ToOwned::to_owned),
             updated_at: now,
             board_path: final_path,
-        })
+        }))
     }
 
     pub fn append_workspace_event(
@@ -1285,5 +1345,40 @@ mod tests {
         assert!(ag_a.cluster_suggestion.is_none());
         let src_ws = store.get_workspace("ws_src").expect("get").expect("some");
         assert!(src_ws.archived_at.is_some());
+    }
+
+    #[test]
+    fn workspace_board_cas_enforces_expected_revision() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        store
+            .upsert_workspace(&sample_ws("ws_cas", "CAS", "/repo"))
+            .expect("ws");
+
+        let ok1 = store
+            .upsert_workspace_board_with_cas("ws_cas", Some(0), Some("proto"), None, |_| {
+                "# CAS\n\n## Decisions\nv1\n".into()
+            })
+            .expect("cas1")
+            .expect("rev 0 matches");
+        assert_eq!(ok1.revision, 1);
+
+        let conflict = store
+            .upsert_workspace_board_with_cas("ws_cas", Some(0), Some("core"), None, |_| {
+                "stale".into()
+            })
+            .expect("cas2");
+        let cur = conflict.expect_err("stale rev 0 must conflict");
+        assert_eq!(cur.revision, 1);
+        assert!(cur.content.contains("v1"));
+
+        let ok2 = store
+            .upsert_workspace_board_with_cas("ws_cas", Some(1), Some("core"), None, |prev| {
+                format!("{}\n## Tasks\ncore done\n", prev.unwrap_or(""))
+            })
+            .expect("cas3")
+            .expect("rev 1 matches");
+        assert_eq!(ok2.revision, 2);
+        assert!(ok2.content.contains("v1"));
+        assert!(ok2.content.contains("core done"));
     }
 }

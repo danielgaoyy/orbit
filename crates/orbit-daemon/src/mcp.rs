@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::DaemonRuntime;
-use crate::tools::{execute_tool, list_tool_definitions, resolve_caller_policy};
+use crate::tools::{execute_tool, list_tool_definitions_for_caller, resolve_caller_policy};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -127,7 +127,7 @@ async fn handle_single_rpc(
                         "name": "orbit-orchestrator",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": "Orbit built-in multi-agent & Mission Workspace orchestration server. Inside a Mission Workspace, use `workspace_peers`, `message_peer` (by @handle or @all), `read_peer_context`, `workspace_board_read`, `workspace_board_update`, and `spawn_workspace_peer` to collaborate naturally with sibling peers and share contracts on BOARD.md. Call `list_profiles` and `list_hosts` before cross-host delegation, create isolated worktrees via `create_workspace` or `spawn_workspace_peer(worktree=true)` for parallel file edits, and rely on automatic finish notifications instead of polling."
+                    "instructions": "Orbit built-in multi-agent & Mission Workspace orchestration server. Inside a Mission Workspace, coordinate with sibling peers using `workspace_peers` (pass `handle` to peek context), `message_peer` (`@handle` or `all`), `workspace_board` (`read`/`update` with optional `expected_revision` CAS lock), `spawn_workspace_peer` (`worktree=true` for parallel edits), `handoff_worktree` (pass `agent_id`/`@handle` to merge peer worktrees back cleanly), and `orbit_timer` (supports `all_peers` barrier). Prefer reactive finish notifications over polling. For capabilities outside loaded packs (schedules, browser, terminals, workflows, artifacts, LSP), run `orbit <subcommand>` via shell (`orbit --help`)."
                 }
             }))
         }
@@ -138,16 +138,17 @@ async fn handle_single_rpc(
         })),
         "tools/list" => {
             let policy = resolve_caller_policy(runtime, caller_agent_id);
-            let tools: Vec<Value> = list_tool_definitions(&policy)
-                .into_iter()
-                .map(|t| {
-                    json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "inputSchema": t.input_schema
+            let tools: Vec<Value> =
+                list_tool_definitions_for_caller(runtime, caller_agent_id, &policy)
+                    .into_iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.input_schema
+                        })
                     })
-                })
-                .collect();
+                    .collect();
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": id_val,

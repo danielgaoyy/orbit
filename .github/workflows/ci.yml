@@ -59,6 +59,7 @@ jobs:
           CARGO_INCREMENTAL: "0"
         run: |
           npm --prefix apps/desktop ci
+          npm --prefix apps/desktop test
           npm --prefix apps/desktop run build
           cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 
@@ -72,8 +73,13 @@ jobs:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: apps/desktop/package-lock.json
-      - run: npm --prefix apps/desktop ci
-      - run: npm --prefix apps/desktop run build
+      - name: Install, test, build & runtime smoke check Desktop frontend
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm test
+          npm run build
+          npm run test:smoke
 
   ios-build-and-simulator-smoke:
     name: Native iOS Build & Simulator Launch Smoke Test

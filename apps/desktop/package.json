@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test": "node --test src/lib/*.test.ts",
+    "test:smoke": "node scripts/smoke-render.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

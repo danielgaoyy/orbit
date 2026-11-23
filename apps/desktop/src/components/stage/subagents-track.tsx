@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import {
   type AgentCardView,
+  type SessionSubagentEntryView,
   type TimelineItemView,
   orbitIpc,
 } from "@/lib/orbit-ipc";
@@ -25,6 +26,8 @@ import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/overlays";
 import { isSubagentArchived, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+
+const EMPTY_STAGE_SUBAGENTS: readonly SessionSubagentEntryView[] = Object.freeze([]);
 
 /**
  * Top banner displayed when the user opens a managed subagent thread:
@@ -180,8 +183,8 @@ export const SubagentsTrack = memo(function SubagentsTrack({
   const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const insightsSubagents = useOrbitSelector((s) =>
     hostId && agentId
-      ? (s.stages[`${hostId}::${agentId}`]?.insights.subagents ?? [])
-      : [],
+      ? (s.stages[`${hostId}::${agentId}`]?.insights.subagents ?? EMPTY_STAGE_SUBAGENTS)
+      : EMPTY_STAGE_SUBAGENTS,
   );
   const [open, setOpen] = useState(false);
 

@@ -1,5 +1,6 @@
-//! End-to-end encryption (`Noise_NK_25519_ChaChaPoly_SHA256`), Multi-Host pairing credentials,
-//! and Zero-Knowledge E2EE Cloud Vault (`orbit-cloud-vault/v1`).
+//! End-to-end encryption (`Noise_NKpsk0_25519_ChaChaPoly_SHA256` for mutually authenticated
+//! client<->daemon tunnels, `Noise_NK_25519_ChaChaPoly_SHA256` for Relay PoP), Multi-Host
+//! pairing credentials, and Zero-Knowledge E2EE Cloud Vault (`orbit-cloud-vault/v1`).
 //!
 //! Ensures the Relay and Cloud Storage providers are strictly zero-knowledge and allows strict
 //! `--allow-pubkey` admission control.
@@ -29,7 +30,16 @@ use snow::{Builder, HandshakeState, TransportState};
 use zeroize::Zeroizing;
 
 pub const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_SHA256";
-pub const NOISE_PROLOGUE: &[u8] = b"orbit-relay-e2ee/1";
+/// Mutually authenticated client<->daemon E2EE Noise pattern using the host's persisted
+/// `pairing_secret` as a pre-shared key (`psk0`).
+pub const CLIENT_E2EE_NOISE_PATTERN: &str = "Noise_NKpsk0_25519_ChaChaPoly_SHA256";
+/// Domain-separated Noise prologue for mutually authenticated client<->daemon E2EE tunnels.
+pub const NOISE_PROLOGUE: &[u8] = b"orbit-relay-e2ee/2";
+/// Exact byte length of each empty-payload `Noise_NKpsk0` client<->daemon handshake message
+/// (32-byte X25519 ephemeral pubkey + 16-byte Poly1305 AEAD tag).
+pub const CLIENT_E2EE_MSG_LEN: usize = 48;
+/// Domain-separation prefix for deriving the 32-byte `Noise_NKpsk0` PSK from `pairing_secret`.
+const CLIENT_E2EE_PSK_DOMAIN: &[u8] = b"orbit-e2ee-psk/v1\0";
 /// Dedicated Noise prologue for 1-RTT Relay Daemon Control Proof-of-Possession (PoP).
 /// Strictly domain-separated from [`NOISE_PROLOGUE`] so client E2EE sessions can never be used
 /// as cross-protocol signing/decryption oracles.
@@ -125,6 +135,14 @@ fn noise_builder() -> Result<Builder<'static>, CryptoError> {
     ))
 }
 
+fn client_e2ee_noise_builder() -> Result<Builder<'static>, CryptoError> {
+    let params = CLIENT_E2EE_NOISE_PATTERN.parse()?;
+    Ok(Builder::with_resolver(
+        params,
+        Box::new(ContributoryCryptoResolver),
+    ))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("noise protocol error: {0}")]
@@ -135,10 +153,33 @@ pub enum CryptoError {
     InvalidKeyLength(usize),
     #[error("malformed encrypted record")]
     MalformedRecord,
+    #[error("invalid or empty pairing secret")]
+    InvalidPairingSecret,
+    #[error("E2EE mutual authentication failed")]
+    AuthenticationFailed,
     #[error("proof-of-possession verification failed")]
     PopVerificationFailed,
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Derive a 32-byte `Noise_NKpsk0` pre-shared key from the host's `pairing_secret`.
+///
+/// Fails closed on empty/whitespace-only secrets or secrets containing `\r`, `\n`, or `\0`.
+pub fn derive_e2ee_psk(pairing_secret: &str) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    if pairing_secret.trim().is_empty()
+        || pairing_secret
+            .bytes()
+            .any(|b| matches!(b, b'\r' | b'\n' | b'\0'))
+    {
+        return Err(CryptoError::InvalidPairingSecret);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(CLIENT_E2EE_PSK_DOMAIN);
+    hasher.update(pairing_secret.as_bytes());
+    let mut psk = Zeroizing::new([0u8; 32]);
+    psk.copy_from_slice(&hasher.finalize());
+    Ok(psk)
 }
 
 /// Static X25519 identity keypair owned by each Orbit Daemon host (Devbox, Workstation, Mac mini).
@@ -285,20 +326,36 @@ pub struct SecureChannel {
 }
 
 impl ClientHandshake {
-    pub fn new(daemon_pubkey: &[u8; 32]) -> Result<(Self, Vec<u8>), CryptoError> {
-        let mut state = noise_builder()?
+    pub fn new(
+        daemon_pubkey: &[u8; 32],
+        pairing_secret: &str,
+    ) -> Result<(Self, Vec<u8>), CryptoError> {
+        let psk = derive_e2ee_psk(pairing_secret)?;
+        let mut state = client_e2ee_noise_builder()?
             .prologue(NOISE_PROLOGUE)
             .remote_public_key(daemon_pubkey)
+            .psk(0, &*psk)
             .build_initiator()?;
-        let mut msg1 = vec![0u8; 128];
-        let n = state.write_message(&[0x01, 0x01], &mut msg1)?;
-        msg1.truncate(n);
+        let mut msg1 = vec![0u8; CLIENT_E2EE_MSG_LEN];
+        let n = state.write_message(&[], &mut msg1)?;
+        if n != CLIENT_E2EE_MSG_LEN {
+            return Err(CryptoError::AuthenticationFailed);
+        }
         Ok((Self { state }, msg1))
     }
 
     pub fn finalize(mut self, msg2: &[u8]) -> Result<SecureChannel, CryptoError> {
-        let mut payload = vec![0u8; 128];
-        let _ = self.state.read_message(msg2, &mut payload)?;
+        if msg2.len() != CLIENT_E2EE_MSG_LEN {
+            return Err(CryptoError::AuthenticationFailed);
+        }
+        let mut payload = [0u8; CLIENT_E2EE_MSG_LEN];
+        let n = self
+            .state
+            .read_message(msg2, &mut payload)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        if n != 0 {
+            return Err(CryptoError::AuthenticationFailed);
+        }
         Ok(SecureChannel {
             transport: self.state.into_transport_mode()?,
         })
@@ -308,18 +365,33 @@ impl ClientHandshake {
 impl DaemonHandshake {
     pub fn accept(
         daemon_privkey: &[u8; 32],
+        expected_pairing_secret: &str,
         msg1: &[u8],
     ) -> Result<(SecureChannel, Vec<u8>), CryptoError> {
-        let mut state: HandshakeState = noise_builder()?
+        let psk = derive_e2ee_psk(expected_pairing_secret)?;
+        if msg1.len() != CLIENT_E2EE_MSG_LEN {
+            return Err(CryptoError::AuthenticationFailed);
+        }
+        let mut state: HandshakeState = client_e2ee_noise_builder()?
             .prologue(NOISE_PROLOGUE)
             .local_private_key(daemon_privkey)
+            .psk(0, &*psk)
             .build_responder()?;
-        let mut offer = vec![0u8; 128];
-        let _ = state.read_message(msg1, &mut offer)?;
+        let mut payload = [0u8; CLIENT_E2EE_MSG_LEN];
+        let n = state
+            .read_message(msg1, &mut payload)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        if n != 0 {
+            return Err(CryptoError::AuthenticationFailed);
+        }
 
-        let mut msg2 = vec![0u8; 128];
-        let n = state.write_message(&[0x01, 0x01], &mut msg2)?;
-        msg2.truncate(n);
+        let mut msg2 = vec![0u8; CLIENT_E2EE_MSG_LEN];
+        let out_len = state
+            .write_message(&[], &mut msg2)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        if out_len != CLIENT_E2EE_MSG_LEN {
+            return Err(CryptoError::AuthenticationFailed);
+        }
 
         Ok((
             SecureChannel {
@@ -486,17 +558,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn noise_nk_handshake_and_large_record_encryption() {
+    fn noise_nkpsk0_handshake_and_bidirectional_large_record_encryption() {
         let host_kp = HostIdentityKeypair::generate().expect("keygen");
         let pub_bytes = host_kp.public_bytes().expect("pub");
         let priv_bytes = host_kp.private_bytes().expect("priv");
+        let secret = generate_pairing_secret();
 
-        let (client_hs, msg1) = ClientHandshake::new(&pub_bytes).expect("client init");
+        let (client_hs, msg1) = ClientHandshake::new(&pub_bytes, &secret).expect("client init");
+        assert_eq!(msg1.len(), CLIENT_E2EE_MSG_LEN);
+
         let (mut daemon_chan, msg2) =
-            DaemonHandshake::accept(&priv_bytes, &msg1).expect("daemon accept");
+            DaemonHandshake::accept(&priv_bytes, &secret, &msg1).expect("daemon accept");
+        assert_eq!(msg2.len(), CLIENT_E2EE_MSG_LEN);
+
         let mut client_chan = client_hs.finalize(&msg2).expect("client finalize");
 
-        // Test multi-chunk large payload (> 65KB)
+        // Test multi-chunk large payload (> 65KB) client -> daemon
         let big_payload = vec![0x42u8; 150_000];
         let ciphertext = client_chan.seal_record(&big_payload).expect("seal");
         let decrypted = daemon_chan.open_record(&ciphertext).expect("open");
@@ -504,6 +581,108 @@ mod tests {
 
         // Replay protection: replaying the exact same ciphertext must fail!
         assert!(daemon_chan.open_record(&ciphertext).is_err());
+
+        // Test bidirectional daemon -> client transport
+        let reply_payload = b"daemon-welcome-authenticated";
+        let reply_ct = daemon_chan.seal_record(reply_payload).expect("daemon seal");
+        let reply_pt = client_chan.open_record(&reply_ct).expect("client open");
+        assert_eq!(reply_pt, reply_payload);
+        assert!(client_chan.open_record(&reply_ct).is_err());
+    }
+
+    #[test]
+    fn client_e2ee_rejects_wrong_empty_whitespace_and_control_char_secrets() {
+        let host_kp = HostIdentityKeypair::generate().expect("keygen");
+        let pub_bytes = host_kp.public_bytes().expect("pub");
+        let priv_bytes = host_kp.private_bytes().expect("priv");
+        let real_secret = generate_pairing_secret();
+        let wrong_secret = generate_pairing_secret();
+
+        // Empty, whitespace-only, and control-char secrets fail closed on derivation & handshake
+        for bad in ["", " ", "\t\t", "   \n", "abc\rdef", "abc\ndef", "abc\0def"] {
+            assert!(
+                matches!(derive_e2ee_psk(bad), Err(CryptoError::InvalidPairingSecret)),
+                "derive_e2ee_psk must reject {bad:?}"
+            );
+            assert!(
+                matches!(
+                    ClientHandshake::new(&pub_bytes, bad),
+                    Err(CryptoError::InvalidPairingSecret)
+                ),
+                "ClientHandshake::new must reject {bad:?}"
+            );
+            assert!(
+                matches!(
+                    DaemonHandshake::accept(&priv_bytes, bad, &[0u8; CLIENT_E2EE_MSG_LEN]),
+                    Err(CryptoError::InvalidPairingSecret)
+                ),
+                "DaemonHandshake::accept must reject {bad:?}"
+            );
+        }
+
+        // Wrong pairing_secret fails AEAD verification with AuthenticationFailed (no msg2 produced)
+        let (_client_hs, msg1_wrong) =
+            ClientHandshake::new(&pub_bytes, &wrong_secret).expect("client init wrong");
+        assert!(matches!(
+            DaemonHandshake::accept(&priv_bytes, &real_secret, &msg1_wrong),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+
+        // Wrong-length msg1 and msg2 fail closed with AuthenticationFailed
+        assert!(matches!(
+            DaemonHandshake::accept(&priv_bytes, &real_secret, &msg1_wrong[..47]),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+        let oversized = vec![0u8; CLIENT_E2EE_MSG_LEN + 1];
+        assert!(matches!(
+            DaemonHandshake::accept(&priv_bytes, &real_secret, &oversized),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+
+        let (client_hs2, _msg1_valid) =
+            ClientHandshake::new(&pub_bytes, &real_secret).expect("client init valid");
+        assert!(matches!(
+            client_hs2.finalize(&oversized),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn client_e2ee_replayed_msg1_is_unusable_without_client_ephemeral_key() {
+        let host_kp = HostIdentityKeypair::generate().expect("keygen");
+        let pub_bytes = host_kp.public_bytes().expect("pub");
+        let priv_bytes = host_kp.private_bytes().expect("priv");
+        let secret = generate_pairing_secret();
+
+        // Legitimate session 1
+        let (client_hs1, msg1) = ClientHandshake::new(&pub_bytes, &secret).expect("init 1");
+        let (mut daemon_chan1, msg2_1) =
+            DaemonHandshake::accept(&priv_bytes, &secret, &msg1).expect("accept 1");
+        let mut client_chan1 = client_hs1.finalize(&msg2_1).expect("finalize 1");
+        let legit_ct = client_chan1
+            .seal_record(b"legit-frame-1")
+            .expect("seal legit");
+        assert_eq!(
+            daemon_chan1.open_record(&legit_ct).expect("open legit"),
+            b"legit-frame-1"
+        );
+
+        // Eavesdropper replays captured msg1 to daemon; daemon mints a fresh ephemeral key (msg2_replay)
+        let (mut daemon_chan_replayed, msg2_replay) =
+            DaemonHandshake::accept(&priv_bytes, &secret, &msg1).expect("replayed accept");
+        assert_ne!(msg2_replay, msg2_1);
+
+        // Without client 1's ephemeral private key:
+        // 1. A fresh client handshake cannot finalize with msg2_replay
+        let (attacker_hs, _attacker_msg1) =
+            ClientHandshake::new(&pub_bytes, &secret).expect("attacker fresh init");
+        assert!(matches!(
+            attacker_hs.finalize(&msg2_replay),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+
+        // 2. Replaying captured transport ciphertext from session 1 fails on daemon_chan_replayed
+        assert!(daemon_chan_replayed.open_record(&legit_ct).is_err());
     }
 
     #[test]
@@ -549,13 +728,14 @@ mod tests {
             0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
             0x5f, 0x49, 0xb8, 0x00,
         ];
+        let pairing_secret = generate_pairing_secret();
         for low_order_pk in [[0u8; 32], order4_point, order8_point] {
             assert!(
                 RelayPopInitiator::new(&low_order_pk).is_err(),
                 "low-order X25519 pubkey must be rejected by contributory DH"
             );
             assert!(
-                ClientHandshake::new(&low_order_pk).is_err(),
+                ClientHandshake::new(&low_order_pk, &pairing_secret).is_err(),
                 "low-order X25519 pubkey must also be rejected on client E2EE handshake"
             );
         }
@@ -589,14 +769,22 @@ mod tests {
         let host_kp = HostIdentityKeypair::generate().expect("keygen");
         let pub_bytes = host_kp.public_bytes().expect("pub");
         let priv_bytes = host_kp.private_bytes().expect("priv");
+        let secret = generate_pairing_secret();
 
-        // A Relay PoP msg1 cannot be decrypted by the client E2EE DaemonHandshake (different prologue)
+        // A Relay PoP msg1 cannot be decrypted by the client E2EE DaemonHandshake (different pattern/prologue/PSK)
         let (_initiator, pop_msg1) = RelayPopInitiator::new(&pub_bytes).expect("pop init");
-        assert!(DaemonHandshake::accept(&priv_bytes, &pop_msg1).is_err());
+        assert!(matches!(
+            DaemonHandshake::accept(&priv_bytes, &secret, &pop_msg1),
+            Err(CryptoError::AuthenticationFailed)
+        ));
 
         // Conversely, a ClientHandshake msg1 cannot be answered by RelayPopResponder
-        let (_client_hs, client_msg1) = ClientHandshake::new(&pub_bytes).expect("client init");
-        assert!(RelayPopResponder::accept(&priv_bytes, &client_msg1).is_err());
+        let (_client_hs, client_msg1) =
+            ClientHandshake::new(&pub_bytes, &secret).expect("client init");
+        assert!(matches!(
+            RelayPopResponder::accept(&priv_bytes, &client_msg1),
+            Err(CryptoError::PopVerificationFailed)
+        ));
     }
 
     #[test]

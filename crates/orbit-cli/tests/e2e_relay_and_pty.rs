@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use orbit_client_core::{
-    ClientInboundEvent, HostConnectionState, MultiHostFleet, app_core::OrbitAppCore,
-    connect_via_relay,
+    ClientCoreError, ClientInboundEvent, HostConnectionState, HostRouteMode, MultiHostFleet,
+    SavedHostProfile, app_core::OrbitAppCore, connect_smart, connect_via_relay,
 };
 use orbit_crypto::HostIdentityKeypair;
 use orbit_daemon::spawn_embedded_daemon;
@@ -41,6 +41,7 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
         .await
         .expect("bootstrap");
     let allowed_pubkey = pre_rt.keypair.public_key_b64.clone();
+    let pairing_secret = pre_rt.pairing_secret.clone();
     drop(pre_rt);
 
     // 2. Bind a free port for the private allowlisted Relay
@@ -65,7 +66,13 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
 
     // 3. Verify stranger pubkey is strictly rejected (zero memory/bandwidth abuse!)
     let stranger_kp = HostIdentityKeypair::generate().expect("stranger keygen");
-    let stranger_res = connect_via_relay(&relay_url, &stranger_kp.public_key_b64, None).await;
+    let stranger_res = connect_via_relay(
+        &relay_url,
+        &stranger_kp.public_key_b64,
+        &pairing_secret,
+        None,
+    )
+    .await;
     assert!(
         stranger_res.is_err(),
         "unlisted public key must be rejected by Relay allowlist"
@@ -342,6 +349,7 @@ async fn ssh_tunneled_e2ee_relay_integration() {
         .await
         .expect("bootstrap");
     let allowed_pubkey = pre_rt.keypair.public_key_b64.clone();
+    let pairing_secret = pre_rt.pairing_secret.clone();
     drop(pre_rt);
 
     // 1. Start localhost-only orbit-relay
@@ -411,7 +419,7 @@ async fn ssh_tunneled_e2ee_relay_integration() {
     }
     .to_uri();
     assert!(
-        connect_via_relay(&wrong_fp, &allowed_pubkey, None)
+        connect_via_relay(&wrong_fp, &allowed_pubkey, &pairing_secret, None)
             .await
             .is_err(),
         "wrong SSH host key fingerprint must be rejected"
@@ -420,9 +428,14 @@ async fn ssh_tunneled_e2ee_relay_integration() {
     // 4. Unlisted daemon pubkey must still be rejected by Relay allowlist through SSH tunnel
     let stranger_kp = HostIdentityKeypair::generate().expect("stranger");
     assert!(
-        connect_via_relay(&ssh_relay_uri, &stranger_kp.public_key_b64, None)
-            .await
-            .is_err(),
+        connect_via_relay(
+            &ssh_relay_uri,
+            &stranger_kp.public_key_b64,
+            &pairing_secret,
+            None,
+        )
+        .await
+        .is_err(),
         "stranger pubkey must be rejected by Relay allowlist over SSH tunnel"
     );
 
@@ -601,6 +614,7 @@ async fn e2e_relay_pop_blocks_daemon_hijack_while_legitimate_client_succeeds() {
         .await
         .expect("bootstrap");
     let allowed_pubkey = pre_rt.keypair.public_key_b64.clone();
+    let pairing_secret = pre_rt.pairing_secret.clone();
     drop(pre_rt);
 
     let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -656,7 +670,7 @@ async fn e2e_relay_pop_blocks_daemon_hijack_while_legitimate_client_succeeds() {
     );
 
     // Legitimate E2EE client still reaches the real daemon unimpeded!
-    let session = connect_via_relay(&relay_url, &allowed_pubkey, None)
+    let session = connect_via_relay(&relay_url, &allowed_pubkey, &pairing_secret, None)
         .await
         .expect("legitimate client must connect after failed hijack");
     let req_id = Uuid::new_v4();
@@ -842,5 +856,382 @@ async fn detached_orbit_shim_isolates_process_group_hides_argv_secrets_and_survi
         !cleanup_file.exists(),
         "shim must unlink cleanup_paths right after its child exits (even after reconnect)"
     );
+    let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+#[tokio::test]
+async fn e2e_relay_e2ee_rejects_wrong_and_empty_pairing_secret() {
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home = base_tmp.join(format!("orb_e2ee_auth_{short_id}"));
+    std::fs::create_dir_all(&temp_home).expect("mkdir");
+
+    let pre_rt = orbit_daemon::DaemonRuntime::bootstrap(&temp_home)
+        .await
+        .expect("bootstrap");
+    let allowed_pubkey = pre_rt.keypair.public_key_b64.clone();
+    let real_secret = pre_rt.pairing_secret.clone();
+    let host_id = pre_rt.host_info.host_id.clone();
+    drop(pre_rt);
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    drop(relay_listener);
+
+    let mut allow_set = HashSet::new();
+    allow_set.insert(allowed_pubkey.clone());
+    let relay_cfg = RelayConfig {
+        listen_addr: relay_addr,
+        allowed_pubkeys: Arc::new(allow_set),
+    };
+    let relay_handle = tokio::spawn(async move {
+        let _ = run_relay(relay_cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let relay_url = format!("ws://{relay_addr}");
+    let (_daemon_addr, _runtime) =
+        spawn_embedded_daemon(temp_home.clone(), Some(relay_url.clone()))
+            .await
+            .expect("spawn daemon");
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    // 1. Empty pairing_secret fails closed before handshake (even against an unreachable relay URL)
+    let empty_err = connect_via_relay("ws://127.0.0.1:1", &allowed_pubkey, "", None)
+        .await
+        .err()
+        .expect("empty pairing_secret must fail closed before handshake");
+    assert!(
+        matches!(empty_err, ClientCoreError::Unauthorized(_)) && empty_err.is_auth_error(),
+        "expected Unauthorized for empty pairing_secret, got {empty_err:?}"
+    );
+
+    // 2. Wrong pairing_secret over live Relay E2EE fails authentication cleanly
+    let wrong_secret = orbit_crypto::generate_pairing_secret();
+    assert_ne!(wrong_secret, real_secret);
+    let wrong_err = connect_via_relay(&relay_url, &allowed_pubkey, &wrong_secret, None)
+        .await
+        .err()
+        .expect("wrong pairing_secret must be rejected over Relay E2EE");
+    assert!(
+        matches!(wrong_err, ClientCoreError::Unauthorized(_)) && wrong_err.is_auth_error(),
+        "expected Unauthorized for wrong pairing_secret over relay, got {wrong_err:?}"
+    );
+
+    // 3. Auto route mode preserves Unauthorized when direct endpoint is unreachable and relay rejects auth
+    let bad_profile = SavedHostProfile {
+        host_id,
+        hostname: "relay-auth-host".into(),
+        custom_name: None,
+        ssh_alias: None,
+        route_mode: HostRouteMode::Auto,
+        remote_daemon_port: 1,
+        custom_direct_endpoint: None,
+        daemon_pubkey_b64: allowed_pubkey.clone(),
+        direct_endpoints: vec!["ws://127.0.0.1:1/ws".into()],
+        relay_url: Some(relay_url.clone()),
+        pairing_secret: wrong_secret,
+        pairing_secret_updated_at_ms: 0,
+        state: HostConnectionState::Disconnected,
+    };
+    let smart_err = connect_smart(&bad_profile, None)
+        .await
+        .err()
+        .expect("connect_smart Auto must fail with Unauthorized");
+    assert!(
+        matches!(smart_err, ClientCoreError::Unauthorized(_)) && smart_err.is_auth_error(),
+        "expected Unauthorized from connect_smart Auto, got {smart_err:?}"
+    );
+
+    // 4. Legitimate pairing_secret succeeds and serves RPCs
+    let session = connect_via_relay(&relay_url, &allowed_pubkey, &real_secret, None)
+        .await
+        .expect("valid pairing_secret must connect over Relay E2EE");
+    let req_id = Uuid::new_v4();
+    let resp = session
+        .request(
+            WireMessage::ListAgents {
+                request_id: req_id,
+                workspace_id: None,
+                include_archived: false,
+                include_background: false,
+                parent_agent_id: None,
+            },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::AgentsSnapshot { request_id, .. } if *request_id == req_id),
+        )
+        .await
+        .expect("list agents with valid pairing_secret");
+    assert!(matches!(resp, WireMessage::AgentsSnapshot { .. }));
+
+    relay_handle.abort();
+    let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+#[tokio::test]
+async fn e2e_relay_e2ee_disconnects_on_pairing_secret_rotation() {
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home = base_tmp.join(format!("orb_e2ee_rot_{short_id}"));
+    std::fs::create_dir_all(&temp_home).expect("mkdir");
+
+    let pre_rt = orbit_daemon::DaemonRuntime::bootstrap(&temp_home)
+        .await
+        .expect("bootstrap");
+    let allowed_pubkey = pre_rt.keypair.public_key_b64.clone();
+    let old_secret = pre_rt.pairing_secret.clone();
+    drop(pre_rt);
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    drop(relay_listener);
+
+    let mut allow_set = HashSet::new();
+    allow_set.insert(allowed_pubkey.clone());
+    let relay_cfg = RelayConfig {
+        listen_addr: relay_addr,
+        allowed_pubkeys: Arc::new(allow_set),
+    };
+    let relay_handle = tokio::spawn(async move {
+        let _ = run_relay(relay_cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let relay_url = format!("ws://{relay_addr}");
+    let (_daemon_addr, runtime) = spawn_embedded_daemon(temp_home.clone(), Some(relay_url.clone()))
+        .await
+        .expect("spawn daemon");
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    // 1. Connect over Relay E2EE with the initial pairing_secret and verify live RPC
+    let session = connect_via_relay(&relay_url, &allowed_pubkey, &old_secret, None)
+        .await
+        .expect("initial relay E2EE connection");
+    let mut events = session.subscribe();
+    let req1 = Uuid::new_v4();
+    let resp1 = session
+        .request(
+            WireMessage::ListAgents {
+                request_id: req1,
+                workspace_id: None,
+                include_archived: false,
+                include_background: false,
+                parent_agent_id: None,
+            },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::AgentsSnapshot { request_id, .. } if *request_id == req1),
+        )
+        .await
+        .expect("initial RPC over relay E2EE");
+    assert!(matches!(resp1, WireMessage::AgentsSnapshot { .. }));
+
+    // 2. Rotate pairing_secret: active Relay E2EE session MUST disconnect promptly
+    let rotated_secret = runtime
+        .rotate_pairing_secret()
+        .expect("rotate pairing_secret");
+    assert_ne!(rotated_secret, old_secret);
+
+    let disconnected = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await {
+                Ok(ClientInboundEvent::Disconnected) | Err(_) => return true,
+                Ok(_) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        disconnected,
+        "active Relay E2EE session must disconnect promptly after pairing_secret rotation"
+    );
+
+    // 3. Reconnecting with the old secret fails with Unauthorized
+    let stale_err = connect_via_relay(&relay_url, &allowed_pubkey, &old_secret, None)
+        .await
+        .err()
+        .expect("old pairing_secret must fail after rotation");
+    assert!(
+        matches!(stale_err, ClientCoreError::Unauthorized(_)) && stale_err.is_auth_error(),
+        "expected Unauthorized with rotated-out secret, got {stale_err:?}"
+    );
+
+    // 4. Reconnecting with the rotated secret succeeds and completes an RPC
+    let fresh_session = connect_via_relay(&relay_url, &allowed_pubkey, &rotated_secret, None)
+        .await
+        .expect("rotated pairing_secret must reconnect over Relay E2EE");
+    let req2 = Uuid::new_v4();
+    let resp2 = fresh_session
+        .request(
+            WireMessage::ListAgents {
+                request_id: req2,
+                workspace_id: None,
+                include_archived: false,
+                include_background: false,
+                parent_agent_id: None,
+            },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::AgentsSnapshot { request_id, .. } if *request_id == req2),
+        )
+        .await
+        .expect("RPC over rotated relay E2EE session");
+    assert!(matches!(resp2, WireMessage::AgentsSnapshot { .. }));
+
+    relay_handle.abort();
+    let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+#[tokio::test]
+async fn e2e_relay_e2ee_replayed_msg1_rejected_before_session_start() {
+    use futures_util::{SinkExt, StreamExt};
+    use orbit_crypto::{CLIENT_E2EE_MSG_LEN, ClientHandshake, decode_key_32};
+    use tokio_tungstenite::tungstenite::{Message as TungMsg, protocol::frame::coding::CloseCode};
+
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home = base_tmp.join(format!("orb_e2ee_replay_{short_id}"));
+    std::fs::create_dir_all(&temp_home).expect("mkdir");
+
+    let pre_rt = orbit_daemon::DaemonRuntime::bootstrap(&temp_home)
+        .await
+        .expect("bootstrap");
+    let allowed_pubkey = pre_rt.keypair.public_key_b64.clone();
+    let pubkey_bytes = decode_key_32(&allowed_pubkey).expect("decode pubkey");
+    let pairing_secret = pre_rt.pairing_secret.clone();
+    drop(pre_rt);
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    drop(relay_listener);
+
+    let mut allow_set = HashSet::new();
+    allow_set.insert(allowed_pubkey.clone());
+    let relay_cfg = RelayConfig {
+        listen_addr: relay_addr,
+        allowed_pubkeys: Arc::new(allow_set),
+    };
+    let relay_handle = tokio::spawn(async move {
+        let _ = run_relay(relay_cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let relay_url = format!("ws://{relay_addr}");
+    let (_daemon_addr, _runtime) =
+        spawn_embedded_daemon(temp_home.clone(), Some(relay_url.clone()))
+            .await
+            .expect("spawn daemon");
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    let client_ws_url = format!("{relay_url}/v1/client/{allowed_pubkey}");
+
+    // 1. Legitimate raw E2EE session: capture `msg1` and the first encrypted `Hello` ciphertext.
+    let (client_hs, captured_msg1) =
+        ClientHandshake::new(&pubkey_bytes, &pairing_secret).expect("client init");
+    let (mut legit_ws, _) = tokio_tungstenite::connect_async(&client_ws_url)
+        .await
+        .expect("connect legit");
+    legit_ws
+        .send(TungMsg::Binary(captured_msg1.clone().into()))
+        .await
+        .expect("send msg1");
+    let msg2_1 = match tokio::time::timeout(Duration::from_secs(5), legit_ws.next())
+        .await
+        .expect("msg2 timeout")
+        .expect("msg2 frame")
+        .expect("msg2 ok")
+    {
+        TungMsg::Binary(b) => b,
+        other => panic!("expected Binary msg2, got {other:?}"),
+    };
+    assert_eq!(msg2_1.len(), CLIENT_E2EE_MSG_LEN);
+
+    let mut legit_chan = client_hs.finalize(&msg2_1).expect("finalize legit");
+    let hello = WireMessage::Hello {
+        client_id: "legit-client".into(),
+        client_name: "legit".into(),
+        protocol_version: orbit_protocol::PROTOCOL_VERSION,
+        supports_zstd: true,
+    };
+    let hello_z = hello.encode_zstd(3).expect("zstd");
+    let mut plain = Vec::with_capacity(1 + hello_z.len());
+    plain.push(orbit_client_core::E2EE_FRAME_WIRE);
+    plain.extend_from_slice(&hello_z);
+    let captured_hello_ct = legit_chan.seal_record(&plain).expect("seal hello");
+    legit_ws
+        .send(TungMsg::Binary(captured_hello_ct.clone().into()))
+        .await
+        .expect("send hello");
+
+    // Verify legitimate client receives encrypted Welcome after sending first record.
+    let welcome_ct = match tokio::time::timeout(Duration::from_secs(5), legit_ws.next())
+        .await
+        .expect("welcome timeout")
+        .expect("welcome frame")
+        .expect("welcome ok")
+    {
+        TungMsg::Binary(b) => b,
+        other => panic!("expected Binary Welcome ciphertext, got {other:?}"),
+    };
+    let welcome_plain = legit_chan.open_record(&welcome_ct).expect("open welcome");
+    assert_eq!(welcome_plain[0], orbit_client_core::E2EE_FRAME_WIRE);
+    let welcome = WireMessage::decode_zstd(&welcome_plain[1..]).expect("decode welcome");
+    assert!(matches!(welcome, WireMessage::Welcome { .. }));
+    let _ = legit_ws.close(None).await;
+
+    // 2. Untrusted relay / attacker replays `captured_msg1`, receives fresh `msg2_replay`,
+    //    and replays `captured_hello_ct` without possessing the client's ephemeral private key.
+    //    Daemon MUST reject and close with Policy (1008) before starting a session or sending Welcome.
+    let (mut replay_ws, _) = tokio_tungstenite::connect_async(&client_ws_url)
+        .await
+        .expect("connect attacker");
+    replay_ws
+        .send(TungMsg::Binary(captured_msg1.into()))
+        .await
+        .expect("send replayed msg1");
+    let msg2_replay = match tokio::time::timeout(Duration::from_secs(5), replay_ws.next())
+        .await
+        .expect("msg2_replay timeout")
+        .expect("msg2_replay frame")
+        .expect("msg2_replay ok")
+    {
+        TungMsg::Binary(b) => b,
+        other => panic!("expected Binary msg2_replay, got {other:?}"),
+    };
+    assert_ne!(msg2_replay, msg2_1);
+
+    replay_ws
+        .send(TungMsg::Binary(captured_hello_ct.into()))
+        .await
+        .expect("send replayed hello ciphertext");
+    let reply = tokio::time::timeout(Duration::from_secs(3), replay_ws.next())
+        .await
+        .expect("daemon must reject replayed ciphertext promptly");
+    assert!(
+        matches!(
+            reply,
+            Some(Ok(TungMsg::Close(Some(ref cf)))) if cf.code == CloseCode::Policy
+        ) || matches!(reply, None | Some(Ok(TungMsg::Close(None))) | Some(Err(_))),
+        "replayed msg1 + ciphertext must be closed with Policy without sending Welcome, got {reply:?}"
+    );
+
+    relay_handle.abort();
     let _ = std::fs::remove_dir_all(&temp_home);
 }

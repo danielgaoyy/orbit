@@ -4,7 +4,7 @@
 //! supervises detached Shims, serves direct WebSocket clients, exposes the built-in Streamable
 //! HTTP MCP orchestration server (`/mcp/agents`), runs the Cron/Heartbeat scheduler, maintains
 //! Daemon-to-Daemon Connected Host links, and optionally registers outbound to Relay with full
-//! `Noise_NK_25519_ChaChaPoly_SHA256` end-to-end encryption.
+//! `Noise_NKpsk0_25519_ChaChaPoly_SHA256` mutually authenticated end-to-end encryption.
 
 pub mod artifacts;
 pub mod attachments;
@@ -83,7 +83,10 @@ use orbit_store::{OrbitStore, ReceiptOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
-use tokio_tungstenite::tungstenite::Message as TungMsg;
+use tokio_tungstenite::tungstenite::{
+    Message as TungMsg,
+    protocol::{CloseFrame as TungCloseFrame, frame::coding::CloseCode as TungCloseCode},
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -737,8 +740,8 @@ impl DaemonRuntime {
         read_pairing_secret(&self.home_dir)
     }
 
-    /// Atomically rotate `$ORBIT_HOME/pairing-secret` and immediately notify active direct `/ws`
-    /// sessions to terminate if their authenticated secret is no longer current.
+    /// Atomically rotate `$ORBIT_HOME/pairing-secret` and immediately notify active client sessions
+    /// (direct `/ws` and Relay E2EE) to terminate if their authenticated secret is no longer current.
     pub fn rotate_pairing_secret(&self) -> anyhow::Result<String> {
         let rotated = rotate_pairing_secret(&self.home_dir)?;
         let _ = self.pairing_secret_rotated_tx.send(());
@@ -1219,6 +1222,102 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
     }
 }
 
+/// Bounded deadline for a Relay E2EE client to prove fresh session key possession by sending
+/// its first authenticated encrypted `WireMessage` after receiving Noise `msg2`.
+const E2EE_FIRST_RECORD_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn close_tung_sink_bounded<S, E>(sink: &mut S, frame: Option<TungCloseFrame>)
+where
+    S: futures_util::Sink<TungMsg, Error = E> + Unpin,
+{
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let _ = sink.send(TungMsg::Close(frame)).await;
+        let _ = sink.close().await;
+    })
+    .await;
+}
+
+/// Wait for the client's first encrypted `WireMessage` under a strict bounded deadline BEFORE
+/// subscribing to daemon broadcasts or spawning session tasks. This blocks untrusted relays from
+/// holding half-open sessions or receiving broadcasts by replaying a captured Noise `msg1`.
+async fn receive_first_e2ee_wire_message<Si, St, E>(
+    chan: &mut SecureChannel,
+    sink: &mut Si,
+    stream: &mut St,
+    timeout: Duration,
+) -> anyhow::Result<WireMessage>
+where
+    Si: futures_util::Sink<TungMsg, Error = E> + Unpin,
+    St: futures_util::Stream<Item = Result<TungMsg, E>> + Unpin,
+    E: Into<anyhow::Error>,
+{
+    let first_wire = tokio::time::timeout(timeout, async {
+        while let Some(item) = stream.next().await {
+            match item.map_err(Into::into)? {
+                TungMsg::Binary(ct) => {
+                    let plain = chan
+                        .open_record(&ct)
+                        .map_err(|_| anyhow::anyhow!("invalid first E2EE transport ciphertext"))?;
+                    if plain.is_empty() || plain[0] != E2EE_FRAME_WIRE {
+                        anyhow::bail!("unexpected first E2EE frame discriminator");
+                    }
+                    let wire = WireMessage::decode_zstd(&plain[1..]).map_err(|err| {
+                        anyhow::anyhow!(
+                            "failed to decode first E2EE wire message: {}",
+                            format_concise_wire_decode_error(&err)
+                        )
+                    })?;
+                    return Ok::<_, anyhow::Error>(wire);
+                }
+                TungMsg::Ping(p) => {
+                    sink.send(TungMsg::Pong(p)).await.map_err(Into::into)?;
+                }
+                TungMsg::Pong(_) => {}
+                TungMsg::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    anyhow::bail!(
+                        "tunnel closed before first authenticated E2EE frame (code={code:?})"
+                    );
+                }
+                other => {
+                    let (kind, bytes) = describe_tung_frame(&other);
+                    anyhow::bail!(
+                        "unexpected frame waiting for first E2EE record (kind={kind}, bytes={bytes})"
+                    );
+                }
+            }
+        }
+        anyhow::bail!("tunnel closed before first authenticated E2EE frame")
+    })
+    .await;
+
+    match first_wire {
+        Ok(Ok(wire)) => Ok(wire),
+        Ok(Err(err)) => {
+            close_tung_sink_bounded(
+                sink,
+                Some(TungCloseFrame {
+                    code: TungCloseCode::Policy,
+                    reason: "unauthorized".into(),
+                }),
+            )
+            .await;
+            Err(err)
+        }
+        Err(_) => {
+            close_tung_sink_bounded(
+                sink,
+                Some(TungCloseFrame {
+                    code: TungCloseCode::Policy,
+                    reason: "handshake timeout".into(),
+                }),
+            )
+            .await;
+            anyhow::bail!("timed out waiting for first authenticated E2EE frame")
+        }
+    }
+}
+
 async fn serve_e2ee_relay_tunnel(
     runtime: Arc<DaemonRuntime>,
     connector: &Arc<RelayConnector>,
@@ -1278,27 +1377,140 @@ async fn serve_e2ee_relay_tunnel(
     .await
     .map_err(|_| anyhow::anyhow!("timed out sending tunnel attach MAC"))??;
 
-    // Receive Noise NK Message 1 from Client
+    // Fail closed before accepting client Noise handshake if persisted pairing-secret is unavailable.
+    if runtime.active_pairing_secret().is_none() {
+        warn!(
+            tunnel_id = %tunnel_id,
+            "Rejected Relay E2EE tunnel: persisted pairing-secret is missing or malformed (fail-closed)"
+        );
+        close_tung_sink_bounded(
+            &mut sink,
+            Some(TungCloseFrame {
+                code: TungCloseCode::Policy,
+                reason: "unauthorized".into(),
+            }),
+        )
+        .await;
+        anyhow::bail!("persisted pairing-secret missing or malformed");
+    }
+
+    // Receive Noise NKpsk0 Message 1 from Client
     let msg1 = tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(Ok(m)) = stream.next().await {
-            if let TungMsg::Binary(b) = m {
-                return Some(b);
+        while let Some(item) = stream.next().await {
+            match item? {
+                TungMsg::Binary(b) => return Ok::<_, anyhow::Error>(b),
+                TungMsg::Ping(p) => {
+                    sink.send(TungMsg::Pong(p)).await?;
+                }
+                TungMsg::Pong(_) => {}
+                TungMsg::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    anyhow::bail!("tunnel closed before Noise msg1 (code={code:?})");
+                }
+                other => {
+                    let (kind, bytes) = describe_tung_frame(&other);
+                    anyhow::bail!(
+                        "unexpected frame waiting for Noise msg1 (kind={kind}, bytes={bytes})"
+                    );
+                }
             }
         }
-        None
+        anyhow::bail!("tunnel closed before Noise msg1")
     })
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("tunnel closed before Noise msg1"))?;
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for Noise msg1"))??;
 
-    let (chan, msg2) = DaemonHandshake::accept(&priv_bytes, &msg1)?;
-    sink.send(TungMsg::Binary(msg2.into())).await?;
+    // Re-read the active persisted pairing secret right before authenticating msg1 so rotations
+    // take effect immediately with zero race window.
+    let Some(expected_secret) = runtime.active_pairing_secret() else {
+        warn!(
+            tunnel_id = %tunnel_id,
+            "Rejected Relay E2EE tunnel: persisted pairing-secret is missing or malformed (fail-closed)"
+        );
+        close_tung_sink_bounded(
+            &mut sink,
+            Some(TungCloseFrame {
+                code: TungCloseCode::Policy,
+                reason: "unauthorized".into(),
+            }),
+        )
+        .await;
+        anyhow::bail!("persisted pairing-secret missing or malformed");
+    };
+
+    let (chan, msg2) = match DaemonHandshake::accept(&priv_bytes, &expected_secret, &msg1) {
+        Ok(accepted) => accepted,
+        Err(err) => {
+            warn!(
+                tunnel_id = %tunnel_id,
+                error = %err,
+                "Rejected unauthorized Relay E2EE client handshake"
+            );
+            close_tung_sink_bounded(
+                &mut sink,
+                Some(TungCloseFrame {
+                    code: TungCloseCode::Policy,
+                    reason: "unauthorized".into(),
+                }),
+            )
+            .await;
+            return Err(err.into());
+        }
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sink.send(TungMsg::Binary(msg2.into())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out sending Noise msg2"))??;
+
+    // Require client key confirmation (first valid encrypted WireMessage) under a bounded timeout
+    // BEFORE subscribing to daemon broadcasts or spawning full session tasks.
+    let mut chan = chan;
+    let initial_wire = tokio::select! {
+        biased;
+        () = wait_for_session_revocation(Arc::clone(&runtime), expected_secret.clone()) => {
+            warn!(
+                tunnel_id = %tunnel_id,
+                "Closing Relay E2EE tunnel before first frame: pairing_secret rotated or revoked"
+            );
+            close_tung_sink_bounded(
+                &mut sink,
+                Some(TungCloseFrame {
+                    code: TungCloseCode::Policy,
+                    reason: "unauthorized".into(),
+                }),
+            )
+            .await;
+            anyhow::bail!("pairing_secret rotated before first E2EE frame");
+        }
+        res = receive_first_e2ee_wire_message(
+            &mut chan,
+            &mut sink,
+            &mut stream,
+            E2EE_FIRST_RECORD_TIMEOUT,
+        ) => {
+            match res {
+                Ok(wire) => wire,
+                Err(err) => {
+                    warn!(
+                        tunnel_id = %tunnel_id,
+                        error = %err,
+                        "Rejected Relay E2EE tunnel before session start"
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    };
 
     let shared_chan = Arc::new(tokio::sync::Mutex::new(chan));
     let (in_tx, in_rx) = mpsc::channel::<SessionFrame>(256);
     let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(256);
 
     let chan_writer = shared_chan.clone();
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let plain = match frame {
                 SessionFrame::Wire { msg, .. } => match msg.encode_zstd(3) {
@@ -1325,51 +1537,75 @@ async fn serve_e2ee_relay_tunnel(
                 break;
             }
         }
+        let _ = tokio::time::timeout(Duration::from_millis(250), sink.close()).await;
     });
 
     let chan_reader = shared_chan;
-    tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         while let Some(Ok(m)) = stream.next().await {
-            if let TungMsg::Binary(ct) = m {
-                let Ok(plain) = chan_reader.lock().await.open_record(&ct) else {
-                    break;
-                };
-                if plain.is_empty() {
-                    continue;
-                }
-                match plain[0] {
-                    E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
-                        Ok(wire) => {
-                            if in_tx
-                                .send(SessionFrame::Wire {
-                                    msg: wire,
-                                    zstd: true,
-                                })
-                                .await
-                                .is_err()
+            match m {
+                TungMsg::Binary(ct) => {
+                    let Ok(plain) = chan_reader.lock().await.open_record(&ct) else {
+                        break;
+                    };
+                    if plain.is_empty() {
+                        continue;
+                    }
+                    match plain[0] {
+                        E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
+                            Ok(wire) => {
+                                if in_tx
+                                    .send(SessionFrame::Wire {
+                                        msg: wire,
+                                        zstd: true,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                let summary = format_concise_wire_decode_error(&err);
+                                tracing::warn!(error = %summary, bytes = plain.len(), "failed to decode E2EE zstd wire message");
+                            }
+                        },
+                        E2EE_FRAME_TERMINAL => {
+                            if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..])
+                                && in_tx.send(SessionFrame::Terminal(term)).await.is_err()
                             {
                                 break;
                             }
                         }
-                        Err(err) => {
-                            let summary = format_concise_wire_decode_error(&err);
-                            tracing::warn!(error = %summary, bytes = plain.len(), "failed to decode E2EE zstd wire message");
-                        }
-                    },
-                    E2EE_FRAME_TERMINAL => {
-                        if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..])
-                            && in_tx.send(SessionFrame::Terminal(term)).await.is_err()
-                        {
-                            break;
-                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                TungMsg::Close(_) => break,
+                _ => {}
             }
         }
     });
 
-    run_client_session_loop(runtime, in_rx, out_tx, None).await;
+    let exit_reason =
+        run_supervised_client_session(runtime, in_rx, out_tx, expected_secret, Some(initial_wire))
+            .await;
+    reader_task.abort();
+    match exit_reason {
+        SessionExitReason::Revoked => {
+            // Immediately abort writer_task to discard all queued outbound PTY/wire frames
+            // and drop the tunnel without draining stale buffers.
+            writer_task.abort();
+        }
+        SessionExitReason::Normal => {
+            let writer_abort = writer_task.abort_handle();
+            if tokio::time::timeout(Duration::from_millis(300), writer_task)
+                .await
+                .is_err()
+            {
+                writer_abort.abort();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1487,9 +1723,23 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>, au
         }
     });
 
-    run_client_session_loop(runtime, in_rx, out_tx, Some(auth_secret)).await;
+    let exit_reason =
+        run_supervised_client_session(runtime, in_rx, out_tx, auth_secret, None).await;
     reader_task.abort();
-    writer_task.abort();
+    match exit_reason {
+        SessionExitReason::Revoked => {
+            writer_task.abort();
+        }
+        SessionExitReason::Normal => {
+            let writer_abort = writer_task.abort_handle();
+            if tokio::time::timeout(Duration::from_millis(300), writer_task)
+                .await
+                .is_err()
+            {
+                writer_abort.abort();
+            }
+        }
+    }
 }
 
 // --- Unified Transport-Neutral Session Controller (shared by Direct WS & Relay E2EE) ---
@@ -1519,69 +1769,165 @@ enum SessionFrame {
     Terminal(TerminalBinaryFrame),
 }
 
-fn is_direct_secret_still_valid(runtime: &DaemonRuntime, auth_secret: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionExitReason {
+    Normal,
+    Revoked,
+}
+
+/// Ensures terminal streaming tasks and side-question tasks are always aborted immediately even
+/// when `run_client_session_loop` is dropped mid-await on secret revocation.
+struct SessionCleanupGuard {
+    slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)>,
+    active_side_questions: Vec<tokio::task::AbortHandle>,
+}
+
+impl SessionCleanupGuard {
+    fn new() -> Self {
+        Self {
+            slot_to_terminal: HashMap::new(),
+            active_side_questions: Vec::new(),
+        }
+    }
+}
+
+impl Drop for SessionCleanupGuard {
+    fn drop(&mut self) {
+        for (_, (_, abort_handle)) in self.slot_to_terminal.drain() {
+            abort_handle.abort();
+        }
+        for abort_handle in self.active_side_questions.drain(..) {
+            abort_handle.abort();
+        }
+    }
+}
+
+fn is_session_secret_still_valid(runtime: &DaemonRuntime, auth_secret: &str) -> bool {
     runtime
         .active_pairing_secret()
         .as_deref()
         .is_some_and(|cur| orbit_crypto::constant_time_eq(cur.as_bytes(), auth_secret.as_bytes()))
 }
 
-async fn run_client_session_loop(
-    runtime: Arc<DaemonRuntime>,
-    mut in_rx: mpsc::Receiver<SessionFrame>,
-    out_tx: mpsc::Sender<SessionFrame>,
-    direct_auth_secret: Option<String>,
-) {
-    let session_id = Uuid::new_v4();
-    let mut use_zstd = false;
-    let mut subscribed_agents: HashSet<String> = HashSet::new();
-    let mut subscribed_provider_subagents: HashSet<(String, String)> = HashSet::new();
-    let mut slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)> = HashMap::new();
-    let mut active_side_questions: Vec<tokio::task::AbortHandle> = Vec::new();
-    let mut bcast_rx = runtime.orchestrator.broadcast_tx.subscribe();
-    let mut host_status_rx = runtime.connected_hosts.status_updates_tx.subscribe();
+/// Independently watches for `pairing_secret` rotation/revocation without being blocked by
+/// in-flight RPC handlers or outbound channel backpressure.
+async fn wait_for_session_revocation(runtime: Arc<DaemonRuntime>, auth_secret: String) {
     let mut secret_rot_rx = runtime.pairing_secret_rotated_tx.subscribe();
     let mut secret_check_interval = tokio::time::interval(Duration::from_secs(1));
     secret_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    if !is_session_secret_still_valid(&runtime, &auth_secret) {
+        return;
+    }
+
     loop {
         tokio::select! {
-            _ = secret_rot_rx.recv(), if direct_auth_secret.is_some() => {
-                if let Some(ref secret) = direct_auth_secret
-                    && !is_direct_secret_still_valid(&runtime, secret)
-                {
-                    warn!(session_id = %session_id, "Closing direct /ws session after pairing_secret rotation");
-                    break;
+            res = secret_rot_rx.recv() => {
+                match res {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if !is_session_secret_still_valid(&runtime, &auth_secret) {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
-
-            _ = secret_check_interval.tick(), if direct_auth_secret.is_some() => {
-                if let Some(ref secret) = direct_auth_secret
-                    && !is_direct_secret_still_valid(&runtime, secret)
-                {
-                    warn!(session_id = %session_id, "Closing direct /ws session: pairing_secret rotated or revoked");
-                    break;
+            _ = secret_check_interval.tick() => {
+                if !is_session_secret_still_valid(&runtime, &auth_secret) {
+                    return;
                 }
             }
+        }
+    }
+}
 
+/// Supervise `run_client_session_loop` alongside an independent revocation watcher so rotating or
+/// deleting `pairing_secret` cancels in-flight RPCs, drops broadcast subscriptions, and terminates
+/// the session immediately even under a blocked RPC or saturated outbound queue.
+async fn run_supervised_client_session(
+    runtime: Arc<DaemonRuntime>,
+    in_rx: mpsc::Receiver<SessionFrame>,
+    out_tx: mpsc::Sender<SessionFrame>,
+    auth_secret: String,
+    initial_msg: Option<WireMessage>,
+) -> SessionExitReason {
+    let session_id = Uuid::new_v4();
+    let revoke_rt = Arc::clone(&runtime);
+    let revoke_secret = auth_secret.clone();
+    tokio::select! {
+        biased;
+        () = wait_for_session_revocation(revoke_rt, revoke_secret) => {
+            warn!(session_id = %session_id, "Closing client session: pairing_secret rotated or revoked");
+            SessionExitReason::Revoked
+        }
+        () = run_client_session_loop(runtime, session_id, in_rx, out_tx, auth_secret, initial_msg) => {
+            SessionExitReason::Normal
+        }
+    }
+}
+
+async fn run_client_session_loop(
+    runtime: Arc<DaemonRuntime>,
+    session_id: Uuid,
+    mut in_rx: mpsc::Receiver<SessionFrame>,
+    out_tx: mpsc::Sender<SessionFrame>,
+    auth_secret: String,
+    initial_msg: Option<WireMessage>,
+) {
+    let mut use_zstd = false;
+    let mut subscribed_agents: HashSet<String> = HashSet::new();
+    let mut subscribed_provider_subagents: HashSet<(String, String)> = HashSet::new();
+    let mut cleanup = SessionCleanupGuard::new();
+    let mut bcast_rx = runtime.orchestrator.broadcast_tx.subscribe();
+    let mut host_status_rx = runtime.connected_hosts.status_updates_tx.subscribe();
+
+    if let Some(msg) = initial_msg {
+        if !is_session_secret_still_valid(&runtime, &auth_secret) {
+            return;
+        }
+        use_zstd = true;
+        if let Some(reply) = handle_wire_rpc(
+            &runtime,
+            session_id,
+            msg,
+            &mut use_zstd,
+            &mut subscribed_agents,
+            &mut subscribed_provider_subagents,
+            &mut cleanup.slot_to_terminal,
+            &mut cleanup.active_side_questions,
+            &out_tx,
+        )
+        .await
+            && out_tx
+                .send(SessionFrame::Wire {
+                    msg: reply,
+                    zstd: use_zstd,
+                })
+                .await
+                .is_err()
+        {
+            return;
+        }
+    }
+
+    loop {
+        tokio::select! {
             maybe_in = in_rx.recv() => {
                 let Some(frame) = maybe_in else { break; };
-                if let Some(ref secret) = direct_auth_secret
-                    && !is_direct_secret_still_valid(&runtime, secret)
-                {
-                    warn!(session_id = %session_id, "Closing direct /ws session on frame arrival: pairing_secret rotated or revoked");
+                if !is_session_secret_still_valid(&runtime, &auth_secret) {
+                    warn!(session_id = %session_id, "Closing client session on frame arrival: pairing_secret rotated or revoked");
                     break;
                 }
                 match frame {
                     SessionFrame::Terminal(tframe) => {
                         match tframe {
                             TerminalBinaryFrame::Input { slot, data } => {
-                                if let Some((tid, _)) = slot_to_terminal.get(&slot) {
+                                if let Some((tid, _)) = cleanup.slot_to_terminal.get(&slot) {
                                     runtime.orchestrator.write_terminal_input(tid, data).await;
                                 }
                             }
                             TerminalBinaryFrame::Resize { slot, cols, rows } => {
-                                if let Some((tid, _)) = slot_to_terminal.get(&slot) {
+                                if let Some((tid, _)) = cleanup.slot_to_terminal.get(&slot) {
                                     runtime.orchestrator.resize_terminal(tid, cols, rows).await;
                                 }
                             }
@@ -1592,7 +1938,7 @@ async fn run_client_session_loop(
                         if zstd {
                             use_zstd = true;
                         }
-                        active_side_questions.retain(|h| !h.is_finished());
+                        cleanup.active_side_questions.retain(|h| !h.is_finished());
                         if let Some(reply) = handle_wire_rpc(
                             &runtime,
                             session_id,
@@ -1600,8 +1946,8 @@ async fn run_client_session_loop(
                             &mut use_zstd,
                             &mut subscribed_agents,
                             &mut subscribed_provider_subagents,
-                            &mut slot_to_terminal,
-                            &mut active_side_questions,
+                            &mut cleanup.slot_to_terminal,
+                            &mut cleanup.active_side_questions,
                             &out_tx,
                         )
                         .await
@@ -1766,13 +2112,6 @@ async fn run_client_session_loop(
                 }
             }
         }
-    }
-
-    for (_, (_, abort_handle)) in slot_to_terminal.drain() {
-        abort_handle.abort();
-    }
-    for abort_handle in active_side_questions.drain(..) {
-        abort_handle.abort();
     }
 }
 
@@ -7532,6 +7871,59 @@ mod self_upgrade_tests {
     }
 
     #[tokio::test]
+    async fn revocation_terminates_session_immediately_even_when_outbound_queue_is_saturated() {
+        let home = std::env::temp_dir().join(format!("orbit_rev_sat_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let runtime = DaemonRuntime::bootstrap(&home).await.expect("bootstrap");
+        let secret = runtime.pairing_secret.clone();
+
+        let (in_tx, in_rx) = mpsc::channel::<SessionFrame>(4);
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(1);
+
+        // Saturate the outbound queue with a pending terminal frame so `out_tx.send(...)` blocks.
+        out_tx
+            .try_send(SessionFrame::Terminal(TerminalBinaryFrame::Output {
+                slot: 0,
+                data: b"queued-pty-bytes".to_vec(),
+            }))
+            .expect("fill outbound queue");
+
+        let rt_session = Arc::clone(&runtime);
+        let session_task = tokio::spawn(async move {
+            run_supervised_client_session(rt_session, in_rx, out_tx, secret, None).await
+        });
+
+        // Trigger a Ping RPC whose Pong reply blocks on the saturated `out_tx` channel.
+        in_tx
+            .send(SessionFrame::Wire {
+                msg: WireMessage::Ping { ts_ms: 42 },
+                zstd: false,
+            })
+            .await
+            .expect("send ping");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !session_task.is_finished(),
+            "session should still be running while blocked on saturated out_tx"
+        );
+
+        // Rotate pairing_secret: independent revocation supervisor MUST exit with Revoked
+        // immediately without waiting for `out_tx` to drain.
+        let _rotated = runtime.rotate_pairing_secret().expect("rotate");
+        let exit = tokio::time::timeout(Duration::from_millis(500), session_task)
+            .await
+            .expect("revocation must not block on saturated outbound queue")
+            .expect("session task join");
+        assert_eq!(exit, SessionExitReason::Revoked);
+
+        // Only the pre-queued frame should exist; the Pong must not have been enqueued after revocation.
+        assert!(out_rx.try_recv().is_ok());
+        assert!(out_rx.try_recv().is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
     async fn detect_running_local_relay_probes_healthz_endpoint() {
         let base = std::env::temp_dir().join(format!(
             "orbit_relay_healthz_test_{}",
@@ -7825,5 +8217,162 @@ mod self_upgrade_tests {
 
         server.abort();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn first_e2ee_transport_record_rejects_silent_replay_and_forged_ciphertext_before_session()
+     {
+        use orbit_crypto::ClientHandshake;
+        use tokio_tungstenite::{accept_async, connect_async};
+
+        let kp = HostIdentityKeypair::generate().expect("keygen");
+        let pub_bytes = kp.public_bytes().expect("pub");
+        let priv_bytes = kp.private_bytes().expect("priv");
+        let secret = orbit_crypto::generate_pairing_secret();
+
+        let (client_hs1, msg1) = ClientHandshake::new(&pub_bytes, &secret).expect("client init");
+        let (_daemon_chan1, msg2_1) =
+            DaemonHandshake::accept(&priv_bytes, &secret, &msg1).expect("daemon accept 1");
+        let mut client_chan1 = client_hs1.finalize(&msg2_1).expect("finalize 1");
+        let hello = WireMessage::Hello {
+            client_id: "c1".into(),
+            client_name: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            supports_zstd: true,
+        };
+        let hello_z = hello.encode_zstd(3).expect("zstd");
+        let mut plain = Vec::with_capacity(1 + hello_z.len());
+        plain.push(E2EE_FRAME_WIRE);
+        plain.extend_from_slice(&hello_z);
+        let legit_ct1 = client_chan1.seal_record(&plain).expect("seal hello");
+
+        // Case 1: Replayed msg1 with silence (+ Ping keepalives) times out and closes with Policy.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (mut daemon_replayed, _msg2_replay) =
+                DaemonHandshake::accept(&priv_bytes, &secret, &msg1).expect("replayed accept");
+
+            let srv = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let ws = accept_async(tcp).await.expect("ws accept");
+                let (mut sink, mut stream) = ws.split();
+                receive_first_e2ee_wire_message(
+                    &mut daemon_replayed,
+                    &mut sink,
+                    &mut stream,
+                    Duration::from_millis(120),
+                )
+                .await
+            });
+
+            let (mut cli_ws, _) = connect_async(format!("ws://{addr}"))
+                .await
+                .expect("connect");
+            // Send a Ping; daemon must reply Pong but still enforce the overall timeout.
+            cli_ws
+                .send(TungMsg::Ping(b"keepalive".to_vec().into()))
+                .await
+                .expect("send ping");
+            let mut saw_close_policy = false;
+            while let Ok(Some(Ok(frame))) =
+                tokio::time::timeout(Duration::from_secs(2), cli_ws.next()).await
+            {
+                if let TungMsg::Close(Some(cf)) = frame
+                    && cf.code == TungCloseCode::Policy
+                {
+                    saw_close_policy = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_close_policy,
+                "silent replayed msg1 must receive Policy close"
+            );
+            assert!(srv.await.expect("join").is_err());
+        }
+
+        // Case 2: Replayed msg1 followed by captured ciphertext from session 1 fails immediately.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (mut daemon_replayed, _msg2_replay) =
+                DaemonHandshake::accept(&priv_bytes, &secret, &msg1).expect("replayed accept");
+
+            let srv = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let ws = accept_async(tcp).await.expect("ws accept");
+                let (mut sink, mut stream) = ws.split();
+                receive_first_e2ee_wire_message(
+                    &mut daemon_replayed,
+                    &mut sink,
+                    &mut stream,
+                    Duration::from_secs(5),
+                )
+                .await
+            });
+
+            let (mut cli_ws, _) = connect_async(format!("ws://{addr}"))
+                .await
+                .expect("connect");
+            cli_ws
+                .send(TungMsg::Binary(legit_ct1.clone().into()))
+                .await
+                .expect("send replayed ct");
+            let close_frame = tokio::time::timeout(Duration::from_secs(2), cli_ws.next())
+                .await
+                .expect("close timeout")
+                .expect("frame")
+                .expect("ok");
+            assert!(
+                matches!(close_frame, TungMsg::Close(Some(ref cf)) if cf.code == TungCloseCode::Policy),
+                "replayed ciphertext must close with Policy, got {close_frame:?}"
+            );
+            assert!(srv.await.expect("join").is_err());
+        }
+
+        // Case 3: Legitimate client completing handshake & sending encrypted Hello succeeds.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (client_hs_ok, msg1_ok) =
+                ClientHandshake::new(&pub_bytes, &secret).expect("client init ok");
+            let (mut daemon_ok, msg2_ok) =
+                DaemonHandshake::accept(&priv_bytes, &secret, &msg1_ok).expect("daemon accept ok");
+            let mut client_ok = client_hs_ok.finalize(&msg2_ok).expect("finalize ok");
+            let ct_ok = client_ok.seal_record(&plain).expect("seal ok");
+
+            let srv = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let ws = accept_async(tcp).await.expect("ws accept");
+                let (mut sink, mut stream) = ws.split();
+                receive_first_e2ee_wire_message(
+                    &mut daemon_ok,
+                    &mut sink,
+                    &mut stream,
+                    Duration::from_secs(5),
+                )
+                .await
+            });
+
+            let (mut cli_ws, _) = connect_async(format!("ws://{addr}"))
+                .await
+                .expect("connect");
+            cli_ws
+                .send(TungMsg::Binary(ct_ok.into()))
+                .await
+                .expect("send valid hello");
+            let decoded = srv
+                .await
+                .expect("join")
+                .expect("valid encrypted Hello must succeed");
+            assert!(matches!(decoded, WireMessage::Hello { client_id, .. } if client_id == "c1"));
+        }
     }
 }

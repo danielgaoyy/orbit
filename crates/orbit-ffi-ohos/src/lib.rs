@@ -294,6 +294,8 @@ struct OhosUpdateSchedulePayload {
     #[serde(default)]
     cron_expr: Option<String>,
     #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
     max_runs: Option<u32>,
@@ -1451,6 +1453,7 @@ impl OhosCoreFacade {
             &payload.schedule_id,
             payload.name,
             payload.cron_expr,
+            payload.timezone,
             payload.prompt,
             payload.max_runs,
             payload.archive_on_finish,

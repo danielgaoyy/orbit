@@ -1549,6 +1549,8 @@ pub enum WireMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cron_expr: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        timezone: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_runs: Option<u32>,

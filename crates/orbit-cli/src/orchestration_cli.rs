@@ -258,6 +258,8 @@ pub enum ScheduleAction {
         #[arg(long)]
         cron: String,
         #[arg(long)]
+        timezone: Option<String>,
+        #[arg(long)]
         cwd: String,
         #[arg(long)]
         prompt: String,
@@ -285,6 +287,8 @@ pub enum ScheduleAction {
         name: Option<String>,
         #[arg(long)]
         cron: Option<String>,
+        #[arg(long)]
+        timezone: Option<String>,
         #[arg(long)]
         prompt: Option<String>,
         #[arg(long)]
@@ -1348,6 +1352,7 @@ pub async fn cmd_schedule(
         ScheduleAction::Create {
             name,
             cron,
+            timezone,
             cwd,
             prompt,
             provider,
@@ -1381,7 +1386,7 @@ pub async fn cmd_schedule(
                     request_id: req_id,
                     name,
                     cron_expr: cron,
-                    timezone: None,
+                    timezone,
                     prompt,
                     target,
                     max_runs,
@@ -1451,6 +1456,7 @@ pub async fn cmd_schedule(
             schedule_id,
             name,
             cron,
+            timezone,
             prompt,
             max_runs,
         } => {
@@ -1463,6 +1469,7 @@ pub async fn cmd_schedule(
                     schedule_id: schedule_id.clone(),
                     name,
                     cron_expr: cron,
+                    timezone,
                     prompt,
                     max_runs,
                     expires_at: None,

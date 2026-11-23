@@ -1239,10 +1239,16 @@ async fn execute_tool_inner(
             let expires_at = opt_str(args, "expires_at")
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
+            let timezone_update = match args.get("timezone") {
+                None => None,
+                Some(Value::String(s)) => Some(s.as_str()),
+                Some(_) => anyhow::bail!("`timezone` must be a string"),
+            };
             let s = rt.scheduler.update_schedule(
                 &sid,
                 opt_str(args, "name"),
                 opt_str(args, "cron").as_deref(),
+                timezone_update,
                 opt_str(args, "prompt"),
                 args.get("max_runs")
                     .and_then(|v| v.as_u64())
@@ -4170,6 +4176,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "name": { "type": "string" },
                     "cron": { "type": "string" },
+                    "timezone": { "type": "string", "description": "Optional IANA timezone (e.g. `Asia/Shanghai`, `America/New_York`) or fixed offset (e.g. `+08:00`). Defaults to host local timezone." },
                     "prompt": { "type": "string" },
                     "cwd": { "type": "string" },
                     "workspace_id": { "type": "string" },
@@ -4232,6 +4239,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "schedule_id": { "type": "string" },
                     "name": { "type": "string" },
                     "cron": { "type": "string" },
+                    "timezone": { "type": "string", "description": "Optional IANA timezone (e.g. `Asia/Shanghai`, `America/New_York`) or fixed offset (e.g. `+08:00`)." },
                     "prompt": { "type": "string" },
                     "max_runs": { "type": "integer" },
                     "expires_at": { "type": "string" }
@@ -5021,6 +5029,106 @@ mod tests {
 
         rt.browser.shutdown_all().await;
         server_task.abort();
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[tokio::test]
+    async fn mcp_update_schedule_preserves_omitted_and_resets_empty_timezone() {
+        let tmp_home = std::env::temp_dir().join(format!(
+            "orbit-tools-sched-tz-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_home).expect("create temp home");
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap");
+
+        let created = execute_tool(
+            &rt,
+            None,
+            "create_schedule",
+            json!({
+                "name": "TZ MCP Test",
+                "cron": "0 9 * * *",
+                "timezone": "Asia/Shanghai",
+                "prompt": "check",
+                "cwd": tmp_home.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert!(!created.is_error, "create failed: {}", created.text);
+        let sid = created.structured["schedule"]["schedule_id"]
+            .as_str()
+            .expect("schedule_id")
+            .to_string();
+        assert_eq!(created.structured["schedule"]["timezone"], "Asia/Shanghai");
+
+        // Omitting `timezone` keeps existing `Asia/Shanghai`.
+        let renamed = execute_tool(
+            &rt,
+            None,
+            "update_schedule",
+            json!({
+                "schedule_id": sid,
+                "name": "TZ MCP Renamed",
+            }),
+        )
+        .await;
+        assert!(!renamed.is_error, "rename failed: {}", renamed.text);
+        assert_eq!(renamed.structured["schedule"]["timezone"], "Asia/Shanghai");
+
+        // Updating `timezone` to canonical fixed offset works.
+        let updated = execute_tool(
+            &rt,
+            None,
+            "update_schedule",
+            json!({
+                "schedule_id": sid,
+                "timezone": "+09:00",
+            }),
+        )
+        .await;
+        assert!(!updated.is_error, "update tz failed: {}", updated.text);
+        assert_eq!(updated.structured["schedule"]["timezone"], "+09:00");
+
+        // Explicit empty string resets `timezone` back to host local (`None`).
+        let reset = execute_tool(
+            &rt,
+            None,
+            "update_schedule",
+            json!({
+                "schedule_id": sid,
+                "timezone": "",
+            }),
+        )
+        .await;
+        assert!(!reset.is_error, "reset tz failed: {}", reset.text);
+        assert!(reset.structured["schedule"].get("timezone").is_none());
+
+        // Non-string `timezone` (including null / number) is rejected.
+        let bad_type = execute_tool(
+            &rt,
+            None,
+            "update_schedule",
+            json!({
+                "schedule_id": sid,
+                "timezone": 123,
+            }),
+        )
+        .await;
+        assert!(bad_type.is_error);
+        let null_type = execute_tool(
+            &rt,
+            None,
+            "update_schedule",
+            json!({
+                "schedule_id": sid,
+                "timezone": null,
+            }),
+        )
+        .await;
+        assert!(null_type.is_error);
+
         let _ = std::fs::remove_dir_all(&tmp_home);
     }
 }

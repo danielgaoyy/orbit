@@ -29,6 +29,7 @@ export interface SidebarConversationRowProps {
   isWorktree: boolean;
   isPinned: boolean;
   isUnread: boolean;
+  hasRunningSubagents?: boolean;
   selected: boolean;
   keyboardFocused?: boolean;
   highlightIndices?: readonly number[];
@@ -63,6 +64,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   isWorktree,
   isPinned,
   isUnread,
+  hasRunningSubagents = false,
   selected,
   keyboardFocused = false,
   highlightIndices,
@@ -237,8 +239,9 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
       {/* Right Slot: Resting Loading / Draft / Relative Time ↔ Hover Actions */}
       {!isRenaming && (
         <div className="flex min-w-[46px] shrink-0 items-center justify-end">
-          {isForegroundRunning ? (
+          {isForegroundRunning || hasRunningSubagents ? (
             <span
+              title={!isForegroundRunning && hasRunningSubagents ? "Subagent running" : undefined}
               className={cn(
                 "text-foreground/65 items-center justify-center gap-1.5 pr-0.5",
                 menuOpen ? "hidden" : "inline-flex group-hover/item:hidden",

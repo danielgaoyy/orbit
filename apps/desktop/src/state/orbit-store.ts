@@ -9,7 +9,6 @@ import {
   playSoftNotificationChime,
 } from "@/lib/notification-sound";
 import {
-  type AgentStageView,
   type CoreNotification,
   type FleetOverviewView,
   type HostDetailView,
@@ -86,6 +85,7 @@ import type {
   ThemeMode,
   ToastAction,
   UndoArchiveEntry,
+  WindowedAgentStageView,
 } from "./store-types";
 
 export {
@@ -344,8 +344,8 @@ function bumpFileLoadSeq(cKey: string): number {
 function applyStageCacheUpdate(
   s: OrbitUiState,
   tlKey: string,
-  nextStage: AgentStageView,
-): Record<string, AgentStageView> {
+  nextStage: WindowedAgentStageView,
+): Record<string, WindowedAgentStageView> {
   const merged = {
     ...s.stages,
     [tlKey]: nextStage,

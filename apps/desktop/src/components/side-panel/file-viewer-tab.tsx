@@ -50,6 +50,14 @@ import {
 import { DARK_PLAIN_TOKEN_FG, LIGHT_PLAIN_TOKEN_FG, resolveTokenColor } from "@/lib/code-highlight";
 import { useI18n } from "@/lib/i18n";
 import { parseAnsiLogLines, resolveAnsiColor } from "@/lib/ansi";
+import {
+  LOG_INITIAL_LINE_CAP,
+  LOG_PAGE_INCREMENT,
+  computeLogWindowSlice,
+  computeNextLogLineCap,
+  computePrependRestoredScrollTop,
+  shouldTriggerTopLogPagination,
+} from "@/lib/stage-pagination";
 import { cn } from "@/lib/utils";
 
 export const FileViewerTab = memo(function FileViewerTab({
@@ -103,7 +111,7 @@ export const FileViewerTab = memo(function FileViewerTab({
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState("");
   const [activeMatchIdx, setActiveMatchIdx] = useState(0);
-  const [renderedLineCap, setRenderedLineCap] = useState(800);
+  const [renderedLineCap, setRenderedLineCap] = useState(LOG_INITIAL_LINE_CAP);
   const [diagDrawerOpen, setDiagDrawerOpen] = useState(false);
   const [lazyHighlights, setLazyHighlights] = useState<Record<number, HighlightedLineView>>({});
   const lazyHighlightRequestedChunksRef = useRef<Set<number>>(new Set());
@@ -119,11 +127,16 @@ export const FileViewerTab = memo(function FileViewerTab({
   const logViewportRef = useRef<HTMLDivElement | null>(null);
   const codeViewportRef = useRef<HTMLDivElement | null>(null);
   const lineRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const pendingLogPrependAnchorRef = useRef<{
+    prevScrollHeight: number;
+    prevScrollTop: number;
+  } | null>(null);
   const ime = useImeCompositionGuard();
   const mod = modSymbol();
 
   useEffect(() => {
-    setRenderedLineCap(800);
+    pendingLogPrependAnchorRef.current = null;
+    setRenderedLineCap(LOG_INITIAL_LINE_CAP);
     setLogFollow(isTaskLogPath);
     lazyHighlightSeqRef.current += 1;
     lazyHighlightRequestedChunksRef.current.clear();
@@ -444,6 +457,55 @@ export const FileViewerTab = memo(function FileViewerTab({
     matchLineNumbers.length > 0
       ? activeTargetLine
       : (focusRange.endLine ?? focusRange.startLine);
+
+  const logWindow = useMemo(
+    () =>
+      isLogFile
+        ? computeLogWindowSlice(logLines.length, renderedLineCap, activeTargetLine)
+        : { effectiveCap: renderedLineCap, startIdx: 0 },
+    [isLogFile, logLines.length, renderedLineCap, activeTargetLine],
+  );
+  const logStartIdx = logWindow.startIdx;
+  const visibleLogLines = useMemo(
+    () => (isLogFile ? (logStartIdx > 0 ? logLines.slice(logStartIdx) : logLines) : []),
+    [isLogFile, logLines, logStartIdx],
+  );
+
+  // Restore scroll position seamlessly after prepending earlier log lines above the viewport
+  useLayoutEffect(() => {
+    const snap = pendingLogPrependAnchorRef.current;
+    const el = logViewportRef.current;
+    if (!snap || !el) return;
+    pendingLogPrependAnchorRef.current = null;
+    el.scrollTop = computePrependRestoredScrollTop(
+      snap.prevScrollTop,
+      snap.prevScrollHeight,
+      el.scrollHeight,
+    );
+  }, [logStartIdx, renderedLineCap]);
+
+  const maybeLoadEarlierLogPage = useCallback(
+    (el: HTMLDivElement) => {
+      if (
+        !shouldTriggerTopLogPagination(
+          logStartIdx,
+          el.scrollTop,
+          pendingLogPrependAnchorRef.current !== null,
+        )
+      ) {
+        return;
+      }
+      if (logFollow) {
+        setLogFollow(false);
+      }
+      pendingLogPrependAnchorRef.current = {
+        prevScrollHeight: el.scrollHeight,
+        prevScrollTop: el.scrollTop,
+      };
+      setRenderedLineCap((c) => computeNextLogLineCap(logLines.length, c, LOG_PAGE_INCREMENT));
+    },
+    [logFollow, logLines.length, logStartIdx],
+  );
 
   // Only log viewer uses `renderedLineCap`; code viewer is fully virtualized (O(1) jump to any line)
   useEffect(() => {
@@ -1119,6 +1181,11 @@ export const FileViewerTab = memo(function FileViewerTab({
           <ScrollArea
             orientation={logWrapLines ? "vertical" : "both"}
             viewportRef={logViewportRef}
+            onWheel={(e) => {
+              if (e.deltaY < 0 && logViewportRef.current) {
+                maybeLoadEarlierLogPage(logViewportRef.current);
+              }
+            }}
             onViewportScroll={(e) => {
               const el = e.currentTarget;
               const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
@@ -1127,6 +1194,7 @@ export const FileViewerTab = memo(function FileViewerTab({
               } else if (distanceFromBottom <= 20 && !logFollow && isTaskLogPath) {
                 setLogFollow(true);
               }
+              maybeLoadEarlierLogPage(el);
             }}
             className="bg-canvas min-h-0 flex-1"
             viewportClassName="selectable-text px-3.5 py-2.5 font-mono text-[11.5px] leading-[1.65]"
@@ -1138,93 +1206,64 @@ export const FileViewerTab = memo(function FileViewerTab({
             )}
 
             <div className="space-y-[1px]">
-              {(() => {
-                // Tail-window large logs to keep WebView rendering fast while live-tailing
-                let effectiveCap = renderedLineCap;
-                if (activeTargetLine != null && logLines.length - activeTargetLine + 20 > effectiveCap) {
-                  effectiveCap = logLines.length - activeTargetLine + 40;
-                }
-                const logStartIdx = Math.max(0, logLines.length - effectiveCap);
-                const visibleLogLines =
-                  logStartIdx > 0 ? logLines.slice(logStartIdx) : logLines;
-                return (
-                  <>
-                    {logStartIdx > 0 && (
-                      <div className="mb-1.5 flex items-center justify-between rounded-md bg-black/[0.03] px-2.5 py-1 font-sans text-[11px] text-muted-foreground dark:bg-white/[0.04]">
-                        <span>
-                          Showing latest {visibleLogLines.length.toLocaleString()} of{" "}
-                          {logLines.length.toLocaleString()} lines
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => setRenderedLineCap((c) => c + 1200)}
-                          className="text-foreground/85 hover:text-foreground cursor-pointer font-medium transition-colors"
-                        >
-                          Show earlier lines
-                        </button>
-                      </div>
-                    )}
-                    {visibleLogLines.map((line, relIdx) => {
-                      const lineNumber = logStartIdx + relIdx + 1;
-                      const isMatched = matchLineSet.has(lineNumber);
-                      const isFocused =
-                        matchLineNumbers.length > 0 &&
-                        matchLineNumbers[Math.min(activeMatchIdx, matchLineNumbers.length - 1)] ===
-                          lineNumber;
+              {visibleLogLines.map((line, relIdx) => {
+                const lineNumber = logStartIdx + relIdx + 1;
+                const isMatched = matchLineSet.has(lineNumber);
+                const isFocused =
+                  matchLineNumbers.length > 0 &&
+                  matchLineNumbers[Math.min(activeMatchIdx, matchLineNumbers.length - 1)] ===
+                    lineNumber;
 
-                      return (
-                        <div
-                          key={lineNumber}
-                          ref={(el) => {
-                            if (el) lineRefs.current.set(lineNumber, el);
-                            else lineRefs.current.delete(lineNumber);
-                          }}
-                          className={cn(
-                            "text-foreground/84 rounded-[4px] px-1 py-[0.5px]",
-                            logWrapLines ? "break-words whitespace-pre-wrap" : "whitespace-pre",
-                            isFocused &&
-                              "bg-primary/[0.14] shadow-[inset_2px_0_0_0_var(--color-primary)]",
-                            !isFocused && isMatched && "bg-amber-500/[0.14]",
-                          )}
-                        >
-                          {line.plain.length === 0 ? (
-                            <span className="block h-[6px]" />
-                          ) : line.spans ? (
-                            line.spans.map((span, sIdx) =>
-                              span.style ? (
-                                <span
-                                  key={sIdx}
-                                  style={{
-                                    color: resolveAnsiColor(span.style.fg, isDark),
-                                    backgroundColor: resolveAnsiColor(span.style.bg, isDark),
-                                    fontWeight: span.style.bold ? 600 : undefined,
-                                    opacity: span.style.dim ? 0.58 : undefined,
-                                    fontStyle: span.style.italic ? "italic" : undefined,
-                                    textDecoration:
-                                      span.style.underline && span.style.strike
-                                        ? "underline line-through"
-                                        : span.style.underline
-                                          ? "underline"
-                                          : span.style.strike
-                                            ? "line-through"
-                                            : undefined,
-                                  }}
-                                >
-                                  {span.text}
-                                </span>
-                              ) : (
-                                <span key={sIdx}>{span.text}</span>
-                              ),
-                            )
-                          ) : (
-                            line.plain
-                          )}
-                        </div>
-                      );
-                    })}
-                  </>
+                return (
+                  <div
+                    key={lineNumber}
+                    ref={(el) => {
+                      if (el) lineRefs.current.set(lineNumber, el);
+                      else lineRefs.current.delete(lineNumber);
+                    }}
+                    className={cn(
+                      "text-foreground/84 rounded-[4px] px-1 py-[0.5px]",
+                      logWrapLines ? "break-words whitespace-pre-wrap" : "whitespace-pre",
+                      isFocused &&
+                        "bg-primary/[0.14] shadow-[inset_2px_0_0_0_var(--color-primary)]",
+                      !isFocused && isMatched && "bg-amber-500/[0.14]",
+                    )}
+                  >
+                    {line.plain.length === 0 ? (
+                      <span className="block h-[6px]" />
+                    ) : line.spans ? (
+                      line.spans.map((span, sIdx) =>
+                        span.style ? (
+                          <span
+                            key={sIdx}
+                            style={{
+                              color: resolveAnsiColor(span.style.fg, isDark),
+                              backgroundColor: resolveAnsiColor(span.style.bg, isDark),
+                              fontWeight: span.style.bold ? 600 : undefined,
+                              opacity: span.style.dim ? 0.58 : undefined,
+                              fontStyle: span.style.italic ? "italic" : undefined,
+                              textDecoration:
+                                span.style.underline && span.style.strike
+                                  ? "underline line-through"
+                                  : span.style.underline
+                                    ? "underline"
+                                    : span.style.strike
+                                      ? "line-through"
+                                      : undefined,
+                            }}
+                          >
+                            {span.text}
+                          </span>
+                        ) : (
+                          <span key={sIdx}>{span.text}</span>
+                        ),
+                      )
+                    ) : (
+                      line.plain
+                    )}
+                  </div>
                 );
-              })()}
+              })}
             </div>
           </ScrollArea>
 

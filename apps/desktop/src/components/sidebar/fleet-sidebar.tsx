@@ -31,6 +31,7 @@ import {
   type SidebarConversationView,
   type SidebarProjectGroupView,
   compareSemver,
+  isAgentBackgroundWaiting,
   isAgentForegroundRunning,
   isMacDesktop,
   normalizeSemver,
@@ -130,6 +131,60 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const appVersion = useOrbitSelector((s) => s.appVersion);
   const releaseUpdateInfo = useOrbitSelector((s) => s.releaseUpdateInfo);
   const fleetUpdate = useOrbitSelector((s) => s.fleetUpdate);
+  const stageRunningSubagentSignature = useOrbitSelector((s) => {
+    let sig = "";
+    for (const [tlKey, st] of Object.entries(s.stages)) {
+      const subs = st.insights.subagents;
+      if (subs.length === 0) continue;
+      const sepIdx = tlKey.indexOf("::");
+      const hostId = sepIdx >= 0 ? tlKey.slice(0, sepIdx) : "";
+      const agentId = sepIdx >= 0 ? tlKey.slice(sepIdx + 2) : "";
+      const provList = hostId && agentId ? s.hostDetails[hostId]?.provider_subagents?.[agentId] : undefined;
+      let hasRunning = false;
+      for (let i = 0; i < subs.length; i += 1) {
+        const sa = subs[i];
+        if (sa.status !== "running") continue;
+        if (sa.child_agent_id) {
+          let managedChild: AgentCardView | undefined;
+          for (const d of Object.values(s.hostDetails)) {
+            const match = d.agents.find((a) => a.agent_id === sa.child_agent_id);
+            if (match) {
+              managedChild = match;
+              break;
+            }
+          }
+          if (managedChild) {
+            if (
+              !managedChild.archived_at_rfc3339 &&
+              (managedChild.is_running ||
+                isAgentBackgroundWaiting(managedChild) ||
+                managedChild.is_awaiting_permission)
+            ) {
+              hasRunning = true;
+              break;
+            }
+            continue;
+          }
+        }
+        if (sa.provider_subagent_id && provList) {
+          const provMatch = provList.find((ps) => ps.subagent_id === sa.provider_subagent_id);
+          if (provMatch) {
+            if (provMatch.status === "running") {
+              hasRunning = true;
+              break;
+            }
+            continue;
+          }
+        }
+        hasRunning = true;
+        break;
+      }
+      if (hasRunning) {
+        sig += sig ? `\0${tlKey}` : tlKey;
+      }
+    }
+    return sig;
+  });
 
   const hasFleetUpdatesAvailable = useMemo(() => {
     if (releaseUpdateInfo?.has_newer_version) return true;
@@ -541,6 +596,40 @@ export const FleetSidebar = memo(function FleetSidebar() {
       return Boolean(archivedThreads[threadScopeKey(hostId, ag.agent_id)]);
     },
     [archivedThreads],
+  );
+
+  // O(N) lookup of parent threads that currently have any active managed, provider-native, or cached-stage subagent
+  const runningParentThreadKeys = useMemo(() => {
+    const keys = new Set<string>();
+    if (stageRunningSubagentSignature) {
+      for (const tKey of stageRunningSubagentSignature.split("\0")) {
+        if (tKey) keys.add(tKey);
+      }
+    }
+    for (const [hid, detail] of Object.entries(hostDetails)) {
+      for (const ag of detail.agents) {
+        if (!ag.parent_agent_id || isAgentArchived(hid, ag)) continue;
+        if (ag.is_running || isAgentBackgroundWaiting(ag) || ag.is_awaiting_permission) {
+          const parentHostId = ag.parent_host_id || hid;
+          keys.add(threadScopeKey(parentHostId, ag.parent_agent_id));
+        }
+      }
+      if (detail.provider_subagents) {
+        for (const [parentAgentId, descriptors] of Object.entries(detail.provider_subagents)) {
+          if (descriptors.some((ps) => ps.status === "running")) {
+            keys.add(threadScopeKey(hid, parentAgentId));
+          }
+        }
+      }
+    }
+    return keys;
+  }, [hostDetails, isAgentArchived, stageRunningSubagentSignature]);
+
+  const hasAgentRunningSubagents = useCallback(
+    (hostId: string, ag: AgentCardView): boolean =>
+      Boolean((ag as AgentCardView & { has_running_subagents?: boolean }).has_running_subagents) ||
+      runningParentThreadKeys.has(threadScopeKey(hostId, ag.agent_id)),
+    [runningParentThreadKeys],
   );
 
   const isConvUnread = useCallback(
@@ -1231,6 +1320,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                     isWorktree={conv.is_worktree}
                     isPinned={true}
                     isUnread={unread}
+                    hasRunningSubagents={hasAgentRunningSubagents(host.host_id, conv.agent)}
                     selected={selected}
                     keyboardFocused={keyboardFocusedNavId === navId}
                     highlightIndices={titleIndices}
@@ -1619,7 +1709,11 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 const hasCollapsedRunning =
                   collapsed &&
                   !hasCollapsedApproval &&
-                  visibleConversations.some((c) => isAgentForegroundRunning(c.agent));
+                  visibleConversations.some(
+                    (c) =>
+                      isAgentForegroundRunning(c.agent) ||
+                      hasAgentRunningSubagents(proj.host_id, c.agent),
+                  );
                 const hasCollapsedUnread =
                   collapsed &&
                   !hasCollapsedApproval &&
@@ -1952,8 +2046,10 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             {/* 1. Optional Groups (borderless, lightweight collapsible sections — zero chrome when none exist) */}
                             {curatedWorkspaces.map((ws) => {
                               const wsCollapsed = ws.wsCollapsed;
-                              const wsHasRunning = ws.visiblePeers.some((c) =>
-                                isAgentForegroundRunning(c.agent),
+                              const wsHasRunning = ws.visiblePeers.some(
+                                (c) =>
+                                  isAgentForegroundRunning(c.agent) ||
+                                  hasAgentRunningSubagents(proj.host_id, c.agent),
                               );
                               const wsHasUnread = ws.visiblePeers.some((c) => isConvUnread(c));
                               const isRenamingThisWs = renamingWorkspaceId === ws.workspace_id;
@@ -2165,6 +2261,10 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                               isWorktree={conv.is_worktree}
                                               isPinned={false}
                                               isUnread={unread}
+                                              hasRunningSubagents={hasAgentRunningSubagents(
+                                                proj.host_id,
+                                                ag,
+                                              )}
                                               selected={selected}
                                               keyboardFocused={keyboardFocusedNavId === navId}
                                               highlightIndices={titleIndicesByThreadKey.get(tKey)}
@@ -2244,6 +2344,10 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                       isWorktree={conv.is_worktree}
                                       isPinned={false}
                                       isUnread={unread}
+                                      hasRunningSubagents={hasAgentRunningSubagents(
+                                        proj.host_id,
+                                        ag,
+                                      )}
                                       selected={selected}
                                       keyboardFocused={keyboardFocusedNavId === navId}
                                       highlightIndices={titleIndicesByThreadKey.get(tKey)}

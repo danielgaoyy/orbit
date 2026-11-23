@@ -1,7 +1,6 @@
 import type { DraftPersistenceController } from "@/lib/draft-persistence";
 import type { NotificationSoundTone } from "@/lib/notification-sound";
 import type {
-  AgentStageView,
   BrowserActionRequest,
   BrowserActionResponseView,
   FleetOverviewView,
@@ -32,6 +31,7 @@ import type {
   ThemeMode,
   ToastAction,
   UndoArchiveEntry,
+  WindowedAgentStageView,
 } from "./store-types";
 
 /**
@@ -62,6 +62,11 @@ export interface OrbitCrossSliceActions {
   reloadFleetAndHosts(initialBootstrap?: boolean): Promise<void>;
   reloadHostDetail(hostId: string, includeFleetOverview?: boolean): Promise<void>;
   pullStageDelta(hostId: string, agentId: string, forceFull?: boolean): Promise<void>;
+  loadEarlierStageTurns(
+    hostId: string,
+    agentId: string,
+    targetTurnIndex?: number,
+  ): Promise<number>;
   selectHost(hostId: string, opts?: { keepDraft?: boolean }): void;
   selectAgent(hostId: string, agentId: string, jumpToSeq?: number | null): void;
   startNewThreadDraft(
@@ -271,8 +276,8 @@ export interface OrbitStoreContext {
   applyStageCacheUpdate(
     s: OrbitUiState,
     tlKey: string,
-    nextStage: AgentStageView,
-  ): Record<string, AgentStageView>;
+    nextStage: WindowedAgentStageView,
+  ): Record<string, WindowedAgentStageView>;
   recordStageKeyAccess(tlKey: string): void;
   pruneStageKeyAccess(keysToRemove: ReadonlySet<string>): void;
 

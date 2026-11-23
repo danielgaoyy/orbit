@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type ComponentType,
   type CSSProperties,
 } from "react";
 import {
@@ -45,9 +46,10 @@ import {
   buildSubagentNameMatcher,
   resolveSessionSubagents,
 } from "@/lib/subagents";
+import { computePrependRestoredScrollTop } from "@/lib/stage-pagination";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { cn } from "@/lib/utils";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { isSubagentArchived, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import {
   EMPTY_ARTIFACTS,
   EMPTY_DIFF_FILES,
@@ -203,15 +205,34 @@ const StageOutlineRailBridge = memo(function StageOutlineRailBridge({
   );
 });
 
-const StageJumpLatestBanner = memo(function StageJumpLatestBanner({
+type FloatingSubagentsTrackProps = {
+  hostId: string | null;
+  agentId: string | null;
+  variant?: "inline" | "floating";
+};
+
+const FloatingSubagentsTrack =
+  SubagentsTrack as ComponentType<FloatingSubagentsTrackProps>;
+
+const STAGE_TOP_PAGINATE_THRESHOLD_PX = 480;
+
+const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
   scrollUiStore,
+  hostId,
+  agentId,
+  hasVisibleSubagents,
   stagePushStyle,
-  dockedOverviewLayout,
+  overviewReservePx,
+  overviewReserveTransition,
   onJumpLatest,
 }: {
   scrollUiStore: StageScrollUiStore;
+  hostId: string;
+  agentId: string;
+  hasVisibleSubagents: boolean;
   stagePushStyle: CSSProperties;
-  dockedOverviewLayout: boolean;
+  overviewReservePx: number;
+  overviewReserveTransition: string;
   onJumpLatest: () => void;
 }) {
   const snap = useSyncExternalStore(
@@ -219,41 +240,66 @@ const StageJumpLatestBanner = memo(function StageJumpLatestBanner({
     scrollUiStore.getSnapshot,
     scrollUiStore.getSnapshot,
   );
+  const showFadeMask = hasVisibleSubagents || snap.showJumpLatest || snap.isOccludingText;
+  const tallFade = hasVisibleSubagents || snap.showJumpLatest;
+
   return (
-    <div className="pointer-events-none absolute inset-x-0 bottom-full h-7">
+    <div className="pointer-events-none absolute right-0 bottom-0 left-0 z-10">
+      {/* Smooth bottom gradient fade mask — leaves far-right scrollbar & docked overview clear */}
       <div
-        className={cn(
-          "absolute inset-y-0 left-0 transition-opacity duration-150",
-          dockedOverviewLayout ? "right-[324px]" : "right-5",
-          snap.isOccludingText ? "opacity-100" : "opacity-0",
-        )}
         style={{
-          background:
-            "linear-gradient(to top, var(--surface-canvas) 0%, color-mix(in oklab, var(--surface-canvas) 66%, transparent) 48%, transparent 100%)",
+          paddingRight: `${Math.max(20, overviewReservePx)}px`,
+          transition: overviewReserveTransition,
         }}
-      />
-      <div
-        style={stagePushStyle}
-        className={cn(
-          "pointer-events-none absolute inset-y-0 left-0",
-          dockedOverviewLayout ? "right-[324px]" : "right-0",
-        )}
+        className="pointer-events-none absolute right-0 bottom-0 left-0"
       >
-        <button
-          type="button"
-          aria-label="Scroll to latest"
-          aria-hidden={!snap.showJumpLatest}
-          tabIndex={snap.showJumpLatest ? 0 : -1}
-          onClick={onJumpLatest}
+        <div
           className={cn(
-            "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute bottom-2 left-1/2 inline-flex size-9.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-[transform,opacity,color,border-color] duration-200 ease-[var(--ease-out-expo)] dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
-            snap.showJumpLatest
-              ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
-              : "pointer-events-none translate-y-1 scale-95 opacity-0",
+            "from-canvas via-canvas/85 w-full bg-gradient-to-t to-transparent transition-[opacity,height] duration-200 ease-out",
+            tallFade ? "h-16" : "h-7",
+            showFadeMask ? "opacity-100" : "opacity-0",
           )}
-        >
-          <ArrowDown className="size-[18px] stroke-[1.9]" />
-        </button>
+        />
+      </div>
+
+      {/* Aligned floating controls row: Subagents capsule (left) + Jump-to-Latest (centered) */}
+      <div
+        style={{
+          paddingRight: `${overviewReservePx}px`,
+          transition: overviewReserveTransition,
+        }}
+        className="pointer-events-none relative"
+      >
+        <div style={stagePushStyle} className="pointer-events-none relative px-[24px]">
+          <div className="@container pointer-events-none relative mx-auto flex w-full max-w-[var(--orbit-stage-max-w,768px)] items-end justify-start">
+            <button
+              type="button"
+              aria-label="Scroll to latest"
+              aria-hidden={!snap.showJumpLatest}
+              tabIndex={snap.showJumpLatest ? 0 : -1}
+              onClick={onJumpLatest}
+              className={cn(
+                "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute left-1/2 inline-flex size-9.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-[transform,opacity,color,border-color,bottom] duration-200 ease-[var(--ease-out-expo)] dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
+                hasVisibleSubagents ? "bottom-11 @[460px]:bottom-2" : "bottom-2",
+                snap.showJumpLatest
+                  ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
+                  : "pointer-events-none translate-y-1 scale-95 opacity-0",
+              )}
+            >
+              <ArrowDown className="size-[18px] stroke-[1.9]" />
+            </button>
+
+            {hasVisibleSubagents && (
+              <div className="pointer-events-none pb-2 [&>div]:mx-0 [&>div]:mb-0 [&>div]:max-w-none [&>div]:px-0 [&_button]:pointer-events-auto">
+                <FloatingSubagentsTrack
+                  hostId={hostId}
+                  agentId={agentId}
+                  variant="floating"
+                />
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -838,7 +884,6 @@ export function StreamStage() {
   const isNetworkOffline = useOrbitSelector((s) => s.isBrowserOffline);
   const {
     isStageWide,
-    dockedOverviewLayout,
     overviewReservePx,
     overviewReserveTransition,
     stageShiftPx,
@@ -853,6 +898,7 @@ export function StreamStage() {
   } = useWorkspaceMotion();
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
   const stageView = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
@@ -913,6 +959,24 @@ export function StreamStage() {
   const [timingTick, setTimingTick] = useState(0);
   const [rewindTarget, setRewindTarget] = useState<RewindRequestTarget | null>(null);
   const [rewindSubmitting, setRewindSubmitting] = useState(false);
+  const [loadingEarlierTurns, setLoadingEarlierTurns] = useState(false);
+  const loadingEarlierTurnsRef = useRef(false);
+  const earlierLoadReqIdRef = useRef(0);
+  const exhaustedEarlierWindowRef = useRef<{
+    scope: string;
+    windowStart: number;
+    revision: number;
+  } | null>(null);
+  const pendingTurnPrependRef = useRef<{
+    scope: string;
+    prevScrollHeight: number;
+    prevScrollTop: number;
+  } | null>(null);
+  const prevWindowStartRef = useRef<{ scope: string | null; windowStart: number }>({
+    scope: null,
+    windowStart: 0,
+  });
+  const jumpEarlierAttemptedNonceRef = useRef<number | null>(null);
   const [imagePreviewTarget, setImagePreviewTarget] =
     useState<PromptImagePreviewTarget | null>(null);
   const handleCloseImagePreview = useCallback(() => setImagePreviewTarget(null), []);
@@ -936,6 +1000,21 @@ export function StreamStage() {
   const bootstrapError = useOrbitSelector((s) => s.bootstrapError);
 
   const stageTurns = stageView?.turns ?? EMPTY_TURNS;
+  const windowStartTurnIndex = Math.max(0, stageView?.window_start_turn_index ?? 0);
+  const windowStartTurnIndexRef = useRef(windowStartTurnIndex);
+  windowStartTurnIndexRef.current = windowStartTurnIndex;
+  const stageRevisionRef = useRef(stageView?.revision ?? 0);
+  stageRevisionRef.current = stageView?.revision ?? 0;
+  const activeHostIdRef = useRef(selectedHostId);
+  activeHostIdRef.current = selectedHostId;
+  const activeAgentIdRef = useRef(selectedAgentId);
+  activeAgentIdRef.current = selectedAgentId;
+  const activeSessionScope =
+    !isDraft && selectedHostId && selectedAgentId
+      ? `${selectedHostId}::${selectedAgentId}`
+      : null;
+  const activeSessionScopeRef = useRef<string | null>(activeSessionScope);
+  activeSessionScopeRef.current = activeSessionScope;
   const pendingPermissions = useMemo(
     () =>
       (stageView?.pending_permissions ?? EMPTY_TIMELINE_ITEMS).filter(
@@ -976,6 +1055,18 @@ export function StreamStage() {
     () => buildSubagentNameMatcher(sessionSubagents),
     [sessionSubagents],
   );
+
+  const hasVisibleSubagents = useMemo(() => {
+    if (!selectedHostId || !selectedAgentId || sessionSubagents.length === 0) return false;
+    return sessionSubagents.some(
+      (sa) =>
+        !isSubagentArchived(archivedSubagents, selectedHostId, selectedAgentId, {
+          id: sa.callId,
+          providerSubagentId: sa.providerSubagentId,
+          childAgentId: sa.childAgentId,
+        }),
+    );
+  }, [archivedSubagents, selectedHostId, selectedAgentId, sessionSubagents]);
 
   const handleOpenSubagent = useCallback(
     (sa: ResolvedSubagentItem) => {
@@ -1244,6 +1335,75 @@ export function StreamStage() {
     };
   }, []);
 
+  const triggerLoadEarlierTurns = useCallback(
+    (targetTurnIndex?: number, capturePrependAnchor = true) => {
+      const hostId = activeHostIdRef.current;
+      const agentId = activeAgentIdRef.current;
+      const scope = activeSessionScopeRef.current;
+      const curWindowStart = windowStartTurnIndexRef.current;
+      if (!hostId || !agentId || !scope || curWindowStart <= 0 || loadingEarlierTurnsRef.current) {
+        return;
+      }
+      const curRev = stageRevisionRef.current;
+      const exhausted = exhaustedEarlierWindowRef.current;
+      if (
+        targetTurnIndex === undefined &&
+        exhausted &&
+        exhausted.scope === scope &&
+        exhausted.windowStart === curWindowStart &&
+        exhausted.revision === curRev
+      ) {
+        return;
+      }
+
+      if (capturePrependAnchor && scrollRef.current) {
+        pendingTurnPrependRef.current = {
+          scope,
+          prevScrollHeight: scrollRef.current.scrollHeight,
+          prevScrollTop: scrollRef.current.scrollTop,
+        };
+      }
+
+      loadingEarlierTurnsRef.current = true;
+      setLoadingEarlierTurns(true);
+      const reqId = (earlierLoadReqIdRef.current += 1);
+
+      void orbitActions
+        .loadEarlierStageTurns(hostId, agentId, targetTurnIndex)
+        .then((loadedCount) => {
+          if (earlierLoadReqIdRef.current !== reqId) return;
+          if (loadedCount === 0) {
+            pendingTurnPrependRef.current = null;
+            if (targetTurnIndex === undefined) {
+              exhaustedEarlierWindowRef.current = {
+                scope,
+                windowStart: curWindowStart,
+                revision: curRev,
+              };
+            }
+          }
+        })
+        .catch(() => {
+          if (earlierLoadReqIdRef.current !== reqId) return;
+          pendingTurnPrependRef.current = null;
+          if (targetTurnIndex === undefined) {
+            exhaustedEarlierWindowRef.current = {
+              scope,
+              windowStart: curWindowStart,
+              revision: curRev,
+            };
+          }
+        })
+        .finally(() => {
+          if (earlierLoadReqIdRef.current === reqId) {
+            loadingEarlierTurnsRef.current = false;
+            setLoadingEarlierTurns(false);
+          }
+        });
+    },
+    [],
+  );
+
   const syncScrollMetrics = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -1285,6 +1445,25 @@ export function StreamStage() {
       nextJump = !pinned && !nearBottom && hasTurns;
     }
 
+    if (
+      loadingEarlierTurnsRef.current &&
+      pendingTurnPrependRef.current &&
+      pendingTurnPrependRef.current.scope === activeSessionScopeRef.current
+    ) {
+      pendingTurnPrependRef.current = {
+        scope: pendingTurnPrependRef.current.scope,
+        prevScrollHeight: el.scrollHeight,
+        prevScrollTop: currentTop,
+      };
+    } else if (
+      !stickToBottomRef.current &&
+      !programmaticScrollRef.current &&
+      currentTop < STAGE_TOP_PAGINATE_THRESHOLD_PX &&
+      windowStartTurnIndexRef.current > 0
+    ) {
+      triggerLoadEarlierTurns(undefined, true);
+    }
+
     let nextActiveSeq = scrollUiStore.getSnapshot().activePromptSeq;
     const prompts = outlinePromptsRef.current;
     if (isStageWideRef.current && prompts.length >= 2) {
@@ -1317,7 +1496,7 @@ export function StreamStage() {
       showJumpLatest: nextJump,
       activePromptSeq: nextActiveSeq,
     });
-  }, [scrollUiStore]);
+  }, [scrollUiStore, triggerLoadEarlierTurns]);
 
   const snapScrollerToBottom = useCallback(() => {
     const el = scrollRef.current;
@@ -1359,6 +1538,12 @@ export function StreamStage() {
             programmaticScrollTimerRef.current = null;
           }
         }
+        if (
+          el.scrollTop < STAGE_TOP_PAGINATE_THRESHOLD_PX &&
+          windowStartTurnIndexRef.current > 0
+        ) {
+          triggerLoadEarlierTurns(undefined, true);
+        }
       }
     };
     const onPointerDown = (e: PointerEvent) => {
@@ -1373,7 +1558,7 @@ export function StreamStage() {
       el.removeEventListener("wheel", onPassiveWheel);
       el.removeEventListener("pointerdown", onPointerDown);
     };
-  }, [isDraft, selectedHostId, selectedAgentId]);
+  }, [isDraft, selectedHostId, selectedAgentId, triggerLoadEarlierTurns]);
 
   useLayoutEffect(() => {
     const contentEl = contentRef.current;
@@ -1527,11 +1712,6 @@ export function StreamStage() {
     [scrollUiStore],
   );
 
-  const activeSessionScope =
-    !isDraft && selectedHostId && selectedAgentId
-      ? `${selectedHostId}::${selectedAgentId}`
-      : null;
-
   const hasPendingJumpForActive = Boolean(
     pendingJumpTarget &&
       selectedHostId &&
@@ -1543,6 +1723,17 @@ export function StreamStage() {
   hasPendingJumpForActiveRef.current = hasPendingJumpForActive;
 
   useLayoutEffect(() => {
+    earlierLoadReqIdRef.current += 1;
+    loadingEarlierTurnsRef.current = false;
+    setLoadingEarlierTurns(false);
+    pendingTurnPrependRef.current = null;
+    exhaustedEarlierWindowRef.current = null;
+    jumpEarlierAttemptedNonceRef.current = null;
+    prevWindowStartRef.current = {
+      scope: activeSessionScope,
+      windowStart: windowStartTurnIndexRef.current,
+    };
+
     if (!activeSessionScope) {
       prevTurnsCountRef.current = 0;
       return;
@@ -1621,6 +1812,46 @@ export function StreamStage() {
     syncScrollMetrics,
   ]);
 
+  // Zero-jump scroll anchoring right after prepending earlier historical turns above the viewport
+  useLayoutEffect(() => {
+    const prev = prevWindowStartRef.current;
+    prevWindowStartRef.current = {
+      scope: activeSessionScope,
+      windowStart: windowStartTurnIndex,
+    };
+    if (
+      !activeSessionScope ||
+      prev.scope !== activeSessionScope ||
+      windowStartTurnIndex >= prev.windowStart
+    ) {
+      return;
+    }
+    const snap = pendingTurnPrependRef.current;
+    pendingTurnPrependRef.current = null;
+    const el = scrollRef.current;
+    if (!snap || snap.scope !== activeSessionScope || !el) return;
+    if (hasPendingJumpForActiveRef.current) return;
+
+    const deltaHeight = el.scrollHeight - snap.prevScrollHeight;
+    if (deltaHeight > 0) {
+      holdActiveRef.current = true;
+      el.scrollTop = computePrependRestoredScrollTop(
+        snap.prevScrollTop,
+        snap.prevScrollHeight,
+        el.scrollHeight,
+      );
+      lastObservedScrollTopRef.current = el.scrollTop;
+      const raf = window.requestAnimationFrame(() => {
+        holdActiveRef.current = false;
+        syncScrollMetrics();
+      });
+      return () => {
+        window.cancelAnimationFrame(raf);
+        holdActiveRef.current = false;
+      };
+    }
+  }, [activeSessionScope, windowStartTurnIndex, stageTurns.length, syncScrollMetrics]);
+
   useEffect(() => {
     if (!activeSessionScope || !pendingJumpTarget) return;
     if (
@@ -1630,6 +1861,20 @@ export function StreamStage() {
       return;
     }
     if (stageTurns.length === 0) return;
+
+    const firstLoadedAnchorSeq = stageTurns[0]?.anchor_seq ?? 0;
+    if (windowStartTurnIndex > 0 && pendingJumpTarget.seq < firstLoadedAnchorSeq) {
+      if (loadingEarlierTurns) {
+        return;
+      }
+      if (jumpEarlierAttemptedNonceRef.current !== pendingJumpTarget.nonce) {
+        stickToBottomRef.current = false;
+        sessionEntryLockUntilRef.current = 0;
+        jumpEarlierAttemptedNonceRef.current = pendingJumpTarget.nonce;
+        triggerLoadEarlierTurns(0, false);
+        return;
+      }
+    }
 
     const match = findTurnIndexForSeq(stageTurns, pendingJumpTarget.seq);
     if (match.index < 0) return;
@@ -1711,9 +1956,12 @@ export function StreamStage() {
     selectedAgentId,
     pendingJumpTarget,
     stageTurns,
+    windowStartTurnIndex,
+    loadingEarlierTurns,
     stageView?.latest_seq,
     jumpFallbackNonce,
     syncScrollMetrics,
+    triggerLoadEarlierTurns,
   ]);
 
   useEffect(() => {
@@ -1871,114 +2119,140 @@ export function StreamStage() {
         </div>
       )}
 
-      {/* 1. Unified Scrollable Conversation Viewport — scrollbar stays on far right edge */}
-      <ScrollArea
-        className="min-h-0 flex-1"
-        viewportRef={scrollRef}
-        onViewportScroll={handleScroll}
-        viewportStyle={{
-          paddingRight: `${24 + overviewReservePx}px`,
-          transition: overviewReserveTransition,
-        }}
-        onViewportTransitionEnd={onStageTransitionEnd}
-        viewportClassName="pt-6 pb-11 pl-[24px]"
-        contentClassName={stageTurns.length === 0 ? "flex min-h-full flex-col" : undefined}
-      >
-        <div
-          key={selectedAgentId}
-          ref={contentRef}
-          onTransitionEnd={onStageTransitionEnd}
-          style={stagePushStyle}
-          className={cn(
-            "mx-auto w-full min-w-0 max-w-[var(--orbit-stage-max-w,768px)]",
-            stageTurns.length === 0 && "flex flex-1 flex-col",
-          )}
-        >
-          {stageTurns.length === 0 &&
-            wasSessionRewound &&
-            stageView !== null &&
-            (stageView.agent?.latest_seq ?? 0) === 0 &&
-            !isAgentRunning && (() => {
-              const cleanDir = (effectiveCwd || "").replace(/\/+$/, "");
-              const folderLabel =
-                cleanDir && cleanDir !== "~" ? cleanDir.split("/").pop() || cleanDir : null;
-              const wsBranch =
-                currentAgent && hostDetail
-                  ? (hostDetail.workspaces.find(
-                      (w) => w.workspace_id === currentAgent.workspace_id,
-                    )?.git_branch ?? null)
-                  : null;
-              return (
-                <div className="flex flex-1 flex-col items-center justify-center pb-12 text-center select-none">
-                  <div className="bg-foreground/[0.035] text-muted-foreground/70 mb-3 flex size-9 items-center justify-center rounded-full ring-1 ring-inset ring-black/[0.06] dark:bg-white/[0.045] dark:ring-white/[0.08]">
-                    <RotateCcw className="size-4 stroke-[1.7]" />
-                  </div>
-                  <p className="text-foreground/85 text-[14px] font-medium tracking-[-0.012em]">
-                    Back to the start
-                  </p>
-                  {(folderLabel || wsBranch) && (
-                    <div className="text-muted-foreground/70 mt-1 flex items-center justify-center gap-1.5 text-[12px]">
-                      {folderLabel && <span className="max-w-[220px] truncate">{folderLabel}</span>}
-                      {folderLabel && wsBranch && <span className="opacity-45">·</span>}
-                      {wsBranch && (
-                        <span className="inline-flex max-w-[180px] items-center gap-1 truncate font-mono text-[11.5px]">
-                          <GitBranch className="size-3 shrink-0 opacity-75" />
-                          <span className="truncate">{wsBranch}</span>
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
+      {/* 1. Unified Scrollable Conversation Viewport + Floating Overlays */}
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+        {loadingEarlierTurns && (
+          <div
+            style={{
+              paddingRight: `${overviewReservePx}px`,
+              transition: overviewReserveTransition,
+            }}
+            className="pointer-events-none absolute top-2.5 right-0 left-0 z-10 flex justify-center"
+          >
+            <div
+              style={stagePushStyle}
+              className="border-border/70 bg-elevated/90 text-muted-foreground inline-flex h-[24px] items-center justify-center rounded-full border px-2.5 shadow-xs backdrop-blur-sm"
+            >
+              <OrbitSpinner size={12} className="text-foreground/70" />
+            </div>
+          </div>
+        )}
 
-          {stageTurns.length > 0 && (
-            <VirtualizedTurnList
-              key={activeSessionScope ?? selectedAgentId}
-              selectedHostId={selectedHostId}
-              selectedAgentId={selectedAgentId}
-              stageTurns={stageTurns}
-              highlightedTurnKey={highlightedTurnKey}
-              hasPendingJump={hasPendingJumpForActive}
-              isLatestTurnActive={isLatestTurnActive}
-              agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
-              hasLiveBackgroundTasks={stageInsights.background_tasks.length > 0}
-              baselineMaxSeq={baselineMaxSeq}
-              isNetworkOffline={isNetworkOffline}
-              autoFoldCompleted={coalesceExploration}
-              effectiveCwd={effectiveCwd}
-              stageMaxContentWidthPx={stageMaxContentWidthPx}
-              hostArtifacts={stableHostArtifacts}
-              timingTick={timingTick}
-              scrollRef={scrollRef}
-              stickToBottomRef={stickToBottomRef}
-              holdActiveRef={holdActiveRef}
-              virtualizerRef={virtualizerRef}
-              turnTimingsRef={turnTimingsRef}
-              thinkingTimingsRef={thinkingTimingsRef}
-              getThinkingDurationMs={getThinkingDurationMs}
-              holdViewport={holdViewport}
-              onRequestRewind={handleRequestRewind}
-              onRequestFork={handleRequestFork}
-              canForkWorktree={canForkWorktree}
-              onPreviewImage={setImagePreviewTarget}
-              sessionSubagents={sessionSubagents}
-              sessionSubagentMatcher={sessionSubagentMatcher}
-              onOpenSubagent={handleOpenSubagent}
-            />
+        <ScrollArea
+          className="min-h-0 flex-1"
+          viewportRef={scrollRef}
+          onViewportScroll={handleScroll}
+          viewportStyle={{
+            paddingRight: `${24 + overviewReservePx}px`,
+            transition: overviewReserveTransition,
+          }}
+          onViewportTransitionEnd={onStageTransitionEnd}
+          viewportClassName={cn(
+            "pt-6 pl-[24px]",
+            hasVisibleSubagents ? "pb-[64px]" : "pb-11",
           )}
-        </div>
-      </ScrollArea>
+          contentClassName={stageTurns.length === 0 ? "flex min-h-full flex-col" : undefined}
+        >
+          <div
+            key={selectedAgentId}
+            ref={contentRef}
+            onTransitionEnd={onStageTransitionEnd}
+            style={stagePushStyle}
+            className={cn(
+              "mx-auto w-full min-w-0 max-w-[var(--orbit-stage-max-w,768px)]",
+              stageTurns.length === 0 && "flex flex-1 flex-col",
+            )}
+          >
+            {stageTurns.length === 0 &&
+              wasSessionRewound &&
+              stageView !== null &&
+              (stageView.agent?.latest_seq ?? 0) === 0 &&
+              !isAgentRunning && (() => {
+                const cleanDir = (effectiveCwd || "").replace(/\/+$/, "");
+                const folderLabel =
+                  cleanDir && cleanDir !== "~" ? cleanDir.split("/").pop() || cleanDir : null;
+                const wsBranch =
+                  currentAgent && hostDetail
+                    ? (hostDetail.workspaces.find(
+                        (w) => w.workspace_id === currentAgent.workspace_id,
+                      )?.git_branch ?? null)
+                    : null;
+                return (
+                  <div className="flex flex-1 flex-col items-center justify-center pb-12 text-center select-none">
+                    <div className="bg-foreground/[0.035] text-muted-foreground/70 mb-3 flex size-9 items-center justify-center rounded-full ring-1 ring-inset ring-black/[0.06] dark:bg-white/[0.045] dark:ring-white/[0.08]">
+                      <RotateCcw className="size-4 stroke-[1.7]" />
+                    </div>
+                    <p className="text-foreground/85 text-[14px] font-medium tracking-[-0.012em]">
+                      Back to the start
+                    </p>
+                    {(folderLabel || wsBranch) && (
+                      <div className="text-muted-foreground/70 mt-1 flex items-center justify-center gap-1.5 text-[12px]">
+                        {folderLabel && <span className="max-w-[220px] truncate">{folderLabel}</span>}
+                        {folderLabel && wsBranch && <span className="opacity-45">·</span>}
+                        {wsBranch && (
+                          <span className="inline-flex max-w-[180px] items-center gap-1 truncate font-mono text-[11.5px]">
+                            <GitBranch className="size-3 shrink-0 opacity-75" />
+                            <span className="truncate">{wsBranch}</span>
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+            {stageTurns.length > 0 && (
+              <VirtualizedTurnList
+                key={activeSessionScope ?? selectedAgentId}
+                selectedHostId={selectedHostId}
+                selectedAgentId={selectedAgentId}
+                stageTurns={stageTurns}
+                highlightedTurnKey={highlightedTurnKey}
+                hasPendingJump={hasPendingJumpForActive}
+                isLatestTurnActive={isLatestTurnActive}
+                agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
+                hasLiveBackgroundTasks={stageInsights.background_tasks.length > 0}
+                baselineMaxSeq={baselineMaxSeq}
+                isNetworkOffline={isNetworkOffline}
+                autoFoldCompleted={coalesceExploration}
+                effectiveCwd={effectiveCwd}
+                stageMaxContentWidthPx={stageMaxContentWidthPx}
+                hostArtifacts={stableHostArtifacts}
+                timingTick={timingTick}
+                scrollRef={scrollRef}
+                stickToBottomRef={stickToBottomRef}
+                holdActiveRef={holdActiveRef}
+                virtualizerRef={virtualizerRef}
+                turnTimingsRef={turnTimingsRef}
+                thinkingTimingsRef={thinkingTimingsRef}
+                getThinkingDurationMs={getThinkingDurationMs}
+                holdViewport={holdViewport}
+                onRequestRewind={handleRequestRewind}
+                onRequestFork={handleRequestFork}
+                canForkWorktree={canForkWorktree}
+                onPreviewImage={setImagePreviewTarget}
+                sessionSubagents={sessionSubagents}
+                sessionSubagentMatcher={sessionSubagentMatcher}
+                onOpenSubagent={handleOpenSubagent}
+              />
+            )}
+          </div>
+        </ScrollArea>
+
+        <StageBottomViewportOverlay
+          scrollUiStore={scrollUiStore}
+          hostId={selectedHostId}
+          agentId={selectedAgentId}
+          hasVisibleSubagents={hasVisibleSubagents}
+          stagePushStyle={stagePushStyle}
+          overviewReservePx={overviewReservePx}
+          overviewReserveTransition={overviewReserveTransition}
+          onJumpLatest={scrollToLatest}
+        />
+      </div>
 
       {/* 2. Docked Composer Shelf — normal flex sibling below scrollRef (scrollbar never enters here) */}
       <div ref={composerShelfRef} className="bg-canvas relative z-20 shrink-0">
-        <StageJumpLatestBanner
-          scrollUiStore={scrollUiStore}
-          stagePushStyle={stagePushStyle}
-          dockedOverviewLayout={dockedOverviewLayout}
-          onJumpLatest={scrollToLatest}
-        />
-
         <div
           style={{
             paddingRight: `${overviewReservePx}px`,
@@ -1988,7 +2262,6 @@ export function StreamStage() {
           <div style={stagePushStyle}>
             <GoalBanner hostId={selectedHostId} agentId={selectedAgentId} />
             <SubagentApprovalBanner hostId={selectedHostId} agentId={selectedAgentId} />
-            <SubagentsTrack hostId={selectedHostId} agentId={selectedAgentId} />
             <StickyApprovalDock
               hostId={selectedHostId}
               agentId={selectedAgentId}

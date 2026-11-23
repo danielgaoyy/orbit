@@ -105,6 +105,8 @@ cd apps/android && gradle assembleDebug --no-daemon
 
 ## Pull Request Guidelines
 
+- **PR-First policy (zero direct push to `main`)**: Every code, doc, CI, and release bump change must go through a Pull Request to `main` with all required CI checks passing; never bypass branch protection. Release tags (`v*`) are only cut from already-merged `main` commits per [`docs/engineering/git-pr-release-workflow.md`](docs/engineering/git-pr-release-workflow.md).
+- **Pre-read & sync documentation**: Read the matching authoritative doc/Skill in [`docs/INDEX.md`](docs/INDEX.md) before editing, and keep docs + `docs/INDEX.md` updated in the same PR when architecture, contracts, design rules, or CI jobs change.
 - **Keep PRs focused**: Prefer small, self-contained changes over sweeping multi-concern diffs.
 - **Include tests**: Bug fixes should add a regression test; new protocol, crypto, security, or UI logic should include unit tests.
 - **Follow commit conventions**: Use clear, scoped prefixes such as `feat(daemon): ...`, `fix(desktop): ...`, `security(relay): ...`, or `chore(ci): ...`.

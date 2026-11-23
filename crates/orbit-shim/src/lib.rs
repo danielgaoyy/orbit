@@ -1012,7 +1012,13 @@ pub async fn probe_existing_shim(socket_path: &Path) -> bool {
     if !socket_path.exists() {
         return false;
     }
-    match tokio::time::timeout(Duration::from_millis(300), connect_shim_stream(socket_path)).await {
+    // On Windows loopback TCP, a closed port takes ~1-2s of SYN retries before WSAECONNREFUSED.
+    let timeout = if cfg!(unix) {
+        Duration::from_millis(300)
+    } else {
+        Duration::from_millis(3000)
+    };
+    match tokio::time::timeout(timeout, connect_shim_stream(socket_path)).await {
         Ok(Ok(_stream)) => true,
         Ok(Err(err))
             if matches!(
@@ -1034,7 +1040,12 @@ pub async fn connect_existing_shim(socket_path: &Path) -> Option<ShimClient> {
     if !socket_path.exists() {
         return None;
     }
-    match tokio::time::timeout(Duration::from_millis(300), ShimClient::connect(socket_path)).await {
+    let timeout = if cfg!(unix) {
+        Duration::from_millis(300)
+    } else {
+        Duration::from_millis(3000)
+    };
+    match tokio::time::timeout(timeout, ShimClient::connect(socket_path)).await {
         Ok(Ok(client)) => Some(client),
         Ok(Err(ShimError::Io(ref err)))
             if matches!(
@@ -1062,8 +1073,13 @@ pub async fn connect_existing_shim_after(
         return None;
     }
     let effective_cursor = Some(after_seq.unwrap_or(u64::MAX));
+    let timeout = if cfg!(unix) {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_millis(3000)
+    };
     match tokio::time::timeout(
-        Duration::from_millis(500),
+        timeout,
         ShimClient::connect_with_cursor(socket_path, effective_cursor, true),
     )
     .await
@@ -1289,8 +1305,14 @@ pub async fn cleanup_stale_shim_sockets(shims_dir: &Path) -> usize {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("sock") {
+            let probe_timeout = if cfg!(unix) {
+                Duration::from_millis(150)
+            } else {
+                // Windows loopback TCP SYN retries take ~1-2s before returning WSAECONNREFUSED.
+                Duration::from_millis(3000)
+            };
             if let Ok(Err(err)) =
-                tokio::time::timeout(Duration::from_millis(150), connect_shim_stream(&path)).await
+                tokio::time::timeout(probe_timeout, connect_shim_stream(&path)).await
                 && matches!(
                     err.kind(),
                     std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
@@ -2515,13 +2537,20 @@ mod tests {
         let mut client = client.expect("connect to in-process pty shim");
 
         let mut collected = String::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut answered_dsr = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(250), client.rx.recv()).await {
                 Ok(Some(ShimFrame::PtyOutput { data_b64 }))
                 | Ok(Some(ShimFrame::PtySnapshot { data_b64 })) => {
                     if let Ok(bytes) = B64.decode(data_b64) {
-                        collected.push_str(&String::from_utf8_lossy(&bytes));
+                        let chunk = String::from_utf8_lossy(&bytes);
+                        if !answered_dsr && chunk.contains("\x1b[6n") {
+                            // Windows ConPTY waits for a CPR response to its initial DSR query.
+                            let _ = client.write_pty_input(b"\x1b[1;1R").await;
+                            answered_dsr = true;
+                        }
+                        collected.push_str(&chunk);
                         if collected.contains("ORBIT_SHIM_PTY_OK") {
                             break;
                         }

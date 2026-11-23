@@ -335,7 +335,19 @@ impl AgentMessageDelivery {
             let mut acks = Vec::with_capacity(batch_items.len());
             let mut entries = Vec::with_capacity(batch_items.len());
             let mut envelopes = Vec::with_capacity(batch_items.len());
-            let behavior = batch_items[0].msg.active_turn_behavior;
+            let behavior = if batch_items
+                .iter()
+                .any(|it| it.msg.active_turn_behavior == ActiveTurnBehavior::Interrupt)
+            {
+                ActiveTurnBehavior::Interrupt
+            } else if batch_items
+                .iter()
+                .any(|it| it.msg.active_turn_behavior == ActiveTurnBehavior::Queue)
+            {
+                ActiveTurnBehavior::Queue
+            } else {
+                ActiveTurnBehavior::Steer
+            };
             let mut session_mode = None;
             let mut unarchive = false;
 
@@ -399,7 +411,15 @@ fn split_compatible_batches(items: Vec<PendingItem>) -> Vec<Vec<PendingItem>> {
 
     for item in items {
         let conflict = if let Some(first) = current.first() {
-            let behavior_diff = item.msg.active_turn_behavior != first.msg.active_turn_behavior;
+            // Only `Interrupt` conflicts with non-interrupting (`Steer`/`Queue`) deliveries so a
+            // direct message (`Steer`) followed immediately by a finish notification (`Queue`)
+            // within the quiet window still coalesces into a single wakeup turn.
+            let behavior_diff =
+                matches!(item.msg.active_turn_behavior, ActiveTurnBehavior::Interrupt)
+                    != matches!(
+                        first.msg.active_turn_behavior,
+                        ActiveTurnBehavior::Interrupt
+                    );
             let mode_diff = match (&cur_mode, &item.msg.session_mode) {
                 (Some(a), Some(b)) => a != b,
                 _ => false,
@@ -591,5 +611,70 @@ mod tests {
             recorded[1].active_turn_behavior,
             ActiveTurnBehavior::Interrupt
         );
+    }
+
+    #[tokio::test]
+    async fn steer_and_queue_coalesce_into_single_queue_batch() {
+        let batches: Arc<Mutex<Vec<CoalescedDispatchBatch>>> = Arc::new(Mutex::new(Vec::new()));
+        let batches_clone = batches.clone();
+        let delivery = AgentMessageDelivery::new(
+            Duration::from_millis(60),
+            Arc::new(move |batch| {
+                let b = batches_clone.clone();
+                Box::pin(async move {
+                    b.lock().await.push(batch);
+                    Ok(())
+                })
+            }),
+        );
+
+        let (_, a1) = delivery
+            .enqueue(QueuedAgentMessage {
+                recipient_id: "ag_p".into(),
+                message_id: "m_pre".into(),
+                source: AgentPromptSource {
+                    kind: AgentMessageKind::DirectMessage,
+                    source_agent_id: Some("c1".into()),
+                    source_host_id: None,
+                    source_title: None,
+                    event: None,
+                    permission_context: None,
+                },
+                body: "PRE_FINISH_REPORT".into(),
+                active_turn_behavior: ActiveTurnBehavior::Steer,
+                session_mode: None,
+                unarchive: false,
+            })
+            .await
+            .expect("q1");
+        let (_, a2) = delivery
+            .enqueue(QueuedAgentMessage {
+                recipient_id: "ag_p".into(),
+                message_id: "m_fin".into(),
+                source: AgentPromptSource {
+                    kind: AgentMessageKind::FinishNotification,
+                    source_agent_id: Some("c1".into()),
+                    source_host_id: None,
+                    source_title: None,
+                    event: Some("finished".into()),
+                    permission_context: None,
+                },
+                body: "FINAL_CHILD_SUMMARY".into(),
+                active_turn_behavior: ActiveTurnBehavior::Queue,
+                session_mode: None,
+                unarchive: false,
+            })
+            .await
+            .expect("q2");
+
+        a1.await.expect("a1").expect("ok");
+        a2.await.expect("a2").expect("ok");
+
+        let recorded = batches.lock().await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].entries.len(), 2);
+        assert_eq!(recorded[0].active_turn_behavior, ActiveTurnBehavior::Queue);
+        assert!(recorded[0].wire_prompt.contains("PRE_FINISH_REPORT"));
+        assert!(recorded[0].wire_prompt.contains("FINAL_CHILD_SUMMARY"));
     }
 }

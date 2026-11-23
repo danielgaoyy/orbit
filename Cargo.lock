@@ -2291,11 +2291,15 @@ dependencies = [
  "anyhow",
  "axum",
  "futures-util",
+ "orbit-crypto",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

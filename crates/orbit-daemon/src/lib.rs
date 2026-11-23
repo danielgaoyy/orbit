@@ -65,7 +65,9 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
-use orbit_crypto::{DaemonHandshake, HostIdentityKeypair, PairingOffer};
+use orbit_crypto::{
+    DaemonHandshake, HostIdentityKeypair, PairingOffer, RelayPopResponder, SecureChannel,
+};
 use orbit_protocol::{
     AgentMessageKind, HostInfo, OrchestrationConfig, PROTOCOL_VERSION, ProviderModelCatalog,
     ScheduleStatus, TerminalBinaryFrame, WireMessage,
@@ -74,7 +76,9 @@ use orbit_providers::{
     SideQuestionSpec, catalogs_to_model_map, discover_installed_providers,
     probe_all_provider_models, probe_all_provider_quotas, run_side_question,
 };
-use orbit_relay_transport::{RelayConnector, is_ssh_relay_url, redact_relay_url};
+use orbit_relay_transport::{
+    MAX_RELAY_CONTROL_WS_FRAME_BYTES, RelayConnector, is_ssh_relay_url, redact_relay_url,
+};
 use orbit_store::{OrbitStore, ReceiptOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -782,47 +786,196 @@ async fn healthz_handler(State(runtime): State<Arc<DaemonRuntime>>) -> impl Into
 
 // --- Outbound Relay Control & Noise NK E2EE Tunnel Spawner ---
 
+const RELAY_CONTROL_POP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn describe_tung_frame(msg: &TungMsg) -> (&'static str, usize) {
+    match msg {
+        TungMsg::Text(t) => ("text", t.len()),
+        TungMsg::Binary(b) => ("binary", b.len()),
+        TungMsg::Ping(p) => ("ping", p.len()),
+        TungMsg::Pong(p) => ("pong", p.len()),
+        TungMsg::Close(frame) => ("close", frame.as_ref().map_or(0, |f| f.reason.len())),
+        TungMsg::Frame(_) => ("frame", 0),
+    }
+}
+
+async fn complete_relay_control_pop<S, R>(
+    sink: &mut S,
+    stream: &mut R,
+    priv_bytes: &[u8; 32],
+) -> anyhow::Result<SecureChannel>
+where
+    S: futures_util::Sink<TungMsg, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    R: futures_util::Stream<Item = Result<TungMsg, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let msg1 = tokio::time::timeout(RELAY_CONTROL_POP_TIMEOUT, async {
+        while let Some(item) = stream.next().await {
+            match item? {
+                TungMsg::Binary(b) => return Ok::<_, anyhow::Error>(b),
+                TungMsg::Ping(p) => {
+                    sink.send(TungMsg::Pong(p)).await?;
+                }
+                TungMsg::Pong(_) => {}
+                TungMsg::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    anyhow::bail!(
+                        "relay closed control socket before PoP challenge (code={code:?})"
+                    );
+                }
+                other => {
+                    let (kind, bytes) = describe_tung_frame(&other);
+                    anyhow::bail!(
+                        "unexpected relay control frame before PoP challenge (kind={kind}, bytes={bytes})"
+                    );
+                }
+            }
+        }
+        anyhow::bail!("relay control stream closed before PoP challenge")
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for relay PoP challenge"))??;
+
+    let (mut control_chan, msg2) = RelayPopResponder::accept(priv_bytes, &msg1)?;
+    tokio::time::timeout(
+        RELAY_CONTROL_POP_TIMEOUT,
+        sink.send(TungMsg::Binary(msg2.into())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out sending relay PoP response"))??;
+
+    tokio::time::timeout(RELAY_CONTROL_POP_TIMEOUT, async {
+        while let Some(item) = stream.next().await {
+            match item? {
+                TungMsg::Binary(ct) => {
+                    let plain = control_chan.open_record(&ct)?;
+                    let v: serde_json::Value = serde_json::from_slice(&plain)?;
+                    if v.get("op").and_then(|x| x.as_str()) == Some("registered") {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    anyhow::bail!(
+                        "unexpected decrypted relay control message during PoP ack (bytes={})",
+                        plain.len()
+                    );
+                }
+                TungMsg::Ping(p) => {
+                    sink.send(TungMsg::Pong(p)).await?;
+                }
+                TungMsg::Pong(_) => {}
+                TungMsg::Close(frame) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    anyhow::bail!(
+                        "relay rejected daemon PoP and closed control socket (code={code:?})"
+                    );
+                }
+                other => {
+                    let (kind, bytes) = describe_tung_frame(&other);
+                    anyhow::bail!(
+                        "unexpected relay control frame waiting for PoP confirmation (kind={kind}, bytes={bytes})"
+                    );
+                }
+            }
+        }
+        anyhow::bail!("relay control stream closed before PoP confirmation")
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for relay PoP confirmation"))??;
+
+    Ok(control_chan)
+}
+
 async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
     let display_relay = redact_relay_url(&relay_base);
     let pubkey = runtime.keypair.public_key_b64.clone();
+    let priv_bytes = match runtime.keypair.private_bytes() {
+        Ok(b) => zeroize::Zeroizing::new(b),
+        Err(e) => {
+            warn!(relay = %display_relay, error = %e, "Invalid daemon host private key; cannot register with Relay");
+            return;
+        }
+    };
     let ctrl_path = format!("/v1/daemon/control?pubkey={pubkey}");
 
     loop {
         match RelayConnector::connect(&relay_base).await {
             Ok(connector) => {
                 let connector = Arc::new(connector);
-                match connector.open_ws(&ctrl_path).await {
+                match connector
+                    .open_ws_with_limit(&ctrl_path, MAX_RELAY_CONTROL_WS_FRAME_BYTES)
+                    .await
+                {
                     Ok(ws) => {
-                        info!(relay = %display_relay, "Connected outbound to Orbit Relay");
                         let (mut sink, mut stream) = ws.split();
-                        while let Some(Ok(msg)) = stream.next().await {
-                            match msg {
-                                TungMsg::Text(txt) => {
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
-                                        && v.get("op").and_then(|x| x.as_str())
-                                            == Some("open_tunnel")
-                                        && let Some(tid) =
-                                            v.get("tunnel_id").and_then(|x| x.as_str())
-                                    {
-                                        let rt_tun = runtime.clone();
-                                        let conn_tun = Arc::clone(&connector);
-                                        let tid_owned = tid.to_string();
-                                        tokio::spawn(async move {
-                                            let _ = serve_e2ee_relay_tunnel(
-                                                rt_tun, &conn_tun, &tid_owned,
-                                            )
-                                            .await;
-                                        });
+                        match complete_relay_control_pop(&mut sink, &mut stream, &priv_bytes).await
+                        {
+                            Ok(mut control_chan) => {
+                                info!(
+                                    relay = %display_relay,
+                                    "Authenticated (PoP) and connected outbound to Orbit Relay"
+                                );
+                                while let Some(Ok(msg)) = stream.next().await {
+                                    match msg {
+                                        TungMsg::Binary(ct) => {
+                                            let Ok(plain) = control_chan.open_record(&ct) else {
+                                                warn!(
+                                                    relay = %display_relay,
+                                                    bytes = ct.len(),
+                                                    "Failed to decrypt Relay control frame; reconnecting"
+                                                );
+                                                break;
+                                            };
+                                            if let Ok(v) =
+                                                serde_json::from_slice::<serde_json::Value>(&plain)
+                                                && v.get("op").and_then(|x| x.as_str())
+                                                    == Some("open_tunnel")
+                                                && let Some(tid) =
+                                                    v.get("tunnel_id").and_then(|x| x.as_str())
+                                                && let Some(secret_b64) =
+                                                    v.get("attach_secret").and_then(|x| x.as_str())
+                                                && let Ok(attach_secret) =
+                                                    orbit_crypto::decode_key_32(secret_b64)
+                                            {
+                                                let rt_tun = runtime.clone();
+                                                let conn_tun = Arc::clone(&connector);
+                                                let tid_owned = tid.to_string();
+                                                let secret_owned =
+                                                    zeroize::Zeroizing::new(attach_secret);
+                                                tokio::spawn(async move {
+                                                    let _ = serve_e2ee_relay_tunnel(
+                                                        rt_tun,
+                                                        &conn_tun,
+                                                        &tid_owned,
+                                                        secret_owned,
+                                                    )
+                                                    .await;
+                                                });
+                                            }
+                                        }
+                                        TungMsg::Ping(p) => {
+                                            let _ = sink.send(TungMsg::Pong(p)).await;
+                                        }
+                                        TungMsg::Pong(_) => {}
+                                        TungMsg::Close(_) => break,
+                                        other => {
+                                            let (kind, bytes) = describe_tung_frame(&other);
+                                            warn!(
+                                                relay = %display_relay,
+                                                frame_kind = kind,
+                                                bytes,
+                                                "Ignored unexpected unencrypted Relay control frame"
+                                            );
+                                        }
                                     }
                                 }
-                                TungMsg::Ping(p) => {
-                                    let _ = sink.send(TungMsg::Pong(p)).await;
-                                }
-                                TungMsg::Close(_) => break,
-                                _ => {}
+                                warn!(relay = %display_relay, "Disconnected from Relay, reconnecting in 2s...");
+                            }
+                            Err(e) => {
+                                warn!(
+                                    relay = %display_relay,
+                                    error = %e,
+                                    "Relay control Proof-of-Possession handshake failed, retrying in 2s..."
+                                );
                             }
                         }
-                        warn!(relay = %display_relay, "Disconnected from Relay, reconnecting in 2s...");
                     }
                     Err(e) => {
                         warn!(relay = %display_relay, error = %e, "Relay control stream failed, retrying in 2s...");
@@ -841,6 +994,7 @@ async fn serve_e2ee_relay_tunnel(
     runtime: Arc<DaemonRuntime>,
     connector: &Arc<RelayConnector>,
     tunnel_id: &str,
+    attach_secret: zeroize::Zeroizing<[u8; 32]>,
 ) -> anyhow::Result<()> {
     let pubkey = &runtime.keypair.public_key_b64;
     let priv_bytes = runtime.keypair.private_bytes()?;
@@ -848,6 +1002,52 @@ async fn serve_e2ee_relay_tunnel(
 
     let ws = connector.open_ws(&tun_path).await?;
     let (mut sink, mut stream) = ws.split();
+
+    // Authenticate /v1/daemon/tunnel: receive 16-byte attach_nonce from Relay and reply with
+    // HMAC-SHA256(attach_secret, attach_nonce || tunnel_id) before bridging client ciphertext.
+    let attach_nonce: [u8; orbit_crypto::TUNNEL_ATTACH_NONCE_LEN] =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(item) = stream.next().await {
+                match item? {
+                    TungMsg::Binary(b) => {
+                        let arr: [u8; orbit_crypto::TUNNEL_ATTACH_NONCE_LEN] =
+                            b.as_ref().try_into().map_err(|_| {
+                                anyhow::anyhow!(
+                                    "invalid relay tunnel attach nonce length (bytes={})",
+                                    b.len()
+                                )
+                            })?;
+                        return Ok::<_, anyhow::Error>(arr);
+                    }
+                    TungMsg::Ping(p) => {
+                        sink.send(TungMsg::Pong(p)).await?;
+                    }
+                    TungMsg::Pong(_) => {}
+                    TungMsg::Close(frame) => {
+                        let code = frame.as_ref().map(|f| u16::from(f.code));
+                        anyhow::bail!("relay closed tunnel before attach nonce (code={code:?})");
+                    }
+                    other => {
+                        let (kind, bytes) = describe_tung_frame(&other);
+                        anyhow::bail!(
+                            "unexpected frame waiting for tunnel attach nonce (kind={kind}, bytes={bytes})"
+                        );
+                    }
+                }
+            }
+            anyhow::bail!("tunnel closed before attach nonce")
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for tunnel attach nonce"))??;
+
+    let attach_mac =
+        orbit_crypto::compute_tunnel_attach_mac(&attach_secret, &attach_nonce, tunnel_id);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sink.send(TungMsg::Binary(attach_mac.to_vec().into())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out sending tunnel attach MAC"))??;
 
     // Receive Noise NK Message 1 from Client
     let msg1 = tokio::time::timeout(Duration::from_secs(10), async {

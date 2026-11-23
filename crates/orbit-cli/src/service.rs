@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use orbit_protocol::{PROTOCOL_VERSION, WireMessage};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message as TungMsg};
+use tokio_tungstenite::tungstenite::Message as TungMsg;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRole {
@@ -67,36 +67,72 @@ pub fn normalize_relay_url(raw: &str) -> anyhow::Result<String> {
     orbit_relay_transport::normalize_relay_url(raw).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Perform a fast 6-second preflight WebSocket check against the Relay control endpoint
+/// Perform a fast 6-second read-only HTTP preflight check against `/v1/daemon/probe`
 /// (supports both direct `ws(s)://` and tunneled `ssh+relay://`).
+///
+/// Never opens `/v1/daemon/control` and never mutates host registrations, ensuring a probe
+/// can never displace an active daemon session.
 pub async fn preflight_probe_relay(relay_base: &str, pubkey: &str) -> RelayProbeOutcome {
-    let path_and_query = format!("/v1/daemon/control?pubkey={pubkey}");
+    let endpoint = match orbit_relay_transport::parse_relay_endpoint(relay_base) {
+        Ok(ep) => ep,
+        Err(e) => return RelayProbeOutcome::Unreachable(e.to_string()),
+    };
+    let path_and_query = format!("/v1/daemon/probe?pubkey={pubkey}");
 
-    let res = tokio::time::timeout(
-        Duration::from_secs(6),
-        orbit_relay_transport::connect_relay_ws(relay_base, &path_and_query),
-    )
-    .await;
-
-    match res {
-        Ok(Ok(mut ws)) => {
-            let _ = SinkExt::close(&mut ws).await;
-            RelayProbeOutcome::Authorized
-        }
-        Ok(Err(orbit_relay_transport::RelayTransportError::WebSocket(err))) if matches!(err.as_ref(), WsError::Http(resp) if resp.status().as_u16() == 403) => {
-            RelayProbeOutcome::Forbidden403
-        }
-        Ok(Err(e)) => {
-            let msg = e.to_string();
-            if msg.contains("403") {
-                RelayProbeOutcome::Forbidden403
+    let probe_res: Result<(u16, String), String> = match endpoint {
+        orbit_relay_transport::RelayEndpoint::DirectWs(base_url) => {
+            let http_base = if let Some(rest) = base_url.strip_prefix("wss://") {
+                format!("https://{rest}")
+            } else if let Some(rest) = base_url.strip_prefix("ws://") {
+                format!("http://{rest}")
             } else {
-                RelayProbeOutcome::Unreachable(msg)
+                base_url
+            };
+            let url = format!("{}{}", http_base.trim_end_matches('/'), path_and_query);
+            match reqwest::Client::builder()
+                .timeout(Duration::from_secs(6))
+                .build()
+            {
+                Ok(client) => match client.get(&url).send().await {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let body = resp.text().await.unwrap_or_default();
+                        Ok((status, body))
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
             }
         }
-        Err(_) => RelayProbeOutcome::Unreachable(
-            "connection timed out after 6s (check SSH connectivity / relay port)".to_string(),
+        orbit_relay_transport::RelayEndpoint::SshTunnel(spec) => {
+            match tokio::time::timeout(
+                Duration::from_secs(6),
+                orbit_relay_transport::http_get_over_ssh_relay(&spec, &path_and_query),
+            )
+            .await
+            {
+                Ok(Ok(res)) => Ok(res),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err(
+                    "connection timed out after 6s (check SSH connectivity / relay port)"
+                        .to_string(),
+                ),
+            }
+        }
+    };
+
+    match probe_res {
+        Ok((200, body)) if body.trim() == orbit_relay::RELAY_PROBE_OK_BODY => {
+            RelayProbeOutcome::Authorized
+        }
+        Ok((403, _)) => RelayProbeOutcome::Forbidden403,
+        Ok((400, _)) => RelayProbeOutcome::Unreachable(
+            "relay rejected malformed host public key (HTTP 400)".to_string(),
         ),
+        Ok((status, _)) => RelayProbeOutcome::Unreachable(format!(
+            "unexpected response from Orbit Relay probe endpoint (HTTP {status})"
+        )),
+        Err(msg) => RelayProbeOutcome::Unreachable(msg),
     }
 }
 
@@ -1011,6 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_preflight_probe_authorized_vs_forbidden() {
+        use orbit_crypto::HostIdentityKeypair;
         use orbit_relay::{RelayConfig, run_relay};
         use std::collections::HashSet;
         use std::sync::Arc;
@@ -1021,8 +1058,10 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         drop(listener);
 
+        let allowed_kp = HostIdentityKeypair::generate().expect("allowed keygen");
+        let stranger_kp = HostIdentityKeypair::generate().expect("stranger keygen");
         let mut allowed = HashSet::new();
-        allowed.insert("my_allowed_pubkey".to_string());
+        allowed.insert(allowed_kp.public_key_b64.clone());
         let cfg = RelayConfig {
             listen_addr: addr,
             allowed_pubkeys: Arc::new(allowed),
@@ -1034,13 +1073,34 @@ mod tests {
 
         let url = format!("ws://{addr}");
         assert_eq!(
-            preflight_probe_relay(&url, "my_allowed_pubkey").await,
+            preflight_probe_relay(&url, &allowed_kp.public_key_b64).await,
             RelayProbeOutcome::Authorized
         );
         assert_eq!(
-            preflight_probe_relay(&url, "stranger_pubkey").await,
+            preflight_probe_relay(&url, &stranger_kp.public_key_b64).await,
             RelayProbeOutcome::Forbidden403
         );
+
+        // A non-Orbit HTTP server returning 200 without Orbit's probe marker must NOT report Authorized
+        let fake_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake");
+        let fake_addr = fake_listener.local_addr().expect("fake addr");
+        let fake_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut stream, _)) = fake_listener.accept().await {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot-orbit")
+                    .await;
+            }
+        });
+        assert!(matches!(
+            preflight_probe_relay(&format!("ws://{fake_addr}"), &allowed_kp.public_key_b64).await,
+            RelayProbeOutcome::Unreachable(_)
+        ));
+        fake_task.abort();
     }
 
     #[test]

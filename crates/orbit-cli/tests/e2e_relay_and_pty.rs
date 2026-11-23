@@ -578,3 +578,100 @@ async fn e2ee_relay_chunked_attachment_staging_integration() {
     let _ = tokio::task::spawn_blocking(move || drop(core)).await;
     let _ = std::fs::remove_dir_all(&temp_home);
 }
+
+#[tokio::test]
+async fn e2e_relay_pop_blocks_daemon_hijack_while_legitimate_client_succeeds() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as TungMsg;
+
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home = base_tmp.join(format!("orb_pop_e2e_{short_id}"));
+    std::fs::create_dir_all(&temp_home).expect("mkdir");
+
+    let pre_rt = orbit_daemon::DaemonRuntime::bootstrap(&temp_home)
+        .await
+        .expect("bootstrap");
+    let allowed_pubkey = pre_rt.keypair.public_key_b64.clone();
+    drop(pre_rt);
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    drop(relay_listener);
+
+    let mut allow_set = HashSet::new();
+    allow_set.insert(allowed_pubkey.clone());
+    let relay_cfg = RelayConfig {
+        listen_addr: relay_addr,
+        allowed_pubkeys: Arc::new(allow_set),
+    };
+    let relay_handle = tokio::spawn(async move {
+        let _ = run_relay(relay_cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let relay_url = format!("ws://{relay_addr}");
+    let (_daemon_addr, _runtime) =
+        spawn_embedded_daemon(temp_home.clone(), Some(relay_url.clone()))
+            .await
+            .expect("spawn daemon");
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    // Attacker knows the allowlisted pubkey and tries to hijack /v1/daemon/control with forged PoP bytes
+    let hijack_url = format!("{relay_url}/v1/daemon/control?pubkey={allowed_pubkey}");
+    let (mut attacker_ws, _) = tokio_tungstenite::connect_async(&hijack_url)
+        .await
+        .expect("attacker ws upgrade");
+    let challenge = tokio::time::timeout(Duration::from_secs(3), attacker_ws.next())
+        .await
+        .expect("challenge timeout")
+        .expect("challenge frame")
+        .expect("challenge ok");
+    assert!(
+        matches!(challenge, TungMsg::Binary(ref b) if b.len() == orbit_crypto::RELAY_POP_MSG_LEN)
+    );
+
+    attacker_ws
+        .send(TungMsg::Binary(
+            vec![0xDEu8; orbit_crypto::RELAY_POP_MSG_LEN].into(),
+        ))
+        .await
+        .expect("send forged pop");
+    let closed = tokio::time::timeout(Duration::from_secs(3), attacker_ws.next())
+        .await
+        .expect("close timeout");
+    assert!(
+        matches!(closed, None | Some(Ok(TungMsg::Close(_))) | Some(Err(_))),
+        "relay must reject forged PoP and close attacker socket, got: {closed:?}"
+    );
+
+    // Legitimate E2EE client still reaches the real daemon unimpeded!
+    let session = connect_via_relay(&relay_url, &allowed_pubkey, None)
+        .await
+        .expect("legitimate client must connect after failed hijack");
+    let req_id = Uuid::new_v4();
+    let resp = session
+        .request(
+            WireMessage::ListAgents {
+                request_id: req_id,
+                workspace_id: None,
+                include_archived: false,
+                include_background: false,
+                parent_agent_id: None,
+            },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::AgentsSnapshot { request_id, .. } if *request_id == req_id),
+        )
+        .await
+        .expect("list agents over E2EE relay after hijack attempt");
+    assert!(matches!(resp, WireMessage::AgentsSnapshot { .. }));
+
+    relay_handle.abort();
+    let _ = std::fs::remove_dir_all(&temp_home);
+}

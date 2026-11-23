@@ -36,11 +36,13 @@ const DEFAULT_RELAY_PORT: u16 = 7878;
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 /// Max WebSocket frame/message size (48 MiB) so 25 MiB base64/E2EE payloads never drop sessions.
 pub const MAX_RELAY_TRANSPORT_WS_FRAME_BYTES: usize = 48 * 1024 * 1024;
+/// Tight WebSocket frame/message cap (64 KiB) for Relay control sockets (`/v1/daemon/control`).
+pub const MAX_RELAY_CONTROL_WS_FRAME_BYTES: usize = 64 * 1024;
 
-fn relay_ws_config() -> WebSocketConfig {
+fn relay_ws_config(max_frame_bytes: usize) -> WebSocketConfig {
     let mut cfg = WebSocketConfig::default();
-    cfg.max_frame_size = Some(MAX_RELAY_TRANSPORT_WS_FRAME_BYTES);
-    cfg.max_message_size = Some(MAX_RELAY_TRANSPORT_WS_FRAME_BYTES);
+    cfg.max_frame_size = Some(max_frame_bytes);
+    cfg.max_message_size = Some(max_frame_bytes);
     cfg
 }
 
@@ -561,22 +563,32 @@ impl RelayConnector {
         }
     }
 
-    /// Open a WebSocket stream to `path_and_query` (for example `/v1/daemon/control?pubkey=...`).
+    /// Open a WebSocket stream to `path_and_query` with the default 48 MiB frame/message cap.
     pub async fn open_ws(
         &self,
         path_and_query: &str,
+    ) -> Result<RelayWsStream, RelayTransportError> {
+        self.open_ws_with_limit(path_and_query, MAX_RELAY_TRANSPORT_WS_FRAME_BYTES)
+            .await
+    }
+
+    /// Open a WebSocket stream to `path_and_query` with an explicit frame/message size cap.
+    pub async fn open_ws_with_limit(
+        &self,
+        path_and_query: &str,
+        max_frame_bytes: usize,
     ) -> Result<RelayWsStream, RelayTransportError> {
         let suffix = if path_and_query.starts_with('/') {
             path_and_query.to_string()
         } else {
             format!("/{path_and_query}")
         };
+        let ws_cfg = relay_ws_config(max_frame_bytes);
 
         match self {
             Self::Direct { base_url } => {
                 let url = format!("{}{}", base_url.trim_end_matches('/'), suffix);
-                let (ws, _) =
-                    connect_async_with_config(&url, Some(relay_ws_config()), false).await?;
+                let (ws, _) = connect_async_with_config(&url, Some(ws_cfg), false).await?;
                 Ok(RelayWsStream::Direct(Box::new(ws)))
             }
             Self::Ssh {
@@ -585,8 +597,7 @@ impl RelayConnector {
             } => {
                 let guard = session.open_channel().await?;
                 let ws_url = format!("ws://127.0.0.1:{relay_port}{suffix}");
-                let (ws, _) =
-                    client_async_with_config(&ws_url, guard, Some(relay_ws_config())).await?;
+                let (ws, _) = client_async_with_config(&ws_url, guard, Some(ws_cfg)).await?;
                 Ok(RelayWsStream::Ssh(Box::new(ws)))
             }
         }
@@ -598,8 +609,86 @@ pub async fn connect_relay_ws(
     relay_base: &str,
     path_and_query: &str,
 ) -> Result<RelayWsStream, RelayTransportError> {
+    connect_relay_ws_with_limit(
+        relay_base,
+        path_and_query,
+        MAX_RELAY_TRANSPORT_WS_FRAME_BYTES,
+    )
+    .await
+}
+
+/// One-shot convenience helper to connect a WebSocket with an explicit frame/message size cap.
+pub async fn connect_relay_ws_with_limit(
+    relay_base: &str,
+    path_and_query: &str,
+    max_frame_bytes: usize,
+) -> Result<RelayWsStream, RelayTransportError> {
     let connector = RelayConnector::connect(relay_base).await?;
-    connector.open_ws(path_and_query).await
+    connector
+        .open_ws_with_limit(path_and_query, max_frame_bytes)
+        .await
+}
+
+/// Perform a lightweight read-only HTTP/1.1 GET request through an `ssh+relay://` tunnel
+/// (for example `/v1/daemon/probe?pubkey=...`), returning `(status_code, body)`.
+pub async fn http_get_over_ssh_relay(
+    spec: &SshRelaySpec,
+    path_and_query: &str,
+) -> Result<(u16, String), RelayTransportError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let suffix = if path_and_query.starts_with('/') {
+        path_and_query.to_string()
+    } else {
+        format!("/{path_and_query}")
+    };
+    let session = SshRelaySession::connect(spec).await?;
+    let mut channel = session.open_channel().await?;
+    let req = format!(
+        "GET {suffix} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        spec.relay_port
+    );
+    channel.write_all(req.as_bytes()).await.map_err(|e| {
+        RelayTransportError::InvalidUrl(format!("SSH HTTP probe write failed: {e}"))
+    })?;
+    channel.flush().await.map_err(|e| {
+        RelayTransportError::InvalidUrl(format!("SSH HTTP probe flush failed: {e}"))
+    })?;
+
+    let mut resp = Vec::with_capacity(512);
+    let mut chunk = [0u8; 512];
+    const MAX_PROBE_RESPONSE_BYTES: usize = 4096;
+    while resp.len() < MAX_PROBE_RESPONSE_BYTES {
+        match channel.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let take = n.min(MAX_PROBE_RESPONSE_BYTES - resp.len());
+                resp.extend_from_slice(&chunk[..take]);
+            }
+            Err(e) => {
+                return Err(RelayTransportError::InvalidUrl(format!(
+                    "SSH HTTP probe read failed: {e}"
+                )));
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&resp);
+    let status_line = text.lines().next().ok_or_else(|| {
+        RelayTransportError::InvalidUrl("empty HTTP response over SSH relay".into())
+    })?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| {
+            RelayTransportError::InvalidUrl(format!("malformed HTTP status line: {status_line}"))
+        })?;
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    Ok((status, body))
 }
 
 fn private_key_from_seed(seed: &[u8; 32]) -> Result<PrivateKey, RelayTransportError> {

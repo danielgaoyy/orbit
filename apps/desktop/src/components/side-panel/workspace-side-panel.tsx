@@ -280,96 +280,104 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         {shouldRenderBody && (
           <>
             {/* Flush 40px Two-State Side Panel Header Bar (No-Tab vs With-Tab) */}
-      <div
-        className="flex h-[40px] shrink-0 items-center justify-between gap-1.5 pl-2 pr-[44px] shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.055)] dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.06)]"
-      >
+      <div className="@container flex h-[40px] min-w-0 shrink-0 items-center gap-1 pl-2 pr-[44px] shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.055)] dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.06)]">
         {tabs.length > 0 ? (
-          <div
-            ref={tabStripRef}
-            className="flex h-full min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [mask-image:linear-gradient(to_right,black_calc(100%-16px),transparent)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          >
-            {tabs.map((tab) => {
-              const isActive = tab.id === activeTab?.id;
-              const isDirtyFile =
-                tab.kind === "file" &&
-                Boolean(tab.filePath) &&
-                Boolean(
-                  fileEditorDrafts[
-                    fileCacheKey(
-                      tab.hostId ?? selectedHostId,
-                      tab.cwd ?? selectedWorkspaceCwd ?? "~",
-                      tab.filePath ?? "",
-                    )
-                  ]?.dirty,
-                );
-              const showPulseDot =
-                (tab.kind === "side_question" && hasStreamingSideQuestion) ||
-                (tab.kind === "terminal" && activeTerminalCount > 0 && !isActive);
+          <>
+            <div
+              ref={tabStripRef}
+              role="tablist"
+              onWheel={(e) => {
+                const el = tabStripRef.current;
+                if (!el || el.scrollWidth <= el.clientWidth) return;
+                if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+                  el.scrollLeft += e.deltaY;
+                }
+              }}
+              className="flex h-full min-w-0 items-center gap-0.5 overflow-x-auto pr-2.5 [mask-image:linear-gradient(to_right,black_calc(100%-10px),transparent)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            >
+              {tabs.map((tab) => {
+                const isActive = tab.id === activeTab?.id;
+                const isDirtyFile =
+                  tab.kind === "file" &&
+                  Boolean(tab.filePath) &&
+                  Boolean(
+                    fileEditorDrafts[
+                      fileCacheKey(
+                        tab.hostId ?? selectedHostId,
+                        tab.cwd ?? selectedWorkspaceCwd ?? "~",
+                        tab.filePath ?? "",
+                      )
+                    ]?.dirty,
+                  );
+                const showPulseDot =
+                  (tab.kind === "side_question" && hasStreamingSideQuestion) ||
+                  (tab.kind === "terminal" && activeTerminalCount > 0 && !isActive);
 
-              const displayTitle = resolveSidePanelTabTitle(tab, t);
-              return (
-                <div
-                  key={tab.id}
-                  role="tab"
-                  aria-selected={isActive}
-                  title={tab.filePath || tab.url || displayTitle}
-                  onClick={() => orbitActions.focusSidePanelTab(tab.id)}
-                  onMouseDown={(e) => {
-                    if (e.button === 1) {
-                      e.preventDefault();
-                      orbitActions.closeSidePanelTab(tab.id);
-                    }
-                  }}
-                  className={cn(
-                    "group/stab relative inline-flex h-[28px] max-w-[160px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] px-2 text-[12px] transition-colors",
-                    isActive
-                      ? "bg-black/[0.055] text-foreground font-medium dark:bg-white/[0.08]"
-                      : "text-muted-foreground hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
-                  )}
-                >
-                  <SidePanelTabIcon tab={tab} />
-                  <span className="truncate">{displayTitle}</span>
-                  {isDirtyFile && (
-                    <span
-                      title={t("sidePanel.unsavedChanges")}
-                      className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
-                    />
-                  )}
-                  {tab.kind === "artifacts" && artifactCount > 0 && (
-                    <span className="text-muted-foreground/80 shrink-0 rounded-full bg-black/[0.05] px-1.5 text-[10px] tabular-nums dark:bg-white/[0.08]">
-                      {artifactCount}
-                    </span>
-                  )}
-                  {showPulseDot && (
-                    <span
-                      className={cn(
-                        "h-1.5 w-1.5 shrink-0 rounded-full",
-                        tab.kind === "side_question"
-                          ? "bg-primary animate-pulse"
-                          : "bg-emerald-500/80",
-                      )}
-                    />
-                  )}
-                  <button
-                    type="button"
-                    aria-label={t("sidePanel.closeTab", { title: displayTitle })}
-                    onMouseDown={(e) => e.stopPropagation()}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      orbitActions.closeSidePanelTab(tab.id);
+                const displayTitle = resolveSidePanelTabTitle(tab, t);
+                return (
+                  <div
+                    key={tab.id}
+                    role="tab"
+                    aria-selected={isActive}
+                    title={tab.filePath || tab.url || displayTitle}
+                    onClick={() => orbitActions.focusSidePanelTab(tab.id)}
+                    onMouseDown={(e) => {
+                      if (e.button === 1) {
+                        e.preventDefault();
+                        orbitActions.closeSidePanelTab(tab.id);
+                      }
                     }}
                     className={cn(
-                      "ml-0.5 inline-flex h-[16px] w-[16px] shrink-0 cursor-pointer items-center justify-center rounded transition-opacity hover:bg-black/[0.08] dark:hover:bg-white/[0.12]",
+                      "group/stab relative inline-flex h-[28px] max-w-[116px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] px-2 text-[12px] transition-colors @[380px]:max-w-[144px] @[480px]:max-w-[168px]",
                       isActive
-                        ? "opacity-65 hover:opacity-100"
-                        : "opacity-0 group-hover/stab:opacity-65 hover:!opacity-100",
+                        ? "bg-black/[0.055] text-foreground font-medium dark:bg-white/[0.08]"
+                        : "text-muted-foreground hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
                     )}
                   >
-                    <X className="h-[11px] w-[11px]" />
-                  </button>
-                </div>
-              );
-            })}
+                    <SidePanelTabIcon tab={tab} />
+                    <span className="min-w-0 truncate">{displayTitle}</span>
+                    {isDirtyFile && (
+                      <span
+                        title={t("sidePanel.unsavedChanges")}
+                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
+                      />
+                    )}
+                    {tab.kind === "artifacts" && artifactCount > 0 && (
+                      <span className="text-muted-foreground/75 hidden shrink-0 text-[10.5px] tabular-nums @[380px]:inline">
+                        {artifactCount}
+                      </span>
+                    )}
+                    {showPulseDot && (
+                      <span
+                        className={cn(
+                          "h-1.5 w-1.5 shrink-0 rounded-full",
+                          tab.kind === "side_question"
+                            ? "bg-primary animate-pulse"
+                            : "bg-emerald-500/80",
+                        )}
+                      />
+                    )}
+                    <button
+                      type="button"
+                      aria-label={t("sidePanel.closeTab", { title: displayTitle })}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        orbitActions.closeSidePanelTab(tab.id);
+                      }}
+                      className={cn(
+                        "ml-0.5 inline-flex h-[16px] w-[16px] shrink-0 cursor-pointer items-center justify-center rounded transition-opacity hover:bg-black/[0.08] dark:hover:bg-white/[0.12]",
+                        isActive
+                          ? "opacity-65 hover:opacity-100"
+                          : "opacity-0 group-hover/stab:opacity-65 hover:!opacity-100",
+                      )}
+                    >
+                      <X className="h-[11px] w-[11px]" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
 
             <SimpleTooltip label={t("sidePanel.newTab")} shortcut={`${mod}T`}>
               <button
@@ -377,7 +385,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                 aria-label={t("sidePanel.newTab")}
                 onClick={() => orbitActions.openSidePanelNewTab()}
                 className={cn(
-                  "ml-0.5 inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors",
+                  "inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-[7px] transition-colors",
                   !activeTab
                     ? "bg-black/[0.06] text-foreground dark:bg-white/[0.09]"
                     : "text-muted-foreground hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
@@ -387,8 +395,8 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
               </button>
             </SimpleTooltip>
 
-            <div data-tauri-drag-region className="h-full min-w-4 flex-1" />
-          </div>
+            <div data-tauri-drag-region className="h-full min-w-2 flex-1" />
+          </>
         ) : (
           <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
         )}

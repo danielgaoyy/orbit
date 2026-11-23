@@ -1,6 +1,7 @@
 mod qr;
 mod tray;
 mod updater;
+mod window_state;
 
 use std::collections::HashMap;
 use std::fs;
@@ -3527,6 +3528,7 @@ pub fn run() {
         .manage(DesktopAppState { core })
         .manage(tray::TrayMenuState::default())
         .setup(|app| {
+            window_state::setup_main_window_state(app);
             tray::setup_system_tray(app);
             Ok(())
         })

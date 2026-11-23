@@ -183,7 +183,7 @@ export const TopBar = memo(function TopBar() {
           : undefined
       }
       className={cn(
-        "bg-canvas flex h-[40px] shrink-0 items-center justify-between gap-3 select-none",
+        "@container bg-canvas flex h-[40px] min-w-0 shrink-0 items-center justify-between gap-2 overflow-hidden select-none @[460px]:gap-3",
         showBottomBorder &&
           "shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.055)] dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.06)]",
         topbarUseOpenLeftPad ? "pl-[16px]" : isMac ? "pl-[114px]" : "pl-[48px]",
@@ -192,7 +192,7 @@ export const TopBar = memo(function TopBar() {
     >
       {/* Left: Conversation Title (glides smoothly via pure GPU translate3d) */}
       <div
-        className="flex min-w-0 items-center"
+        className="flex min-w-0 flex-1 items-center overflow-hidden"
         data-tauri-drag-region
         style={{
           transform:
@@ -203,8 +203,9 @@ export const TopBar = memo(function TopBar() {
       >
         <span
           data-tauri-drag-region
+          title={headerTitle}
           className={cn(
-            "translate-y-[0.5px] truncate text-[13.5px] leading-[20px] font-medium",
+            "block min-w-0 translate-y-[0.5px] truncate text-[13.5px] leading-[20px] font-medium",
             workspacePanel === "conversation" && isDraft
               ? "text-foreground/72"
               : "text-foreground/92",
@@ -226,20 +227,20 @@ export const TopBar = memo(function TopBar() {
           transition: topbarRightTransition,
           willChange: isAnimating ? "transform" : undefined,
         }}
-        className="flex shrink-0 items-center gap-1"
+        className="flex shrink-0 items-center gap-0.5 @[460px]:gap-1"
       >
         {hasActiveSession && selectedHostId && selectedAgentId && (
           <>
             {workspaceArtifactCount > 0 && (
-              <SimpleTooltip label={t("topbar.artifacts")}>
+              <SimpleTooltip label={t("topbar.artifactsCount", { count: workspaceArtifactCount })}>
                 <button
                   type="button"
                   aria-label={t("topbar.artifactsCount", { count: workspaceArtifactCount })}
                   onClick={() => orbitActions.openArtifactsTab({ hostId: selectedHostId })}
-                  className="text-foreground/70 hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-[7px] px-2 text-[12px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+                  className="text-foreground/70 hover:text-foreground inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center gap-1 rounded-[7px] px-0 text-[12px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06] @[460px]:w-auto @[460px]:px-2"
                 >
-                  <Blocks className="h-[14px] w-[14px] stroke-[1.75]" />
-                  <span className="tabular-nums text-[11px] opacity-80">
+                  <Blocks className="h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                  <span className="hidden text-[11px] tabular-nums opacity-80 @[460px]:inline">
                     {workspaceArtifactCount}
                   </span>
                 </button>

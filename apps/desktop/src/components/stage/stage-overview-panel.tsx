@@ -1,354 +1,93 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import {
   ArrowUpRight,
-  Blocks,
-  CheckCircle2,
-  ChevronRight,
-  Clock,
   File,
   FileDiff,
   FileText,
-  Pause,
-  Play,
   Square,
   SquareTerminal,
-  Target,
-  Timer,
   X,
 } from "lucide-react";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
+import {
+  ArmedTimerRow,
+  OverviewArtifactRow,
+  OverviewBackgroundTaskRow,
+  OverviewExpandFooter,
+  OverviewGoalRow,
+  OverviewLinkRow,
+  OverviewPullRequestRow,
+  OverviewSection,
+  OverviewSideQuestionRow,
+} from "@/components/stage/stage-overview-sections";
 import {
   SubagentCrewList,
   archiveSettledSubagentsList,
 } from "@/components/stage/subagent-crew-dock";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
 import { DiffStat } from "@/components/ui/diff-stat";
 import { IconButton } from "@/components/ui/icon-button";
 import { ListRow } from "@/components/ui/list-row";
-import { OrbitSpinner } from "@/components/ui/orbit-spinner";
-import { Separator } from "@/components/ui/separator";
+import { SimpleTooltip } from "@/components/ui/overlays";
+import { useI18n } from "@/lib/i18n";
+import { modSymbol } from "@/lib/keybindings";
 import {
   type AgentCardView,
+  type ArtifactSummary,
   type ConditionalTimerRecord,
   type DiffFileView,
-  type GoalControlAction,
-  type GoalRunRecord,
+  type HostCardView,
+  type HostDetailView,
   type SessionInsightsView,
-  formatTimerConditionLabel,
-  formatTimerCountdown,
+  type SessionPullRequestView,
   isAgentBackgroundWaiting,
   isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
-import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import {
-  selectSessionRuntimeActivity,
+  buildOverviewLinkItems,
+  doesTouchedFileMatchOpenPath,
+  doesUrlMatchOpenBrowserUrl,
+  findGitReviewForCwd,
+  formatTouchedFilesForOverview,
+  hasArmedTimersForAgent,
+  hasCrossHostChildAgents,
+  hasLocalSubagentRecords,
+  mergeSessionPullRequests,
+  selectActiveGoalForAgent,
+  selectScopedTerminalCount,
   selectSessionSubagents,
+  selectWorkspaceArtifactsList,
   selectWorkspaceToolSummary,
+  splitFormattedTouchedFiles,
 } from "@/state/selectors/session-selectors";
 import {
-  type OverviewSectionId,
+  type SideQuestionEntry,
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-function cleanBackgroundOutputPreview(raw: string | null | undefined): string | null {
-  if (!raw) return null;
-  const kept: string[] = [];
-  for (const rawLine of raw.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    if (
-      /^Created At:\s*/i.test(line) ||
-      /^Completed At:\s*/i.test(line) ||
-      /^Tool is running as a background task\b/i.test(line) ||
-      /^Task logs are available at:\s*/i.test(line) ||
-      /^Task Description:\s*/i.test(line) ||
-      /^Log output:\s*$/i.test(line) ||
-      /^<truncated \d+ lines>$/i.test(line)
-    ) {
-      continue;
-    }
-    kept.push(rawLine);
-  }
-  const joined = kept.join("\n").trim();
-  return joined.length > 0 ? joined : null;
-}
+const EMPTY_HOST_DETAILS: Record<string, HostDetailView> = Object.freeze({});
+const EMPTY_FLEET_HOSTS: readonly HostCardView[] = Object.freeze([]);
+const EMPTY_TIMERS: readonly ConditionalTimerRecord[] = Object.freeze([]);
+const EMPTY_ARTIFACTS: readonly ArtifactSummary[] = Object.freeze([]);
+const EMPTY_SIDE_QUESTIONS: readonly SideQuestionEntry[] = Object.freeze([]);
+const EMPTY_PRS: readonly SessionPullRequestView[] = Object.freeze([]);
 
-function TaskElapsedLabel({ startedAtMs }: { startedAtMs: number }) {
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
-  useEffect(() => {
-    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  const elapsed = Math.max(0, nowMs - startedAtMs);
-  if (elapsed < 1000) return null;
-
-  return (
-    <span className="text-ink-muted tabular-nums shrink-0 font-mono text-[11px]">
-      {formatDurationCompact(elapsed)}
-    </span>
-  );
-}
-
-const OverviewGoalRow = memo(function OverviewGoalRow({
-  hostId,
-  goal,
-}: {
-  hostId: string;
-  goal: GoalRunRecord;
-}) {
-  const [busyAction, setBusyAction] = useState<GoalControlAction | null>(null);
-  const isPaused = goal.status === "paused";
-  const isVerifying = goal.status === "verifying";
-
-  const handleControl = async (action: GoalControlAction) => {
-    setBusyAction(action);
-    try {
-      await orbitActions.controlGoalRun(hostId, goal.goal_id, action);
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  return (
-    <div
-      title={goal.verify_command ? `${goal.objective}\nVerify: ${goal.verify_command}` : goal.objective}
-      className="group/goalrow hover:bg-accent/70 flex min-h-[38px] w-full items-center justify-between gap-2 rounded-[8px] px-2 py-1.5 transition-colors"
-    >
-      <div className="flex min-w-0 flex-1 items-start gap-2">
-        <span className="mt-[4px] flex size-[14px] shrink-0 items-center justify-center">
-          <span
-            className={cn(
-              "size-[6px] rounded-full",
-              isVerifying
-                ? "bg-signal-info animate-pulse"
-                : isPaused
-                  ? "bg-signal-warning"
-                  : "bg-signal-success animate-pulse",
-            )}
-          />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="text-ink-primary truncate text-[12px] leading-[16px] font-medium">
-            {goal.objective}
-          </div>
-          <div className="text-ink-tertiary flex items-center gap-1.5 text-[11px] leading-[15px]">
-            <Target className="size-[11px] shrink-0 opacity-75" />
-            <span>{isVerifying ? "Verifying" : isPaused ? "Paused" : "Goal"}</span>
-            <span className="opacity-45">·</span>
-            <span className="font-mono tabular-nums">
-              Iter {goal.current_iteration}/{goal.max_iterations}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      <div className="hidden shrink-0 items-center gap-0.5 group-focus-within/goalrow:flex group-hover/goalrow:flex">
-        {!isVerifying && (
-          <IconButton
-            size="xs"
-            tooltip="Verify now"
-            disabled={busyAction !== null}
-            onClick={() => void handleControl("verify_now")}
-          >
-            <CheckCircle2 className="size-3" />
-          </IconButton>
-        )}
-        <IconButton
-          size="xs"
-          tooltip={isPaused ? "Resume goal" : "Pause goal"}
-          disabled={busyAction !== null || isVerifying}
-          onClick={() => void handleControl(isPaused ? "resume" : "pause")}
-        >
-          {isPaused ? <Play className="size-3" /> : <Pause className="size-3" />}
-        </IconButton>
-        <IconButton
-          size="xs"
-          tone="danger"
-          tooltip="Stop goal"
-          disabled={busyAction !== null}
-          onClick={() => void handleControl("cancel")}
-        >
-          <Square className="size-[9px] fill-current" />
-        </IconButton>
-      </div>
-    </div>
-  );
-});
-
-const ArmedTimerRow = memo(function ArmedTimerRow({
-  hostId,
-  timer,
-  nowMs,
-}: {
-  hostId: string;
-  timer: ConditionalTimerRecord;
-  nowMs: number;
-}) {
-  const [busy, setBusy] = useState(false);
-  const countdown = formatTimerCountdown(timer.fire_at_ms, nowMs);
-  const conditionLabel = formatTimerConditionLabel(timer.condition);
-
-  return (
-    <div
-      title={timer.prompt}
-      className="group/timerrow hover:bg-accent/70 flex h-[30px] w-full items-center justify-between gap-1.5 rounded-[8px] px-2 transition-colors"
-    >
-      <div className="flex min-w-0 items-center gap-1.5 text-[12px]">
-        <Timer className="text-signal-warning size-[13px] shrink-0 stroke-[1.8]" />
-        <span className="text-ink-primary tabular-nums shrink-0 font-mono text-[11px] font-medium">
-          {countdown}
-        </span>
-        <span className="text-ink-muted shrink-0">·</span>
-        <span className="text-ink-tertiary truncate text-[11px]">{conditionLabel}</span>
-      </div>
-      <div className="hidden shrink-0 items-center gap-0.5 group-focus-within/timerrow:flex group-hover/timerrow:flex">
-        <IconButton
-          size="xs"
-          tooltip="Run now"
-          disabled={busy}
-          onClick={() => {
-            if (busy) return;
-            setBusy(true);
-            void orbitActions.fireConditionalTimerNow(hostId, timer.timer_id).then(
-              () => orbitActions.showToast("Timer triggered"),
-              (err) => {
-                setBusy(false);
-                orbitActions.showToast(`Failed to trigger timer: ${String(err)}`);
-              },
-            );
-          }}
-        >
-          <Play className="size-[10px] fill-current" />
-        </IconButton>
-        <IconButton
-          size="xs"
-          tone="danger"
-          tooltip="Cancel timer"
-          disabled={busy}
-          onClick={() => {
-            if (busy) return;
-            setBusy(true);
-            void orbitActions.cancelConditionalTimer(hostId, timer.timer_id).then(
-              () => orbitActions.showToast("Timer canceled"),
-              (err) => {
-                setBusy(false);
-                orbitActions.showToast(`Failed to cancel timer: ${String(err)}`);
-              },
-            );
-          }}
-        >
-          <X className="size-3 stroke-[1.9]" />
-        </IconButton>
-      </div>
-    </div>
-  );
-});
-
-const OverviewSection = memo(function OverviewSection({
-  id,
-  label,
-  count,
-  collapsed,
-  isRunning = false,
-  hasAlert = false,
-  runningTone = "spinner",
-  trailingMeta,
-  headerAction,
-  footer,
-  children,
-}: {
-  id: OverviewSectionId;
-  label: string;
-  count?: number;
-  collapsed: boolean;
-  isRunning?: boolean;
-  hasAlert?: boolean;
-  runningTone?: "spinner" | "emerald";
-  trailingMeta?: React.ReactNode;
-  headerAction?: React.ReactNode;
-  footer?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <>
-      <Separator className="bg-border-subtle" />
-      <Collapsible
-        open={!collapsed}
-        onOpenChange={() => orbitActions.toggleOverviewSection(id)}
-        className={cn("px-2 pt-1.5", !collapsed && footer ? "pb-0" : "pb-1.5")}
-      >
-        <div className="group/sechead hover:bg-accent/65 flex h-[28px] w-full items-center rounded-[8px] pr-1 transition-colors">
-          <CollapsibleTrigger className="group/trigger focus-visible:ring-ring/50 flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded-[8px] pr-1 pl-2 text-left outline-none focus-visible:ring-2">
-            <span className="text-ink-tertiary group-hover/sechead:text-ink-primary truncate text-[11px] font-medium tracking-[0.03em] uppercase transition-colors">
-              {label}
-            </span>
-            {typeof count === "number" && (
-              <span className="text-ink-muted tabular-nums font-mono text-[11px]">
-                {count}
-              </span>
-            )}
-          </CollapsibleTrigger>
-
-          <div className="flex shrink-0 items-center gap-1">
-            {headerAction && (
-              <div className="hidden items-center group-focus-within/sechead:flex group-hover/sechead:flex">
-                {headerAction}
-              </div>
-            )}
-            {trailingMeta && (
-              <span
-                className={cn(
-                  "flex items-center",
-                  headerAction && "group-focus-within/sechead:hidden group-hover/sechead:hidden",
-                )}
-              >
-                {trailingMeta}
-              </span>
-            )}
-            {collapsed && (hasAlert || isRunning) && (
-              <span
-                className={cn(
-                  "flex items-center",
-                  headerAction && "group-focus-within/sechead:hidden group-hover/sechead:hidden",
-                )}
-              >
-                {hasAlert ? (
-                  <span className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
-                ) : runningTone === "emerald" ? (
-                  <span className="bg-signal-success size-[6px] shrink-0 rounded-full" />
-                ) : (
-                  <OrbitSpinner size={12} className="text-ink-secondary" />
-                )}
-              </span>
-            )}
-            <CollapsibleTrigger
-              aria-label={`Toggle ${label}`}
-              className="group/trigger text-ink-muted inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[6px] outline-none"
-            >
-              <ChevronRight className="size-3 shrink-0 transition-transform duration-200 ease-[var(--ease-panel)] group-data-[panel-open]/trigger:rotate-90" />
-            </CollapsibleTrigger>
-          </div>
-        </div>
-
-        <CollapsibleContent>
-          <div className="pt-1">{children}</div>
-        </CollapsibleContent>
-        {!collapsed && footer}
-      </Collapsible>
-    </>
-  );
-});
+const DEFAULT_VISIBLE_TOUCHED_FILES = 8;
+const DEFAULT_VISIBLE_LIST_ITEMS = 3;
 
 interface StageOverviewContentProps {
   hostId: string;
@@ -356,8 +95,10 @@ interface StageOverviewContentProps {
   cwd: string;
   insights: SessionInsightsView;
   sessionTurnDiffs: readonly DiffFileView[];
-  currentAgent: AgentCardView | null;
-  cardMaxHeightExpr: string;
+  agentWorkspaceId: string | null;
+  agentParentId: string | null;
+  agentBackgroundWaiting: boolean;
+  agentForegroundRunning: boolean;
 }
 
 const StageOverviewBody = memo(function StageOverviewBody({
@@ -366,31 +107,130 @@ const StageOverviewBody = memo(function StageOverviewBody({
   cwd,
   insights,
   sessionTurnDiffs,
-  currentAgent,
-  cardMaxHeightExpr,
+  agentWorkspaceId,
+  agentParentId,
+  agentBackgroundWaiting,
+  agentForegroundRunning,
 }: StageOverviewContentProps) {
+  const { t } = useI18n();
+  const mod = modSymbol();
+  const sessionScopeKey = `${hostId}::${agentId}`;
+
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
-  const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const gitReviews = useOrbitSelector((s) => s.gitReviews);
-  const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
+  const resolvedWorkspaceId = useOrbitSelector(
+    (s) =>
+      agentWorkspaceId ??
+      s.hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId)?.workspace_id ??
+      null,
+  );
+  const resolvedParentId = useOrbitSelector(
+    (s) =>
+      agentParentId ??
+      s.hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId)?.parent_agent_id ??
+      null,
+  );
+  const hostArtifacts = useOrbitSelector((s) => {
+    const list = s.hostDetails[hostId]?.artifacts;
+    return list && list.length > 0 ? list : EMPTY_ARTIFACTS;
+  });
+  const sideQuestions = useOrbitSelector(
+    (s) => s.sideQuestionsByScope[sessionScopeKey] ?? EMPTY_SIDE_QUESTIONS,
+  );
+  const createdPrs = useOrbitSelector(
+    (s) => s.sessionCreatedPrs[sessionScopeKey] ?? EMPTY_PRS,
+  );
+  const groupBoardRevision = useOrbitSelector((s) => {
+    const detail = s.hostDetails[hostId];
+    if (!detail || !resolvedWorkspaceId) return 0;
+    const ws = detail.workspaces.find((w) => w.workspace_id === resolvedWorkspaceId);
+    return detail.workspace_boards?.[resolvedWorkspaceId]?.revision ?? ws?.board_revision ?? 0;
+  });
+  const showGroupNotes = useOrbitSelector((s) => {
+    if (!resolvedWorkspaceId || resolvedParentId) return false;
+    const detail = s.hostDetails[hostId];
+    if (!detail) return false;
+    const ws = detail.workspaces.find((w) => w.workspace_id === resolvedWorkspaceId);
+    const rev = detail.workspace_boards?.[resolvedWorkspaceId]?.revision ?? ws?.board_revision ?? 0;
+    return Boolean(ws?.is_curated || rev > 0);
+  });
+  const groupTitle = useOrbitSelector((s) => {
+    if (!resolvedWorkspaceId) return null;
+    return (
+      s.hostDetails[hostId]?.workspaces.find((w) => w.workspace_id === resolvedWorkspaceId)?.title ??
+      null
+    );
+  });
+  const activeGoal = useOrbitSelector((s) =>
+    selectActiveGoalForAgent(s.hostDetails[hostId], agentId),
+  );
+  const hostTimersForAgent = useOrbitSelector((s) =>
+    hasArmedTimersForAgent(s.hostDetails[hostId], agentId)
+      ? (s.hostDetails[hostId]?.conditional_timers ?? EMPTY_TIMERS)
+      : EMPTY_TIMERS,
+  );
+  const localSubagentHostDetail = useOrbitSelector((s) =>
+    hasLocalSubagentRecords(s.hostDetails[hostId], hostId, agentId)
+      ? (s.hostDetails[hostId] ?? null)
+      : null,
+  );
+  const crossHostDetails = useOrbitSelector((s) =>
+    hasCrossHostChildAgents(s.hostDetails, hostId, agentId)
+      ? s.hostDetails
+      : EMPTY_HOST_DETAILS,
+  );
+  const crossHostFleetHosts = useOrbitSelector((s) =>
+    hasCrossHostChildAgents(s.hostDetails, hostId, agentId)
+      ? s.fleet.hosts
+      : EMPTY_FLEET_HOSTS,
+  );
+  const gitReview = useOrbitSelector((s) => findGitReviewForCwd(s.gitReviews, hostId, cwd));
+  const terminalCount = useOrbitSelector((s) =>
+    selectScopedTerminalCount(s.terminalTabs, s.hostDetails[hostId]?.terminals, hostId, cwd),
+  );
   const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
-  const activeStage = useOrbitSelector((s) => s.stages[`${hostId}::${agentId}`] ?? null);
+  const activeSideTab = useOrbitSelector((s) =>
+    s.sidePanelOpen
+      ? (s.sidePanelTabs.find((tab) => tab.id === s.activeSidePanelTabId) ?? null)
+      : null,
+  );
 
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const [stoppingBg, setStoppingBg] = useState(false);
+  const [showAllPrs, setShowAllPrs] = useState(false);
+  const [showAllSubagents, setShowAllSubagents] = useState(false);
+  const [showAllSideQuestions, setShowAllSideQuestions] = useState(false);
   const [showAllTasks, setShowAllTasks] = useState(false);
+  const [showAllArtifacts, setShowAllArtifacts] = useState(false);
+  const [showAllLinks, setShowAllLinks] = useState(false);
+  const [showAllTouchedFiles, setShowAllTouchedFiles] = useState(false);
+
+  const workspaceArtifacts = useMemo(
+    () => selectWorkspaceArtifactsList(hostArtifacts, resolvedWorkspaceId, agentId),
+    [hostArtifacts, resolvedWorkspaceId, agentId],
+  );
+
+  const scopedSubagentHostDetails = useMemo(
+    () =>
+      crossHostDetails !== EMPTY_HOST_DETAILS
+        ? crossHostDetails
+        : localSubagentHostDetail
+          ? { [hostId]: localSubagentHostDetail }
+          : EMPTY_HOST_DETAILS,
+    [crossHostDetails, localSubagentHostDetail, hostId],
+  );
 
   const selectorSlice = useMemo(
     () => ({
-      hostDetails,
-      fleet,
-      gitReviews,
-      terminalTabs,
+      hostDetails: scopedSubagentHostDetails,
+      fleet: {
+        revision: 0,
+        total_pending_approvals: 0,
+        hosts: crossHostFleetHosts as HostCardView[],
+        projects: [],
+      },
       archivedSubagents,
-      stages: activeStage ? { [`${hostId}::${agentId}`]: activeStage } : {},
     }),
-    [hostDetails, fleet, gitReviews, terminalTabs, archivedSubagents, activeStage, hostId, agentId],
+    [scopedSubagentHostDetails, crossHostFleetHosts, archivedSubagents],
   );
 
   const toolSummary = useMemo(
@@ -401,71 +241,134 @@ const StageOverviewBody = memo(function StageOverviewBody({
         agentId,
         cwd,
         sessionTurnDiffs,
-        currentAgent,
+        null,
+        insights.touched_files,
+        {
+          gitReview,
+          terminalCount,
+          artifactCount: workspaceArtifacts.length,
+          showGroupNotes,
+          groupBoardRevision,
+          groupTitle,
+          workspaceId: resolvedWorkspaceId,
+        },
       ),
-    [selectorSlice, hostId, agentId, cwd, sessionTurnDiffs, currentAgent],
+    [
+      selectorSlice,
+      hostId,
+      agentId,
+      cwd,
+      sessionTurnDiffs,
+      insights.touched_files,
+      gitReview,
+      terminalCount,
+      workspaceArtifacts.length,
+      showGroupNotes,
+      groupBoardRevision,
+      groupTitle,
+      resolvedWorkspaceId,
+    ],
   );
 
   const subagentSummary = useMemo(
-    () => selectSessionSubagents(selectorSlice, hostId, agentId),
-    [selectorSlice, hostId, agentId],
+    () => selectSessionSubagents(selectorSlice, hostId, agentId, insights.subagents),
+    [selectorSlice, hostId, agentId, insights.subagents],
   );
 
-  const runtimeActivity = useMemo(
-    () => selectSessionRuntimeActivity(selectorSlice, hostId, agentId),
-    [selectorSlice, hostId, agentId],
+  const pullRequests = useMemo(
+    () => mergeSessionPullRequests(insights.pull_requests, createdPrs),
+    [insights.pull_requests, createdPrs],
+  );
+  const visiblePrs = showAllPrs
+    ? pullRequests
+    : pullRequests.slice(0, DEFAULT_VISIBLE_LIST_ITEMS);
+  const hiddenPrCount = Math.max(0, pullRequests.length - visiblePrs.length);
+
+  const orderedSideQuestions = useMemo(
+    () =>
+      sideQuestions.length <= 1
+        ? sideQuestions
+        : [...sideQuestions].sort((a, b) => b.createdAtMs - a.createdAtMs),
+    [sideQuestions],
+  );
+  const hasStreamingSideQuestion = useMemo(
+    () => orderedSideQuestions.some((q) => q.status === "streaming"),
+    [orderedSideQuestions],
+  );
+  const visibleSideQuestions = showAllSideQuestions
+    ? orderedSideQuestions
+    : orderedSideQuestions.slice(0, DEFAULT_VISIBLE_LIST_ITEMS);
+  const hiddenSideQuestionCount = Math.max(
+    0,
+    orderedSideQuestions.length - visibleSideQuestions.length,
+  );
+
+  const visibleArtifacts = showAllArtifacts
+    ? workspaceArtifacts
+    : workspaceArtifacts.slice(0, DEFAULT_VISIBLE_LIST_ITEMS);
+  const hiddenArtifactCount = Math.max(0, workspaceArtifacts.length - visibleArtifacts.length);
+
+  const overviewLinks = useMemo(
+    () => buildOverviewLinkItems(insights.detected_local_urls, insights.detected_links),
+    [insights.detected_local_urls, insights.detected_links],
+  );
+  const visibleLinks = showAllLinks
+    ? overviewLinks
+    : overviewLinks.slice(0, DEFAULT_VISIBLE_LIST_ITEMS);
+  const hiddenLinkCount = Math.max(0, overviewLinks.length - visibleLinks.length);
+
+  const armedTimers = useMemo(
+    () =>
+      hostTimersForAgent.length === 0
+        ? EMPTY_TIMERS
+        : hostTimersForAgent.filter((timer) => timer.agent_id === agentId && timer.state === "armed"),
+    [hostTimersForAgent, agentId],
   );
 
   const backgroundTasks = insights.background_tasks;
-  const hasRunningBgTask = backgroundTasks.some((t) => t.status === "running");
-  const canStopBackground =
-    hasRunningBgTask &&
-    isAgentBackgroundWaiting(currentAgent) &&
-    !isAgentForegroundRunning(currentAgent);
-
-  useEffect(() => {
-    setStoppingBg(false);
-    setShowAllTasks(false);
-  }, [agentId, backgroundTasks.length]);
-
-  const armedTimers = runtimeActivity.armedTimers;
-  const activeGoal = runtimeActivity.activeGoal;
-  const hasArmedTimers = armedTimers.length > 0;
-  const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
-
-  useEffect(() => {
-    if (!hasArmedTimers) return;
-    setTimerNowMs(Date.now());
-    const id = window.setInterval(() => setTimerNowMs(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [hasArmedTimers]);
-
-  const layer1Ref = useRef<HTMLDivElement | null>(null);
-  const [layer1HeightPx, setLayer1HeightPx] = useState(148);
-
-  useLayoutEffect(() => {
-    const el = layer1Ref.current;
-    if (!el) return;
-    const syncHeight = () => {
-      const next = Math.ceil(el.getBoundingClientRect().height);
-      if (next > 0) {
-        setLayer1HeightPx((prev) => (prev === next ? prev : next));
-      }
-    };
-    syncHeight();
-    if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(syncHeight);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [toolSummary.showGroupNotes, toolSummary.artifactCount, cwd]);
-
   const orderedTasks = useMemo(() => {
-    const running = backgroundTasks.filter((t) => t.status === "running");
-    const rest = backgroundTasks.filter((t) => t.status !== "running");
+    const running = backgroundTasks.filter((task) => task.status === "running");
+    const rest = backgroundTasks.filter((task) => task.status !== "running");
     return [...running, ...rest];
   }, [backgroundTasks]);
 
-  const runningTaskCount = orderedTasks.filter((t) => t.status === "running").length;
+  const runningTaskCount = useMemo(
+    () => orderedTasks.filter((task) => task.status === "running").length,
+    [orderedTasks],
+  );
+  const hasRunningBgTask = runningTaskCount > 0;
+  const canStopBackground =
+    hasRunningBgTask && agentBackgroundWaiting && !agentForegroundRunning;
+
+  useEffect(() => {
+    setStoppingBg(false);
+  }, [agentId, runningTaskCount]);
+
+  useEffect(() => {
+    setShowAllPrs(false);
+    setShowAllSubagents(false);
+    setShowAllSideQuestions(false);
+    setShowAllTasks(false);
+    setShowAllArtifacts(false);
+    setShowAllLinks(false);
+    setShowAllTouchedFiles(false);
+    setExpandedTasks({});
+  }, [agentId]);
+
+  const toggleOrOpenSideTab = useCallback((isCurrentlyActive: boolean, openFn: () => void) => {
+    if (isCurrentlyActive) {
+      orbitActions.toggleSidePanel(false);
+      orbitActions.setOverviewPopoverOpen(false);
+      return;
+    }
+    openFn();
+  }, []);
+
+  const handleToggleTaskExpand = useCallback((taskId: string) => {
+    setExpandedTasks((prev) => ({ ...prev, [taskId]: !prev[taskId] }));
+  }, []);
+
+  const hasArmedTimers = armedTimers.length > 0;
   const defaultVisibleTaskCount =
     runningTaskCount > 0 ? Math.min(Math.max(runningTaskCount, 2), 3) : 2;
   const visibleTasks = showAllTasks
@@ -480,97 +383,148 @@ const StageOverviewBody = memo(function StageOverviewBody({
       ),
     [subagentSummary.visible],
   );
+  const defaultVisibleSubagentCount = Math.max(subagentSummary.activeCount, 5);
+  const displayedSubagents = showAllSubagents
+    ? subagentSummary.visible
+    : subagentSummary.visible.slice(0, defaultVisibleSubagentCount);
+  const hiddenSubagentCount = Math.max(0, subagentSummary.visible.length - displayedSubagents.length);
 
-  const touchedFiles = toolSummary.touchedFiles;
+  const formattedTouchedFiles = useMemo(
+    () => formatTouchedFilesForOverview(toolSummary.touchedFiles),
+    [toolSummary.touchedFiles],
+  );
+  const { modified: modifiedFiles, read: readFiles } = useMemo(
+    () => splitFormattedTouchedFiles(formattedTouchedFiles),
+    [formattedTouchedFiles],
+  );
+  const hasModifiedFiles = modifiedFiles.length > 0;
+  const activeFileList = hasModifiedFiles ? modifiedFiles : readFiles;
+  const visibleTouchedFiles = showAllTouchedFiles
+    ? activeFileList
+    : activeFileList.slice(0, DEFAULT_VISIBLE_TOUCHED_FILES);
+  const hiddenTouchedFileCount = Math.max(0, activeFileList.length - visibleTouchedFiles.length);
+
   const hasGoalOrTimers = Boolean(activeGoal) || hasArmedTimers;
+  const goalSectionLabel =
+    activeGoal && hasArmedTimers
+      ? t("overview.goalAndTimers")
+      : activeGoal
+        ? t("overview.activeGoal")
+        : t("overview.armedTimers");
+  const goalSectionCount = (activeGoal ? 1 : 0) + armedTimers.length;
+  const goalIsActive = Boolean(activeGoal && activeGoal.status !== "paused");
+  const goalIsPaused = Boolean(activeGoal && activeGoal.status === "paused");
+
   const hasSecondarySections =
+    pullRequests.length > 0 ||
     subagentSummary.visible.length > 0 ||
+    orderedSideQuestions.length > 0 ||
     hasGoalOrTimers ||
     backgroundTasks.length > 0 ||
-    touchedFiles.length > 0;
+    workspaceArtifacts.length > 0 ||
+    overviewLinks.length > 0 ||
+    formattedTouchedFiles.length > 0;
+
+  const isReviewActive = activeSideTab?.kind === "review";
+  const isFilesActive = activeSideTab?.kind === "files";
+  const isTerminalActive = activeSideTab?.kind === "terminal";
+  const isSideQuestionActive = activeSideTab?.kind === "side_question";
+  const isBoardActive =
+    activeSideTab?.kind === "board" && activeSideTab.workspaceId === toolSummary.workspaceId;
 
   return (
     <>
       {/* 1. Fixed Top Workspace Quick Bar */}
-      <div ref={layer1Ref} className="shrink-0 px-2 pt-2.5 pb-1.5 select-none">
-        <div className="flex h-[22px] items-center justify-between px-2 pb-0.5">
+      <div className="shrink-0 px-2 pt-2 pb-1.5 select-none">
+        <div className="flex h-[24px] items-center justify-between pr-0.5 pl-2 pb-0.5">
           <span className="text-ink-tertiary text-[11px] font-medium tracking-[0.04em] uppercase">
-            Overview
+            {t("overview.title")}
           </span>
+          <IconButton
+            size="xs"
+            tooltip={t("topbar.hideOverview")}
+            shortcut={`${mod}⌥O`}
+            aria-label={t("topbar.hideOverview")}
+            onClick={() => orbitActions.toggleOverviewPanel()}
+            className="text-ink-muted hover:text-ink-primary"
+          >
+            <X className="size-3 stroke-[1.85]" />
+          </IconButton>
         </div>
 
-        <div className="space-y-0.5">
-          <ListRow
-            density="compact"
-            leading={<FileDiff className="size-[14px] stroke-[1.7]" />}
-            onClick={() =>
-              orbitActions.openReviewTab({ path: null, scope: toolSummary.reviewScope })
-            }
-            trailing={
-              toolSummary.reviewCount > 0 ? (
-                toolSummary.reviewAdditions > 0 || toolSummary.reviewDeletions > 0 ? (
-                  <DiffStat
-                    additions={toolSummary.reviewAdditions}
-                    deletions={toolSummary.reviewDeletions}
-                  />
-                ) : (
-                  <Badge variant="secondary" className="h-[18px] rounded-full px-1.5 font-mono tabular-nums">
-                    {toolSummary.reviewCount}
-                  </Badge>
-                )
-              ) : undefined
-            }
-          >
-            Review
-          </ListRow>
-
-          <ListRow
-            density="compact"
-            leading={<File className="size-[14px] stroke-[1.7]" />}
-            onClick={() => orbitActions.openFilesExplorerTab()}
-          >
-            Files
-          </ListRow>
-
-          <ListRow
-            density="compact"
-            leading={<SquareTerminal className="size-[14px] stroke-[1.7]" />}
-            onClick={() => orbitActions.openTerminalTab()}
-            trailing={
-              toolSummary.terminalCount > 0 ? (
-                <Badge variant="secondary" className="h-[18px] rounded-full px-1.5 font-mono tabular-nums">
-                  {toolSummary.terminalCount}
-                </Badge>
-              ) : undefined
-            }
-          >
-            Terminal
-          </ListRow>
-
-          {toolSummary.artifactCount > 0 && (
+        <div className="flex flex-col gap-0.5">
+          <SimpleTooltip label={t("overview.review")} shortcut={`${mod}D`} side="left">
             <ListRow
               density="compact"
-              leading={<Blocks className="size-[14px] stroke-[1.7]" />}
-              onClick={() => orbitActions.openArtifactsTab({ hostId })}
+              selected={isReviewActive}
+              leading={<FileDiff className="size-[14px] stroke-[1.7]" />}
+              onClick={() =>
+                toggleOrOpenSideTab(isReviewActive, () =>
+                  orbitActions.openReviewTab({ path: null, scope: toolSummary.reviewScope }),
+                )
+              }
               trailing={
-                <Badge variant="secondary" className="h-[18px] rounded-full px-1.5 font-mono tabular-nums">
-                  {toolSummary.artifactCount}
-                </Badge>
+                toolSummary.reviewCount > 0 ? (
+                  toolSummary.reviewAdditions > 0 || toolSummary.reviewDeletions > 0 ? (
+                    <DiffStat
+                      additions={toolSummary.reviewAdditions}
+                      deletions={toolSummary.reviewDeletions}
+                    />
+                  ) : (
+                    <Badge variant="secondary" className="h-[18px] rounded-full px-1.5 font-mono tabular-nums">
+                      {toolSummary.reviewCount}
+                    </Badge>
+                  )
+                ) : undefined
               }
             >
-              Artifacts
+              {t("overview.review")}
             </ListRow>
-          )}
+          </SimpleTooltip>
+
+          <ListRow
+            density="compact"
+            selected={isFilesActive}
+            leading={<File className="size-[14px] stroke-[1.7]" />}
+            onClick={() =>
+              toggleOrOpenSideTab(isFilesActive, () => orbitActions.openFilesExplorerTab())
+            }
+          >
+            {t("overview.files")}
+          </ListRow>
+
+          <SimpleTooltip label={t("overview.terminal")} shortcut={`${mod}J`} side="left">
+            <ListRow
+              density="compact"
+              selected={isTerminalActive}
+              leading={<SquareTerminal className="size-[14px] stroke-[1.7]" />}
+              onClick={() =>
+                toggleOrOpenSideTab(isTerminalActive, () => orbitActions.openTerminalTab())
+              }
+              trailing={
+                toolSummary.terminalCount > 0 ? (
+                  <Badge variant="secondary" className="h-[18px] rounded-full px-1.5 font-mono tabular-nums">
+                    {toolSummary.terminalCount}
+                  </Badge>
+                ) : undefined
+              }
+            >
+              {t("overview.terminal")}
+            </ListRow>
+          </SimpleTooltip>
 
           {toolSummary.showGroupNotes && toolSummary.workspaceId && (
             <ListRow
               density="compact"
+              selected={isBoardActive}
               leading={<FileText className="size-[14px] stroke-[1.7]" />}
               onClick={() =>
-                orbitActions.openWorkspaceBoardTab(
-                  hostId,
-                  toolSummary.workspaceId!,
-                  toolSummary.groupTitle ?? undefined,
+                toggleOrOpenSideTab(isBoardActive, () =>
+                  orbitActions.openWorkspaceBoardTab(
+                    hostId,
+                    toolSummary.workspaceId!,
+                    toolSummary.groupTitle ?? undefined,
+                  ),
                 )
               }
               trailing={
@@ -581,27 +535,27 @@ const StageOverviewBody = memo(function StageOverviewBody({
                 ) : undefined
               }
             >
-              Group notes
+              {t("overview.groupNotes")}
             </ListRow>
           )}
         </div>
       </div>
 
-      {/* Shared Scrollable Body for Live Situational Sections */}
+      {/* Shared Scrollable Body with pinned 1px top divider (Pure Flexbox, zero JS measurement) */}
       {hasSecondarySections && (
-        <div
-          style={{ maxHeight: `calc(${cardMaxHeightExpr} - ${layer1HeightPx + 2}px)` }}
-          className="orbit-native-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain select-none"
-        >
-          {/* 2. Living Subagents Crew (OneWorks 3D Avatars) */}
+        <div className="orbit-native-scroll border-border-subtle min-h-0 shrink overflow-y-auto overscroll-contain border-t select-none">
+          {/* === Tier 1: Live Runtime (Subagents -> Goal & Timers -> Background Tasks) === */}
+
+          {/* 1. Living Subagents Crew (OneWorks 3D Avatars — top priority for live work & approvals) */}
           {subagentSummary.visible.length > 0 && (
             <OverviewSection
               id="subagents"
-              label="Subagents"
+              label={t("overview.subagents")}
               count={subagentSummary.visible.length}
               collapsed={collapsedSections.subagents}
               isRunning={subagentSummary.activeCount > 0}
               hasAlert={subagentSummary.awaitingCount > 0}
+              headerActionVisibility="hover"
               headerAction={
                 settledSubagents.length > 0 ? (
                   <button
@@ -609,46 +563,44 @@ const StageOverviewBody = memo(function StageOverviewBody({
                     onClick={() => archiveSettledSubagentsList(hostId, agentId, settledSubagents)}
                     className="text-ink-tertiary hover:text-ink-primary cursor-pointer rounded-[6px] px-1.5 py-0.5 text-[11px] font-medium transition-colors"
                   >
-                    Archive done
+                    {t("overview.archiveDone")}
                   </button>
+                ) : undefined
+              }
+              footer={
+                subagentSummary.visible.length > defaultVisibleSubagentCount ? (
+                  <OverviewExpandFooter
+                    expanded={showAllSubagents}
+                    hiddenCount={hiddenSubagentCount}
+                    onToggle={() => setShowAllSubagents((v) => !v)}
+                  />
                 ) : undefined
               }
             >
               <SubagentCrewList
                 hostId={hostId}
                 agentId={agentId}
-                subagents={subagentSummary.visible}
+                subagents={displayedSubagents}
               />
             </OverviewSection>
           )}
 
-          {/* 3. Active Goal & Armed Timers (Conditional) */}
+          {/* 2. Active Goal & Armed Timers */}
           {hasGoalOrTimers && (
-            <>
-              <Separator className="bg-border-subtle" />
-              <div className="space-y-0.5 px-2 py-1.5">
-                <div className="flex h-[24px] items-center justify-between px-2">
-                  <span className="text-ink-tertiary text-[11px] font-medium tracking-[0.03em] uppercase">
-                    {activeGoal && hasArmedTimers
-                      ? "Goal & Timers"
-                      : activeGoal
-                        ? "Active Goal"
-                        : "Armed Timers"}
-                  </span>
-                  <span className="text-ink-muted font-mono text-[11px] tabular-nums">
-                    {(activeGoal ? 1 : 0) + armedTimers.length}
-                  </span>
-                </div>
-
+            <OverviewSection
+              id="goals"
+              label={goalSectionLabel}
+              count={goalSectionCount}
+              collapsed={collapsedSections.goals}
+              isRunning={goalIsActive || hasArmedTimers}
+              hasAlert={goalIsPaused}
+              runningTone={goalIsActive ? "emerald" : "info"}
+            >
+              <div className="flex flex-col gap-0.5 pb-1">
                 {activeGoal && <OverviewGoalRow hostId={hostId} goal={activeGoal} />}
 
                 {armedTimers.slice(0, 3).map((timer) => (
-                  <ArmedTimerRow
-                    key={timer.timer_id}
-                    hostId={hostId}
-                    timer={timer}
-                    nowMs={timerNowMs}
-                  />
+                  <ArmedTimerRow key={timer.timer_id} hostId={hostId} timer={timer} />
                 ))}
 
                 {armedTimers.length > 3 && (
@@ -657,179 +609,211 @@ const StageOverviewBody = memo(function StageOverviewBody({
                     onClick={() => orbitActions.openAutomations()}
                     className="text-ink-tertiary hover:text-ink-primary hover:bg-accent/70 flex h-[24px] w-full cursor-pointer items-center justify-between rounded-[6px] px-2 text-[11px] font-medium transition-colors"
                   >
-                    <span>+{armedTimers.length - 3} more timers</span>
+                    <span>{t("overview.moreTimers", { count: armedTimers.length - 3 })}</span>
                     <ArrowUpRight className="size-3 shrink-0" />
                   </button>
                 )}
               </div>
-            </>
+            </OverviewSection>
           )}
 
-          {/* 4. Background Tasks (Conditional) */}
+          {/* 3. Background Tasks */}
           {backgroundTasks.length > 0 && (
             <OverviewSection
               id="tasks"
-              label="Background Tasks"
+              label={t("overview.backgroundTasks")}
               count={backgroundTasks.length}
               collapsed={collapsedSections.tasks}
               isRunning={hasRunningBgTask}
               runningTone="emerald"
-              footer={
-                orderedTasks.length > defaultVisibleTaskCount ? (
-                  <div
-                    className={cn(
-                      showAllTasks
-                        ? "bg-surface-raised/95 sticky bottom-0 z-[2] -mx-2 pt-1 pr-2 pb-2 pl-4 backdrop-blur-[6px]"
-                        : "pt-0.5 pb-1.5 pl-2",
-                    )}
-                  >
+              headerActionVisibility="always"
+              headerAction={
+                canStopBackground ? (
+                  <SimpleTooltip label={t("overview.stopBackgroundTasksTooltip")} side="top">
                     <button
                       type="button"
-                      onClick={() => setShowAllTasks((v) => !v)}
-                      className="text-ink-tertiary hover:text-ink-primary inline-flex cursor-pointer items-center py-0.5 text-[11px] font-medium transition-colors"
+                      disabled={stoppingBg}
+                      onClick={() => {
+                        if (stoppingBg) return;
+                        setStoppingBg(true);
+                        void orbitIpc.interruptAgent(hostId, agentId).then(
+                          () => orbitActions.showToast(t("overview.stoppedBackgroundTasksToast")),
+                          (err) => {
+                            setStoppingBg(false);
+                            orbitActions.showToast(
+                              t("overview.stopBackgroundTasksFailedToast", {
+                                error: String(err),
+                              }),
+                            );
+                          },
+                        );
+                      }}
+                      className="text-signal-danger/85 hover:text-signal-danger hover:bg-signal-danger-bg inline-flex cursor-pointer items-center gap-1 rounded-[6px] px-1.5 py-0.5 text-[11px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
                     >
-                      {showAllTasks ? "Show less" : `Show ${hiddenTaskCount} more`}
+                      <Square className="size-[8px] fill-current" />
+                      <span>{t("overview.stopTasks")}</span>
                     </button>
-                  </div>
+                  </SimpleTooltip>
+                ) : undefined
+              }
+              footer={
+                orderedTasks.length > defaultVisibleTaskCount ? (
+                  <OverviewExpandFooter
+                    expanded={showAllTasks}
+                    hiddenCount={hiddenTaskCount}
+                    onToggle={() => setShowAllTasks((v) => !v)}
+                  />
                 ) : undefined
               }
             >
-              <div className="space-y-0.5 pb-1">
-                {visibleTasks.map((task) => {
-                  const cleanPreview = cleanBackgroundOutputPreview(task.output_preview);
-                  const hasDetails = Boolean(task.command || cleanPreview || task.log_path);
-                  const isExpanded = Boolean(expandedTasks[task.id]);
-                  const showStopAction = canStopBackground && task.status === "running";
-                  const hasHoverActions = Boolean(task.log_path || showStopAction);
-                  return (
-                    <div
-                      key={task.id}
-                      className={cn(
-                        "group/bgtask flex w-full flex-col rounded-[8px] transition-colors",
-                        isExpanded ? "bg-surface-recessed/70" : "hover:bg-accent/70",
-                      )}
-                    >
-                      <div className="relative flex h-[30px] min-w-0 w-full items-center">
-                        <button
-                          type="button"
-                          aria-expanded={hasDetails ? isExpanded : undefined}
-                          onClick={() => {
-                            if (!hasDetails) return;
-                            setExpandedTasks((prev) => ({ ...prev, [task.id]: !prev[task.id] }));
-                          }}
-                          className={cn(
-                            "flex h-full min-w-0 flex-1 items-center gap-2 px-2 text-left",
-                            hasDetails ? "cursor-pointer" : "cursor-default",
-                          )}
-                        >
-                          <span className="flex size-[14px] shrink-0 items-center justify-center">
-                            {task.status === "running" ? (
-                              <span className="bg-signal-success size-[6px] rounded-full" />
-                            ) : (
-                              <Clock className="text-ink-muted size-[13px] stroke-[1.7]" />
-                            )}
-                          </span>
-                          <span className="text-ink-primary min-w-0 flex-1 truncate text-[12px] leading-[18px]">
-                            {task.title}
-                          </span>
-                        </button>
-
-                        <div className="flex shrink-0 items-center pr-1.5">
-                          {typeof task.started_at_ms === "number" && (
-                            <div
-                              className={cn(
-                                "pr-0.5",
-                                hasHoverActions &&
-                                  (isExpanded
-                                    ? "hidden"
-                                    : "group-hover/bgtask:hidden group-focus-within/bgtask:hidden"),
-                              )}
-                            >
-                              <TaskElapsedLabel startedAtMs={task.started_at_ms} />
-                            </div>
-                          )}
-
-                          {hasHoverActions && (
-                            <div
-                              className={cn(
-                                "items-center gap-0.5",
-                                isExpanded
-                                  ? "flex"
-                                  : "hidden group-hover/bgtask:flex group-focus-within/bgtask:flex",
-                              )}
-                            >
-                              {task.log_path && (
-                                <IconButton
-                                  size="xs"
-                                  tooltip="Open log"
-                                  onClick={() => {
-                                    if (task.log_path) {
-                                      orbitActions.openFileInSidePanel(task.log_path, {
-                                        hostId,
-                                        cwd,
-                                      });
-                                    }
-                                  }}
-                                >
-                                  <ArrowUpRight className="size-3" />
-                                </IconButton>
-                              )}
-                              {showStopAction && (
-                                <IconButton
-                                  size="xs"
-                                  tone="danger"
-                                  tooltip="Stop background task"
-                                  disabled={stoppingBg}
-                                  onClick={() => {
-                                    if (stoppingBg) return;
-                                    setStoppingBg(true);
-                                    void orbitIpc.interruptAgent(hostId, agentId).then(
-                                      () => orbitActions.showToast("Stopped background tasks"),
-                                      (err) => {
-                                        setStoppingBg(false);
-                                        orbitActions.showToast(
-                                          `Failed to stop background tasks: ${String(err)}`,
-                                        );
-                                      },
-                                    );
-                                  }}
-                                >
-                                  <Square className="size-[9px] fill-current" />
-                                </IconButton>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      {hasDetails && isExpanded && (
-                        <div className="selectable-text space-y-1.5 px-2.5 pt-0.5 pb-2 font-mono text-[11px] leading-relaxed">
-                          {task.command && (
-                            <div className="text-ink-secondary break-all whitespace-pre-wrap">
-                              <span className="text-ink-muted select-none">$ </span>
-                              {task.command}
-                            </div>
-                          )}
-                          {cleanPreview && (
-                            <pre className="text-ink-tertiary max-h-[88px] overflow-hidden break-words whitespace-pre-wrap">
-                              {cleanPreview.slice(0, 320)}
-                            </pre>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+              <div className="flex flex-col gap-0.5 pb-1">
+                {visibleTasks.map((task) => (
+                  <OverviewBackgroundTaskRow
+                    key={task.id}
+                    hostId={hostId}
+                    cwd={cwd}
+                    task={task}
+                    isExpanded={Boolean(expandedTasks[task.id])}
+                    onToggleExpand={handleToggleTaskExpand}
+                  />
+                ))}
               </div>
             </OverviewSection>
           )}
 
-          {/* 5. Touched Files (Conditional, collapsed by default for clean density) */}
-          {touchedFiles.length > 0 && (
+          {/* === Tier 2: Session Deliverables (Pull Requests -> Artifacts -> Links) === */}
+
+          {/* 4. Pull Requests */}
+          {pullRequests.length > 0 && (
+            <OverviewSection
+              id="pull_requests"
+              label={t("overview.pullRequests")}
+              count={pullRequests.length}
+              collapsed={collapsedSections.pull_requests}
+              footer={
+                pullRequests.length > DEFAULT_VISIBLE_LIST_ITEMS ? (
+                  <OverviewExpandFooter
+                    expanded={showAllPrs}
+                    hiddenCount={hiddenPrCount}
+                    onToggle={() => setShowAllPrs((v) => !v)}
+                  />
+                ) : undefined
+              }
+            >
+              <div className="flex flex-col gap-0.5 pb-1">
+                {visiblePrs.map((pr) => (
+                  <OverviewPullRequestRow key={pr.url} pr={pr} />
+                ))}
+              </div>
+            </OverviewSection>
+          )}
+
+          {/* 5. Artifacts (Direct-access item list for active session) */}
+          {workspaceArtifacts.length > 0 && (
+            <OverviewSection
+              id="artifacts"
+              label={t("overview.artifacts")}
+              count={workspaceArtifacts.length}
+              collapsed={collapsedSections.artifacts}
+              footer={
+                workspaceArtifacts.length > DEFAULT_VISIBLE_LIST_ITEMS ? (
+                  <OverviewExpandFooter
+                    expanded={showAllArtifacts}
+                    hiddenCount={hiddenArtifactCount}
+                    onToggle={() => setShowAllArtifacts((v) => !v)}
+                  />
+                ) : undefined
+              }
+            >
+              <div className="flex flex-col gap-0.5 pb-1">
+                {visibleArtifacts.map((artifact) => (
+                  <OverviewArtifactRow
+                    key={artifact.artifact_id}
+                    hostId={hostId}
+                    artifact={artifact}
+                    selected={
+                      activeSideTab?.kind === "artifacts" &&
+                      activeSideTab.artifactId === artifact.artifact_id
+                    }
+                  />
+                ))}
+              </div>
+            </OverviewSection>
+          )}
+
+          {/* 6. Links (Local preview URLs -> built-in Browser, external links -> system browser) */}
+          {overviewLinks.length > 0 && (
+            <OverviewSection
+              id="links"
+              label={t("overview.links")}
+              count={overviewLinks.length}
+              collapsed={collapsedSections.links}
+              footer={
+                overviewLinks.length > DEFAULT_VISIBLE_LIST_ITEMS ? (
+                  <OverviewExpandFooter
+                    expanded={showAllLinks}
+                    hiddenCount={hiddenLinkCount}
+                    onToggle={() => setShowAllLinks((v) => !v)}
+                  />
+                ) : undefined
+              }
+            >
+              <div className="flex flex-col gap-0.5 pb-1">
+                {visibleLinks.map((item) => (
+                  <OverviewLinkRow
+                    key={`${item.kind}:${item.url}`}
+                    item={item}
+                    selected={
+                      item.kind === "local" &&
+                      activeSideTab?.kind === "browser" &&
+                      doesUrlMatchOpenBrowserUrl(activeSideTab.url, item.url)
+                    }
+                  />
+                ))}
+              </div>
+            </OverviewSection>
+          )}
+
+          {/* === Tier 3: Secondary Context (Side Questions -> Modified Files) === */}
+
+          {/* 7. Side Questions (/btw) */}
+          {orderedSideQuestions.length > 0 && (
+            <OverviewSection
+              id="side_questions"
+              label={t("overview.sideQuestions")}
+              count={orderedSideQuestions.length}
+              collapsed={collapsedSections.side_questions}
+              isRunning={hasStreamingSideQuestion}
+              footer={
+                orderedSideQuestions.length > DEFAULT_VISIBLE_LIST_ITEMS ? (
+                  <OverviewExpandFooter
+                    expanded={showAllSideQuestions}
+                    hiddenCount={hiddenSideQuestionCount}
+                    onToggle={() => setShowAllSideQuestions((v) => !v)}
+                  />
+                ) : undefined
+              }
+            >
+              <div className="flex flex-col gap-0.5 pb-1">
+                {visibleSideQuestions.map((entry) => (
+                  <OverviewSideQuestionRow
+                    key={entry.id}
+                    entry={entry}
+                    selected={
+                      isSideQuestionActive && activeSideTab?.sideQuestionEntryId === entry.id
+                    }
+                  />
+                ))}
+              </div>
+            </OverviewSection>
+          )}
+
+          {/* 8. Modified Files (or Touched Files for read-only research sessions; collapsed by default) */}
+          {formattedTouchedFiles.length > 0 && (
             <OverviewSection
               id="touched_files"
-              label="Touched Files"
-              count={touchedFiles.length}
+              label={hasModifiedFiles ? t("overview.modifiedFiles") : t("overview.touchedFiles")}
+              count={activeFileList.length}
               collapsed={collapsedSections.touched_files}
               trailingMeta={
                 toolSummary.touchedAdditions > 0 || toolSummary.touchedDeletions > 0 ? (
@@ -840,56 +824,96 @@ const StageOverviewBody = memo(function StageOverviewBody({
                   />
                 ) : undefined
               }
+              footer={
+                activeFileList.length > DEFAULT_VISIBLE_TOUCHED_FILES ? (
+                  <OverviewExpandFooter
+                    expanded={showAllTouchedFiles}
+                    hiddenCount={hiddenTouchedFileCount}
+                    onToggle={() => setShowAllTouchedFiles((v) => !v)}
+                  />
+                ) : undefined
+              }
             >
-              <div className="space-y-0.5 pb-1">
-                {touchedFiles.slice(0, 8).map((file) => {
-                  const basename = file.display_path.split("/").pop() || file.display_path;
+              <div className="flex flex-col gap-0.5 pb-1">
+                {visibleTouchedFiles.map(({ file, basename, dirHint }) => {
+                  const isModified = file.action === "created" || file.action === "edited";
+                  const actionLabel =
+                    file.action === "created"
+                      ? t("overview.fileActionCreated")
+                      : file.action === "edited"
+                        ? t("overview.fileActionEdited")
+                        : t("overview.fileActionRead");
+
                   return (
-                    <ListRow
-                      key={file.path}
-                      density="compact"
-                      title={file.display_path}
-                      onClick={() =>
-                        orbitActions.openFileInSidePanel(file.path, { hostId, cwd })
-                      }
-                      leading={
-                        <span
-                          className={cn(
-                            "size-[6px] rounded-full",
-                            file.action === "created"
-                              ? "bg-signal-success"
-                              : file.action === "edited"
-                                ? "bg-signal-info"
-                                : "bg-ink-muted/60",
-                          )}
-                        />
-                      }
-                      trailing={
-                        file.additions > 0 || file.deletions > 0 ? (
-                          <DiffStat
-                            size="xs"
-                            additions={file.additions}
-                            deletions={file.deletions}
+                    <div key={file.path} className="group/tfile relative">
+                      <ListRow
+                        density="compact"
+                        selected={
+                          activeSideTab?.kind === "file" &&
+                          doesTouchedFileMatchOpenPath(activeSideTab.filePath, file, cwd)
+                        }
+                        title={`${actionLabel} · ${file.display_path}`}
+                        onClick={() =>
+                          orbitActions.openFileInSidePanel(file.path, { hostId, cwd })
+                        }
+                        leading={
+                          <span
+                            className={cn(
+                              "size-[6px] rounded-full",
+                              file.action === "created"
+                                ? "bg-signal-success"
+                                : file.action === "edited"
+                                  ? "bg-signal-info"
+                                  : "bg-ink-muted/60",
+                            )}
                           />
-                        ) : undefined
-                      }
-                    >
-                      <span className="font-mono text-[12px]">{basename}</span>
-                    </ListRow>
+                        }
+                        trailing={
+                          file.additions > 0 || file.deletions > 0 ? (
+                            <span
+                              className={cn(
+                                isModified &&
+                                  "transition-opacity duration-150 group-focus-within/tfile:opacity-0 group-hover/tfile:opacity-0",
+                              )}
+                            >
+                              <DiffStat
+                                size="xs"
+                                additions={file.additions}
+                                deletions={file.deletions}
+                              />
+                            </span>
+                          ) : undefined
+                        }
+                      >
+                        <span className="flex min-w-0 items-baseline gap-1.5">
+                          <span className="min-w-0 truncate font-mono text-[12px]">{basename}</span>
+                          {dirHint && (
+                            <span className="text-ink-faint max-w-[44%] shrink-0 truncate font-mono text-[10.5px] font-normal">
+                              {dirHint}
+                            </span>
+                          )}
+                        </span>
+                      </ListRow>
+
+                      {isModified && (
+                        <div className="bg-[var(--overview-surface,var(--surface-raised))]/95 border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center rounded-[7px] border p-0.5 opacity-0 shadow-xs backdrop-blur-[6px] transition-opacity duration-150 group-focus-within/tfile:pointer-events-auto group-focus-within/tfile:opacity-100 group-hover/tfile:pointer-events-auto group-hover/tfile:opacity-100">
+                          <IconButton
+                            size="xs"
+                            tooltip={t("overview.viewFileDiff")}
+                            onClick={() =>
+                              orbitActions.openReviewTab({
+                                path: file.display_path,
+                                scope: toolSummary.reviewScope,
+                              })
+                            }
+                          >
+                            <FileDiff className="size-3" />
+                          </IconButton>
+                        </div>
+                      )}
+                    </div>
                   );
                 })}
-                {touchedFiles.length > 8 && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      orbitActions.openReviewTab({ path: null, scope: toolSummary.reviewScope })
-                    }
-                    className="text-ink-tertiary hover:text-ink-primary flex h-[24px] w-full cursor-pointer items-center justify-between rounded-[6px] px-2 text-[11px] font-medium transition-colors"
-                  >
-                    <span>View all {touchedFiles.length} files</span>
-                    <ArrowUpRight className="size-3 shrink-0" />
-                  </button>
-                )}
               </div>
             </OverviewSection>
           )}
@@ -900,34 +924,20 @@ const StageOverviewBody = memo(function StageOverviewBody({
 });
 
 /**
- * Antigravity-inspired 288px Session Overview HUD:
- * - Spacious stage (`canDock = true`): docks cleanly at top-right (left of scrollbar).
- * - Compact/split stage (`canDock = false`): opens on demand via TopBar Overview toggle (`⌘⌥O`),
- *   while TopBar relays living Subagent avatars whenever Overview is hidden.
+ * Isolated Docked Shell so `useWorkspaceMotion()` phase transitions (e.g. Left Sidebar toggling)
+ * animate the outer GPU transform without re-reconciling the memoized `StageOverviewBody` child.
  */
-export const StageOverviewPanel = memo(function StageOverviewPanel({
-  canDock,
-  hostId,
-  agentId,
-  cwd,
-  insights,
-  sessionTurnDiffs,
-  currentAgent,
-  stageContainerRef,
+const DockedOverviewShell = memo(function DockedOverviewShell({
+  ariaLabel,
+  dockedTopPx,
+  maxHeightPx,
+  children,
 }: {
-  canDock: boolean;
-  hostId: string;
-  agentId: string;
-  cwd: string;
-  insights: SessionInsightsView;
-  sessionTurnDiffs: readonly DiffFileView[];
-  currentAgent: AgentCardView | null;
-  stageContainerRef?: RefObject<HTMLDivElement | null>;
+  ariaLabel: string;
+  dockedTopPx: number;
+  maxHeightPx: number;
+  children: ReactNode;
 }) {
-  const popoverOpen = useOrbitSelector((s) => s.overviewPopoverOpen);
-  const popoverRef = useRef<HTMLDivElement | null>(null);
-  const [dockedTopPx, setDockedTopPx] = useState(52);
-  const [stageHeightPx, setStageHeightPx] = useState(640);
   const {
     dockedOverviewMounted,
     dockedOverviewVisualOpen,
@@ -935,35 +945,46 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
     dockedOverviewTransition,
   } = useWorkspaceMotion();
 
-  useLayoutEffect(() => {
-    const el = stageContainerRef?.current;
-    if (!el) return;
-    let rafId = 0;
-    const syncRect = () => {
-      const rect = el.getBoundingClientRect();
-      const nextTop = Math.round(rect.top) + 12;
-      const nextHeight = Math.round(rect.height);
-      setDockedTopPx((prev) => (prev === nextTop ? prev : nextTop));
-      if (nextHeight > 0) {
-        setStageHeightPx((prev) => (prev === nextHeight ? prev : nextHeight));
-      }
-    };
-    const scheduleSyncRect = () => {
-      if (rafId) return;
-      rafId = window.requestAnimationFrame(() => {
-        rafId = 0;
-        syncRect();
-      });
-    };
-    syncRect();
-    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(scheduleSyncRect) : null;
-    ro?.observe(el);
-    return () => {
-      ro?.disconnect();
-      if (rafId) window.cancelAnimationFrame(rafId);
-    };
-  }, [stageContainerRef, dockedOverviewMounted, popoverOpen]);
+  if (!dockedOverviewMounted) return null;
 
+  return (
+    <aside
+      aria-label={ariaLabel}
+      inert={!dockedOverviewVisualOpen}
+      style={{
+        top: `${dockedTopPx}px`,
+        transform: dockedOverviewTransform,
+        opacity: dockedOverviewVisualOpen ? 1 : 0,
+        transition: dockedOverviewTransition,
+      }}
+      className={cn(
+        "fixed right-4 z-[15] w-[288px] origin-top-right will-change-[transform,opacity]",
+        !dockedOverviewVisualOpen && "pointer-events-none",
+      )}
+    >
+      <Card
+        style={{ maxHeight: `${maxHeightPx}px` }}
+        className="overview-card-surface flex w-full flex-col gap-0 overflow-hidden rounded-[12px] p-0"
+      >
+        {children}
+      </Card>
+    </aside>
+  );
+});
+
+const PopoverOverviewShell = memo(function PopoverOverviewShell({
+  canDock,
+  ariaLabel,
+  maxHeightPx,
+  children,
+}: {
+  canDock: boolean;
+  ariaLabel: string;
+  maxHeightPx: number;
+  children: ReactNode;
+}) {
+  const popoverOpen = useOrbitSelector((s) => s.overviewPopoverOpen);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
   const isPopoverVisible = !canDock && popoverOpen;
   const [popoverMounted, setPopoverMounted] = useState(isPopoverVisible);
   const [popoverVisualOpen, setPopoverVisualOpen] = useState(isPopoverVisible);
@@ -975,6 +996,7 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
       const raf1 = window.requestAnimationFrame(() => {
         raf2 = window.requestAnimationFrame(() => {
           setPopoverVisualOpen(true);
+          popoverRef.current?.focus({ preventScroll: true });
         });
       });
       return () => {
@@ -1003,14 +1025,17 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
     };
     const onKeyDown = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") {
+        ev.stopPropagation();
         orbitActions.setOverviewPopoverOpen(false);
+        const trigger = document.querySelector<HTMLElement>("[data-overview-trigger]");
+        trigger?.focus({ preventScroll: true });
       }
     };
     window.addEventListener("mousedown", onPointerDown);
-    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown, true);
     return () => {
       window.removeEventListener("mousedown", onPointerDown);
-      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keydown", onKeyDown, true);
     };
   }, [isPopoverVisible]);
 
@@ -1020,74 +1045,168 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
     }
   }, [canDock, popoverOpen]);
 
-  const dockedCardMaxHeightExpr = `min(calc(100vh - ${dockedTopPx + 84}px), 620px)`;
+  if (!popoverMounted) return null;
+
+  return (
+    <div
+      ref={popoverRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-label={ariaLabel}
+      inert={!popoverVisualOpen}
+      style={{ maxHeight: `${maxHeightPx}px` }}
+      className={cn(
+        "absolute top-3 right-4 z-30 w-[288px] max-w-[calc(100%-32px)] origin-top-right outline-none will-change-[transform,opacity]",
+        popoverVisualOpen
+          ? "translate-x-0 translate-y-0 scale-100 opacity-100 transition-[opacity,transform] duration-[190ms] ease-[var(--ease-out-expo)]"
+          : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[145ms] ease-[var(--ease-exit)]",
+      )}
+    >
+      <Card
+        style={{ maxHeight: `${maxHeightPx}px` }}
+        className="floating-surface flex w-full flex-col gap-0 overflow-hidden rounded-[12px] border p-0"
+      >
+        {children}
+      </Card>
+    </div>
+  );
+});
+
+interface StageOverviewPanelProps {
+  canDock: boolean;
+  hostId: string;
+  agentId: string;
+  cwd: string;
+  insights: SessionInsightsView;
+  sessionTurnDiffs: readonly DiffFileView[];
+  currentAgent: AgentCardView | null;
+  stageContainerRef?: RefObject<HTMLDivElement | null>;
+}
+
+function areStageOverviewPanelPropsEqual(
+  prev: StageOverviewPanelProps,
+  next: StageOverviewPanelProps,
+): boolean {
+  return (
+    prev.canDock === next.canDock &&
+    prev.hostId === next.hostId &&
+    prev.agentId === next.agentId &&
+    prev.cwd === next.cwd &&
+    prev.insights === next.insights &&
+    prev.sessionTurnDiffs === next.sessionTurnDiffs &&
+    prev.stageContainerRef === next.stageContainerRef &&
+    (prev.currentAgent?.workspace_id ?? null) === (next.currentAgent?.workspace_id ?? null) &&
+    (prev.currentAgent?.parent_agent_id ?? null) === (next.currentAgent?.parent_agent_id ?? null) &&
+    isAgentBackgroundWaiting(prev.currentAgent) === isAgentBackgroundWaiting(next.currentAgent) &&
+    isAgentForegroundRunning(prev.currentAgent) === isAgentForegroundRunning(next.currentAgent)
+  );
+}
+
+/**
+ * Antigravity-inspired 288px Session Overview HUD:
+ * - Spacious stage (`canDock = true`): docks cleanly at top-right (left of scrollbar).
+ * - Compact/split stage (`canDock = false`): opens on demand via TopBar Overview toggle (`⌘⌥O`),
+ *   while TopBar relays living Subagent avatars whenever Overview is hidden.
+ */
+export const StageOverviewPanel = memo(function StageOverviewPanel({
+  canDock,
+  hostId,
+  agentId,
+  cwd,
+  insights,
+  sessionTurnDiffs,
+  currentAgent,
+  stageContainerRef,
+}: StageOverviewPanelProps) {
+  const { t } = useI18n();
+  const [dockedTopPx, setDockedTopPx] = useState(52);
+  const [stageHeightPx, setStageHeightPx] = useState(640);
+
+  useLayoutEffect(() => {
+    const el = stageContainerRef?.current;
+    if (!el) return;
+    let rafId = 0;
+    const syncRect = () => {
+      const rect = el.getBoundingClientRect();
+      const nextTop = Math.round(rect.top) + 12;
+      const nextHeight = Math.round(rect.height);
+      setDockedTopPx((prev) => (prev === nextTop ? prev : nextTop));
+      if (nextHeight > 0) {
+        setStageHeightPx((prev) => (prev === nextHeight ? prev : nextHeight));
+      }
+    };
+    const scheduleSyncRect = () => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        syncRect();
+      });
+    };
+    syncRect();
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(scheduleSyncRect) : null;
+    ro?.observe(el);
+    if (el.parentElement) ro?.observe(el.parentElement);
+    window.addEventListener("resize", scheduleSyncRect);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener("resize", scheduleSyncRect);
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, [stageContainerRef, canDock]);
+
+  const dockedMaxHeightPx = Math.min(640, Math.max(240, stageHeightPx - 28));
   const popoverMaxHeightPx = Math.min(560, Math.max(240, stageHeightPx - 24));
-  const popoverCardMaxHeightExpr = `${popoverMaxHeightPx}px`;
+  const overviewAriaLabel = t("overview.ariaLabel");
+
+  const agentWorkspaceId = currentAgent?.workspace_id ?? null;
+  const agentParentId = currentAgent?.parent_agent_id ?? null;
+  const agentBackgroundWaiting = isAgentBackgroundWaiting(currentAgent);
+  const agentForegroundRunning = isAgentForegroundRunning(currentAgent);
+
+  const bodyNode = useMemo(
+    () => (
+      <StageOverviewBody
+        hostId={hostId}
+        agentId={agentId}
+        cwd={cwd}
+        insights={insights}
+        sessionTurnDiffs={sessionTurnDiffs}
+        agentWorkspaceId={agentWorkspaceId}
+        agentParentId={agentParentId}
+        agentBackgroundWaiting={agentBackgroundWaiting}
+        agentForegroundRunning={agentForegroundRunning}
+      />
+    ),
+    [
+      hostId,
+      agentId,
+      cwd,
+      insights,
+      sessionTurnDiffs,
+      agentWorkspaceId,
+      agentParentId,
+      agentBackgroundWaiting,
+      agentForegroundRunning,
+    ],
+  );
 
   return (
     <>
-      {dockedOverviewMounted && (
-        <aside
-          aria-label="Session overview"
-          inert={!dockedOverviewVisualOpen}
-          style={{
-            top: `${dockedTopPx}px`,
-            transform: dockedOverviewTransform,
-            opacity: dockedOverviewVisualOpen ? 1 : 0,
-            transition: dockedOverviewTransition,
-          }}
-          className={cn(
-            "fixed right-4 z-[15] w-[288px] origin-top-right will-change-[transform,opacity]",
-            !dockedOverviewVisualOpen && "pointer-events-none",
-          )}
-        >
-          <Card
-            style={{ maxHeight: dockedCardMaxHeightExpr }}
-            className="overview-card-surface flex w-full flex-col gap-0 overflow-hidden rounded-[12px] p-0"
-          >
-            <StageOverviewBody
-              hostId={hostId}
-              agentId={agentId}
-              cwd={cwd}
-              insights={insights}
-              sessionTurnDiffs={sessionTurnDiffs}
-              currentAgent={currentAgent}
-              cardMaxHeightExpr={dockedCardMaxHeightExpr}
-            />
-          </Card>
-        </aside>
-      )}
+      <DockedOverviewShell
+        ariaLabel={overviewAriaLabel}
+        dockedTopPx={dockedTopPx}
+        maxHeightPx={dockedMaxHeightPx}
+      >
+        {bodyNode}
+      </DockedOverviewShell>
 
-      {popoverMounted && (
-        <div
-          ref={popoverRef}
-          role="dialog"
-          aria-label="Session overview"
-          inert={!popoverVisualOpen}
-          style={{ maxHeight: popoverCardMaxHeightExpr }}
-          className={cn(
-            "absolute top-3 right-4 z-30 w-[288px] max-w-[calc(100%-32px)] origin-top-right will-change-[transform,opacity]",
-            popoverVisualOpen
-              ? "translate-x-0 translate-y-0 scale-100 opacity-100 transition-[opacity,transform] duration-[190ms] ease-[var(--ease-out-expo)]"
-              : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[145ms] ease-[var(--ease-exit)]",
-          )}
-        >
-          <Card
-            style={{ maxHeight: popoverCardMaxHeightExpr }}
-            className="overview-card-surface floating-surface flex w-full flex-col gap-0 overflow-hidden rounded-[12px] p-0"
-          >
-            <StageOverviewBody
-              hostId={hostId}
-              agentId={agentId}
-              cwd={cwd}
-              insights={insights}
-              sessionTurnDiffs={sessionTurnDiffs}
-              currentAgent={currentAgent}
-              cardMaxHeightExpr={popoverCardMaxHeightExpr}
-            />
-          </Card>
-        </div>
-      )}
+      <PopoverOverviewShell
+        canDock={canDock}
+        ariaLabel={overviewAriaLabel}
+        maxHeightPx={popoverMaxHeightPx}
+      >
+        {bodyNode}
+      </PopoverOverviewShell>
     </>
   );
-});
+}, areStageOverviewPanelPropsEqual);

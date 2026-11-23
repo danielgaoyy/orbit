@@ -365,6 +365,7 @@
 
 /* Antigravity-inspired Stage Overview HUD surface */
 .overview-card-surface {
+  --overview-surface: var(--surface-raised);
   background: var(--surface-raised);
   border: 1px solid var(--border-subtle);
   box-shadow:
@@ -373,6 +374,7 @@
 }
 
 .dark .overview-card-surface {
+  --overview-surface: var(--surface-raised);
   background: var(--surface-raised);
   border: 1px solid var(--border-subtle);
   box-shadow:
@@ -383,6 +385,7 @@
 
 /* Omnidirectional floating surface for Popovers, Menus, Command Palette & Toasts */
 .floating-surface {
+  --overview-surface: var(--surface-overlay);
   background: var(--surface-overlay);
   border-color: var(--border-default);
   box-shadow:
@@ -391,6 +394,7 @@
 }
 
 .dark .floating-surface {
+  --overview-surface: var(--surface-overlay);
   background: var(--surface-overlay);
   border-color: var(--border-default);
   box-shadow:

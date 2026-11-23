@@ -246,12 +246,34 @@ pub struct SessionSubagentEntryView {
     pub last_seq: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPullRequestView {
+    pub url: String,
+    pub number: u64,
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub last_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLinkView {
+    pub url: String,
+    pub label: String,
+    pub host: String,
+    pub last_seq: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInsightsView {
     pub touched_files: Vec<SessionTouchedFileView>,
     pub background_tasks: Vec<SessionBackgroundTaskView>,
     pub subagents: Vec<SessionSubagentEntryView>,
     pub detected_local_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pull_requests: Vec<SessionPullRequestView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_links: Vec<SessionLinkView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2310,6 +2332,442 @@ fn collect_local_urls(text: &str, out: &mut Vec<String>) {
     }
 }
 
+fn is_ignored_external_host(host_lower: &str) -> bool {
+    if host_lower.is_empty() || !host_lower.contains('.') {
+        return true;
+    }
+    if host_lower.starts_with("127.") {
+        return true;
+    }
+    if matches!(
+        host_lower,
+        "localhost"
+            | "localhost.localdomain"
+            | "0.0.0.0"
+            | "::1"
+            | "[::1]"
+            | "example.com"
+            | "www.example.com"
+            | "example.org"
+            | "example.net"
+            | "w3.org"
+            | "www.w3.org"
+            | "json-schema.org"
+            | "schemas.microsoft.com"
+            | "schemas.android.com"
+            | "purl.org"
+            | "xmlns.com"
+            | "ogp.me"
+            | "registry.npmjs.org"
+            | "registry.yarnpkg.com"
+            | "pypi.org"
+            | "files.pythonhosted.org"
+            | "static.crates.io"
+            | "index.crates.io"
+            | "api.github.com"
+            | "raw.githubusercontent.com"
+            | "objects.githubusercontent.com"
+            | "codeload.github.com"
+    ) {
+        return true;
+    }
+    host_lower.ends_with(".local") || host_lower.ends_with(".example")
+}
+
+fn is_static_asset_url_path(path_lower: &str) -> bool {
+    let last_seg = path_lower.rsplit('/').next().unwrap_or("");
+    const ASSET_EXTS: &[&str] = &[
+        ".git", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif", ".woff",
+        ".woff2", ".ttf", ".eot", ".otf", ".map", ".css", ".js", ".mjs", ".cjs", ".wasm", ".mp4",
+        ".mov", ".webm", ".mp3", ".wav", ".zip", ".tar", ".gz", ".tgz", ".dmg", ".pkg", ".exe",
+        ".deb", ".rpm",
+    ];
+    ASSET_EXTS.iter().any(|ext| last_seg.ends_with(ext))
+}
+
+/// Strips Markdown fenced code blocks (``` / ~~~) and inline backtick code spans so external
+/// link extraction only surfaces URLs genuinely referenced in prose, not code snippets or logs.
+fn strip_markdown_code_regions(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence: Option<char> = None;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(fence_ch) = in_fence {
+            let closes = if fence_ch == '`' {
+                trimmed.starts_with("```")
+            } else {
+                trimmed.starts_with("~~~")
+            };
+            if closes {
+                in_fence = None;
+            }
+            out.push('\n');
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            in_fence = Some('`');
+            out.push('\n');
+            continue;
+        }
+        if trimmed.starts_with("~~~") {
+            in_fence = Some('~');
+            out.push('\n');
+            continue;
+        }
+
+        // Strip inline backtick spans on this prose line, preserving spaces/newlines
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let mut inline_ticks: usize = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'`' {
+                let mut tick_end = i;
+                while tick_end < bytes.len() && bytes[tick_end] == b'`' {
+                    tick_end += 1;
+                }
+                let run = tick_end - i;
+                if inline_ticks == 0 {
+                    inline_ticks = run;
+                } else if run == inline_ticks {
+                    inline_ticks = 0;
+                }
+                out.push(' ');
+                i = tick_end;
+                continue;
+            }
+            if inline_ticks == 0 {
+                let Some(ch) = line[i..].chars().next() else {
+                    break;
+                };
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                let Some(ch) = line[i..].chars().next() else {
+                    break;
+                };
+                if ch == '\n' {
+                    out.push('\n');
+                    inline_ticks = 0;
+                } else {
+                    out.push(' ');
+                }
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+fn extract_markdown_link_label(text: &str, url_start: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    if url_start < 3
+        || bytes.get(url_start - 1) != Some(&b'(')
+        || bytes.get(url_start - 2) != Some(&b']')
+    {
+        return None;
+    }
+    let close_bracket = url_start - 2;
+    let search_floor = close_bracket.saturating_sub(180);
+    let mut open_bracket = None;
+    let mut idx = close_bracket;
+    while idx > search_floor {
+        idx -= 1;
+        match bytes[idx] {
+            b'\n' | b'\r' | b']' => return None,
+            b'[' => {
+                open_bracket = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let open = open_bracket?;
+    // Ignore Markdown images `![alt](url)`
+    if open > 0 && bytes.get(open - 1) == Some(&b'!') {
+        return None;
+    }
+    let raw_label = text.get(open + 1..close_bracket)?;
+    let cleaned: String = raw_label
+        .trim()
+        .trim_matches(|c: char| matches!(c, '`' | '*' | '_' | '"' | '\''))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = cleaned.to_ascii_lowercase();
+    if cleaned.is_empty()
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || cleaned.len() <= 1
+    {
+        return None;
+    }
+    Some(cleaned)
+}
+
+fn parse_pull_request_url(
+    scheme: &str,
+    authority: &str,
+    path_only: &str,
+) -> Option<(String, u64, String)> {
+    let segs: Vec<&str> = path_only.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() < 4 {
+        return None;
+    }
+
+    // GitLab: /<group...>/<repo>/-/merge_requests/<num>
+    if let Some(dash_pos) = segs.iter().position(|s| *s == "-")
+        && dash_pos >= 2
+        && segs.get(dash_pos + 1).copied() == Some("merge_requests")
+        && let Some(num_str) = segs.get(dash_pos + 2)
+        && let Ok(number) = num_str.parse::<u64>()
+        && number > 0
+    {
+        let group_repo = segs[..dash_pos].join("/");
+        let canonical = format!("{scheme}://{authority}/{group_repo}/-/merge_requests/{number}");
+        let repo = if dash_pos >= 2 {
+            format!("{}/{}", segs[dash_pos - 2], segs[dash_pos - 1])
+        } else {
+            group_repo
+        };
+        return Some((canonical, number, repo));
+    }
+
+    // GitHub / GHE (`/owner/repo/pull/123`), Bitbucket (`/ws/repo/pull-requests/123`),
+    // Gitea / Forgejo / Codeberg (`/owner/repo/pulls/123`).
+    let kind_seg = segs[2];
+    if matches!(kind_seg, "pull" | "pull-requests" | "pulls")
+        && let Ok(number) = segs[3].parse::<u64>()
+        && number > 0
+    {
+        let owner = segs[0];
+        let repo_name = segs[1];
+        let canonical = format!("{scheme}://{authority}/{owner}/{repo_name}/{kind_seg}/{number}");
+        return Some((canonical, number, format!("{owner}/{repo_name}")));
+    }
+
+    None
+}
+
+fn is_generic_pr_label(label: &str, number: u64) -> bool {
+    let trimmed = label.trim().to_ascii_lowercase();
+    trimmed == format!("#{number}")
+        || trimmed == format!("pr #{number}")
+        || trimmed == format!("pr {number}")
+        || trimmed == format!("mr !{number}")
+        || trimmed == format!("!{number}")
+        || trimmed == format!("pull request #{number}")
+}
+
+fn compact_link_fallback_label(display_host: &str, path_and_query: &str) -> String {
+    let trimmed_path = path_and_query.trim_end_matches('/');
+    if trimmed_path.is_empty() {
+        return display_host.to_string();
+    }
+    let combined = format!("{display_host}{trimmed_path}");
+    truncate_chars_head(&combined, 56)
+}
+
+fn collect_session_urls_from_text(
+    text: &str,
+    seq: u64,
+    pr_map: &mut HashMap<String, SessionPullRequestView>,
+    mut link_map: Option<&mut HashMap<String, SessionLinkView>>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut offset = 0;
+
+    while offset < lower.len() {
+        let rel_http = lower[offset..].find("http://");
+        let rel_https = lower[offset..].find("https://");
+        let (rel, scheme_len) = match (rel_http, rel_https) {
+            (Some(a), Some(b)) => {
+                if a <= b {
+                    (a, 7)
+                } else {
+                    (b, 8)
+                }
+            }
+            (Some(a), None) => (a, 7),
+            (None, Some(b)) => (b, 8),
+            (None, None) => break,
+        };
+        let start = offset + rel;
+        let after_scheme = start + scheme_len;
+        let word_boundary = if start == 0 {
+            true
+        } else {
+            text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        };
+        if !word_boundary || !text.is_char_boundary(after_scheme) {
+            offset = after_scheme;
+            continue;
+        }
+
+        let mut url_end = after_scheme;
+        let mut paren_depth: usize = 0;
+        while url_end < text.len() {
+            let Some(ch) = text[url_end..].chars().next() else {
+                break;
+            };
+            if ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '"' | '\''
+                        | '`'
+                        | '<'
+                        | '>'
+                        | ']'
+                        | '['
+                        | '{'
+                        | '}'
+                        | '|'
+                        | '\\'
+                        | '。'
+                        | '，'
+                        | '；'
+                        | '：'
+                        | '、'
+                        | '）'
+                        | '】'
+                        | '」'
+                        | '』'
+                        | '》'
+                )
+            {
+                break;
+            }
+            if ch == '(' {
+                paren_depth += 1;
+            } else if ch == ')' {
+                if paren_depth == 0 {
+                    break;
+                }
+                paren_depth -= 1;
+            }
+            url_end += ch.len_utf8();
+        }
+
+        let raw_url = text[start..url_end].trim_end_matches(&['.', ',', ';', ':', '!', '?'][..]);
+        offset = url_end.max(after_scheme);
+
+        if raw_url.len() <= scheme_len
+            || raw_url.contains('$')
+            || raw_url.contains('*')
+            || raw_url.contains("...")
+        {
+            continue;
+        }
+
+        let scheme = if scheme_len == 8 { "https" } else { "http" };
+        let after = &raw_url[scheme_len..];
+        let auth_end = after.find(&['/', '?', '#'][..]).unwrap_or(after.len());
+        let authority = &after[..auth_end];
+        if authority.is_empty() || authority.contains('@') {
+            continue;
+        }
+        let host_part = if authority.starts_with('[') {
+            authority
+                .find(']')
+                .map(|end| &authority[..=end])
+                .unwrap_or(authority)
+        } else {
+            authority.split(':').next().unwrap_or(authority)
+        };
+        let host_lower = host_part.to_ascii_lowercase();
+        if is_ignored_external_host(&host_lower) {
+            continue;
+        }
+
+        let rest = &after[auth_end..];
+        let path_end = rest.find(&['?', '#'][..]).unwrap_or(rest.len());
+        let path_only = &rest[..path_end];
+        let md_label = extract_markdown_link_label(text, start);
+
+        if let Some((canonical_url, number, repo)) =
+            parse_pull_request_url(scheme, authority, path_only)
+        {
+            let title = md_label
+                .as_deref()
+                .filter(|lbl| !is_generic_pr_label(lbl, number))
+                .map(|lbl| truncate_chars_head(lbl, 72));
+            let key = canonical_url.to_ascii_lowercase();
+            pr_map
+                .entry(key)
+                .and_modify(|prev| {
+                    prev.last_seq = prev.last_seq.max(seq);
+                    if prev.title.is_none() && title.is_some() {
+                        prev.title = title.clone();
+                    }
+                })
+                .or_insert_with(|| SessionPullRequestView {
+                    url: canonical_url,
+                    number,
+                    repo,
+                    title,
+                    last_seq: seq,
+                });
+            continue;
+        }
+
+        let Some(links) = link_map.as_deref_mut() else {
+            continue;
+        };
+
+        if is_static_asset_url_path(&path_only.to_ascii_lowercase()) {
+            continue;
+        }
+
+        let display_host = host_lower.strip_prefix("www.").unwrap_or(&host_lower);
+        let canonical_url = if rest == "/" {
+            raw_url[..raw_url.len() - 1].to_string()
+        } else {
+            raw_url.to_string()
+        };
+        let fallback_label = compact_link_fallback_label(display_host, path_only);
+        let has_md_label = md_label.is_some();
+        let label = md_label
+            .map(|lbl| truncate_chars_head(&lbl, 64))
+            .unwrap_or_else(|| fallback_label.clone());
+        let key = canonical_url.to_ascii_lowercase();
+        links
+            .entry(key)
+            .and_modify(|prev| {
+                prev.last_seq = prev.last_seq.max(seq);
+                if has_md_label && prev.label == fallback_label {
+                    prev.label = label.clone();
+                }
+            })
+            .or_insert_with(|| SessionLinkView {
+                url: canonical_url,
+                label,
+                host: display_host.to_string(),
+                last_seq: seq,
+            });
+    }
+}
+
+fn collect_prose_urls(
+    text: &str,
+    seq: u64,
+    pr_map: &mut HashMap<String, SessionPullRequestView>,
+    link_map: &mut HashMap<String, SessionLinkView>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let prose = strip_markdown_code_regions(text);
+    collect_session_urls_from_text(&prose, seq, pr_map, Some(link_map));
+    // Also scan full raw text for PR URLs alone in case a PR URL was pasted inside inline backticks.
+    collect_session_urls_from_text(text, seq, pr_map, None);
+}
+
 fn extract_legacy_log_path_from_line(line: &str) -> Option<String> {
     for marker in ["Task logs are available at: file://", "Log: file://"] {
         if let Some(idx) = line.find(marker) {
@@ -2979,13 +3437,19 @@ pub fn derive_session_insights(
     let mut bg_task_map: HashMap<String, SessionBackgroundTaskView> = HashMap::new();
     let mut subagent_map: HashMap<String, SessionSubagentEntryView> = HashMap::new();
     let mut detected_local_urls: Vec<String> = Vec::new();
+    let mut pr_map: HashMap<String, SessionPullRequestView> = HashMap::new();
+    let mut link_map: HashMap<String, SessionLinkView> = HashMap::new();
 
     let agent_has_live_work = current_agent.is_some_and(|a| a.is_running || a.has_background_tasks);
 
     for item in items {
         match item {
-            TimelineItemView::AssistantMessage { text, .. } => {
+            TimelineItemView::UserPrompt { seq, text, .. } => {
+                collect_prose_urls(text, *seq, &mut pr_map, &mut link_map);
+            }
+            TimelineItemView::AssistantMessage { seq, text, .. } => {
                 collect_local_urls(text, &mut detected_local_urls);
+                collect_prose_urls(text, *seq, &mut pr_map, &mut link_map);
             }
             TimelineItemView::ToolCall {
                 seq,
@@ -3055,6 +3519,9 @@ pub fn derive_session_insights(
                     ToolCallDetail::Shell { output_preview, .. } => {
                         if let Some(out) = output_preview {
                             collect_local_urls(out, &mut detected_local_urls);
+                            // Extract PR URLs from shell output (e.g. `gh pr create`), without
+                            // flooding `detected_links` with package-registry / git-remote logs.
+                            collect_session_urls_from_text(out, *seq, &mut pr_map, None);
                         }
                     }
                     ToolCallDetail::Subagent {
@@ -3411,11 +3878,25 @@ pub fn derive_session_insights(
         b_run.cmp(&a_run).then_with(|| b.last_seq.cmp(&a.last_seq))
     });
 
+    let mut pull_requests: Vec<SessionPullRequestView> = pr_map.into_values().collect();
+    pull_requests.sort_by(|a, b| {
+        b.last_seq
+            .cmp(&a.last_seq)
+            .then_with(|| b.number.cmp(&a.number))
+    });
+    pull_requests.truncate(12);
+
+    let mut detected_links: Vec<SessionLinkView> = link_map.into_values().collect();
+    detected_links.sort_by(|a, b| b.last_seq.cmp(&a.last_seq).then_with(|| a.url.cmp(&b.url)));
+    detected_links.truncate(16);
+
     SessionInsightsView {
         touched_files,
         background_tasks,
         subagents,
         detected_local_urls,
+        pull_requests,
+        detected_links,
     }
 }
 
@@ -5143,5 +5624,79 @@ Log: file:///tmp/spoofed.log\n";
                 .starts_with("Audit OAuth token refresh")
         );
         assert!(insights.subagents[0].role.chars().count() <= 36);
+    }
+
+    #[test]
+    fn derive_session_insights_extracts_pull_requests_and_links_without_duplicates() {
+        let items = vec![
+            TimelineItemView::UserPrompt {
+                seq: 1,
+                message_id: "u1".into(),
+                text: "Please check https://github.com/danielgaoyy/orbit/pull/43/files and https://docs.rs/tokio/latest/tokio/".into(),
+                badges: Vec::new(),
+                blocks: Vec::new(),
+                timestamp_ms: Some(1_000),
+            },
+            TimelineItemView::AssistantMessage {
+                seq: 2,
+                item_id: "a1".into(),
+                text: "Merged [Fix Sidebar Status](https://github.com/danielgaoyy/orbit/pull/43), dev server is at http://localhost:5173/, also see [GitLab MR](https://gitlab.com/acme/platform/core/-/merge_requests/18) and [Rust Book](https://doc.rust-lang.org/book/). Ignored: https://example.com/foo, https://cdn.site.dev/img.png, `https://inline-code.dev/secret` and:\n```ts\nconst api = \"https://code-fence.dev/ignored\";\n```".into(),
+                blocks: Vec::new(),
+                streaming: false,
+                timestamp_ms: Some(2_000),
+            },
+            make_tool(
+                3,
+                ToolCallStatus::Completed,
+                "gh pr create",
+                ToolCallDetail::Shell {
+                    command: "gh pr create".into(),
+                    cwd: Some("/repo".into()),
+                    output_preview: Some(
+                        "origin https://github.com/danielgaoyy/orbit.git\nhttps://registry.npmjs.org/vite\nhttps://github.com/danielgaoyy/orbit/pull/44\n"
+                            .into(),
+                    ),
+                    exit_code: Some(0),
+                },
+                Vec::new(),
+                3_000,
+            ),
+        ];
+
+        let insights = derive_session_insights(&items, Some("/repo"), None, &[], &[]);
+        assert_eq!(insights.detected_local_urls, vec!["http://localhost:5173/"]);
+
+        assert_eq!(insights.pull_requests.len(), 3);
+        assert_eq!(insights.pull_requests[0].number, 44);
+        assert_eq!(insights.pull_requests[0].repo, "danielgaoyy/orbit");
+        assert_eq!(
+            insights.pull_requests[0].url,
+            "https://github.com/danielgaoyy/orbit/pull/44"
+        );
+        // PR #43 canonicalized from `/files` and enriched with Markdown title
+        let pr43 = insights
+            .pull_requests
+            .iter()
+            .find(|pr| pr.number == 43)
+            .expect("PR #43 should be extracted");
+        assert_eq!(pr43.url, "https://github.com/danielgaoyy/orbit/pull/43");
+        assert_eq!(pr43.title.as_deref(), Some("Fix Sidebar Status"));
+
+        let mr18 = insights
+            .pull_requests
+            .iter()
+            .find(|pr| pr.number == 18)
+            .expect("GitLab MR !18 should be extracted");
+        assert_eq!(mr18.repo, "platform/core");
+
+        // External links exclude PRs, localhost, example.com, and static image assets
+        assert_eq!(insights.detected_links.len(), 2);
+        assert!(
+            insights
+                .detected_links
+                .iter()
+                .any(|l| l.label == "Rust Book")
+        );
+        assert!(insights.detected_links.iter().any(|l| l.host == "docs.rs"));
     }
 }

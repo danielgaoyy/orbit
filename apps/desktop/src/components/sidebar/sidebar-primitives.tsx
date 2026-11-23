@@ -1,13 +1,13 @@
 import { memo, useSyncExternalStore } from "react";
-import { FolderPlus, GitBranch, Timer } from "lucide-react";
+import { FolderPlus, GitBranch } from "lucide-react";
 import {
   type AgentCardView,
   type HostCardView,
-  isAgentBackgroundWaiting,
 } from "@/lib/orbit-ipc";
 import { useI18n } from "@/lib/i18n";
 import { isLocalHostCard } from "@/lib/projects";
 import { IconButton } from "@/components/ui/icon-button";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -108,44 +108,66 @@ export const SidebarRelativeTime = memo(function SidebarRelativeTime({
 });
 
 /**
- * Left `16×16px` semantic status slot (running spinner lives in the right time/action slot):
- * - Blocked / awaiting input -> warning signal dot
- * - Unread completed -> info signal dot
- * - Error -> danger signal dot
- * - Background task / timer running -> calm `Timer` glyph
- * - Idle & read inside isolated Git worktree -> muted branch glyph
+ * Unified left `16×16px` lifecycle status rail (strictly aligned with Codex Desktop / Cursor / Claude Code):
+ * 1. Blocked / awaiting approval -> amber 6px signal dot
+ * 2. Actively running (main agent or subagents) -> monochrome `OrbitSpinner`
+ * 3. Error -> red 6px signal dot
+ * 4. Completed & unread -> blue 6px signal dot
+ * 5. Idle & read inside isolated Git worktree -> faint `GitBranch` glyph
+ * 6. Normal idle & read (including background dev servers / armed timers, which live in Overview) -> empty
  */
 export const ConversationStatusGlyph = memo(function ConversationStatusGlyph({
   agent,
+  isForegroundRunning,
+  hasRunningSubagents,
   isWorktree,
   isUnread,
 }: {
   agent: AgentCardView;
+  isForegroundRunning: boolean;
+  hasRunningSubagents: boolean;
   isWorktree: boolean;
   isUnread: boolean;
 }) {
   const { t } = useI18n();
   if (agent.is_awaiting_permission) {
-    return <span className="bg-signal-warning size-[6px] shrink-0 rounded-full" />;
+    return (
+      <span
+        title={t("sidebar.waitingForApproval")}
+        className="bg-signal-warning size-[6px] shrink-0 rounded-full"
+      />
+    );
+  }
+  if (isForegroundRunning || hasRunningSubagents) {
+    return (
+      <span
+        title={isForegroundRunning ? t("sidebar.running") : t("sidebar.subagentRunning")}
+        className="text-ink-secondary inline-flex shrink-0 items-center justify-center"
+      >
+        <OrbitSpinner size={13} />
+      </span>
+    );
+  }
+  if (agent.status_label === "Error") {
+    return (
+      <span
+        title={t("sidebar.error")}
+        className="bg-signal-danger size-[6px] shrink-0 rounded-full"
+      />
+    );
   }
   if (isUnread) {
     return <span className="bg-signal-info size-[6px] shrink-0 rounded-full" />;
   }
-  if (agent.status_label === "Error") {
-    return <span className="bg-signal-danger size-[6px] shrink-0 rounded-full" />;
-  }
-  if (isAgentBackgroundWaiting(agent)) {
+  if (isWorktree) {
     return (
       <span
-        title={agent.status_label || t("sidebar.backgroundTaskRunning")}
+        title={agent.worktree_branch || undefined}
         className="inline-flex shrink-0 items-center justify-center"
       >
-        <Timer className="text-ink-tertiary size-[12px] shrink-0 stroke-[1.75]" />
+        <GitBranch className="text-ink-faint size-[12px] shrink-0 stroke-[1.75]" />
       </span>
     );
-  }
-  if (isWorktree) {
-    return <GitBranch className="text-ink-muted size-[12px] shrink-0 stroke-[1.75]" />;
   }
   return null;
 });

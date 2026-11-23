@@ -266,8 +266,13 @@ fn get_bridge_info(state: State<'_, DesktopAppState>) -> BridgeInfoView {
 }
 
 #[tauri::command]
-fn get_fleet_overview(state: State<'_, DesktopAppState>) -> FleetOverviewView {
-    state.core.fleet_overview()
+async fn get_fleet_overview(
+    state: State<'_, DesktopAppState>,
+) -> Result<FleetOverviewView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.fleet_overview())
+        .await
+        .map_err(|e| format!("fleet overview task error: {e}"))
 }
 
 #[tauri::command]
@@ -351,8 +356,14 @@ async fn get_fleet_sidebar(
 }
 
 #[tauri::command]
-fn get_host_detail(state: State<'_, DesktopAppState>, host_id: String) -> Option<HostDetailView> {
-    state.core.host_detail(&host_id)
+async fn get_host_detail(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<Option<HostDetailView>, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.host_detail(&host_id))
+        .await
+        .map_err(|e| format!("host detail task error: {e}"))
 }
 
 #[tauri::command]
@@ -495,8 +506,16 @@ async fn render_diagram(req: RenderDiagramRequest) -> RenderDiagramView {
 }
 
 #[tauri::command]
-fn mark_agent_seen(state: State<'_, DesktopAppState>, host_id: String, agent_id: String, seq: u64) {
-    state.core.mark_agent_seen(&host_id, &agent_id, seq);
+async fn mark_agent_seen(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    seq: u64,
+) -> Result<(), String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.mark_agent_seen(&host_id, &agent_id, seq))
+        .await
+        .map_err(|e| format!("mark agent seen task error: {e}"))
 }
 
 #[tauri::command]
@@ -855,8 +874,15 @@ fn create_agent(
 }
 
 #[tauri::command]
-fn open_agent_timeline(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) {
-    state.core.open_agent_timeline(&host_id, &agent_id);
+async fn open_agent_timeline(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> Result<(), String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.open_agent_timeline(&host_id, &agent_id))
+        .await
+        .map_err(|e| format!("open agent timeline task error: {e}"))
 }
 
 #[tauri::command]
@@ -1014,8 +1040,15 @@ fn detach_agent(state: State<'_, DesktopAppState>, host_id: String, agent_id: St
 }
 
 #[tauri::command]
-fn mark_agent_read(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) {
-    state.core.mark_agent_read(&host_id, &agent_id);
+async fn mark_agent_read(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> Result<(), String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.mark_agent_read(&host_id, &agent_id))
+        .await
+        .map_err(|e| format!("mark agent read task error: {e}"))
 }
 
 #[tauri::command]
@@ -1728,14 +1761,17 @@ async fn import_managed_skill(
 }
 
 #[tauri::command]
-fn list_provider_subagents(
+async fn list_provider_subagents(
     state: State<'_, DesktopAppState>,
     host_id: String,
     parent_agent_id: String,
-) {
-    state
-        .core
-        .list_provider_subagents(&host_id, &parent_agent_id);
+) -> Result<(), String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.list_provider_subagents(&host_id, &parent_agent_id)
+    })
+    .await
+    .map_err(|e| format!("list provider subagents task error: {e}"))
 }
 
 #[tauri::command]

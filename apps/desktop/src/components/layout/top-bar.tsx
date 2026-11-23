@@ -6,11 +6,17 @@ import {
   Download,
   GitBranch,
   GitFork,
+  LayoutList,
   MoreHorizontal,
-  PanelTop,
   Sparkles,
 } from "lucide-react";
-import { isMacDesktop } from "@/lib/orbit-ipc";
+import {
+  type HostCardView,
+  type HostDetailView,
+  type SessionBackgroundTaskView,
+  type SessionSubagentEntryView,
+  isMacDesktop,
+} from "@/lib/orbit-ipc";
 import { useI18n } from "@/lib/i18n";
 import { isAgentInGitRepo } from "@/lib/projects";
 import { modSymbol } from "@/lib/keybindings";
@@ -28,11 +34,17 @@ import {
 } from "@/components/ui/overlays";
 import { Separator } from "@/components/ui/separator";
 import {
+  hasCrossHostChildAgents,
   selectSessionRuntimeActivity,
   selectSessionSubagents,
 } from "@/state/selectors/session-selectors";
 import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+
+const EMPTY_INSIGHT_SUBAGENTS: readonly SessionSubagentEntryView[] = Object.freeze([]);
+const EMPTY_INSIGHT_BG_TASKS: readonly SessionBackgroundTaskView[] = Object.freeze([]);
+const EMPTY_HOST_DETAILS: Record<string, HostDetailView> = Object.freeze({});
+const EMPTY_FLEET_HOSTS: readonly HostCardView[] = Object.freeze([]);
 
 /**
  * Precision 40px Stage Header:
@@ -90,40 +102,85 @@ export const TopBar = memo(function TopBar() {
     return isAgentInGitRepo(s.selectedHostId, ag, detail, s.sidebarView);
   });
 
-  const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleet = useOrbitSelector((s) => s.fleet);
+  const currentHostDetail = useOrbitSelector((s) =>
+    hasActiveSession && s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
+  );
+  const crossHostDetails = useOrbitSelector((s) =>
+    hasActiveSession && hasCrossHostChildAgents(s.hostDetails, s.selectedHostId, s.selectedAgentId)
+      ? s.hostDetails
+      : EMPTY_HOST_DETAILS,
+  );
+  const crossHostFleetHosts = useOrbitSelector((s) =>
+    hasActiveSession && hasCrossHostChildAgents(s.hostDetails, s.selectedHostId, s.selectedAgentId)
+      ? s.fleet.hosts
+      : EMPTY_FLEET_HOSTS,
+  );
   const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
-  const activeStage = useOrbitSelector((s) =>
+  const insightSubagents = useOrbitSelector((s) =>
     hasActiveSession && s.selectedHostId && s.selectedAgentId
-      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
-      : null,
+      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights?.subagents ??
+        EMPTY_INSIGHT_SUBAGENTS)
+      : EMPTY_INSIGHT_SUBAGENTS,
+  );
+  const insightBackgroundTasks = useOrbitSelector((s) =>
+    hasActiveSession && s.selectedHostId && s.selectedAgentId
+      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights?.background_tasks ??
+        EMPTY_INSIGHT_BG_TASKS)
+      : EMPTY_INSIGHT_BG_TASKS,
   );
 
-  const stageSlice = useMemo(() => {
-    const stages =
-      hasActiveSession && selectedHostId && selectedAgentId && activeStage
-        ? { [`${selectedHostId}::${selectedAgentId}`]: activeStage }
-        : {};
-    return { hostDetails, fleet, archivedSubagents, stages };
-  }, [hasActiveSession, selectedHostId, selectedAgentId, activeStage, hostDetails, fleet, archivedSubagents]);
+  const scopedHostDetails = useMemo(
+    () =>
+      crossHostDetails !== EMPTY_HOST_DETAILS
+        ? crossHostDetails
+        : selectedHostId && currentHostDetail
+          ? { [selectedHostId]: currentHostDetail }
+          : EMPTY_HOST_DETAILS,
+    [crossHostDetails, selectedHostId, currentHostDetail],
+  );
+
+  const selectorState = useMemo(
+    () => ({
+      hostDetails: scopedHostDetails,
+      fleet: {
+        revision: 0,
+        total_pending_approvals: 0,
+        hosts: crossHostFleetHosts as HostCardView[],
+        projects: [],
+      },
+      archivedSubagents,
+    }),
+    [scopedHostDetails, crossHostFleetHosts, archivedSubagents],
+  );
 
   const subagentSummary = useMemo(
     () =>
       hasActiveSession
-        ? selectSessionSubagents(stageSlice, selectedHostId, selectedAgentId)
+        ? selectSessionSubagents(selectorState, selectedHostId, selectedAgentId, insightSubagents)
         : null,
-    [hasActiveSession, stageSlice, selectedHostId, selectedAgentId],
+    [hasActiveSession, selectorState, selectedHostId, selectedAgentId, insightSubagents],
   );
 
   const runtimeActivity = useMemo(
     () =>
       hasActiveSession
-        ? selectSessionRuntimeActivity(stageSlice, selectedHostId, selectedAgentId)
+        ? selectSessionRuntimeActivity(selectorState, selectedHostId, selectedAgentId, {
+            subagents: subagentSummary ?? undefined,
+            backgroundTasks: insightBackgroundTasks,
+          })
         : null,
-    [hasActiveSession, stageSlice, selectedHostId, selectedAgentId],
+    [
+      hasActiveSession,
+      selectorState,
+      selectedHostId,
+      selectedAgentId,
+      subagentSummary,
+      insightBackgroundTasks,
+    ],
   );
 
   const overviewIndicatorTone = runtimeActivity?.overviewIndicatorTone ?? "none";
+  const overviewIndicatorReason = runtimeActivity?.overviewIndicatorReason ?? "none";
 
   const {
     topbarUseOpenLeftPad,
@@ -181,13 +238,17 @@ export const TopBar = memo(function TopBar() {
 
   const overviewTooltip = overviewVisible
     ? t("topbar.hideOverview")
-    : overviewIndicatorTone === "approval"
+    : overviewIndicatorReason === "approval"
       ? t("topbar.showOverviewApproval")
-      : overviewIndicatorTone === "running"
+      : overviewIndicatorReason === "subagent"
         ? t("topbar.showOverviewSubagent")
-        : overviewIndicatorTone === "goal"
+        : overviewIndicatorReason === "background_task"
           ? t("topbar.showOverviewBackground")
-          : t("topbar.showOverview");
+          : overviewIndicatorReason === "goal"
+            ? t("topbar.showOverviewGoal")
+            : overviewIndicatorReason === "timer"
+              ? t("topbar.showOverviewTimer")
+              : t("topbar.showOverview");
 
   return (
     <header
@@ -386,7 +447,7 @@ export const TopBar = memo(function TopBar() {
               aria-label={overviewVisible ? t("topbar.hideOverview") : t("topbar.showOverview")}
               onClick={() => orbitActions.toggleOverviewPanel()}
             >
-              <PanelTop className="size-[15px] stroke-[1.75]" />
+              <LayoutList className="size-[15px] stroke-[1.75]" />
             </IconButton>
           </>
         )}

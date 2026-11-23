@@ -16376,6 +16376,7 @@ public enum FfiTimerCondition: Equatable, Hashable {
     case sender(senderId: String
     )
     case allSubagentsSettled
+    case allPeersSettled
     case fileChanged(path: String
     )
 
@@ -16408,7 +16409,9 @@ public struct FfiConverterTypeFfiTimerCondition: FfiConverterRustBuffer {
         
         case 4: return .allSubagentsSettled
         
-        case 5: return .fileChanged(path: try FfiConverterString.read(from: &buf)
+        case 5: return .allPeersSettled
+        
+        case 6: return .fileChanged(path: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -16436,8 +16439,12 @@ public struct FfiConverterTypeFfiTimerCondition: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case let .fileChanged(path):
+        case .allPeersSettled:
             writeInt(&buf, Int32(5))
+        
+        
+        case let .fileChanged(path):
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(path, into: &buf)
             
         }

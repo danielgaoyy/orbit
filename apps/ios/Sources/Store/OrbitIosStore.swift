@@ -806,52 +806,47 @@ public final class OrbitIosStore: ObservableObject {
 
     public var activeAgent: FfiAgentCard? {
         guard let aid = selectedAgentId else { return nil }
+        // Prefer freshly updated `HostChanged` host-detail cards over `agentStage?.agent`
+        // (matching Desktop `stream-stage.tsx`) so status transitions (`Running -> Idle / waiting`)
+        // reflect immediately without waiting for another `TimelineChanged` event.
+        if let selectedHostId,
+           let matched = hostDetailsByHostId[selectedHostId]?.agents.first(where: { $0.agentId == aid }) {
+            return matched
+        }
+        if let matched = currentHostDetail?.agents.first(where: { $0.agentId == aid }) {
+            return matched
+        }
         if let stageAgent = agentStage?.agent,
            stageAgent.agentId == aid,
            (agentStageHostId == nil || agentStageHostId == selectedHostId) {
             return stageAgent
         }
-        if let selectedHostId,
-           let matched = hostDetailsByHostId[selectedHostId]?.agents.first(where: { $0.agentId == aid }) {
-            return matched
-        }
-        return currentHostDetail?.agents.first(where: { $0.agentId == aid })
+        return nil
     }
 
     public var isDraftNewSession: Bool {
         selectedAgentId == nil
     }
 
-    /// True when the agent is executing a foreground turn OR still holds live background tasks.
+    /// Single source of truth for foreground execution (matching Desktop `isAgentForegroundRunning`).
+    /// Background-only waiting states never mark a finished turn pending or show the red Stop button.
     public var isActiveAgentRunning: Bool {
-        if isActiveAgentTurnBusy {
-            return true
-        }
-        return isActiveAgentBackgroundWaiting
+        isActiveAgentTurnBusy
     }
 
-    /// True only while an active foreground turn is streaming or executing tools.
+    /// True only while an active foreground turn or autonomous wakeup is actively executing.
     public var isActiveAgentTurnBusy: Bool {
-        if let agent = activeAgent {
-            let lastTurnActive = agentStage?.turns.last.map { $0.hasActiveItem && $0.terminalReply == nil } ?? false
-            return OrbitAgentLogic.isAgentForegroundRunning(
-                statusRaw: agent.statusLabel,
-                hasActiveTurn: agent.isRunning || lastTurnActive
-            )
-        }
-        if let lastTurn = agentStage?.turns.last, lastTurn.hasActiveItem && lastTurn.terminalReply == nil {
-            return true
-        }
-        return false
+        guard let agent = activeAgent else { return false }
+        return agent.isForegroundRunning
     }
 
-    /// True when no foreground turn is active, yet the agent still has running background tasks or subagents.
+    /// True when no foreground turn is active, yet the agent still has running background tasks.
     public var isActiveAgentBackgroundWaiting: Bool {
         guard let agent = activeAgent else { return false }
         let hasBgTasks = agent.hasBackgroundTasks || !(agentStage?.insights.backgroundTasks.isEmpty ?? true)
         return OrbitAgentLogic.isAgentBackgroundWaiting(
             statusRaw: agent.statusLabel,
-            hasActiveTurn: isActiveAgentTurnBusy,
+            hasActiveTurn: agent.isForegroundRunning,
             hasBackgroundTasks: hasBgTasks
         )
     }
@@ -902,7 +897,7 @@ public final class OrbitIosStore: ObservableObject {
             isError: isError,
             hasUnread: isThreadUnread(hostId: hostId, agent: agent),
             hasBackgroundTasks: agent.hasBackgroundTasks,
-            isRunning: agent.isRunning
+            isRunning: agent.isForegroundRunning
         )
     }
 
@@ -1048,13 +1043,18 @@ public final class OrbitIosStore: ObservableObject {
         hostId: String,
         agentId: String,
         seq: UInt64,
+        force: Bool = false,
         refreshSidebarAfter: Bool = true
     ) {
         let key = "\(hostId)::\(agentId)"
-        if let lastSeq = lastMarkedSeenSeqByAgent[key], lastSeq >= seq {
+        guard OrbitAgentLogic.shouldDispatchMarkAgentSeen(
+            lastMarkedSeq: lastMarkedSeenSeqByAgent[key],
+            nextSeq: seq,
+            force: force
+        ) else {
             return
         }
-        lastMarkedSeenSeqByAgent[key] = seq
+        lastMarkedSeenSeqByAgent[key] = max(lastMarkedSeenSeqByAgent[key] ?? 0, seq)
         core?.markAgentSeen(hostId: hostId, agentId: agentId, seq: seq)
         if refreshSidebarAfter {
             refreshSidebar()
@@ -1077,7 +1077,7 @@ public final class OrbitIosStore: ObservableObject {
 
     public func isThreadUnread(hostId: String, agent: FfiAgentCard) -> Bool {
         let isSelected = selectedHostId == hostId && selectedAgentId == agent.agentId && !isDraftNewSession
-        if isSelected || agent.isRunning {
+        if isSelected || agent.isForegroundRunning {
             return false
         }
         if let conv = sidebarView?.pinnedConversations.first(where: {
@@ -1824,10 +1824,15 @@ public final class OrbitIosStore: ObservableObject {
             }
         }
 
+        // Invalidate cached seen-seq whenever the host reports an agent as unread
+        // (e.g. AttentionState::Finished / Error / ManualUnread synced from another device).
+        for agent in detail.agents where agent.isUnread {
+            lastMarkedSeenSeqByAgent.removeValue(forKey: "\(hostId)::\(agent.agentId)")
+        }
+
         // Evaluate running -> settled transitions for background sessions with queued prompts
         for agent in detail.agents where !(hostId == selectedHostId && agent.agentId == selectedAgentId) {
-            let busy = OrbitAgentLogic.isAgentForegroundRunning(statusRaw: agent.statusLabel, hasActiveTurn: agent.isRunning)
-                || agent.isAwaitingPermission
+            let busy = agent.isForegroundRunning || agent.isAwaitingPermission
             evaluateAgentQueueDrain(hostId: hostId, agentId: agent.agentId, isBusy: busy)
         }
 
@@ -1841,7 +1846,13 @@ public final class OrbitIosStore: ObservableObject {
         // Advance active thread's seen cursor if currently viewing it
         if let currentAid = selectedAgentId, !isDraftNewSession,
            let ag = detail.agents.first(where: { $0.agentId == currentAid }) {
-            markAgentSeen(hostId: hostId, agentId: currentAid, seq: ag.latestSeq, refreshSidebarAfter: false)
+            markAgentSeen(
+                hostId: hostId,
+                agentId: currentAid,
+                seq: ag.latestSeq,
+                force: ag.isUnread,
+                refreshSidebarAfter: false
+            )
         }
 
         // Seamlessly migrate optimistic agent ID when daemon assigns permanent ID
@@ -1977,7 +1988,21 @@ public final class OrbitIosStore: ObservableObject {
                     core?.fetchWorkspaceBoard(hostId: hostId, workspaceId: card.workspaceId)
                 }
             }
-            markAgentSeen(hostId: hostId, agentId: agentId, seq: max(card.latestSeq, agentStage?.latestSeq ?? 0))
+            markAgentSeen(
+                hostId: hostId,
+                agentId: agentId,
+                seq: max(card.latestSeq, agentStage?.latestSeq ?? 0),
+                force: true,
+                refreshSidebarAfter: false
+            )
+        } else {
+            markAgentSeen(
+                hostId: hostId,
+                agentId: agentId,
+                seq: agentStage?.latestSeq ?? 0,
+                force: true,
+                refreshSidebarAfter: false
+            )
         }
         if agentChanged {
             restoreComposerDraftForCurrentScope()
@@ -2069,7 +2094,8 @@ public final class OrbitIosStore: ObservableObject {
                     hostId: hostId,
                     agentId: agentId,
                     seq: max(card.latestSeq, stage.latestSeq),
-                    refreshSidebarAfter: !card.isRunning
+                    force: card.isUnread,
+                    refreshSidebarAfter: !card.isForegroundRunning
                 )
             }
         } else if hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
@@ -4408,7 +4434,7 @@ public final class OrbitIosStore: ObservableObject {
 
     public func archiveFinishedSubagents() {
         var count = 0
-        for child in activeManagedSubagents where !child.isRunning && !child.isAwaitingPermission {
+        for child in activeManagedSubagents where !child.isForegroundRunning && !child.isAwaitingPermission {
             archiveManagedSubagent(child.agentId)
             count += 1
         }
@@ -4794,7 +4820,7 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Fleet Daemon Version & One-Click Over-the-Wire Update
 
     public var appShortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.9.1"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.9.4"
     }
 
     public func isHostProtocolBehind(_ host: FfiHostCard) -> Bool {
@@ -5260,5 +5286,20 @@ public final class OrbitIosStore: ObservableObject {
             return res.pushedRemote ? "Cloud Sync uploaded (rev #\(res.vaultRevision))" : "Cloud Sync up to date"
         }
         return "Cloud Synced: \(parts.joined(separator: ", "))"
+    }
+}
+
+// MARK: - FfiAgentCard Foreground-Running Semantics (Desktop Parity)
+
+public extension FfiAgentCard {
+    /// True when the agent is idle in the foreground and only waiting on background tasks / timers.
+    var isBackgroundWaiting: Bool {
+        if hasBackgroundTasks { return true }
+        return OrbitAgentLogic.isBackgroundWaitingStatusLabel(statusLabel)
+    }
+
+    /// True ONLY when a foreground turn or active autonomous wakeup is executing.
+    var isForegroundRunning: Bool {
+        isRunning && !isBackgroundWaiting
     }
 }

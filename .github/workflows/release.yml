@@ -29,6 +29,24 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  desktop-frontend-quality:
+    name: Desktop Frontend Tests, Build & Runtime Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install, test, build & runtime smoke check Desktop frontend
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm test
+          npm run build
+          npm run test:smoke
+
   build-host-binaries:
     name: Build CLI & Daemon (${{ matrix.artifact }})
     needs: rust-quality-and-e2e
@@ -77,7 +95,7 @@ jobs:
 
   build-macos-desktop:
     name: Build macOS Tauri v2 Desktop App (Orbit.dmg)
-    needs: rust-quality-and-e2e
+    needs: [rust-quality-and-e2e, desktop-frontend-quality]
     runs-on: macos-latest
     outputs:
       notarized: ${{ steps.macos-signing.outputs.notarized }}
@@ -234,7 +252,7 @@ jobs:
 
   build-linux-desktop:
     name: Build Linux Tauri v2 Desktop App (${{ matrix.artifact }})
-    needs: rust-quality-and-e2e
+    needs: [rust-quality-and-e2e, desktop-frontend-quality]
     strategy:
       fail-fast: false
       matrix:
@@ -280,7 +298,7 @@ jobs:
 
   build-windows-desktop:
     name: Build Windows Tauri v2 Desktop App (.msi & NSIS .exe)
-    needs: rust-quality-and-e2e
+    needs: [rust-quality-and-e2e, desktop-frontend-quality]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

@@ -24,7 +24,7 @@ pub enum ParseTimerConditionError {
     #[error("timer condition `file:<path>` requires a non-empty path")]
     EmptyFilePath,
     #[error(
-        "invalid timer condition `{0}`; expected `never`, `any`, `all_subagents`, `sender:<id>`, or `file:<path>`"
+        "invalid timer condition `{0}`; expected `never`, `any`, `all_subagents`, `all_peers`, `sender:<id>`, or `file:<path>`"
     )]
     InvalidCondition(String),
 }
@@ -42,6 +42,8 @@ pub enum TimerCondition {
     Sender { sender_id: String },
     /// Cancel early once all active managed and provider-native subagents of the agent settle.
     AllSubagentsSettled,
+    /// Cancel early once all sibling peers in the agent's Mission Workspace settle.
+    AllPeersSettled,
     /// Watch a file inside the agent's workspace; wake immediately / resolve early on change.
     FileChanged { path: String },
 }
@@ -61,6 +63,11 @@ impl FromStr for TimerCondition {
             || trimmed.eq_ignore_ascii_case("all_subagents_settled")
         {
             return Ok(Self::AllSubagentsSettled);
+        }
+        if trimmed.eq_ignore_ascii_case("all_peers")
+            || trimmed.eq_ignore_ascii_case("all_peers_settled")
+        {
+            return Ok(Self::AllPeersSettled);
         }
         if let Some((prefix, value)) = trimmed.split_once(':') {
             let val = value.trim();
@@ -89,7 +96,7 @@ impl FromStr for TimerCondition {
 
 impl TimerCondition {
     /// Parse a compact string shorthand used by MCP tools and CLI flags:
-    /// `"never"` | `"any"` | `"all_subagents"` | `"sender:<id>"` | `"file:<path>"`.
+    /// `"never"` | `"any"` | `"all_subagents"` | `"all_peers"` | `"sender:<id>"` | `"file:<path>"`.
     pub fn parse_shorthand(raw: &str) -> Result<Self, String> {
         raw.parse::<Self>().map_err(|e| e.to_string())
     }
@@ -101,6 +108,7 @@ impl TimerCondition {
             Self::AnyMessage => "any".to_string(),
             Self::Sender { sender_id } => format!("sender:{sender_id}"),
             Self::AllSubagentsSettled => "all_subagents".to_string(),
+            Self::AllPeersSettled => "all_peers".to_string(),
             Self::FileChanged { path } => format!("file:{path}"),
         }
     }
@@ -112,6 +120,7 @@ impl TimerCondition {
             Self::AnyMessage => "until any message".to_string(),
             Self::Sender { sender_id } => format!("until {sender_id}"),
             Self::AllSubagentsSettled => "until subagents settle".to_string(),
+            Self::AllPeersSettled => "until workspace peers settle".to_string(),
             Self::FileChanged { path } => {
                 let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
                 format!("until {leaf} changes")
@@ -187,6 +196,7 @@ mod tests {
             ("never", TimerCondition::Never),
             ("any", TimerCondition::AnyMessage),
             ("all_subagents", TimerCondition::AllSubagentsSettled),
+            ("all_peers", TimerCondition::AllPeersSettled),
             (
                 "sender:ag_child_1",
                 TimerCondition::Sender {

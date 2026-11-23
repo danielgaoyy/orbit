@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
-  AlertCircle,
   Blocks,
-  CheckCircle2,
   ChevronRight,
   Clock,
   CornerDownLeft,
@@ -19,7 +17,6 @@ import {
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
-import { resolveSessionSubagents } from "@/lib/subagents";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { orbitActions, sideQuestionScopeKey, useOrbitSelector } from "@/state/orbit-store";
@@ -201,7 +198,6 @@ export function SidePanelLaunchpad({
   const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
   const stages = useOrbitSelector((s) => s.stages);
   const gitReviews = useOrbitSelector((s) => s.gitReviews);
   const workspaceFilesCache = useOrbitSelector((s) => s.workspaceFilesCache);
@@ -228,17 +224,6 @@ export function SidePanelLaunchpad({
   const cwd = currentAgent?.cwd || selectedWorkspaceCwd || "~";
   const insights = stage?.insights ?? EMPTY_INSIGHTS;
   const backgroundTasks = insights.background_tasks;
-  const resolvedSubagents = useMemo(
-    () =>
-      resolveSessionSubagents({
-        hostId: selectedHostId,
-        agentId: isDraftNewSession ? null : selectedAgentId,
-        insightsSubagents: insights.subagents,
-        hostDetails,
-        fleetHosts,
-      }),
-    [selectedHostId, isDraftNewSession, selectedAgentId, insights.subagents, hostDetails, fleetHosts],
-  );
 
   const sessionTurnDiffs = stage?.session_turn_diffs ?? EMPTY_DIFFS;
   const gitReview =
@@ -732,79 +717,8 @@ export function SidePanelLaunchpad({
               })}
             </div>
 
-            {(resolvedSubagents.length > 0 ||
-              backgroundTasks.length > 0 ||
-              recentFiles.length > 0) && (
+            {(backgroundTasks.length > 0 || recentFiles.length > 0) && (
               <div className="mt-6 flex flex-col gap-5">
-                {/* Subagents */}
-                {resolvedSubagents.length > 0 && (
-                  <section>
-                    <div className="mb-1.5 flex items-center gap-1.5 px-2.5 text-[11.5px] font-medium">
-                      <span className="text-muted-foreground/75">{t("sidePanel.subagents")}</span>
-                      <span className="text-muted-foreground/55 tabular-nums">
-                        {resolvedSubagents.length}
-                      </span>
-                    </div>
-                    <div className="flex flex-col gap-0.5">
-                      {resolvedSubagents.map((subagent) => {
-                        const isAwaiting = subagent.status === "awaiting_permission";
-                        const isRunning = subagent.status === "running";
-                        const isFailed = subagent.status === "failed";
-                        const isCanceled = subagent.status === "canceled";
-                        return (
-                          <button
-                            key={subagent.key}
-                            type="button"
-                            onClick={() => {
-                              if (isAwaiting && subagent.isManaged && subagent.childAgentId) {
-                                orbitActions.selectAgent(subagent.childHostId, subagent.childAgentId);
-                                return;
-                              }
-                              orbitActions.openSubagentTab({
-                                callId: subagent.callId,
-                                role: subagent.title,
-                                promptPreview: subagent.promptPreview,
-                                childAgentId: subagent.childAgentId,
-                                childHostId: subagent.childHostId,
-                                providerSubagentId: subagent.providerSubagentId,
-                                parentAgentId: selectedAgentId,
-                              });
-                            }}
-                            className="group/item text-foreground/85 flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2.5 text-left text-[12.5px] transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]"
-                          >
-                            <span className="flex min-w-0 items-center gap-2.5">
-                              {isAwaiting ? (
-                                <span className="size-[6.5px] shrink-0 rounded-full bg-amber-500 shadow-[0_0_0_2.5px_rgba(245,158,11,0.18)]" />
-                              ) : isRunning ? (
-                                <Loader2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 animate-spin" />
-                              ) : isFailed ? (
-                                <AlertCircle className="h-[14px] w-[14px] shrink-0 text-red-500" />
-                              ) : isCanceled ? (
-                                <span className="bg-muted-foreground/45 size-[6.5px] shrink-0 rounded-full" />
-                              ) : (
-                                <CheckCircle2 className="h-[14px] w-[14px] shrink-0 text-emerald-600 dark:text-emerald-400" />
-                              )}
-                              <span className="truncate font-medium">{subagent.title}</span>
-                            </span>
-                            <span className="flex shrink-0 items-center gap-1.5">
-                              {isAwaiting ? (
-                                <span className="text-[11px] font-medium text-amber-600/90 dark:text-amber-400/90">
-                                  {t("sidePanel.approval")}
-                                </span>
-                              ) : subagent.remoteHostName ? (
-                                <span className="text-muted-foreground/60 max-w-[76px] truncate text-[11px]">
-                                  {subagent.remoteHostName}
-                                </span>
-                              ) : null}
-                              <ChevronRight className="text-muted-foreground/45 group-hover/item:text-muted-foreground h-[13px] w-[13px] shrink-0 transition-colors" />
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </section>
-                )}
-
                 {/* Background Tasks */}
                 {backgroundTasks.length > 0 && (
                   <section>

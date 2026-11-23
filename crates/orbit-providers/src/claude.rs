@@ -488,6 +488,9 @@ pub async fn spawn_claude_session(
     let mut fork_fallback_notice: Option<String> = None;
 
     let (shim, is_reattached) = if let Some(existing) = reattached {
+        if let Some(ack_seq) = existing.attach_ack_seq() {
+            cfg.shim_seq_tracker.fetch_max(ack_seq, Ordering::Relaxed);
+        }
         (existing, true)
     } else if let Some(ref fork_sid) = cfg.fork_from_session_id {
         match spawn_claude_shim_and_init(&cfg, ClaudeSessionStartMode::ForkFrom(fork_sid)).await {

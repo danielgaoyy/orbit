@@ -1063,7 +1063,7 @@ struct FleetDrawerView: View {
         let conversations = project.conversations
         let extraDirs = Array(project.directories.dropFirst())
         let hasCollapsedApproval = isCollapsed && conversations.contains { $0.agent.isAwaitingPermission }
-        let hasCollapsedRunning = isCollapsed && !hasCollapsedApproval && conversations.contains { $0.agent.isRunning }
+        let hasCollapsedRunning = isCollapsed && !hasCollapsedApproval && conversations.contains { $0.agent.isForegroundRunning }
         let hasCollapsedUnread = isCollapsed
             && !hasCollapsedApproval
             && !hasCollapsedRunning
@@ -1294,11 +1294,11 @@ struct FleetDrawerView: View {
         let isWorktree = conv.isWorktree
         let isSelected = !store.isDraftNewSession && store.selectedHostId == hostId && store.selectedAgentId == agent.agentId
         let isPinned = conv.isPinned || store.isThreadPinned(hostId: hostId, agentId: agent.agentId)
-        let isUnread = conv.isUnread && !isSelected && !agent.isRunning
+        let isUnread = conv.isUnread && !isSelected && !agent.isForegroundRunning
         let titleWeight: Font.Weight = (isSelected || isUnread) ? .medium : .regular
         let titleColor = (isSelected || isUnread) ? palette.fgPrimary : mutedRowForeground
         let rightLabel = trailingTag
-            ?? (agent.isRunning ? "now" : OrbitFormatters.relativeUpdatedTime(rfc3339: agent.updatedAtRfc3339))
+            ?? (agent.isForegroundRunning ? "now" : OrbitFormatters.relativeUpdatedTime(rfc3339: agent.updatedAtRfc3339))
         let semanticHandle: String? = {
             guard isInsideWorkspace,
                   let raw = agent.handle?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1531,12 +1531,16 @@ struct FleetDrawerView: View {
             Circle()
                 .fill(palette.warning)
                 .frame(width: 6.5, height: 6.5)
-        } else if agent.isRunning {
+        } else if agent.isForegroundRunning {
             OrbitSpinnerRingView(color: palette.fgSecondary, size: 12.5)
         } else if isUnread {
             Circle()
                 .fill(Color(hex: "#0EA5E9"))
                 .frame(width: 6, height: 6)
+        } else if agent.isBackgroundWaiting {
+            Image(systemName: "timer")
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(palette.fgMuted.opacity(0.8))
         } else if isWorktree {
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 11.5, weight: .medium))

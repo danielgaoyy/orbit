@@ -66,6 +66,7 @@ import {
   clampSidebarPrefWidth,
   computeEqualizedSidePanelWidth,
 } from "@/lib/workspace-layout";
+import { createCachedStateSnapshot } from "@/lib/selector-snapshot";
 import {
   type AgentStageView,
   type BrowserActionRequest,
@@ -11821,8 +11822,26 @@ function noopSubscribe(): () => void {
   return () => {};
 }
 
+const isDevSelectorGuard = Boolean(
+  (import.meta as { env?: { DEV?: boolean } }).env?.DEV,
+);
+let didWarnUnstableSelector = false;
+
+function warnUnstableSelectorOnce(): void {
+  if (didWarnUnstableSelector) return;
+  didWarnUnstableSelector = true;
+  console.error(
+    "[orbit-store] useOrbitSelector selector returned a non-stable reference for identical state. Use a module-level constant (e.g. EMPTY_*) for fallback arrays/objects.",
+  );
+}
+
 export function useOrbitSelector<T>(selector: (s: OrbitUiState) => T): T {
-  return useSyncExternalStore(subscribeStore, () => selector(state));
+  const getSnapshot = createCachedStateSnapshot(
+    () => state,
+    selector,
+    isDevSelectorGuard && !didWarnUnstableSelector ? warnUnstableSelectorOnce : undefined,
+  );
+  return useSyncExternalStore(subscribeStore, getSnapshot);
 }
 
 /**

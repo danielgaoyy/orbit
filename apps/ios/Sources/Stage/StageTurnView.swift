@@ -59,11 +59,74 @@ struct StageTurnView: View {
     @ObservedObject var store: OrbitIosStore
     let turn: FfiStageTurn
     var isTurnActive: Bool = false
+    var agentStatusLabel: String? = nil
+    var hasLiveBackgroundTasks: Bool = false
 
     @Environment(\.orbitPalette) private var palette
     @State private var isFoldedStepsExpanded = false
     @State private var isRewindDialogPresented = false
     @State private var rewindTargetSeq: UInt64? = nil
+
+    private var visibleLiveSegments: [FfiTurnLiveSegment] {
+        var result: [FfiTurnLiveSegment] = []
+        result.reserveCapacity(turn.liveSegments.count)
+        for segment in turn.liveSegments {
+            if case let .wakeup(_, label) = segment {
+                let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                if OrbitAgentLogic.isHiddenWakeupLabel(trimmed) {
+                    continue
+                }
+                if case let .wakeup(_, prevLabel)? = result.last,
+                   prevLabel.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(trimmed) == .orderedSame {
+                    continue
+                }
+            }
+            result.append(segment)
+        }
+        return result
+    }
+
+    private var isWaitingOnlyOnBackgroundTasks: Bool {
+        guard isTurnActive else { return false }
+        if hasLiveBackgroundTasks || OrbitAgentLogic.isBackgroundWaitingStatusLabel(agentStatusLabel) {
+            return true
+        }
+        if case let .wakeup(_, label)? = turn.liveSegments.last,
+           OrbitAgentLogic.isWaitingWakeupLabel(label) {
+            return true
+        }
+        return false
+    }
+
+    private var trailingActivityLabel: String? {
+        guard isTurnActive, !isWaitingOnlyOnBackgroundTasks else { return nil }
+        let needsTrailing: Bool
+        switch turn.liveSegments.last {
+        case .none:
+            needsTrailing = true
+        case let .assistantMessage(_, item):
+            if case let .assistantMessage(_, _, _, isMsgStreaming, _, _) = item {
+                needsTrailing = !isMsgStreaming
+            } else {
+                needsTrailing = true
+            }
+        case .notice, .wakeup, .compaction:
+            needsTrailing = true
+        case .stepGroup:
+            needsTrailing = false
+        }
+        guard needsTrailing else { return nil }
+        let lowerStatus = (agentStatusLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lowerStatus.contains("think") {
+            return "Thinking…"
+        }
+        return "Working…"
+    }
+
+    private var isHostOnline: Bool {
+        guard let host = store.activeHost else { return true }
+        return OrbitFormatters.isHostOnline(host.connectionState)
+    }
 
     private var isFirstStepBearingTurn: Bool {
         if let firstWithSteps = store.agentStage?.turns.first(where: { !$0.foldedSteps.isEmpty }) {
@@ -97,7 +160,7 @@ struct StageTurnView: View {
     }
 
     private var hasAssistantBody: Bool {
-        !turn.liveSegments.isEmpty || turn.terminalReply != nil || !turn.notices.isEmpty || isTurnActive
+        !visibleLiveSegments.isEmpty || trailingActivityLabel != nil || turn.terminalReply != nil || !turn.notices.isEmpty
     }
 
     var body: some View {
@@ -116,7 +179,7 @@ struct StageTurnView: View {
                             onCopy: {
                                 store.copyPromptText(text)
                             },
-                            onRewind: !store.isActiveAgentRunning ? {
+                            onRewind: !store.isActiveAgentTurnBusy ? {
                                 rewindTargetSeq = promptSeq
                                 isRewindDialogPresented = true
                             } : nil
@@ -154,8 +217,17 @@ struct StageTurnView: View {
                                    case let .assistantMessage(_, _, text, _, blocks, _) = replyItem {
                                     assistantMarkdownBlock(text: text, blocks: blocks)
                                 }
-                            } else if !turn.liveSegments.isEmpty {
-                                liveSegmentsSection
+                            } else if !visibleLiveSegments.isEmpty || trailingActivityLabel != nil {
+                                if !visibleLiveSegments.isEmpty {
+                                    liveSegmentsSection
+                                }
+                                if let trailingLabel = trailingActivityLabel {
+                                    InlineTrailingActivityView(
+                                        label: trailingLabel,
+                                        startedAtMs: turn.startedAtMs,
+                                        isHostOnline: isHostOnline
+                                    )
+                                }
                             } else {
                                 ForEach(Array(turn.notices.enumerated()), id: \.offset) { _, noticeItem in
                                     if case let .notice(_, level, message, _) = noticeItem {
@@ -303,23 +375,53 @@ struct StageTurnView: View {
     // MARK: - Live / Multi-Segment Stream
 
     private var liveSegmentsSection: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
-            ForEach(Array(turn.liveSegments.enumerated()), id: \.element.segmentKey) { segIdx, segment in
+        let segments = visibleLiveSegments
+        return VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+            ForEach(Array(segments.enumerated()), id: \.element.segmentKey) { segIdx, segment in
                 switch segment {
-                case let .stepGroup(segKey, _, items, summary, _, _, _, _, hasFollowingContent, hasRunningStep):
-                    let isTrailingSeg = segIdx == turn.liveSegments.count - 1
-                    let isSegLiveActive = isTurnActive && isTrailingSeg && !hasFollowingContent
-                    let segSettled = !isSegLiveActive && !hasRunningStep
+                case let .stepGroup(segKey, _, items, summary, thoughtDurationMs, workDurationMs, segStartedAtMs, segLatestActivityMs, hasFollowingContent, hasRunningStep):
+                    let isLastVisible = segIdx == segments.count - 1
+                    let isSegLiveActive = OrbitAgentLogic.isStepGroupLiveActive(
+                        isTurnActive: isTurnActive,
+                        hasFollowingContent: hasFollowingContent,
+                        hasRunningStep: hasRunningStep,
+                        isLastVisibleSegment: isLastVisible,
+                        unrecoveredFailureCount: summary.counts.unrecoveredFailureCount
+                    )
                     let keepOpenForTrailingFailure = !hasFollowingContent && summary.counts.unrecoveredFailureCount > 0
-                    let shouldFold = store.coalesceExploration && segSettled && !keepOpenForTrailingFailure
+                    let shouldFold = store.coalesceExploration && !isSegLiveActive && !keepOpenForTrailingFailure
+                    let isThoughtOnly = summary.counts.actionSteps == 0 && items.allSatisfy {
+                        if case .assistantThinking = $0 { return true }
+                        return false
+                    }
+                    let settledGroupLabel: String = {
+                        if isThoughtOnly, let thought = OrbitFormatters.formatDurationMs(thoughtDurationMs) {
+                            return "Thought for \(thought)"
+                        }
+                        let base = summary.label.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !base.isEmpty {
+                            return base
+                        }
+                        return "Completed \(items.count) \(items.count == 1 ? "step" : "steps")"
+                    }()
+                    let groupDurationMs: Int64? = {
+                        if isThoughtOnly { return nil }
+                        let total = max(0, workDurationMs ?? 0) + max(0, thoughtDurationMs ?? 0)
+                        return total > 0 ? total : nil
+                    }()
 
                     LiveStepGroupView(
                         store: store,
                         segmentKey: segKey,
                         items: items,
                         summary: summary,
+                        settledLabel: settledGroupLabel,
+                        settledDurationMs: groupDurationMs,
                         fallbackLiveLabel: turn.workSummaryLiveLabel,
                         fallbackLiveDetail: turn.workSummaryLiveDetail,
+                        startedAtMs: segStartedAtMs ?? turn.startedAtMs,
+                        latestActivityMs: segLatestActivityMs,
+                        isHostOnline: isHostOnline,
                         shouldFold: shouldFold,
                         isLiveActive: isSegLiveActive,
                         showInlineDiffStat: isTurnActive,
@@ -442,7 +544,7 @@ private extension FfiTurnLiveSegment {
     }
 }
 
-// MARK: - Quiet Turn Footer (Live Elapsed Ticker or Settled Icon Actions + Timestamp)
+// MARK: - Quiet Turn Footer (Settled Icon Actions + Timestamp — Hidden While Active to Match Desktop)
 
 private struct TurnFooterView: View {
     let isTurnActive: Bool
@@ -476,71 +578,72 @@ private struct TurnFooterView: View {
     }
 
     var body: some View {
-        if isTurnActive || hasSettledContent {
+        // Desktop parity (`TurnFooter` in `stream-stage.tsx`):
+        // Never render a bottom `• MM:SS` pending footer while a turn is active;
+        // live elapsed duration is shown inline inside the active step disclosure instead.
+        if !isTurnActive && hasSettledContent {
             HStack(spacing: 4) {
-                if isTurnActive {
-                    LiveTurnElapsedView(startedAtMs: startedAtMs)
-                } else {
-                    if let reply = replyText {
+                if let reply = replyText {
+                    Button {
+                        onCopy(reply)
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            copied = true
+                        }
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            withAnimation(.easeIn(duration: 0.2)) {
+                                copied = false
+                            }
+                        }
+                    } label: {
+                        Image(systemName: copied ? "checkmark" : "square.on.square")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(copied ? palette.direct : palette.fgSecondary.opacity(0.75))
+                            .orbitSymbolReplaceTransition()
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(copied ? "Copied Reply" : "Copy Assistant Reply")
+
+                    if let onQuote {
                         Button {
-                            onCopy(reply)
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                copied = true
-                            }
-                            Task { @MainActor in
-                                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                                withAnimation(.easeIn(duration: 0.2)) {
-                                    copied = false
-                                }
-                            }
+                            onQuote(reply)
                         } label: {
-                            Image(systemName: copied ? "checkmark" : "square.on.square")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(copied ? palette.direct : palette.fgSecondary.opacity(0.75))
-                                .orbitSymbolReplaceTransition()
+                            Image(systemName: "text.quote")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(palette.fgSecondary.opacity(0.75))
                                 .frame(width: 28, height: 28)
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel(copied ? "Copied Reply" : "Copy Assistant Reply")
-
-                        if let onQuote {
-                            Button {
-                                onQuote(reply)
-                            } label: {
-                                Image(systemName: "text.quote")
-                                    .font(.system(size: 12.5, weight: .medium))
-                                    .foregroundStyle(palette.fgSecondary.opacity(0.75))
-                                    .frame(width: 28, height: 28)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Quote Reply into Composer")
-                        }
+                        .accessibilityLabel("Quote Reply into Composer")
                     }
+                }
 
-                    if let completedMs = completedAtMs {
-                        RelativeTimestampText(timestampMs: completedMs)
-                            .padding(.leading, replyText != nil ? 2 : 0)
-                    }
+                if let completedMs = completedAtMs {
+                    RelativeTimestampText(timestampMs: completedMs)
+                        .padding(.leading, replyText != nil ? 2 : 0)
+                }
 
-                    if let dur = compactDurationBadge {
-                        Text("· \(dur)")
-                            .font(OrbitTypography.meta(.regular))
-                            .foregroundStyle(palette.fgMuted)
-                    }
+                if let dur = compactDurationBadge {
+                    Text("· \(dur)")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgMuted)
                 }
 
                 Spacer(minLength: 0)
             }
-            .padding(.leading, (!isTurnActive && replyText != nil) ? -6 : 0)
+            .padding(.leading, replyText != nil ? -6 : 0)
             .frame(minHeight: 28)
         }
     }
 }
 
-private struct LiveTurnElapsedView: View {
+private struct InlineLiveElapsedText: View {
     let startedAtMs: Int64?
+    var latestActivityMs: Int64? = nil
+    var isHostOnline: Bool = true
 
     @Environment(\.orbitPalette) private var palette
     @State private var fallbackStartDate = Date()
@@ -549,18 +652,56 @@ private struct LiveTurnElapsedView: View {
         let startDate = startedAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) } ?? fallbackStartDate
 
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            let elapsedSec = max(0, Int(context.date.timeIntervalSince(startDate)))
-            let mins = elapsedSec / 60
-            let secs = elapsedSec % 60
-            let formatted = String(format: "%d:%02d", mins, secs)
+            let nowMs = Int64(context.date.timeIntervalSince1970 * 1000)
+            let elapsedMs = max(0, Int64(context.date.timeIntervalSince(startDate) * 1000))
+            let compact = elapsedMs >= 1000
+                ? OrbitFormatters.formatDurationCompact(UInt64(elapsedMs))
+                : nil
+            let idleMs = latestActivityMs.map { max(0, nowMs - $0) } ?? 0
 
-            HStack(spacing: 7) {
-                PulsingDotView(color: palette.fgMuted, size: 5.5)
-                Text(formatted)
-                    .font(OrbitTypography.meta(.regular))
-                    .foregroundStyle(palette.fgMuted)
+            HStack(spacing: 5) {
+                if let compact {
+                    Text("· \(compact)")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgMuted)
+                        .monospacedDigit()
+                }
+                if !isHostOnline {
+                    Text("· offline")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.warning)
+                } else if idleMs >= 25_000 {
+                    Text("· waiting for response")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgMuted.opacity(0.85))
+                }
             }
         }
+    }
+}
+
+private struct InlineTrailingActivityView: View {
+    let label: String
+    let startedAtMs: Int64?
+    var isHostOnline: Bool = true
+
+    @Environment(\.orbitPalette) private var palette
+
+    var body: some View {
+        HStack(spacing: 6) {
+            PulsingDotView(color: palette.primary, size: 5.5)
+            Text(label)
+                .font(OrbitTypography.subhead(.regular))
+                .foregroundStyle(palette.fgSecondary)
+                .lineLimit(1)
+            InlineLiveElapsedText(
+                startedAtMs: startedAtMs,
+                latestActivityMs: nil,
+                isHostOnline: isHostOnline
+            )
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -1092,6 +1233,7 @@ struct UserPromptBubbleView: View {
 
 private struct StepSummaryDisclosureButton: View {
     let label: String
+    var durationBadge: String? = nil
     let unrecoveredFailureCount: UInt32
     let labelIncludesFailure: Bool
     let isExpanded: Bool
@@ -1119,6 +1261,12 @@ private struct StepSummaryDisclosureButton: View {
                     Text("· \(unrecoveredFailureCount) failed")
                         .font(OrbitTypography.meta(.regular))
                         .foregroundStyle(palette.danger)
+                }
+
+                if let dur = durationBadge, !dur.isEmpty {
+                    Text("· \(dur)")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgMuted)
                 }
 
                 if showInlineDiffStat && (additions > 0 || deletions > 0) {
@@ -1155,31 +1303,48 @@ private struct LiveStepGroupView: View {
     let segmentKey: String
     let items: [FfiTimelineItem]
     let summary: FfiWorkSummaryResult
+    var settledLabel: String? = nil
+    var settledDurationMs: Int64? = nil
     let fallbackLiveLabel: String
     var fallbackLiveDetail: String? = nil
+    var startedAtMs: Int64? = nil
+    var latestActivityMs: Int64? = nil
+    var isHostOnline: Bool = true
     let shouldFold: Bool
     let isLiveActive: Bool
     let showInlineDiffStat: Bool
     @Binding var isManualExpanded: Bool
 
     @Environment(\.orbitPalette) private var palette
+    @State private var isLiveCollapsed = false
 
-    private var headerText: String {
-        if isLiveActive {
-            let base: String
-            if !summary.liveLabel.isEmpty {
-                base = summary.liveLabel
-            } else if !fallbackLiveLabel.isEmpty {
-                base = fallbackLiveLabel
-            } else {
-                base = "Working…"
-            }
-            if let detail = summary.liveDetail ?? fallbackLiveDetail, !detail.isEmpty {
-                return "\(base) · \(detail)"
-            }
-            return base
+    private var liveTitleText: String {
+        if !summary.liveLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return summary.liveLabel
         }
-        return summary.label.isEmpty ? "Completed \(items.count) \(items.count == 1 ? "step" : "steps")" : summary.label
+        if !fallbackLiveLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return fallbackLiveLabel
+        }
+        return "Working…"
+    }
+
+    private var liveDetailText: String? {
+        let raw = (summary.liveDetail ?? fallbackLiveDetail)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw, !raw.isEmpty else { return nil }
+        return raw
+    }
+
+    private var resolvedSettledLabel: String {
+        if let settled = settledLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !settled.isEmpty {
+            return settled
+        }
+        let base = summary.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        return base.isEmpty ? "Completed \(items.count) \(items.count == 1 ? "step" : "steps")" : base
+    }
+
+    private var settledDurationBadge: String? {
+        guard let ms = settledDurationMs, ms >= 1000 else { return nil }
+        return OrbitFormatters.formatDurationCompact(UInt64(ms))
     }
 
     private var forceExpanded: Bool {
@@ -1191,26 +1356,97 @@ private struct LiveStepGroupView: View {
     }
 
     var body: some View {
-        if !shouldFold || forceExpanded {
-            VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-                if isLiveActive, let detail = summary.liveDetail ?? fallbackLiveDetail, !detail.isEmpty {
-                    Text(detail)
-                        .font(OrbitTypography.meta(.regular))
-                        .foregroundStyle(palette.fgMuted)
-                        .lineLimit(1)
+        if isLiveActive {
+            // Desktop parity (`TurnActivityDisclosure`): compact inline live status + elapsed duration header
+            // directly above the active step rail (replacing the removed bottom `• MM:SS` turn footer).
+            VStack(alignment: .leading, spacing: 0) {
+                Button {
+                    store.hapticLight()
+                    withAnimation(orbitDisclosureAnimation) {
+                        isLiveCollapsed.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        PulsingDotView(color: palette.primary, size: 5.5)
+
+                        Text(liveTitleText)
+                            .font(OrbitTypography.subhead(.regular))
+                            .foregroundStyle(palette.fgSecondary)
+                            .lineLimit(1)
+
+                        if let detail = liveDetailText {
+                            Text(detail)
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgMuted)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+
+                        if items.count >= 2 {
+                            Text("· \(items.count) steps")
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgMuted)
+                        }
+
+                        InlineLiveElapsedText(
+                            startedAtMs: startedAtMs,
+                            latestActivityMs: latestActivityMs,
+                            isHostOnline: isHostOnline
+                        )
+
+                        if showInlineDiffStat && (summary.counts.additions > 0 || summary.counts.deletions > 0) {
+                            HStack(spacing: 4) {
+                                if summary.counts.additions > 0 {
+                                    Text("+\(summary.counts.additions)")
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(palette.added)
+                                }
+                                if summary.counts.deletions > 0 {
+                                    Text("-\(summary.counts.deletions)")
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(palette.removed)
+                                }
+                            }
+                        }
+
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted.opacity(0.75))
+                            .rotationEffect(.degrees(isLiveCollapsed ? 0 : 90))
+
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 5)
+                    .contentShape(Rectangle())
                 }
-                StepRailListView(
-                    store: store,
-                    items: items,
-                    expandFirstToolStep: store.expandFirstStepByDefault,
-                    isLiveActive: isLiveActive,
-                    autoExpandErrors: !isLiveActive && summary.counts.unrecoveredFailureCount > 0
-                )
+                .buttonStyle(.plain)
+                .zIndex(1)
+
+                if !isLiveCollapsed {
+                    StepRailListView(
+                        store: store,
+                        items: items,
+                        expandFirstToolStep: store.expandFirstStepByDefault,
+                        isLiveActive: true,
+                        autoExpandErrors: false
+                    )
+                    .padding(.top, OrbitSpacing.xs)
+                    .transition(.orbitVerticalDisclosure)
+                }
             }
+        } else if !shouldFold || forceExpanded {
+            StepRailListView(
+                store: store,
+                items: items,
+                expandFirstToolStep: store.expandFirstStepByDefault,
+                isLiveActive: false,
+                autoExpandErrors: summary.counts.unrecoveredFailureCount > 0
+            )
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 StepSummaryDisclosureButton(
-                    label: headerText,
+                    label: resolvedSettledLabel,
+                    durationBadge: settledDurationBadge,
                     unrecoveredFailureCount: summary.counts.unrecoveredFailureCount,
                     labelIncludesFailure: summary.labelIncludesFailure,
                     isExpanded: isFoldOpen,

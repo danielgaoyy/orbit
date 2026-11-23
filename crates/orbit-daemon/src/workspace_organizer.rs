@@ -189,7 +189,13 @@ fn strip_orbit_workspace_xml(raw: &str) -> &str {
     let mut cur = raw;
     loop {
         let trimmed = cur.trim_start();
-        if trimmed.starts_with("<orbit-workspace")
+        if trimmed.starts_with("<orbit-workspace-delta")
+            && let Some(end_idx) = trimmed.find("</orbit-workspace-delta>")
+        {
+            cur = trimmed[end_idx + "</orbit-workspace-delta>".len()..].trim_start();
+            continue;
+        }
+        if (trimmed.starts_with("<orbit-workspace ") || trimmed.starts_with("<orbit-workspace>"))
             && let Some(end_idx) = trimmed.find("</orbit-workspace>")
         {
             cur = trimmed[end_idx + "</orbit-workspace>".len()..].trim_start();
@@ -1927,6 +1933,11 @@ mod tests {
         assert_eq!(strip_orbit_workspace_xml(prose_mention), prose_mention);
         let wrapped = "<orbit-workspace id=\"ws_1\">meta</orbit-workspace>\n\n<WORKSPACE_RULES>\n### Rule: rust\nNo unwrap\n</WORKSPACE_RULES>\n\nFix login bug";
         assert_eq!(strip_orbit_workspace_xml(wrapped), "Fix login bug");
+        let delta_wrapped = "<orbit-workspace-delta id=\"ws_1\" board-revision=\"2\"><board-updated rev=\"2\" by=\"@proto\">spec</board-updated></orbit-workspace-delta>\n\nImplement rate limiter";
+        assert_eq!(
+            strip_orbit_workspace_xml(delta_wrapped),
+            "Implement rate limiter"
+        );
         let rules_first =
             "<WORKSPACE_RULES>\n### Rule: a\nBody\n</WORKSPACE_RULES>\n\nRefactor auth";
         assert_eq!(strip_orbit_workspace_xml(rules_first), "Refactor auth");

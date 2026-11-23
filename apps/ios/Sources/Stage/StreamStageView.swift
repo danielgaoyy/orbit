@@ -29,8 +29,14 @@ struct StreamStageView: View {
     }
 
     private var isLatestTurnActive: Bool {
-        guard let last = turns.last else { return false }
-        return store.isActiveAgentRunning || last.hasActiveItem
+        // Single source of truth: trust authoritative foreground-running agent status
+        // (matching Desktop `stream-stage.tsx`) so background-task waiting or stale
+        // running tool items can never hold a settled turn in a phantom pending state.
+        !turns.isEmpty && store.isActiveAgentTurnBusy
+    }
+
+    private var hasLiveBackgroundTasks: Bool {
+        !(store.agentStage?.insights.backgroundTasks.isEmpty ?? true)
     }
 
     private var pendingDecisionCount: Int {
@@ -133,7 +139,13 @@ struct StreamStageView: View {
                     LazyVStack(alignment: .leading, spacing: 22) {
                         ForEach(Array(turns.enumerated()), id: \.element.key) { idx, turn in
                             let isTurnActive = (idx == turns.count - 1) && isLatestTurnActive
-                            StageTurnView(store: store, turn: turn, isTurnActive: isTurnActive)
+                            StageTurnView(
+                                store: store,
+                                turn: turn,
+                                isTurnActive: isTurnActive,
+                                agentStatusLabel: isTurnActive ? store.activeAgent?.statusLabel : nil,
+                                hasLiveBackgroundTasks: isTurnActive && hasLiveBackgroundTasks
+                            )
                         }
 
                         Color.clear
@@ -252,7 +264,7 @@ struct StreamStageView: View {
                             }
                         } label: {
                             Group {
-                                if store.isActiveAgentRunning {
+                                if store.isActiveAgentTurnBusy {
                                     HStack(spacing: 6) {
                                         PulsingDotView(color: palette.primary, size: 6)
                                         Image(systemName: "arrow.down")

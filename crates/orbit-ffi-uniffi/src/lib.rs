@@ -1470,6 +1470,7 @@ pub enum FfiTimerCondition {
     AnyMessage,
     Sender { sender_id: String },
     AllSubagentsSettled,
+    AllPeersSettled,
     FileChanged { path: String },
 }
 
@@ -1480,6 +1481,7 @@ impl From<TimerCondition> for FfiTimerCondition {
             TimerCondition::AnyMessage => Self::AnyMessage,
             TimerCondition::Sender { sender_id } => Self::Sender { sender_id },
             TimerCondition::AllSubagentsSettled => Self::AllSubagentsSettled,
+            TimerCondition::AllPeersSettled => Self::AllPeersSettled,
             TimerCondition::FileChanged { path } => Self::FileChanged { path },
         }
     }

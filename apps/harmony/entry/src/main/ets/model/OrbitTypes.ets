@@ -1193,6 +1193,9 @@ export function formatTimerConditionLabel(cond: TimerConditionDto): string {
   if (cond.kind === 'all_subagents_settled') {
     return 'until subagents settle';
   }
+  if (cond.kind === 'all_peers_settled') {
+    return 'until workspace peers settle';
+  }
   if (cond.kind === 'sender' && cond.sender_id !== undefined && cond.sender_id.length > 0) {
     return `until ${cond.sender_id}`;
   }

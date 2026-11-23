@@ -9,15 +9,15 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, ForkTarget, HostProjectEntry,
-    HostSyncState, KeepAwakeStatus, OrchestrationConfig, PendingPermissionSummary, PromptBadge,
-    ProviderKind, ProviderModelCatalog, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    QuestionItem, ReasoningEffort, ScheduleSpec, SessionMode, TerminalSummary, TimelineEvent,
-    TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceEventKind,
-    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
-    WorkspaceScriptKind, WorkspaceScriptStatus, WorkspaceSetupProgress, WorkspaceSetupStatus,
-    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffDirection, WorktreeHandoffMode,
-    WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    ActiveTurnBehavior, AgentMessageKind, AgentStatus, AgentSummary, AttentionState, ForkTarget,
+    HostProjectEntry, HostSyncState, KeepAwakeStatus, OrchestrationConfig,
+    PendingPermissionSummary, PromptBadge, ProviderKind, ProviderModelCatalog,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec,
+    SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
+    WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
+    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus,
+    WorkspaceSetupProgress, WorkspaceSetupStatus, WorkspaceSummary, WorktreeCreateMode,
+    WorktreeHandoffDirection, WorktreeHandoffMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, SessionLaunchConfig,
@@ -38,10 +38,13 @@ use crate::git::{
     reverse_apply_file_edit_diffs,
 };
 use crate::keep_awake::KeepAwakeManager;
-use crate::messaging::{CoalescedDispatchBatch, sanitize_human_prompt_for_wire};
+use crate::messaging::{
+    AgentMessageDelivery, AgentPromptSource, CoalescedDispatchBatch, QueuedAgentMessage,
+    sanitize_human_prompt_for_wire,
+};
 use crate::workspace_board::{
-    board_file_path, build_workspace_roster_context, default_board_template,
-    upsert_markdown_section, write_board_file,
+    WorkspaceRosterState, board_file_path, build_workspace_roster_context_incremental,
+    default_board_template, upsert_markdown_section, write_board_file,
 };
 use crate::workspace_cluster::{allocate_unique_handle, evaluate_auto_cluster, sanitize_handle};
 use crate::workspace_runtime::{
@@ -84,6 +87,7 @@ pub struct ForkAgentOutcome {
 #[derive(Debug, Clone)]
 pub struct ExecuteWorktreeHandoffSpec {
     pub workspace_id: String,
+    pub source_agent_id: Option<String>,
     pub direction: WorktreeHandoffDirection,
     pub mode: WorktreeHandoffMode,
     pub target_workspace_id: Option<String>,
@@ -229,8 +233,12 @@ pub struct AgentOrchestrator {
     /// Recently Guardian-auto-resolved `(agent_id, request_id)` pairs so trailing
     /// `StatusChanged::AwaitingPermission` events do not flash stale `AttentionState::Permission`.
     guardian_auto_resolved_requests: RwLock<std::collections::HashSet<(String, String)>>,
-    /// Last `<orbit-workspace>` roster fingerprint injected per `agent_id` to avoid redundant XML bloat.
-    roster_fingerprints: RwLock<HashMap<String, String>>,
+    /// Incremental `<orbit-workspace>` roster tracking state per `agent_id`.
+    roster_states: RwLock<HashMap<String, WorkspaceRosterState>>,
+    /// Per-agent injected `<WORKSPACE_RULES>` hashes `(agent_id -> (rule_id -> content_hash))`.
+    injected_rule_hashes: RwLock<HashMap<String, HashMap<String, String>>>,
+    /// Per-repository mutex serializing concurrent `handoff_worktree` mutations into shared checkouts.
+    repo_handoff_locks: RwLock<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     /// Conflict radar cooldown keyed by `(workspace_id, canonical_file_path)`.
     conflict_cooldowns: RwLock<HashMap<(String, String), std::time::Instant>>,
     /// Agents whose next idle transition was caused by explicit interrupt or flush-now,
@@ -250,6 +258,7 @@ pub struct AgentOrchestrator {
     /// so bursts of completing sessions never saturate local CPU or provider API rate limits.
     auto_name_semaphore: Arc<tokio::sync::Semaphore>,
     conditional_timers: RwLock<Option<Arc<crate::timers::ConditionalTimerEngine>>>,
+    message_delivery: RwLock<Option<Arc<AgentMessageDelivery>>>,
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
 }
 
@@ -314,7 +323,9 @@ impl AgentOrchestrator {
             live_terminals: RwLock::new(HashMap::new()),
             pending_permissions: RwLock::new(HashMap::new()),
             guardian_auto_resolved_requests: RwLock::new(std::collections::HashSet::new()),
-            roster_fingerprints: RwLock::new(HashMap::new()),
+            roster_states: RwLock::new(HashMap::new()),
+            injected_rule_hashes: RwLock::new(HashMap::new()),
+            repo_handoff_locks: RwLock::new(HashMap::new()),
             conflict_cooldowns: RwLock::new(HashMap::new()),
             suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
             turn_usage_recorded: RwLock::new(std::collections::HashSet::new()),
@@ -322,6 +333,7 @@ impl AgentOrchestrator {
             organizing_locks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             auto_name_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             conditional_timers: RwLock::new(None),
+            message_delivery: RwLock::new(None),
             broadcast_tx,
         })
     }
@@ -332,6 +344,46 @@ impl AgentOrchestrator {
 
     async fn conditional_timers(&self) -> Option<Arc<crate::timers::ConditionalTimerEngine>> {
         self.conditional_timers.read().await.clone()
+    }
+
+    pub async fn set_message_delivery(&self, delivery: Arc<AgentMessageDelivery>) {
+        *self.message_delivery.write().await = Some(delivery);
+    }
+
+    async fn message_delivery(&self) -> Option<Arc<AgentMessageDelivery>> {
+        self.message_delivery.read().await.clone()
+    }
+
+    pub fn are_all_workspace_peers_settled(&self, agent_id: &str) -> bool {
+        let Some(agent) = self.store.get_agent(agent_id).ok().flatten() else {
+            return false;
+        };
+        let peers = self
+            .store
+            .list_agents_filtered(Some(&agent.workspace_id), false, false, None)
+            .unwrap_or_default();
+        !peers.into_iter().any(|p| {
+            p.agent_id != agent_id
+                && p.parent_agent_id.is_none()
+                && (p.status.is_foreground_busy()
+                    || matches!(p.status, AgentStatus::AwaitingPermission { .. }))
+        })
+    }
+
+    async fn acquire_repo_handoff_lock(&self, checkout_dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let key = match resolve_git_checkout_info(checkout_dir).await {
+            Ok(info) => info.common_dir,
+            Err(_) => PathBuf::from(self.resolve_canonical_repo_key(checkout_dir).await),
+        };
+        if let Some(lock) = self.repo_handoff_locks.read().await.get(&key) {
+            return Arc::clone(lock);
+        }
+        let mut guard = self.repo_handoff_locks.write().await;
+        Arc::clone(
+            guard
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 
     fn are_all_subagents_settled(&self, parent_agent_id: &str) -> bool {
@@ -441,7 +493,7 @@ impl AgentOrchestrator {
     }
 
     pub(crate) async fn invalidate_roster_fingerprint(&self, agent_id: &str) {
-        self.roster_fingerprints.write().await.remove(agent_id);
+        self.roster_states.write().await.remove(agent_id);
     }
 
     async fn current_generation(&self, agent_id: &str) -> u64 {
@@ -968,19 +1020,45 @@ impl AgentOrchestrator {
         Ok(ws)
     }
 
-    /// Preview a bidirectional Git Worktree <-> Local checkout handoff without mutating disk.
-    pub async fn preview_worktree_handoff(
+    async fn resolve_handoff_source_and_target(
         &self,
         workspace_id: &str,
+        source_agent_id: Option<&str>,
         direction: WorktreeHandoffDirection,
         target_workspace_id: Option<&str>,
-        include_committed: bool,
-    ) -> anyhow::Result<WorktreeHandoffPreview> {
+    ) -> anyhow::Result<(
+        WorkspaceSummary,
+        Option<AgentSummary>,
+        PathBuf,
+        Option<PathBuf>,
+    )> {
         let source_ws = self
             .store
             .get_workspace(workspace_id)?
             .ok_or_else(|| anyhow::anyhow!("workspace `{workspace_id}` not found"))?;
-        let source_cwd = crate::expand_host_path(&source_ws.cwd);
+        let source_agent = match source_agent_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(aid) => {
+                let ag = self
+                    .store
+                    .get_agent(aid)?
+                    .ok_or_else(|| anyhow::anyhow!("agent `{aid}` not found"))?;
+                if ag.workspace_id != source_ws.workspace_id {
+                    anyhow::bail!(
+                        "agent `{}` belongs to workspace `{}`, not `{}`",
+                        ag.agent_id,
+                        ag.workspace_id,
+                        source_ws.workspace_id
+                    );
+                }
+                Some(ag)
+            }
+            None => None,
+        };
+
+        let source_cwd = match source_agent.as_ref() {
+            Some(ag) => crate::expand_host_path(&ag.cwd),
+            None => crate::expand_host_path(&source_ws.cwd),
+        };
 
         let target_cwd =
             if let Some(tid) = target_workspace_id.map(str::trim).filter(|s| !s.is_empty()) {
@@ -990,7 +1068,19 @@ impl AgentOrchestrator {
                     .ok_or_else(|| anyhow::anyhow!("target workspace `{tid}` not found"))?;
                 Some(crate::expand_host_path(&target_ws.cwd))
             } else if direction == WorktreeHandoffDirection::WorktreeToLocal {
-                if let Some(candidate) = source_ws
+                let agent_wt_src = source_agent
+                    .as_ref()
+                    .and_then(|ag| ag.labels.get("orbit.worktree_source_cwd"))
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(crate::expand_host_path)
+                    .filter(|p| *p != source_cwd);
+                if let Some(candidate) = agent_wt_src
+                    && tokio::fs::try_exists(&candidate).await.unwrap_or(false)
+                {
+                    Some(candidate)
+                } else if let Some(candidate) = source_ws
                     .source_cwd
                     .as_deref()
                     .map(str::trim)
@@ -1007,6 +1097,46 @@ impl AgentOrchestrator {
                 None
             };
 
+        Ok((source_ws, source_agent, source_cwd, target_cwd))
+    }
+
+    /// Preview a bidirectional Git Worktree <-> Local checkout handoff without mutating disk.
+    pub async fn preview_worktree_handoff(
+        &self,
+        workspace_id: &str,
+        direction: WorktreeHandoffDirection,
+        target_workspace_id: Option<&str>,
+        include_committed: bool,
+    ) -> anyhow::Result<WorktreeHandoffPreview> {
+        self.preview_worktree_handoff_with_agent(
+            workspace_id,
+            None,
+            direction,
+            target_workspace_id,
+            include_committed,
+        )
+        .await
+    }
+
+    /// Preview a bidirectional Git Worktree <-> Local checkout handoff, optionally scoped to a
+    /// specific sibling peer's isolated worktree inside a Mission Workspace.
+    pub async fn preview_worktree_handoff_with_agent(
+        &self,
+        workspace_id: &str,
+        source_agent_id: Option<&str>,
+        direction: WorktreeHandoffDirection,
+        target_workspace_id: Option<&str>,
+        include_committed: bool,
+    ) -> anyhow::Result<WorktreeHandoffPreview> {
+        let (source_ws, _source_agent, source_cwd, target_cwd) = self
+            .resolve_handoff_source_and_target(
+                workspace_id,
+                source_agent_id,
+                direction,
+                target_workspace_id,
+            )
+            .await?;
+
         preview_worktree_handoff_paths(HandoffPreviewPathsSpec {
             source_cwd,
             target_cwd,
@@ -1022,37 +1152,27 @@ impl AgentOrchestrator {
         self: &Arc<Self>,
         spec: ExecuteWorktreeHandoffSpec,
     ) -> anyhow::Result<WorktreeHandoffOutcome> {
-        let source_ws = self
-            .store
-            .get_workspace(&spec.workspace_id)?
-            .ok_or_else(|| anyhow::anyhow!("workspace `{}` not found", spec.workspace_id))?;
-        let source_cwd = crate::expand_host_path(&source_ws.cwd);
+        let (source_ws, _source_agent, source_cwd, resolved_target_cwd) = self
+            .resolve_handoff_source_and_target(
+                &spec.workspace_id,
+                spec.source_agent_id.as_deref(),
+                spec.direction,
+                spec.target_workspace_id.as_deref(),
+            )
+            .await?;
+
+        // Serialize concurrent handoffs touching the same underlying Git repository so parallel
+        // worktree peers merging back into local checkout never race on `.git` or partial patches.
+        let repo_lock = self.acquire_repo_handoff_lock(&source_cwd).await;
+        let _repo_guard = repo_lock.lock().await;
 
         match spec.direction {
             WorktreeHandoffDirection::WorktreeToLocal => {
-                let target_cwd = if let Some(tid) = spec
-                    .target_workspace_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    let target_ws = self
-                        .store
-                        .get_workspace(tid)?
-                        .ok_or_else(|| anyhow::anyhow!("target workspace `{tid}` not found"))?;
-                    crate::expand_host_path(&target_ws.cwd)
-                } else if let Some(src_dir) = source_ws
-                    .source_cwd
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(crate::expand_host_path)
-                    .filter(|p| *p != source_cwd)
-                    && tokio::fs::try_exists(&src_dir).await.unwrap_or(false)
-                {
-                    src_dir
-                } else {
-                    crate::worktree_handoff::resolve_primary_local_checkout(&source_cwd).await?
+                let target_cwd = match resolved_target_cwd {
+                    Some(dir) => dir,
+                    None => {
+                        crate::worktree_handoff::resolve_primary_local_checkout(&source_cwd).await?
+                    }
                 };
 
                 execute_worktree_handoff_paths(HandoffExecutePathsSpec {
@@ -1079,7 +1199,8 @@ impl AgentOrchestrator {
                         .store
                         .get_workspace(tid)?
                         .ok_or_else(|| anyhow::anyhow!("target workspace `{tid}` not found"))?;
-                    let target_cwd = crate::expand_host_path(&target_ws.cwd);
+                    let target_cwd = resolved_target_cwd
+                        .unwrap_or_else(|| crate::expand_host_path(&target_ws.cwd));
                     return execute_worktree_handoff_paths(HandoffExecutePathsSpec {
                         source_cwd,
                         target_cwd,
@@ -1808,6 +1929,18 @@ impl AgentOrchestrator {
         if spec.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
             agent_labels.insert("orbit.title_locked".into(), "1".into());
         }
+        let is_subagent = spec.parent_agent_id.is_some() || effective_background;
+        let has_browser_binary = if crate::tools::prompt_mentions_browser(&human_seed) {
+            crate::browser::discover_chrome_binary().is_some()
+        } else {
+            false
+        };
+        let detected_packs =
+            crate::tools::detect_startup_mcp_packs(&human_seed, is_subagent, has_browser_binary);
+        agent_labels.insert(
+            crate::tools::LABEL_MCP_PACKS.into(),
+            crate::tools::format_mcp_packs_label(&detected_packs),
+        );
         let allocated_handle = allocate_unique_handle(
             spec.handle.as_deref(),
             provider,
@@ -2229,6 +2362,9 @@ impl AgentOrchestrator {
         let mut labels = HashMap::new();
         if explicit_title.is_some() {
             labels.insert("orbit.title_locked".into(), "1".into());
+        }
+        if let Some(packs) = source.labels.get(crate::tools::LABEL_MCP_PACKS) {
+            labels.insert(crate::tools::LABEL_MCP_PACKS.into(), packs.clone());
         }
         if let Some(ref ws) = created_workspace
             && ws.is_worktree
@@ -3464,6 +3600,13 @@ impl AgentOrchestrator {
                 let all_settled = self.are_all_subagents_settled(parent_id);
                 timers.notify_subagent_settled(parent_id, all_settled).await;
             }
+            if let Some(ref ws_id) = parent_ws_id
+                && let Some(timers) = self.conditional_timers().await
+            {
+                timers.notify_workspace_peer_settled(ws_id, agent_id).await;
+            }
+            self.roster_states.write().await.remove(agent_id);
+            self.injected_rule_hashes.write().await.remove(agent_id);
             if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
                 let wt_src = updated.labels.get("orbit.worktree_source_cwd").cloned();
                 let wt_branch = updated.labels.get("orbit.worktree_branch").cloned();
@@ -3552,26 +3695,25 @@ impl AgentOrchestrator {
             .update_agent_status(agent_id, &AgentStatus::Closed)?;
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
             let parent_id = updated.parent_agent_id.clone();
+            let ws_id = updated.workspace_id.clone();
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::AgentUpdated(updated));
-            if let Some(ref pid) = parent_id
-                && let Some(timers) = self.conditional_timers().await
-            {
-                let all_settled = self.are_all_subagents_settled(pid);
-                timers.notify_subagent_settled(pid, all_settled).await;
+            if let Some(timers) = self.conditional_timers().await {
+                if let Some(ref pid) = parent_id {
+                    let all_settled = self.are_all_subagents_settled(pid);
+                    timers.notify_subagent_settled(pid, all_settled).await;
+                }
+                timers.notify_workspace_peer_settled(&ws_id, agent_id).await;
             }
         }
         Ok(())
     }
 
     pub async fn delete_agent(self: &Arc<Self>, agent_id: &str) -> anyhow::Result<()> {
-        let prev_parent_id = self
-            .store
-            .get_agent(agent_id)
-            .ok()
-            .flatten()
-            .and_then(|a| a.parent_agent_id);
+        let existing = self.store.get_agent(agent_id).ok().flatten();
+        let prev_parent_id = existing.as_ref().and_then(|a| a.parent_agent_id.clone());
+        let prev_ws_id = existing.map(|a| a.workspace_id);
         let _ = self.kill_agent(agent_id).await;
         if let Some(timers) = self.conditional_timers().await {
             timers.cancel_all_for_agent(agent_id, "Agent deleted").await;
@@ -3585,15 +3727,19 @@ impl AgentOrchestrator {
             }
         }
         self.store.delete_agent(agent_id)?;
-        if let Some(ref parent_id) = prev_parent_id
-            && let Some(timers) = self.conditional_timers().await
-        {
-            let all_settled = self.are_all_subagents_settled(parent_id);
-            timers.notify_subagent_settled(parent_id, all_settled).await;
+        if let Some(timers) = self.conditional_timers().await {
+            if let Some(ref parent_id) = prev_parent_id {
+                let all_settled = self.are_all_subagents_settled(parent_id);
+                timers.notify_subagent_settled(parent_id, all_settled).await;
+            }
+            if let Some(ref ws_id) = prev_ws_id {
+                timers.notify_workspace_peer_settled(ws_id, agent_id).await;
+            }
         }
         self.driver_start_locks.write().await.remove(agent_id);
         self.agent_generations.write().await.remove(agent_id);
-        self.roster_fingerprints.write().await.remove(agent_id);
+        self.roster_states.write().await.remove(agent_id);
+        self.injected_rule_hashes.write().await.remove(agent_id);
         self.suppress_auto_drain.write().await.remove(agent_id);
         let _ = self
             .broadcast_tx
@@ -3714,34 +3860,64 @@ impl AgentOrchestrator {
         updated_by: Option<&str>,
         editor_agent_id: Option<&str>,
     ) -> anyhow::Result<WorkspaceBoardSnapshot> {
+        match self.update_workspace_board_cas(
+            workspace_id,
+            content,
+            section,
+            None,
+            updated_by,
+            editor_agent_id,
+        )? {
+            Ok(snap) | Err(snap) => Ok(snap),
+        }
+    }
+
+    /// Atomically update `BOARD.md` in SQLite and on disk, optionally enforcing an optimistic lock
+    /// via `expected_revision`. Returns `Ok(Err(current_snapshot))` when the revision is stale.
+    pub fn update_workspace_board_cas(
+        &self,
+        workspace_id: &str,
+        content: &str,
+        section: Option<&str>,
+        expected_revision: Option<u64>,
+        updated_by: Option<&str>,
+        editor_agent_id: Option<&str>,
+    ) -> anyhow::Result<Result<WorkspaceBoardSnapshot, WorkspaceBoardSnapshot>> {
         let ws = self
             .store
             .get_workspace(workspace_id)?
             .ok_or_else(|| anyhow::anyhow!("workspace `{workspace_id}` not found"))?;
-        let final_content = match section.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(sec) => {
-                let current = self
-                    .store
-                    .get_workspace_board(workspace_id)?
-                    .map(|b| b.content)
-                    .unwrap_or_else(|| {
+        let clean_section = section.map(str::trim).filter(|s| !s.is_empty());
+        let target_disk_path = board_file_path(&self.home_dir, workspace_id)
+            .to_string_lossy()
+            .to_string();
+
+        let cas_res = self.store.upsert_workspace_board_with_cas(
+            workspace_id,
+            expected_revision,
+            updated_by,
+            Some(&target_disk_path),
+            |existing_content| match clean_section {
+                Some(sec) => {
+                    let base = existing_content.map(ToOwned::to_owned).unwrap_or_else(|| {
                         default_board_template(&ws.title, ws.mission_goal.as_deref())
                     });
-                upsert_markdown_section(&current, sec, content)
-            }
-            None => content.to_string(),
-        };
-        let disk_path = write_board_file(&self.home_dir, workspace_id, &final_content);
-        let snap = self.store.upsert_workspace_board(
-            workspace_id,
-            &final_content,
-            updated_by,
-            disk_path.as_deref(),
+                    upsert_markdown_section(&base, sec, content)
+                }
+                None => content.to_string(),
+            },
         )?;
+
+        let snap = match cas_res {
+            Ok(s) => s,
+            Err(current) => return Ok(Err(current)),
+        };
+
+        let _ = write_board_file(&self.home_dir, workspace_id, &snap.content);
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::WorkspaceBoardUpdated(snap.clone()));
-        let event_summary = match section.map(str::trim).filter(|s| !s.is_empty()) {
+        let event_summary = match clean_section {
             Some(sec) => format!(
                 "Updated Shared Board section `{sec}` (rev {})",
                 snap.revision
@@ -3765,7 +3941,7 @@ impl AgentOrchestrator {
                 .broadcast_tx
                 .send(DaemonBroadcast::WorkspaceUpdated(updated_ws));
         }
-        Ok(snap)
+        Ok(Ok(snap))
     }
 
     pub fn list_workspace_events(
@@ -3898,8 +4074,8 @@ impl AgentOrchestrator {
             .store
             .move_agent_to_workspace(agent_id, &target_ws.workspace_id, true)?
             .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
-        // Reset cached roster fingerprint so next turn reflects the new workspace peers
-        self.roster_fingerprints.write().await.remove(agent_id);
+        // Reset cached roster state so next turn reflects the new workspace peers
+        self.roster_states.write().await.remove(agent_id);
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::AgentUpdated(updated.clone()));
@@ -3979,7 +4155,7 @@ impl AgentOrchestrator {
             let mut moved_copy = ag.clone();
             moved_copy.handle = Some(unique_handle);
             dst_peers.push(moved_copy);
-            self.roster_fingerprints.write().await.remove(&ag.agent_id);
+            self.roster_states.write().await.remove(&ag.agent_id);
         }
         // Merge non-empty source board into target board if present
         if let Ok(Some(src_board)) = self.store.get_workspace_board(source_workspace_id)
@@ -4063,6 +4239,16 @@ impl AgentOrchestrator {
         }) {
             return Ok(Some(exact_handle.clone()));
         }
+        let sanitized = crate::workspace_cluster::sanitize_handle(clean);
+        if !sanitized.is_empty()
+            && let Some(norm_handle) = peers.iter().find(|a| {
+                a.handle
+                    .as_deref()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(&sanitized))
+            })
+        {
+            return Ok(Some(norm_handle.clone()));
+        }
         let lower = clean.to_ascii_lowercase();
         Ok(peers
             .into_iter()
@@ -4070,8 +4256,7 @@ impl AgentOrchestrator {
     }
 
     /// Match workspace/user path-scoped glob rules against mentioned/edited paths and `@rule:` tokens,
-    /// prepending `<WORKSPACE_RULES>` cleanly when non-empty and leaving the prompt untouched otherwise.
-    /// `signal_source` is strictly the current turn's user prompt (never historical handoff turns).
+    /// deduplicating unchanged rules across turns within the same session so prompt prefixes stay clean.
     async fn augment_prompt_with_path_rules(
         &self,
         agent_id: &str,
@@ -4103,18 +4288,34 @@ impl AgentOrchestrator {
             &edited_paths,
         );
 
+        let mut prior_hashes = self
+            .injected_rule_hashes
+            .read()
+            .await
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_default();
         let home_dir = self.home_dir.clone();
         let cwd = PathBuf::from(&agent.cwd);
-        let matched = tokio::task::spawn_blocking(move || {
-            crate::rules::match_rules_for_workspace(
+        let (matched, updated_hashes) = tokio::task::spawn_blocking(move || {
+            let res = crate::rules::match_rules_for_workspace_dedup(
                 &home_dir,
                 Some(&cwd),
                 &active_paths,
                 &manual_rules,
-            )
+                &mut prior_hashes,
+            );
+            (res, prior_hashes)
         })
         .await
         .unwrap_or_default();
+
+        if !updated_hashes.is_empty() {
+            self.injected_rule_hashes
+                .write()
+                .await
+                .insert(agent_id.to_string(), updated_hashes);
+        }
 
         if matched.injected_markdown.is_empty() {
             prompt
@@ -4123,9 +4324,8 @@ impl AgentOrchestrator {
         }
     }
 
-    /// Prepend a deduplicated `<orbit-workspace>` live awareness block (peers + shared board +
-    /// recent events) whenever the workspace has 2+ peers or board content that changed since the
-    /// last turn sent to `agent_id`.
+    /// Prepend either the full `<orbit-workspace>` block (Turn 1) or a compact `<orbit-workspace-delta>`
+    /// block (Turn 2+) whenever structural peers, shared board, or high-signal events change.
     async fn augment_prompt_with_workspace_context(
         &self,
         agent_id: &str,
@@ -4154,7 +4354,8 @@ impl AgentOrchestrator {
             .ok()
             .flatten();
 
-        let Some((xml, fingerprint)) = build_workspace_roster_context(
+        let prev_state = self.roster_states.read().await.get(agent_id).cloned();
+        let Some((maybe_xml, next_state)) = build_workspace_roster_context_incremental(
             &self.store,
             &self.home_dir,
             &ws,
@@ -4162,28 +4363,81 @@ impl AgentOrchestrator {
             &peers,
             &events,
             board.as_ref(),
+            prev_state.as_ref(),
         ) else {
             return prompt;
         };
 
-        let should_inject = {
-            let mut guard = self.roster_fingerprints.write().await;
-            let changed = guard.get(agent_id).map(String::as_str) != Some(fingerprint.as_str());
-            if changed {
-                guard.insert(agent_id.to_string(), fingerprint);
-            }
-            changed
-        };
+        self.roster_states
+            .write()
+            .await
+            .insert(agent_id.to_string(), next_state);
 
-        if should_inject {
-            format!("{xml}\n\n{prompt}")
-        } else {
-            prompt
+        match maybe_xml {
+            Some(xml) => format!("{xml}\n\n{prompt}"),
+            None => prompt,
         }
     }
 
-    /// Track file edits inside a Mission Workspace and emit live Conflict Radar alerts when two
-    /// peers sharing the SAME physical working directory edit the same file within 10 minutes.
+    async fn send_conflict_steer_if_active(&self, target_agent_id: &str, body: String) {
+        let Ok(Some(ag)) = self.store.get_agent(target_agent_id) else {
+            return;
+        };
+        if ag.archived_at.is_some()
+            || ag.background
+            || !matches!(
+                ag.status,
+                AgentStatus::Running { .. } | AgentStatus::AutonomousWakeup { .. }
+            )
+        {
+            return;
+        }
+        let Some(delivery) = self.message_delivery().await else {
+            return;
+        };
+        let _ = delivery
+            .enqueue(QueuedAgentMessage {
+                recipient_id: target_agent_id.to_string(),
+                message_id: format!("cr_{}", Uuid::new_v4().simple()),
+                source: AgentPromptSource {
+                    kind: AgentMessageKind::FinishNotification,
+                    source_agent_id: None,
+                    source_host_id: Some(self.host_id.clone()),
+                    source_title: Some("Conflict Radar".to_string()),
+                    event: Some("conflict_warning".to_string()),
+                    permission_context: None,
+                },
+                body,
+                active_turn_behavior: ActiveTurnBehavior::Steer,
+                session_mode: None,
+                unarchive: false,
+            })
+            .await;
+    }
+
+    async fn check_conflict_cooldown(
+        &self,
+        workspace_id: &str,
+        key_suffix: &str,
+        cooldown_secs: u64,
+    ) -> bool {
+        let key = (workspace_id.to_string(), key_suffix.to_string());
+        let mut guard = self.conflict_cooldowns.write().await;
+        let now = std::time::Instant::now();
+        guard.retain(|_, prev| now.duration_since(*prev) < Duration::from_secs(120));
+        match guard.get(&key) {
+            Some(prev) if now.duration_since(*prev) < Duration::from_secs(cooldown_secs) => false,
+            _ => {
+                guard.insert(key, now);
+                true
+            }
+        }
+    }
+
+    /// Track file edits inside a Mission Workspace and emit live Conflict Radar alerts:
+    /// - Same-directory edits within 10m emit `ConflictWarning` + UI Notice + active `Steer`
+    ///   (strictly to currently `Running` / `AutonomousWakeup` peers — never wakes `Idle` agents).
+    /// - Cross-worktree edits on the same path emit an early-warning `ConflictWarning` + active `Steer`.
     async fn record_file_edit_and_check_conflict(&self, agent_id: &str, raw_path: &str) {
         let trimmed = raw_path.trim();
         if trimmed.is_empty() {
@@ -4214,7 +4468,7 @@ impl AgentOrchestrator {
                 .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
         }
 
-        // Check for active peer conflicts in the SAME workspace AND SAME physical cwd
+        // Check for active peer conflicts in the SAME workspace within the last 10 minutes
         let since = Utc::now() - chrono::Duration::minutes(10);
         let Ok(other_editors) = self.store.recent_workspace_file_editors(
             &agent.workspace_id,
@@ -4228,75 +4482,102 @@ impl AgentOrchestrator {
             return;
         }
 
-        let mut conflicting_handles: Vec<String> = Vec::new();
+        let mut same_dir_peers: Vec<(String, String)> = Vec::new();
+        let mut cross_wt_peers: Vec<(String, String)> = Vec::new();
         for (other_id, other_handle) in other_editors {
             if let Ok(Some(other_ag)) = self.store.get_agent(&other_id)
                 && other_ag.archived_at.is_none()
                 && !other_ag.background
-                && other_ag.cwd == agent.cwd
             {
-                conflicting_handles.push(
-                    other_handle
-                        .or(other_ag.handle)
-                        .unwrap_or_else(|| other_ag.title.clone()),
-                );
-            }
-        }
-        if conflicting_handles.is_empty() {
-            return;
-        }
-
-        // Throttle per (workspace_id, norm_path) to at most once every 60 seconds
-        let key = (agent.workspace_id.clone(), norm_path.clone());
-        let should_alert = {
-            let mut guard = self.conflict_cooldowns.write().await;
-            let now = std::time::Instant::now();
-            guard.retain(|_, prev| now.duration_since(*prev) < Duration::from_secs(60));
-            match guard.get(&key) {
-                Some(_) => false,
-                None => {
-                    guard.insert(key, now);
-                    true
+                let label = other_handle
+                    .or(other_ag.handle)
+                    .unwrap_or_else(|| other_ag.title.clone());
+                if other_ag.cwd == agent.cwd {
+                    same_dir_peers.push((other_id, label));
+                } else {
+                    cross_wt_peers.push((other_id, label));
                 }
             }
-        };
-        if !should_alert {
-            return;
         }
 
-        let others_str = conflicting_handles
-            .iter()
-            .map(|h| format!("@{h}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let msg = format!(
-            "Conflict Radar: @{handle} and {others_str} both edited `{norm_path}` in the same directory (`{}`). Coordinate via `message_peer` / `workspace_board_update` or fork one peer into a worktree.",
-            agent.cwd
-        );
-        if let Ok(ev) = self.store.append_workspace_event(
-            &agent.workspace_id,
-            Some(agent_id),
-            Some(handle),
-            WorkspaceEventKind::ConflictWarning,
-            &msg,
-            Some(&norm_path),
-        ) {
-            let _ = self
-                .broadcast_tx
-                .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
+        if !same_dir_peers.is_empty()
+            && self
+                .check_conflict_cooldown(&agent.workspace_id, &norm_path, 60)
+                .await
+        {
+            let others_str = same_dir_peers
+                .iter()
+                .map(|(_, h)| format!("@{h}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let msg = format!(
+                "Conflict Radar: @{handle} and {others_str} both edited `{norm_path}` in the same directory (`{}`). Coordinate via `message_peer` / `workspace_board` or fork one peer into a worktree.",
+                agent.cwd
+            );
+            if let Ok(ev) = self.store.append_workspace_event(
+                &agent.workspace_id,
+                Some(agent_id),
+                Some(handle),
+                WorkspaceEventKind::ConflictWarning,
+                &msg,
+                Some(&norm_path),
+            ) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
+            }
+            if let Ok(notice_ev) = self.store.append_timeline_event(
+                agent_id,
+                1,
+                None,
+                TimelinePayload::Notice {
+                    level: "warning".into(),
+                    message: msg.clone(),
+                },
+            ) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::TimelineLive(notice_ev));
+            }
+            self.send_conflict_steer_if_active(agent_id, msg.clone())
+                .await;
+            for (other_id, _) in &same_dir_peers {
+                self.send_conflict_steer_if_active(other_id, msg.clone())
+                    .await;
+            }
         }
-        if let Ok(notice_ev) = self.store.append_timeline_event(
-            agent_id,
-            1,
-            None,
-            TimelinePayload::Notice {
-                level: "warning".into(),
-                message: msg,
-            },
-        ) {
-            let _ = self
-                .broadcast_tx
-                .send(DaemonBroadcast::TimelineLive(notice_ev));
+
+        if !cross_wt_peers.is_empty()
+            && self
+                .check_conflict_cooldown(&agent.workspace_id, &format!("xwt:{norm_path}"), 120)
+                .await
+        {
+            let others_str = cross_wt_peers
+                .iter()
+                .map(|(_, h)| format!("@{h}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let msg = format!(
+                "Cross-worktree conflict heads-up: @{handle} and {others_str} both edited `{norm_path}` in separate checkouts. Align contracts on `workspace_board` and merge with `handoff_worktree(allow_three_way_conflicts=true)`."
+            );
+            if let Ok(ev) = self.store.append_workspace_event(
+                &agent.workspace_id,
+                Some(agent_id),
+                Some(handle),
+                WorkspaceEventKind::ConflictWarning,
+                &msg,
+                Some(&norm_path),
+            ) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
+            }
+            self.send_conflict_steer_if_active(agent_id, msg.clone())
+                .await;
+            for (other_id, _) in &cross_wt_peers {
+                self.send_conflict_steer_if_active(other_id, msg.clone())
+                    .await;
+            }
         }
     }
 
@@ -4665,12 +4946,22 @@ impl AgentOrchestrator {
         );
 
         let shim_after_seq = if reattach_existing_shim {
-            self.store.get_agent_shim_cursor(&summary.agent_id)
+            match self.store.get_agent_shim_cursor(&summary.agent_id) {
+                Some(seq) => Some(seq),
+                // If we are reattaching to an existing shim whose cursor was never persisted
+                // (e.g. daemon crashed/SIGKILLed before flushing or agent predated cursor tracking),
+                // and this agent already has persisted timeline history, tail from the shim's
+                // latest seq (`u64::MAX`) instead of replaying the entire 512-frame ring buffer.
+                None if summary.latest_seq > 0 => Some(u64::MAX),
+                None => None,
+            }
         } else {
             let _ = self.store.clear_agent_shim_cursor(&summary.agent_id);
             None
         };
-        let shim_seq_tracker = Arc::new(AtomicU64::new(shim_after_seq.unwrap_or(0)));
+        let shim_seq_tracker = Arc::new(AtomicU64::new(
+            shim_after_seq.filter(|&seq| seq < u64::MAX).unwrap_or(0),
+        ));
         let persisted_active_turn_id = if reattach_existing_shim {
             match &summary.status {
                 AgentStatus::Running { turn_id } => Some(turn_id.clone()),
@@ -4679,6 +4970,13 @@ impl AgentOrchestrator {
         } else {
             None
         };
+        if !reattach_existing_shim && resume_session_id.is_none() {
+            self.roster_states.write().await.remove(&summary.agent_id);
+            self.injected_rule_hashes
+                .write()
+                .await
+                .remove(&summary.agent_id);
+        }
         let persisted_turn_step_seq = persisted_active_turn_id
             .as_deref()
             .map(|tid| self.store.max_turn_segment_step(&summary.agent_id, tid))
@@ -5563,12 +5861,14 @@ impl AgentOrchestrator {
             }
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
 
-            if ag_settled
-                && let Some(ref parent_id) = ag_parent_id
-                && let Some(timers) = self.conditional_timers().await
-            {
-                let all_settled = self.are_all_subagents_settled(parent_id);
-                timers.notify_subagent_settled(parent_id, all_settled).await;
+            if ag_settled && let Some(timers) = self.conditional_timers().await {
+                if let Some(ref parent_id) = ag_parent_id {
+                    let all_settled = self.are_all_subagents_settled(parent_id);
+                    timers.notify_subagent_settled(parent_id, all_settled).await;
+                }
+                if !ag_bg && !ag_is_subagent {
+                    timers.notify_workspace_peer_settled(&ws_id, agent_id).await;
+                }
             }
 
             if finished_idle && !ag_bg {
@@ -7254,6 +7554,7 @@ mod fast_mode_orchestrator_tests {
         let bad = orch
             .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
                 workspace_id: local_ws.workspace_id.clone(),
+                source_agent_id: None,
                 direction: WorktreeHandoffDirection::LocalToWorktree,
                 mode: WorktreeHandoffMode::Move,
                 target_workspace_id: None,
@@ -7268,6 +7569,7 @@ mod fast_mode_orchestrator_tests {
         let outcome = orch
             .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
                 workspace_id: local_ws.workspace_id.clone(),
+                source_agent_id: None,
                 direction: WorktreeHandoffDirection::LocalToWorktree,
                 mode: WorktreeHandoffMode::Move,
                 target_workspace_id: None,
@@ -7361,6 +7663,7 @@ mod fast_mode_orchestrator_tests {
         let err = orch
             .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
                 workspace_id: local_ws.workspace_id.clone(),
+                source_agent_id: None,
                 direction: WorktreeHandoffDirection::LocalToWorktree,
                 mode: WorktreeHandoffMode::Move,
                 target_workspace_id: None,
@@ -7806,6 +8109,306 @@ mod fast_mode_orchestrator_tests {
         assert!(live_fail_cfg.exists());
         assert!(arch_pid_cfg.exists());
         assert!(!dead_cfg.exists());
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn peer_worktree_handoff_resolves_agent_worktree_and_serializes_concurrent_merges() {
+        let root = std::env::temp_dir().join(format!("orbit_peer_wt_merge_{}", Uuid::new_v4()));
+        let repo_dir = root.join("repo");
+        let wt_a = root.join("wt-a");
+        let wt_b = root.join("wt-b");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "core.autocrlf", "false"],
+            vec!["config", "user.email", "test@orbit.local"],
+            vec!["config", "user.name", "Orbit Test"],
+        ] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git init/config");
+            assert!(st.success());
+        }
+        std::fs::write(repo_dir.join("shared.txt"), "line1\nline2\nline3\n")
+            .expect("write shared.txt");
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "init"]] {
+            let st = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git commit");
+            assert!(st.success());
+        }
+        for (wt, br) in [(&wt_a, "feat/a"), (&wt_b, "feat/b")] {
+            let st = tokio::process::Command::new("git")
+                .args(["worktree", "add", "-q", "-b", br])
+                .arg(wt)
+                .arg("main")
+                .current_dir(&repo_dir)
+                .status()
+                .await
+                .expect("git worktree add");
+            assert!(st.success());
+        }
+
+        let (home_dir, store, orch) = test_orchestrator("peer_wt_handoff").await;
+        let ws = orch
+            .ensure_workspace(repo_dir.to_str().expect("utf8"), None, None, None)
+            .await
+            .expect("ensure workspace");
+        let _ = store.set_workspace_curated(&ws.workspace_id, true);
+
+        let now = Utc::now();
+        for (aid, handle, wt) in [("ag_wt_a", "feat_a", &wt_a), ("ag_wt_b", "feat_b", &wt_b)] {
+            let mut labels = HashMap::new();
+            labels.insert(
+                "orbit.worktree_source_cwd".to_string(),
+                repo_dir.to_string_lossy().to_string(),
+            );
+            store
+                .upsert_agent(
+                    &AgentSummary {
+                        agent_id: aid.into(),
+                        workspace_id: ws.workspace_id.clone(),
+                        cwd: wt.to_string_lossy().to_string(),
+                        title: handle.into(),
+                        provider: ProviderKind::ClaudeCode,
+                        model: None,
+                        effort: None,
+                        fast_mode: false,
+                        mode: SessionMode::FullAccess,
+                        status: AgentStatus::Idle,
+                        parent_agent_id: None,
+                        parent_host_id: None,
+                        latest_seq: 0,
+                        timeline_epoch: 0,
+                        created_at: now,
+                        updated_at: now,
+                        archived_at: None,
+                        background: false,
+                        auto_archive: false,
+                        profile_id: None,
+                        labels,
+                        attention: AttentionState::None,
+                        last_activity_at: Some(now),
+                        queued_prompts: Vec::new(),
+                        read_seq: 0,
+                        is_pinned: false,
+                        pinned_order: 0,
+                        handle: Some(handle.into()),
+                        cluster_suggestion: None,
+                        task_summary: None,
+                        forked_from_agent_id: None,
+                        forked_at_seq: None,
+                        acp_agent_id: None,
+                    },
+                    None,
+                )
+                .expect("upsert peer");
+        }
+
+        std::fs::write(wt_a.join("shared.txt"), "line1\nfrom-peer-a\nline3\n").expect("wt_a edit");
+        std::fs::write(wt_a.join("a.txt"), "from-a\n").expect("wt_a a.txt");
+        std::fs::write(wt_b.join("shared.txt"), "line1\nfrom-peer-b\nline3\n").expect("wt_b edit");
+        std::fs::write(wt_b.join("b.txt"), "from-b\n").expect("wt_b b.txt");
+
+        let preview_a = orch
+            .preview_worktree_handoff_with_agent(
+                &ws.workspace_id,
+                Some("ag_wt_a"),
+                WorktreeHandoffDirection::WorktreeToLocal,
+                None,
+                true,
+            )
+            .await
+            .expect("preview peer a");
+        assert!(preview_a.can_apply_cleanly);
+        assert_eq!(preview_a.files.len(), 2);
+
+        let (res_a, res_b) = tokio::join!(
+            orch.execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                workspace_id: ws.workspace_id.clone(),
+                source_agent_id: Some("ag_wt_a".into()),
+                direction: WorktreeHandoffDirection::WorktreeToLocal,
+                mode: WorktreeHandoffMode::Apply,
+                target_workspace_id: None,
+                include_committed: true,
+                branch: None,
+                allow_three_way_conflicts: true,
+            }),
+            orch.execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
+                workspace_id: ws.workspace_id.clone(),
+                source_agent_id: Some("ag_wt_b".into()),
+                direction: WorktreeHandoffDirection::WorktreeToLocal,
+                mode: WorktreeHandoffMode::Apply,
+                target_workspace_id: None,
+                include_committed: true,
+                branch: None,
+                allow_three_way_conflicts: true,
+            }),
+        );
+        let out_a = res_a.expect("peer a handoff succeeds");
+        let out_b = res_b.expect("peer b handoff succeeds");
+
+        assert!(repo_dir.join("a.txt").exists(), "a.txt must land in local");
+        assert!(repo_dir.join("b.txt").exists(), "b.txt must land in local");
+        assert!(
+            out_a.had_conflicts || out_b.had_conflicts,
+            "second overlapping handoff must report had_conflicts=true"
+        );
+        let shared = std::fs::read_to_string(repo_dir.join("shared.txt")).expect("read shared");
+        assert!(
+            shared.contains("<<<<<<<") && shared.contains(">>>>>>>"),
+            "overlapping concurrent handoff must leave 3-way conflict markers: {shared}"
+        );
+
+        orch.shutdown_worktree_pool().await;
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn conflict_radar_warns_cross_worktree_and_never_wakes_idle_peers() {
+        let (home_dir, store, orch) = test_orchestrator("cr_xwt").await;
+        let sent: Arc<tokio::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sent_cb = Arc::clone(&sent);
+        let dispatcher: crate::messaging::DispatchCallback = Arc::new(move |batch| {
+            let sent_cb = Arc::clone(&sent_cb);
+            Box::pin(async move {
+                sent_cb
+                    .lock()
+                    .await
+                    .push((batch.recipient_id, batch.wire_prompt));
+                Ok(())
+            })
+        });
+        let delivery = crate::messaging::AgentMessageDelivery::new(Duration::ZERO, dispatcher);
+        orch.set_message_delivery(delivery).await;
+
+        let dir_a = home_dir.join("wt_a");
+        let dir_b = home_dir.join("wt_b");
+        std::fs::create_dir_all(&dir_a).expect("mkdir a");
+        std::fs::create_dir_all(&dir_b).expect("mkdir b");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_cr".into(),
+                title: "Radar Test".into(),
+                cwd: dir_a.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: true,
+            })
+            .expect("upsert ws");
+
+        for (aid, handle, cwd, status) in [
+            ("ag_cr_idle", "idle-dev", &dir_a, AgentStatus::Idle),
+            (
+                "ag_cr_run",
+                "run_dev",
+                &dir_b,
+                AgentStatus::Running {
+                    turn_id: "t1".into(),
+                },
+            ),
+        ] {
+            store
+                .upsert_agent(
+                    &AgentSummary {
+                        agent_id: aid.into(),
+                        workspace_id: "ws_cr".into(),
+                        cwd: cwd.to_string_lossy().to_string(),
+                        title: handle.into(),
+                        provider: ProviderKind::ClaudeCode,
+                        model: None,
+                        effort: None,
+                        fast_mode: false,
+                        mode: SessionMode::FullAccess,
+                        status,
+                        parent_agent_id: None,
+                        parent_host_id: None,
+                        latest_seq: 0,
+                        timeline_epoch: 0,
+                        created_at: now,
+                        updated_at: now,
+                        archived_at: None,
+                        background: false,
+                        auto_archive: false,
+                        profile_id: None,
+                        labels: HashMap::new(),
+                        attention: AttentionState::None,
+                        last_activity_at: Some(now),
+                        queued_prompts: Vec::new(),
+                        read_seq: 0,
+                        is_pinned: false,
+                        pinned_order: 0,
+                        handle: Some(handle.into()),
+                        cluster_suggestion: None,
+                        task_summary: None,
+                        forked_from_agent_id: None,
+                        forked_at_seq: None,
+                        acp_agent_id: None,
+                    },
+                    None,
+                )
+                .expect("upsert agent");
+        }
+
+        let resolved_underscore = orch
+            .resolve_peer_in_workspace("ws_cr", "idle_dev")
+            .expect("resolve underscore alias")
+            .expect("peer exists");
+        assert_eq!(resolved_underscore.agent_id, "ag_cr_idle");
+
+        orch.record_file_edit_and_check_conflict("ag_cr_idle", "src/api.rs")
+            .await;
+        orch.record_file_edit_and_check_conflict("ag_cr_run", "src/api.rs")
+            .await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let events = store
+            .list_workspace_events("ws_cr", 20)
+            .expect("list events");
+        assert!(
+            events.iter().any(|ev| {
+                ev.kind == orbit_protocol::WorkspaceEventKind::ConflictWarning
+                    && ev.summary.contains("Cross-worktree conflict heads-up")
+                    && ev.summary.contains("src/api.rs")
+            }),
+            "Cross-worktree conflict warning must be logged: {events:?}"
+        );
+
+        let delivered = sent.lock().await;
+        assert!(
+            !delivered.iter().any(|(id, _)| id == "ag_cr_idle"),
+            "Idle peer must NEVER be woken by Conflict Radar"
+        );
+        assert!(
+            delivered.iter().any(|(id, body)| {
+                id == "ag_cr_run" && body.contains("Cross-worktree conflict heads-up")
+            }),
+            "Running peer should receive active Conflict Radar steer: {delivered:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&home_dir);
     }

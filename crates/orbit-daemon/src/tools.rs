@@ -1,8 +1,9 @@
-//! Transport-neutral Orbit Orchestration Tool Catalog (~39 tools).
+//! Transport-neutral Orbit Orchestration Tool Catalog.
 //!
 //! Exposed to agents via the built-in MCP Server (`POST /mcp/agents`) and `orbit mcp` stdio bridge.
-//! Handles caller identity resolution, per-profile tool policies, idempotency receipts,
-//! durable finish subscriptions, and single-hop cross-host delegation.
+//! Exposes a compact Core Pack (11 tools) plus startup-locked optional Capability Packs (up to 18
+//! total composite tools in `tools/list`) to minimize LLM context overhead and preserve prompt cache
+//! prefixes, while keeping 100% backward compatibility in `execute_tool` for all legacy tool names.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,10 +12,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentMessageKind, ArtifactKind, BestOfNCandidateSpec, BrowserActionRequest,
-    DagStepSpec, ForkTarget, McpToolPolicy, MonitorKind, ProviderKind, ReasoningEffort,
-    ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode, TimelinePayload,
-    ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection,
-    WorktreeHandoffMode,
+    DagStepSpec, ForkTarget, McpToolPack, McpToolPolicy, MonitorKind, ProviderKind,
+    ReasoningEffort, ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode,
+    TimelinePayload, ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode,
+    WorktreeHandoffDirection, WorktreeHandoffMode,
 };
 use orbit_store::{ReceiptOutcome, UpsertArtifactInput};
 use serde_json::{Value, json};
@@ -34,11 +35,19 @@ use crate::workflows::{
     validate_mcp_verify_command,
 };
 
+pub const LABEL_MCP_PACKS: &str = "orbit.mcp_packs";
+
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
+}
+
+#[derive(Debug, Clone)]
+struct PackToolDefinition {
+    pack: McpToolPack,
+    def: ToolDefinition,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +77,139 @@ impl ToolExecResult {
     }
 }
 
+/// Fast deterministic check whether an initial prompt requests browser/web interaction.
+pub fn prompt_mentions_browser(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    [
+        "browser",
+        "screenshot",
+        "webpage",
+        "e2e",
+        "playwright",
+        "cdp",
+        "dom ",
+        "浏览器",
+        "截图",
+        "网页",
+        "打开页面",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw) || prompt.contains(kw))
+}
+
+/// Determine which MCP capability packs should be locked for a newly launched agent session.
+///
+/// The returned pack list is persisted on the agent at launch and kept immutable for the lifetime
+/// of the session so `tools/list` never mutates mid-conversation (protecting LLM prompt caches).
+pub fn detect_startup_mcp_packs(
+    initial_prompt: &str,
+    is_subagent: bool,
+    has_browser_binary: bool,
+) -> Vec<McpToolPack> {
+    let mut packs = vec![McpToolPack::Core];
+    let lower = initial_prompt.to_ascii_lowercase();
+    let has_any = |kws: &[&str]| {
+        kws.iter()
+            .any(|kw| lower.contains(kw) || initial_prompt.contains(kw))
+    };
+
+    if has_browser_binary && prompt_mentions_browser(initial_prompt) {
+        packs.push(McpToolPack::Browser);
+    }
+    if has_any(&[
+        "cron",
+        "schedule",
+        "heartbeat",
+        "recurring",
+        "定时",
+        "每天",
+        "每小时",
+        "周期",
+    ]) {
+        packs.push(McpToolPack::Schedules);
+    }
+    if !is_subagent
+        && has_any(&[
+            "batch",
+            "csv",
+            "fanout",
+            "dag",
+            "workflow",
+            "best-of-n",
+            "best_of_n",
+            "arena",
+            "工作流",
+            "流水线",
+            "批量",
+        ])
+    {
+        packs.push(McpToolPack::Workflows);
+    }
+    if has_any(&[
+        "/goal",
+        "autonomous goal",
+        "start_goal",
+        "monitor",
+        "log_file_tail",
+        "http_health",
+        "健康检查",
+        "监控",
+    ]) {
+        packs.push(McpToolPack::Goals);
+    }
+    if has_any(&[
+        "pty",
+        "detached terminal",
+        "interactive terminal",
+        "离屏终端",
+        "虚拟终端",
+    ]) {
+        packs.push(McpToolPack::Terminals);
+    }
+    if has_any(&[
+        "artifact",
+        "mermaid",
+        "svg",
+        "mcp_app",
+        "mcp app",
+        "可视化产物",
+        "交互图表",
+    ]) {
+        packs.push(McpToolPack::Artifacts);
+    }
+    if has_any(&[
+        "lsp",
+        "goto definition",
+        "go to definition",
+        "workspace symbol",
+        "diagnostics",
+        "语言服务",
+        "符号跳转",
+    ]) {
+        packs.push(McpToolPack::Lsp);
+    }
+    packs
+}
+
+pub fn format_mcp_packs_label(packs: &[McpToolPack]) -> String {
+    packs.iter().map(|p| p.slug()).collect::<Vec<_>>().join(",")
+}
+
+pub fn parse_mcp_packs_label(raw: &str) -> Vec<McpToolPack> {
+    let mut packs = Vec::new();
+    for part in raw.split(',') {
+        if let Some(p) = McpToolPack::parse_slug(part)
+            && !packs.contains(&p)
+        {
+            packs.push(p);
+        }
+    }
+    if !packs.contains(&McpToolPack::Core) {
+        packs.insert(0, McpToolPack::Core);
+    }
+    packs
+}
+
 /// Resolve the effective `McpToolPolicy` for an optional calling agent.
 pub fn resolve_caller_policy(
     runtime: &DaemonRuntime,
@@ -91,15 +233,269 @@ pub fn resolve_caller_policy(
         .unwrap_or_default()
 }
 
+pub fn resolve_effective_packs(
+    runtime: &DaemonRuntime,
+    caller_agent_id: Option<&str>,
+    policy: &McpToolPolicy,
+) -> Vec<McpToolPack> {
+    if !policy.enabled {
+        return Vec::new();
+    }
+    let base: Vec<McpToolPack> = if let Some(ref explicit) = policy.enabled_packs {
+        explicit.clone()
+    } else if let Some(cid) = caller_agent_id {
+        if let Some(agent) = runtime.store.get_agent(cid).ok().flatten() {
+            if let Some(raw_packs) = agent.labels.get(LABEL_MCP_PACKS) {
+                parse_mcp_packs_label(raw_packs)
+            } else {
+                vec![McpToolPack::Core]
+            }
+        } else {
+            vec![McpToolPack::Core]
+        }
+    } else {
+        // External MCP clients (no caller_agent_id) see the full 18-tool catalog unless disabled.
+        McpToolPack::ALL.to_vec()
+    };
+
+    let mut out = Vec::with_capacity(base.len());
+    for pack in base {
+        if !policy.disabled_packs.contains(&pack) && !out.contains(&pack) {
+            out.push(pack);
+        }
+    }
+    out
+}
+
 pub fn list_tool_definitions(policy: &McpToolPolicy) -> Vec<ToolDefinition> {
     if !policy.enabled {
         return Vec::new();
     }
-    all_tool_definitions()
+    let allowed_packs: Vec<McpToolPack> = policy
+        .enabled_packs
+        .as_deref()
+        .unwrap_or(&McpToolPack::ALL)
+        .iter()
+        .copied()
+        .filter(|p| !policy.disabled_packs.contains(p))
+        .collect();
+    pack_tool_definitions()
         .into_iter()
-        .filter(|t| !policy.disabled_tools.iter().any(|d| d == t.name))
+        .filter(|entry| {
+            allowed_packs.contains(&entry.pack)
+                && !policy.disabled_tools.iter().any(|d| d == entry.def.name)
+        })
+        .map(|entry| entry.def)
         .collect()
 }
+
+pub fn list_tool_definitions_for_caller(
+    runtime: &DaemonRuntime,
+    caller_agent_id: Option<&str>,
+    policy: &McpToolPolicy,
+) -> Vec<ToolDefinition> {
+    if !policy.enabled {
+        return Vec::new();
+    }
+    let packs = resolve_effective_packs(runtime, caller_agent_id, policy);
+    pack_tool_definitions()
+        .into_iter()
+        .filter(|entry| {
+            packs.contains(&entry.pack)
+                && !policy.disabled_tools.iter().any(|d| d == entry.def.name)
+        })
+        .map(|entry| entry.def)
+        .collect()
+}
+
+fn tool_pack_for_canonical_name(canonical_name: &str) -> McpToolPack {
+    match canonical_name {
+        "browser_open" | "browser_snapshot" | "browser_screenshot" | "browser_click"
+        | "browser_type" | "browser_scroll" | "browser_close" | "orbit_browser" => {
+            McpToolPack::Browser
+        }
+        "create_schedule" | "list_schedules" | "inspect_schedule" | "pause_schedule"
+        | "resume_schedule" | "update_schedule" | "schedule_logs" | "run_schedule_once"
+        | "delete_schedule" | "create_heartbeat" | "delete_heartbeat" | "orbit_schedule" => {
+            McpToolPack::Schedules
+        }
+        "run_batch_fanout"
+        | "run_dag_workflow"
+        | "run_best_of_n"
+        | "get_workflow_status"
+        | "cancel_workflow"
+        | "orbit_workflow" => McpToolPack::Workflows,
+        "start_goal"
+        | "update_goal_progress"
+        | "complete_goal"
+        | "start_monitor"
+        | "stop_monitor"
+        | "orbit_goal" => McpToolPack::Goals,
+        "list_terminals" | "create_terminal" | "capture_terminal" | "send_terminal_keys"
+        | "kill_terminal" | "orbit_terminal" => McpToolPack::Terminals,
+        "publish_artifact" | "list_artifacts" | "read_artifact" | "delete_artifact"
+        | "orbit_artifact" => McpToolPack::Artifacts,
+        "lsp_diagnostics" | "lsp_symbols" | "lsp_goto_definition" | "orbit_lsp" => McpToolPack::Lsp,
+        _ => McpToolPack::Core,
+    }
+}
+
+fn resolve_composite_dispatch(name: &str, args: &Value) -> anyhow::Result<&'static str> {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase());
+    let req_action = || {
+        action
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing required parameter `action` for `{name}`"))
+    };
+
+    match name {
+        "workspace_peers" => {
+            if opt_str(args, "handle").is_some() {
+                Ok("read_peer_context")
+            } else {
+                Ok("workspace_peers")
+            }
+        }
+        "workspace_board" => {
+            let act = action.as_deref().unwrap_or_else(|| {
+                if args.get("content").and_then(|v| v.as_str()).is_some() {
+                    "update"
+                } else {
+                    "read"
+                }
+            });
+            match act {
+                "read" => Ok("workspace_board_read"),
+                "update" | "write" => Ok("workspace_board_update"),
+                other => anyhow::bail!("unsupported `workspace_board` action `{other}`"),
+            }
+        }
+        "orbit_agent" => match req_action()? {
+            "list" => Ok("list_agents"),
+            "status" => Ok("get_agent_status"),
+            "activity" => Ok("get_agent_activity"),
+            "fork" => Ok("fork_agent"),
+            "update" => Ok("update_agent"),
+            "set_mode" | "mode" => Ok("set_agent_mode"),
+            "cancel" | "interrupt" => Ok("cancel_agent"),
+            "archive" => Ok("archive_agent"),
+            "kill" | "delete" => Ok("kill_agent"),
+            "move_workspace" | "move" => Ok("move_agent_to_workspace"),
+            other => anyhow::bail!("unsupported `orbit_agent` action `{other}`"),
+        },
+        "orbit_workspace" => match req_action()? {
+            "create" => Ok("create_workspace"),
+            "list" => Ok("list_workspaces"),
+            "rename" => Ok("rename_workspace"),
+            "archive" => Ok("archive_workspace"),
+            "list_scripts" => Ok("list_workspace_scripts"),
+            "start_script" => Ok("start_workspace_script"),
+            "stop_script" => Ok("stop_workspace_script"),
+            other => anyhow::bail!("unsupported `orbit_workspace` action `{other}`"),
+        },
+        "orbit_timer" => match req_action()? {
+            "create" => Ok("create_timer"),
+            "list" => Ok("list_timers"),
+            "cancel" => Ok("cancel_timer"),
+            other => anyhow::bail!("unsupported `orbit_timer` action `{other}`"),
+        },
+        "orbit_control" => match req_action()? {
+            "list_profiles" | "profiles" => Ok("list_profiles"),
+            "list_providers" | "providers" => Ok("list_providers"),
+            "list_models" | "models" => Ok("list_models"),
+            "list_hosts" | "hosts" => Ok("list_hosts"),
+            "list_pending_permissions" | "list_permissions" | "permissions" => {
+                Ok("list_pending_permissions")
+            }
+            "respond_permission" | "respond_to_permission" => Ok("respond_to_permission"),
+            other => anyhow::bail!("unsupported `orbit_control` action `{other}`"),
+        },
+        "orbit_browser" => match req_action()? {
+            "open" => Ok("browser_open"),
+            "snapshot" => Ok("browser_snapshot"),
+            "screenshot" => Ok("browser_screenshot"),
+            "click" => Ok("browser_click"),
+            "type" => Ok("browser_type"),
+            "scroll" => Ok("browser_scroll"),
+            "close" => Ok("browser_close"),
+            other => anyhow::bail!("unsupported `orbit_browser` action `{other}`"),
+        },
+        "orbit_schedule" => match req_action()? {
+            "create" => Ok("create_schedule"),
+            "list" => Ok("list_schedules"),
+            "inspect" => Ok("inspect_schedule"),
+            "update" => Ok("update_schedule"),
+            "pause" => Ok("pause_schedule"),
+            "resume" => Ok("resume_schedule"),
+            "run_once" => Ok("run_schedule_once"),
+            "logs" => Ok("schedule_logs"),
+            "delete" => Ok("delete_schedule"),
+            "create_heartbeat" | "heartbeat_add" => Ok("create_heartbeat"),
+            "delete_heartbeat" | "heartbeat_delete" => Ok("delete_heartbeat"),
+            other => anyhow::bail!("unsupported `orbit_schedule` action `{other}`"),
+        },
+        "orbit_workflow" => match req_action()? {
+            "batch_fanout" | "batch" => Ok("run_batch_fanout"),
+            "dag" => Ok("run_dag_workflow"),
+            "best_of_n" => Ok("run_best_of_n"),
+            "status" => Ok("get_workflow_status"),
+            "cancel" => Ok("cancel_workflow"),
+            other => anyhow::bail!("unsupported `orbit_workflow` action `{other}`"),
+        },
+        "orbit_goal" => match req_action()? {
+            "start_goal" | "start" => Ok("start_goal"),
+            "update_goal" | "update_goal_progress" | "update" => Ok("update_goal_progress"),
+            "complete_goal" | "complete" => Ok("complete_goal"),
+            "start_monitor" => Ok("start_monitor"),
+            "stop_monitor" => Ok("stop_monitor"),
+            other => anyhow::bail!("unsupported `orbit_goal` action `{other}`"),
+        },
+        "orbit_terminal" => match req_action()? {
+            "list" => Ok("list_terminals"),
+            "create" => Ok("create_terminal"),
+            "capture" => Ok("capture_terminal"),
+            "send_keys" | "keys" => Ok("send_terminal_keys"),
+            "kill" => Ok("kill_terminal"),
+            other => anyhow::bail!("unsupported `orbit_terminal` action `{other}`"),
+        },
+        "orbit_artifact" => match req_action()? {
+            "publish" => Ok("publish_artifact"),
+            "list" => Ok("list_artifacts"),
+            "read" => Ok("read_artifact"),
+            "delete" => Ok("delete_artifact"),
+            other => anyhow::bail!("unsupported `orbit_artifact` action `{other}`"),
+        },
+        "orbit_lsp" => match req_action()? {
+            "diagnostics" => Ok("lsp_diagnostics"),
+            "symbols" => Ok("lsp_symbols"),
+            "goto_definition" => Ok("lsp_goto_definition"),
+            other => anyhow::bail!("unsupported `orbit_lsp` action `{other}`"),
+        },
+        _ => Ok(""),
+    }
+}
+
+#[derive(Debug)]
+struct BoardCasConflictError {
+    expected: u64,
+    current_board: orbit_protocol::WorkspaceBoardSnapshot,
+}
+
+impl std::fmt::Display for BoardCasConflictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "board_revision_conflict: expected revision {} but current revision is {}",
+            self.expected, self.current_board.revision
+        )
+    }
+}
+
+impl std::error::Error for BoardCasConflictError {}
 
 /// Execute any Orbit orchestration tool by name with caller scoping & policy checks.
 pub async fn execute_tool(
@@ -115,9 +511,51 @@ pub async fn execute_tool(
         ));
     }
 
-    match execute_tool_inner(runtime, caller_agent_id, name, &args).await {
+    let resolved = match resolve_composite_dispatch(name, &args) {
+        Ok("") => name.to_string(),
+        Ok(mapped) => mapped.to_string(),
+        Err(e) => return ToolExecResult::err(e.to_string()),
+    };
+
+    if policy.disabled_tools.iter().any(|d| d == &resolved) {
+        return ToolExecResult::err(format!(
+            "tool `{resolved}` is disabled by this agent's profile policy"
+        ));
+    }
+    let pack = tool_pack_for_canonical_name(&resolved);
+    if policy.disabled_packs.contains(&pack)
+        || policy
+            .enabled_packs
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&pack))
+    {
+        return ToolExecResult::err(format!(
+            "tool pack `{}` for `{resolved}` is disabled by this agent's profile policy",
+            pack.slug()
+        ));
+    }
+
+    match execute_tool_inner(runtime, caller_agent_id, &resolved, &args).await {
         Ok(val) => ToolExecResult::ok(val),
-        Err(e) => ToolExecResult::err(e.to_string()),
+        Err(e) => {
+            if let Some(cas_err) = e.downcast_ref::<BoardCasConflictError>() {
+                let structured = json!({
+                    "error": cas_err.to_string(),
+                    "conflict": true,
+                    "expected_revision": cas_err.expected,
+                    "current_revision": cas_err.current_board.revision,
+                    "current_board": cas_err.current_board,
+                });
+                let text =
+                    serde_json::to_string_pretty(&structured).unwrap_or_else(|_| e.to_string());
+                return ToolExecResult {
+                    is_error: true,
+                    structured,
+                    text,
+                };
+            }
+            ToolExecResult::err(e.to_string())
+        }
     }
 }
 
@@ -906,9 +1344,55 @@ async fn execute_tool_inner(
         }
 
         "handoff_worktree" => {
-            let workspace_id = opt_str(args, "workspace_id")
+            let requested_ws_id = opt_str(args, "workspace_id");
+            let requested_agent = opt_str(args, "agent_id");
+            let fallback_ws_id = requested_ws_id
+                .clone()
+                .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()));
+
+            let resolved_agent_id: Option<String> = if let Some(ref raw_ag) = requested_agent {
+                if target_host.is_some() {
+                    Some(raw_ag.clone())
+                } else if let Ok(Some(exact)) = rt.store.get_agent(raw_ag) {
+                    Some(exact.agent_id)
+                } else if let Some(ref ws_ctx) = fallback_ws_id {
+                    let resolved = rt
+                        .orchestrator
+                        .resolve_peer_in_workspace(ws_ctx, raw_ag)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("peer `{raw_ag}` not found in workspace `{ws_ctx}`")
+                        })?;
+                    Some(resolved.agent_id)
+                } else {
+                    Some(raw_ag.clone())
+                }
+            } else if target_host.is_none()
+                && caller.as_ref().is_some_and(|c| {
+                    c.labels.contains_key("orbit.worktree_source_cwd")
+                        && requested_ws_id
+                            .as_deref()
+                            .is_none_or(|ws| ws == c.workspace_id)
+                })
+            {
+                caller_agent_id.map(ToOwned::to_owned)
+            } else {
+                None
+            };
+
+            let workspace_id = requested_ws_id
+                .or_else(|| {
+                    if target_host.is_none() {
+                        resolved_agent_id
+                            .as_deref()
+                            .and_then(|aid| rt.store.get_agent(aid).ok().flatten())
+                            .map(|a| a.workspace_id)
+                    } else {
+                        None
+                    }
+                })
                 .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
                 .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+
             let direction = match opt_str(args, "direction")
                 .as_deref()
                 .unwrap_or("worktree_to_local")
@@ -981,8 +1465,9 @@ async fn execute_tool_inner(
                     }
                 } else {
                     rt.orchestrator
-                        .preview_worktree_handoff(
+                        .preview_worktree_handoff_with_agent(
                             &workspace_id,
+                            resolved_agent_id.as_deref(),
                             direction,
                             target_workspace_id.as_deref(),
                             include_committed,
@@ -1027,6 +1512,7 @@ async fn execute_tool_inner(
                 rt.orchestrator
                     .execute_worktree_handoff(ExecuteWorktreeHandoffSpec {
                         workspace_id,
+                        source_agent_id: resolved_agent_id,
                         direction,
                         mode,
                         target_workspace_id,
@@ -1802,19 +2288,32 @@ async fn execute_tool_inner(
                 .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
             let content = str_arg(args, "content")?;
             let section = opt_str(args, "section");
+            let expected_revision = match args.get("expected_revision") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("`expected_revision` must be an integer"))?,
+                ),
+            };
             let updated_by = caller
                 .as_ref()
                 .and_then(|c| c.handle.clone())
                 .or_else(|| opt_str(args, "updated_by"))
                 .unwrap_or_else(|| "peer".into());
-            let board = rt.orchestrator.update_workspace_board(
+            match rt.orchestrator.update_workspace_board_cas(
                 &ws_id,
                 &content,
                 section.as_deref(),
+                expected_revision,
                 Some(&updated_by),
                 caller_agent_id,
-            )?;
-            Ok(json!({ "board": board }))
+            )? {
+                Ok(board) => Ok(json!({ "board": board })),
+                Err(current_board) => Err(anyhow::Error::new(BoardCasConflictError {
+                    expected: expected_revision.unwrap_or(0),
+                    current_board,
+                })),
+            }
         }
 
         "spawn_workspace_peer" => {
@@ -3829,1084 +4328,454 @@ fn summarize_timeline_event(ev: &orbit_protocol::TimelineEvent) -> Value {
     }
 }
 
-fn all_tool_definitions() -> Vec<ToolDefinition> {
+fn pack_tool_definitions() -> Vec<PackToolDefinition> {
     vec![
-        // --- Agents (10) ---
-        ToolDefinition {
-            name: "create_agent",
-            description: "Create and launch a new Orbit coding agent asynchronously (optionally inside a specific workspace, isolated git worktree, profile, or remote connected host). Automatically registers a durable finish notification back to the calling agent by default.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`, `acp`) or `provider/model` pair." },
-                    "acp_agent_id": { "type": "string", "description": "ACP agent ID from the host ACP registry (required when `provider` is `acp`)." },
-                    "model": { "type": "string" },
-                    "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
-                    "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
-                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
-                    "profile_id": { "type": "string", "description": "Optional saved profile ID or name from `list_profiles`." },
-                    "workspace_id": { "type": "string", "description": "Existing workspace ID from `create_workspace` or `list_workspaces`." },
-                    "cwd": { "type": "string", "description": "Working directory (defaults to caller's directory on local host)." },
-                    "worktree": { "type": "boolean", "description": "Create a fresh isolated git worktree for this agent." },
-                    "base_ref": { "type": "string" },
-                    "branch": { "type": "string" },
-                    "title": { "type": "string" },
-                    "initial_prompt": { "type": "string" },
-                    "background": { "type": "boolean" },
-                    "auto_archive": { "type": "boolean" },
-                    "notify_on_finish": { "type": "boolean", "default": true },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." },
-                    "idempotency_key": { "type": "string" }
-                },
-                "required": ["initial_prompt"]
-            }),
+        // ==================== CORE PACK (11 tools, compact schemas) ====================
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "workspace_peers",
+                description: "Inspect Mission Workspace sibling peers, Shared Blackboard revision, and recent events/conflicts; pass `handle` to peek a specific peer's edited files and recent entries without waking it.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_id": { "type": "string" },
+                        "handle": { "type": "string", "description": "Optional @handle or agent_id to inspect a single peer's context." },
+                        "limit": { "type": "integer", "default": 20 }
+                    }
+                }),
+            },
         },
-        ToolDefinition {
-            name: "fork_agent",
-            description: "Fork/branch an existing agent conversation into a new session (either in the same directory or inside a freshly created isolated git worktree), optionally truncating history at `up_to_seq`.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "source_agent_id": { "type": "string", "description": "Source agent ID to fork from (defaults to the calling agent)." },
-                    "up_to_seq": { "type": "integer", "description": "Optional timeline sequence upper bound (inclusive). Omit to fork the full conversation." },
-                    "worktree": { "type": "boolean", "description": "When true, creates a fresh isolated git worktree workspace for the branch." },
-                    "branch": { "type": "string", "description": "Optional git branch name when forking into a worktree." },
-                    "base_ref": { "type": "string", "description": "Optional git base ref when forking into a worktree." },
-                    "title": { "type": "string", "description": "Optional custom title for the forked conversation." },
-                    "initial_prompt": { "type": "string", "description": "Optional immediate follow-up prompt to dispatch on the forked branch." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "send_agent_prompt",
-            description: "Send a follow-up prompt or message to another agent by ID (supports steering a running turn, queueing, or interrupting, and optional finish notification).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "active_turn_behavior": { "type": "string", "enum": ["steer", "queue", "interrupt"], "default": "steer" },
-                    "session_mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
-                    "notify_on_finish": { "type": "boolean", "default": true },
-                    "host_id": { "type": "string" },
-                    "message_id": { "type": "string" }
-                },
-                "required": ["agent_id", "prompt"]
-            }),
-        },
-        ToolDefinition {
-            name: "get_agent_status",
-            description: "Inspect the latest status snapshot, pending permission requests, and last assistant summary of an agent.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["agent_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "get_agent_activity",
-            description: "Fetch a curated summary of recent timeline entries (messages, tool calls, status transitions) for an agent.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "since_seq": { "type": "integer" },
-                    "limit": { "type": "integer", "default": 40 },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["agent_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "list_agents",
-            description: "List managed Orbit agents on this host or a connected remote host.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "workspace_id": { "type": "string" },
-                    "cwd": { "type": "string" },
-                    "parent_agent_id": { "type": "string" },
-                    "include_archived": { "type": "boolean", "default": false },
-                    "include_background": { "type": "boolean", "default": false },
-                    "host_id": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "cancel_agent",
-            description: "Interrupt an agent's active turn while keeping its session alive for follow-up prompts.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["agent_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "archive_agent",
-            description: "Soft-archive an agent, closing its process and cascading to non-detached same-workspace children.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["agent_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "kill_agent",
-            description: "Terminate an agent's underlying provider runtime process immediately.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["agent_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "update_agent",
-            description: "Update an agent's title, model, reasoning effort, fast mode, session mode, or labels.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "title": { "type": "string" },
-                    "model": { "type": "string" },
-                    "effort": { "type": "string" },
-                    "fast_mode": { "type": "boolean", "description": "Toggle Fast output mode (lower latency, higher quota usage)." },
-                    "mode": { "type": "string" },
-                    "labels": { "type": "object" },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["agent_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "set_agent_mode",
-            description: "Switch an agent's permission/execution mode (`default`, `plan`, `accept_edits`, `full_access`).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "mode": { "type": "string" },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["agent_id", "mode"]
-            }),
-        },
-        // --- Workspaces & Scripts (7) ---
-        ToolDefinition {
-            name: "create_workspace",
-            description: "Create a local or git-worktree-isolated workspace (branch off, checkout existing branch, or checkout a PR) with `.worktreeinclude` copy and `orbit.json`/`paseo.json` setup hooks.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "source_cwd": { "type": "string" },
-                    "isolation": { "type": "string", "enum": ["local", "worktree"], "default": "local" },
-                    "worktree_mode": { "type": "string", "enum": ["branch_off", "checkout_branch", "checkout_pr"], "default": "branch_off" },
-                    "new_branch": { "type": "string" },
-                    "branch": { "type": "string" },
-                    "base_ref": { "type": "string" },
-                    "pr_number": { "type": "integer" },
-                    "title": { "type": "string" },
-                    "background": { "type": "boolean" },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["source_cwd"]
-            }),
-        },
-        ToolDefinition {
-            name: "list_workspaces",
-            description: "List active workspaces, their directories, branches, and isolation modes.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "include_archived": { "type": "boolean", "default": false },
-                    "include_background": { "type": "boolean", "default": false },
-                    "host_id": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "rename_workspace",
-            description: "Rename a workspace.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "workspace_id": { "type": "string" },
-                    "title": { "type": "string" }
-                },
-                "required": ["title"]
-            }),
-        },
-        ToolDefinition {
-            name: "archive_workspace",
-            description: "Archive a workspace and its sessions; runs teardown and deletes the managed git worktree once its final workspace is archived.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "workspace_id": { "type": "string" },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["workspace_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "handoff_worktree",
-            description: "Bidirectional Git Worktree <-> Local checkout sync/handoff (`apply` or `move`) with non-mutating conflict dry-run (`dry_run: true`) and automatic hidden Git backup ref creation (`refs/orbit/handoff-backup/...`).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "workspace_id": { "type": "string", "description": "Source workspace ID (defaults to calling agent's workspace)." },
-                    "direction": { "type": "string", "enum": ["worktree_to_local", "local_to_worktree"], "default": "worktree_to_local" },
-                    "mode": { "type": "string", "enum": ["apply", "move"], "default": "apply" },
-                    "target_workspace_id": { "type": "string", "description": "Optional explicit target workspace ID (omit for Local -> new worktree or Worktree -> primary local checkout)." },
-                    "include_committed": { "type": "boolean", "description": "Include worktree commits ahead of local HEAD when direction is `worktree_to_local`." },
-                    "branch": { "type": "string", "description": "Optional branch name when creating a new worktree for `local_to_worktree`." },
-                    "allow_three_way_conflicts": { "type": "boolean", "default": false, "description": "When true, falls back to `git apply --3way` and writes conflict markers if clean apply fails." },
-                    "dry_run": { "type": "boolean", "default": false, "description": "Preview changed files and conflicts without mutating disk." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "list_workspace_scripts",
-            description: "List scripts and long-running services configured in `orbit.json` / `paseo.json` along with live ports and `*.localhost` proxy URLs.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "workspace_id": { "type": "string" } }
-            }),
-        },
-        ToolDefinition {
-            name: "start_workspace_script",
-            description: "Start a configured workspace script or service through Orbit's managed launcher and reverse proxy.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "workspace_id": { "type": "string" },
-                    "script_name": { "type": "string" }
-                },
-                "required": ["workspace_id", "script_name"]
-            }),
-        },
-        ToolDefinition {
-            name: "stop_workspace_script",
-            description: "Stop a running workspace script or service.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "workspace_id": { "type": "string" },
-                    "script_name": { "type": "string" }
-                },
-                "required": ["workspace_id", "script_name"]
-            }),
-        },
-        // --- Terminals (5) ---
-        ToolDefinition {
-            name: "list_terminals",
-            description: "List active detached PTY terminal sessions.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "cwd": { "type": "string" } }
-            }),
-        },
-        ToolDefinition {
-            name: "create_terminal",
-            description: "Create a detached PTY terminal session (survives daemon restarts).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cwd": { "type": "string" },
-                    "title": { "type": "string" },
-                    "cols": { "type": "integer", "default": 120 },
-                    "rows": { "type": "integer", "default": 36 },
-                    "initial_command": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "capture_terminal",
-            description: "Capture clean plain-text screen output from a terminal session.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "terminal_id": { "type": "string" },
-                    "lines": { "type": "integer", "default": 200 }
-                },
-                "required": ["terminal_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "send_terminal_keys",
-            description: "Send text and/or special key tokens (`Enter`, `Ctrl+C`, `Tab`, `Esc`, `Up`, `Down`) to a terminal session.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "terminal_id": { "type": "string" },
-                    "text": { "type": "string" },
-                    "keys": { "type": "array", "items": { "type": "string" } }
-                },
-                "required": ["terminal_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "kill_terminal",
-            description: "Terminate a PTY terminal session.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "terminal_id": { "type": "string" } },
-                "required": ["terminal_id"]
-            }),
-        },
-        // --- Schedules & Heartbeats (11) ---
-        ToolDefinition {
-            name: "create_schedule",
-            description: "Create a cron schedule (supports 5-field cron or presets like `5m`, `1h`, `daily 09:00`) that launches a fresh agent on each trigger.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "cron": { "type": "string" },
-                    "timezone": { "type": "string", "description": "Optional IANA timezone (e.g. `Asia/Shanghai`, `America/New_York`) or fixed offset (e.g. `+08:00`). Defaults to host local timezone." },
-                    "prompt": { "type": "string" },
-                    "cwd": { "type": "string" },
-                    "workspace_id": { "type": "string" },
-                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `acp`)." },
-                    "acp_agent_id": { "type": "string", "description": "ACP agent ID from the host ACP registry (required when `provider` is `acp`)." },
-                    "model": { "type": "string" },
-                    "effort": { "type": "string" },
-                    "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
-                    "mode": { "type": "string" },
-                    "profile_id": { "type": "string" },
-                    "worktree": { "type": "boolean" },
-                    "base_ref": { "type": "string" },
-                    "max_runs": { "type": "integer" },
-                    "expires_at": { "type": "string" }
-                },
-                "required": ["name", "cron", "prompt"]
-            }),
-        },
-        ToolDefinition {
-            name: "list_schedules",
-            description: "List daemon-managed cron schedules and heartbeats.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "include_completed": { "type": "boolean", "default": false } }
-            }),
-        },
-        ToolDefinition {
-            name: "inspect_schedule",
-            description: "Inspect a schedule definition and its recent execution history.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "schedule_id": { "type": "string" } },
-                "required": ["schedule_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "pause_schedule",
-            description: "Pause an active cron schedule.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "schedule_id": { "type": "string" } },
-                "required": ["schedule_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "resume_schedule",
-            description: "Resume a paused cron schedule.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "schedule_id": { "type": "string" } },
-                "required": ["schedule_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "update_schedule",
-            description: "Update a schedule's name, cron cadence, prompt, max_runs, or expiration.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "schedule_id": { "type": "string" },
-                    "name": { "type": "string" },
-                    "cron": { "type": "string" },
-                    "timezone": { "type": "string", "description": "Optional IANA timezone (e.g. `Asia/Shanghai`, `America/New_York`) or fixed offset (e.g. `+08:00`)." },
-                    "prompt": { "type": "string" },
-                    "max_runs": { "type": "integer" },
-                    "expires_at": { "type": "string" }
-                },
-                "required": ["schedule_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "schedule_logs",
-            description: "Return recent execution records and summaries for a schedule.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "schedule_id": { "type": "string" },
-                    "limit": { "type": "integer", "default": 20 }
-                },
-                "required": ["schedule_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "run_schedule_once",
-            description: "Trigger one immediate run of a schedule without modifying its cron.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "schedule_id": { "type": "string" } },
-                "required": ["schedule_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "delete_schedule",
-            description: "Delete a schedule permanently.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "schedule_id": { "type": "string" } },
-                "required": ["schedule_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "create_heartbeat",
-            description: "Attach a recurring cron-backed wake-up prompt to the calling agent (or specified agent_id) to keep long tasks moving.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cron": { "type": "string", "description": "Cron expression or preset like `5m`, `10m`, `1h`." },
-                    "prompt": { "type": "string" },
-                    "name": { "type": "string" },
-                    "agent_id": { "type": "string" },
-                    "max_runs": { "type": "integer" },
-                    "expires_at": { "type": "string" }
-                },
-                "required": ["cron", "prompt"]
-            }),
-        },
-        ToolDefinition {
-            name: "delete_heartbeat",
-            description: "Delete an active heartbeat once a long-running task is complete.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "heartbeat_id": { "type": "string" },
-                    "schedule_id": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "create_timer",
-            description: "Arm a durable one-shot conditional wakeup timer (1..=86400s) that automatically cancels early if its condition is met (e.g. incoming message, subagents settling, or workspace file change).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "duration_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
-                    "prompt": { "type": "string", "description": "Wakeup prompt delivered to the agent if the timer elapses." },
-                    "condition": {
-                        "type": "string",
-                        "description": "Early-cancel condition: `never` (default), `any`, `all_subagents`, `sender:<agent_id>`, or `file:<relative_path>`."
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "message_peer",
+                description: "Send a collaborative message to a sibling peer by `@handle` or `all` in the same Mission Workspace (with optional finish notification).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "handle": { "type": "string", "description": "Peer @handle or `all`." },
+                        "message": { "type": "string" },
+                        "active_turn_behavior": { "type": "string", "enum": ["steer", "queue", "interrupt"], "default": "steer" },
+                        "notify_on_finish": { "type": "boolean", "default": true },
+                        "workspace_id": { "type": "string" }
                     },
-                    "agent_id": { "type": "string", "description": "Optional target agent ID (defaults to calling agent; required when `host_id` targets a remote host)." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["duration_seconds", "prompt"]
-            }),
+                    "required": ["handle", "message"]
+                }),
+            },
         },
-        ToolDefinition {
-            name: "list_timers",
-            description: "List armed (and optionally resolved) one-shot conditional timers on this host or a connected remote host.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "include_resolved": { "type": "boolean" },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                }
-            }),
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "workspace_board",
+                description: "Read or update the Mission Workspace Shared Blackboard (`BOARD.md`). Supports per-section upsert (`section`) and optimistic locking (`expected_revision` CAS).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["read", "update"], "default": "read" },
+                        "content": { "type": "string", "description": "Markdown body when action=update." },
+                        "section": { "type": "string", "description": "Optional `## Section` heading to upsert." },
+                        "expected_revision": { "type": "integer", "description": "Optional optimistic lock revision for CAS." },
+                        "workspace_id": { "type": "string" }
+                    }
+                }),
+            },
         },
-        ToolDefinition {
-            name: "cancel_timer",
-            description: "Manually cancel an armed one-shot conditional timer on this host or a connected remote host.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "timer_id": { "type": "string" },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["timer_id"]
-            }),
-        },
-        // --- Profiles / Discovery / Permissions / Hosts (6) ---
-        ToolDefinition {
-            name: "list_profiles",
-            description: "List saved Agent Profiles including `when_to_use` delegation guidance, provider, model, effort, and mode.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "host_id": { "type": "string" } }
-            }),
-        },
-        ToolDefinition {
-            name: "list_providers",
-            description: "List installed coding agent CLIs and supported modes on this host.",
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        ToolDefinition {
-            name: "list_models",
-            description: "List dynamically discovered models and reasoning-effort options for installed providers.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "provider": { "type": "string" },
-                    "host_id": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "list_pending_permissions",
-            description: "List currently pending tool permission approvals across managed agents.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "host_id": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "respond_to_permission",
-            description: "Approve or deny a pending tool permission request on a delegated child agent.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "request_id": { "type": "string" },
-                    "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["agent_id", "request_id", "decision"]
-            }),
-        },
-        ToolDefinition {
-            name: "list_hosts",
-            description: "List this daemon (`self`) and all connected remote Orbit hosts available for cross-machine delegation.",
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        // --- Mission Workspace Collaboration (7) ---
-        ToolDefinition {
-            name: "workspace_peers",
-            description: "Inspect your current Mission Workspace: list all sibling peers (@handles, providers, statuses, cwds, latest summaries), Shared Blackboard revision/path, and recent workspace events/conflicts.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "workspace_id": { "type": "string", "description": "Optional workspace ID (defaults to caller's Mission Workspace)." }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "message_peer",
-            description: "Send a direct collaborative message to a sibling peer in the same Mission Workspace by `@handle` (e.g. `reviewer`, `backend`) or `all` to broadcast to every sibling peer.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "handle": { "type": "string", "description": "Peer @handle (e.g. `reviewer`, `impl`) or `all`." },
-                    "message": { "type": "string", "description": "Message or question for the peer." },
-                    "active_turn_behavior": { "type": "string", "enum": ["steer", "queue", "interrupt"], "default": "steer" },
-                    "notify_on_finish": { "type": "boolean", "default": true },
-                    "workspace_id": { "type": "string" }
-                },
-                "required": ["handle", "message"]
-            }),
-        },
-        ToolDefinition {
-            name: "read_peer_context",
-            description: "Read-only peek into a sibling peer's status, edited files, latest summary, and recent activity by `@handle` without interrupting or waking that peer.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "handle": { "type": "string", "description": "Peer @handle or agent_id inside the Mission Workspace." },
-                    "limit": { "type": "integer", "default": 20 },
-                    "workspace_id": { "type": "string" }
-                },
-                "required": ["handle"]
-            }),
-        },
-        ToolDefinition {
-            name: "workspace_board_read",
-            description: "Read the Mission Workspace's Shared Blackboard (`BOARD.md`) containing shared goals, API contracts, task ownership, and review findings.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "workspace_id": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "workspace_board_update",
-            description: "Update the Mission Workspace's Shared Blackboard (`BOARD.md`) — either a specific Markdown `## Section` (e.g. `Decisions & Contracts`, `Tasks`, `Findings`) or the full document.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "content": { "type": "string", "description": "Markdown body for the section or full document." },
-                    "section": { "type": "string", "description": "Optional Markdown `## Section` heading to upsert without disturbing other sections." },
-                    "workspace_id": { "type": "string" }
-                },
-                "required": ["content"]
-            }),
-        },
-        ToolDefinition {
-            name: "spawn_workspace_peer",
-            description: "Spawn a visible sibling peer inside your current Mission Workspace with a readable `@handle` (optionally in a different provider/model family and/or an isolated git worktree while sharing the same Mission Workspace & Shared Blackboard).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "handle": { "type": "string", "description": "Short peer handle (e.g. `reviewer`, `backend`, `tester`)." },
-                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`, `acp`) or `provider/model`." },
-                    "acp_agent_id": { "type": "string", "description": "ACP agent ID from the host ACP registry (required when `provider` is `acp`)." },
-                    "model": { "type": "string" },
-                    "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
-                    "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
-                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
-                    "profile_id": { "type": "string" },
-                    "cwd": { "type": "string" },
-                    "worktree": { "type": "boolean", "description": "Isolate this peer in its own git worktree while staying in the same Mission Workspace." },
-                    "branch": { "type": "string" },
-                    "base_ref": { "type": "string" },
-                    "title": { "type": "string" },
-                    "initial_prompt": { "type": "string" },
-                    "notify_on_finish": { "type": "boolean", "default": true },
-                    "workspace_id": { "type": "string" }
-                },
-                "required": ["initial_prompt"]
-            }),
-        },
-        ToolDefinition {
-            name: "move_agent_to_workspace",
-            description: "Move an agent into an existing Mission Workspace or split it out into a standalone Mission Workspace (omit `target_workspace_id`).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string" },
-                    "target_workspace_id": { "type": "string" },
-                    "new_workspace_title": { "type": "string" }
-                }
-            }),
-        },
-        // --- First-Class Artifacts & SEP-1865 MCP Apps (4) ---
-        ToolDefinition {
-            name: "publish_artifact",
-            description: "Publish or update a versioned Artifact (Markdown, interactive sandboxed HTML, Code, SVG, Mermaid diagram, or SEP-1865 MCP App) in a workspace.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "artifact_id": { "type": "string", "description": "Optional existing artifact ID to update (increments revision)." },
-                    "workspace_id": { "type": "string", "description": "Target workspace ID (defaults to calling agent's workspace on local host)." },
-                    "agent_id": { "type": "string" },
-                    "title": { "type": "string" },
-                    "kind": { "type": "string", "enum": ["markdown", "html", "code", "svg", "mermaid", "mcp_app"] },
-                    "content": { "type": "string" },
-                    "language": { "type": "string" },
-                    "mime_type": { "type": "string" },
-                    "resource_uri": { "type": "string", "description": "Optional SEP-1865 MCP App URI (e.g. `ui://dashboard/metrics`)." },
-                    "summary_note": { "type": "string", "description": "Short revision note describing this update." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["title", "kind", "content"]
-            }),
-        },
-        ToolDefinition {
-            name: "list_artifacts",
-            description: "List versioned Artifacts on this host or a connected remote host, optionally filtered by workspace or agent.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "workspace_id": { "type": "string" },
-                    "agent_id": { "type": "string" },
-                    "host_id": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "read_artifact",
-            description: "Read the full content and revision history of an Artifact (optionally at a specific historical version).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "artifact_id": { "type": "string" },
-                    "version": { "type": "integer", "description": "Optional specific revision number to inspect." },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["artifact_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "delete_artifact",
-            description: "Permanently delete an Artifact and all of its stored revisions.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "artifact_id": { "type": "string" },
-                    "host_id": { "type": "string" }
-                },
-                "required": ["artifact_id"]
-            }),
-        },
-        // --- Pure-Rust LSP Language Server Intelligence (3) ---
-        ToolDefinition {
-            name: "lsp_diagnostics",
-            description: "Return compiler and language server diagnostics (errors, warnings, info, hints) for a file or workspace via Orbit's host-local LSP manager.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cwd": { "type": "string", "description": "Workspace root directory (defaults to calling agent's cwd on local host)." },
-                    "path": { "type": "string", "description": "Optional workspace-relative file path to inspect." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "lsp_symbols",
-            description: "Search symbols across a workspace (`workspace/symbol`) or list symbols inside a single file (`textDocument/documentSymbol`) via LSP.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Symbol name substring filter (empty lists all document symbols when `path` is set)." },
-                    "path": { "type": "string", "description": "Optional workspace-relative file path for document-level symbols." },
-                    "limit": { "type": "integer", "default": 50, "description": "Maximum number of symbols to return (1-200)." },
-                    "cwd": { "type": "string", "description": "Workspace root directory (defaults to calling agent's cwd on local host)." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "lsp_goto_definition",
-            description: "Resolve Go-to-Definition target locations (with 1-based line/col and line preview) for a symbol at `(path, line, col)` via LSP.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative path to the source file." },
-                    "line": { "type": "integer", "description": "1-based line number." },
-                    "col": { "type": "integer", "description": "1-based UTF-16 code-unit column number." },
-                    "cwd": { "type": "string", "description": "Workspace root directory (defaults to calling agent's cwd on local host)." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["path", "line", "col"]
-            }),
-        },
-        // --- Autonomous Goal Mode & Streaming Monitor Engine (5) ---
-        ToolDefinition {
-            name: "start_goal",
-            description: "Start an unattended autonomous `/goal` verification loop on an agent until acceptance criteria or `verify_command` exits 0 (with automatic circuit-breaker & Keep-Awake).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "objective": { "type": "string", "description": "Clear goal objective to accomplish autonomously." },
-                    "criteria": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional list of acceptance criteria."
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "spawn_workspace_peer",
+                description: "Spawn a sibling peer in the current Mission Workspace with a `@handle` (set `worktree=true` for isolated parallel file edits).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "handle": { "type": "string" },
+                        "provider": { "type": "string", "description": "Provider ID or `provider/model`." },
+                        "acp_agent_id": { "type": "string" },
+                        "model": { "type": "string" },
+                        "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                        "fast_mode": { "type": "boolean" },
+                        "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
+                        "profile_id": { "type": "string" },
+                        "cwd": { "type": "string" },
+                        "worktree": { "type": "boolean" },
+                        "branch": { "type": "string" },
+                        "base_ref": { "type": "string" },
+                        "title": { "type": "string" },
+                        "initial_prompt": { "type": "string" },
+                        "notify_on_finish": { "type": "boolean", "default": true },
+                        "workspace_id": { "type": "string" }
                     },
-                    "verify_command": { "type": "string", "description": "Optional shell command run in the agent's workspace after each turn (exit 0 = goal succeeded)." },
-                    "max_iterations": { "type": "integer", "default": 10, "description": "Maximum verification retry iterations (1-50)." },
-                    "max_duration_secs": { "type": "integer", "default": 3600, "description": "Maximum wall-clock duration in seconds (60-86400)." },
-                    "agent_id": { "type": "string", "description": "Target agent ID (defaults to calling agent on local host)." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["objective"]
-            }),
+                    "required": ["initial_prompt"]
+                }),
+            },
         },
-        ToolDefinition {
-            name: "update_goal_progress",
-            description: "Update pass/fail status on one or more criteria of an active Goal run.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "goal_id": { "type": "string", "description": "Optional Goal ID (defaults to calling agent's active goal)." },
-                    "agent_id": { "type": "string", "description": "Optional agent ID." },
-                    "criterion_id": { "type": "string", "description": "Single criterion ID or label to update." },
-                    "passed": { "type": "boolean", "default": true },
-                    "criteria": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": { "type": "string" },
-                                "label": { "type": "string" },
-                                "passed": { "type": "boolean" }
-                            }
-                        },
-                        "description": "Batch of criterion progress updates."
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "handoff_worktree",
+                description: "Preview (`dry_run: true`) or execute (`apply`/`move`) bidirectional Git Worktree <-> Local checkout handoff with backup ref safety and optional `--3way` conflict markers. Pass `agent_id`/`@handle` for Mission Workspace peer worktrees.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_id": { "type": "string" },
+                        "agent_id": { "type": "string", "description": "Optional peer agent_id or @handle whose worktree to hand off." },
+                        "direction": { "type": "string", "enum": ["worktree_to_local", "local_to_worktree"], "default": "worktree_to_local" },
+                        "mode": { "type": "string", "enum": ["apply", "move"], "default": "apply" },
+                        "target_workspace_id": { "type": "string" },
+                        "include_committed": { "type": "boolean" },
+                        "branch": { "type": "string" },
+                        "allow_three_way_conflicts": { "type": "boolean", "default": false },
+                        "dry_run": { "type": "boolean", "default": false },
+                        "host_id": { "type": "string" }
+                    }
+                }),
+            },
+        },
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "create_agent",
+                description: "Launch a new child/remote Orbit coding agent asynchronously with automatic finish notification.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "provider": { "type": "string" },
+                        "acp_agent_id": { "type": "string" },
+                        "model": { "type": "string" },
+                        "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                        "fast_mode": { "type": "boolean" },
+                        "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
+                        "profile_id": { "type": "string" },
+                        "workspace_id": { "type": "string" },
+                        "cwd": { "type": "string" },
+                        "worktree": { "type": "boolean" },
+                        "base_ref": { "type": "string" },
+                        "branch": { "type": "string" },
+                        "title": { "type": "string" },
+                        "initial_prompt": { "type": "string" },
+                        "background": { "type": "boolean" },
+                        "auto_archive": { "type": "boolean" },
+                        "notify_on_finish": { "type": "boolean", "default": true },
+                        "host_id": { "type": "string" },
+                        "idempotency_key": { "type": "string" }
                     },
-                    "note": { "type": "string", "description": "Optional concise status note." }
-                }
-            }),
+                    "required": ["initial_prompt"]
+                }),
+            },
         },
-        ToolDefinition {
-            name: "complete_goal",
-            description: "Mark an active Goal run as completed (or trigger its configured `verify_command` before marking succeeded).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "goal_id": { "type": "string", "description": "Optional Goal ID (defaults to calling agent's active goal)." },
-                    "agent_id": { "type": "string", "description": "Optional agent ID." },
-                    "summary": { "type": "string", "description": "Concise completion or failure summary." },
-                    "failed": { "type": "boolean", "default": false, "description": "Set true to terminate the goal as failed." }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "start_monitor",
-            description: "Start a streaming background Monitor watch (`command_stream`, `log_file_tail`, or `http_health`) that wakes the owning agent on matching events or HTTP transitions.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["command_stream", "log_file_tail", "http_health"],
-                        "description": "Monitor source kind."
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "send_agent_prompt",
+                description: "Send a follow-up prompt to another agent by ID (`steer`, `queue`, or `interrupt`).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_id": { "type": "string" },
+                        "prompt": { "type": "string" },
+                        "active_turn_behavior": { "type": "string", "enum": ["steer", "queue", "interrupt"], "default": "steer" },
+                        "session_mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
+                        "notify_on_finish": { "type": "boolean", "default": true },
+                        "host_id": { "type": "string" },
+                        "message_id": { "type": "string" }
                     },
-                    "name": { "type": "string", "description": "Human-readable monitor label." },
-                    "command": { "type": "string", "description": "Non-shell executable for `command_stream`." },
-                    "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for `command_stream`." },
-                    "path": { "type": "string", "description": "Workspace-relative file path for `log_file_tail`." },
-                    "pattern": { "type": "string", "description": "Linear-time regex/substring match pattern." },
-                    "url": { "type": "string", "description": "Public HTTP/HTTPS URL for `http_health`." },
-                    "expect_status": { "type": "integer", "default": 200, "description": "Expected HTTP status code." },
-                    "interval_secs": { "type": "integer", "default": 30, "description": "HTTP poll interval in seconds (5-3600)." },
-                    "expires_in_secs": { "type": "integer", "description": "Optional auto-expiry TTL in seconds." },
-                    "agent_id": { "type": "string", "description": "Owning agent ID (defaults to calling agent on local host)." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["kind"]
-            }),
+                    "required": ["agent_id", "prompt"]
+                }),
+            },
         },
-        ToolDefinition {
-            name: "stop_monitor",
-            description: "Stop a running background Monitor watch and terminate any associated process group.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "monitor_id": { "type": "string", "description": "Monitor ID to stop." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["monitor_id"]
-            }),
-        },
-        // --- Pure-Rust CDP Browser Automation & Guarded Computer Use (7) ---
-        ToolDefinition {
-            name: "browser_open",
-            description: "Start a new isolated pure-Rust CDP browser session (or navigate an existing `session_id`) with strict URL/SSRF/domain guards.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "description": "Optional http:// or https:// URL to open." },
-                    "session_id": { "type": "string", "description": "Optional existing browser session ID to navigate instead of launching a new session." },
-                    "headless": { "type": "boolean", "description": "Override host headless mode default." },
-                    "viewport_width": { "type": "integer", "description": "Viewport width in CSS pixels (320-3840)." },
-                    "viewport_height": { "type": "integer", "description": "Viewport height in CSS pixels (240-2160)." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "browser_snapshot",
-            description: "Capture compact numbered interactive DOM element refs (`e1`..`e80`), visible text excerpt, console errors, and CAPTCHA detection status for a live CDP session.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Live browser session ID." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["session_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_screenshot",
-            description: "Capture a PNG screenshot (base64, capped at 8 MiB) of a live CDP browser session.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Live browser session ID." },
-                    "full_page": { "type": "boolean", "default": false, "description": "Capture beyond viewport height." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["session_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_click",
-            description: "Click an interactive element by snapshot `ref_id` (e.g. `e1`) or explicit viewport `(x, y)` coordinates.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Live browser session ID." },
-                    "ref_id": { "type": "string", "description": "Element reference ID from `browser_snapshot` (e.g. `e1`)." },
-                    "x": { "type": "number", "description": "Optional X coordinate when `ref_id` is omitted." },
-                    "y": { "type": "number", "description": "Optional Y coordinate when `ref_id` is omitted." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["session_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_type",
-            description: "Type text into a non-sensitive input field (refuses password and credit-card fields by default under host policy).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Live browser session ID." },
-                    "ref_id": { "type": "string", "description": "Optional element ref ID to focus before typing." },
-                    "text": { "type": "string", "description": "Text to insert." },
-                    "submit": { "type": "boolean", "default": false, "description": "Press Enter after inserting text." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["session_id", "text"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_scroll",
-            description: "Scroll the active viewport by `(delta_x, delta_y)` pixels.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Live browser session ID." },
-                    "delta_x": { "type": "number", "default": 0, "description": "Horizontal scroll delta in pixels." },
-                    "delta_y": { "type": "number", "default": 400, "description": "Vertical scroll delta in pixels." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["session_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_close",
-            description: "Close a live CDP browser session, terminate its isolated process group, and clean up its temporary profile directory.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Live browser session ID to close." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["session_id"]
-            }),
-        },
-        // --- Batch CSV Fan-Out, Programmable DAG Workflows & Best-of-N Arena (5) ---
-        ToolDefinition {
-            name: "run_batch_fanout",
-            description: "Launch a bounded-concurrency Batch CSV Fan-Out workflow (up to 200 rows, RFC 4180 CSV with `{{col}}` interpolation).",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Optional human-readable workflow run title." },
-                    "cwd": { "type": "string", "description": "Workspace directory (defaults to calling agent's cwd on local host)." },
-                    "csv_content": { "type": "string", "description": "RFC 4180 CSV text with header row and 1..=200 data rows." },
-                    "prompt_template": { "type": "string", "description": "Prompt template using `{{column}}` placeholders." },
-                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, etc., or `provider/model`)." },
-                    "model": { "type": "string" },
-                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"], "default": "accept_edits" },
-                    "max_concurrency": { "type": "integer", "default": 3, "description": "Parallel worker limit (1..=8)." },
-                    "isolated_worktree": { "type": "boolean", "default": false, "description": "Run each CSV row inside its own isolated Git worktree." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["csv_content", "prompt_template"]
-            }),
-        },
-        ToolDefinition {
-            name: "run_dag_workflow",
-            description: "Launch a topologically validated Programmable DAG Workflow (up to 64 nodes) with `{{step.<id>.output}}` interpolation and bounded concurrency.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "cwd": { "type": "string", "description": "Workspace directory (defaults to calling agent's cwd on local host)." },
-                    "steps": {
-                        "type": "array",
-                        "description": "1..=64 DAG step specifications.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "step_id": { "type": "string" },
-                                "name": { "type": "string" },
-                                "depends_on": { "type": "array", "items": { "type": "string" } },
-                                "prompt_template": { "type": "string" },
-                                "provider": { "type": "string" },
-                                "model": { "type": "string" },
-                                "isolated_worktree": { "type": "boolean" },
-                                "retry_count": { "type": "integer" },
-                                "timeout_secs": { "type": "integer" }
-                            },
-                            "required": ["step_id", "name", "prompt_template"]
-                        }
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "orbit_agent",
+                description: "Manage Orbit agents: list, inspect status/activity, fork (same dir or worktree), update config/mode, move workspace, cancel, archive, or kill.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "status", "activity", "fork", "update", "set_mode", "move_workspace", "cancel", "archive", "kill"] },
+                        "agent_id": { "type": "string" },
+                        "workspace_id": { "type": "string" },
+                        "target_workspace_id": { "type": "string" },
+                        "new_workspace_title": { "type": "string" },
+                        "since_seq": { "type": "integer" },
+                        "limit": { "type": "integer" },
+                        "up_to_seq": { "type": "integer" },
+                        "worktree": { "type": "boolean" },
+                        "branch": { "type": "string" },
+                        "base_ref": { "type": "string" },
+                        "title": { "type": "string" },
+                        "initial_prompt": { "type": "string" },
+                        "model": { "type": "string" },
+                        "effort": { "type": "string" },
+                        "fast_mode": { "type": "boolean" },
+                        "mode": { "type": "string" },
+                        "include_archived": { "type": "boolean" },
+                        "include_background": { "type": "boolean" },
+                        "host_id": { "type": "string" }
                     },
-                    "default_provider": { "type": "string" },
-                    "default_mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"], "default": "accept_edits" },
-                    "max_concurrency": { "type": "integer", "default": 3 },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["steps"]
-            }),
+                    "required": ["action"]
+                }),
+            },
         },
-        ToolDefinition {
-            name: "run_best_of_n",
-            description: "Launch a Best-of-N Parallel Arena (2..=5 candidates) where each model solves the same prompt in an isolated Git worktree with optional verification command.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "cwd": { "type": "string", "description": "Git workspace directory (defaults to calling agent's cwd on local host)." },
-                    "prompt": { "type": "string", "description": "Shared task prompt sent to every candidate." },
-                    "candidates": {
-                        "type": "array",
-                        "description": "2..=5 candidate specs (`label`, `provider`, optional `model` and `effort`).",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "label": { "type": "string" },
-                                "provider": { "type": "string" },
-                                "model": { "type": "string" },
-                                "effort": { "type": "string" }
-                            },
-                            "required": ["label", "provider"]
-                        }
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "orbit_workspace",
+                description: "Manage workspaces and `orbit.json`/`paseo.json` dev scripts: create, list, rename, archive, list_scripts, start_script, stop_script.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["create", "list", "rename", "archive", "list_scripts", "start_script", "stop_script"] },
+                        "workspace_id": { "type": "string" },
+                        "source_cwd": { "type": "string" },
+                        "isolation": { "type": "string", "enum": ["local", "worktree"] },
+                        "worktree_mode": { "type": "string", "enum": ["branch_off", "checkout_branch", "checkout_pr"] },
+                        "branch": { "type": "string" },
+                        "base_ref": { "type": "string" },
+                        "pr_number": { "type": "integer" },
+                        "title": { "type": "string" },
+                        "script_name": { "type": "string" },
+                        "include_archived": { "type": "boolean" },
+                        "host_id": { "type": "string" }
                     },
-                    "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"], "default": "accept_edits" },
-                    "verify_command": { "type": "string", "description": "Optional scrubbed shell verification command run in each candidate worktree after completion." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["prompt", "candidates"]
-            }),
+                    "required": ["action"]
+                }),
+            },
         },
-        ToolDefinition {
-            name: "get_workflow_status",
-            description: "Inspect a specific workflow run by `run_id` or list recent Batch/DAG/Best-of-N workflow runs.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "run_id": { "type": "string", "description": "Optional workflow run ID to inspect." },
-                    "include_completed": { "type": "boolean", "default": true },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                }
-            }),
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "orbit_timer",
+                description: "Arm, list, or cancel durable one-shot conditional wakeup timers (`never`, `any`, `all_subagents`, `all_peers`, `sender:<id>`, `file:<path>`).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["create", "list", "cancel"] },
+                        "timer_id": { "type": "string" },
+                        "duration_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+                        "prompt": { "type": "string" },
+                        "condition": { "type": "string" },
+                        "agent_id": { "type": "string" },
+                        "include_resolved": { "type": "boolean" },
+                        "host_id": { "type": "string" }
+                    },
+                    "required": ["action"]
+                }),
+            },
         },
-        ToolDefinition {
-            name: "cancel_workflow",
-            description: "Cancel an active Batch CSV, DAG, or Best-of-N workflow run and interrupt in-flight steps.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "run_id": { "type": "string", "description": "Workflow run ID to cancel." },
-                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
-                },
-                "required": ["run_id"]
-            }),
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "orbit_control",
+                description: "Inspect host profiles, providers, models, connected remote hosts, or list/respond to pending child permission approvals.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list_profiles", "list_providers", "list_models", "list_hosts", "list_pending_permissions", "respond_permission"] },
+                        "provider": { "type": "string" },
+                        "agent_id": { "type": "string" },
+                        "request_id": { "type": "string" },
+                        "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
+                        "host_id": { "type": "string" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        // ==================== OPTIONAL CAPABILITY PACKS (7 tools) ====================
+        PackToolDefinition {
+            pack: McpToolPack::Browser,
+            def: ToolDefinition {
+                name: "orbit_browser",
+                description: "Pure-Rust CDP browser automation (`open`, `snapshot`, `screenshot`, `click`, `type`, `scroll`, `close`) with SSRF & CAPTCHA guards.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["open", "snapshot", "screenshot", "click", "type", "scroll", "close"] },
+                        "session_id": { "type": "string" },
+                        "url": { "type": "string" },
+                        "ref_id": { "type": "string" },
+                        "text": { "type": "string" },
+                        "submit": { "type": "boolean" },
+                        "x": { "type": "number" },
+                        "y": { "type": "number" },
+                        "delta_x": { "type": "number" },
+                        "delta_y": { "type": "number" },
+                        "full_page": { "type": "boolean" },
+                        "headless": { "type": "boolean" },
+                        "viewport_width": { "type": "integer" },
+                        "viewport_height": { "type": "integer" },
+                        "host_id": { "type": "string" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        PackToolDefinition {
+            pack: McpToolPack::Schedules,
+            def: ToolDefinition {
+                name: "orbit_schedule",
+                description: "Manage recurring cron schedules and agent heartbeats (`create`, `list`, `inspect`, `update`, `pause`, `resume`, `run_once`, `logs`, `delete`, `create_heartbeat`, `delete_heartbeat`).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["create", "list", "inspect", "update", "pause", "resume", "run_once", "logs", "delete", "create_heartbeat", "delete_heartbeat"] },
+                        "schedule_id": { "type": "string" },
+                        "heartbeat_id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "cron": { "type": "string" },
+                        "timezone": { "type": "string", "description": "Optional IANA timezone (e.g. 'Asia/Shanghai', 'America/New_York') or fixed offset ('+08:00'); empty string resets to host local." },
+                        "prompt": { "type": "string" },
+                        "cwd": { "type": "string" },
+                        "workspace_id": { "type": "string" },
+                        "agent_id": { "type": "string" },
+                        "provider": { "type": "string" },
+                        "model": { "type": "string" },
+                        "mode": { "type": "string" },
+                        "worktree": { "type": "boolean" },
+                        "max_runs": { "type": "integer" },
+                        "expires_at": { "type": "string" },
+                        "include_completed": { "type": "boolean" },
+                        "limit": { "type": "integer" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        PackToolDefinition {
+            pack: McpToolPack::Workflows,
+            def: ToolDefinition {
+                name: "orbit_workflow",
+                description: "Launch and manage multi-agent workflows: `batch_fanout` (CSV), `dag` (up to 64 nodes), `best_of_n` (parallel worktree arena), `status`, `cancel`.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["batch_fanout", "dag", "best_of_n", "status", "cancel"] },
+                        "run_id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "cwd": { "type": "string" },
+                        "csv_content": { "type": "string" },
+                        "prompt_template": { "type": "string" },
+                        "prompt": { "type": "string" },
+                        "steps": { "type": "array", "items": { "type": "object" } },
+                        "candidates": { "type": "array", "items": { "type": "object" } },
+                        "provider": { "type": "string" },
+                        "default_provider": { "type": "string" },
+                        "model": { "type": "string" },
+                        "mode": { "type": "string" },
+                        "max_concurrency": { "type": "integer" },
+                        "isolated_worktree": { "type": "boolean" },
+                        "verify_command": { "type": "string" },
+                        "include_completed": { "type": "boolean" },
+                        "host_id": { "type": "string" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        PackToolDefinition {
+            pack: McpToolPack::Goals,
+            def: ToolDefinition {
+                name: "orbit_goal",
+                description: "Manage autonomous `/goal` verification loops and streaming background monitors (`start_goal`, `update_goal`, `complete_goal`, `start_monitor`, `stop_monitor`).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["start_goal", "update_goal", "complete_goal", "start_monitor", "stop_monitor"] },
+                        "goal_id": { "type": "string" },
+                        "monitor_id": { "type": "string" },
+                        "objective": { "type": "string" },
+                        "criteria": { "type": "array" },
+                        "criterion_id": { "type": "string" },
+                        "passed": { "type": "boolean" },
+                        "verify_command": { "type": "string" },
+                        "max_iterations": { "type": "integer" },
+                        "max_duration_secs": { "type": "integer" },
+                        "summary": { "type": "string" },
+                        "failed": { "type": "boolean" },
+                        "kind": { "type": "string", "enum": ["command_stream", "log_file_tail", "http_health"] },
+                        "name": { "type": "string" },
+                        "command": { "type": "string" },
+                        "args": { "type": "array", "items": { "type": "string" } },
+                        "path": { "type": "string" },
+                        "pattern": { "type": "string" },
+                        "url": { "type": "string" },
+                        "expect_status": { "type": "integer" },
+                        "interval_secs": { "type": "integer" },
+                        "expires_in_secs": { "type": "integer" },
+                        "agent_id": { "type": "string" },
+                        "host_id": { "type": "string" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        PackToolDefinition {
+            pack: McpToolPack::Terminals,
+            def: ToolDefinition {
+                name: "orbit_terminal",
+                description: "Manage detached PTY terminal sessions (`list`, `create`, `capture`, `send_keys`, `kill`).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "create", "capture", "send_keys", "kill"] },
+                        "terminal_id": { "type": "string" },
+                        "cwd": { "type": "string" },
+                        "title": { "type": "string" },
+                        "initial_command": { "type": "string" },
+                        "text": { "type": "string" },
+                        "keys": { "type": "array", "items": { "type": "string" } },
+                        "lines": { "type": "integer" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        PackToolDefinition {
+            pack: McpToolPack::Artifacts,
+            def: ToolDefinition {
+                name: "orbit_artifact",
+                description: "Publish, list, read, or delete versioned workspace Artifacts (`markdown`, `html`, `code`, `svg`, `mermaid`, `mcp_app`).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["publish", "list", "read", "delete"] },
+                        "artifact_id": { "type": "string" },
+                        "workspace_id": { "type": "string" },
+                        "agent_id": { "type": "string" },
+                        "title": { "type": "string" },
+                        "kind": { "type": "string", "enum": ["markdown", "html", "code", "svg", "mermaid", "mcp_app"] },
+                        "content": { "type": "string" },
+                        "language": { "type": "string" },
+                        "resource_uri": { "type": "string" },
+                        "summary_note": { "type": "string" },
+                        "version": { "type": "integer" },
+                        "host_id": { "type": "string" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        PackToolDefinition {
+            pack: McpToolPack::Lsp,
+            def: ToolDefinition {
+                name: "orbit_lsp",
+                description: "Language server intelligence via Orbit's host-local LSP manager (`diagnostics`, `symbols`, `goto_definition`).",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["diagnostics", "symbols", "goto_definition"] },
+                        "cwd": { "type": "string" },
+                        "path": { "type": "string" },
+                        "query": { "type": "string" },
+                        "line": { "type": "integer" },
+                        "col": { "type": "integer" },
+                        "limit": { "type": "integer" },
+                        "host_id": { "type": "string" }
+                    },
+                    "required": ["action"]
+                }),
+            },
         },
     ]
 }
@@ -4916,19 +4785,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timer_mcp_tools_expose_multi_host_id_schema() {
-        let defs = all_tool_definitions();
-        for name in [
-            "create_timer",
-            "list_timers",
-            "cancel_timer",
-            "run_batch_fanout",
-            "run_dag_workflow",
-            "run_best_of_n",
-            "get_workflow_status",
-            "cancel_workflow",
-        ] {
-            let def = defs
+    fn mcp_tool_catalog_stays_within_compact_token_budget() {
+        let core_policy = McpToolPolicy {
+            enabled: true,
+            disabled_tools: Vec::new(),
+            enabled_packs: Some(vec![McpToolPack::Core]),
+            disabled_packs: Vec::new(),
+        };
+        let core_defs = list_tool_definitions(&core_policy);
+        assert_eq!(
+            core_defs.len(),
+            11,
+            "Core pack must expose 11 compact tools"
+        );
+        let core_json = serde_json::to_string(
+            &core_defs
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize core defs");
+        assert!(
+            core_json.len() <= 9_500,
+            "Core MCP catalog JSON ({} bytes) exceeded 9,500-byte budget",
+            core_json.len()
+        );
+
+        let full_defs = list_tool_definitions(&McpToolPolicy::default());
+        assert_eq!(
+            full_defs.len(),
+            18,
+            "Full MCP catalog must expose 18 composite tools (11 Core + 7 optional packs)"
+        );
+        let full_json = serde_json::to_string(
+            &full_defs
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize full defs");
+        assert!(
+            full_json.len() <= 18_500,
+            "Full MCP catalog JSON ({} bytes) exceeded 18,500-byte budget",
+            full_json.len()
+        );
+
+        for name in ["orbit_timer", "orbit_workflow", "orbit_browser"] {
+            let def = full_defs
                 .iter()
                 .find(|d| d.name == name)
                 .unwrap_or_else(|| panic!("missing MCP tool definition `{name}`"));
@@ -4940,26 +4855,48 @@ mod tests {
     }
 
     #[test]
-    fn browser_mcp_tools_expose_multi_host_id_schema() {
-        let defs = all_tool_definitions();
-        for name in [
-            "browser_open",
-            "browser_snapshot",
-            "browser_screenshot",
-            "browser_click",
-            "browser_type",
-            "browser_scroll",
-            "browser_close",
-        ] {
-            let def = defs
-                .iter()
-                .find(|d| d.name == name)
-                .unwrap_or_else(|| panic!("missing MCP tool definition `{name}`"));
-            assert!(
-                def.input_schema["properties"].get("host_id").is_some(),
-                "MCP tool `{name}` must expose `host_id` for multi-host routing"
-            );
-        }
+    fn startup_pack_detection_keeps_normal_chat_minimal_and_gates_subagents() {
+        let plain =
+            detect_startup_mcp_packs("Explain why this Rust function returns early", false, true);
+        assert_eq!(plain, vec![McpToolPack::Core]);
+
+        let browser_no_bin =
+            detect_startup_mcp_packs("Open browser and take a screenshot", false, false);
+        assert_eq!(browser_no_bin, vec![McpToolPack::Core]);
+
+        let browser_with_bin =
+            detect_startup_mcp_packs("Open browser and take a screenshot", false, true);
+        assert_eq!(
+            browser_with_bin,
+            vec![McpToolPack::Core, McpToolPack::Browser]
+        );
+
+        let subagent_dag =
+            detect_startup_mcp_packs("Run a DAG workflow and cron schedule every 5m", true, false);
+        assert!(subagent_dag.contains(&McpToolPack::Core));
+        assert!(subagent_dag.contains(&McpToolPack::Schedules));
+        assert!(
+            !subagent_dag.contains(&McpToolPack::Workflows),
+            "subagents cannot launch recursive workflows and must not receive Workflows pack"
+        );
+    }
+
+    #[test]
+    fn composite_dispatch_maps_actions_and_enforces_pack_mapping() {
+        let mapped = resolve_composite_dispatch("orbit_agent", &json!({"action": "kill"}))
+            .expect("map kill");
+        assert_eq!(mapped, "kill_agent");
+        assert_eq!(tool_pack_for_canonical_name(mapped), McpToolPack::Core);
+
+        let board_up =
+            resolve_composite_dispatch("workspace_board", &json!({"content": "Updated contract"}))
+                .expect("map implicit board update");
+        assert_eq!(board_up, "workspace_board_update");
+
+        let wf = resolve_composite_dispatch("orbit_workflow", &json!({"action": "best_of_n"}))
+            .expect("map best_of_n");
+        assert_eq!(wf, "run_best_of_n");
+        assert_eq!(tool_pack_for_canonical_name(wf), McpToolPack::Workflows);
     }
 
     #[tokio::test]
@@ -5129,6 +5066,133 @@ mod tests {
         .await;
         assert!(null_type.is_error);
 
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[tokio::test]
+    async fn workspace_board_cas_conflict_and_caller_core_pack_default() {
+        let tmp_home =
+            std::env::temp_dir().join(format!("orbit-tools-cas-pack-{}", Uuid::new_v4()));
+        let ws_dir = tmp_home.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir repo");
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+
+        let now = Utc::now();
+        rt.store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_cas_1".into(),
+                title: "Mission".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: true,
+            })
+            .expect("upsert ws");
+
+        let mut labels = HashMap::new();
+        labels.insert(LABEL_MCP_PACKS.into(), "core".into());
+        rt.store
+            .upsert_agent(
+                &orbit_protocol::AgentSummary {
+                    agent_id: "ag_cas_1".into(),
+                    workspace_id: "ws_cas_1".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Peer".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::FullAccess,
+                    status: orbit_protocol::AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels,
+                    attention: orbit_protocol::AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("dev".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let caller_tools =
+            list_tool_definitions_for_caller(&rt, Some("ag_cas_1"), &McpToolPolicy::default());
+        assert_eq!(caller_tools.len(), 11);
+
+        let ok_res = execute_tool(
+            &rt,
+            Some("ag_cas_1"),
+            "workspace_board",
+            json!({
+                "action": "update",
+                "section": "Decisions & Contracts",
+                "content": "Contract v1",
+                "expected_revision": 0
+            }),
+        )
+        .await;
+        assert!(!ok_res.is_error, "CAS rev 0 -> 1 must succeed");
+        assert_eq!(ok_res.structured["board"]["revision"], 1);
+
+        let conflict_res = execute_tool(
+            &rt,
+            Some("ag_cas_1"),
+            "workspace_board",
+            json!({
+                "action": "update",
+                "section": "Decisions & Contracts",
+                "content": "Stale overwrite",
+                "expected_revision": 0
+            }),
+        )
+        .await;
+        assert!(conflict_res.is_error, "stale expected_revision must fail");
+        assert_eq!(conflict_res.structured["conflict"], true);
+        assert_eq!(conflict_res.structured["expected_revision"], 0);
+        assert_eq!(conflict_res.structured["current_revision"], 1);
+        assert_eq!(conflict_res.structured["current_board"]["revision"], 1);
+
+        let legacy_read =
+            execute_tool(&rt, Some("ag_cas_1"), "workspace_board_read", json!({})).await;
+        assert!(!legacy_read.is_error);
+        let board_txt = legacy_read.structured["board"]["content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(board_txt.contains("Contract v1"));
+        assert!(!board_txt.contains("Stale overwrite"));
+
+        rt.browser.shutdown_all().await;
         let _ = std::fs::remove_dir_all(&tmp_home);
     }
 }

@@ -17249,6 +17249,9 @@ sealed class FfiTimerCondition {
     object AllSubagentsSettled : FfiTimerCondition()
     
     
+    object AllPeersSettled : FfiTimerCondition()
+    
+    
     data class FileChanged(
         val `path`: kotlin.String) : FfiTimerCondition()
         
@@ -17280,7 +17283,8 @@ public object FfiConverterTypeFfiTimerCondition : FfiConverterRustBuffer<FfiTime
                 FfiConverterString.read(buf),
                 )
             4 -> FfiTimerCondition.AllSubagentsSettled
-            5 -> FfiTimerCondition.FileChanged(
+            5 -> FfiTimerCondition.AllPeersSettled
+            6 -> FfiTimerCondition.FileChanged(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -17308,6 +17312,12 @@ public object FfiConverterTypeFfiTimerCondition : FfiConverterRustBuffer<FfiTime
             )
         }
         is FfiTimerCondition.AllSubagentsSettled -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiTimerCondition.AllPeersSettled -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
@@ -17341,8 +17351,12 @@ public object FfiConverterTypeFfiTimerCondition : FfiConverterRustBuffer<FfiTime
                 buf.putInt(4)
                 Unit
             }
-            is FfiTimerCondition.FileChanged -> {
+            is FfiTimerCondition.AllPeersSettled -> {
                 buf.putInt(5)
+                Unit
+            }
+            is FfiTimerCondition.FileChanged -> {
+                buf.putInt(6)
                 FfiConverterString.write(value.`path`, buf)
                 Unit
             }

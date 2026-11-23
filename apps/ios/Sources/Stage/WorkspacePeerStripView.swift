@@ -260,7 +260,7 @@ struct WorkspacePeerStripView: View {
                     Circle()
                         .fill(palette.warning)
                         .frame(width: 6, height: 6)
-                } else if peer.isRunning {
+                } else if peer.isForegroundRunning {
                     OrbitSpinnerRingView(color: isActive ? palette.primary : palette.fgSecondary, size: 11)
                 } else if peer.isUnread && !isActive {
                     Circle()

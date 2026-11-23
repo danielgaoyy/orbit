@@ -180,7 +180,7 @@ struct SubagentsTrackPill: View {
     private var totalCount: Int { managed.count + native.count }
 
     private var runningCount: Int {
-        managed.filter { $0.isRunning }.count
+        managed.filter { $0.isForegroundRunning }.count
             + native.filter { $0.status == .running }.count
     }
 
@@ -275,7 +275,7 @@ struct SubagentsListSheet: View {
     private var native: [FfiProviderSubagentDescriptor] { store.visibleProviderSubagents }
 
     private var hasFinished: Bool {
-        managed.contains { !$0.isRunning && !$0.isAwaitingPermission }
+        managed.contains { !$0.isForegroundRunning && !$0.isAwaitingPermission }
             || native.contains { $0.status != .running }
     }
 
@@ -361,7 +361,7 @@ struct SubagentsListSheet: View {
             HStack(spacing: OrbitSpacing.sm) {
                 if child.isAwaitingPermission {
                     Circle().fill(palette.warning).frame(width: 7, height: 7)
-                } else if child.isRunning {
+                } else if child.isForegroundRunning {
                     OrbitSpinnerRingView(color: palette.primary, size: 12.5)
                 } else {
                     OrbitProviderIcon(provider: child.provider, size: 14)

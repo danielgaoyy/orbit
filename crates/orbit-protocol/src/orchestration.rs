@@ -146,6 +146,61 @@ fn default_resume_prompt() -> String {
     "Resume working.".to_string()
 }
 
+/// Capability pack grouping Orbit MCP orchestration tools to keep default context lightweight
+/// while locking session tool definitions at launch to preserve LLM prompt cache prefixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpToolPack {
+    Core,
+    Browser,
+    Schedules,
+    Workflows,
+    Goals,
+    Terminals,
+    Artifacts,
+    Lsp,
+}
+
+impl McpToolPack {
+    pub const ALL: [Self; 8] = [
+        Self::Core,
+        Self::Browser,
+        Self::Schedules,
+        Self::Workflows,
+        Self::Goals,
+        Self::Terminals,
+        Self::Artifacts,
+        Self::Lsp,
+    ];
+
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Browser => "browser",
+            Self::Schedules => "schedules",
+            Self::Workflows => "workflows",
+            Self::Goals => "goals",
+            Self::Terminals => "terminals",
+            Self::Artifacts => "artifacts",
+            Self::Lsp => "lsp",
+        }
+    }
+
+    pub fn parse_slug(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "core" => Some(Self::Core),
+            "browser" | "cdp" => Some(Self::Browser),
+            "schedules" | "schedule" | "cron" | "heartbeats" => Some(Self::Schedules),
+            "workflows" | "workflow" => Some(Self::Workflows),
+            "goals" | "goal" | "monitors" | "monitor" => Some(Self::Goals),
+            "terminals" | "terminal" | "pty" => Some(Self::Terminals),
+            "artifacts" | "artifact" => Some(Self::Artifacts),
+            "lsp" => Some(Self::Lsp),
+            _ => None,
+        }
+    }
+}
+
 /// Per-profile MCP tool catalog policy (e.g., disallow worker profiles from spawning recursive subagents).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpToolPolicy {
@@ -153,6 +208,12 @@ pub struct McpToolPolicy {
     pub enabled: bool,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// Explicit override list of capability packs to expose for this profile (overrides auto-detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_packs: Option<Vec<McpToolPack>>,
+    /// Capability packs explicitly suppressed even if auto-detected or enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_packs: Vec<McpToolPack>,
 }
 
 impl Default for McpToolPolicy {
@@ -160,6 +221,8 @@ impl Default for McpToolPolicy {
         Self {
             enabled: true,
             disabled_tools: Vec::new(),
+            enabled_packs: None,
+            disabled_packs: Vec::new(),
         }
     }
 }
@@ -568,4 +631,24 @@ pub struct WorkspaceOrganizeEvent {
     pub grouped_agents: u32,
     #[serde(default)]
     pub summarized_agents: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_tool_policy_legacy_json_deserializes_with_defaults() {
+        let legacy: McpToolPolicy =
+            serde_json::from_str(r#"{"enabled":true,"disabled_tools":["kill_agent"]}"#)
+                .expect("deserialize legacy");
+        assert!(legacy.enabled);
+        assert_eq!(legacy.disabled_tools, vec!["kill_agent"]);
+        assert!(legacy.enabled_packs.is_none());
+        assert!(legacy.disabled_packs.is_empty());
+
+        for pack in McpToolPack::ALL {
+            assert_eq!(McpToolPack::parse_slug(pack.slug()), Some(pack));
+        }
+    }
 }

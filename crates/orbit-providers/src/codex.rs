@@ -103,22 +103,24 @@ fn build_codex_turn_start_params(
         "approvalsReviewer": "user",
         "sandboxPolicy": sandbox_policy
     });
-    if let Some(m) = resolved_model {
-        params["model"] = Value::String(m.clone());
+    let clean_model = resolved_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let eff_str = current_effort.map(|eff| match eff {
+        ReasoningEffort::Off => "none",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max => "max",
+        ReasoningEffort::Ultra => "ultra",
+    });
+    if let Some(m) = clean_model {
+        params["model"] = Value::String(m.to_string());
     }
-    if let Some(eff) = current_effort {
-        let eff_str = match eff {
-            ReasoningEffort::Off => Some("none"),
-            ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium => Some("medium"),
-            ReasoningEffort::High => Some("high"),
-            ReasoningEffort::Xhigh => Some("xhigh"),
-            ReasoningEffort::Max => Some("max"),
-            ReasoningEffort::Ultra => Some("ultra"),
-        };
-        if let Some(s) = eff_str {
-            params["effort"] = Value::String(s.to_string());
-        }
+    if let Some(s) = eff_str {
+        params["effort"] = Value::String(s.to_string());
     }
     if fast_mode {
         params["serviceTier"] = Value::String("fast".to_string());
@@ -127,10 +129,19 @@ fn build_codex_turn_start_params(
         // explicit `null` clears `-c service_tier="fast"` / thread / user config.
         params["serviceTier"] = Value::Null;
     }
-    if matches!(mode, SessionMode::Plan) {
+    // Codex app-server schema requires `CollaborationMode.settings.model` to be a non-empty string.
+    // When no model is resolved yet, omit `collaborationMode` and rely on read-only `sandboxPolicy`.
+    if matches!(mode, SessionMode::Plan)
+        && let Some(m) = clean_model
+    {
+        let mut settings = serde_json::Map::new();
+        settings.insert("model".to_string(), Value::String(m.to_string()));
+        if let Some(s) = eff_str {
+            settings.insert("reasoning_effort".to_string(), Value::String(s.to_string()));
+        }
         params["collaborationMode"] = json!({
             "mode": "plan",
-            "settings": {}
+            "settings": Value::Object(settings)
         });
     }
     params
@@ -507,6 +518,9 @@ async fn run_codex_actor(
     let mut pending_approvals: HashMap<String, PendingCodexApproval> = HashMap::new();
     let mut pending_questions: HashMap<String, PendingCodexQuestion> = HashMap::new();
     let mut queued_prompts: VecDeque<(String, String)> = VecDeque::new();
+    let mut pending_interrupt_replacement: Option<(String, String)> = None;
+    let mut pending_turn_start_rpc_id: Option<u64> = None;
+    let mut pending_interrupt_on_turn_started = false;
     let mut usage_tracker = CodexTurnUsageTracker::default();
 
     loop {
@@ -562,20 +576,24 @@ async fn run_codex_actor(
                                         }
                                     });
                                     let _ = shim.write_stdin_line(req.to_string()).await;
-                                    queued_prompts.push_front((turn_id, prompt));
+                                    pending_interrupt_replacement = Some((turn_id, prompt));
                                     continue;
                                 }
                             }
                         } else if client_turn_id.is_some() {
                             match behavior {
-                                ActiveTurnBehavior::Queue => queued_prompts.push_back((turn_id, prompt)),
-                                ActiveTurnBehavior::Steer | ActiveTurnBehavior::Interrupt => {
-                                    queued_prompts.push_front((turn_id, prompt));
+                                ActiveTurnBehavior::Queue | ActiveTurnBehavior::Steer => {
+                                    queued_prompts.push_back((turn_id, prompt));
+                                }
+                                ActiveTurnBehavior::Interrupt => {
+                                    pending_interrupt_on_turn_started = true;
+                                    pending_interrupt_replacement = Some((turn_id, prompt));
                                 }
                             }
                             continue;
                         }
 
+                        pending_interrupt_on_turn_started = false;
                         if dispatch_codex_turn(
                             &cfg,
                             &thread_id,
@@ -587,6 +605,7 @@ async fn run_codex_actor(
                             &turn_id,
                             &prompt,
                             &mut next_id,
+                            &mut pending_turn_start_rpc_id,
                             &mut client_turn_id,
                             &mut msg_accum,
                             &mut thought_accum,
@@ -600,7 +619,10 @@ async fn run_codex_actor(
                         }
                     }
                     DriverCommand::Interrupt => {
+                        queued_prompts.clear();
+                        pending_interrupt_replacement = None;
                         if let Some(ref nat_tid) = native_turn_id {
+                            pending_interrupt_on_turn_started = false;
                             let req_id = next_id;
                             next_id += 1;
                             let req = json!({
@@ -612,6 +634,8 @@ async fn run_codex_actor(
                                 }
                             });
                             let _ = shim.write_stdin_line(req.to_string()).await;
+                        } else if client_turn_id.is_some() {
+                            pending_interrupt_on_turn_started = true;
                         }
                     }
                     DriverCommand::SetMode { mode: new_mode } => {
@@ -723,46 +747,105 @@ async fn run_codex_actor(
                                 &evt_tx,
                             )
                             .await;
-                            if turn_completed
-                                && let Some((next_tid, next_prompt)) = queued_prompts.pop_front()
-                                && dispatch_codex_turn(
-                                    &cfg,
-                                    &thread_id,
-                                    &mode,
-                                    &resolved_model,
-                                    current_effort,
-                                    current_fast_mode,
-                                    service_tier_explicitly_controlled,
-                                    &next_tid,
-                                    &next_prompt,
-                                    &mut next_id,
-                                    &mut client_turn_id,
-                                    &mut msg_accum,
-                                    &mut thought_accum,
-                                    &shim,
-                                    &evt_tx,
-                                )
-                                .await
-                                .is_err()
+                            if m == "turn/started"
+                                && pending_interrupt_on_turn_started
+                                && let Some(ref nat_tid) = native_turn_id
                             {
-                                break;
+                                pending_interrupt_on_turn_started = false;
+                                let req_id = next_id;
+                                next_id += 1;
+                                let req = json!({
+                                    "id": req_id,
+                                    "method": "turn/interrupt",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turnId": nat_tid
+                                    }
+                                });
+                                let _ = shim.write_stdin_line(req.to_string()).await;
                             }
-                        } else if rpc_id.is_some()
-                            && method.is_none()
-                            && let Some(err) = val.get("error").filter(|v| !v.is_null())
-                        {
-                            let msg = err
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Codex RPC error")
-                                .to_string();
-                            if !msg.contains("no active turn") {
-                                let _ = evt_tx
-                                    .send(DriverEvent::Notice {
-                                        level: "error".into(),
-                                        message: msg,
-                                    })
-                                    .await;
+                            if turn_completed {
+                                pending_interrupt_on_turn_started = false;
+                                pending_turn_start_rpc_id = None;
+                                if let Some((next_tid, next_prompt)) = pending_interrupt_replacement
+                                    .take()
+                                    .or_else(|| queued_prompts.pop_front())
+                                    && dispatch_codex_turn(
+                                        &cfg,
+                                        &thread_id,
+                                        &mode,
+                                        &resolved_model,
+                                        current_effort,
+                                        current_fast_mode,
+                                        service_tier_explicitly_controlled,
+                                        &next_tid,
+                                        &next_prompt,
+                                        &mut next_id,
+                                        &mut pending_turn_start_rpc_id,
+                                        &mut client_turn_id,
+                                        &mut msg_accum,
+                                        &mut thought_accum,
+                                        &shim,
+                                        &evt_tx,
+                                    )
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        } else if rpc_id.is_some() && method.is_none() {
+                            let is_turn_start_resp =
+                                pending_turn_start_rpc_id.is_some() && pending_turn_start_rpc_id == rpc_id;
+                            if is_turn_start_resp {
+                                pending_turn_start_rpc_id = None;
+                            }
+                            if let Some(err) = val.get("error").filter(|v| !v.is_null()) {
+                                let msg = err
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Codex RPC error")
+                                    .to_string();
+                                if is_turn_start_resp {
+                                    client_turn_id = None;
+                                    native_turn_id = None;
+                                    pending_interrupt_on_turn_started = false;
+                                    msg_accum.clear();
+                                    thought_accum.clear();
+                                    let _ = evt_tx
+                                        .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                            message: msg,
+                                            recoverable: true,
+                                        }))
+                                        .await;
+                                } else if !msg.contains("no active turn") {
+                                    let _ = evt_tx
+                                        .send(DriverEvent::Notice {
+                                            level: "error".into(),
+                                            message: msg,
+                                        })
+                                        .await;
+                                }
+                            } else if is_turn_start_resp
+                                && native_turn_id.is_none()
+                                && let Some(tid) =
+                                    val.pointer("/result/turn/id").and_then(|v| v.as_str())
+                            {
+                                native_turn_id = Some(tid.to_string());
+                                if pending_interrupt_on_turn_started {
+                                    pending_interrupt_on_turn_started = false;
+                                    let req_id = next_id;
+                                    next_id += 1;
+                                    let req = json!({
+                                        "id": req_id,
+                                        "method": "turn/interrupt",
+                                        "params": {
+                                            "threadId": thread_id,
+                                            "turnId": tid
+                                        }
+                                    });
+                                    let _ = shim.write_stdin_line(req.to_string()).await;
+                                }
                             }
                         }
                     }
@@ -864,6 +947,7 @@ async fn dispatch_codex_turn(
     turn_id: &str,
     prompt: &str,
     next_id: &mut u64,
+    pending_turn_start_rpc_id: &mut Option<u64>,
     client_turn_id: &mut Option<String>,
     msg_accum: &mut HashMap<String, String>,
     thought_accum: &mut HashMap<String, String>,
@@ -883,6 +967,7 @@ async fn dispatch_codex_turn(
 
     let req_id = *next_id;
     *next_id += 1;
+    *pending_turn_start_rpc_id = Some(req_id);
     let params = build_codex_turn_start_params(
         cfg,
         thread_id,
@@ -2891,5 +2976,346 @@ mod tests {
             }
             other => panic!("expected TurnUsage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn codex_plan_mode_turn_start_params_require_model_and_include_effort() {
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_plan".into(),
+            provider: ProviderKind::Codex,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: PathBuf::from("/tmp/plan.sock"),
+            runtime_dir: std::env::temp_dir(),
+            cwd: PathBuf::from("/tmp/repo"),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gpt-5.4".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: false,
+            mode: SessionMode::Plan,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        // With model + effort: collaborationMode includes required `settings.model` + `reasoning_effort`
+        let with_model = build_codex_turn_start_params(
+            &cfg,
+            "thr_1",
+            &SessionMode::Plan,
+            &Some("gpt-5.4".to_string()),
+            Some(ReasoningEffort::High),
+            false,
+            false,
+            json!([]),
+        );
+        assert_eq!(with_model["collaborationMode"]["mode"], json!("plan"));
+        assert_eq!(
+            with_model["collaborationMode"]["settings"]["model"],
+            json!("gpt-5.4")
+        );
+        assert_eq!(
+            with_model["collaborationMode"]["settings"]["reasoning_effort"],
+            json!("high")
+        );
+        assert_eq!(with_model["sandboxPolicy"]["type"], json!("readOnly"));
+
+        // With model but no effort: omits `reasoning_effort`, keeps `model`
+        let with_model_no_effort = build_codex_turn_start_params(
+            &cfg,
+            "thr_1",
+            &SessionMode::Plan,
+            &Some("gpt-5.4".to_string()),
+            None,
+            false,
+            false,
+            json!([]),
+        );
+        assert_eq!(
+            with_model_no_effort["collaborationMode"]["settings"]["model"],
+            json!("gpt-5.4")
+        );
+        assert!(
+            with_model_no_effort["collaborationMode"]["settings"]
+                .get("reasoning_effort")
+                .is_none()
+        );
+
+        // Without model (None or empty): omit `collaborationMode` so app-server never rejects with missing `model`
+        for empty_model in [None, Some(String::new()), Some("   ".to_string())] {
+            let without_model = build_codex_turn_start_params(
+                &cfg,
+                "thr_1",
+                &SessionMode::Plan,
+                &empty_model,
+                Some(ReasoningEffort::Medium),
+                false,
+                false,
+                json!([]),
+            );
+            assert!(
+                without_model.get("collaborationMode").is_none(),
+                "must omit collaborationMode when model is unset/empty"
+            );
+            assert_eq!(without_model["sandboxPolicy"]["type"], json!("readOnly"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_turn_start_rpc_error_clears_running_and_startup_interrupt_fires_on_turn_started()
+    {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let short_id: String = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect();
+        let sock_path = std::env::temp_dir().join(format!("o_cdx_err_{short_id}.sock"));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+
+        let interrupted_turn_ids: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let int_bg = Arc::clone(&interrupted_turn_ids);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+            }
+
+            let mut turn_start_count = 0u32;
+            while let Ok(Some(raw_line)) = lines.next_line().await {
+                let Ok(frame) = serde_json::from_str::<ShimFrame>(&raw_line) else {
+                    continue;
+                };
+                let ShimFrame::WriteStdin { line } = frame else {
+                    continue;
+                };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "thread/start" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": req["id"],
+                                "result": { "thread": { "id": "thr_err_test" } }
+                            }),
+                        )
+                        .await;
+                    }
+                    "turn/start" => {
+                        turn_start_count += 1;
+                        if turn_start_count == 1 {
+                            // Reject first turn/start with RPC error
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "id": req["id"],
+                                    "error": {
+                                        "code": -32602,
+                                        "message": "Invalid request: missing field `model`"
+                                    }
+                                }),
+                            )
+                            .await;
+                        } else if turn_start_count == 2 {
+                            // Delay `turn/started` slightly so Interrupt arrives during startup window
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "id": req["id"],
+                                    "result": {}
+                                }),
+                            )
+                            .await;
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "method": "turn/started",
+                                    "params": { "turn": { "id": "nat_turn_2" } }
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    "turn/interrupt" => {
+                        let tid = req
+                            .pointer("/params/turnId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        int_bg.lock().await.push(tid.clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "method": "turn/completed",
+                                "params": { "turn": { "id": tid, "status": "interrupted" } }
+                            }),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_cdx_err".into(),
+            provider: ProviderKind::Codex,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gpt-5.4".into()),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Plan,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let actor = tokio::spawn(run_codex_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // 1. First `turn/start` returns RPC error -> driver must transition out of Running to Error!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_err_1".into(),
+                prompt: "bad turn".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("send 1");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("err wait")
+                .expect("ev");
+            if let DriverEvent::StatusChanged(AgentStatus::Error {
+                message,
+                recoverable,
+            }) = ev
+            {
+                assert!(recoverable);
+                assert!(message.contains("missing field"));
+                break;
+            }
+        }
+
+        // 2. Second `turn/start` can now dispatch cleanly (not stuck in Running!), and Interrupt
+        // during the `turn/start`..`turn/started` startup window must fire once `turn/started` arrives!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_win_2".into(),
+                prompt: "slow startup".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("send 2");
+        // Wait for Running status (meaning `turn/start` was sent, before `turn/started` arrives)
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("running wait")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Running { .. })) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::Interrupt)
+            .await
+            .expect("interrupt during startup window");
+
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("idle wait")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+        assert_eq!(
+            *interrupted_turn_ids.lock().await,
+            vec!["nat_turn_2".to_string()],
+            "startup-window Interrupt must fire turn/interrupt as soon as turn/started delivers native_turn_id"
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

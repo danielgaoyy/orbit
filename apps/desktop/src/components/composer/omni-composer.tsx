@@ -388,7 +388,7 @@ export const OmniComposer = memo(function OmniComposer({
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const mirrorTextareaRef = useRef<HTMLDivElement | null>(null);
-  const lastTextareaHeightRef = useRef<number>(38);
+  const lastTextareaHeightRef = useRef<number>(40);
   const [composerWidthPx, setComposerWidthPx] = useState(0);
   const [isCompactBar, setIsCompactBar] = useState(false);
   const draftTextRef = useRef<string>(draftText);
@@ -561,8 +561,8 @@ export const OmniComposer = memo(function OmniComposer({
     return () => window.clearTimeout(timer);
   }, [selectedHostId, selectedCwd]);
 
-  const minTextareaHeight = 38;
-  const maxTextareaHeight = 212;
+  const minTextareaHeight = 40;
+  const maxTextareaHeight = 216;
 
   useLayoutEffect(() => {
     if (!slashDirective) {
@@ -603,9 +603,12 @@ export const OmniComposer = memo(function OmniComposer({
     if (!el) return;
 
     if (draftText.length === 0 && !slashDirective) {
-      if (lastTextareaHeightRef.current !== minTextareaHeight || el.style.height !== "38px") {
+      if (
+        lastTextareaHeightRef.current !== minTextareaHeight ||
+        el.style.height !== `${minTextareaHeight}px`
+      ) {
         lastTextareaHeightRef.current = minTextareaHeight;
-        el.style.height = "38px";
+        el.style.height = `${minTextareaHeight}px`;
       }
       if (el.style.overflowY !== "hidden") {
         el.style.overflowY = "hidden";
@@ -1403,10 +1406,7 @@ export const OmniComposer = memo(function OmniComposer({
           <div className="approval-dock-surface orbit-stage-enter overflow-hidden rounded-[14px] text-[12.5px]">
             <ScrollArea
               className="w-full"
-              viewportClassName={cn(
-                "max-h-[160px] overscroll-contain py-1.5 pl-2",
-                queued.length > 5 ? "pr-3.5" : "pr-2",
-              )}
+              viewportClassName="max-h-[160px] overscroll-contain px-2 py-1.5"
               contentClassName="space-y-0.5"
             >
               {queued.map((qItem, idx) => {
@@ -1743,7 +1743,7 @@ export const OmniComposer = memo(function OmniComposer({
                     e.preventDefault();
                     textareaRef.current?.focus();
                   }}
-                  className="orbit-pill-enter pointer-events-auto absolute top-[13px] left-[14px] z-10 inline-flex h-[20px] cursor-text items-center gap-[5.5px] select-none"
+                  className="orbit-pill-enter pointer-events-auto absolute top-[12px] left-[14px] z-10 inline-flex h-[22px] cursor-text items-center gap-[5.5px] select-none"
                 >
                   {slashDirective === "plan" ? (
                     <ListTodo className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
@@ -1760,7 +1760,7 @@ export const OmniComposer = memo(function OmniComposer({
                   ) : (
                     <FoldVertical className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
                   )}
-                  <span className="text-foreground text-[15px] leading-[20px] font-normal">
+                  <span className="text-foreground text-[15px] leading-[22px] font-normal">
                     {slashDirective}
                   </span>
                 </span>
@@ -1769,7 +1769,7 @@ export const OmniComposer = memo(function OmniComposer({
               {!slashDirective && draftText.length === 0 && (
                 <div
                   aria-hidden="true"
-                  className="text-foreground/45 pointer-events-none absolute top-[13px] right-[14px] left-[14px] truncate text-[15px] leading-[20px] select-none"
+                  className="text-foreground/45 pointer-events-none absolute top-[12px] right-[14px] left-[14px] truncate text-[15px] leading-[22px] select-none"
                 >
                   {t("composer.placeholder")}
                 </div>
@@ -1784,7 +1784,7 @@ export const OmniComposer = memo(function OmniComposer({
                     ? { textIndent: `${directiveIndentPx}px` }
                     : undefined
                 }
-                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[13px] pb-[5px] text-[15px] leading-[20px] whitespace-pre-wrap break-words"
+                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] whitespace-pre-wrap break-words"
               >
                 {draftText}
                 {"\u200b"}
@@ -1830,7 +1830,7 @@ export const OmniComposer = memo(function OmniComposer({
                 {...ime.compositionProps}
                 onKeyDown={handleKeyDown}
                 rows={1}
-                className="text-foreground block min-h-[38px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[13px] pb-[5px] text-[15px] leading-[20px] outline-none"
+                className="text-foreground block min-h-[40px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] outline-none"
               />
             </div>
 

@@ -356,6 +356,11 @@ export interface ComposerFocusOptions {
   onlyIfIdle?: boolean;
 }
 
+export type WindowedAgentStageView = AgentStageView & {
+  window_start_turn_index?: number;
+  total_turn_count?: number;
+};
+
 export interface OrbitUiState {
   fleet: FleetOverviewView;
   fleetHydrated: boolean;
@@ -396,7 +401,7 @@ export interface OrbitUiState {
   promptHistory: string[];
 
   // Incremental stage projections keyed by `hostId::agentId` + Rust sidebar tree + slash commands
-  stages: Record<string, AgentStageView>;
+  stages: Record<string, WindowedAgentStageView>;
   sidebarView: FleetSidebarView | null;
   slashCommands: SlashCommandView[];
   rewoundSessions: Record<string, true>;

@@ -319,6 +319,350 @@ pub struct WorkspaceFilePayload {
     pub line_ending: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ManagedWorktreeRoots {
+    agy_worktree_roots: Vec<PathBuf>,
+    orbit_worktree_roots: Vec<PathBuf>,
+}
+
+impl ManagedWorktreeRoots {
+    fn from_env(home: Option<&Path>) -> Self {
+        let mut agy_worktree_roots = Vec::new();
+        let mut orbit_worktree_roots = Vec::new();
+
+        if let Some(dir) = std::env::var_os("ANTIGRAVITY_EXECUTABLE_DATA_DIR")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            agy_worktree_roots.push(dir.join("worktrees"));
+        }
+        if let Some(h) = home {
+            if let Ok(rel) = std::env::var("ANTIGRAVITY_CONFIG_REL_DIR") {
+                let rel_trimmed = rel.trim();
+                if !rel_trimmed.is_empty() {
+                    let custom = h.join(".gemini").join(rel_trimmed).join("worktrees");
+                    if !agy_worktree_roots.contains(&custom) {
+                        agy_worktree_roots.push(custom);
+                    }
+                }
+            }
+            let default_agy = h.join(".gemini").join("antigravity-cli").join("worktrees");
+            if !agy_worktree_roots.contains(&default_agy) {
+                agy_worktree_roots.push(default_agy);
+            }
+        }
+
+        if let Some(oh) = std::env::var_os("ORBIT_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            orbit_worktree_roots.push(oh.join("worktrees"));
+        }
+        if let Some(h) = home {
+            let default_orbit = h.join(".orbit").join("worktrees");
+            if !orbit_worktree_roots.contains(&default_orbit) {
+                orbit_worktree_roots.push(default_orbit);
+            }
+        }
+
+        Self {
+            agy_worktree_roots,
+            orbit_worktree_roots,
+        }
+    }
+
+    fn all_roots(&self) -> impl Iterator<Item = &PathBuf> {
+        self.agy_worktree_roots
+            .iter()
+            .chain(self.orbit_worktree_roots.iter())
+    }
+}
+
+fn canonicalize_existing_prefix_sync(path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(cur) {
+            let mut out = canon;
+            for seg in missing.into_iter().rev() {
+                out.push(seg);
+            }
+            return Some(out);
+        }
+        let name = cur.file_name()?.to_os_string();
+        missing.push(name);
+        cur = cur.parent()?;
+    }
+}
+
+fn strip_worktree_rel_with_skip(
+    candidate: &Path,
+    canon_candidate: Option<&Path>,
+    root: &Path,
+    skip_leading_segments: usize,
+) -> Option<PathBuf> {
+    let canon_root = std::fs::canonicalize(root).ok();
+    let tail = candidate
+        .strip_prefix(root)
+        .ok()
+        .or_else(|| {
+            canon_root
+                .as_deref()
+                .and_then(|cr| candidate.strip_prefix(cr).ok())
+        })
+        .or_else(|| canon_candidate.and_then(|cc| cc.strip_prefix(root).ok()))
+        .or_else(|| {
+            canon_candidate
+                .zip(canon_root.as_deref())
+                .and_then(|(cc, cr)| cc.strip_prefix(cr).ok())
+        })?;
+    let mut normals = Vec::new();
+    for comp in tail.components() {
+        match comp {
+            Component::Normal(seg) => normals.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    if normals.len() <= skip_leading_segments {
+        return None;
+    }
+    let mut rel = PathBuf::new();
+    for seg in &normals[skip_leading_segments..] {
+        rel.push(seg);
+    }
+    (!rel.as_os_str().is_empty()).then_some(rel)
+}
+
+/// Extract a safe workspace-relative path when `candidate` points inside a temporary Antigravity
+/// (`<agy_data>/worktrees/<conv>/<wt>/<rel>`) or Orbit (`<orbit_home>/worktrees/<wt>/<rel>`)
+/// subagent worktree that has already been cleaned up after merge.
+fn extract_deleted_worktree_relative_path(
+    candidate: &Path,
+    worktree_roots: &ManagedWorktreeRoots,
+) -> Option<PathBuf> {
+    if !candidate.is_absolute() {
+        return None;
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    let canon_candidate = canonicalize_existing_prefix_sync(candidate);
+    for root in &worktree_roots.agy_worktree_roots {
+        if let Some(rel) =
+            strip_worktree_rel_with_skip(candidate, canon_candidate.as_deref(), root, 2)
+        {
+            return Some(rel);
+        }
+    }
+    for root in &worktree_roots.orbit_worktree_roots {
+        if let Some(rel) =
+            strip_worktree_rel_with_skip(candidate, canon_candidate.as_deref(), root, 1)
+        {
+            return Some(rel);
+        }
+    }
+    None
+}
+
+fn resolve_git_common_dir(start: &Path, stop_root: Option<&Path>) -> Option<PathBuf> {
+    let mut cur = if start.is_dir() {
+        start
+    } else {
+        start.parent()?
+    };
+    loop {
+        if let Some(bound) = stop_root
+            && (cur == bound || !cur.starts_with(bound))
+        {
+            return None;
+        }
+        let dot_git = cur.join(".git");
+        if let Ok(meta) = std::fs::symlink_metadata(&dot_git) {
+            if meta.is_dir() {
+                return std::fs::canonicalize(&dot_git).ok();
+            }
+            if meta.is_file() {
+                let raw = std::fs::read_to_string(&dot_git).ok()?;
+                let first_line = raw.lines().next()?.trim();
+                let gitdir_raw = first_line
+                    .strip_prefix("gitdir:")
+                    .or_else(|| first_line.strip_prefix("GITDIR:"))?
+                    .trim();
+                if gitdir_raw.is_empty() {
+                    return None;
+                }
+                let gitdir_path = {
+                    let p = Path::new(gitdir_raw);
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        cur.join(p)
+                    }
+                };
+                let canon_gitdir = std::fs::canonicalize(&gitdir_path).ok()?;
+                let commondir_file = canon_gitdir.join("commondir");
+                if let Ok(common_raw) = std::fs::read_to_string(&commondir_file) {
+                    let common_trim = common_raw.trim();
+                    if !common_trim.is_empty() {
+                        let common_path = {
+                            let p = Path::new(common_trim);
+                            if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                canon_gitdir.join(p)
+                            }
+                        };
+                        return std::fs::canonicalize(&common_path).ok();
+                    }
+                }
+                return Some(canon_gitdir);
+            }
+        }
+        cur = cur.parent()?;
+    }
+}
+
+/// Verify that `canonical_target` lives inside a managed worktree root AND belongs to the exact
+/// same Git repository (identical canonicalized Git common dir) as `canonical_cwd`.
+fn is_same_repo_worktree_file(
+    canonical_cwd: &Path,
+    canonical_target: &Path,
+    worktree_roots: &ManagedWorktreeRoots,
+) -> bool {
+    let Ok(raw_canon_cwd) = std::fs::canonicalize(canonical_cwd) else {
+        return false;
+    };
+    let Ok(raw_canon_target) = std::fs::canonicalize(canonical_target) else {
+        return false;
+    };
+    let Some(cwd_common) = resolve_git_common_dir(&raw_canon_cwd, None) else {
+        return false;
+    };
+    for wt_root in worktree_roots.all_roots() {
+        let Ok(canon_wt_root) = std::fs::canonicalize(wt_root) else {
+            continue;
+        };
+        if !raw_canon_target.starts_with(&canon_wt_root) {
+            continue;
+        }
+        if let Some(target_common) = resolve_git_common_dir(&raw_canon_target, Some(&canon_wt_root))
+            && target_common == cwd_common
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn unix_o_nofollow_flag() -> Option<i32> {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        Some(0x0100)
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "x86", target_arch = "riscv64")
+    ))]
+    {
+        Some(0x20000)
+    }
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+    {
+        Some(0x10000)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "x86_64",
+                target_arch = "x86",
+                target_arch = "riscv64",
+                target_arch = "aarch64",
+                target_arch = "arm"
+            )
+        )
+    )))]
+    {
+        None
+    }
+}
+
+/// Open a canonicalized regular file with `O_NOFOLLOW` (where supported) and verify via `fstat`
+/// on the opened handle + pre/post `symlink_metadata` `(dev, ino)` identity checks that no
+/// symlink swap occurred between containment validation and open.
+async fn open_validated_regular_file_async(
+    canonical: &Path,
+    trimmed: &str,
+) -> Result<(tokio::fs::File, std::fs::Metadata), String> {
+    let lmeta_before = tokio::fs::symlink_metadata(canonical)
+        .await
+        .map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
+    if lmeta_before.file_type().is_symlink() {
+        return Err(format!(
+            "Access denied: `{trimmed}` resolved to a symlink during open"
+        ));
+    }
+    if !lmeta_before.is_file() {
+        return Err(format!("`{trimmed}` is not a regular file"));
+    }
+
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    if let Some(flag) = unix_o_nofollow_flag() {
+        opts.custom_flags(flag);
+    }
+    let file = opts
+        .open(canonical)
+        .await
+        .map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
+    let fmeta = file
+        .metadata()
+        .await
+        .map_err(|e| format!("Cannot inspect `{trimmed}`: {e}"))?;
+    if !fmeta.is_file() {
+        return Err(format!("`{trimmed}` is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let lmeta_after = tokio::fs::symlink_metadata(canonical)
+            .await
+            .map_err(|e| format!("Cannot verify `{trimmed}`: {e}"))?;
+        if lmeta_after.file_type().is_symlink()
+            || fmeta.dev() != lmeta_before.dev()
+            || fmeta.ino() != lmeta_before.ino()
+            || fmeta.dev() != lmeta_after.dev()
+            || fmeta.ino() != lmeta_after.ino()
+        {
+            return Err(format!(
+                "Access denied: `{trimmed}` changed during validation"
+            ));
+        }
+    }
+
+    Ok((file, fmeta))
+}
+
 fn managed_artifact_roots(extra_attachments_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(extra) = extra_attachments_dir {
@@ -346,9 +690,11 @@ fn managed_artifact_roots(extra_attachments_dir: Option<&Path>) -> Vec<PathBuf> 
     roots
 }
 
-/// Resolve a path that points directly into an explicitly allowed read-only agent artifact/log root
-/// (such as `$ORBIT_HOME/attachments`, Antigravity brain task logs, or Claude Code task outputs)
-/// even when `cwd` is `"~"` or outside that root.
+/// Resolve a path that points directly into an explicitly allowed read-only agent artifact/log
+/// root (such as `$ORBIT_HOME/attachments`, Antigravity brain task logs, or Claude Code task
+/// outputs) even when `cwd` is `"~"` or outside that root.
+/// Managed worktrees are NOT included here; they are strictly scoped to the same Git repository as
+/// `cwd` in [`resolve_contained_file_path_with_roots`].
 async fn resolve_managed_artifact_file_if_allowed(
     trimmed: &str,
     allow_managed_artifacts: bool,
@@ -384,13 +730,32 @@ async fn resolve_managed_artifact_file_if_allowed(
 }
 
 /// Resolve a canonical file path strictly contained inside `cwd` (or an explicitly allowed
-/// read-only agent artifact/log root when `allow_managed_artifacts` is true), blocking
-/// path-traversal and symlink escapes.
+/// read-only agent artifact/log root or same-repository managed worktree when
+/// `allow_managed_artifacts` is true), blocking path-traversal and symlink escapes.
 async fn resolve_contained_file_path(
     cwd: &Path,
     raw_path: &str,
     allow_managed_artifacts: bool,
     extra_attachments_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let home = crate::platform::resolve_user_home_dir();
+    let worktree_roots = ManagedWorktreeRoots::from_env(home.as_deref());
+    resolve_contained_file_path_with_roots(
+        cwd,
+        raw_path,
+        allow_managed_artifacts,
+        extra_attachments_dir,
+        &worktree_roots,
+    )
+    .await
+}
+
+async fn resolve_contained_file_path_with_roots(
+    cwd: &Path,
+    raw_path: &str,
+    allow_managed_artifacts: bool,
+    extra_attachments_dir: Option<&Path>,
+    worktree_roots: &ManagedWorktreeRoots,
 ) -> Result<PathBuf, String> {
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
@@ -432,9 +797,21 @@ async fn resolve_contained_file_path(
         }
     };
 
-    let canonical = crate::platform::canonicalize_clean_async(&candidate)
-        .await
-        .map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
+    let canonical = match crate::platform::canonicalize_clean_async(&candidate).await {
+        Ok(canon) => canon,
+        Err(orig_err) => {
+            if allow_managed_artifacts
+                && let Some(rel) =
+                    extract_deleted_worktree_relative_path(&candidate, worktree_roots)
+                && let Ok(fallback) =
+                    crate::platform::canonicalize_clean_async(&canonical_cwd.join(&rel)).await
+                && fallback.starts_with(&canonical_cwd)
+            {
+                return Ok(fallback);
+            }
+            return Err(format!("Cannot read `{trimmed}`: {orig_err}"));
+        }
+    };
 
     if canonical.starts_with(&canonical_cwd) {
         return Ok(canonical);
@@ -447,6 +824,9 @@ async fn resolve_contained_file_path(
             {
                 return Ok(canonical);
             }
+        }
+        if is_same_repo_worktree_file(&canonical_cwd, &canonical, worktree_roots) {
+            return Ok(canonical);
         }
     }
 
@@ -508,23 +888,12 @@ pub async fn read_workspace_file_with_attachments_dir(
 ) -> Result<WorkspaceFilePayload, String> {
     let trimmed = raw_path.trim();
     let canonical = resolve_contained_file_path(cwd, trimmed, true, extra_attachments_dir).await?;
-
-    let meta = tokio::fs::metadata(&canonical)
-        .await
-        .map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
-
-    if !meta.is_file() {
-        return Err(format!("`{trimmed}` is not a regular file"));
-    }
+    let (mut file, meta) = open_validated_regular_file_async(&canonical, trimmed).await?;
 
     let size_bytes = meta.len();
     let mtime_unix_ms = metadata_mtime_unix_ms(&meta);
     let writable = compute_workspace_file_writable(cwd, trimmed, &canonical, &meta).await;
     let resolved_path = canonical.to_string_lossy().to_string();
-
-    let mut file = tokio::fs::File::open(&canonical)
-        .await
-        .map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
 
     // Read a bounded 4 KiB header first so images, PDF, audio, and video files are classified
     // by magic bytes (never blindly by extension) without allocating tens of megabytes in memory.
@@ -1454,6 +1823,224 @@ mod tests {
             .await
             .is_err()
         );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn subagent_worktree_reads_allow_live_and_deleted_fallback_readonly_and_block_escapes() {
+        let root = std::env::temp_dir().join(format!("orbit_wt_read_{}", Uuid::new_v4()));
+        let ws = root.join("repo_a");
+        let repo_b = root.join("repo_b");
+        let agy_wt_root = root.join("agy_data").join("worktrees");
+        let agy_live_wt = agy_wt_root.join("conv-123").join("subagent-track-1-repo-a");
+        let agy_other_repo_wt = agy_wt_root.join("conv-456").join("subagent-other-repo-b");
+        let orbit_wt_root = root.join("orbit_home").join("worktrees");
+        let orbit_live_wt = orbit_wt_root.join("repo-a-feat-foo");
+        let orbit_other_repo_wt = orbit_wt_root.join("repo-b-feat-bar");
+        let outside = root.join("outside_secrets");
+
+        // Set up real Git common dir + worktree gitdir/commondir links for repo_a and repo_b
+        let ws_git = ws.join(".git");
+        let ws_wt_agy_gitdir = ws_git.join("worktrees").join("subagent-track-1-repo-a");
+        let ws_wt_orbit_gitdir = ws_git.join("worktrees").join("repo-a-feat-foo");
+        let repo_b_git = repo_b.join(".git");
+        let repo_b_wt_agy_gitdir = repo_b_git.join("worktrees").join("subagent-other-repo-b");
+        let repo_b_wt_orbit_gitdir = repo_b_git.join("worktrees").join("repo-b-feat-bar");
+
+        for dir in [
+            ws.join("src"),
+            ws_wt_agy_gitdir.clone(),
+            ws_wt_orbit_gitdir.clone(),
+            repo_b.join("src"),
+            repo_b_wt_agy_gitdir.clone(),
+            repo_b_wt_orbit_gitdir.clone(),
+            agy_live_wt.join("src"),
+            agy_other_repo_wt.join("src"),
+            orbit_live_wt.join("src"),
+            orbit_other_repo_wt.join("src"),
+            outside.clone(),
+        ] {
+            tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        }
+        for (wt_checkout, gitdir) in [
+            (&agy_live_wt, &ws_wt_agy_gitdir),
+            (&orbit_live_wt, &ws_wt_orbit_gitdir),
+            (&agy_other_repo_wt, &repo_b_wt_agy_gitdir),
+            (&orbit_other_repo_wt, &repo_b_wt_orbit_gitdir),
+        ] {
+            tokio::fs::write(gitdir.join("commondir"), "../..\n")
+                .await
+                .expect("write commondir");
+            tokio::fs::write(
+                wt_checkout.join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .await
+            .expect("write wt .git");
+        }
+
+        let primary_file = ws.join("src").join("lib.rs");
+        let agy_live_file = agy_live_wt.join("src").join("lib.rs");
+        let agy_other_repo_file = agy_other_repo_wt.join("src").join("secret_b.rs");
+        let orbit_live_file = orbit_live_wt.join("src").join("lib.rs");
+        let orbit_other_repo_file = orbit_other_repo_wt.join("src").join("secret_b.rs");
+        let outside_file = outside.join("secret.txt");
+
+        tokio::fs::write(&primary_file, "pub fn primary() {}\n")
+            .await
+            .expect("write primary");
+        tokio::fs::write(&agy_live_file, "pub fn agy_live() {}\n")
+            .await
+            .expect("write agy live");
+        tokio::fs::write(&agy_other_repo_file, "pub fn repo_b_secret() {}\n")
+            .await
+            .expect("write agy other");
+        tokio::fs::write(&orbit_live_file, "pub fn orbit_live() {}\n")
+            .await
+            .expect("write orbit live");
+        tokio::fs::write(&orbit_other_repo_file, "pub fn repo_b_secret() {}\n")
+            .await
+            .expect("write orbit other");
+        tokio::fs::write(&outside_file, "top-secret\n")
+            .await
+            .expect("write outside");
+
+        let roots = ManagedWorktreeRoots {
+            agy_worktree_roots: vec![agy_wt_root.clone()],
+            orbit_worktree_roots: vec![orbit_wt_root.clone()],
+        };
+        let canon_primary = crate::platform::canonicalize_clean_async(&primary_file)
+            .await
+            .expect("canon primary");
+        let canon_agy_live = crate::platform::canonicalize_clean_async(&agy_live_file)
+            .await
+            .expect("canon agy live");
+        let canon_orbit_live = crate::platform::canonicalize_clean_async(&orbit_live_file)
+            .await
+            .expect("canon orbit live");
+
+        // (a) Same-repo live Antigravity and Orbit worktree files are allowed and strictly read-only
+        let agy_raw = agy_live_file.to_string_lossy().to_string();
+        let resolved_agy =
+            resolve_contained_file_path_with_roots(&ws, &agy_raw, true, None, &roots)
+                .await
+                .expect("same-repo live agy worktree file must resolve");
+        assert_eq!(resolved_agy, canon_agy_live);
+        let agy_meta = tokio::fs::metadata(&resolved_agy).await.expect("meta");
+        assert!(
+            !compute_workspace_file_writable(&ws, &agy_raw, &resolved_agy, &agy_meta).await,
+            "live agy worktree read must remain strictly read-only"
+        );
+
+        let orbit_raw = orbit_live_file.to_string_lossy().to_string();
+        let resolved_orbit =
+            resolve_contained_file_path_with_roots(&ws, &orbit_raw, true, None, &roots)
+                .await
+                .expect("same-repo live orbit worktree file must resolve");
+        assert_eq!(resolved_orbit, canon_orbit_live);
+        let orbit_meta = tokio::fs::metadata(&resolved_orbit).await.expect("meta");
+        assert!(
+            !compute_workspace_file_writable(&ws, &orbit_raw, &resolved_orbit, &orbit_meta).await,
+            "live orbit worktree read must remain strictly read-only"
+        );
+
+        // (a2) Cross-repository worktree files MUST BE STRICTLY DENIED (repo_a cannot read repo_b's worktree!)
+        assert!(
+            resolve_contained_file_path_with_roots(
+                &ws,
+                &agy_other_repo_file.to_string_lossy(),
+                true,
+                None,
+                &roots,
+            )
+            .await
+            .is_err(),
+            "repo A must NEVER read a file from repo B's Antigravity worktree"
+        );
+        assert!(
+            resolve_contained_file_path_with_roots(
+                &ws,
+                &orbit_other_repo_file.to_string_lossy(),
+                true,
+                None,
+                &roots,
+            )
+            .await
+            .is_err(),
+            "repo A must NEVER read a file from repo B's Orbit worktree"
+        );
+
+        // (b) Deleted worktree files gracefully fall back to primary workspace `cwd` (read-only)
+        let deleted_agy_path = agy_wt_root
+            .join("conv-999")
+            .join("deleted-subagent-wt")
+            .join("src")
+            .join("lib.rs");
+        let deleted_agy_raw = deleted_agy_path.to_string_lossy().to_string();
+        let fallback_agy =
+            resolve_contained_file_path_with_roots(&ws, &deleted_agy_raw, true, None, &roots)
+                .await
+                .expect("deleted agy worktree must fall back to primary cwd");
+        assert_eq!(fallback_agy, canon_primary);
+        let fb_meta = tokio::fs::metadata(&fallback_agy).await.expect("meta");
+        assert!(
+            !compute_workspace_file_writable(&ws, &deleted_agy_raw, &fallback_agy, &fb_meta).await,
+            "fallback absolute worktree read must remain strictly read-only"
+        );
+
+        let deleted_orbit_path = orbit_wt_root
+            .join("deleted-orbit-wt")
+            .join("src")
+            .join("lib.rs");
+        let deleted_orbit_raw = deleted_orbit_path.to_string_lossy().to_string();
+        let fallback_orbit =
+            resolve_contained_file_path_with_roots(&ws, &deleted_orbit_raw, true, None, &roots)
+                .await
+                .expect("deleted orbit worktree must fall back to primary cwd");
+        assert_eq!(fallback_orbit, canon_primary);
+
+        // (c) Traversal, outside-root escapes, and symlink opens remain strictly denied
+        let traversal_agy = format!(
+            "{}/conv-999/deleted-wt/../../outside_secrets/secret.txt",
+            agy_wt_root.display()
+        );
+        assert!(
+            resolve_contained_file_path_with_roots(&ws, &traversal_agy, true, None, &roots)
+                .await
+                .is_err(),
+            "parent-dir traversal inside worktree path must be denied"
+        );
+        assert!(
+            resolve_contained_file_path_with_roots(
+                &ws,
+                outside_file.to_str().unwrap_or(""),
+                true,
+                None,
+                &roots,
+            )
+            .await
+            .is_err(),
+            "outside secret file must remain denied"
+        );
+        assert!(
+            resolve_contained_file_path_with_roots(&ws, &agy_raw, false, None, &roots)
+                .await
+                .is_err(),
+            "worktree read must be denied when allow_managed_artifacts is false"
+        );
+
+        #[cfg(unix)]
+        {
+            let sym = ws.join("src").join("swap_link.rs");
+            std::os::unix::fs::symlink(&outside_file, &sym).expect("create symlink");
+            assert!(
+                open_validated_regular_file_async(&sym, "src/swap_link.rs")
+                    .await
+                    .is_err(),
+                "TOCTOU-hardened open must reject symlinks directly"
+            );
+        }
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

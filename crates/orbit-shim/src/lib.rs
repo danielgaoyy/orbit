@@ -2105,6 +2105,40 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
     Ok(())
 }
 
+fn is_zsh_program(program: &str) -> bool {
+    let trimmed = program.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let file_name = Path::new(trimmed)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(trimmed);
+    let basename = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
+    basename.eq_ignore_ascii_case("zsh")
+}
+
+/// Build the environment variables applied to a spawned PTY shell.
+/// Defaults (`TERM`, `TERM_PROGRAM`, and `PROMPT_EOL_MARK=""` for `zsh` to prevent the reverse-video
+/// `%` partial-line artifact on fresh PTY launch) are injected before `spec_env` so explicit caller
+/// overrides always win.
+fn build_pty_env_pairs(program: &str, spec_env: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut env = Vec::with_capacity(spec_env.len() + 3);
+    if !spec_env.contains_key("TERM") {
+        env.push(("TERM".to_string(), "xterm-256color".to_string()));
+    }
+    if !spec_env.contains_key("TERM_PROGRAM") {
+        env.push(("TERM_PROGRAM".to_string(), "Orbit".to_string()));
+    }
+    if is_zsh_program(program) && !spec_env.contains_key("PROMPT_EOL_MARK") {
+        env.push(("PROMPT_EOL_MARK".to_string(), String::new()));
+    }
+    for (k, v) in spec_env {
+        env.push((k.clone(), v.clone()));
+    }
+    env
+}
+
 async fn run_pty_shim(
     socket_path: &Path,
     spec: ShimSpawnSpec,
@@ -2130,8 +2164,7 @@ async fn run_pty_shim(
     let mut cmd = CommandBuilder::new(&spec.program);
     cmd.args(&spec.args);
     cmd.cwd(&spec.cwd);
-    cmd.env("TERM", "xterm-256color");
-    for (k, v) in &spec.env {
+    for (k, v) in build_pty_env_pairs(&spec.program, &spec.env) {
         cmd.env(k, v);
     }
 
@@ -3666,5 +3699,54 @@ mod tests {
             "SpawnedChildGuard drop must remove socket and pid sidecar owned by cancelled shim"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pty_env_injects_empty_prompt_eol_mark_for_zsh_only_and_respects_overrides() {
+        let to_map = |pairs: Vec<(String, String)>| -> HashMap<String, String> {
+            pairs.into_iter().collect()
+        };
+
+        // 1. `/bin/zsh`, `zsh`, and case-insensitive `ZSH` receive `PROMPT_EOL_MARK=""` and `TERM_PROGRAM="Orbit"`
+        for prog in ["/bin/zsh", "zsh", "/opt/homebrew/bin/ZSH"] {
+            assert!(is_zsh_program(prog), "{prog} must be recognized as zsh");
+            let env = to_map(build_pty_env_pairs(prog, &HashMap::new()));
+            assert_eq!(env.get("PROMPT_EOL_MARK").map(String::as_str), Some(""));
+            assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("Orbit"));
+            assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        }
+
+        // 2. Non-zsh shells must NOT receive `PROMPT_EOL_MARK`
+        for prog in [
+            "/bin/bash",
+            "bash",
+            "/bin/sh",
+            "/usr/bin/fish",
+            "/bin/zsh-5.9",
+        ] {
+            assert!(!is_zsh_program(prog), "{prog} must not match zsh");
+            let env = to_map(build_pty_env_pairs(prog, &HashMap::new()));
+            assert!(
+                !env.contains_key("PROMPT_EOL_MARK"),
+                "PROMPT_EOL_MARK must not be injected for {prog}"
+            );
+            assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("Orbit"));
+        }
+
+        // 3. Explicit caller overrides in `spec.env` always win
+        let mut custom = HashMap::new();
+        custom.insert("PROMPT_EOL_MARK".to_string(), "%B%S#%s%b".to_string());
+        custom.insert("TERM_PROGRAM".to_string(), "CustomTerm".to_string());
+        custom.insert("TERM".to_string(), "screen-256color".to_string());
+        let env = to_map(build_pty_env_pairs("/bin/zsh", &custom));
+        assert_eq!(
+            env.get("PROMPT_EOL_MARK").map(String::as_str),
+            Some("%B%S#%s%b")
+        );
+        assert_eq!(
+            env.get("TERM_PROGRAM").map(String::as_str),
+            Some("CustomTerm")
+        );
+        assert_eq!(env.get("TERM").map(String::as_str), Some("screen-256color"));
     }
 }

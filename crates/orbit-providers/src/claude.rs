@@ -841,6 +841,7 @@ async fn run_claude_actor(
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingClaudePerm> = HashMap::new();
     let mut queued_prompts: VecDeque<(String, String)> = VecDeque::new();
+    let mut pending_interrupt_replacement: Option<(String, String)> = None;
     let mut declared_tasks: HashMap<String, ProviderSubagentDescriptor> = HashMap::new();
     let mut tool_use_to_task: HashMap<String, String> = HashMap::new();
     let mut bg_bash_tasks: HashMap<String, (String, ToolCallDetail, BackgroundTaskInfo)> =
@@ -897,7 +898,7 @@ async fn run_claude_actor(
                                         }
                                     });
                                     let _ = shim.write_stdin_line(req.to_string()).await;
-                                    queued_prompts.push_front((turn_id, prompt));
+                                    pending_interrupt_replacement = Some((turn_id, prompt));
                                     continue;
                                 }
                                 ActiveTurnBehavior::Steer => {
@@ -945,6 +946,8 @@ async fn run_claude_actor(
                         }
                     }
                     DriverCommand::Interrupt => {
+                        queued_prompts.clear();
+                        pending_interrupt_replacement = None;
                         let rid = format!("ctrl_{ctrl_seq}");
                         ctrl_seq += 1;
                         let req = json!({
@@ -1774,8 +1777,11 @@ async fn run_claude_actor(
                                         .await;
                                 }
 
-                                // Drain queued or interrupted-replacement prompt immediately on turn settle
-                                if let Some((next_tid, next_prompt)) = queued_prompts.pop_front() {
+                                // Drain interrupted-replacement or accepted FIFO queued prompt immediately on turn settle
+                                if let Some((next_tid, next_prompt)) = pending_interrupt_replacement
+                                    .take()
+                                    .or_else(|| queued_prompts.pop_front())
+                                {
                                     active_turn_id = Some(next_tid.clone());
                                     streamed_blocks.clear();
                                     emitted_text_in_turn = false;

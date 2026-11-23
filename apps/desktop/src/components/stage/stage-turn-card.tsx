@@ -276,6 +276,7 @@ export const TurnStageSection = memo(function TurnStageSection({
       lastRawSeg.kind === "notice" ||
       lastRawSeg.kind === "wakeup" ||
       lastRawSeg.kind === "compaction" ||
+      lastRawSeg.kind === "agent_message" ||
       isTrailingSettledDelegation);
 
   const hasBody = segments.length > 0 || needsTrailingActivity;
@@ -284,7 +285,7 @@ export const TurnStageSection = memo(function TurnStageSection({
     turn.user_prompt?.item_type === "user_prompt" ? turn.user_prompt : null;
   const lastReplyText =
     !isTurnActive && turn.last_assistant_reply?.item_type === "assistant_message"
-      ? turn.last_assistant_reply.text
+      ? turn.last_assistant_reply.text.trim() || null
       : null;
   const turnForkSeq = useMemo(() => resolveTurnForkSeq(turn), [turn]);
 
@@ -307,7 +308,7 @@ export const TurnStageSection = memo(function TurnStageSection({
       )}
 
       {turn.agent_message?.item_type === "agent_message" && (
-        <AgentMessageCard hostId={hostId} item={turn.agent_message} />
+        <AgentMessageCard hostId={hostId} agentId={agentId} item={turn.agent_message} />
       )}
 
       {hasBody && (
@@ -346,6 +347,21 @@ export const TurnStageSection = memo(function TurnStageSection({
                     />
                   );
                 }
+
+                if (seg.kind === "agent_message") {
+                  if (seg.item.item_type !== "agent_message") return null;
+                  return (
+                    <AgentMessageCard
+                      key={seg.key}
+                      hostId={hostId}
+                      agentId={agentId}
+                      item={seg.item}
+                      inline
+                    />
+                  );
+                }
+
+                if (seg.kind !== "step_group") return null;
 
                 const split =
                   stepGroupSplits.get(seg.key) ?? splitStepGroupChronologically(seg.items);

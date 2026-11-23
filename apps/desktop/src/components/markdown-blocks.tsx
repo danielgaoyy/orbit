@@ -218,7 +218,7 @@ const InlineSpans = memo(
                 {span.math_ml ? (
                   <InlineMathSpan tex={span.text} mathMl={span.math_ml} />
                 ) : span.inline_code ? (
-                  <code className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[1.5px] font-mono text-[13px] [overflow-wrap:anywhere] dark:bg-white/[0.09]">
+                  <code className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.86em] leading-[1.35] [overflow-wrap:anywhere] dark:bg-white/[0.09]">
                     {span.text}
                   </code>
                 ) : (
@@ -257,7 +257,7 @@ const InlineSpans = memo(
                     onOpen(matchedSubagent);
                   }}
                   className={cn(
-                    "group/salink text-foreground/92 hover:text-foreground inline cursor-pointer items-baseline rounded-[5px] bg-black/[0.055] px-1.5 py-[1.5px] font-mono text-[13px] underline decoration-foreground/25 decoration-dotted underline-offset-2 transition-colors hover:bg-black/[0.085] hover:decoration-foreground/75 [overflow-wrap:anywhere] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]",
+                    "group/salink text-foreground/92 hover:text-foreground inline cursor-pointer rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.86em] leading-[1.35] underline decoration-foreground/25 decoration-dotted underline-offset-2 transition-colors hover:bg-black/[0.085] hover:decoration-foreground/75 [overflow-wrap:anywhere] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]",
                     className,
                   )}
                 >
@@ -269,7 +269,7 @@ const InlineSpans = memo(
             return (
               <code
                 key={idx}
-                className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[1.5px] font-mono text-[13px] [overflow-wrap:anywhere] dark:bg-white/[0.09]"
+                className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.86em] leading-[1.35] [overflow-wrap:anywhere] dark:bg-white/[0.09]"
               >
                 {span.text}
               </code>
@@ -660,7 +660,7 @@ function renderGroupedNodeContent(
     }
     case "block_quote":
       return (
-        <blockquote className="border-border text-muted-foreground border-l-2 pl-3.5 text-[14px]">
+        <blockquote className="border-border text-muted-foreground border-l-2 pl-3.5 text-[14px] leading-[1.68]">
           <InlineSpans spans={block.spans} />
         </blockquote>
       );
@@ -759,10 +759,10 @@ export const MarkdownBlocksView = memo(function MarkdownBlocksView({
   const groupedNodes = useMemo(() => groupMarkdownBlocks(blocks), [blocks]);
 
   const containerClass = compact
-    ? "selectable-text text-foreground/78 min-w-0 space-y-1 text-[13px] leading-[1.5] break-words"
+    ? "selectable-text text-foreground/78 min-w-0 space-y-1 text-[13px] leading-[1.58] break-words"
     : bubble
-      ? "selectable-text text-foreground/95 min-w-0 space-y-2 text-[14.5px] leading-[1.64] break-words"
-      : "selectable-text text-foreground/95 min-w-0 space-y-3 text-[14.5px] leading-[1.72] break-words";
+      ? "selectable-text text-foreground/95 min-w-0 space-y-2 text-[14.5px] leading-[1.68] break-words"
+      : "selectable-text text-foreground/95 min-w-0 space-y-3 text-[14.5px] leading-[1.68] break-words";
   const listSpacingClass = compact || bubble ? "space-y-0.5" : "space-y-1";
 
   return (

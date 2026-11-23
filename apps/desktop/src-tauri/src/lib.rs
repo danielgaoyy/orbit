@@ -373,13 +373,36 @@ async fn get_agent_stage_delta(
     agent_id: String,
     since_revision: u64,
     since_aux_revision: Option<u64>,
+    tail_turn_limit: Option<usize>,
 ) -> Result<AgentStageDeltaView, String> {
     let core = Arc::clone(&state.core);
     tauri::async_runtime::spawn_blocking(move || {
-        core.agent_stage_delta_with_aux(&host_id, &agent_id, since_revision, since_aux_revision)
+        core.agent_stage_delta_with_options(
+            &host_id,
+            &agent_id,
+            since_revision,
+            since_aux_revision,
+            tail_turn_limit,
+        )
     })
     .await
     .map_err(|e| format!("agent stage delta task error: {e}"))
+}
+
+#[tauri::command]
+async fn get_agent_stage_turns_slice(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    start_turn_index: usize,
+    count: usize,
+) -> Result<Vec<StageTurnView>, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.agent_stage_turns_slice(&host_id, &agent_id, start_turn_index, count)
+    })
+    .await
+    .map_err(|e| format!("agent stage turns slice task error: {e}"))
 }
 
 #[tauri::command]
@@ -3889,6 +3912,7 @@ pub fn run() {
             get_host_detail,
             get_agent_stage,
             get_agent_stage_delta,
+            get_agent_stage_turns_slice,
             get_fallback_provider_catalogs,
             resolve_model_selection,
             get_slash_commands,

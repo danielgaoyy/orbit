@@ -229,7 +229,7 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
         side="bottom"
         sideOffset={6}
         finalFocus={false}
-        className="w-[276px] space-y-2.5 p-2.5 select-none"
+        className="w-[276px] space-y-2.5 overflow-hidden p-2.5 select-none"
       >
         <div className="space-y-1">
           <div className="text-muted-foreground px-1 text-[11px] font-medium">
@@ -282,7 +282,7 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
             {t("peerStrip.moveToGroup")}
           </div>
           {projectGroups.length > 0 && (
-            <div className="max-h-36 space-y-0.5 overflow-y-auto">
+            <div className="orbit-native-scroll -mx-2.5 max-h-36 space-y-0.5 overflow-y-auto overscroll-contain px-2.5">
               {projectGroups.map((ws) => (
                 <button
                   key={ws.workspace_id}
@@ -633,7 +633,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
             side="bottom"
             sideOffset={6}
             finalFocus={false}
-            className="w-[280px] space-y-2.5 p-2.5 select-none"
+            className="w-[280px] space-y-2.5 overflow-hidden p-2.5 select-none"
           >
             {workspace && (
               <div className="border-border/60 space-y-1.5 border-b pb-2.5">
@@ -687,7 +687,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                 <div className="text-muted-foreground px-0.5 text-[11px] font-medium">
                   {t("peerStrip.moveThreadTo")}
                 </div>
-                <div className="max-h-36 space-y-0.5 overflow-y-auto">
+                <div className="orbit-native-scroll -mx-2.5 max-h-36 space-y-0.5 overflow-y-auto overscroll-contain px-2.5">
                   {projectGroups.map((ws) => {
                     const isCurrent = ws.workspace_id === activeAgent.workspace_id;
                     const count = hostDetail.agents.filter(

@@ -379,9 +379,9 @@ function HookEditorModal({
         role="dialog"
         aria-modal="true"
         aria-label={editing ? "Edit lifecycle hook" : "Add lifecycle hook"}
-        className="border-border bg-elevated text-foreground floating-surface flex max-h-[88vh] w-full max-w-[540px] flex-col rounded-[14px] border p-5"
+        className="border-border bg-elevated text-foreground floating-surface flex max-h-[88vh] w-full max-w-[540px] flex-col overflow-hidden rounded-[14px] border p-0"
       >
-        <div className="mb-4 flex items-center justify-between gap-2">
+        <div className="flex items-center justify-between gap-2 px-5 pt-5 pb-4">
           <div className="min-w-0">
             <h3 className="text-[15px] font-semibold tracking-[-0.01em]">
               {editing ? `Edit ${editing.name}` : "Add Lifecycle Hook"}
@@ -403,7 +403,7 @@ function HookEditorModal({
 
         <form
           onSubmit={(e) => void handleSubmit(e)}
-          className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto pr-0.5"
+          className="orbit-native-scroll flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto overscroll-contain px-5 pb-5"
         >
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="space-y-1">

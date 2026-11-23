@@ -474,7 +474,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
             <div
               onMouseEnter={() => setHoveredModelKey(null)}
               className={cn(
-                "bg-popover text-popover-foreground floating-surface flex max-h-[min(420px,calc(var(--available-height,540px)-8px))] flex-col items-center overflow-y-auto rounded-[14px] border border-black/[0.09] dark:border-white/[0.10]",
+                "orbit-native-scroll bg-popover text-popover-foreground floating-surface flex max-h-[min(420px,calc(var(--available-height,540px)-8px))] flex-col items-center overflow-y-auto overscroll-contain rounded-[14px] border border-black/[0.09] dark:border-white/[0.10]",
                 compactAgentRail ? "gap-0.5 p-1" : "gap-1 p-1.5",
               )}
             >
@@ -564,10 +564,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
             </div>
 
             <ScrollArea
-              className="-mx-1.5"
+              className="-mx-1.5 -mb-1.5"
               viewportRef={modelListRef}
               onViewportScroll={() => setHoveredModelKey(null)}
-              viewportClassName="max-h-[min(448px,calc(var(--available-height,540px)-42px))] px-1.5"
+              viewportClassName="max-h-[min(448px,calc(var(--available-height,540px)-42px))] px-1.5 pb-1.5"
             >
               {canSwitchAgentEngine && profiles.length > 0 && effectiveBrowsedProvider !== "acp" && (
                 <div className="border-border mb-1.5 space-y-0.5 border-b pb-1.5">

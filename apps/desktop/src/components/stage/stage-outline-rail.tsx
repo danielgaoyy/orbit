@@ -207,7 +207,7 @@ export const ChatOutlineRail = memo(
                     </div>
                     <ScrollArea
                       className="w-full"
-                      viewportClassName="max-h-[256px] overscroll-contain py-1 pl-1 pr-2.5"
+                      viewportClassName="max-h-[256px] overscroll-contain px-1.5 py-1"
                       contentClassName="space-y-0.5"
                     >
                       {earlier.map((item, idx) => {

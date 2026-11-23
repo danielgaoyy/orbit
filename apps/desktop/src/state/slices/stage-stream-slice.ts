@@ -25,7 +25,6 @@ import {
   matchesProjectDirectory,
 } from "@/lib/projects";
 import {
-  type AgentStageView,
   type ComposerContextInput,
   type PromptBadge,
   type ProviderKind,
@@ -34,6 +33,13 @@ import {
   isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import {
+  INITIAL_STAGE_TURN_WINDOW,
+  OLDER_STAGE_TURN_PAGE_SIZE,
+  computeEarlierTurnSliceRequest,
+  mergePrependedStageTurns,
+  mergeStageDeltaWithWindow,
+} from "@/lib/stage-pagination";
 import {
   containsInlineMentionToken,
   extractLineSnippet,
@@ -57,6 +63,7 @@ import type {
   PendingDraftCreateState,
   QueuedPromptItem,
   SlashDirective,
+  WindowedAgentStageView,
 } from "../store-types";
 
 export function createStageStreamSlice(ctx: OrbitStoreContext) {
@@ -76,6 +83,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
   const inflightAttachmentUploads = new Map<string, Promise<void>>();
   const submittingComposerScopes = new Set<string>();
+  const loadingEarlierStageKeys = new Set<string>();
   const localQueuedDraftExtras = new Map<
     string,
     Pick<QueuedPromptItem, "slashDirective" | "contexts" | "pastes" | "quotes">
@@ -232,6 +240,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
             agentId,
             sinceRevision,
             sinceAuxRevision,
+            sinceRevision === 0 ? INITIAL_STAGE_TURN_WINDOW : null,
           );
 
           const prevAgent = existing?.agent ?? null;
@@ -243,6 +252,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
               prevAgent.latest_seq !== nextAgent.latest_seq ||
               prevAgent.is_running !== nextAgent.is_running ||
               Boolean(prevAgent.has_background_tasks) !== Boolean(nextAgent.has_background_tasks) ||
+              Boolean(prevAgent.has_running_subagents) !== Boolean(nextAgent.has_running_subagents) ||
               prevAgent.is_awaiting_permission !== nextAgent.is_awaiting_permission ||
               (prevAgent.queued_prompts?.length ?? 0) !== (nextAgent.queued_prompts?.length ?? 0) ||
               (prevAgent.queued_prompts ?? []).some(
@@ -276,18 +286,15 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
                 return s;
               }
               const resetTurns = delta.reset || sinceRevision === 0 || !prev;
-              const turns = resetTurns
-                ? delta.changed_turns
-                : [
-                    ...prev.turns.slice(0, delta.replace_from_turn_index),
-                    ...delta.changed_turns,
-                  ];
+              const mergedWindow = mergeStageDeltaWithWindow(prev, delta, sinceRevision);
               const reusePrevAux = Boolean(delta.aux_unchanged && !resetTurns && prev);
-              const mergedStage: AgentStageView = {
+              const mergedStage: WindowedAgentStageView = {
                 revision: delta.revision,
                 host_id: delta.host_id,
                 agent: delta.agent ?? prev?.agent ?? null,
-                turns,
+                turns: mergedWindow.turns,
+                window_start_turn_index: mergedWindow.window_start_turn_index,
+                total_turn_count: mergedWindow.total_turn_count,
                 pending_permissions: reusePrevAux
                   ? prev.pending_permissions
                   : delta.pending_permissions,
@@ -328,6 +335,79 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         }
       } finally {
         gate.inFlight = false;
+      }
+    },
+
+
+    async loadEarlierStageTurns(
+      hostId: string,
+      agentId: string,
+      targetTurnIndex?: number,
+    ): Promise<number> {
+      const tlKey = `${hostId}::${agentId}`;
+      if (loadingEarlierStageKeys.has(tlKey)) {
+        return 0;
+      }
+      const stage = getState().stages[tlKey];
+      const curStart = Math.max(0, Math.floor(stage?.window_start_turn_index ?? 0));
+      if (!stage || curStart <= 0) {
+        return 0;
+      }
+
+      const sliceReq = computeEarlierTurnSliceRequest(
+        curStart,
+        OLDER_STAGE_TURN_PAGE_SIZE,
+        targetTurnIndex,
+      );
+      if (!sliceReq) {
+        return 0;
+      }
+
+      const expectedWindowStart = curStart;
+      const expectedFirstTurnKey = stage.turns[0]?.key ?? null;
+      loadingEarlierStageKeys.add(tlKey);
+
+      try {
+        const olderTurns = await orbitIpc.getAgentStageTurnsSlice(
+          hostId,
+          agentId,
+          sliceReq.startTurnIndex,
+          sliceReq.count,
+        );
+        if (!Array.isArray(olderTurns) || olderTurns.length === 0) {
+          return 0;
+        }
+
+        let prependedCount = 0;
+        setState((s) => {
+          const prev = s.stages[tlKey];
+          const merged = mergePrependedStageTurns(
+            prev,
+            olderTurns,
+            sliceReq.startTurnIndex,
+            expectedWindowStart,
+            expectedFirstTurnKey,
+          );
+          if (!prev || !merged.applied) {
+            return s;
+          }
+          prependedCount = merged.prependedCount;
+          const nextStage: WindowedAgentStageView = {
+            ...prev,
+            turns: merged.turns,
+            window_start_turn_index: merged.window_start_turn_index,
+            total_turn_count: merged.total_turn_count,
+          };
+          return {
+            ...s,
+            stages: applyStageCacheUpdate(s, tlKey, nextStage),
+          };
+        });
+        return prependedCount;
+      } catch {
+        return 0;
+      } finally {
+        loadingEarlierStageKeys.delete(tlKey);
       }
     },
 

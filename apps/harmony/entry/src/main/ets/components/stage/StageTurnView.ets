@@ -1020,6 +1020,12 @@ export struct StageTurnView {
               fallbackText: seg.item.text ?? '',
               turnIndex: this.turn.turn_index
             })
+          } else if (seg.kind === 'agent_message' && seg.item !== undefined) {
+            RichMarkdownView({
+              blocks: seg.item.blocks ?? [],
+              fallbackText: seg.item.text ?? '',
+              turnIndex: this.turn.turn_index
+            })
           } else if (seg.kind === 'compaction') {
             this.renderCompactionDivider(seg.label ?? 'Context compacted')
           } else if (seg.kind === 'wakeup') {

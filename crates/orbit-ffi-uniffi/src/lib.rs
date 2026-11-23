@@ -3148,6 +3148,10 @@ pub enum FfiTurnLiveSegment {
         key: String,
         item: FfiTimelineItem,
     },
+    AgentMessage {
+        key: String,
+        item: FfiTimelineItem,
+    },
     Notice {
         key: String,
         item: FfiTimelineItem,
@@ -3189,6 +3193,10 @@ impl From<TurnLiveSegmentView> for FfiTurnLiveSegment {
                 has_running_step,
             },
             TurnLiveSegmentView::AssistantMessage { key, item } => Self::AssistantMessage {
+                key,
+                item: item.into(),
+            },
+            TurnLiveSegmentView::AgentMessage { key, item } => Self::AgentMessage {
                 key,
                 item: item.into(),
             },

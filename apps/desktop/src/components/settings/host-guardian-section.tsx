@@ -377,7 +377,7 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                   <span>No Guardian decisions recorded on this host yet.</span>
                 </div>
               ) : (
-                <div className="divide-border max-h-[280px] divide-y overflow-y-auto">
+                <div className="orbit-native-scroll divide-border max-h-[280px] divide-y overflow-y-auto overscroll-contain">
                   {audits.slice(0, 40).map((item) => {
                     const risk = formatRiskBadge(item.assessment.risk_level);
                     return (

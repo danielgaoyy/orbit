@@ -134,7 +134,7 @@ export function resolveSessionSubagents(params: {
         (!ag.parent_host_id || ag.parent_host_id === hostId);
       if (!matchesParent) continue;
 
-      if (ag.archived_at_rfc3339) {
+      if (ag.archived_at_rfc3339 && !ag.is_running && !ag.is_awaiting_permission) {
         archivedManagedIds.add(ag.agent_id);
         continue;
       }
@@ -275,6 +275,40 @@ export function resolveSessionSubagents(params: {
   });
 
   return out;
+}
+
+/**
+ * Returns true when a subagent is currently active (running or awaiting approval).
+ * Active subagents must never be hidden by historical archive entries (for instance
+ * when a previously finished & archived subagent is resumed via `send_message`).
+ */
+export function isSubagentActiveStatus(status: ResolvedSubagentStatus): boolean {
+  return status === "running" || status === "awaiting_permission";
+}
+
+/**
+ * Filters a resolved session subagent list for UI presentation, keeping all active
+ * subagents visible regardless of `archivedSubagents` while hiding archived settled ones.
+ */
+export function filterVisibleSubagents<
+  T extends Pick<ResolvedSubagentItem, "callId" | "providerSubagentId" | "childAgentId" | "status">,
+>(
+  subagents: readonly T[],
+  archivedSubagents: Readonly<Record<string, true>>,
+  hostId: string | null,
+  agentId: string | null,
+): T[] {
+  if (!hostId || !agentId) return [];
+  const prefix = `${hostId}::${agentId}::`;
+  return subagents.filter((sa) => {
+    if (isSubagentActiveStatus(sa.status)) return true;
+    if (sa.callId && archivedSubagents[`${prefix}${sa.callId}`]) return false;
+    if (sa.providerSubagentId && archivedSubagents[`${prefix}${sa.providerSubagentId}`]) {
+      return false;
+    }
+    if (sa.childAgentId && archivedSubagents[`${prefix}${sa.childAgentId}`]) return false;
+    return true;
+  });
 }
 
 export interface ResolvedToolCallSubagent {

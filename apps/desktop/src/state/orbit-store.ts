@@ -1,6 +1,14 @@
 import { useSyncExternalStore } from "react";
 import { PROVIDERS } from "@/components/composer/composer-constants";
 import {
+  type HostSettingsTab,
+  type SettingsCoreSectionId,
+  type SettingsSection,
+  type SettingsSectionTarget,
+  type SettingsSubTabId,
+  resolveSettingsSectionTarget as resolveConsolidatedSettingsTarget,
+} from "@/components/settings/settings-nav";
+import {
   type OrbitLocale,
   getLocale,
   resolveLocale,
@@ -432,29 +440,13 @@ export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
 export type WorkspacePanelMode = "conversation" | "automations";
-export type HostSettingsTab =
-  | "agents"
-  | "guardian"
-  | "im_channels"
-  | "skills"
-  | "acp"
-  | "mcp"
-  | "rules"
-  | "hooks"
-  | "lsp"
-  | "usage"
-  | "connection";
-export type SettingsSection =
-  | "general"
-  | "instructions"
-  | "cloud_sync"
-  | "appearance"
-  | "shortcuts"
-  | "notifications"
-  | "archived"
-  | "add_host"
-  | `host:${string}:${HostSettingsTab}`;
-export type SettingsSectionTarget = SettingsSection | "hosts" | "providers" | "skills";
+export type {
+  HostSettingsTab,
+  SettingsCoreSectionId,
+  SettingsSection,
+  SettingsSectionTarget,
+  SettingsSubTabId,
+};
 export type TerminalCursorStyle = "bar" | "block" | "underline";
 export type SidebarProjectSort = "recent" | "alphabetical" | "manual";
 export type SidebarThreadFilter = "all" | "active_unread";
@@ -2152,16 +2144,7 @@ function resolveSettingsSectionTarget(
   section?: SettingsSectionTarget,
 ): SettingsSection {
   const targetHostId = s.selectedHostId ?? s.fleet.hosts[0]?.host_id ?? null;
-  if (section === "hosts") {
-    return targetHostId ? `host:${targetHostId}:connection` : "add_host";
-  }
-  if (section === "providers") {
-    return targetHostId ? `host:${targetHostId}:agents` : "general";
-  }
-  if (section === "skills") {
-    return targetHostId ? `host:${targetHostId}:skills` : "general";
-  }
-  return section ?? s.settingsSection;
+  return resolveConsolidatedSettingsTarget(section, targetHostId, s.settingsSection);
 }
 
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;

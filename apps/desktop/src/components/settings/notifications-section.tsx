@@ -5,8 +5,11 @@ import {
   SettingGroupLabel,
   SettingRow,
   SettingSectionHeader,
+  SettingSelect,
+  type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import type { PushPlatform, PushPreferences } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -16,6 +19,12 @@ const HOURS = Array.from({ length: 24 }, (_, h) => h);
 function formatHour(hour: number): string {
   return `${String(hour).padStart(2, "0")}:00`;
 }
+
+const HOUR_OPTIONS: readonly SettingSelectOption<number>[] = HOURS.map((h) => ({
+  value: h,
+  label: formatHour(h),
+  mono: true,
+}));
 
 function formatPlatformLabel(platform: PushPlatform): string {
   switch (platform) {
@@ -133,7 +142,26 @@ export function NotificationsSection() {
   const [gatewayTokenInput, setGatewayTokenInput] = useState("");
   const [clearStoredToken, setClearStoredToken] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
+  const [pendingRemoveDevice, setPendingRemoveDevice] = useState<{
+    hostId: string;
+    hostName: string;
+    device_id: string;
+    device_name: string;
+    platform: PushPlatform;
+  } | null>(null);
   const lastSyncedHostIdRef = useRef<string>(activeHostId);
+
+  useEffect(() => {
+    if (!pendingRemoveDevice) return;
+    if (!hosts.some((h) => h.host_id === pendingRemoveDevice.hostId)) {
+      setPendingRemoveDevice(null);
+    }
+  }, [hosts, pendingRemoveDevice]);
+
+  const hostSelectOptions = useMemo<SettingSelectOption<string>[]>(
+    () => hosts.map((h) => ({ value: h.host_id, label: h.display_name })),
+    [hosts],
+  );
 
   useEffect(() => {
     const hostChanged = lastSyncedHostIdRef.current !== activeHostId;
@@ -307,39 +335,29 @@ export function NotificationsSection() {
             <div className="flex items-center gap-2">
               {notifyQuietHoursEnabled && (
                 <div className="flex items-center gap-1.5 text-[12px]">
-                  <select
-                    aria-label="Desktop quiet start hour"
+                  <SettingSelect<number>
+                    size="sm"
+                    ariaLabel="Desktop quiet start hour"
                     value={notifyQuietStartHour}
-                    onChange={(e) =>
-                      orbitActions.setNotificationPrefs({
-                        notifyQuietStartHour: Number(e.target.value),
-                      })
+                    options={HOUR_OPTIONS}
+                    triggerClassName="min-w-[82px]"
+                    menuClassName="min-w-[104px]"
+                    onChange={(hour) =>
+                      orbitActions.setNotificationPrefs({ notifyQuietStartHour: hour })
                     }
-                    className="border-border bg-background text-foreground h-[28px] rounded-md border px-2 text-[12px]"
-                  >
-                    {HOURS.map((h) => (
-                      <option key={h} value={h}>
-                        {formatHour(h)}
-                      </option>
-                    ))}
-                  </select>
+                  />
                   <span className="text-muted-foreground">to</span>
-                  <select
-                    aria-label="Desktop quiet end hour"
+                  <SettingSelect<number>
+                    size="sm"
+                    ariaLabel="Desktop quiet end hour"
                     value={notifyQuietEndHour}
-                    onChange={(e) =>
-                      orbitActions.setNotificationPrefs({
-                        notifyQuietEndHour: Number(e.target.value),
-                      })
+                    options={HOUR_OPTIONS}
+                    triggerClassName="min-w-[82px]"
+                    menuClassName="min-w-[104px]"
+                    onChange={(hour) =>
+                      orbitActions.setNotificationPrefs({ notifyQuietEndHour: hour })
                     }
-                    className="border-border bg-background text-foreground h-[28px] rounded-md border px-2 text-[12px]"
-                  >
-                    {HOURS.map((h) => (
-                      <option key={h} value={h}>
-                        {formatHour(h)}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </div>
               )}
               <ToggleSwitch
@@ -356,18 +374,14 @@ export function NotificationsSection() {
         <div className="flex items-center justify-between">
           <SettingGroupLabel>Mobile Push & Gateway</SettingGroupLabel>
           {hosts.length > 1 && (
-            <select
-              aria-label="Target host for mobile push"
+            <SettingSelect<string>
+              size="compact"
+              ariaLabel="Target host for mobile push"
               value={activeHostId}
-              onChange={(e) => setTargetHostId(e.target.value)}
-              className="border-border bg-background text-foreground h-[26px] rounded-md border px-2 text-[12px]"
-            >
-              {hosts.map((h) => (
-                <option key={h.host_id} value={h.host_id}>
-                  {h.display_name}
-                </option>
-              ))}
-            </select>
+              options={hostSelectOptions}
+              triggerClassName="h-[26px] min-w-[132px] max-w-[200px]"
+              onChange={(hostId) => setTargetHostId(hostId)}
+            />
           )}
         </div>
 
@@ -444,43 +458,31 @@ export function NotificationsSection() {
             <div className="flex items-center gap-2">
               {draftPrefs.quiet_hours_enabled && (
                 <div className="flex items-center gap-1.5 text-[12px]">
-                  <select
-                    aria-label="Mobile quiet start hour"
+                  <SettingSelect<number>
+                    size="sm"
+                    ariaLabel="Mobile quiet start hour"
                     value={draftPrefs.quiet_start_hour}
+                    options={HOUR_OPTIONS}
                     disabled={!isPushReady}
-                    onChange={(e) =>
-                      updateDraftPrefs((p) => ({
-                        ...p,
-                        quiet_start_hour: Number(e.target.value),
-                      }))
+                    triggerClassName="min-w-[82px]"
+                    menuClassName="min-w-[104px]"
+                    onChange={(hour) =>
+                      updateDraftPrefs((p) => ({ ...p, quiet_start_hour: hour }))
                     }
-                    className="border-border bg-background text-foreground h-[28px] rounded-md border px-2 text-[12px]"
-                  >
-                    {HOURS.map((h) => (
-                      <option key={h} value={h}>
-                        {formatHour(h)}
-                      </option>
-                    ))}
-                  </select>
+                  />
                   <span className="text-muted-foreground">to</span>
-                  <select
-                    aria-label="Mobile quiet end hour"
+                  <SettingSelect<number>
+                    size="sm"
+                    ariaLabel="Mobile quiet end hour"
                     value={draftPrefs.quiet_end_hour}
+                    options={HOUR_OPTIONS}
                     disabled={!isPushReady}
-                    onChange={(e) =>
-                      updateDraftPrefs((p) => ({
-                        ...p,
-                        quiet_end_hour: Number(e.target.value),
-                      }))
+                    triggerClassName="min-w-[82px]"
+                    menuClassName="min-w-[104px]"
+                    onChange={(hour) =>
+                      updateDraftPrefs((p) => ({ ...p, quiet_end_hour: hour }))
                     }
-                    className="border-border bg-background text-foreground h-[28px] rounded-md border px-2 text-[12px]"
-                  >
-                    {HOURS.map((h) => (
-                      <option key={h} value={h}>
-                        {formatHour(h)}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </div>
               )}
               <ToggleSwitch
@@ -660,9 +662,16 @@ export function NotificationsSection() {
                     type="button"
                     aria-label={`Remove ${dev.device_name}`}
                     disabled={!isPushReady}
-                    onClick={() =>
-                      void orbitActions.unregisterPushDevice(activeHostId, dev.device_id)
-                    }
+                    onClick={() => {
+                      if (!activeHostId) return;
+                      setPendingRemoveDevice({
+                        hostId: activeHostId,
+                        hostName: activeHost?.display_name ?? "this host",
+                        device_id: dev.device_id,
+                        device_name: dev.device_name,
+                        platform: dev.platform,
+                      });
+                    }}
                     className="text-muted-foreground hover:text-destructive inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:opacity-50"
                   >
                     <Trash2 className="h-[13.5px] w-[13.5px]" />
@@ -673,6 +682,25 @@ export function NotificationsSection() {
           )}
         </SettingCard>
       </div>
+
+      {pendingRemoveDevice && (
+        <ConfirmDialog
+          key={`${pendingRemoveDevice.hostId}:${pendingRemoveDevice.device_id}`}
+          open
+          onOpenChange={(open) => {
+            if (!open) setPendingRemoveDevice(null);
+          }}
+          title={`Remove "${pendingRemoveDevice.device_name}"?`}
+          description={`This ${formatPlatformLabel(pendingRemoveDevice.platform)} device will stop receiving background push alerts from ${pendingRemoveDevice.hostName} until paired again.`}
+          confirmLabel="Remove device"
+          tone="danger"
+          onConfirm={async () => {
+            const target = pendingRemoveDevice;
+            if (!hosts.some((h) => h.host_id === target.hostId)) return;
+            await orbitActions.unregisterPushDevice(target.hostId, target.device_id);
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -19,6 +19,7 @@ import {
   encodeHostPairingUri,
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useImeCompositionGuard } from "@/lib/ime";
 import {
   type SshHostItem,
@@ -47,6 +48,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   const [showSshDeploy, setShowSshDeploy] = useState(false);
   const [deployingSsh, setDeployingSsh] = useState<string | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [confirmRemoveOpen, setConfirmRemoveOpen] = useState(false);
   const ime = useImeCompositionGuard();
 
   useEffect(() => {
@@ -385,7 +387,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           >
             <button
               type="button"
-              onClick={() => void handleRemoveHost()}
+              onClick={() => setConfirmRemoveOpen(true)}
               className="inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border border-rose-500/25 px-3 text-[12px] font-medium text-rose-600 transition-colors hover:bg-rose-500/10 dark:text-rose-400"
             >
               <Trash2 className="h-[13px] w-[13px]" />
@@ -394,6 +396,16 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           </SettingRow>
         </SettingCard>
       )}
+
+      <ConfirmDialog
+        open={confirmRemoveOpen}
+        onOpenChange={setConfirmRemoveOpen}
+        title={`Remove ${host.display_name}?`}
+        description="Unpairs this machine from Orbit Desktop. Running agents and shells on the host keep running, and you can pair it again later."
+        confirmLabel="Remove host"
+        tone="danger"
+        onConfirm={handleRemoveHost}
+      />
     </div>
   );
 }

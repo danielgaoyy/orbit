@@ -21,6 +21,8 @@ import {
   SettingSectionHeader,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { Checkbox } from "@/components/ui/checkbox";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { orbitIpc } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -56,6 +58,7 @@ export function CloudSyncSection() {
   const [copiedFlag, setCopiedFlag] = useState<"code" | "key" | "cli" | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [clearHostsOnLogout, setClearHostsOnLogout] = useState(false);
+  const [confirmSignOutOpen, setConfirmSignOutOpen] = useState(false);
 
   const ime = useImeCompositionGuard();
 
@@ -664,20 +667,19 @@ export function CloudSyncSection() {
                   title="Sign out of this device"
                   description="Removes local credentials only — your encrypted GitHub Secret Gist remains safe for other devices."
                 >
-                  <div className="flex items-center gap-2">
-                    <label className="text-muted-foreground flex cursor-pointer items-center gap-1.5 text-[12px]">
-                      <input
-                        type="checkbox"
+                  <div className="flex items-center gap-2.5">
+                    <label className="text-muted-foreground flex cursor-pointer items-center gap-1.5 text-[12px] select-none">
+                      <Checkbox
+                        size="sm"
                         checked={clearHostsOnLogout}
-                        onChange={(e) => setClearHostsOnLogout(e.target.checked)}
-                        className="rounded"
+                        onCheckedChange={setClearHostsOnLogout}
                       />
                       <span>Clear hosts</span>
                     </label>
                     <button
                       type="button"
                       disabled={busy}
-                      onClick={() => void orbitActions.logoutCloudSync(clearHostsOnLogout)}
+                      onClick={() => setConfirmSignOutOpen(true)}
                       className="border-border hover:bg-rose-500/10 hover:text-rose-600 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12px] font-medium transition-colors"
                     >
                       <LogOut className="h-3.5 w-3.5" />
@@ -733,6 +735,24 @@ export function CloudSyncSection() {
           <span className="selectable-text break-words">{displayError}</span>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmSignOutOpen}
+        onOpenChange={setConfirmSignOutOpen}
+        title={
+          clearHostsOnLogout
+            ? "Sign out and clear paired hosts?"
+            : "Sign out of Cloud Sync?"
+        }
+        description={
+          clearHostsOnLogout
+            ? "Removes local sync credentials and clears synced host pairings on this device. Your encrypted GitHub Secret Gist remains safe for other devices."
+            : "Removes local Cloud Sync credentials from this device. Your paired hosts and encrypted GitHub Secret Gist remain intact."
+        }
+        confirmLabel={clearHostsOnLogout ? "Sign out & clear hosts" : "Sign out"}
+        tone={clearHostsOnLogout ? "danger" : "default"}
+        onConfirm={() => orbitActions.logoutCloudSync(clearHostsOnLogout)}
+      />
     </div>
   );
 }

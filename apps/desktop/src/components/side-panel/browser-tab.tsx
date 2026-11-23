@@ -19,6 +19,7 @@ import {
   Tablet,
   X,
 } from "lucide-react";
+import { Select } from "@/components/ui/select";
 import { orbitIpc } from "@/lib/orbit-ipc";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -618,19 +619,23 @@ export const BrowserTab = memo(function BrowserTab({
         <div className="border-border bg-sidebar/60 flex shrink-0 items-center justify-between gap-2 border-b px-2.5 py-1 text-[11px]">
           <div className="flex min-w-0 items-center gap-2">
             {cdpSessions.length > 1 && selectedHostId ? (
-              <select
+              <Select<string>
+                size="compact"
+                align="start"
+                ariaLabel="Active CDP browser session"
                 value={activeCdpSession.session_id}
-                onChange={(e) =>
-                  orbitActions.selectBrowserSession(selectedHostId, e.target.value)
+                options={cdpSessions.map((s) => ({
+                  value: s.session_id,
+                  label: s.session_id,
+                  description: s.title || s.url || undefined,
+                  mono: true,
+                }))}
+                triggerClassName="h-[22px] max-w-[164px] bg-canvas"
+                menuClassName="min-w-[200px] max-w-[280px]"
+                onChange={(sessionId) =>
+                  orbitActions.selectBrowserSession(selectedHostId, sessionId)
                 }
-                className="border-border bg-canvas text-foreground h-[22px] rounded-md border px-1.5 font-mono text-[11px] outline-none"
-              >
-                {cdpSessions.map((s) => (
-                  <option key={s.session_id} value={s.session_id}>
-                    {s.session_id}
-                  </option>
-                ))}
-              </select>
+              />
             ) : (
               <span className="text-muted-foreground font-mono text-[10.5px]">
                 {activeCdpSession.session_id}

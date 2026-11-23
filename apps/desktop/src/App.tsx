@@ -22,7 +22,12 @@ import { RemoteFolderPickerDialog } from "@/components/sidebar/remote-folder-pic
 import { StreamStage } from "@/components/stage/stream-stage";
 import { WorkspacePeerStrip } from "@/components/stage/workspace-peer-strip";
 import { SimpleTooltip, TooltipProvider } from "@/components/ui/overlays";
-import { modSymbol, useGlobalErgonomicKeybindings } from "@/lib/keybindings";
+import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
+import {
+  isConfirmDialogOpen,
+  modSymbol,
+  useGlobalErgonomicKeybindings,
+} from "@/lib/keybindings";
 import { orbitIpc, isMacDesktop } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -30,6 +35,7 @@ import { cn } from "@/lib/utils";
 export default function App() {
   const isDarkTheme = useOrbitSelector((s) => s.resolvedTheme === "dark");
   const activeView = useOrbitSelector((s) => s.activeView);
+  const settingsSection = useOrbitSelector((s) => s.settingsSection);
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
   const toastNotice = useOrbitSelector((s) => s.toastNotice);
   const lastArchivedUndo = useOrbitSelector((s) => s.lastArchivedUndo);
@@ -144,6 +150,9 @@ export default function App() {
       ) {
         return;
       }
+      if (isConfirmDialogOpen()) {
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
         e.preventDefault();
         orbitActions.undoLastArchive();
@@ -173,7 +182,15 @@ export default function App() {
     <TooltipProvider>
       <MarkdownThemeProvider isDark={isDarkTheme}>
         {/* Dedicated Full-Window Settings Center (`⌘,`) with Smooth Enter/Exit */}
-        {settingsMounted && <SettingsView closing={settingsClosing} />}
+        {settingsMounted && (
+          <PanelErrorBoundary
+            panelName="Settings"
+            resetKey={`${activeView}:${settingsSection}`}
+            className="bg-canvas fixed inset-0 z-40"
+          >
+            <SettingsView closing={settingsClosing} />
+          </PanelErrorBoundary>
+        )}
 
         {/* Main Workspace Shell coordinated by 100% GPU WorkspaceMotionProvider */}
         <WorkspaceMotionProvider>
@@ -216,7 +233,12 @@ export default function App() {
 }
 
 const StableFleetSidebar = memo(function StableFleetSidebar() {
-  return <FleetSidebar />;
+  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  return (
+    <PanelErrorBoundary panelName="Fleet Sidebar" compact resetKey={selectedHostId}>
+      <FleetSidebar />
+    </PanelErrorBoundary>
+  );
 });
 
 const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
@@ -228,6 +250,9 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
 }) {
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
   const sidePanelOpen = useOrbitSelector((s) => s.sidePanelOpen);
+  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
+  const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const sidebarElRef = useRef<HTMLDivElement | null>(null);
 
@@ -410,7 +435,21 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
           <ConnectionStatusBanner />
           <WorkspacePeerStrip />
           <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-            {workspacePanel === "automations" ? <AutomationsView /> : <StreamStage />}
+            {workspacePanel === "automations" ? (
+              <PanelErrorBoundary
+                panelName="Automations"
+                resetKey={`${selectedHostId ?? ""}:${workspacePanel}`}
+              >
+                <AutomationsView />
+              </PanelErrorBoundary>
+            ) : (
+              <PanelErrorBoundary
+                panelName="Conversation Stage"
+                resetKey={`${selectedHostId ?? ""}:${selectedAgentId ?? ""}:${isDraftNewSession ? "draft" : "thread"}`}
+              >
+                <StreamStage />
+              </PanelErrorBoundary>
+            )}
           </main>
         </div>
 

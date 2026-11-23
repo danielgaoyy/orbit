@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/dialog-tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { SimpleTooltip } from "@/components/ui/overlays";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   SettingSelect,
   ToggleSwitch,
@@ -1051,31 +1052,28 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                         </label>
                       </div>
 
-                      <div className="flex flex-wrap items-center gap-3 text-[11.5px]">
-                        <label className="inline-flex cursor-pointer items-center gap-1.5">
-                          <input
-                            type="checkbox"
+                      <div className="flex flex-wrap items-center gap-3.5 text-[11.5px]">
+                        <label className="inline-flex cursor-pointer items-center gap-1.5 select-none">
+                          <Checkbox
+                            size="sm"
                             checked={pollWatchPrs}
-                            onChange={(e) => setPollWatchPrs(e.target.checked)}
-                            className="accent-foreground"
+                            onCheckedChange={setPollWatchPrs}
                           />
                           <span>Pull requests</span>
                         </label>
-                        <label className="inline-flex cursor-pointer items-center gap-1.5">
-                          <input
-                            type="checkbox"
+                        <label className="inline-flex cursor-pointer items-center gap-1.5 select-none">
+                          <Checkbox
+                            size="sm"
                             checked={pollWatchIssues}
-                            onChange={(e) => setPollWatchIssues(e.target.checked)}
-                            className="accent-foreground"
+                            onCheckedChange={setPollWatchIssues}
                           />
                           <span>Issues</span>
                         </label>
-                        <label className="inline-flex cursor-pointer items-center gap-1.5">
-                          <input
-                            type="checkbox"
+                        <label className="inline-flex cursor-pointer items-center gap-1.5 select-none">
+                          <Checkbox
+                            size="sm"
                             checked={pollWatchCi}
-                            onChange={(e) => setPollWatchCi(e.target.checked)}
-                            className="accent-foreground"
+                            onCheckedChange={setPollWatchCi}
                           />
                           <span>CI failures</span>
                         </label>

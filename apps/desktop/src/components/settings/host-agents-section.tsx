@@ -17,8 +17,11 @@ import {
   SettingGroupLabel,
   SettingRow,
   SettingSectionHeader,
+  SettingSelect,
+  type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   PROVIDER_LIST,
   formatProviderShortLabel,
@@ -32,6 +35,23 @@ import { isLocalHostCard } from "@/lib/projects";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+
+type PresetSessionMode = "auto" | "accept_edits" | "plan" | "full_access" | "default";
+
+const IDLE_TIMEOUT_OPTIONS: readonly SettingSelectOption<number>[] = [
+  { value: 600, label: "10 min" },
+  { value: 1200, label: "20 min" },
+  { value: 1800, label: "30 min" },
+  { value: 3600, label: "60 min" },
+];
+
+const PROFILE_MODE_OPTIONS: readonly SettingSelectOption<PresetSessionMode>[] = [
+  { value: "auto", label: "Auto (Guardian)" },
+  { value: "accept_edits", label: "Accept Edits" },
+  { value: "plan", label: "Plan (Read-only)" },
+  { value: "full_access", label: "Full Access" },
+  { value: "default", label: "Ask" },
+];
 
 const DEFAULT_ORCH_CONFIG: OrchestrationConfig = {
   mcp_inject_enabled: true,
@@ -73,12 +93,34 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
   const [peerUri, setPeerUri] = useState("");
   const [peerLabel, setPeerLabel] = useState("");
 
+  // Destructive confirmation state
+  const [pendingDeleteProfile, setPendingDeleteProfile] = useState<AgentProfile | null>(null);
+  const [pendingRemovePeer, setPendingRemovePeer] = useState<{
+    registration_id: string;
+    label: string;
+  } | null>(null);
+
   const available =
     hostDetail?.host.available_providers ?? hostCard?.available_providers ?? [];
   const installedProviders = PROVIDER_LIST.filter((p) => available.includes(p.id));
   const uninstalledProviders = PROVIDER_LIST.filter((p) => !available.includes(p.id));
   const effectiveProfProvider: ProviderKind =
     profProvider ?? installedProviders[0]?.id ?? "claude_code";
+  const profileProviderOptions: SettingSelectOption<ProviderKind>[] =
+    installedProviders.length > 0 && uninstalledProviders.length > 0
+      ? [
+          ...installedProviders.map((p) => ({
+            value: p.id,
+            label: p.label,
+            group: "Installed",
+          })),
+          ...uninstalledProviders.map((p) => ({
+            value: p.id,
+            label: p.label,
+            group: "Other Supported",
+          })),
+        ]
+      : PROVIDER_LIST.map((p) => ({ value: p.id, label: p.label }));
   const visibleProviders =
     installedProviders.length === 0 || showUninstalledProviders
       ? [...installedProviders, ...uninstalledProviders]
@@ -319,20 +361,16 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
             description="Automatically release idle provider processes after inactivity while preserving full session resume state and protecting active subagent trees."
           >
             <div className="flex items-center gap-2.5">
-              <select
+              <SettingSelect<number>
+                size="sm"
                 value={orchConfig.idle_timeout_secs}
+                options={IDLE_TIMEOUT_OPTIONS}
                 disabled={!orchConfig.idle_cleanup_enabled}
-                aria-label="Idle runtime cleanup timeout"
-                onChange={(e) =>
-                  void patchOrchConfig({ idle_timeout_secs: Number(e.target.value) })
-                }
-                className="border-border bg-canvas text-foreground rounded-md border px-2 py-1 text-[12px] disabled:opacity-50"
-              >
-                <option value={600}>10 min</option>
-                <option value={1200}>20 min</option>
-                <option value={1800}>30 min</option>
-                <option value={3600}>60 min</option>
-              </select>
+                ariaLabel="Idle runtime cleanup timeout"
+                triggerClassName="min-w-[88px]"
+                menuClassName="min-w-[120px]"
+                onChange={(secs) => void patchOrchConfig({ idle_timeout_secs: secs })}
+              />
               <ToggleSwitch
                 checked={orchConfig.idle_cleanup_enabled}
                 onChange={(next) => void patchOrchConfig({ idle_cleanup_enabled: next })}
@@ -410,53 +448,28 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
                 placeholder="Profile Name (e.g. Claude Architect)"
                 className="border-border bg-canvas rounded-lg border px-2.5 py-1.5 outline-none"
               />
-              <select
+              <SettingSelect<ProviderKind>
+                align="start"
                 value={effectiveProfProvider}
-                onChange={(e) => setProfProvider(e.target.value as ProviderKind)}
-                className="border-border bg-canvas rounded-lg border px-2 py-1.5"
-              >
-                {installedProviders.length > 0 && uninstalledProviders.length > 0 ? (
-                  <>
-                    <optgroup label="Installed">
-                      {installedProviders.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.label}
-                        </option>
-                      ))}
-                    </optgroup>
-                    <optgroup label="Other Supported">
-                      {uninstalledProviders.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.label}
-                        </option>
-                      ))}
-                    </optgroup>
-                  </>
-                ) : (
-                  PROVIDER_LIST.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.label}
-                    </option>
-                  ))
-                )}
-              </select>
+                options={profileProviderOptions}
+                ariaLabel="Profile provider"
+                triggerClassName="w-full min-w-0 bg-canvas"
+                onChange={(provider) => setProfProvider(provider)}
+              />
               <input
                 value={profModel}
                 onChange={(e) => setProfModel(e.target.value)}
                 placeholder="Model slug (optional)"
                 className="border-border bg-canvas rounded-lg border px-2.5 py-1.5 outline-none"
               />
-              <select
+              <SettingSelect<PresetSessionMode>
+                align="start"
                 value={typeof profMode === "string" ? profMode : "accept_edits"}
-                onChange={(e) => setProfMode(e.target.value as SessionMode)}
-                className="border-border bg-canvas rounded-lg border px-2 py-1.5"
-              >
-                <option value="auto">Auto (Guardian)</option>
-                <option value="accept_edits">Accept Edits</option>
-                <option value="plan">Plan (Read-only)</option>
-                <option value="full_access">Full Access</option>
-                <option value="default">Ask</option>
-              </select>
+                options={PROFILE_MODE_OPTIONS}
+                ariaLabel="Profile permission mode"
+                triggerClassName="w-full min-w-0 bg-canvas"
+                onChange={(mode) => setProfMode(mode)}
+              />
             </div>
             <input
               value={profWhenToUse}
@@ -564,8 +577,9 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
               >
                 <button
                   type="button"
-                  onClick={() => void orbitIpc.deleteProfile(hostId, p.profile_id)}
-                  className="text-muted-foreground hover:text-rose-500 hover:bg-accent cursor-pointer rounded-md p-1.5"
+                  aria-label={`Delete profile ${p.name}`}
+                  onClick={() => setPendingDeleteProfile(p)}
+                  className="text-muted-foreground hover:text-rose-500 hover:bg-accent cursor-pointer rounded-md p-1.5 transition-colors"
                 >
                   <Trash2 className="h-[13.5px] w-[13.5px]" />
                 </button>
@@ -679,23 +693,26 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
                     : `${peer.hostname ?? peer.host_id ?? "pending handshake"}${peer.available_providers.length > 0 ? ` · ${peer.available_providers.map((p) => formatProviderShortLabel(p)).join(", ")}` : ""}`
                 }
               >
-                <div className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
+                <div className="flex items-center gap-2.5">
+                  <ToggleSwitch
                     checked={peer.enabled}
-                    onChange={(e) =>
+                    ariaLabel={`Enable connected peer ${peer.label}`}
+                    onChange={(enabled) =>
                       void orbitIpc.updateConnectedHost(hostId, peer.registration_id, {
-                        enabled: e.target.checked,
+                        enabled,
                       })
                     }
-                    className="h-4 w-4 cursor-pointer"
                   />
                   <button
                     type="button"
+                    aria-label={`Remove connected peer ${peer.label}`}
                     onClick={() =>
-                      void orbitIpc.removeConnectedHost(hostId, peer.registration_id)
+                      setPendingRemovePeer({
+                        registration_id: peer.registration_id,
+                        label: peer.label,
+                      })
                     }
-                    className="text-muted-foreground hover:text-rose-500 hover:bg-accent cursor-pointer rounded-md p-1.5"
+                    className="text-muted-foreground hover:text-rose-500 hover:bg-accent cursor-pointer rounded-md p-1.5 transition-colors"
                   >
                     <Trash2 className="h-[13.5px] w-[13.5px]" />
                   </button>
@@ -727,6 +744,48 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
           </div>
         </SettingCard>
       </div>
+
+      <ConfirmDialog
+        open={pendingDeleteProfile !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDeleteProfile(null);
+        }}
+        title={
+          pendingDeleteProfile
+            ? `Delete profile "${pendingDeleteProfile.name}"?`
+            : "Delete agent profile?"
+        }
+        description="Orchestrating agents on this host will no longer be able to delegate tasks using this profile."
+        confirmLabel="Delete profile"
+        tone="danger"
+        onConfirm={async () => {
+          if (!pendingDeleteProfile) return;
+          const target = pendingDeleteProfile;
+          await orbitIpc.deleteProfile(hostId, target.profile_id);
+          orbitActions.showToast(`Deleted profile "${target.name}"`);
+        }}
+      />
+
+      <ConfirmDialog
+        open={pendingRemovePeer !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingRemovePeer(null);
+        }}
+        title={
+          pendingRemovePeer
+            ? `Remove peer "${pendingRemovePeer.label}"?`
+            : "Remove connected peer?"
+        }
+        description="Agents on this host will no longer be able to delegate tasks to this peer daemon."
+        confirmLabel="Remove peer"
+        tone="danger"
+        onConfirm={async () => {
+          if (!pendingRemovePeer) return;
+          const target = pendingRemovePeer;
+          await orbitIpc.removeConnectedHost(hostId, target.registration_id);
+          orbitActions.showToast(`Removed peer "${target.label}"`);
+        }}
+      />
     </div>
   );
 }

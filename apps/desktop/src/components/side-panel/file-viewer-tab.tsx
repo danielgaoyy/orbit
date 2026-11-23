@@ -31,6 +31,11 @@ import { WorkspaceCodeEditor } from "@/components/side-panel/workspace-code-edit
 import { MediaPlayer } from "@/components/viewers/media-player";
 import { PdfViewer } from "@/components/viewers/pdf-viewer";
 import { formatLineRangeLabel, normalizeLineRange } from "@/lib/file-links";
+import {
+  isFocusInsideFileViewerPane,
+  isFocusInsideModalDialog,
+  resolveFileViewerShortcut,
+} from "@/lib/file-viewer-shortcuts";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -107,6 +112,7 @@ export const FileViewerTab = memo(function FileViewerTab({
     nonce: number;
   } | null>(null);
 
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const logViewportRef = useRef<HTMLDivElement | null>(null);
   const codeViewportRef = useRef<HTMLDivElement | null>(null);
@@ -475,6 +481,12 @@ export const FileViewerTab = memo(function FileViewerTab({
     }
   };
 
+  const closeFindBar = useCallback(() => {
+    setFindOpen(false);
+    setFindQuery("");
+    requestAnimationFrame(() => containerRef.current?.focus({ preventScroll: true }));
+  }, []);
+
   const openFind = () => {
     setFindOpen(true);
     if (isMarkdown) setMarkdownMode("source");
@@ -486,35 +498,37 @@ export const FileViewerTab = memo(function FileViewerTab({
   useEffect(() => {
     const onWindowKeyDown = (e: KeyboardEvent) => {
       const snap = orbitActions.getSnapshot();
-      if (
-        !snap.sidePanelOpen ||
-        snap.activeSidePanelTabId !== tab.id ||
-        snap.terminalFocused ||
-        snap.commandPaletteOpen ||
-        snap.quickOpenFilesOpen ||
-        snap.mediaPreviewTarget !== null
-      ) {
-        return;
-      }
-      if (
-        canFindInFile &&
-        !isEditMode &&
-        (e.metaKey || e.ctrlKey) &&
-        !e.shiftKey &&
-        !e.altKey &&
-        e.key.toLowerCase() === "f"
-      ) {
+      const action = resolveFileViewerShortcut(
+        {
+          activeView: snap.activeView,
+          sidePanelOpen: snap.sidePanelOpen,
+          activeSidePanelTabId: snap.activeSidePanelTabId,
+          tabId: tab.id,
+          terminalFocused: snap.terminalFocused,
+          commandPaletteOpen: snap.commandPaletteOpen,
+          quickOpenFilesOpen: snap.quickOpenFilesOpen,
+          mediaPreviewOpen: snap.mediaPreviewTarget !== null,
+          focusInsideSidePanel: isFocusInsideFileViewerPane(
+            containerRef.current,
+            e.target,
+            document.activeElement,
+          ),
+          targetInsideModalDialog: isFocusInsideModalDialog(e.target, document.activeElement),
+          canFindInFile,
+          isEditable,
+          isEditMode,
+          findOpen,
+        },
+        e,
+      );
+      if (!action) return;
+
+      if (action === "find") {
         e.preventDefault();
         setFindOpen(true);
         if (isMarkdown) setMarkdownMode("source");
         requestAnimationFrame(() => findInputRef.current?.focus());
-      } else if (
-        (e.metaKey || e.ctrlKey) &&
-        !e.shiftKey &&
-        !e.altKey &&
-        e.key.toLowerCase() === "e" &&
-        isEditable
-      ) {
+      } else if (action === "toggle_edit") {
         e.preventDefault();
         if (isEditMode) {
           orbitActions.requestFileViewMode(hostId, cwd, path);
@@ -522,26 +536,31 @@ export const FileViewerTab = memo(function FileViewerTab({
           setFindOpen(false);
           orbitActions.enterFileEditMode(hostId, cwd, path);
         }
-      } else if (
-        (e.metaKey || e.ctrlKey) &&
-        !e.shiftKey &&
-        !e.altKey &&
-        e.key.toLowerCase() === "s" &&
-        isEditMode
-      ) {
+      } else if (action === "save") {
         e.preventDefault();
         if (!orbitActions.getSnapshot().fileEditorDrafts[cKey]?.saving) {
           void orbitActions.saveWorkspaceFile(hostId, cwd, path, false);
         }
-      } else if (e.key === "Escape" && findOpen) {
+      } else if (action === "close_find") {
         e.preventDefault();
-        setFindOpen(false);
-        setFindQuery("");
+        closeFindBar();
       }
     };
     window.addEventListener("keydown", onWindowKeyDown);
     return () => window.removeEventListener("keydown", onWindowKeyDown);
-  }, [findOpen, isMarkdown, canFindInFile, isEditable, isEditMode, cKey, hostId, cwd, path, tab.id]);
+  }, [
+    findOpen,
+    isMarkdown,
+    canFindInFile,
+    isEditable,
+    isEditMode,
+    cKey,
+    hostId,
+    cwd,
+    path,
+    tab.id,
+    closeFindBar,
+  ]);
 
   const stepMatch = (delta: number) => {
     if (matchLineNumbers.length === 0) return;
@@ -550,18 +569,9 @@ export const FileViewerTab = memo(function FileViewerTab({
 
   return (
     <div
+      ref={containerRef}
       tabIndex={-1}
       className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden outline-none"
-      onKeyDown={(e) => {
-        if (canFindInFile && !isEditMode && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
-          e.preventDefault();
-          openFind();
-        } else if (e.key === "Escape" && findOpen) {
-          e.preventDefault();
-          setFindOpen(false);
-          setFindQuery("");
-        }
-      }}
     >
       {/* Slim File Breadcrumb & Actions Sub-Bar */}
       <div className="border-border flex h-[36px] shrink-0 items-center justify-between gap-2 border-b px-3">
@@ -982,10 +992,7 @@ export const FileViewerTab = memo(function FileViewerTab({
           </button>
           <button
             type="button"
-            onClick={() => {
-              setFindOpen(false);
-              setFindQuery("");
-            }}
+            onClick={closeFindBar}
             className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded"
           >
             <X className="h-[13px] w-[13px]" />

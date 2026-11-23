@@ -23,8 +23,10 @@ import {
 } from "@/lib/orbit-ipc";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { normalizeProjectPath } from "@/lib/projects";
+import { Checkbox } from "@/components/ui/checkbox";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ProviderIcon } from "@/components/ui/provider-icons";
+import { Select, type SelectOption } from "@/components/ui/select";
 import {
   Popover,
   PopoverContent,
@@ -37,6 +39,16 @@ import { cn } from "@/lib/utils";
 function providerShortName(provider: ProviderKind): string {
   return formatProviderShortLabel(provider);
 }
+
+type PresetSessionMode = "auto" | "accept_edits" | "plan" | "full_access" | "default";
+
+const PEER_MODE_OPTIONS: readonly SelectOption<PresetSessionMode>[] = [
+  { value: "auto", label: "Auto (Guardian)" },
+  { value: "accept_edits", label: "Accept Edits" },
+  { value: "plan", label: "Plan" },
+  { value: "full_access", label: "Full Access" },
+  { value: "default", label: "Ask" },
+];
 
 function pickAlternateProvider(
   current: ProviderKind,
@@ -948,17 +960,19 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     placeholder="Label (e.g. backend)"
                     className="border-border bg-canvas text-foreground rounded-md border px-2 py-1 text-[12px] outline-none"
                   />
-                  <select
+                  <Select<ProviderKind>
+                    size="compact"
+                    align="end"
+                    ariaLabel="Peer provider"
                     value={effectiveCustomProvider}
-                    onChange={(e) => setCustomProvider(e.target.value as ProviderKind)}
-                    className="border-border bg-canvas text-foreground rounded-md border px-2 py-1 text-[12px]"
-                  >
-                    {availableProviders.map((p) => (
-                      <option key={p} value={p}>
-                        {providerShortName(p)}
-                      </option>
-                    ))}
-                  </select>
+                    options={availableProviders.map((p) => ({
+                      value: p,
+                      label: providerShortName(p),
+                    }))}
+                    triggerClassName="h-[28px] w-full bg-canvas text-[12px]"
+                    menuClassName="min-w-[144px]"
+                    onChange={(provider) => setCustomProvider(provider)}
+                  />
                 </div>
                 <textarea
                   rows={2}
@@ -969,23 +983,22 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                 />
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
-                    <select
+                    <Select<PresetSessionMode>
+                      size="compact"
+                      align="start"
+                      ariaLabel="Peer permission mode"
                       value={typeof customMode === "string" ? customMode : "accept_edits"}
-                      onChange={(e) => setCustomMode(e.target.value as SessionMode)}
-                      className="border-border bg-canvas text-foreground rounded-md border px-1.5 py-0.5 text-[11.5px]"
-                    >
-                      <option value="auto">Auto (Guardian)</option>
-                      <option value="accept_edits">Accept Edits</option>
-                      <option value="plan">Plan</option>
-                      <option value="full_access">Full Access</option>
-                      <option value="default">Ask</option>
-                    </select>
+                      options={PEER_MODE_OPTIONS}
+                      triggerClassName="h-[25px] bg-canvas"
+                      menuClassName="min-w-[152px]"
+                      onChange={(mode) => setCustomMode(mode)}
+                    />
                     {canWorktree && (
-                      <label className="text-muted-foreground inline-flex cursor-pointer items-center gap-1 text-[11.5px]">
-                        <input
-                          type="checkbox"
+                      <label className="text-muted-foreground inline-flex cursor-pointer items-center gap-1.5 text-[11.5px] select-none">
+                        <Checkbox
+                          size="sm"
                           checked={customWorktree}
-                          onChange={(e) => setCustomWorktree(e.target.checked)}
+                          onCheckedChange={setCustomWorktree}
                         />
                         <span>Worktree</span>
                       </label>

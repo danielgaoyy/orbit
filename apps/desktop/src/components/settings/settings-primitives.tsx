@@ -1,11 +1,6 @@
 import type { ReactNode } from "react";
-import { Check, ChevronsUpDown, Loader2, ShieldCheck } from "lucide-react";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/overlays";
+import { Loader2, ShieldCheck } from "lucide-react";
+import { Select, type SelectOption, type SelectProps } from "@/components/ui/select";
 import type { HostCardView, HostConnectionState } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
 
@@ -65,108 +60,19 @@ export function ToggleSwitch({
   );
 }
 
-export interface SettingSelectOption<T extends string | number> {
-  value: T;
-  label: string;
-  description?: string;
-  badge?: string;
-  disabled?: boolean;
-  mono?: boolean;
-}
+export type SettingSelectOption<T extends string | number> = SelectOption<T>;
 
 export function SettingSelect<T extends string | number>({
-  value,
-  options,
-  onChange,
-  placeholder = "Select…",
-  disabled = false,
-  triggerClassName,
+  align = "end",
   menuClassName,
-}: {
-  value: T | null;
-  options: SettingSelectOption<T>[];
-  onChange: (value: T) => void;
-  placeholder?: string;
-  disabled?: boolean;
-  triggerClassName?: string;
-  menuClassName?: string;
-}) {
-  const active = value !== null ? (options.find((opt) => opt.value === value) ?? null) : null;
-
+  ...props
+}: SelectProps<T>) {
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={disabled}>
-        <button
-          type="button"
-          disabled={disabled}
-          className={cn(
-            "border-border bg-background text-foreground hover:bg-accent/70 focus-visible:ring-foreground/20 flex h-[30px] min-w-[144px] cursor-pointer items-center justify-between gap-2 rounded-lg border px-2.5 text-[12.5px] font-medium transition-colors outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-45",
-            triggerClassName,
-          )}
-        >
-          <span
-            className={cn(
-              "truncate",
-              active?.mono && "font-mono text-[12px]",
-              !active && "text-muted-foreground font-normal",
-            )}
-          >
-            {active ? active.label : placeholder}
-          </span>
-          <ChevronsUpDown className="text-muted-foreground/75 h-[13px] w-[13px] shrink-0" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="end"
-        sideOffset={5}
-        className={cn("min-w-[180px]", menuClassName)}
-      >
-        {options.map((opt) => {
-          const selected = opt.value === value;
-          return (
-            <DropdownMenuItem
-              key={String(opt.value)}
-              disabled={opt.disabled}
-              onSelect={() => {
-                if (!opt.disabled && !selected) {
-                  onChange(opt.value);
-                }
-              }}
-              className={cn(opt.description && "items-start py-2")}
-            >
-              <div className="min-w-0 flex-1">
-                <div
-                  className={cn(
-                    "truncate text-[12.5px]",
-                    selected ? "text-foreground font-medium" : "text-foreground/90 font-normal",
-                    opt.mono && "font-mono text-[12px]",
-                  )}
-                >
-                  {opt.label}
-                </div>
-                {opt.description && (
-                  <div className="text-muted-foreground mt-0.5 text-[11.5px] leading-snug">
-                    {opt.description}
-                  </div>
-                )}
-              </div>
-              {selected ? (
-                <Check
-                  className={cn(
-                    "text-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[2]",
-                    opt.description && "mt-0.5",
-                  )}
-                />
-              ) : opt.badge ? (
-                <span className="text-muted-foreground/65 shrink-0 text-[10.5px]">
-                  {opt.badge}
-                </span>
-              ) : null}
-            </DropdownMenuItem>
-          );
-        })}
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <Select<T>
+      align={align}
+      menuClassName={cn("min-w-[180px]", menuClassName)}
+      {...props}
+    />
   );
 }
 

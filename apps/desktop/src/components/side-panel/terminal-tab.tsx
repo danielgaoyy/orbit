@@ -1,5 +1,6 @@
-import { Suspense, lazy, memo, useMemo } from "react";
+import { Suspense, lazy, memo, useEffect, useMemo, useState } from "react";
 import { ChevronDown, Plus, X } from "lucide-react";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -38,6 +39,23 @@ export const TerminalTab = memo(function TerminalTab({
   const hostTerminals = useOrbitSelector((s) =>
     selectedHostId ? (s.hostDetails[selectedHostId]?.terminals ?? EMPTY_TERMINALS) : EMPTY_TERMINALS,
   );
+
+  const [pendingCloseTab, setPendingCloseTab] = useState<{
+    key: string;
+    terminalId: string | null;
+    title: string;
+    cwd: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!pendingCloseTab) return;
+    const stillMatches = terminalTabs.some(
+      (t) => t.key === pendingCloseTab.key && t.terminalId === pendingCloseTab.terminalId,
+    );
+    if (!stillMatches) {
+      setPendingCloseTab(null);
+    }
+  }, [pendingCloseTab, terminalTabs]);
 
   const hostTabs = useMemo(
     () => terminalTabs.filter((t) => t.hostId === selectedHostId),
@@ -85,10 +103,16 @@ export const TerminalTab = memo(function TerminalTab({
                 </span>
                 <button
                   type="button"
-                  title="Kill shell"
+                  title="Close shell"
+                  aria-label={`Close ${tab.title}`}
                   onClick={(e) => {
                     e.stopPropagation();
-                    orbitActions.closeTerminalTab(tab.key, true);
+                    setPendingCloseTab({
+                      key: tab.key,
+                      terminalId: tab.terminalId,
+                      title: tab.title,
+                      cwd: tab.cwd,
+                    });
                   }}
                   className="rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/15"
                 >
@@ -177,6 +201,50 @@ export const TerminalTab = memo(function TerminalTab({
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={pendingCloseTab !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingCloseTab(null);
+        }}
+        title={
+          pendingCloseTab ? `Close "${pendingCloseTab.title}"?` : "Close terminal shell?"
+        }
+        description="Detach hides this tab while keeping the shell process running in the background so you can re-attach anytime. Kill terminates the shell process immediately."
+        detail={
+          pendingCloseTab ? (
+            <span className="font-mono text-[11.5px]">
+              {pendingCloseTab.title} · {shortDir(pendingCloseTab.cwd)}
+            </span>
+          ) : undefined
+        }
+        secondaryAction={{
+          label: "Detach",
+          variant: "default",
+          onClick: async () => {
+            if (!pendingCloseTab) return;
+            const detached = await orbitActions.closeTerminalTab(
+              pendingCloseTab.key,
+              false,
+              pendingCloseTab.terminalId,
+            );
+            if (detached) {
+              orbitActions.showToast(`Detached ${pendingCloseTab.title} — kept running in background`);
+            }
+          },
+        }}
+        confirmLabel="Kill shell"
+        tone="danger"
+        defaultAction="secondary"
+        onConfirm={async () => {
+          if (!pendingCloseTab) return;
+          await orbitActions.closeTerminalTab(
+            pendingCloseTab.key,
+            true,
+            pendingCloseTab.terminalId,
+          );
+        }}
+      />
     </div>
   );
 });

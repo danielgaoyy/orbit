@@ -49,6 +49,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
 import type { HostCardView } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import {
@@ -722,7 +723,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
               />
             )}
             <div key={section} className="orbit-stage-enter min-h-0 flex-1">
-              <InstructionsSection />
+              <PanelErrorBoundary panelName="Project Instructions">
+                <InstructionsSection />
+              </PanelErrorBoundary>
             </div>
           </div>
         ) : (
@@ -814,47 +817,49 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                 />
               )}
 
-              {section === "general" && <GeneralSection />}
-              {section === "cloud_sync" && <CloudSyncSection />}
-              {section === "appearance" && <AppearanceSection />}
-              {section === "shortcuts" && <ShortcutsSection />}
-              {section === "notifications" && <NotificationsSection />}
-              {section === "archived" && <ArchivedSection />}
-              {section === "add_host" && <AddHostSection />}
-              {parsedHost && !resolvedHost && <AddHostSection />}
-              {resolvedHost?.tab === "agents" && (
-                <HostAgentsSection hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "guardian" && (
-                <HostGuardianSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "im_channels" && (
-                <HostImChannelsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "skills" && (
-                <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "acp" && (
-                <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "mcp" && (
-                <HostMcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "rules" && (
-                <HostRulesSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "hooks" && (
-                <HostHooksSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "lsp" && (
-                <HostLspSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "usage" && (
-                <HostUsageSection hostId={resolvedHost.hostId} />
-              )}
-              {resolvedHost?.tab === "connection" && (
-                <HostConnectionSection hostId={resolvedHost.hostId} />
-              )}
+              <PanelErrorBoundary panelName="Settings Section">
+                {section === "general" && <GeneralSection />}
+                {section === "cloud_sync" && <CloudSyncSection />}
+                {section === "appearance" && <AppearanceSection />}
+                {section === "shortcuts" && <ShortcutsSection />}
+                {section === "notifications" && <NotificationsSection />}
+                {section === "archived" && <ArchivedSection />}
+                {section === "add_host" && <AddHostSection />}
+                {parsedHost && !resolvedHost && <AddHostSection />}
+                {resolvedHost?.tab === "agents" && (
+                  <HostAgentsSection hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "guardian" && (
+                  <HostGuardianSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "im_channels" && (
+                  <HostImChannelsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "skills" && (
+                  <HostSkillsSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "acp" && (
+                  <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "mcp" && (
+                  <HostMcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "rules" && (
+                  <HostRulesSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "hooks" && (
+                  <HostHooksSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "lsp" && (
+                  <HostLspSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "usage" && (
+                  <HostUsageSection hostId={resolvedHost.hostId} />
+                )}
+                {resolvedHost?.tab === "connection" && (
+                  <HostConnectionSection hostId={resolvedHost.hostId} />
+                )}
+              </PanelErrorBoundary>
             </div>
           </ScrollArea>
         )}

@@ -1583,6 +1583,9 @@ interface TerminalStreamChannel {
   subs: Set<(bytes: Uint8Array) => void>;
 }
 const terminalChannels = hmrData?.terminalChannels ?? new Map<string, TerminalStreamChannel>();
+// Explicitly detached PTY terminal keys (`hostId::terminalId`) so `host_detail` snapshots
+// never resurrect a tab the user intentionally detached into the background.
+const detachedTerminalIds = new Set<string>();
 
 let disposed = false;
 
@@ -3338,27 +3341,44 @@ export const orbitActions = {
         }
       }
 
-      // Sync attached terminal tab metadata if server assigned/attached a terminal
+      // Prune exited terminals from the detached suppression set for this host
+      const livePrefix = `${hostId}::`;
+      const liveTermIds = new Set(detail.terminals.map((t) => t.terminal_id));
+      for (const detachedKey of detachedTerminalIds) {
+        if (detachedKey.startsWith(livePrefix)) {
+          const tid = detachedKey.slice(livePrefix.length);
+          if (!liveTermIds.has(tid)) {
+            detachedTerminalIds.delete(detachedKey);
+          }
+        }
+      }
+
+      // Sync attached terminal tab metadata only when the server terminal is still live
       let nextTabs = s.terminalTabs;
       let nextActiveTab = s.activeTerminalTabKey;
-      if (detail.active_terminal_id) {
+      if (
+        detail.active_terminal_id &&
+        !detachedTerminalIds.has(`${hostId}::${detail.active_terminal_id}`)
+      ) {
         const termMeta = detail.terminals.find((t) => t.terminal_id === detail.active_terminal_id);
-        const tabKey = `${hostId}::slot-${detail.active_terminal_slot}`;
-        const existingIdx = nextTabs.findIndex((t) => t.key === tabKey);
-        const entry: TerminalTabSession = {
-          key: tabKey,
-          hostId,
-          terminalId: detail.active_terminal_id,
-          slot: detail.active_terminal_slot,
-          cwd: termMeta?.cwd ?? nextCwd,
-          title: termMeta?.title ?? "shell",
-        };
-        if (existingIdx >= 0) {
-          nextTabs = [...nextTabs];
-          nextTabs[existingIdx] = entry;
-        } else {
-          nextTabs = [...nextTabs, entry];
-          nextActiveTab = tabKey;
+        if (termMeta) {
+          const tabKey = `${hostId}::slot-${detail.active_terminal_slot}`;
+          const existingIdx = nextTabs.findIndex((t) => t.key === tabKey);
+          const entry: TerminalTabSession = {
+            key: tabKey,
+            hostId,
+            terminalId: detail.active_terminal_id,
+            slot: detail.active_terminal_slot,
+            cwd: termMeta.cwd || nextCwd,
+            title: termMeta.title || "shell",
+          };
+          if (existingIdx >= 0) {
+            nextTabs = [...nextTabs];
+            nextTabs[existingIdx] = entry;
+          } else {
+            nextTabs = [...nextTabs, entry];
+            nextActiveTab = tabKey;
+          }
         }
       }
 
@@ -10226,6 +10246,7 @@ export const orbitActions = {
   },
 
   attachExistingTerminal(hostId: string, terminalId: string, cwd: string, title: string): void {
+    detachedTerminalIds.delete(`${hostId}::${terminalId}`);
     const existing = state.terminalTabs.find(
       (t) => t.hostId === hostId && t.terminalId === terminalId,
     );
@@ -10254,14 +10275,30 @@ export const orbitActions = {
     void orbitIpc.attachTerminal(hostId, terminalId, slot);
   },
 
-  closeTerminalTab(tabKey: string, killRemoteShim: boolean): void {
+  async closeTerminalTab(
+    tabKey: string,
+    killRemoteShim: boolean,
+    expectedTerminalId?: string | null,
+  ): Promise<boolean> {
     const target = state.terminalTabs.find((t) => t.key === tabKey);
-    if (target) {
-      if (killRemoteShim && target.terminalId) {
-        void orbitIpc.killTerminal(target.hostId, target.terminalId);
-      }
-      terminalChannels.delete(`${target.hostId}::${target.slot}`);
+    if (!target) return false;
+    if (expectedTerminalId !== undefined && target.terminalId !== expectedTerminalId) {
+      return false;
     }
+    if (target.terminalId) {
+      const detachedKey = `${target.hostId}::${target.terminalId}`;
+      if (killRemoteShim) {
+        await orbitIpc.killTerminal(target.hostId, target.terminalId);
+        detachedTerminalIds.delete(detachedKey);
+        const latest = state.terminalTabs.find((t) => t.key === tabKey);
+        if (!latest || latest.terminalId !== target.terminalId) {
+          return false;
+        }
+      } else {
+        detachedTerminalIds.add(detachedKey);
+      }
+    }
+    terminalChannels.delete(`${target.hostId}::${target.slot}`);
     setState((s) => {
       const remaining = s.terminalTabs.filter((t) => t.key !== tabKey);
       const nextActive =
@@ -10285,6 +10322,7 @@ export const orbitActions = {
         terminalFocused: nextTerminalFocused,
       };
     });
+    return true;
   },
 
   setActiveTerminalTab(tabKey: string): void {

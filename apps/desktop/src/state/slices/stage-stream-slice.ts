@@ -36,7 +36,6 @@ import {
 import {
   INITIAL_STAGE_TURN_WINDOW,
   OLDER_STAGE_TURN_PAGE_SIZE,
-  type StageTurnPaginationIpc,
   computeEarlierTurnSliceRequest,
   mergePrependedStageTurns,
   mergeStageDeltaWithWindow,
@@ -236,8 +235,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           const sinceRevision = nextForceFull || !existing ? 0 : existing.revision;
           const sinceAuxRevision =
             nextForceFull || !existing ? null : (existing.aux_revision ?? null);
-          const stageIpc = orbitIpc as typeof orbitIpc & StageTurnPaginationIpc;
-          const delta = await stageIpc.getAgentStageDelta(
+          const delta = await orbitIpc.getAgentStageDelta(
             hostId,
             agentId,
             sinceRevision,
@@ -254,6 +252,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
               prevAgent.latest_seq !== nextAgent.latest_seq ||
               prevAgent.is_running !== nextAgent.is_running ||
               Boolean(prevAgent.has_background_tasks) !== Boolean(nextAgent.has_background_tasks) ||
+              Boolean(prevAgent.has_running_subagents) !== Boolean(nextAgent.has_running_subagents) ||
               prevAgent.is_awaiting_permission !== nextAgent.is_awaiting_permission ||
               (prevAgent.queued_prompts?.length ?? 0) !== (nextAgent.queued_prompts?.length ?? 0) ||
               (prevAgent.queued_prompts ?? []).some(
@@ -364,17 +363,12 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         return 0;
       }
 
-      const stageIpc = orbitIpc as typeof orbitIpc & StageTurnPaginationIpc;
-      if (typeof stageIpc.getAgentStageTurnsSlice !== "function") {
-        return 0;
-      }
-
       const expectedWindowStart = curStart;
       const expectedFirstTurnKey = stage.turns[0]?.key ?? null;
       loadingEarlierStageKeys.add(tlKey);
 
       try {
-        const olderTurns = await stageIpc.getAgentStageTurnsSlice(
+        const olderTurns = await orbitIpc.getAgentStageTurnsSlice(
           hostId,
           agentId,
           sliceReq.startTurnIndex,

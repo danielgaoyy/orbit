@@ -7,7 +7,6 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
-  type ComponentType,
   type CSSProperties,
 } from "react";
 import {
@@ -44,12 +43,13 @@ import {
   type SubagentNameMatcher,
   areResolvedSubagentsEqual,
   buildSubagentNameMatcher,
+  filterVisibleSubagents,
   resolveSessionSubagents,
 } from "@/lib/subagents";
 import { computePrependRestoredScrollTop } from "@/lib/stage-pagination";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { cn } from "@/lib/utils";
-import { isSubagentArchived, orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import {
   EMPTY_ARTIFACTS,
   EMPTY_DIFF_FILES,
@@ -205,15 +205,6 @@ const StageOutlineRailBridge = memo(function StageOutlineRailBridge({
   );
 });
 
-type FloatingSubagentsTrackProps = {
-  hostId: string | null;
-  agentId: string | null;
-  variant?: "inline" | "floating";
-};
-
-const FloatingSubagentsTrack =
-  SubagentsTrack as ComponentType<FloatingSubagentsTrackProps>;
-
 const STAGE_TOP_PAGINATE_THRESHOLD_PX = 480;
 
 const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
@@ -291,7 +282,7 @@ const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
 
             {hasVisibleSubagents && (
               <div className="pointer-events-none pb-2 [&>div]:mx-0 [&>div]:mb-0 [&>div]:max-w-none [&>div]:px-0 [&_button]:pointer-events-auto">
-                <FloatingSubagentsTrack
+                <SubagentsTrack
                   hostId={hostId}
                   agentId={agentId}
                   variant="floating"
@@ -1058,13 +1049,13 @@ export function StreamStage() {
 
   const hasVisibleSubagents = useMemo(() => {
     if (!selectedHostId || !selectedAgentId || sessionSubagents.length === 0) return false;
-    return sessionSubagents.some(
-      (sa) =>
-        !isSubagentArchived(archivedSubagents, selectedHostId, selectedAgentId, {
-          id: sa.callId,
-          providerSubagentId: sa.providerSubagentId,
-          childAgentId: sa.childAgentId,
-        }),
+    return (
+      filterVisibleSubagents(
+        sessionSubagents,
+        archivedSubagents,
+        selectedHostId,
+        selectedAgentId,
+      ).length > 0
     );
   }, [archivedSubagents, selectedHostId, selectedAgentId, sessionSubagents]);
 

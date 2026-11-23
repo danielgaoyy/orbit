@@ -50,33 +50,6 @@ import {
   WakeupEventRow,
 } from "./stage-step-group";
 
-interface InlineAgentMessageSegment {
-  kind: "agent_message";
-  key: string;
-  item: Extract<TimelineItemView, { item_type: "agent_message" }>;
-}
-
-/**
- * Type-safe runtime guard for inline `agent_message` segments emitted by the stage
- * builder (compatible both before and after `TurnLiveSegmentView` includes `"agent_message"`).
- */
-function asInlineAgentMessageSegment(seg: unknown): InlineAgentMessageSegment | null {
-  if (!seg || typeof seg !== "object") return null;
-  const candidate = seg as { kind?: unknown; key?: unknown; item?: TimelineItemView };
-  if (
-    candidate.kind === "agent_message" &&
-    typeof candidate.key === "string" &&
-    candidate.item?.item_type === "agent_message"
-  ) {
-    return {
-      kind: "agent_message",
-      key: candidate.key,
-      item: candidate.item,
-    };
-  }
-  return null;
-}
-
 const StageNoticeSegment = memo(function StageNoticeSegment({
   item,
 }: {
@@ -303,7 +276,7 @@ export const TurnStageSection = memo(function TurnStageSection({
       lastRawSeg.kind === "notice" ||
       lastRawSeg.kind === "wakeup" ||
       lastRawSeg.kind === "compaction" ||
-      asInlineAgentMessageSegment(lastRawSeg) !== null ||
+      lastRawSeg.kind === "agent_message" ||
       isTrailingSettledDelegation);
 
   const hasBody = segments.length > 0 || needsTrailingActivity;
@@ -375,14 +348,14 @@ export const TurnStageSection = memo(function TurnStageSection({
                   );
                 }
 
-                const inlineAgentMsg = asInlineAgentMessageSegment(seg);
-                if (inlineAgentMsg) {
+                if (seg.kind === "agent_message") {
+                  if (seg.item.item_type !== "agent_message") return null;
                   return (
                     <AgentMessageCard
-                      key={inlineAgentMsg.key}
+                      key={seg.key}
                       hostId={hostId}
                       agentId={agentId}
-                      item={inlineAgentMsg.item}
+                      item={seg.item}
                       inline
                     />
                   );

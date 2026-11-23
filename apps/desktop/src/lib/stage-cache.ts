@@ -303,6 +303,8 @@ function fingerprintLiveSegment(seg: TurnLiveSegmentView | undefined): string {
   switch (seg.kind) {
     case "assistant_message":
       return `msg:${seg.key}:${fingerprintTimelineItem(seg.item)}`;
+    case "agent_message":
+      return `agm:${seg.key}:${fingerprintTimelineItem(seg.item)}`;
     case "notice":
       return `not:${seg.key}:${fingerprintTimelineItem(seg.item)}`;
     case "compaction":

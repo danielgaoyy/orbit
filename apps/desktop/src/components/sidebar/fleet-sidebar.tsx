@@ -627,7 +627,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
   const hasAgentRunningSubagents = useCallback(
     (hostId: string, ag: AgentCardView): boolean =>
-      Boolean((ag as AgentCardView & { has_running_subagents?: boolean }).has_running_subagents) ||
+      Boolean(ag.has_running_subagents) ||
       runningParentThreadKeys.has(threadScopeKey(hostId, ag.agent_id)),
     [runningParentThreadKeys],
   );

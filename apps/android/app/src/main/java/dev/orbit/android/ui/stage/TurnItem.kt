@@ -743,6 +743,15 @@ private fun LiveTurnSegments(
                     }
                 }
 
+                is FfiTurnLiveSegment.AgentMessage -> {
+                    (seg.item as? FfiTimelineItem.AgentMessage)?.let { msg ->
+                        MarkdownBlocks(
+                            blocks = msg.blocks,
+                            fallbackText = msg.text,
+                        )
+                    }
+                }
+
                 is FfiTurnLiveSegment.Notice -> {
                     (seg.item as? FfiTimelineItem.Notice)?.let { notice ->
                         NoticeBannerRow(notice = notice)

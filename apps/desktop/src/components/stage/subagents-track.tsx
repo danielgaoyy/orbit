@@ -24,13 +24,13 @@ import {
   extractCleanAgentMessageBody,
   formatCleanAgentMessagePreview,
 } from "@/lib/agent-message-clean";
-import { resolveSessionSubagents } from "@/lib/subagents";
+import { filterVisibleSubagents, resolveSessionSubagents } from "@/lib/subagents";
 
 export { extractCleanAgentMessageBody };
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/overlays";
-import { isSubagentArchived, orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 const EMPTY_STAGE_SUBAGENTS: readonly SessionSubagentEntryView[] = Object.freeze([]);
@@ -200,20 +200,14 @@ export const SubagentsTrack = memo(function SubagentsTrack({
 
   const orderedSubagents = useMemo(() => {
     if (!hostId || !agentId) return [];
-    return resolveSessionSubagents({
+    const resolved = resolveSessionSubagents({
       hostId,
       agentId,
       insightsSubagents,
       hostDetails,
       fleetHosts,
-    }).filter(
-      (sa) =>
-        !isSubagentArchived(archivedSubagents, hostId, agentId, {
-          id: sa.callId,
-          providerSubagentId: sa.providerSubagentId,
-          childAgentId: sa.childAgentId,
-        }),
-    );
+    });
+    return filterVisibleSubagents(resolved, archivedSubagents, hostId, agentId);
   }, [hostId, agentId, insightsSubagents, hostDetails, fleetHosts, archivedSubagents]);
 
   const totalCount = orderedSubagents.length;

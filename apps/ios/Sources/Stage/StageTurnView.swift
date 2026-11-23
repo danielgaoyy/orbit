@@ -110,7 +110,7 @@ struct StageTurnView: View {
             } else {
                 needsTrailing = true
             }
-        case .notice, .wakeup, .compaction:
+        case .agentMessage, .notice, .wakeup, .compaction:
             needsTrailing = true
         case .stepGroup:
             needsTrailing = false
@@ -443,6 +443,22 @@ struct StageTurnView: View {
                         assistantMarkdownBlock(text: text, blocks: blocks, streaming: isMsgStreaming)
                     }
 
+                case let .agentMessage(_, item):
+                    if case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, blocks, timestampMs) = item {
+                        AgentMessageCardView(
+                            store: store,
+                            kind: kind,
+                            sourceAgentId: sourceAgentId,
+                            sourceHostId: sourceHostId,
+                            sourceTitle: sourceTitle,
+                            event: event,
+                            text: text,
+                            permissionContext: permissionContext,
+                            blocks: blocks,
+                            timestampMs: timestampMs
+                        )
+                    }
+
                 case let .notice(_, item):
                     if case let .notice(_, level, message, _) = item {
                         TurnNoticeRow(level: level, message: message)
@@ -537,6 +553,7 @@ private extension FfiTurnLiveSegment {
         switch self {
         case let .stepGroup(key, _, _, _, _, _, _, _, _, _): return key
         case let .assistantMessage(key, _): return key
+        case let .agentMessage(key, _): return key
         case let .notice(key, _): return key
         case let .compaction(key, _): return key
         case let .wakeup(key, _): return key

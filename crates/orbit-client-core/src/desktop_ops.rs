@@ -554,6 +554,7 @@ pub fn bootstrap_ssh_host_and_pair(
     alias: &str,
     explicit_port: Option<u16>,
 ) -> Result<String, String> {
+    let repo = orbit_protocol::configured_github_repo();
     let port_flag = explicit_port
         .map(|p| format!(" --port {p}"))
         .unwrap_or_default();
@@ -564,7 +565,7 @@ pub fn bootstrap_ssh_host_and_pair(
          if ! command -v orbit >/dev/null 2>&1; then NEED_INSTALL=1; \
          elif orbit --version 2>&1 | grep -Eq 'GLIBC_|0\\.1\\.|0\\.2\\.[012]'; then NEED_INSTALL=1; fi; \
          if [ \"$NEED_INSTALL\" = \"1\" ]; then \
-           curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
+           curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/install.sh | ORBIT_GITHUB_REPO='{repo}' sh >/dev/null 2>&1; \
            orbit daemon up{port_flag} >/dev/null 2>&1 || true; \
          elif ! orbit daemon status 2>/dev/null | grep -q 'RUNNING'; then \
            orbit daemon up{port_flag} >/dev/null 2>&1 || true; \
@@ -610,13 +611,14 @@ pub fn upgrade_remote_daemon_over_ssh(
     alias: &str,
     explicit_port: Option<u16>,
 ) -> Result<(String, Option<String>), String> {
+    let repo = orbit_protocol::configured_github_repo();
     let port_flag = explicit_port
         .map(|p| format!(" --port {p}"))
         .unwrap_or_default();
     let remote_script = format!(
         "set -eu; \
          export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
-         curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
+         curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/install.sh | ORBIT_GITHUB_REPO='{repo}' sh >/dev/null 2>&1; \
          orbit daemon up{port_flag} >/dev/null 2>&1; \
          if [ -f \"$HOME/.orbit/relay.json\" ] && orbit relay status 2>/dev/null | grep -q 'RUNNING'; then orbit relay up >/dev/null 2>&1 || true; fi; \
          orbit --version; \
@@ -827,11 +829,12 @@ pub fn provision_ssh_tunnel_relay_with_home(
         format_restricted_authorized_key_line(&tunnel_key.openssh_pubkey, relay_port, &tag)
             .replace('\'', "");
 
+    let repo = orbit_protocol::configured_github_repo();
     let remote_script = format!(
         "set -eu; \
          export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
          if ! command -v orbit >/dev/null 2>&1 || orbit --version 2>&1 | grep -q 'GLIBC_' || ! orbit relay --help 2>&1 | grep -q 'allow'; then \
-           curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh; \
+           curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/install.sh | ORBIT_GITHUB_REPO='{repo}' sh; \
          fi; \
          orbit relay up --listen 127.0.0.1:{relay_port} {pubkey_flags}; \
          mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\"; \

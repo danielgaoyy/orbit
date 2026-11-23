@@ -761,8 +761,9 @@ fn extract_tag_from_release_url(url: &str) -> Option<String> {
 }
 
 async fn resolve_latest_release_tag(current_ver: &str) -> anyhow::Result<String> {
-    const LATEST_WEB_URL: &str = "https://github.com/danielgaoyy/orbit/releases/latest";
-    const LATEST_API_URL: &str = "https://api.github.com/repos/danielgaoyy/orbit/releases/latest";
+    let repo = orbit_protocol::configured_github_repo();
+    let latest_web_url = format!("https://github.com/{repo}/releases/latest");
+    let latest_api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
 
     // 1. Primary: lightweight no-redirect web HEAD/GET -> 302 Location (`/releases/tag/vX.Y.Z`).
     //    Never consumes `api.github.com` unauthenticated 60 req/hr quota.
@@ -775,9 +776,9 @@ async fn resolve_latest_release_tag(current_ver: &str) -> anyhow::Result<String>
     let mut web_err: Option<String> = None;
     for use_head in [true, false] {
         let req = if use_head {
-            no_redirect.head(LATEST_WEB_URL)
+            no_redirect.head(&latest_web_url)
         } else {
-            no_redirect.get(LATEST_WEB_URL)
+            no_redirect.get(&latest_web_url)
         };
         match req.send().await {
             Ok(resp) => {
@@ -813,7 +814,7 @@ async fn resolve_latest_release_tag(current_ver: &str) -> anyhow::Result<String>
         .user_agent(format!("orbit-cli/{current_ver}"))
         .build()?;
     let mut req = api_client
-        .get(LATEST_API_URL)
+        .get(&latest_api_url)
         .header("Accept", "application/vnd.github+json");
     if let Some(token) = resolve_github_token() {
         req = req.bearer_auth(token);
@@ -955,7 +956,8 @@ pub async fn self_upgrade_cli(
         (os, arch) => anyhow::bail!("unsupported auto-upgrade platform: {os}/{arch}"),
     };
 
-    let release_base_url = format!("https://github.com/danielgaoyy/orbit/releases/download/{tag}");
+    let repo = orbit_protocol::configured_github_repo();
+    let release_base_url = format!("https://github.com/{repo}/releases/download/{tag}");
     println!("Downloading & verifying Orbit {tag} ({asset_name}) from GitHub Releases...");
     let (bytes, verified_sha256) =
         download_and_verify_release_asset(&client, &release_base_url, asset_name).await?;

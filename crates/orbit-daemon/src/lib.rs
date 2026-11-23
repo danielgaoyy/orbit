@@ -6814,10 +6814,7 @@ impl DaemonRuntime {
         };
         let tmp_path = install_dir.join(tmp_name);
 
-        let repo = std::env::var("ORBIT_REPO")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "danielgaoyy/orbit".to_string());
+        let repo = orbit_protocol::configured_github_repo();
 
         let release_tag = match target_version
             .as_deref()

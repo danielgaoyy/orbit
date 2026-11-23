@@ -11508,12 +11508,15 @@ impl OrbitAppCore {
                 }
             };
 
-            let cmd = "export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\" && curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh && orbit daemon up; exit";
+            let repo = orbit_protocol::configured_github_repo();
+            let cmd = format!(
+                "export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\" && curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/install.sh | ORBIT_GITHUB_REPO='{repo}' sh && orbit daemon up; exit"
+            );
             if let Err(e) = session
                 .send_wire(WireMessage::SendTerminalKeys {
                     request_id: Uuid::new_v4(),
                     terminal_id,
-                    text: Some(cmd.to_string()),
+                    text: Some(cmd),
                     keys: vec!["Enter".to_string()],
                 })
                 .await

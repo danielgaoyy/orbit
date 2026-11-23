@@ -49,6 +49,58 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 4;
 
+/// Canonical default GitHub repository (`owner/repo`) for Orbit releases, self-updates,
+/// and remote installer bootstrapping.
+///
+/// Forks and organizations can override this in one place at runtime or compile time via
+/// `ORBIT_GITHUB_REPO=owner/repo` (validated by [`configured_github_repo`]).
+pub const DEFAULT_GITHUB_REPO: &str = "danielgaoyy/orbit";
+
+/// Validate a GitHub `owner/repo` slug against strict safe ASCII characters
+/// (`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`), rejecting `.` segments, `..` traversal,
+/// extra slashes, whitespace, or shell/URL injection characters.
+pub fn is_valid_github_repo(raw: &str) -> bool {
+    let Some((owner, repo)) = raw.split_once('/') else {
+        return false;
+    };
+    if owner.is_empty() || repo.is_empty() || owner.len() > 100 || repo.len() > 100 {
+        return false;
+    }
+    if owner == "." || repo == "." || owner.contains("..") || repo.contains("..") {
+        return false;
+    }
+    let is_safe_segment = |part: &str| {
+        part.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    is_safe_segment(owner) && is_safe_segment(repo)
+}
+
+fn resolve_github_repo_from(runtime_env: Option<&str>, compile_env: Option<&str>) -> String {
+    if let Some(val) = runtime_env
+        && is_valid_github_repo(val)
+    {
+        return val.to_string();
+    }
+    if let Some(val) = compile_env
+        && is_valid_github_repo(val)
+    {
+        return val.to_string();
+    }
+    DEFAULT_GITHUB_REPO.to_string()
+}
+
+/// Resolve the configured GitHub repository (`owner/repo`) for release downloads and updates.
+///
+/// Precedence:
+/// 1. Runtime `ORBIT_GITHUB_REPO` environment variable (if strictly valid).
+/// 2. Compile-time `option_env!("ORBIT_GITHUB_REPO")` (if strictly valid).
+/// 3. [`DEFAULT_GITHUB_REPO`] (`"danielgaoyy/orbit"`).
+pub fn configured_github_repo() -> String {
+    let runtime = std::env::var("ORBIT_GITHUB_REPO").ok();
+    resolve_github_repo_from(runtime.as_deref(), option_env!("ORBIT_GITHUB_REPO"))
+}
+
 fn wire_default_true() -> bool {
     true
 }
@@ -4923,5 +4975,79 @@ mod tests {
         assert_eq!(committed_json["kind"], "committed");
         assert_eq!(committed_json["commit_sha"], "abc");
         assert_eq!(committed_json["branch"], "main");
+    }
+
+    #[test]
+    fn github_repo_validation_accepts_valid_slugs_and_rejects_traversal_or_injection() {
+        for valid in [
+            DEFAULT_GITHUB_REPO,
+            "my-org/orbit",
+            "Org_123/orbit.rs",
+            "a/b",
+            "foo.bar/baz-qux_9",
+        ] {
+            assert!(
+                is_valid_github_repo(valid),
+                "expected valid github repo slug `{valid}`"
+            );
+        }
+
+        let overlong = format!("{}/orbit", "a".repeat(101));
+        for invalid in [
+            "",
+            "orbit",
+            "/orbit",
+            "owner/",
+            "owner/repo/extra",
+            "../orbit",
+            "owner/..",
+            "owner/a..b",
+            "a..b/orbit",
+            "./orbit",
+            "owner/.",
+            "owner/repo?foo=bar",
+            "owner/repo#frag",
+            "owner/repo;id",
+            "owner/repo | sh",
+            "owner/repo\n",
+            " owner/repo",
+            "owner/repo ",
+            "owner/repo\0",
+            "https://github.com/danielgaoyy/orbit",
+            "owner/örbit",
+            overlong.as_str(),
+        ] {
+            assert!(
+                !is_valid_github_repo(invalid),
+                "expected invalid github repo slug `{invalid:?}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn github_repo_resolution_precedence_and_fallback() {
+        assert_eq!(
+            resolve_github_repo_from(Some("fork-org/orbit"), Some("compile-org/orbit")),
+            "fork-org/orbit"
+        );
+        assert_eq!(
+            resolve_github_repo_from(Some("../evil"), Some("compile-org/orbit")),
+            "compile-org/orbit"
+        );
+        assert_eq!(
+            resolve_github_repo_from(None, Some("compile-org/orbit.v2")),
+            "compile-org/orbit.v2"
+        );
+        assert_eq!(
+            resolve_github_repo_from(Some("bad slug"), Some("also/../bad")),
+            DEFAULT_GITHUB_REPO
+        );
+        assert_eq!(resolve_github_repo_from(None, None), DEFAULT_GITHUB_REPO);
+
+        let effective = configured_github_repo();
+        assert!(
+            is_valid_github_repo(&effective),
+            "configured_github_repo() must always return a valid slug, got `{effective}`"
+        );
     }
 }

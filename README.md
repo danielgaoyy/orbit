@@ -1,66 +1,120 @@
 # Orbit
 
-**Orbit** 是一个基于纯 Rust 核心构建的超轻量、极低延迟、原生支持多主机舰队（Multi-Host Fleet）的本地 AI Coding Agent 编排与全平台远程控制面。
+**Orbit** is a pure-Rust, low-latency, multi-host orchestration engine and cross-platform native control plane for AI coding agents.
 
-无论你的 AI 编程会话运行在云端 **Devbox**、**Linux 工作站**，还是家里的 **Mac mini** 上，你都可以通过：
-- **桌面端（macOS / Linux / Windows）**：基于 **Tauri v2** + **React 19 / TypeScript / Tailwind CSS v4 / shadcn/ui / `@xterm/xterm` WebGL** 的轻量级原生桌面控制台（`apps/desktop`）；
-- **移动端第一方原生 UI**：
-  - **iOS (`16.4+`)**：纯原生 **Swift + SwiftUI** 客户端（`apps/ios`，经 UniFFI 嵌入 Rust 内核）；
-  - **Android (`minSdk 29` / `targetSdk 36`)**：纯原生 **Kotlin 2.1 + Jetpack Compose Material 3** 客户端（`apps/android`，经 UniFFI 嵌入 Rust 内核）；
-  - **HarmonyOS (`7.0.0(26)`，仅支持鸿蒙 7 及以上)**：纯原生 **ArkTS + ArkUI V2 (`@ComponentV2` / `@ObservedV2`)** 客户端（`apps/harmony`，经 `ohos-rs` 嵌入 Rust 内核）；
-- 或 **`orbit` 单文件 CLI**
+Run coding agents across cloud Devboxes, Linux workstations, and home Macs simultaneously, then monitor streaming turns, approve tool calls, answer clarifying questions, review Git diffs, manage worktrees, and operate detached remote PTYs from a single native interface:
 
-随时随地以毫秒级响应查看流式进展、审批工具权限、回答澄清提问、审查 Git Diff、操控原生远程终端以及监控各账号实时额度。
+- **Desktop (macOS / Linux / Windows)**: Tauri v2 + React 19 + TypeScript + Tailwind CSS v4 + Base UI + `@xterm/xterm` WebGL (`apps/desktop`) with guided onboarding, live provider readiness probing, pure-Rust QR code pairing, system tray integration, and built-in localization (`en`, `zh-CN`, `ja`).
+- **iOS (`16.4+`)**: Native Swift + SwiftUI (`apps/ios`), linked to Rust via UniFFI.
+- **Android (`API 29–36`)**: Native Kotlin 2.1 + Jetpack Compose Material 3 (`apps/android`), linked to Rust via UniFFI.
+- **HarmonyOS (`7.0.0 / API 26+`)**: Native Stage model + ArkTS + ArkUI V2 (`apps/harmony`), linked to Rust via `ohos-rs` N-API.
+- **CLI**: Single static `orbit` binary (`crates/orbit-cli`) with zero Node.js or Python runtime dependencies.
 
 ---
 
-## 核心特性
+## Key Capabilities
 
-1. **单静态二进制四合一（Single Binary Everything）**：
-   同一个 `orbit` 可执行文件同时包含 `daemon`（守护进程）、`shim`（热升级不死宿主壳）、`relay`（零知识端到端加密中继）和 `cli`（命令行客户端）。零 Node.js / Python 运行时依赖。
-2. **共享纯 Rust 客户端引擎（`orbit-client-core`）**：
-   多主机连接池、Happy-Eyeballs 智能路由、Noise NK 端到端加密、SQLite WAL 离线秒开缓存、流式 Markdown AST 解析（`pulldown-cmark`）、纯 Rust 语法高亮（`syntect`）、结构化 Git Diff（`similar`）以及 VT100 终端屏幕网格（`vt100`）全部在纯 Rust 内核统一完成。
-3. **三大王牌 CLI 原生纯 Rust 驱动**：
-   - **Antigravity (`agy`)**：原生对接 `agy acp --stdio` + `transcript_full.jsonl` 字节偏移增量流。
-   - **Codex (`codex`)**：原生对接 `codex app-server` 双向 JSON-RPC 2.0 协议。
-   - **Claude Code (`claude`)**：纯 Rust 实现双向 `stream-json` Control Protocol。
-4. **私有零知识白名单中继**：
-   `orbit relay --allow-pubkey <KEY>` 采用 `Noise_NK_25519_ChaChaPoly_SHA256` 端到端加密与公钥白名单硬拦截，配合 Zstd 实时帧压缩降低 75%+ 跨国流量。
+### Single Binary & Zero-Downtime Shim Isolation
+- One static `orbit` executable bundles `daemon`, `shim`, `relay`, `pair`, `doctor`, and full orchestration CLI commands.
+- Stateful agent sessions and interactive PTYs run inside detached `orbit shim` processes over `$ORBIT_HOME/shims/*.sock`. Upgrading or restarting `orbit daemon` keeps active sessions running uninterrupted.
+
+### Multi-Host Fleet & Shared Rust Client Core
+- `orbit-client-core` manages concurrent multi-host connection pools, Happy-Eyeballs smart routing (direct LAN/SSH/Tailscale vs. E2EE Relay), SQLite WAL offline caches, streaming CommonMark/GFM AST parsing (`pulldown-cmark`), native light/dark syntax highlighting (`syntect`), structured Git Diff (`similar`), and VT100 terminal grids (`vt100`).
+- Supports multi-agent **Mission Workspaces** with shared `BOARD.md` collaboration, isolated Git worktrees, bidirectional worktree handoff, cron schedules with IANA timezones, conditional timers, lifecycle hooks, and LSP diagnostics/symbols.
+
+### 34+ ACP & First-Class Native Providers
+- **Native protocol drivers**: Claude Code (`stream-json` control protocol), Codex (`app-server` JSON-RPC 2.0), Antigravity (`agy` ACP stdio + byte-offset transcript streaming), and Pi (`pi-rpc`).
+- **First-class ACP stdio providers**: OpenCode, Gemini CLI, Cursor Agent, GitHub Copilot, Goose, Kimi CLI, Cline, Mistral Vibe, and Augment.
+- **Universal ACP Registry**: Curated built-in catalog of 34 ACP-compatible coding agents aligned with `agentclientprotocol/registry`, plus live `initialize` handshake probing and custom agent management.
+
+### Zero-Trust Security Architecture
+- **Loopback-by-default daemon**: Binds to `127.0.0.1:6868` by default with persisted `pairing_secret` authentication and strict anti-CSWSH `Origin` validation.
+- **Mutually authenticated zero-knowledge relay**: `orbit relay --allow-pubkey <PUBKEY>` enforces `Noise_NKpsk0_25519_ChaChaPoly_SHA256` end-to-end encryption (with contributory X25519 DH validation and active session disconnect on secret rotation), `Noise_NK` Proof-of-Possession on daemon control channels, HMAC-SHA256 tunnel attachment, and Zstd frame compression.
+- **Verified delivery & zero-knowledge sync**: Mandatory SHA-256 verification against `SHA256SUMS.txt` on installs and self-upgrades, SSH host-key verification on `ssh+relay` tunnels, and optional client-side encrypted GitHub Gist Cloud Sync (`Argon2id` + `AES-256-GCM`). See [SECURITY.md](SECURITY.md) for details.
 
 ---
 
-## 快速构建指南
+## Quick Start
 
-### 1. Rust 服务端与全量测试
+### 1. Install the `orbit` CLI / Daemon / Relay (Linux & macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh
+```
+
+> Forks and organizations can override the release repository with `ORBIT_GITHUB_REPO=owner/repo` (for both installer scripts and compiled binaries).
+
+### 2. Inspect Host Readiness & Start the Daemon
+
+```bash
+orbit doctor        # Inspect identity keys and detected coding-agent CLIs
+orbit daemon up     # Install and start the persistent background daemon (127.0.0.1:6868)
+orbit pair          # Print an orbit://pair/... URI (or scan the QR code in Orbit Desktop)
+```
+
+### 3. Optional: Self-Hosted Zero-Knowledge Relay (BYOR)
+
+On a cloud VM or bastion host:
+
+```bash
+orbit relay up --port 7878 --allow-pubkey <YOUR_HOST_PUBKEY>
+```
+
+On each workstation / Devbox / Mac mini:
+
+```bash
+orbit use-relay <YOUR_RELAY_HOST>:7878
+```
+
+See [deploy/README.md](deploy/README.md) for full relay and firewall setup instructions.
+
+---
+
+## Building from Source
+
+### Rust Workspace
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-### 2. 桌面端（macOS / Linux / Windows — Tauri v2 + shadcn/ui）
+### Desktop App (macOS / Linux / Windows — Tauri v2)
+
 ```bash
 cd apps/desktop
-npm install
-npm run tauri dev     # 启动桌面开发窗口（自动发现本机 127.0.0.1:6868 Daemon）
-npm run tauri build   # 构建当前桌面平台的原生安装包 (.dmg / .deb / .msi)
+npm ci
+node --experimental-strip-types --test "src/**/*.test.ts"
+npm run tauri dev     # Launch desktop app (auto-discovers local 127.0.0.1:6868 daemon)
+npm run tauri build   # Build native installer (.dmg / .deb / .msi / .exe)
 ```
 
-### 3. iOS 原生端（SwiftUI，兼容 iOS 16.4+）
+### Mobile Clients
+
 ```bash
+# iOS (16.4+, SwiftUI + UniFFI)
 ./apps/ios/scripts/build-rust-xcframework.sh
-cd apps/ios && xcodegen generate
-open OrbitMobile.xcodeproj
-```
+cd apps/ios && xcodegen generate && open OrbitMobile.xcodeproj
 
-### 4. Android 原生端（Jetpack Compose Material 3，minSdk 29 / targetSdk 36）
-```bash
+# Android (API 29-36, Jetpack Compose + UniFFI)
 ./apps/android/scripts/build-rust-android.sh
-# 使用 Android Studio 打开 apps/android 或运行 gradle assembleRelease
+cd apps/android && gradle assembleDebug --no-daemon
+
+# HarmonyOS 7+ (API 26+, ArkTS + ArkUI V2 + N-API)
+./apps/harmony/scripts/build-rust-ohos.sh
 ```
 
-### 5. HarmonyOS 7+ 原生端（ArkTS + ArkUI V2，compatibleSdkVersion 7.0.0(26)）
-```bash
-./apps/harmony/scripts/build-rust-ohos.sh
-# 使用 DevEco Studio (HarmonyOS 7 / API 26 SDK) 打开 apps/harmony 构建 HAP
-```
+---
+
+## Documentation & Community
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — System design, process isolation, and crate topology
+- [CONTRIBUTING.md](CONTRIBUTING.md) — Development setup, architecture redlines, and PR checklist
+- [SECURITY.md](SECURITY.md) — Threat model, cryptographic design, and private vulnerability reporting
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — Community standards (Contributor Covenant v2.1)
+- [deploy/README.md](deploy/README.md) — Self-hosted Relay & service supervision guide
+
+## License
+
+Dual-licensed under [MIT](LICENSE) or Apache-2.0.

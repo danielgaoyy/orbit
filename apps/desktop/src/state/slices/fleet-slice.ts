@@ -315,6 +315,12 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       }
     },
 
+    async applyRelayToAllHosts(rawRelayUrl: string): Promise<number> {
+      const count = await orbitIpc.applyRelayToAllHosts(rawRelayUrl);
+      await ctx.actions.reloadFleetAndHosts(false);
+      return count;
+    },
+
 
     async reloadFleetAndHosts(initialBootstrap = false): Promise<void> {
       const snap = await orbitIpc.getFleetOverview();

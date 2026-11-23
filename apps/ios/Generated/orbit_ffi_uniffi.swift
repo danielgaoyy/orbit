@@ -901,6 +901,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func answerQuestion(hostId: String, agentId: String, questionRequestId: String, answers: [[String]]) 
     
+    func applyRelayToFleet(rawRelayUrl: String) throws  -> UInt32
+    
     func archiveAgent(hostId: String, agentId: String) 
     
     func archiveWorkspace(hostId: String, workspaceId: String, keepAgentsUnclassified: Bool) 
@@ -1015,6 +1017,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func getArtifact(hostId: String, artifactId: String, version: UInt32?) throws  -> FfiArtifactDetail
     
+    func getToolCallDiff(hostId: String, agentId: String, seq: UInt64)  -> [FfiDiffFile]
+    
     func gitReposInspection(hostId: String, path: String)  -> FfiGitReposInspection?
     
     func gitReview(hostId: String, cwd: String, path: String?)  -> FfiGitReview
@@ -1044,6 +1048,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func listPushDevices(hostId: String) throws  -> FfiPushDevicesSnapshot
     
     func listWorkflowRuns(hostId: String, includeCompleted: Bool) throws  -> [FfiWorkflowRunRecord]
+    
+    func loadOlderAgentTimeline(hostId: String, agentId: String, limitEvents: UInt32)  -> Bool
     
     func markAgentSeen(hostId: String, agentId: String, seq: UInt64) 
     
@@ -1381,6 +1387,16 @@ open func answerQuestion(hostId: String, agentId: String, questionRequestId: Str
         FfiConverterSequenceSequenceString.lower(answers),uniffiCallStatus
     )
 }
+}
+    
+open func applyRelayToFleet(rawRelayUrl: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_apply_relay_to_fleet(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(rawRelayUrl),uniffiCallStatus
+    )
+})
 }
     
 open func archiveAgent(hostId: String, agentId: String)  {try! rustCall() {
@@ -1996,6 +2012,18 @@ open func getArtifact(hostId: String, artifactId: String, version: UInt32?)throw
 })
 }
     
+open func getToolCallDiff(hostId: String, agentId: String, seq: UInt64) -> [FfiDiffFile]  {
+    return try!  FfiConverterSequenceTypeFfiDiffFile.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_get_tool_call_diff(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterUInt64.lower(seq),uniffiCallStatus
+    )
+})
+}
+    
 open func gitReposInspection(hostId: String, path: String) -> FfiGitReposInspection?  {
     return try!  FfiConverterOptionTypeFfiGitReposInspection.lift(try! rustCall() {
         uniffiCallStatus in
@@ -2153,6 +2181,18 @@ open func listWorkflowRuns(hostId: String, includeCompleted: Bool)throws  -> [Ff
             self.uniffiCloneHandle(),
         FfiConverterString.lower(hostId),
         FfiConverterBool.lower(includeCompleted),uniffiCallStatus
+    )
+})
+}
+    
+open func loadOlderAgentTimeline(hostId: String, agentId: String, limitEvents: UInt32) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_load_older_agent_timeline(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterUInt32.lower(limitEvents),uniffiCallStatus
     )
 })
 }
@@ -3901,10 +3941,15 @@ public struct FfiAgentStageDelta: Equatable, Hashable {
     public var insights: FfiSessionInsights
     public var latestSeq: UInt64
     public var reset: Bool
+    public var auxRevision: UInt64
+    public var auxUnchanged: Bool
+    public var windowStartTurnIndex: UInt32
+    public var hasOlderTurns: Bool
+    public var oldestLoadedSeq: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(revision: UInt64, hostId: String, agent: FfiAgentCard?, replaceFromTurnIndex: UInt32, changedTurns: [FfiStageTurn], totalTurnCount: UInt32, pendingPermissions: [FfiTimelineItem], pendingQuestions: [FfiTimelineItem], sessionTurnDiffs: [FfiDiffFile], insights: FfiSessionInsights, latestSeq: UInt64, reset: Bool) {
+    public init(revision: UInt64, hostId: String, agent: FfiAgentCard?, replaceFromTurnIndex: UInt32, changedTurns: [FfiStageTurn], totalTurnCount: UInt32, pendingPermissions: [FfiTimelineItem], pendingQuestions: [FfiTimelineItem], sessionTurnDiffs: [FfiDiffFile], insights: FfiSessionInsights, latestSeq: UInt64, reset: Bool, auxRevision: UInt64, auxUnchanged: Bool, windowStartTurnIndex: UInt32, hasOlderTurns: Bool, oldestLoadedSeq: UInt64) {
         self.revision = revision
         self.hostId = hostId
         self.agent = agent
@@ -3917,6 +3962,11 @@ public struct FfiAgentStageDelta: Equatable, Hashable {
         self.insights = insights
         self.latestSeq = latestSeq
         self.reset = reset
+        self.auxRevision = auxRevision
+        self.auxUnchanged = auxUnchanged
+        self.windowStartTurnIndex = windowStartTurnIndex
+        self.hasOlderTurns = hasOlderTurns
+        self.oldestLoadedSeq = oldestLoadedSeq
     }
 
     
@@ -3946,7 +3996,12 @@ public struct FfiConverterTypeFfiAgentStageDelta: FfiConverterRustBuffer {
                 sessionTurnDiffs: FfiConverterSequenceTypeFfiDiffFile.read(from: &buf), 
                 insights: FfiConverterTypeFfiSessionInsights.read(from: &buf), 
                 latestSeq: FfiConverterUInt64.read(from: &buf), 
-                reset: FfiConverterBool.read(from: &buf)
+                reset: FfiConverterBool.read(from: &buf), 
+                auxRevision: FfiConverterUInt64.read(from: &buf), 
+                auxUnchanged: FfiConverterBool.read(from: &buf), 
+                windowStartTurnIndex: FfiConverterUInt32.read(from: &buf), 
+                hasOlderTurns: FfiConverterBool.read(from: &buf), 
+                oldestLoadedSeq: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -3963,6 +4018,11 @@ public struct FfiConverterTypeFfiAgentStageDelta: FfiConverterRustBuffer {
         FfiConverterTypeFfiSessionInsights.write(value.insights, into: &buf)
         FfiConverterUInt64.write(value.latestSeq, into: &buf)
         FfiConverterBool.write(value.reset, into: &buf)
+        FfiConverterUInt64.write(value.auxRevision, into: &buf)
+        FfiConverterBool.write(value.auxUnchanged, into: &buf)
+        FfiConverterUInt32.write(value.windowStartTurnIndex, into: &buf)
+        FfiConverterBool.write(value.hasOlderTurns, into: &buf)
+        FfiConverterUInt64.write(value.oldestLoadedSeq, into: &buf)
     }
 }
 
@@ -3986,13 +4046,19 @@ public struct FfiAgentStageDeltaRequest: Equatable, Hashable {
     public var hostId: String
     public var agentId: String
     public var sinceRevision: UInt64
+    public var sinceAuxRevision: UInt64?
+    public var turnLimit: UInt32?
+    public var sinceWindowStartTurnIndex: UInt32?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hostId: String, agentId: String, sinceRevision: UInt64) {
+    public init(hostId: String, agentId: String, sinceRevision: UInt64, sinceAuxRevision: UInt64?, turnLimit: UInt32?, sinceWindowStartTurnIndex: UInt32?) {
         self.hostId = hostId
         self.agentId = agentId
         self.sinceRevision = sinceRevision
+        self.sinceAuxRevision = sinceAuxRevision
+        self.turnLimit = turnLimit
+        self.sinceWindowStartTurnIndex = sinceWindowStartTurnIndex
     }
 
     
@@ -4013,7 +4079,10 @@ public struct FfiConverterTypeFfiAgentStageDeltaRequest: FfiConverterRustBuffer 
             try FfiAgentStageDeltaRequest(
                 hostId: FfiConverterString.read(from: &buf), 
                 agentId: FfiConverterString.read(from: &buf), 
-                sinceRevision: FfiConverterUInt64.read(from: &buf)
+                sinceRevision: FfiConverterUInt64.read(from: &buf), 
+                sinceAuxRevision: FfiConverterOptionUInt64.read(from: &buf), 
+                turnLimit: FfiConverterOptionUInt32.read(from: &buf), 
+                sinceWindowStartTurnIndex: FfiConverterOptionUInt32.read(from: &buf)
         )
     }
 
@@ -4021,6 +4090,9 @@ public struct FfiConverterTypeFfiAgentStageDeltaRequest: FfiConverterRustBuffer 
         FfiConverterString.write(value.hostId, into: &buf)
         FfiConverterString.write(value.agentId, into: &buf)
         FfiConverterUInt64.write(value.sinceRevision, into: &buf)
+        FfiConverterOptionUInt64.write(value.sinceAuxRevision, into: &buf)
+        FfiConverterOptionUInt32.write(value.turnLimit, into: &buf)
+        FfiConverterOptionUInt32.write(value.sinceWindowStartTurnIndex, into: &buf)
     }
 }
 
@@ -16778,6 +16850,8 @@ public enum FfiTurnLiveSegment: Equatable, Hashable {
     )
     case assistantMessage(key: String, item: FfiTimelineItem
     )
+    case agentMessage(key: String, item: FfiTimelineItem
+    )
     case notice(key: String, item: FfiTimelineItem
     )
     case compaction(key: String, label: String
@@ -16811,13 +16885,16 @@ public struct FfiConverterTypeFfiTurnLiveSegment: FfiConverterRustBuffer {
         case 2: return .assistantMessage(key: try FfiConverterString.read(from: &buf), item: try FfiConverterTypeFfiTimelineItem.read(from: &buf)
         )
         
-        case 3: return .notice(key: try FfiConverterString.read(from: &buf), item: try FfiConverterTypeFfiTimelineItem.read(from: &buf)
+        case 3: return .agentMessage(key: try FfiConverterString.read(from: &buf), item: try FfiConverterTypeFfiTimelineItem.read(from: &buf)
         )
         
-        case 4: return .compaction(key: try FfiConverterString.read(from: &buf), label: try FfiConverterString.read(from: &buf)
+        case 4: return .notice(key: try FfiConverterString.read(from: &buf), item: try FfiConverterTypeFfiTimelineItem.read(from: &buf)
         )
         
-        case 5: return .wakeup(key: try FfiConverterString.read(from: &buf), label: try FfiConverterString.read(from: &buf)
+        case 5: return .compaction(key: try FfiConverterString.read(from: &buf), label: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .wakeup(key: try FfiConverterString.read(from: &buf), label: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -16848,20 +16925,26 @@ public struct FfiConverterTypeFfiTurnLiveSegment: FfiConverterRustBuffer {
             FfiConverterTypeFfiTimelineItem.write(item, into: &buf)
             
         
-        case let .notice(key,item):
+        case let .agentMessage(key,item):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(key, into: &buf)
             FfiConverterTypeFfiTimelineItem.write(item, into: &buf)
             
         
-        case let .compaction(key,label):
+        case let .notice(key,item):
             writeInt(&buf, Int32(4))
+            FfiConverterString.write(key, into: &buf)
+            FfiConverterTypeFfiTimelineItem.write(item, into: &buf)
+            
+        
+        case let .compaction(key,label):
+            writeInt(&buf, Int32(5))
             FfiConverterString.write(key, into: &buf)
             FfiConverterString.write(label, into: &buf)
             
         
         case let .wakeup(key,label):
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(key, into: &buf)
             FfiConverterString.write(label, into: &buf)
             
@@ -20167,6 +20250,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_answer_question() != 41977) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_apply_relay_to_fleet() != 15717) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_agent() != 61104) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -20338,6 +20424,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_get_artifact() != 65066) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_get_tool_call_diff() != 27316) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_repos_inspection() != 62271) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -20381,6 +20470,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_workflow_runs() != 14912) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_load_older_agent_timeline() != 59706) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_seen() != 61018) {

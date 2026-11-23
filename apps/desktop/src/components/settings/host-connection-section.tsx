@@ -48,6 +48,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
 
   const [relayInput, setRelayInput] = useState(host?.relay_url ?? "");
   const [relayStatusMsg, setRelayStatusMsg] = useState<string | null>(null);
+  const [sharingRelay, setSharingRelay] = useState(false);
   const [showSshDeploy, setShowSshDeploy] = useState(false);
   const [deployingSsh, setDeployingSsh] = useState<string | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
@@ -80,6 +81,21 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
     orbitActions.showToast(val ? "Saved relay endpoint" : "Cleared relay endpoint");
   };
 
+  const handleShareRelayAllHosts = async () => {
+    const val = relayInput.trim();
+    if (!val) return;
+    setSharingRelay(true);
+    try {
+      const count = await orbitActions.applyRelayToAllHosts(val);
+      setRelayStatusMsg(`Shared relay across ${count} host${count === 1 ? "" : "s"}`);
+      orbitActions.showToast(`Shared relay with ${count} host${count === 1 ? "" : "s"}`);
+    } catch (err) {
+      setRelayStatusMsg(String(err));
+    } finally {
+      setSharingRelay(false);
+    }
+  };
+
   const handleDeploySshRelay = async (ssh: SshHostItem) => {
     setDeployingSsh(ssh.alias);
     setRelayStatusMsg(`Deploying relay to ${ssh.alias}…`);
@@ -89,9 +105,11 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         sshAlias: ssh.alias,
         fallbackHostname: ssh.host_name,
         relayPort: 7878,
+        applyToAllHosts: true,
       });
       setRelayInput(url);
-      setRelayStatusMsg(`Active on ${url}`);
+      await orbitActions.reloadFleetAndHosts();
+      setRelayStatusMsg(`Active across fleet on ${url}`);
     } catch (err) {
       setRelayStatusMsg(String(err));
     } finally {
@@ -318,10 +336,10 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         <SettingGroupLabel>Private Relay</SettingGroupLabel>
         <div className="border-border bg-background/60 space-y-3 rounded-[13px] border p-4">
           <p className="text-muted-foreground text-[12.5px] leading-relaxed">
-            Route remote traffic through an end-to-end encrypted Noise relay.
+            Route remote traffic through an end-to-end encrypted Noise relay (needed for mobile access off your local network; SSH relay deployment applies across all hosts automatically).
           </p>
 
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <input
               type="text"
               value={relayInput}
@@ -332,7 +350,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                 if (e.key === "Enter" && relayDirty) void handleSaveRelay(false);
               }}
               placeholder="wss://relay.example.com"
-              className="border-border bg-background text-foreground placeholder:text-muted-foreground h-[34px] flex-1 rounded-lg border px-3 font-mono text-[12.5px] outline-none focus:border-foreground/30"
+              className="border-border bg-background text-foreground placeholder:text-muted-foreground h-[34px] min-w-[200px] flex-1 rounded-lg border px-3 font-mono text-[12.5px] outline-none focus:border-foreground/30"
             />
             <button
               type="button"
@@ -342,6 +360,17 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             >
               Save
             </button>
+            {fleet.hosts.length > 1 && relayInput.trim() && (
+              <button
+                type="button"
+                disabled={sharingRelay}
+                onClick={() => void handleShareRelayAllHosts()}
+                className="border-border hover:bg-accent inline-flex h-[34px] cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-medium transition-colors disabled:opacity-50"
+              >
+                {sharingRelay && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                <span>Share with All Hosts</span>
+              </button>
+            )}
             {host.relay_url && (
               <button
                 type="button"

@@ -248,6 +248,11 @@ struct SettingsAndQuotasSheet: View {
         let status = store.cloudSyncStatus
         let state = status?.state ?? .signedOut
         let oauthReady = status?.githubOauthConfigured ?? false
+        let combinedError = store.cloudSyncError ?? status?.lastError
+        let isAuthError = state == .error || (combinedError.map {
+            let low = $0.lowercased()
+            return low.contains("401") || low.contains("bad credentials") || low.contains("expired") || low.contains("revoked")
+        } ?? false)
 
         return VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
             HStack {
@@ -255,7 +260,11 @@ struct SettingsAndQuotasSheet: View {
                     .font(OrbitTypography.meta(.medium))
                     .foregroundStyle(palette.fgMuted)
                 Spacer()
-                if state == .ready {
+                if state == .error || isAuthError {
+                    Text("Auth Expired")
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.danger)
+                } else if state == .ready {
                     Text("Synced")
                         .font(OrbitTypography.meta(.semibold))
                         .foregroundStyle(palette.direct)
@@ -268,52 +277,54 @@ struct SettingsAndQuotasSheet: View {
             .padding(.horizontal, OrbitSpacing.xs)
 
             VStack(alignment: .leading, spacing: OrbitSpacing.md) {
-                if state == .signedOut {
-                    if let flow = store.cloudSyncDeviceFlow {
-                        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
-                            Text("Enter this code on GitHub")
-                                .font(OrbitTypography.subhead(.semibold))
+                if let flow = store.cloudSyncDeviceFlow {
+                    VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+                        Text("Enter this code on GitHub")
+                            .font(OrbitTypography.subhead(.semibold))
+                            .foregroundStyle(palette.fgPrimary)
+                        HStack {
+                            Text(flow.userCode)
+                                .font(.system(.title3, design: .monospaced).weight(.bold))
                                 .foregroundStyle(palette.fgPrimary)
-                            HStack {
-                                Text(flow.userCode)
-                                    .font(.system(.title3, design: .monospaced).weight(.bold))
-                                    .foregroundStyle(palette.fgPrimary)
-                                Spacer()
-                                Button("Copy") {
-                                    UIPasteboard.general.string = flow.userCode
-                                    store.showToast("Code copied")
-                                }
-                                .font(OrbitTypography.meta(.semibold))
-                                .foregroundStyle(palette.accentSky)
+                            Spacer()
+                            Button("Copy") {
+                                UIPasteboard.general.string = flow.userCode
+                                store.showToast("Code copied")
                             }
-                            .padding(OrbitSpacing.sm)
-                            .background(palette.subtleFill)
-                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-                            HStack(spacing: OrbitSpacing.sm) {
-                                Button {
-                                    UIPasteboard.general.string = flow.userCode
-                                    if let url = URL(string: flow.verificationUri) {
-                                        UIApplication.shared.open(url)
-                                    }
-                                } label: {
-                                    Text("Copy & Open GitHub")
-                                        .font(OrbitTypography.subhead(.semibold))
-                                        .foregroundStyle(palette.onPrimary)
-                                        .frame(maxWidth: .infinity, minHeight: 38)
-                                        .background(palette.primary)
-                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                }
-                                .buttonStyle(.plain)
-
-                                Button("Cancel") {
-                                    store.cancelGithubCloudLogin()
-                                }
-                                .font(OrbitTypography.subhead(.medium))
-                                .foregroundStyle(palette.fgSecondary)
-                                .padding(.horizontal, OrbitSpacing.sm)
-                            }
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.accentSky)
                         }
+                        .padding(OrbitSpacing.sm)
+                        .background(palette.subtleFill)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                        HStack(spacing: OrbitSpacing.sm) {
+                            Button {
+                                UIPasteboard.general.string = flow.userCode
+                                if let url = URL(string: flow.verificationUri) {
+                                    UIApplication.shared.open(url)
+                                }
+                            } label: {
+                                Text("Copy & Open GitHub")
+                                    .font(OrbitTypography.subhead(.semibold))
+                                    .foregroundStyle(palette.onPrimary)
+                                    .frame(maxWidth: .infinity, minHeight: 38)
+                                    .background(palette.primary)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+
+                            Button("Cancel") {
+                                store.cancelGithubCloudLogin()
+                            }
+                            .font(OrbitTypography.subhead(.medium))
+                            .foregroundStyle(palette.fgSecondary)
+                            .padding(.horizontal, OrbitSpacing.sm)
+                        }
+                    }
+                } else if state == .signedOut {
+                    if false {
+                        EmptyView()
                     } else {
                         Text("Sync paired hosts & projects across devices via your own encrypted GitHub Secret Gist (`gist` scope only, zero Orbit servers).")
                             .font(OrbitTypography.meta(.regular))
@@ -550,9 +561,35 @@ struct SettingsAndQuotasSheet: View {
                 }
 
                 if let err = store.cloudSyncError ?? status?.lastError, !err.isEmpty {
-                    Text(err)
-                        .font(OrbitTypography.meta(.regular))
-                        .foregroundStyle(palette.danger)
+                    VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+                        Text(err)
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.danger)
+
+                        if (isAuthError || state == .error) && store.cloudSyncDeviceFlow == nil {
+                            Button {
+                                store.startGithubCloudLogin(
+                                    clientIdOverride: cloudClientIdInput.isEmpty ? nil : cloudClientIdInput
+                                )
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if store.cloudSyncBusy {
+                                        ProgressView().tint(palette.onPrimary)
+                                    } else {
+                                        Image(systemName: "arrow.clockwise")
+                                    }
+                                    Text("Sign In Again with GitHub")
+                                        .font(OrbitTypography.meta(.semibold))
+                                }
+                                .foregroundStyle(palette.onPrimary)
+                                .frame(maxWidth: .infinity, minHeight: 34)
+                                .background(palette.primary)
+                                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(store.cloudSyncBusy)
+                        }
+                    }
                 }
             }
             .padding(OrbitSpacing.md)
@@ -1150,6 +1187,19 @@ private struct HostDetailSettingsView: View {
                         .padding(.vertical, OrbitSpacing.sm)
                 }
 
+                if !OrbitFormatters.isHostOnline(host.connectionState),
+                   (host.relayUrl ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    OrbitHairline()
+                        .padding(.leading, OrbitSpacing.md)
+
+                    Text("No E2EE Relay configured for this host. Configure & share a relay on Orbit Desktop (Settings -> Connection -> Share with All Hosts), then tap Sync in Cloud Sync above to reach it off-LAN.")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.warning)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, OrbitSpacing.md)
+                        .padding(.vertical, OrbitSpacing.sm)
+                }
+
                 if host.hostId != store.selectedHostId {
                     OrbitHairline()
                         .padding(.leading, OrbitSpacing.md)
@@ -1297,6 +1347,27 @@ private struct HostDetailSettingsView: View {
             }
             .buttonStyle(.plain)
             .padding(.top, OrbitSpacing.xs)
+
+            if store.hosts.count > 1,
+               !relayUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Button {
+                    store.hapticLight()
+                    store.applyRelayToFleet(relayUrl)
+                } label: {
+                    Text("Share Relay with All Hosts")
+                        .font(OrbitTypography.subhead(.medium))
+                        .foregroundStyle(palette.primary)
+                        .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
+                        .background(palette.elevated)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(palette.hairline, lineWidth: 0.5)
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
         }
     }
 

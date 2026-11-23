@@ -1386,18 +1386,51 @@ fn flush_omitted_diff_notice(files: &mut [DiffFileView], omitted_lines: &mut usi
     *omitted_lines = 0;
 }
 
-fn push_capped_diff_line(file: &mut DiffFileView, omitted_lines: &mut usize, line: DiffLineView) {
-    if file.lines.len() < MAX_RENDERED_DIFF_LINES_PER_FILE {
+fn push_capped_diff_line(
+    file: &mut DiffFileView,
+    omitted_lines: &mut usize,
+    line: DiffLineView,
+    max_lines: usize,
+) {
+    if file.lines.len() < max_lines {
         file.lines.push(line);
     } else {
         *omitted_lines += 1;
     }
 }
 
+/// Fast single-pass count of added and removed lines in a unified diff without syntax highlighting.
+pub fn count_unified_diff_stats(unified_diff: &str) -> (u32, u32) {
+    let mut additions = 0u32;
+    let mut deletions = 0u32;
+    for raw_line in unified_diff.lines() {
+        if raw_line.starts_with("+++ ") || raw_line.starts_with("--- ") {
+            continue;
+        }
+        if raw_line.starts_with('+') {
+            additions = additions.saturating_add(1);
+        } else if raw_line.starts_with('-') {
+            deletions = deletions.saturating_add(1);
+        }
+    }
+    (additions, deletions)
+}
+
 /// Parse a `git diff` unified output string into per-file structured diff lines with dual line numbers.
 /// Counts exact `additions` / `deletions` across arbitrarily large files while capping rendered lines per file
 /// and sorting handwritten source files ahead of lockfiles & generated bindings.
 pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
+    parse_unified_diff_capped(unified_diff, MAX_RENDERED_DIFF_LINES_PER_FILE, true)
+}
+
+/// Parse a unified diff with a caller-specified per-file rendered line cap and optional syntax
+/// highlighting + word-level intra-line diffing.
+pub fn parse_unified_diff_capped(
+    unified_diff: &str,
+    max_lines_per_file: usize,
+    highlight: bool,
+) -> Vec<DiffFileView> {
+    let max_lines = max_lines_per_file.max(1);
     let mut files: Vec<DiffFileView> = Vec::new();
     let mut old_ln: u32 = 0;
     let mut new_ln: u32 = 0;
@@ -1448,6 +1481,7 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
                 cur_file,
                 &mut omitted_lines,
                 DiffLineView::plain(DiffLineKind::Meta, None, None, raw_line.to_string()),
+                max_lines,
             );
             continue;
         }
@@ -1460,6 +1494,7 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
                 cur_file,
                 &mut omitted_lines,
                 DiffLineView::plain(DiffLineKind::HunkHeader, None, None, raw_line.to_string()),
+                max_lines,
             );
             continue;
         }
@@ -1472,6 +1507,7 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
                 cur_file,
                 &mut omitted_lines,
                 DiffLineView::plain(DiffLineKind::Added, None, Some(ln), added.to_string()),
+                max_lines,
             );
         } else if let Some(removed) = raw_line.strip_prefix('-') {
             cur_file.deletions += 1;
@@ -1481,6 +1517,7 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
                 cur_file,
                 &mut omitted_lines,
                 DiffLineView::plain(DiffLineKind::Removed, Some(ln), None, removed.to_string()),
+                max_lines,
             );
         } else {
             let content = raw_line.strip_prefix(' ').unwrap_or(raw_line).to_string();
@@ -1496,21 +1533,24 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
                 cur_file,
                 &mut omitted_lines,
                 DiffLineView::plain(DiffLineKind::Context, o, n, content),
+                max_lines,
             );
         }
     }
 
     flush_omitted_diff_notice(&mut files, &mut omitted_lines);
     files.sort_by_key(|f| is_generated_or_lockfile_path(&f.path));
-    // Budget eager syntax highlighting across huge multi-file diffs so IPC payloads stay small
-    // and parsing stays < 15ms; single-file diffs always highlight in full.
-    let mut remaining_highlight_budget: usize = if files.len() <= 1 {
-        MAX_RENDERED_DIFF_LINES_PER_FILE
-    } else {
-        2400
-    };
-    for file in &mut files {
-        enrich_diff_file_highlights_and_intraline(file, &mut remaining_highlight_budget);
+    if highlight {
+        // Budget eager syntax highlighting across huge multi-file diffs so IPC payloads stay small
+        // and parsing stays < 15ms; single-file diffs always highlight in full.
+        let mut remaining_highlight_budget: usize = if files.len() <= 1 {
+            max_lines
+        } else {
+            2400.min(max_lines.saturating_mul(files.len()))
+        };
+        for file in &mut files {
+            enrich_diff_file_highlights_and_intraline(file, &mut remaining_highlight_budget);
+        }
     }
     files
 }
@@ -1541,6 +1581,7 @@ pub fn diff_two_texts(path: &str, old_text: &str, new_text: &str) -> DiffFileVie
                     change.new_index().map(|i| (i + 1) as u32),
                     content,
                 ),
+                MAX_RENDERED_DIFF_LINES_PER_FILE,
             ),
             ChangeTag::Delete => {
                 file.deletions += 1;
@@ -1553,6 +1594,7 @@ pub fn diff_two_texts(path: &str, old_text: &str, new_text: &str) -> DiffFileVie
                         None,
                         content,
                     ),
+                    MAX_RENDERED_DIFF_LINES_PER_FILE,
                 );
             }
             ChangeTag::Insert => {
@@ -1566,6 +1608,7 @@ pub fn diff_two_texts(path: &str, old_text: &str, new_text: &str) -> DiffFileVie
                         change.new_index().map(|i| (i + 1) as u32),
                         content,
                     ),
+                    MAX_RENDERED_DIFF_LINES_PER_FILE,
                 );
             }
         }

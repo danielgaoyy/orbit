@@ -1,21 +1,15 @@
 import SwiftUI
 
-private struct StageBottomAnchorKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
 struct StreamStageView: View {
     @ObservedObject var store: OrbitIosStore
 
     @Environment(\.orbitPalette) private var palette
     @State private var isBottomAnchorMounted: Bool = true
-    @State private var isScrolledUpByGeometry: Bool = false
     @State private var wasPinnedToBottom: Bool = true
     @State private var isReanchoringForViewportShrink: Bool = false
     @State private var stageViewportHeight: CGFloat = 0
+    @State private var pendingPrependAnchorKey: String? = nil
+    @State private var lastAutoScrollTime: CFTimeInterval = 0
     @State private var isProjectPickerPresented: Bool = false
     @State private var isWorkspacePickerPresented: Bool = false
     @State private var isHostPickerPresented: Bool = false
@@ -47,7 +41,7 @@ struct StreamStageView: View {
     }
 
     private var showScrollToBottomPill: Bool {
-        !turns.isEmpty && !isReanchoringForViewportShrink && (!isBottomAnchorMounted || isScrolledUpByGeometry)
+        !turns.isEmpty && !isReanchoringForViewportShrink && !isBottomAnchorMounted
     }
 
     private func dismissKeyboard() {
@@ -132,47 +126,99 @@ struct StreamStageView: View {
 
     // MARK: - Turn Stream ScrollView
 
+    private var loadOlderTurnsBar: some View {
+        HStack {
+            Spacer()
+            Button {
+                store.hapticLight()
+                pendingPrependAnchorKey = turns.first?.key
+                store.loadOlderStageTurns()
+            } label: {
+                HStack(spacing: 6) {
+                    if store.isLoadingOlderTurns {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.up.circle")
+                            .font(OrbitTypography.iconSmall)
+                    }
+                    Text(store.isLoadingOlderTurns ? "Loading earlier turns…" : "Load earlier turns")
+                        .font(OrbitTypography.meta(.medium))
+                }
+                .foregroundStyle(palette.fgSecondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(palette.elevated)
+                .clipShape(Capsule())
+                .overlay(
+                    Capsule()
+                        .strokeBorder(palette.hairline, lineWidth: 0.5)
+                )
+            }
+            .buttonStyle(.plain)
+            .disabled(store.isLoadingOlderTurns)
+            Spacer()
+        }
+        .padding(.bottom, 4)
+    }
+
     private var turnStreamScrollView: some View {
-        GeometryReader { outerGeo in
+        let turnActions = StageTurnActions(store: store)
+        let hostOnline = store.activeHost.map(isHostOnline(_:)) ?? true
+        let firstTurnKey = turns.first?.key
+        let firstStepBearingTurnKey = turns.first(where: { !$0.foldedSteps.isEmpty })?.key
+
+        return GeometryReader { outerGeo in
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(alignment: .leading, spacing: 22) {
+                        if store.stageHasOlderTurns {
+                            loadOlderTurnsBar
+                        }
+
                         ForEach(Array(turns.enumerated()), id: \.element.key) { idx, turn in
                             let isTurnActive = (idx == turns.count - 1) && isLatestTurnActive
                             StageTurnView(
-                                store: store,
                                 turn: turn,
                                 isTurnActive: isTurnActive,
                                 agentStatusLabel: isTurnActive ? store.activeAgent?.statusLabel : nil,
-                                hasLiveBackgroundTasks: isTurnActive && hasLiveBackgroundTasks
+                                hasLiveBackgroundTasks: isTurnActive && hasLiveBackgroundTasks,
+                                isHostOnline: hostOnline,
+                                activeCwd: store.activeCwd,
+                                selectedHostId: store.selectedHostId,
+                                isActiveAgentTurnBusy: store.isActiveAgentTurnBusy,
+                                coalesceExploration: store.coalesceExploration,
+                                expandAllWorkGroupsByDefault: store.expandAllWorkGroupsByDefault,
+                                expandFirstStepByDefault: store.expandFirstStepByDefault,
+                                expandFirstTurnByDefault: store.expandFirstTurnByDefault,
+                                isFirstStepBearingTurn: turn.key == firstStepBearingTurnKey,
+                                isFirstTurn: turn.key == firstTurnKey,
+                                actions: turnActions
                             )
+                            .equatable()
                         }
 
                         Color.clear
-                            .frame(height: 1)
+                            .frame(height: 24)
                             .id(bottomAnchorId)
                             .onAppear {
                                 isBottomAnchorMounted = true
+                                wasPinnedToBottom = true
                             }
                             .onDisappear {
                                 isBottomAnchorMounted = false
-                            }
-                            .background(
-                                GeometryReader { anchorGeo in
-                                    Color.clear.preference(
-                                        key: StageBottomAnchorKey.self,
-                                        value: anchorGeo.frame(in: .named("stageScrollSpace")).maxY
-                                    )
+                                if !isReanchoringForViewportShrink {
+                                    wasPinnedToBottom = false
                                 }
-                            )
+                            }
                     }
                     .padding(.horizontal, OrbitSpacing.lg)
                     .padding(.top, OrbitSpacing.md)
                     .padding(.bottom, OrbitSpacing.lg)
                 }
-                .coordinateSpace(name: "stageScrollSpace")
                 .orbitSoftScrollEdgeEffect()
                 .scrollDismissesKeyboard(.interactively)
+                .modifier(OrbitDefaultBottomScrollAnchorModifier())
                 .refreshable {
                     await store.pullToRefreshStage()
                 }
@@ -187,7 +233,6 @@ struct StreamStageView: View {
                     } else {
                         wasPinnedToBottom = true
                         isBottomAnchorMounted = true
-                        isScrolledUpByGeometry = false
                         proxy.scrollTo(bottomAnchorId, anchor: .bottom)
                         DispatchQueue.main.async {
                             guard !store.keepStageScrolledToTop else { return }
@@ -210,20 +255,16 @@ struct StreamStageView: View {
                         reanchorToBottomAfterLayout(proxy: proxy)
                     }
                 }
-                .onPreferenceChange(StageBottomAnchorKey.self) { anchorMaxY in
-                    guard stageViewportHeight > 0, isBottomAnchorMounted, !isReanchoringForViewportShrink else {
-                        return
-                    }
-                    let delta = anchorMaxY - stageViewportHeight
-                    let scrolledAway = delta > 72 && !turns.isEmpty
-                    wasPinnedToBottom = !scrolledAway
-                    if scrolledAway != isScrolledUpByGeometry {
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            isScrolledUpByGeometry = scrolledAway
+                .onChange(of: turns.first?.key) { _ in
+                    if let anchorKey = pendingPrependAnchorKey {
+                        pendingPrependAnchorKey = nil
+                        DispatchQueue.main.async {
+                            proxy.scrollTo(anchorKey, anchor: .top)
                         }
                     }
                 }
                 .onChange(of: store.selectedAgentId) { _ in
+                    pendingPrependAnchorKey = nil
                     if store.keepStageScrolledToTop {
                         wasPinnedToBottom = false
                         isBottomAnchorMounted = false
@@ -234,7 +275,6 @@ struct StreamStageView: View {
                         }
                     } else {
                         wasPinnedToBottom = true
-                        isScrolledUpByGeometry = false
                         isBottomAnchorMounted = true
                         DispatchQueue.main.async {
                             proxy.scrollTo(bottomAnchorId, anchor: .bottom)
@@ -242,11 +282,21 @@ struct StreamStageView: View {
                     }
                 }
                 .onChange(of: store.agentStage?.latestSeq) { _ in
-                    guard wasPinnedToBottom, !showScrollToBottomPill, !store.keepStageScrolledToTop else { return }
+                    guard pendingPrependAnchorKey == nil,
+                          wasPinnedToBottom,
+                          !showScrollToBottomPill,
+                          !store.keepStageScrolledToTop else { return }
+                    let now = CFAbsoluteTimeGetCurrent()
+                    guard now - lastAutoScrollTime >= 0.12 else { return }
+                    lastAutoScrollTime = now
                     proxy.scrollTo(bottomAnchorId, anchor: .bottom)
                 }
                 .onChange(of: turns.count) { _ in
-                    guard wasPinnedToBottom, !showScrollToBottomPill, !store.keepStageScrolledToTop else { return }
+                    guard pendingPrependAnchorKey == nil,
+                          wasPinnedToBottom,
+                          !showScrollToBottomPill,
+                          !store.keepStageScrolledToTop else { return }
+                    lastAutoScrollTime = CFAbsoluteTimeGetCurrent()
                     withAnimation(.easeOut(duration: 0.22)) {
                         proxy.scrollTo(bottomAnchorId, anchor: .bottom)
                     }
@@ -258,7 +308,6 @@ struct StreamStageView: View {
                             store.keepStageScrolledToTop = false
                             wasPinnedToBottom = true
                             withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                                isScrolledUpByGeometry = false
                                 isBottomAnchorMounted = true
                                 proxy.scrollTo(bottomAnchorId, anchor: .bottom)
                             }
@@ -309,7 +358,6 @@ struct StreamStageView: View {
 
     private func reanchorToBottomAfterLayout(proxy: ScrollViewProxy) {
         isReanchoringForViewportShrink = true
-        isScrolledUpByGeometry = false
         wasPinnedToBottom = true
         withAnimation(.easeOut(duration: 0.18)) {
             proxy.scrollTo(bottomAnchorId, anchor: .bottom)
@@ -1001,5 +1049,15 @@ struct StreamStageView: View {
         .background(palette.subtleFill)
         .clipShape(Capsule())
         .contentShape(Capsule())
+    }
+}
+
+private struct OrbitDefaultBottomScrollAnchorModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, *) {
+            content.defaultScrollAnchor(.bottom)
+        } else {
+            content
+        }
     }
 }

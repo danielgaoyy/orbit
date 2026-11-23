@@ -560,6 +560,7 @@ pub async fn cmd_wait(
                 request_id: tl_req,
                 agent_id: aid,
                 since_seq: 0,
+                tail_limit: None,
             },
             15,
         )
@@ -744,6 +745,7 @@ pub async fn cmd_inspect(
             request_id: tl_req,
             agent_id: agent_id.to_string(),
             since_seq: 0,
+            tail_limit: None,
         },
         15,
     )
@@ -2352,6 +2354,7 @@ async fn cmd_export_agent(
                 request_id: tl_req,
                 agent_id: agent_id.clone(),
                 since_seq,
+                tail_limit: None,
             },
             20,
         )

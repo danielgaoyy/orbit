@@ -406,6 +406,21 @@ async fn get_agent_stage_turns_slice(
 }
 
 #[tauri::command]
+async fn load_older_agent_timeline(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    limit_events: Option<u32>,
+) -> Result<bool, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.load_older_agent_timeline(&host_id, &agent_id, limit_events.unwrap_or(300))
+    })
+    .await
+    .map_err(|e| format!("load older timeline task error: {e}"))
+}
+
+#[tauri::command]
 fn get_fallback_provider_catalogs(state: State<'_, DesktopAppState>) -> Vec<ProviderModelCatalog> {
     state.core.fallback_provider_catalogs()
 }
@@ -636,6 +651,17 @@ fn update_host_relay(
     state
         .core
         .update_host_relay(&host_id, relay_url.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn apply_relay_to_all_hosts(
+    state: State<'_, DesktopAppState>,
+    raw_relay_url: String,
+) -> Result<u32, String> {
+    state
+        .core
+        .apply_relay_to_fleet(&raw_relay_url)
         .map_err(|e| e.to_string())
 }
 
@@ -3629,6 +3655,7 @@ async fn provision_ssh_relay(
     ssh_alias: String,
     fallback_hostname: String,
     relay_port: u16,
+    apply_to_all_hosts: Option<bool>,
 ) -> Result<String, String> {
     let overview = state.core.fleet_overview();
     let pubkeys: Vec<String> = overview
@@ -3643,10 +3670,17 @@ async fn provision_ssh_relay(
     .await
     .map_err(|e| format!("task join error: {e}"))??;
 
-    state
-        .core
-        .update_host_relay(&target_host_id, Some(&relay_url))
-        .map_err(|e| e.to_string())?;
+    if apply_to_all_hosts.unwrap_or(true) {
+        let _ = state
+            .core
+            .apply_relay_to_fleet(&relay_url)
+            .map_err(|e| e.to_string())?;
+    } else {
+        state
+            .core
+            .update_host_relay(&target_host_id, Some(&relay_url))
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(relay_url)
 }
@@ -3913,6 +3947,7 @@ pub fn run() {
             get_agent_stage,
             get_agent_stage_delta,
             get_agent_stage_turns_slice,
+            load_older_agent_timeline,
             get_fallback_provider_catalogs,
             resolve_model_selection,
             get_slash_commands,
@@ -3935,6 +3970,7 @@ pub fn run() {
             remove_host,
             update_host_config,
             update_host_relay,
+            apply_relay_to_all_hosts,
             upgrade_remote_daemon,
             upsert_project,
             remove_project,

@@ -1545,6 +1545,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         request_id: req_id,
                         agent_id,
                         since_seq: 0,
+                        tail_limit: None,
                     },
                     Duration::from_secs(10),
                     |w| matches!(w, WireMessage::TimelineCatchup { request_id: r, .. } if *r == req_id),

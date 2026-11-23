@@ -79,7 +79,9 @@ use orbit_providers::{
     SideQuestionSpec, catalogs_to_model_map, discover_installed_providers,
     probe_all_provider_models, probe_all_provider_quotas, run_side_question,
 };
-use orbit_relay_transport::{MAX_RELAY_CONTROL_WS_FRAME_BYTES, RelayConnector, redact_relay_url};
+use orbit_relay_transport::{
+    MAX_RELAY_CONTROL_WS_FRAME_BYTES, RelayConnector, normalize_relay_url, redact_relay_url,
+};
 use orbit_store::{OrbitStore, ReceiptOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -465,6 +467,8 @@ pub struct DaemonRuntime {
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
     pub mcp_config_lock: Arc<AsyncMutex<()>>,
+    pub relay_url: Arc<RwLock<Option<String>>>,
+    relay_task: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     catalog_refresh_lock: AsyncMutex<()>,
     upgrade_lock: AsyncMutex<()>,
 }
@@ -614,6 +618,7 @@ impl DaemonRuntime {
         .await
         .map_err(|e| anyhow::anyhow!("provider discovery task failed: {e}"))?;
 
+        let persisted_relay = persisted.relay_url.clone();
         let host_info = HostInfo {
             host_id,
             hostname: host_display_name,
@@ -623,6 +628,7 @@ impl DaemonRuntime {
             protocol_version: PROTOCOL_VERSION,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             available_providers,
+            relay_url: persisted_relay.clone(),
         };
 
         let (pairing_secret_rotated_tx, _) = broadcast::channel(16);
@@ -660,6 +666,8 @@ impl DaemonRuntime {
             provider_catalogs,
             mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
             mcp_config_lock: Arc::new(AsyncMutex::new(())),
+            relay_url: Arc::new(RwLock::new(persisted_relay)),
+            relay_task: AsyncMutex::new(None),
             catalog_refresh_lock: AsyncMutex::new(()),
             upgrade_lock: AsyncMutex::new(()),
         }))
@@ -764,6 +772,70 @@ impl DaemonRuntime {
             relay_url,
             pairing_secret,
         })
+    }
+
+    pub async fn effective_host_info(&self) -> HostInfo {
+        let mut info = self.host_info.clone();
+        info.relay_url = self.relay_url.read().await.clone();
+        info
+    }
+
+    /// Atomically configure or clear the daemon's outbound E2EE Relay registration,
+    /// restarting the background `outbound_relay_loop` without disrupting active agents or clients.
+    pub fn set_outbound_relay<'a>(
+        self: &'a Arc<Self>,
+        raw_relay_url: Option<String>,
+        persist: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let normalized = match raw_relay_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(raw) => Some(normalize_relay_url(raw)?),
+                None => None,
+            };
+
+            if persist {
+                let mut persisted = DaemonPersistedConfig::load(&self.home_dir);
+                persisted.relay_url = normalized.clone();
+                persisted.save(&self.home_dir)?;
+            }
+
+            let mut task_guard = self.relay_task.lock().await;
+            let current = self.relay_url.read().await.clone();
+            if current == normalized
+                && task_guard
+                    .as_ref()
+                    .is_some_and(|handle| !handle.is_finished())
+            {
+                return Ok(normalized);
+            }
+
+            if let Some(prev) = task_guard.take() {
+                prev.abort();
+            }
+            *self.relay_url.write().await = normalized.clone();
+
+            if let Some(ref relay_url) = normalized {
+                let rt_relay = Arc::clone(self);
+                let relay_owned = relay_url.clone();
+                *task_guard = Some(tokio::spawn(async move {
+                    outbound_relay_loop(rt_relay, relay_owned).await;
+                }));
+            }
+
+            Ok(normalized)
+        })
+    }
+
+    async fn shutdown_outbound_relay(&self) {
+        if let Some(handle) = self.relay_task.lock().await.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -928,10 +1000,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     );
 
     if let Some(relay_url) = effective_relay {
-        let rt_relay = runtime.clone();
-        tokio::spawn(async move {
-            outbound_relay_loop(rt_relay, relay_url).await;
-        });
+        let _ = runtime.set_outbound_relay(Some(relay_url), false).await;
     }
 
     let runtime_shutdown = runtime.clone();
@@ -939,6 +1008,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             wait_daemon_shutdown_signal().await;
+            runtime_shutdown.shutdown_outbound_relay().await;
             runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
             runtime_shutdown.orchestrator.shutdown_worktree_pool().await;
             runtime_shutdown.conditional_timers.shutdown().await;
@@ -996,10 +1066,7 @@ pub async fn spawn_embedded_daemon(
     runtime.activate_server(addr).await;
 
     if let Some(r_url) = relay_url {
-        let rt_relay = runtime.clone();
-        tokio::spawn(async move {
-            outbound_relay_loop(rt_relay, r_url).await;
-        });
+        let _ = runtime.set_outbound_relay(Some(r_url), false).await;
     }
 
     let app = build_http_router(runtime.clone());
@@ -1118,6 +1185,9 @@ where
 }
 
 async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
+    const CONTROL_PING_INTERVAL: Duration = Duration::from_secs(20);
+    const CONTROL_DEADLINE: Duration = Duration::from_secs(65);
+
     let display_relay = redact_relay_url(&relay_base);
     let pubkey = runtime.keypair.public_key_b64.clone();
     let priv_bytes = match runtime.keypair.private_bytes() {
@@ -1130,6 +1200,7 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
     let ctrl_path = format!("/v1/daemon/control?pubkey={pubkey}");
 
     loop {
+        let mut backoff = Duration::from_secs(2);
         match RelayConnector::connect(&relay_base).await {
             Ok(connector) => {
                 let connector = Arc::new(connector);
@@ -1146,61 +1217,89 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
                                     relay = %display_relay,
                                     "Authenticated (PoP) and connected outbound to Orbit Relay"
                                 );
-                                while let Some(Ok(msg)) = stream.next().await {
-                                    match msg {
-                                        TungMsg::Binary(ct) => {
-                                            let Ok(plain) = control_chan.open_record(&ct) else {
-                                                warn!(
-                                                    relay = %display_relay,
-                                                    bytes = ct.len(),
-                                                    "Failed to decrypt Relay control frame; reconnecting"
-                                                );
+                                let mut ping_interval =
+                                    tokio::time::interval(CONTROL_PING_INTERVAL);
+                                ping_interval.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Delay,
+                                );
+                                ping_interval.tick().await;
+                                let mut last_seen = tokio::time::Instant::now();
+
+                                loop {
+                                    tokio::select! {
+                                        _ = ping_interval.tick() => {
+                                            if last_seen.elapsed() > CONTROL_DEADLINE {
+                                                warn!(relay = %display_relay, "Relay control heartbeat timed out, reconnecting...");
                                                 break;
-                                            };
-                                            if let Ok(v) =
-                                                serde_json::from_slice::<serde_json::Value>(&plain)
-                                                && v.get("op").and_then(|x| x.as_str())
-                                                    == Some("open_tunnel")
-                                                && let Some(tid) =
-                                                    v.get("tunnel_id").and_then(|x| x.as_str())
-                                                && let Some(secret_b64) =
-                                                    v.get("attach_secret").and_then(|x| x.as_str())
-                                                && let Ok(attach_secret) =
-                                                    orbit_crypto::decode_key_32(secret_b64)
-                                            {
-                                                let rt_tun = runtime.clone();
-                                                let conn_tun = Arc::clone(&connector);
-                                                let tid_owned = tid.to_string();
-                                                let secret_owned =
-                                                    zeroize::Zeroizing::new(attach_secret);
-                                                tokio::spawn(async move {
-                                                    let _ = serve_e2ee_relay_tunnel(
-                                                        rt_tun,
-                                                        &conn_tun,
-                                                        &tid_owned,
-                                                        secret_owned,
-                                                    )
-                                                    .await;
-                                                });
+                                            }
+                                            if sink.send(TungMsg::Ping(b"hb".to_vec().into())).await.is_err() {
+                                                break;
                                             }
                                         }
-                                        TungMsg::Ping(p) => {
-                                            let _ = sink.send(TungMsg::Pong(p)).await;
-                                        }
-                                        TungMsg::Pong(_) => {}
-                                        TungMsg::Close(_) => break,
-                                        other => {
-                                            let (kind, bytes) = describe_tung_frame(&other);
-                                            warn!(
-                                                relay = %display_relay,
-                                                frame_kind = kind,
-                                                bytes,
-                                                "Ignored unexpected unencrypted Relay control frame"
-                                            );
+                                        maybe_msg = stream.next() => {
+                                            match maybe_msg {
+                                                Some(Ok(TungMsg::Binary(ct))) => {
+                                                    last_seen = tokio::time::Instant::now();
+                                                    let Ok(plain) = control_chan.open_record(&ct) else {
+                                                        warn!(
+                                                            relay = %display_relay,
+                                                            bytes = ct.len(),
+                                                            "Failed to decrypt Relay control frame; reconnecting"
+                                                        );
+                                                        break;
+                                                    };
+                                                    if let Ok(v) =
+                                                        serde_json::from_slice::<serde_json::Value>(&plain)
+                                                        && v.get("op").and_then(|x| x.as_str())
+                                                            == Some("open_tunnel")
+                                                        && let Some(tid) =
+                                                            v.get("tunnel_id").and_then(|x| x.as_str())
+                                                        && let Some(secret_b64) =
+                                                            v.get("attach_secret").and_then(|x| x.as_str())
+                                                        && let Ok(attach_secret) =
+                                                            orbit_crypto::decode_key_32(secret_b64)
+                                                    {
+                                                        let rt_tun = runtime.clone();
+                                                        let conn_tun = Arc::clone(&connector);
+                                                        let tid_owned = tid.to_string();
+                                                        let secret_owned =
+                                                            zeroize::Zeroizing::new(attach_secret);
+                                                        tokio::spawn(async move {
+                                                            let _ = serve_e2ee_relay_tunnel(
+                                                                rt_tun,
+                                                                &conn_tun,
+                                                                &tid_owned,
+                                                                secret_owned,
+                                                            )
+                                                            .await;
+                                                        });
+                                                    }
+                                                }
+                                                Some(Ok(TungMsg::Ping(p))) => {
+                                                    last_seen = tokio::time::Instant::now();
+                                                    if sink.send(TungMsg::Pong(p)).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(Ok(TungMsg::Close(_))) | Some(Err(_)) | None => break,
+                                                Some(Ok(TungMsg::Pong(_))) => {
+                                                    last_seen = tokio::time::Instant::now();
+                                                }
+                                                Some(Ok(other)) => {
+                                                    last_seen = tokio::time::Instant::now();
+                                                    let (kind, bytes) = describe_tung_frame(&other);
+                                                    warn!(
+                                                        relay = %display_relay,
+                                                        frame_kind = kind,
+                                                        bytes,
+                                                        "Ignored unexpected unencrypted Relay control frame"
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                                warn!(relay = %display_relay, "Disconnected from Relay, reconnecting in 2s...");
+                                warn!(relay = %display_relay, "Disconnected from Relay, reconnecting...");
                             }
                             Err(e) => {
                                 warn!(
@@ -1212,7 +1311,17 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
                         }
                     }
                     Err(e) => {
-                        warn!(relay = %display_relay, error = %e, "Relay control stream failed, retrying in 2s...");
+                        let detail = e.to_string();
+                        if detail.contains("403") {
+                            backoff = Duration::from_secs(10);
+                            warn!(
+                                relay = %display_relay,
+                                pubkey = %pubkey,
+                                "Relay rejected host daemon public key (HTTP 403 Forbidden); authorize it with `orbit relay allow {pubkey}`"
+                            );
+                        } else {
+                            warn!(relay = %display_relay, error = %e, "Relay control stream failed, retrying in 2s...");
+                        }
                     }
                 }
             }
@@ -1220,7 +1329,7 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
                 warn!(relay = %display_relay, error = %e, "Relay connection failed, retrying in 2s...");
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(backoff).await;
     }
 }
 
@@ -2133,10 +2242,20 @@ async fn handle_wire_rpc(
         WireMessage::Hello { supports_zstd, .. } => {
             *use_zstd = supports_zstd;
             Some(WireMessage::Welcome {
-                host: runtime.host_info.clone(),
+                host: runtime.effective_host_info().await,
             })
         }
         WireMessage::Ping { ts_ms } => Some(WireMessage::Pong { ts_ms }),
+        WireMessage::ConfigureHostRelay {
+            request_id,
+            relay_url,
+        } => match runtime.set_outbound_relay(relay_url, true).await {
+            Ok(effective) => Some(WireMessage::HostRelayConfigured {
+                request_id,
+                relay_url: effective,
+            }),
+            Err(e) => Some(rpc_err(request_id, "configure_relay_failed", e)),
+        },
 
         // Workspaces & Git
         WireMessage::DiscoverProjects { request_id } => {
@@ -3873,27 +3992,80 @@ async fn handle_wire_rpc(
             request_id,
             agent_id,
             since_seq,
-        } => match runtime.store.fetch_timeline_since_budgeted(
-            &agent_id,
-            since_seq,
-            2000,
-            orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES,
-        ) {
-            Ok((events, has_more)) => {
-                // Only enable live broadcast streaming after the final catchup page is fetched so
-                // TimelineLive frames cannot race ahead of paginated catchup history.
-                if !has_more {
-                    subscribed_agents.insert(agent_id.clone());
+            tail_limit,
+        } => {
+            if since_seq == 0
+                && let Some(tail) = tail_limit.filter(|&n| n > 0)
+            {
+                let capped = (tail as usize).clamp(1, 2000);
+                match runtime.store.fetch_timeline_tail_budgeted(
+                    &agent_id,
+                    capped,
+                    orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES,
+                ) {
+                    Ok((events, has_older)) => {
+                        subscribed_agents.insert(agent_id.clone());
+                        Some(WireMessage::TimelineCatchup {
+                            request_id,
+                            agent_id,
+                            events,
+                            has_more: false,
+                            has_older_history: has_older,
+                        })
+                    }
+                    Err(e) => Some(rpc_err(request_id, "timeline_error", e)),
                 }
-                Some(WireMessage::TimelineCatchup {
+            } else {
+                match runtime.store.fetch_timeline_since_budgeted(
+                    &agent_id,
+                    since_seq,
+                    2000,
+                    orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES,
+                ) {
+                    Ok((events, has_more)) => {
+                        // Only enable live broadcast streaming after the final catchup page is fetched so
+                        // TimelineLive frames cannot race ahead of paginated catchup history.
+                        if !has_more {
+                            subscribed_agents.insert(agent_id.clone());
+                        }
+                        Some(WireMessage::TimelineCatchup {
+                            request_id,
+                            agent_id,
+                            events,
+                            has_more,
+                            has_older_history: false,
+                        })
+                    }
+                    Err(e) => Some(rpc_err(request_id, "timeline_error", e)),
+                }
+            }
+        }
+        WireMessage::FetchTimelineBefore {
+            request_id,
+            agent_id,
+            before_seq,
+            limit,
+        } => {
+            let capped = if limit == 0 {
+                300
+            } else {
+                (limit as usize).clamp(1, 1000)
+            };
+            match runtime.store.fetch_timeline_before_budgeted(
+                &agent_id,
+                before_seq,
+                capped,
+                orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES,
+            ) {
+                Ok((events, has_more_older)) => Some(WireMessage::TimelineHistoryPage {
                     request_id,
                     agent_id,
                     events,
-                    has_more,
-                })
+                    has_more_older,
+                }),
+                Err(e) => Some(rpc_err(request_id, "timeline_history_error", e)),
             }
-            Err(e) => Some(rpc_err(request_id, "timeline_error", e)),
-        },
+        }
 
         // Terminals
         WireMessage::ListTerminals { request_id } => {

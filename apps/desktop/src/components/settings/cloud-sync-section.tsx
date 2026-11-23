@@ -50,6 +50,7 @@ export function CloudSyncSection() {
   const storeError = useOrbitSelector((s) => s.cloudSyncError);
   const deviceFlow = useOrbitSelector((s) => s.cloudSyncDeviceFlow);
   const lastResult = useOrbitSelector((s) => s.cloudSyncLastResult);
+  const hosts = useOrbitSelector((s) => s.fleet.hosts);
 
   const [loginTab, setLoginTab] = useState<LoginMethodTab>("device");
   const [clientIdInput, setClientIdInput] = useState("");
@@ -82,6 +83,11 @@ export function CloudSyncSection() {
 
   const effectiveState = status?.state ?? "signed_out";
   const displayError = localError ?? storeError ?? status?.last_error ?? null;
+  const isAuthExpiredError = Boolean(
+    displayError &&
+      /401|bad credentials|expired|revoked|unauthorized/i.test(displayError),
+  );
+  const hostsMissingRelay = hosts.filter((h) => !(h.relay_url ?? "").trim());
 
   const markCopied = (which: "code" | "key" | "cli", text: string) => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
@@ -175,75 +181,77 @@ export function CloudSyncSection() {
         </div>
       </div>
 
-      {/* 1. SIGNED OUT */}
-      {effectiveState === "signed_out" && (
-        <div className="space-y-3">
-          {deviceFlow ? (
-            <div className="space-y-2">
-              <SettingGroupLabel>GitHub Verification</SettingGroupLabel>
-              <SettingCard>
-                <div className="space-y-4 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-foreground text-[13.5px] font-medium">
-                        Enter this code on GitHub
-                      </div>
-                      <div className="text-muted-foreground text-[12px]">
-                        Authorize Orbit to store your encrypted sync vault in a Secret Gist.
-                      </div>
-                    </div>
-                    <Loader2 className="text-muted-foreground h-4 w-4 shrink-0 animate-spin" />
+      {/* Active GitHub Device Flow Card (shown regardless of signed_out/error state for seamless re-auth) */}
+      {deviceFlow && (
+        <div className="space-y-2">
+          <SettingGroupLabel>GitHub Verification</SettingGroupLabel>
+          <SettingCard>
+            <div className="space-y-4 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-foreground text-[13.5px] font-medium">
+                    Enter this code on GitHub
                   </div>
-
-                  <div className="border-border bg-muted/40 flex items-center justify-between rounded-[11px] border px-4 py-3">
-                    <span className="selectable-text text-foreground font-mono text-[22px] font-semibold tracking-[0.14em]">
-                      {deviceFlow.user_code}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => markCopied("code", deviceFlow.user_code)}
-                      className="border-border bg-background hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
-                    >
-                      {copiedFlag === "code" ? (
-                        <>
-                          <Check className="h-3.5 w-3.5 text-emerald-500" />
-                          <span>{t("common.copied")}</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="h-3.5 w-3.5" />
-                          <span>{t("common.copy")}</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        markCopied("code", deviceFlow.user_code);
-                        void orbitIpc.openExternalBrowserUrl(deviceFlow.verification_uri);
-                      }}
-                      className="bg-foreground text-background inline-flex h-[34px] cursor-pointer items-center gap-2 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90"
-                    >
-                      <ExternalLink className="h-3.5 w-3.5" />
-                      <span>{t("settings.copyCodeOpenGithub")}</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => orbitActions.cancelGithubCloudLogin()}
-                      className="border-border text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[34px] cursor-pointer items-center rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
-                    >
-                      {t("common.cancel")}
-                    </button>
+                  <div className="text-muted-foreground text-[12px]">
+                    Authorize Orbit to store your encrypted sync vault in a Secret Gist.
                   </div>
                 </div>
-              </SettingCard>
+                <Loader2 className="text-muted-foreground h-4 w-4 shrink-0 animate-spin" />
+              </div>
+
+              <div className="border-border bg-muted/40 flex items-center justify-between rounded-[11px] border px-4 py-3">
+                <span className="selectable-text text-foreground font-mono text-[22px] font-semibold tracking-[0.14em]">
+                  {deviceFlow.user_code}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => markCopied("code", deviceFlow.user_code)}
+                  className="border-border bg-background hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+                >
+                  {copiedFlag === "code" ? (
+                    <>
+                      <Check className="h-3.5 w-3.5 text-emerald-500" />
+                      <span>{t("common.copied")}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-3.5 w-3.5" />
+                      <span>{t("common.copy")}</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    markCopied("code", deviceFlow.user_code);
+                    void orbitIpc.openExternalBrowserUrl(deviceFlow.verification_uri);
+                  }}
+                  className="bg-foreground text-background inline-flex h-[34px] cursor-pointer items-center gap-2 rounded-lg px-3.5 text-[12.5px] font-medium transition-opacity hover:opacity-90"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  <span>{t("settings.copyCodeOpenGithub")}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => orbitActions.cancelGithubCloudLogin()}
+                  className="border-border text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[34px] cursor-pointer items-center rounded-lg border px-3 text-[12.5px] font-medium transition-colors"
+                >
+                  {t("common.cancel")}
+                </button>
+              </div>
             </div>
-          ) : (
-            <div className="space-y-2">
+          </SettingCard>
+        </div>
+      )}
+
+      {/* 1. SIGNED OUT */}
+      {effectiveState === "signed_out" && !deviceFlow && (
+        <div className="space-y-3">
+          <div className="space-y-2">
               <SettingGroupLabel>{t("settings.signInGithub")}</SettingGroupLabel>
               <SettingCard>
                 <div className="space-y-4 p-4">
@@ -385,7 +393,6 @@ export function CloudSyncSection() {
                 </div>
               </SettingCard>
             </div>
-          )}
         </div>
       )}
 
@@ -731,10 +738,32 @@ export function CloudSyncSection() {
           </div>
         )}
 
-      {displayError && (
-        <div className="border-rose-500/30 bg-rose-500/8 flex items-start gap-2 rounded-[11px] border px-3.5 py-2.5 text-[12.5px] text-rose-600 dark:text-rose-400">
+      {effectiveState === "ready" && hosts.length > 0 && hostsMissingRelay.length > 0 && (
+        <div className="border-amber-500/25 bg-amber-500/8 flex items-start gap-2 rounded-[11px] border px-3.5 py-2.5 text-[12px] text-amber-700 dark:text-amber-300">
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span className="selectable-text break-words">{displayError}</span>
+          <span>
+            {hostsMissingRelay.length} host{hostsMissingRelay.length === 1 ? " has" : "s have"} no Private Relay configured yet — mobile off-LAN connections require configuring &amp; sharing a relay in Host Connection settings.
+          </span>
+        </div>
+      )}
+
+      {displayError && (
+        <div className="border-rose-500/30 bg-rose-500/8 flex flex-wrap items-center justify-between gap-2.5 rounded-[11px] border px-3.5 py-2.5 text-[12.5px] text-rose-600 dark:text-rose-400">
+          <div className="flex min-w-0 flex-1 items-start gap-2">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span className="selectable-text break-words">{displayError}</span>
+          </div>
+          {(effectiveState === "error" || isAuthExpiredError) && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void handleStartDeviceLogin()}
+              className="bg-foreground text-background inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12px] font-medium transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              <Cloud className="h-3.5 w-3.5" />
+              <span>Sign In Again with GitHub</span>
+            </button>
+          )}
         </div>
       )}
 

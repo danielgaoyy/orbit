@@ -952,6 +952,7 @@ async fn execute_tool_inner(
                             request_id: req_id,
                             agent_id: agent_id.clone(),
                             since_seq,
+                            tail_limit: None,
                         },
                         Duration::from_secs(15),
                     )

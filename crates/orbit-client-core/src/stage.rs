@@ -290,6 +290,12 @@ pub struct AgentStageDeltaView {
     pub aux_revision: u64,
     #[serde(default)]
     pub aux_unchanged: bool,
+    #[serde(default)]
+    pub has_older_turns: bool,
+    #[serde(default)]
+    pub has_older_history: bool,
+    #[serde(default)]
+    pub oldest_loaded_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1452,7 +1458,7 @@ pub fn process_timeline_turns_slice(
     }
 }
 
-/// Collects unresolved HITL gates, session-wide tool diffs, and derived session insights in a single pass.
+/// Collects unresolved HITL gates, deduplicated session-wide tool diffs, and derived session insights in a single pass.
 pub fn collect_stage_auxiliary_state(
     items: &[TimelineItemView],
     cwd: Option<&str>,
@@ -1465,15 +1471,24 @@ pub fn collect_stage_auxiliary_state(
     Vec<DiffFileView>,
     SessionInsightsView,
 ) {
+    const MAX_SESSION_TURN_DIFF_FILES: usize = 64;
+
     let mut pending_permissions: Vec<TimelineItemView> = Vec::new();
     let mut pending_questions: Vec<TimelineItemView> = Vec::new();
+    let mut diff_index_by_path: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut session_turn_diffs: Vec<DiffFileView> = Vec::new();
 
     for raw_item in items {
         match raw_item {
             TimelineItemView::ToolCall { diff_files, .. } => {
                 for df in diff_files {
-                    session_turn_diffs.push(df.clone());
+                    if let Some(&idx) = diff_index_by_path.get(&df.path) {
+                        session_turn_diffs[idx] = df.clone();
+                    } else if session_turn_diffs.len() < MAX_SESSION_TURN_DIFF_FILES {
+                        diff_index_by_path.insert(df.path.clone(), session_turn_diffs.len());
+                        session_turn_diffs.push(df.clone());
+                    }
                 }
             }
             TimelineItemView::PermissionRequest {
@@ -1790,7 +1805,24 @@ fn finalize_turn(
         .iter()
         .rev()
         .find(|it| matches!(it, TimelineItemView::AssistantMessage { text, .. } if !text.trim().is_empty()))
-        .cloned();
+        .map(|it| match it {
+            TimelineItemView::AssistantMessage {
+                seq,
+                item_id,
+                text,
+                streaming,
+                timestamp_ms,
+                ..
+            } => TimelineItemView::AssistantMessage {
+                seq: *seq,
+                item_id: item_id.clone(),
+                text: text.clone(),
+                streaming: *streaming,
+                blocks: Vec::new(),
+                timestamp_ms: *timestamp_ms,
+            },
+            other => other.clone(),
+        });
 
     let turn_diffs: Vec<TurnFileDiffSummaryView> = diff_paths_order
         .into_iter()

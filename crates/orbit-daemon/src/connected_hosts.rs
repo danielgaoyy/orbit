@@ -543,6 +543,8 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::PendingPermissionsSnapshot { request_id, .. }
         | WireMessage::Ack { request_id }
         | WireMessage::TimelineCatchup { request_id, .. }
+        | WireMessage::TimelineHistoryPage { request_id, .. }
+        | WireMessage::HostRelayConfigured { request_id, .. }
         | WireMessage::TerminalsSnapshot { request_id, .. }
         | WireMessage::TerminalAttached { request_id, .. }
         | WireMessage::TerminalCaptured { request_id, .. }

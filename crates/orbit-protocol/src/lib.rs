@@ -518,6 +518,8 @@ pub struct HostInfo {
     pub protocol_version: u32,
     pub daemon_version: String,
     pub available_providers: Vec<ProviderKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
 }
 
 /// Workspace record (either a direct local checkout, isolated git worktree, or multi-agent Mission Workspace).
@@ -1596,15 +1598,43 @@ pub enum WireMessage {
         agent_id: String,
         /// Client passes its local SQLite cursor for instant catch-up without full reload.
         since_seq: u64,
+        /// When `since_seq == 0` and set, return only the latest `tail_limit` events (tail-first).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tail_limit: Option<u32>,
     },
     TimelineCatchup {
         request_id: Uuid,
         agent_id: String,
         events: Vec<TimelineEvent>,
         has_more: bool,
+        #[serde(default)]
+        has_older_history: bool,
+    },
+    FetchTimelineBefore {
+        request_id: Uuid,
+        agent_id: String,
+        before_seq: u64,
+        #[serde(default)]
+        limit: u32,
+    },
+    TimelineHistoryPage {
+        request_id: Uuid,
+        agent_id: String,
+        events: Vec<TimelineEvent>,
+        has_more_older: bool,
     },
     TimelineLive {
         event: TimelineEvent,
+    },
+    ConfigureHostRelay {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_url: Option<String>,
+    },
+    HostRelayConfigured {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_url: Option<String>,
     },
 
     // Detached PTY Terminals

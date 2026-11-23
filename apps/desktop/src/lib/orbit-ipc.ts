@@ -2255,6 +2255,9 @@ export interface AgentStageView {
   turns: StageTurnView[];
   window_start_turn_index?: number;
   total_turn_count?: number;
+  has_older_turns?: boolean;
+  has_older_history?: boolean;
+  oldest_loaded_seq?: number;
   pending_permissions: TimelineItemView[];
   pending_questions: TimelineItemView[];
   session_turn_diffs: DiffFileView[];
@@ -2271,6 +2274,9 @@ export interface AgentStageDeltaView {
   window_start_turn_index?: number;
   changed_turns: StageTurnView[];
   total_turn_count: number;
+  has_older_turns?: boolean;
+  has_older_history?: boolean;
+  oldest_loaded_seq?: number;
   pending_permissions: TimelineItemView[];
   pending_questions: TimelineItemView[];
   session_turn_diffs: DiffFileView[];
@@ -2946,6 +2952,9 @@ export const orbitIpc = {
         reset: sinceRevision > 0,
         aux_revision: 0,
         aux_unchanged: false,
+        has_older_turns: false,
+        has_older_history: false,
+        oldest_loaded_seq: 0,
       };
     }
     return invoke("get_agent_stage_delta", {
@@ -2969,6 +2978,19 @@ export const orbitIpc = {
       agentId,
       startTurnIndex,
       count,
+    });
+  },
+
+  async loadOlderAgentTimeline(
+    hostId: string,
+    agentId: string,
+    limitEvents = 300,
+  ): Promise<boolean> {
+    if (!isTauriRuntime()) return false;
+    return invoke("load_older_agent_timeline", {
+      hostId,
+      agentId,
+      limitEvents,
     });
   },
 
@@ -3260,6 +3282,11 @@ export const orbitIpc = {
   updateHostRelay: async (hostId: string, relayUrl: string | null): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("update_host_relay", { hostId, relayUrl });
+  },
+
+  applyRelayToAllHosts: async (rawRelayUrl: string): Promise<number> => {
+    if (!isTauriRuntime()) return 0;
+    return invoke<number>("apply_relay_to_all_hosts", { rawRelayUrl });
   },
 
   connectHost: async (hostId: string): Promise<void> => {
@@ -5177,6 +5204,7 @@ export const orbitIpc = {
     sshAlias: string;
     fallbackHostname: string;
     relayPort: number;
+    applyToAllHosts?: boolean;
   }): Promise<string> => {
     return invoke<string>("provision_ssh_relay", params);
   },

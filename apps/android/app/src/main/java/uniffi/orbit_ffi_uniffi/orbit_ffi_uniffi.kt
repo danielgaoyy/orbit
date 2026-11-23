@@ -751,6 +751,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_answer_question(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_apply_relay_to_fleet(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_agent(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_workspace(
@@ -865,6 +867,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_get_artifact(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_get_tool_call_diff(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_repos_inspection(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_review(
@@ -894,6 +898,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_push_devices(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_workflow_runs(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_load_older_agent_timeline(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_seen(
     ): Int
@@ -1133,6 +1139,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_answer_question(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`questionRequestId`: RustBuffer.ByValue,`answers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_apply_relay_to_fleet(`ptr`: Long,`rawRelayUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_archive_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_archive_workspace(`ptr`: Long,`hostId`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,`keepAgentsUnclassified`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -1247,6 +1255,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_get_artifact(`ptr`: Long,`hostId`: RustBuffer.ByValue,`artifactId`: RustBuffer.ByValue,`version`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_get_tool_call_diff(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`seq`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_git_repos_inspection(`ptr`: Long,`hostId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_git_review(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1277,6 +1287,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_list_workflow_runs(`ptr`: Long,`hostId`: RustBuffer.ByValue,`includeCompleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_load_older_agent_timeline(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`limitEvents`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_mark_agent_seen(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`seq`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_mark_agent_unread(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1644,6 +1656,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_answer_question() and 0xFFFF) != 41977) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_apply_relay_to_fleet() and 0xFFFF) != 15717) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_agent() and 0xFFFF) != 61104) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1815,6 +1830,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_get_artifact() and 0xFFFF) != 65066) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_get_tool_call_diff() and 0xFFFF) != 27316) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_repos_inspection() and 0xFFFF) != 62271) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1858,6 +1876,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_workflow_runs() and 0xFFFF) != 14912) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_load_older_agent_timeline() and 0xFFFF) != 59706) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_seen() and 0xFFFF) != 61018) {
@@ -3038,6 +3059,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `answerQuestion`(`hostId`: kotlin.String, `agentId`: kotlin.String, `questionRequestId`: kotlin.String, `answers`: List<List<kotlin.String>>)
     
+    fun `applyRelayToFleet`(`rawRelayUrl`: kotlin.String): kotlin.UInt
+    
     fun `archiveAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
     
     fun `archiveWorkspace`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `keepAgentsUnclassified`: kotlin.Boolean)
@@ -3152,6 +3175,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `getArtifact`(`hostId`: kotlin.String, `artifactId`: kotlin.String, `version`: kotlin.UInt?): FfiArtifactDetail
     
+    fun `getToolCallDiff`(`hostId`: kotlin.String, `agentId`: kotlin.String, `seq`: kotlin.ULong): List<FfiDiffFile>
+    
     fun `gitReposInspection`(`hostId`: kotlin.String, `path`: kotlin.String): FfiGitReposInspection?
     
     fun `gitReview`(`hostId`: kotlin.String, `cwd`: kotlin.String, `path`: kotlin.String?): FfiGitReview
@@ -3181,6 +3206,8 @@ public interface OrbitMobileCoreInterface {
     fun `listPushDevices`(`hostId`: kotlin.String): FfiPushDevicesSnapshot
     
     fun `listWorkflowRuns`(`hostId`: kotlin.String, `includeCompleted`: kotlin.Boolean): List<FfiWorkflowRunRecord>
+    
+    fun `loadOlderAgentTimeline`(`hostId`: kotlin.String, `agentId`: kotlin.String, `limitEvents`: kotlin.UInt): kotlin.Boolean
     
     fun `markAgentSeen`(`hostId`: kotlin.String, `agentId`: kotlin.String, `seq`: kotlin.ULong)
     
@@ -3569,6 +3596,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
 }
     }
     
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `applyRelayToFleet`(`rawRelayUrl`: kotlin.String): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_apply_relay_to_fleet(
+        it,
+        
+        FfiConverterString.lower(`rawRelayUrl`),_status)
+}
+    }
+    )
+    }
     
 
     override fun `archiveAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
@@ -4434,6 +4476,22 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     
 
+    override fun `getToolCallDiff`(`hostId`: kotlin.String, `agentId`: kotlin.String, `seq`: kotlin.ULong): List<FfiDiffFile> {
+            return FfiConverterSequenceTypeFfiDiffFile.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_get_tool_call_diff(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterULong.lower(`seq`),_status)
+}
+    }
+    )
+    }
+    
+
     override fun `gitReposInspection`(`hostId`: kotlin.String, `path`: kotlin.String): FfiGitReposInspection? {
             return FfiConverterOptionalTypeFfiGitReposInspection.lift(
     callWithHandle {
@@ -4656,6 +4714,22 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         
         FfiConverterString.lower(`hostId`),
         FfiConverterBoolean.lower(`includeCompleted`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `loadOlderAgentTimeline`(`hostId`: kotlin.String, `agentId`: kotlin.String, `limitEvents`: kotlin.UInt): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_load_older_agent_timeline(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterUInt.lower(`limitEvents`),_status)
 }
     }
     )
@@ -6894,6 +6968,16 @@ data class FfiAgentStageDelta (
     var `latestSeq`: kotlin.ULong
     , 
     var `reset`: kotlin.Boolean
+    , 
+    var `auxRevision`: kotlin.ULong
+    , 
+    var `auxUnchanged`: kotlin.Boolean
+    , 
+    var `windowStartTurnIndex`: kotlin.UInt
+    , 
+    var `hasOlderTurns`: kotlin.Boolean
+    , 
+    var `oldestLoadedSeq`: kotlin.ULong
     
 ){
     
@@ -6922,6 +7006,11 @@ public object FfiConverterTypeFfiAgentStageDelta: FfiConverterRustBuffer<FfiAgen
             FfiConverterTypeFfiSessionInsights.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
         )
     }
 
@@ -6937,7 +7026,12 @@ public object FfiConverterTypeFfiAgentStageDelta: FfiConverterRustBuffer<FfiAgen
             FfiConverterSequenceTypeFfiDiffFile.allocationSize(value.`sessionTurnDiffs`) +
             FfiConverterTypeFfiSessionInsights.allocationSize(value.`insights`) +
             FfiConverterULong.allocationSize(value.`latestSeq`) +
-            FfiConverterBoolean.allocationSize(value.`reset`)
+            FfiConverterBoolean.allocationSize(value.`reset`) +
+            FfiConverterULong.allocationSize(value.`auxRevision`) +
+            FfiConverterBoolean.allocationSize(value.`auxUnchanged`) +
+            FfiConverterUInt.allocationSize(value.`windowStartTurnIndex`) +
+            FfiConverterBoolean.allocationSize(value.`hasOlderTurns`) +
+            FfiConverterULong.allocationSize(value.`oldestLoadedSeq`)
     )
 
     override fun write(value: FfiAgentStageDelta, buf: ByteBuffer) {
@@ -6953,6 +7047,11 @@ public object FfiConverterTypeFfiAgentStageDelta: FfiConverterRustBuffer<FfiAgen
             FfiConverterTypeFfiSessionInsights.write(value.`insights`, buf)
             FfiConverterULong.write(value.`latestSeq`, buf)
             FfiConverterBoolean.write(value.`reset`, buf)
+            FfiConverterULong.write(value.`auxRevision`, buf)
+            FfiConverterBoolean.write(value.`auxUnchanged`, buf)
+            FfiConverterUInt.write(value.`windowStartTurnIndex`, buf)
+            FfiConverterBoolean.write(value.`hasOlderTurns`, buf)
+            FfiConverterULong.write(value.`oldestLoadedSeq`, buf)
     }
 }
 
@@ -6964,6 +7063,12 @@ data class FfiAgentStageDeltaRequest (
     var `agentId`: kotlin.String
     , 
     var `sinceRevision`: kotlin.ULong
+    , 
+    var `sinceAuxRevision`: kotlin.ULong?
+    , 
+    var `turnLimit`: kotlin.UInt?
+    , 
+    var `sinceWindowStartTurnIndex`: kotlin.UInt?
     
 ){
     
@@ -6983,19 +7088,28 @@ public object FfiConverterTypeFfiAgentStageDeltaRequest: FfiConverterRustBuffer<
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterOptionalULong.read(buf),
+            FfiConverterOptionalUInt.read(buf),
+            FfiConverterOptionalUInt.read(buf),
         )
     }
 
     override fun allocationSize(value: FfiAgentStageDeltaRequest) = (
             FfiConverterString.allocationSize(value.`hostId`) +
             FfiConverterString.allocationSize(value.`agentId`) +
-            FfiConverterULong.allocationSize(value.`sinceRevision`)
+            FfiConverterULong.allocationSize(value.`sinceRevision`) +
+            FfiConverterOptionalULong.allocationSize(value.`sinceAuxRevision`) +
+            FfiConverterOptionalUInt.allocationSize(value.`turnLimit`) +
+            FfiConverterOptionalUInt.allocationSize(value.`sinceWindowStartTurnIndex`)
     )
 
     override fun write(value: FfiAgentStageDeltaRequest, buf: ByteBuffer) {
             FfiConverterString.write(value.`hostId`, buf)
             FfiConverterString.write(value.`agentId`, buf)
             FfiConverterULong.write(value.`sinceRevision`, buf)
+            FfiConverterOptionalULong.write(value.`sinceAuxRevision`, buf)
+            FfiConverterOptionalUInt.write(value.`turnLimit`, buf)
+            FfiConverterOptionalUInt.write(value.`sinceWindowStartTurnIndex`, buf)
     }
 }
 
@@ -17692,6 +17806,16 @@ sealed class FfiTurnLiveSegment {
         companion object
     }
     
+    data class AgentMessage(
+        val `key`: kotlin.String, 
+        val `item`: uniffi.orbit_ffi_uniffi.FfiTimelineItem) : FfiTurnLiveSegment()
+        
+    {
+        
+
+        companion object
+    }
+    
     data class Notice(
         val `key`: kotlin.String, 
         val `item`: uniffi.orbit_ffi_uniffi.FfiTimelineItem) : FfiTurnLiveSegment()
@@ -17754,15 +17878,19 @@ public object FfiConverterTypeFfiTurnLiveSegment : FfiConverterRustBuffer<FfiTur
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiTimelineItem.read(buf),
                 )
-            3 -> FfiTurnLiveSegment.Notice(
+            3 -> FfiTurnLiveSegment.AgentMessage(
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiTimelineItem.read(buf),
                 )
-            4 -> FfiTurnLiveSegment.Compaction(
+            4 -> FfiTurnLiveSegment.Notice(
+                FfiConverterString.read(buf),
+                FfiConverterTypeFfiTimelineItem.read(buf),
+                )
+            5 -> FfiTurnLiveSegment.Compaction(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            5 -> FfiTurnLiveSegment.Wakeup(
+            6 -> FfiTurnLiveSegment.Wakeup(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
@@ -17788,6 +17916,14 @@ public object FfiConverterTypeFfiTurnLiveSegment : FfiConverterRustBuffer<FfiTur
             )
         }
         is FfiTurnLiveSegment.AssistantMessage -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`key`)
+                + FfiConverterTypeFfiTimelineItem.allocationSize(value.`item`)
+            )
+        }
+        is FfiTurnLiveSegment.AgentMessage -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
@@ -17843,20 +17979,26 @@ public object FfiConverterTypeFfiTurnLiveSegment : FfiConverterRustBuffer<FfiTur
                 FfiConverterTypeFfiTimelineItem.write(value.`item`, buf)
                 Unit
             }
-            is FfiTurnLiveSegment.Notice -> {
+            is FfiTurnLiveSegment.AgentMessage -> {
                 buf.putInt(3)
                 FfiConverterString.write(value.`key`, buf)
                 FfiConverterTypeFfiTimelineItem.write(value.`item`, buf)
                 Unit
             }
-            is FfiTurnLiveSegment.Compaction -> {
+            is FfiTurnLiveSegment.Notice -> {
                 buf.putInt(4)
+                FfiConverterString.write(value.`key`, buf)
+                FfiConverterTypeFfiTimelineItem.write(value.`item`, buf)
+                Unit
+            }
+            is FfiTurnLiveSegment.Compaction -> {
+                buf.putInt(5)
                 FfiConverterString.write(value.`key`, buf)
                 FfiConverterString.write(value.`label`, buf)
                 Unit
             }
             is FfiTurnLiveSegment.Wakeup -> {
-                buf.putInt(5)
+                buf.putInt(6)
                 FfiConverterString.write(value.`key`, buf)
                 FfiConverterString.write(value.`label`, buf)
                 Unit

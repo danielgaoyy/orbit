@@ -524,7 +524,22 @@ async fn connect_via_relay_with_host_id(
     })?;
     let path_and_query = format!("/v1/client/{daemon_pubkey_b64}");
 
-    let ws_stream = connect_relay_ws(relay_base_url, &path_and_query).await?;
+    let ws_stream = connect_relay_ws(relay_base_url, &path_and_query)
+        .await
+        .map_err(|err| {
+            let detail = err.to_string();
+            if detail.contains("502") {
+                ClientCoreError::Handshake(
+                    "Host daemon is not registered on Relay (502) — ensure the host daemon is running with this Relay configured".into(),
+                )
+            } else if detail.contains("403") {
+                ClientCoreError::Handshake(
+                    "Relay rejected host public key (403 Forbidden) — authorize this host on the Relay".into(),
+                )
+            } else {
+                ClientCoreError::RelayTransport(err)
+            }
+        })?;
     let (mut sink, mut stream) = ws_stream.split();
 
     sink.send(Message::Binary(msg1.into())).await?;
@@ -847,14 +862,84 @@ async fn try_connect_direct_endpoints(
         .unwrap_or(ClientCoreError::Unreachable))
 }
 
+async fn connect_auto(
+    profile: &SavedHostProfile,
+    replica: Option<Arc<OrbitStore>>,
+    has_ssh: bool,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    let mut last_ssh_err = None;
+    let mut auth_err = None;
+    let mut mismatch_err = None;
+    if has_ssh && !has_custom_direct_endpoint(profile) {
+        match try_connect_ssh_tunnel(profile, replica.clone()).await {
+            Ok(h) => return Ok(h),
+            Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
+                mismatch_err = Some(e);
+            }
+            Err(e) if e.is_auth_error() => auth_err = Some(e),
+            Err(e) => last_ssh_err = Some(e),
+        }
+        match try_connect_direct_endpoints(profile, replica.clone()).await {
+            Ok(h) => return Ok(h),
+            Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
+                mismatch_err = Some(e);
+            }
+            Err(e) if e.is_auth_error() => auth_err = Some(e),
+            Err(_) => {}
+        }
+    } else {
+        match try_connect_direct_endpoints(profile, replica.clone()).await {
+            Ok(h) => return Ok(h),
+            Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
+                mismatch_err = Some(e);
+            }
+            Err(e) if e.is_auth_error() => auth_err = Some(e),
+            Err(_) => {}
+        }
+        if has_ssh {
+            match try_connect_ssh_tunnel(profile, replica.clone()).await {
+                Ok(h) => return Ok(h),
+                Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
+                    mismatch_err = Some(e);
+                }
+                Err(e) if e.is_auth_error() => auth_err = Some(e),
+                Err(e) => last_ssh_err = Some(e),
+            }
+        }
+    }
+
+    if let Some(ref relay_url) = profile.relay_url {
+        match connect_via_relay_with_host_id(
+            &profile.host_id,
+            relay_url,
+            &profile.daemon_pubkey_b64,
+            &profile.pairing_secret,
+            replica,
+        )
+        .await
+        {
+            Ok(h) => return Ok(h),
+            Err(e) if e.is_auth_error() => return Err(e),
+            Err(e) => return Err(mismatch_err.or(auth_err).unwrap_or(e)),
+        }
+    }
+
+    Err(mismatch_err
+        .or(auth_err)
+        .or(last_ssh_err)
+        .unwrap_or(ClientCoreError::Unreachable))
+}
+
 /// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`):
 /// - When an `ssh_alias` (`devbox`) is configured on Desktop in `Auto` mode, connects via dedicated SSH tunnel FIRST!
+/// - On mobile (`!macos && !linux`), `SshTunnel` degrades gracefully to the `Auto` route (Direct -> E2EE Relay).
 /// - Otherwise probes Direct WS -> SSH Tunnel -> Noise E2EE Relay.
 pub async fn connect_smart(
     profile: &SavedHostProfile,
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
-    let has_ssh = cfg!(any(target_os = "macos", target_os = "linux"))
+    let desktop_ssh_supported = cfg!(any(target_os = "macos", target_os = "linux"));
+    let has_ssh = desktop_ssh_supported
         && profile
             .ssh_alias
             .as_deref()
@@ -862,7 +947,13 @@ pub async fn connect_smart(
             .unwrap_or(false);
 
     match profile.route_mode {
-        HostRouteMode::SshTunnel => try_connect_ssh_tunnel(profile, replica).await,
+        HostRouteMode::SshTunnel => {
+            if desktop_ssh_supported {
+                try_connect_ssh_tunnel(profile, replica).await
+            } else {
+                connect_auto(profile, replica, false).await
+            }
+        }
         HostRouteMode::DirectOnly => try_connect_direct_endpoints(profile, replica).await,
         HostRouteMode::RelayOnly => {
             if let Some(ref relay_url) = profile.relay_url {
@@ -880,69 +971,7 @@ pub async fn connect_smart(
                 ))
             }
         }
-        HostRouteMode::Auto => {
-            let mut last_ssh_err = None;
-            let mut auth_err = None;
-            let mut mismatch_err = None;
-            if has_ssh && !has_custom_direct_endpoint(profile) {
-                match try_connect_ssh_tunnel(profile, replica.clone()).await {
-                    Ok(h) => return Ok(h),
-                    Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
-                        mismatch_err = Some(e);
-                    }
-                    Err(e) if e.is_auth_error() => auth_err = Some(e),
-                    Err(e) => last_ssh_err = Some(e),
-                }
-                match try_connect_direct_endpoints(profile, replica.clone()).await {
-                    Ok(h) => return Ok(h),
-                    Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
-                        mismatch_err = Some(e);
-                    }
-                    Err(e) if e.is_auth_error() => auth_err = Some(e),
-                    Err(_) => {}
-                }
-            } else {
-                match try_connect_direct_endpoints(profile, replica.clone()).await {
-                    Ok(h) => return Ok(h),
-                    Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
-                        mismatch_err = Some(e);
-                    }
-                    Err(e) if e.is_auth_error() => auth_err = Some(e),
-                    Err(_) => {}
-                }
-                if has_ssh {
-                    match try_connect_ssh_tunnel(profile, replica.clone()).await {
-                        Ok(h) => return Ok(h),
-                        Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
-                            mismatch_err = Some(e);
-                        }
-                        Err(e) if e.is_auth_error() => auth_err = Some(e),
-                        Err(e) => last_ssh_err = Some(e),
-                    }
-                }
-            }
-
-            if let Some(ref relay_url) = profile.relay_url {
-                match connect_via_relay_with_host_id(
-                    &profile.host_id,
-                    relay_url,
-                    &profile.daemon_pubkey_b64,
-                    &profile.pairing_secret,
-                    replica,
-                )
-                .await
-                {
-                    Ok(h) => return Ok(h),
-                    Err(e) if e.is_auth_error() => return Err(e),
-                    Err(e) => return Err(mismatch_err.or(auth_err).unwrap_or(e)),
-                }
-            }
-
-            Err(mismatch_err
-                .or(auth_err)
-                .or(last_ssh_err)
-                .unwrap_or(ClientCoreError::Unreachable))
-        }
+        HostRouteMode::Auto => connect_auto(profile, replica, has_ssh).await,
     }
 }
 
@@ -1020,7 +1049,10 @@ async fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMe
             }
         }
         WireMessage::TimelineCatchup {
-            agent_id, events, ..
+            agent_id,
+            events,
+            has_older_history,
+            ..
         } => {
             if let Err(err) = retry_replica_write(|| {
                 store.upsert_replica_timeline_events_batch_for_host(host_id, events)
@@ -1034,6 +1066,30 @@ async fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMe
                     "failed to persist TimelineCatchup batch to replica; resetting contiguous cursor"
                 );
                 let _ = store.clear_replica_contiguous_seq(agent_id);
+            } else if *has_older_history {
+                let _ = store.set_replica_has_older(agent_id, true);
+            }
+        }
+        WireMessage::TimelineHistoryPage {
+            agent_id,
+            events,
+            has_more_older,
+            ..
+        } => {
+            if !events.is_empty()
+                && let Err(err) = retry_replica_write(|| {
+                    store.upsert_replica_timeline_events_batch_for_host(host_id, events)
+                })
+                .await
+            {
+                tracing::warn!(
+                    host_id = %host_id,
+                    agent_id = %agent_id,
+                    error = %err,
+                    "failed to persist TimelineHistoryPage batch to replica"
+                );
+            } else {
+                let _ = store.set_replica_has_older(agent_id, *has_more_older);
             }
         }
         WireMessage::TimelineLive { event } => {

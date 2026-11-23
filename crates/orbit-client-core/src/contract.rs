@@ -60,6 +60,10 @@ pub struct AgentStageDeltaRequest {
     pub since_revision: u64,
     #[serde(default)]
     pub since_aux_revision: Option<u64>,
+    #[serde(default)]
+    pub turn_limit: Option<u32>,
+    #[serde(default)]
+    pub since_window_start_turn_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

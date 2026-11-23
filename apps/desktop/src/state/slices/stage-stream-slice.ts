@@ -269,12 +269,16 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           const auxChanged =
             !delta.aux_unchanged &&
             (delta.aux_revision ?? 0) !== (existing?.aux_revision ?? -1);
+          const olderStateChanged =
+            Boolean(delta.has_older_history) !== Boolean(existing?.has_older_history) ||
+            (delta.oldest_loaded_seq ?? 0) !== (existing?.oldest_loaded_seq ?? 0);
           const hasChanges =
             isReset ||
             delta.revision !== existing.revision ||
             delta.changed_turns.length > 0 ||
             agentChanged ||
-            auxChanged;
+            auxChanged ||
+            olderStateChanged;
 
           if (hasChanges) {
             let latestSeqToMark: number | null = null;
@@ -295,6 +299,10 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
                 turns: mergedWindow.turns,
                 window_start_turn_index: mergedWindow.window_start_turn_index,
                 total_turn_count: mergedWindow.total_turn_count,
+                has_older_turns:
+                  mergedWindow.window_start_turn_index > 0 || Boolean(delta.has_older_history),
+                has_older_history: Boolean(delta.has_older_history),
+                oldest_loaded_seq: delta.oldest_loaded_seq ?? prev?.oldest_loaded_seq ?? 0,
                 pending_permissions: reusePrevAux
                   ? prev.pending_permissions
                   : delta.pending_permissions,
@@ -350,8 +358,27 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       }
       const stage = getState().stages[tlKey];
       const curStart = Math.max(0, Math.floor(stage?.window_start_turn_index ?? 0));
-      if (!stage || curStart <= 0) {
+      if (!stage) {
         return 0;
+      }
+
+      if (curStart <= 0) {
+        if (!stage.has_older_history) {
+          return 0;
+        }
+        loadingEarlierStageKeys.add(tlKey);
+        try {
+          const started = await orbitIpc.loadOlderAgentTimeline(hostId, agentId, 300);
+          if (!started) {
+            return 0;
+          }
+          await ctx.actions.pullStageDelta(hostId, agentId);
+          return 1;
+        } catch {
+          return 0;
+        } finally {
+          loadingEarlierStageKeys.delete(tlKey);
+        }
       }
 
       const sliceReq = computeEarlierTurnSliceRequest(

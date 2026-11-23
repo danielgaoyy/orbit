@@ -4585,6 +4585,60 @@ impl OrbitAppCore {
                     });
                 }
 
+                // Spawn inbound listener BEFORE sending initial bootstrap RPCs so replies drain immediately.
+                let loop_core = Arc::clone(self);
+                let owned_host_id = host_id.to_string();
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(ev) => {
+                                let is_current_gen = loop_core
+                                    .hosts
+                                    .read()
+                                    .ok()
+                                    .and_then(|g| {
+                                        g.get(&owned_host_id).map(|h| h.session_gen == conn_gen)
+                                    })
+                                    .unwrap_or(false);
+                                if !is_current_gen {
+                                    break;
+                                }
+                                match ev {
+                                    ClientInboundEvent::Wire(wire) => {
+                                        loop_core.handle_inbound_wire(&owned_host_id, wire);
+                                    }
+                                    ClientInboundEvent::Terminal(term) => {
+                                        loop_core.handle_inbound_terminal(&owned_host_id, term);
+                                    }
+                                    ClientInboundEvent::Disconnected => {
+                                        loop_core.handle_unexpected_disconnect(
+                                            &owned_host_id,
+                                            Some(conn_gen),
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(
+                                    host_id = %owned_host_id,
+                                    conn_gen,
+                                    skipped,
+                                    "Host inbound event channel lagged; reconnecting for authoritative resync"
+                                );
+                                loop_core
+                                    .handle_unexpected_disconnect(&owned_host_id, Some(conn_gen));
+                                break;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                loop_core
+                                    .handle_unexpected_disconnect(&owned_host_id, Some(conn_gen));
+                                break;
+                            }
+                        }
+                    }
+                });
+
                 // Fast SQLite state (`< 2ms`) FIRST so sidebar sessions appear immediately,
                 // followed by orchestration state, filesystem project discovery & background quota probes!
                 let _ = handle
@@ -4779,26 +4833,6 @@ impl OrbitAppCore {
                 for queued_msg in queued_outbox {
                     let _ = handle.send_wire(queued_msg).await;
                 }
-
-                let loop_core = Arc::clone(self);
-                let owned_host_id = host_id.to_string();
-                tokio::spawn(async move {
-                    while let Ok(ev) = rx.recv().await {
-                        match ev {
-                            ClientInboundEvent::Wire(wire) => {
-                                loop_core.handle_inbound_wire(&owned_host_id, wire);
-                            }
-                            ClientInboundEvent::Terminal(term) => {
-                                loop_core.handle_inbound_terminal(&owned_host_id, term);
-                            }
-                            ClientInboundEvent::Disconnected => {
-                                loop_core
-                                    .handle_unexpected_disconnect(&owned_host_id, Some(conn_gen));
-                                break;
-                            }
-                        }
-                    }
-                });
             }
             Err(err) => {
                 tracing::warn!(host_id = %host_id, error = %err, "Host connection attempt failed");

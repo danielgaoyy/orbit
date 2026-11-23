@@ -320,7 +320,6 @@ async fn open_and_connect_core(
 
     let card = core.pair_host(&pairing_uri).expect("pair host");
     let host_id = card.host_id.clone();
-    core.connect_host_async(host_id.clone());
 
     let online = wait_until(Duration::from_secs(12), || {
         let c = Arc::clone(&core);
@@ -576,6 +575,9 @@ async fn test_02_dual_client_realtime_multi_device_sync() {
                             !x.is_running
                                 && !y.is_running
                                 && x.latest_seq > 0
+                                && x.latest_seq == y.latest_seq
+                                && x.attention == AttentionState::Finished
+                                && y.attention == AttentionState::Finished
                                 && x.is_unread
                                 && y.is_unread
                         }

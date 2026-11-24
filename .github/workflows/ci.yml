@@ -285,6 +285,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build Rust UniFFI JNI Libraries (API 29+)
         run: ./apps/android/scripts/build-rust-android.sh
-      - name: Assemble Debug APK
+      - name: Run Android JVM Unit Tests, Lint & Assemble Debug APK
         working-directory: apps/android
-        run: gradle assembleDebug --no-daemon
+        run: gradle testDebugUnitTest lintDebug assembleDebug --no-daemon

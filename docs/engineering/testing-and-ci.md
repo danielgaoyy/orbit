@@ -26,7 +26,7 @@
    - `tauri-rust-check`（macOS）：Tauri crate fmt / clippy / tests
    - `windows-rust-and-desktop-check`（Windows）：`cargo build -p orbit-cli --bin orbit` + `cargo test --workspace -- --skip live_devbox_ssh_one_click_e2e` + Desktop check
    - `ios-build-and-simulator-smoke`（macOS）：XCFramework + `xcodegen` + 并行唤醒模拟器与单遍 Simulator `xcodebuild test` + Launch 截图烟测
-   - Android UniFFI & Debug APK build
+   - Android UniFFI & Debug APK build（含 `testDebugUnitTest` + `lintDebug` + `assembleDebug`）
 
 In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight ([`testflight.yml`](../../.github/workflows/testflight.yml))：
 

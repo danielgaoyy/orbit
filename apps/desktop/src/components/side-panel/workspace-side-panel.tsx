@@ -137,8 +137,12 @@ function resolveSidePanelTabTitle(
 
 export function WorkspaceSidePanel() {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const hasTerminalTab = useOrbitSelector((s) =>
-    s.sidePanelTabs.some((t) => t.kind === "terminal") || s.terminalTabs.length > 0,
+  const hasPersistentTab = useOrbitSelector(
+    (s) =>
+      s.terminalTabs.length > 0 ||
+      s.sidePanelTabs.some(
+        (t) => t.kind === "terminal" || t.kind === "review" || t.kind === "board",
+      ),
   );
   const { rightVisible } = useWorkspaceMotion();
 
@@ -147,7 +151,7 @@ export function WorkspaceSidePanel() {
   return (
     <WorkspaceSidePanelInner
       selectedHostId={selectedHostId}
-      shouldRenderBody={rightVisible || hasTerminalTab}
+      shouldRenderBody={rightVisible || hasPersistentTab}
     />
   );
 }
@@ -217,13 +221,23 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   useEffect(() => {
     if (!activeTabId || !tabStripRef.current) return;
     const activeEl = tabStripRef.current.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
-    activeEl?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const prefersReducedMotion =
+      typeof window !== "undefined" &&
+      Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+    activeEl?.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+      behavior: prefersReducedMotion ? "auto" : "smooth",
+    });
   }, [activeTabId, tabs.length]);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const hasTerminalTabInBar = tabs.some((t) => t.kind === "terminal");
   const hasAnyPtySession = totalTerminalCount > 0;
   const isTerminalVisible = panelVisible && activeTab?.kind === "terminal";
+  const hasReviewTab = tabs.some((t) => t.kind === "review");
+  const isReviewVisible = panelVisible && activeTab?.kind === "review";
+  const boardTabs = tabs.filter((t) => t.kind === "board");
 
   const startResize = (e: React.MouseEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -399,7 +413,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                         className={cn(
                           "h-1.5 w-1.5 shrink-0 rounded-full",
                           tab.kind === "side_question"
-                            ? "bg-primary animate-pulse"
+                            ? "bg-signal-info animate-pulse"
                             : "bg-emerald-500/80",
                         )}
                       />
@@ -480,57 +494,99 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
             );
           })}
 
-        {activeTab?.kind === "review" && (
+        {/* Persistent Review Pool (kept alive across tab switches so comments, viewed state & commit draft survive) */}
+        {hasReviewTab && (
           <PanelErrorBoundary
             panelName="Review"
             resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+            className={!isReviewVisible ? "hidden" : undefined}
           >
-            <ReviewTab selectedHostId={selectedHostId} />
+            <ReviewTab selectedHostId={selectedHostId} visible={isReviewVisible} />
           </PanelErrorBoundary>
         )}
+
+        {/* Persistent Workspace Board Pool (kept alive across tab switches so unsaved drafts survive) */}
+        {boardTabs.map((boardTab) => {
+          const isBoardVisible = panelVisible && activeTab?.id === boardTab.id;
+          return (
+            <PanelErrorBoundary
+              key={boardTab.id}
+              panelName="Workspace Notes"
+              className={!isBoardVisible ? "hidden" : undefined}
+            >
+              <WorkspaceBoardTab tab={boardTab} visible={isBoardVisible} />
+            </PanelErrorBoundary>
+          );
+        })}
+
         {activeTab?.kind === "files" && (
-          <PanelErrorBoundary
-            panelName="Files"
-            resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+          <div
+            key={activeTab.id}
+            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
           >
-            <FilesExplorerTab />
-          </PanelErrorBoundary>
+            <PanelErrorBoundary
+              panelName="Files"
+              resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+            >
+              <FilesExplorerTab />
+            </PanelErrorBoundary>
+          </div>
         )}
         {activeTab?.kind === "file" && (
-          <PanelErrorBoundary
+          <div
             key={`${activeTab.id}:${activeTab.filePath ?? ""}`}
-            panelName="File Viewer"
+            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
           >
-            <FileViewerTab tab={activeTab} />
-          </PanelErrorBoundary>
+            <PanelErrorBoundary
+              key={`${activeTab.id}:${activeTab.filePath ?? ""}`}
+              panelName="File Viewer"
+            >
+              <FileViewerTab tab={activeTab} />
+            </PanelErrorBoundary>
+          </div>
         )}
         {activeTab?.kind === "side_question" && (
-          <PanelErrorBoundary
-            panelName="Side Question"
-            resetKey={`${selectedHostId}:${activeTab.id}`}
+          <div
+            key={activeTab.id}
+            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
           >
-            <SideQuestionTab />
-          </PanelErrorBoundary>
+            <PanelErrorBoundary
+              panelName="Side Question"
+              resetKey={`${selectedHostId}:${activeTab.id}`}
+            >
+              <SideQuestionTab />
+            </PanelErrorBoundary>
+          </div>
         )}
         {activeTab?.kind === "subagent" && (
-          <PanelErrorBoundary key={activeTab.id} panelName="Subagent">
-            <SubagentTab tab={activeTab} />
-          </PanelErrorBoundary>
-        )}
-        {activeTab?.kind === "board" && (
-          <PanelErrorBoundary key={activeTab.id} panelName="Workspace Notes">
-            <WorkspaceBoardTab tab={activeTab} />
-          </PanelErrorBoundary>
+          <div
+            key={activeTab.id}
+            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
+          >
+            <PanelErrorBoundary key={activeTab.id} panelName="Subagent">
+              <SubagentTab tab={activeTab} />
+            </PanelErrorBoundary>
+          </div>
         )}
         {activeTab?.kind === "peer" && (
-          <PanelErrorBoundary key={activeTab.id} panelName="Peer Split">
-            <PeerSplitTab tab={activeTab} />
-          </PanelErrorBoundary>
+          <div
+            key={activeTab.id}
+            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
+          >
+            <PanelErrorBoundary key={activeTab.id} panelName="Peer Split">
+              <PeerSplitTab tab={activeTab} />
+            </PanelErrorBoundary>
+          </div>
         )}
         {activeTab?.kind === "artifacts" && (
-          <PanelErrorBoundary key={activeTab.id} panelName="Artifacts">
-            <ArtifactsTab tab={activeTab} />
-          </PanelErrorBoundary>
+          <div
+            key={activeTab.id}
+            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
+          >
+            <PanelErrorBoundary key={activeTab.id} panelName="Artifacts">
+              <ArtifactsTab tab={activeTab} />
+            </PanelErrorBoundary>
+          </div>
         )}
 
         {!activeTab && (

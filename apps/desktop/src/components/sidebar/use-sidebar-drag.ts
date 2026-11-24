@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { SidebarProjectGroupView } from "@/lib/orbit-ipc";
 import { projectPathScopeKey } from "@/lib/projects";
 import type { SidebarProjectSort } from "@/state/store-types";
@@ -154,11 +154,19 @@ export function useSidebarDrag(params: {
     [scrollViewportRef, stopAutoScroll],
   );
 
-  // Sync initial preview coordinates immediately when floating preview mounts
-  useEffect(() => {
-    if (!draggingThread || !floatingPreviewRef.current) return;
+  // Sync initial preview coordinates & lift scale immediately before paint, then crisp 110ms fade-in
+  useLayoutEffect(() => {
+    const el = floatingPreviewRef.current;
+    if (!draggingThread || !el) return;
     const { x, y } = lastPreviewPosRef.current;
-    floatingPreviewRef.current.style.transform = `translate3d(${x + 12}px, ${y - 14}px, 0)`;
+    el.style.transform = `translate3d(${x + 12}px, ${y - 14}px, 0) scale(1.02)`;
+    el.style.opacity = "0";
+    const raf = window.requestAnimationFrame(() => {
+      if (el.isConnected) {
+        el.style.opacity = "1";
+      }
+    });
+    return () => window.cancelAnimationFrame(raf);
   }, [draggingThread]);
 
   useEffect(() => {
@@ -269,7 +277,7 @@ export function useSidebarDrag(params: {
         // Direct DOM transform keeps drag preview locked at 60fps with 0 React re-renders
         lastPreviewPosRef.current = { x: ev.clientX, y: ev.clientY };
         if (floatingPreviewRef.current) {
-          floatingPreviewRef.current.style.transform = `translate3d(${ev.clientX + 12}px, ${ev.clientY - 14}px, 0)`;
+          floatingPreviewRef.current.style.transform = `translate3d(${ev.clientX + 12}px, ${ev.clientY - 14}px, 0) scale(1.02)`;
         }
         updateAutoScroll(ev.clientY);
 
@@ -280,7 +288,8 @@ export function useSidebarDrag(params: {
           if (
             wsEntry.hostId !== source.hostId ||
             wsEntry.projectId !== source.projectId ||
-            wsEntry.workspaceId === source.workspaceId
+            wsEntry.workspaceId === source.workspaceId ||
+            wsEntry.el.closest('.orbit-collapse-grid[data-open="false"]')
           ) {
             continue;
           }
@@ -301,7 +310,11 @@ export function useSidebarDrag(params: {
           const sameScopeEntries: Array<{ entry: ThreadRowEntry; rect: DOMRect }> = [];
 
           for (const entry of threadRowRefs.current.values()) {
-            if (entry.hostId !== source.hostId || entry.projectId !== source.projectId) {
+            if (
+              entry.hostId !== source.hostId ||
+              entry.projectId !== source.projectId ||
+              entry.el.closest('.orbit-collapse-grid[data-open="false"]')
+            ) {
               continue;
             }
             const rect = entry.el.getBoundingClientRect();
@@ -367,7 +380,11 @@ export function useSidebarDrag(params: {
         // 3. Unclassified project area (ungroup when dragging out of a curated group)
         if (!best && source.workspaceId !== null) {
           for (const inboxEntry of inboxAreaRefs.current.values()) {
-            if (inboxEntry.hostId !== source.hostId || inboxEntry.projectId !== source.projectId) {
+            if (
+              inboxEntry.hostId !== source.hostId ||
+              inboxEntry.projectId !== source.projectId ||
+              inboxEntry.el.closest('.orbit-collapse-grid[data-open="false"]')
+            ) {
               continue;
             }
             const rect = inboxEntry.el.getBoundingClientRect();

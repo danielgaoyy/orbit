@@ -1041,7 +1041,7 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
                   className={cn(
                     "group/line flex min-w-fit cursor-pointer px-2 whitespace-pre transition-colors",
                     isSelected
-                      ? "bg-primary/12 dark:bg-primary/20"
+                      ? "bg-signal-info/12 dark:bg-signal-info/20"
                       : "hover:bg-black/[0.03] dark:hover:bg-white/[0.04]",
                   )}
                 >

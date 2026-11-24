@@ -1,9 +1,8 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowUpRight,
   Check,
-  ChevronRight,
   FileCode2,
   FilePlus2,
   FileSearch,
@@ -19,8 +18,23 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
+import { DiffStat } from "@/components/ui/diff-stat";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { useI18n } from "@/lib/i18n";
+import {
+  TraceCollapsible,
+  TraceCollapsibleContent,
+  TraceCollapsibleTrigger,
+  TraceDescription,
+  TraceIcon,
+  TraceLine,
+  TraceTitle,
+} from "@/components/ui/trace";
+import { useLiveSecondClock } from "@/lib/live-clock";
+import {
+  cancelHoverPrefetch,
+  scheduleHoverPrefetch,
+  shouldPrefetchOnPointerDown,
+} from "@/lib/file-prefetch";
 import type { DiffLineView, TimelineItemView } from "@/lib/orbit-ipc";
 import {
   type ResolvedSubagentItem,
@@ -34,6 +48,7 @@ import {
   formatDurationCompact,
   formatThoughtSummaryLabel,
 } from "@/lib/timeline-coalesce";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { orbitActions } from "@/state/orbit-store";
 import {
@@ -42,19 +57,123 @@ import {
   formatJsonPreview,
   parseUnifiedDiffFallback,
 } from "./stage-helpers";
+import { StageCopyButton } from "./stage-prompt-controls";
+
+const quickActionClass =
+  "text-ink-muted hover:text-ink-primary inline-flex shrink-0 cursor-pointer rounded p-0.5 opacity-0 transition-opacity duration-150 group-hover/tool:opacity-100 group-focus-within/tool:opacity-100 [@media(hover:none)]:opacity-100 motion-reduce:transition-none";
+
+function StepOutput({
+  text,
+  children,
+  className = "rounded-lg border bg-surface-recessed",
+  viewportClassName = "max-h-44 py-2 pl-3",
+}: {
+  text: string;
+  children?: ReactNode;
+  className?: string;
+  viewportClassName?: string;
+}) {
+  return (
+    <div className={cn("border-border-subtle flex min-w-0 items-start", className)}>
+      <ScrollArea
+        className="min-w-0 flex-1"
+        viewportClassName={cn("overscroll-contain [overflow-wrap:anywhere]", viewportClassName)}
+      >
+        {children ?? (
+          <pre className="selectable-text text-ink-secondary font-mono text-[13px] leading-[1.5] whitespace-pre-wrap">
+            {text}
+          </pre>
+        )}
+      </ScrollArea>
+      <StageCopyButton text={text} className="m-1 shrink-0" />
+    </div>
+  );
+}
+
+function thinkingInline(text: string): ReactNode {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) => {
+    if (i % 2 === 0) return part;
+    if (part.startsWith("**")) return <strong key={i}>{thinkingInline(part.slice(2, -2))}</strong>;
+    return (
+      <code key={i} className="bg-surface-recessed rounded px-1 font-mono text-[0.88em]">
+        {part.slice(1, -1)}
+      </code>
+    );
+  });
+}
+
+/** Thinking items have text only. Keep code literal and format prose without interpreting HTML. */
+function ThinkingMarkdown({ text }: { text: string }) {
+  const lines = text.split(/\r?\n/);
+  const blocks: ReactNode[] = [];
+  const listMarker = /^\s*(?:([-*+])|(\d+)\.)\s+(.+)$/;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    if (/^\s*```/.test(line)) {
+      const start = i + 1;
+      i = start;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) i++;
+      blocks.push(
+        <pre key={start - 1} className="bg-surface-recessed rounded p-2 font-mono whitespace-pre-wrap">
+          {lines.slice(start, i).join("\n")}
+        </pre>,
+      );
+      continue;
+    }
+    const first = line.match(listMarker);
+    if (first) {
+      const start = i;
+      const items = [<li key={i}>{thinkingInline(first[3])}</li>];
+      let next = lines[i + 1]?.match(listMarker);
+      while (next && Boolean(next[2]) === Boolean(first[2])) {
+        i++;
+        items.push(
+          <li key={i} value={next[2] ? Number(next[2]) : undefined}>
+            {thinkingInline(next[3])}
+          </li>,
+        );
+        next = lines[i + 1]?.match(listMarker);
+      }
+      blocks.push(first[2] ? (
+        <ol key={start} start={Number(first[2])} className="list-decimal pl-5">{items}</ol>
+      ) : (
+        <ul key={start} className="list-disc pl-5">{items}</ul>
+      ));
+      continue;
+    }
+    const heading = line.match(/^\s*(#{1,6})\s+(.+)$/);
+    blocks.push(heading ? (
+      <div key={i} role="heading" aria-level={heading[1].length} className="text-ink-primary font-semibold">
+        {thinkingInline(heading[2])}
+      </div>
+    ) : <p key={i}>{thinkingInline(line)}</p>);
+  }
+  return (
+    <div className="selectable-text text-ink-secondary flex flex-col gap-1 text-[13px] leading-[1.55] whitespace-pre-wrap">
+      {blocks}
+    </div>
+  );
+}
 
 /** Inline compact diff preview used when expanding an `Edited` / `Created` step inside a turn. */
 export const InlineStepDiffPreview = memo(function InlineStepDiffPreview({
   lines,
+  onOpenDiffReview,
 }: {
   lines: DiffLineView[];
+  onOpenDiffReview?: () => void;
 }) {
+  const { t } = useI18n();
   const capped = lines.slice(0, 80);
+  const remaining = lines.length - capped.length;
+  const remainingLabel = t(remaining === 1 ? "stage.moreDiffLine" : "stage.moreDiffLines", { count: remaining });
   return (
     <ScrollArea
       orientation="both"
-      className="border-border bg-muted/45 dark:bg-muted/25 rounded-lg border"
-      viewportClassName="selectable-text max-h-56 overscroll-contain py-1.5 font-mono text-[12px] leading-[1.55]"
+      className="border-border-subtle bg-surface-recessed rounded-lg border"
+      viewportClassName="selectable-text max-h-56 overscroll-contain py-1.5 font-mono text-[13px] leading-[1.5]"
     >
       {capped.map((ln, idx) => {
         if (ln.kind === "meta") return null;
@@ -64,9 +183,9 @@ export const InlineStepDiffPreview = memo(function InlineStepDiffPreview({
             className={cn(
               "flex min-w-fit px-3 whitespace-pre",
               ln.kind === "added" &&
-                "bg-emerald-500/[0.10] text-emerald-900 dark:bg-emerald-500/[0.14] dark:text-emerald-200",
+                "bg-signal-success-bg text-signal-success",
               ln.kind === "removed" &&
-                "bg-rose-500/[0.10] text-rose-900 dark:bg-rose-500/[0.14] dark:text-rose-200",
+                "bg-signal-danger-bg text-signal-danger",
               ln.kind === "hunk_header" &&
                 "text-muted-foreground/75 py-0.5 text-[11px] select-none",
               ln.kind === "context" && "text-foreground/80",
@@ -79,9 +198,19 @@ export const InlineStepDiffPreview = memo(function InlineStepDiffPreview({
           </div>
         );
       })}
-      {lines.length > 80 && (
-        <div className="text-muted-foreground px-3 pt-1 text-[11px] select-none">
-          … {lines.length - 80} more diff lines (open in Diff Review for full file)
+      {remaining > 0 && (
+        <div className="text-ink-muted px-3 py-1 font-sans text-[11px]">
+          {onOpenDiffReview ? (
+            <button
+              type="button"
+              onClick={onOpenDiffReview}
+              className="hover:text-ink-primary cursor-pointer rounded-sm hover:underline"
+            >
+              {remainingLabel} · {t("stage.openDiffReview")}
+            </button>
+          ) : (
+            remainingLabel
+          )}
         </div>
       )}
     </ScrollArea>
@@ -182,15 +311,8 @@ export const InlineLiveElapsed = memo(function InlineLiveElapsed({
   stallLabel?: string | null;
   queuedNotificationCount?: number;
 }) {
-  const { t } = useI18n();
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
-  useEffect(() => {
-    setNowMs(Date.now());
-    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [startedAtMs]);
-
+  const { t, locale } = useI18n();
+  const nowMs = useLiveSecondClock(true);
   const { elapsedMs, isSilentStall, isThinkingStall } = computeLiveStallState({
     nowMs,
     startedAtMs,
@@ -206,27 +328,27 @@ export const InlineLiveElapsed = memo(function InlineLiveElapsed({
   return (
     <>
       {elapsedMs >= 1000 && (
-        <span className="text-ink-muted shrink-0 font-mono text-[12.5px] tabular-nums">
-          · {formatDurationCompact(elapsedMs)}
-        </span>
+        <TraceDescription>
+          · {formatDurationCompact(elapsedMs, locale)}
+        </TraceDescription>
       )}
       {isNetworkOffline ? (
-        <span className="text-signal-warning shrink-0 text-[12px]">
-          · offline
-        </span>
+        <TraceDescription className="font-sans text-signal-warning">
+          · {t("stage.offline")}
+        </TraceDescription>
       ) : isSilentStall ? (
-        <span className="text-ink-muted shrink-0 text-[12px]">
+        <TraceDescription className="min-w-0 shrink truncate font-sans">
           · {stallLabel ?? t("stage.waitingForResponse")}
-        </span>
+        </TraceDescription>
       ) : isThinkingStall ? (
-        <span className="text-signal-warning shrink-0 text-[12px]">
+        <TraceDescription className="font-sans text-signal-warning">
           · {t("stage.thinkingNoProgress")}
-        </span>
+        </TraceDescription>
       ) : null}
       {queuedNotificationCount > 0 && (
-        <span className="text-signal-warning shrink-0 font-mono text-[12px] tabular-nums">
+        <TraceDescription className="text-signal-warning">
           · {t("stage.queuedCount", { count: queuedNotificationCount })}
-        </span>
+        </TraceDescription>
       )}
     </>
   );
@@ -251,14 +373,7 @@ export const LiveStallInterruptButton = memo(function LiveStallInterruptButton({
   onInterruptAndContinue?: (() => void) | null;
 }) {
   const { t } = useI18n();
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
-  useEffect(() => {
-    if (!onInterruptAndContinue) return;
-    setNowMs(Date.now());
-    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [startedAtMs, onInterruptAndContinue]);
+  const nowMs = useLiveSecondClock(Boolean(onInterruptAndContinue));
 
   if (!onInterruptAndContinue) return null;
 
@@ -281,19 +396,65 @@ export const LiveStallInterruptButton = memo(function LiveStallInterruptButton({
         e.stopPropagation();
         onInterruptAndContinue();
       }}
-      className="border-signal-warning-border bg-signal-warning-bg text-signal-warning hover:bg-signal-warning-bg/80 inline-flex h-[22px] shrink-0 cursor-pointer items-center rounded-[6px] border px-2 text-[11px] font-medium transition-colors"
+      className="orbit-press border-signal-warning-border bg-signal-warning-bg text-signal-warning hover:bg-signal-warning-bg/80 inline-flex h-[22px] shrink-0 cursor-pointer items-center rounded-[6px] border px-2 text-[11px] font-medium"
     >
       {t("stage.interruptAndContinue")}
     </button>
   );
 });
 
-/**
- * Borderless step row for reasoning, intermediate notes, permissions, and tool calls:
- * - Zero box/border clutter at rest; tight vertical grouping.
- * - Pure-CSS `group-hover` swap between semantic icon and `ChevronRight` (0 React hover re-renders during scroll).
- * - Active thinking/tool step sweeps a calm linear-gradient text shimmer.
- */
+function ToolStepDetail({
+  item,
+  diffLines,
+  onOpenDiffReview,
+}: {
+  item: Extract<TimelineItemView, { item_type: "tool_call" }>;
+  diffLines: DiffLineView[];
+  onOpenDiffReview?: () => void;
+}) {
+  const { t } = useI18n();
+  const { detail } = item;
+  switch (detail.kind) {
+    case "shell":
+      return (
+        <StepOutput
+          text={detail.output_preview || detail.command}
+          className={cn(
+            "rounded-lg border",
+            item.status === "failed" || item.status === "denied"
+              ? "border-signal-danger-border bg-signal-danger-bg"
+              : "bg-surface-recessed",
+          )}
+          viewportClassName="max-h-56 py-2 pl-3"
+        >
+          <pre className="selectable-text text-ink-primary font-mono text-[13px] leading-[1.5] whitespace-pre-wrap">
+            <span className="text-ink-muted select-none">$ </span>
+            {detail.command}
+            {detail.output_preview ? (
+              `\n\n${detail.output_preview}`
+            ) : item.status !== "running" && (
+              <span className="text-ink-muted select-none">{"\n\n"}{t("stage.noOutput")}</span>
+            )}
+          </pre>
+        </StepOutput>
+      );
+    case "file_edit":
+      return <InlineStepDiffPreview lines={diffLines} onOpenDiffReview={onOpenDiffReview} />;
+    case "subagent":
+      return <StepOutput text={detail.prompt_preview} />;
+    case "generic": {
+      const message = extractSubagentMessageCall(item)?.message;
+      if (!message) return <StepOutput text={formatJsonPreview(detail.arguments_json)} />;
+      return (
+        <StepOutput text={message} viewportClassName="max-h-60 py-2 pl-3">
+          <p className="selectable-text text-ink-secondary text-[13px] leading-[1.5] whitespace-pre-wrap">{message}</p>
+        </StepOutput>
+      );
+    }
+    default:
+      return null;
+  }
+}
 export const StepItemRow = memo(function StepItemRow({
   item,
   hostId,
@@ -317,171 +478,120 @@ export const StepItemRow = memo(function StepItemRow({
   sessionSubagents?: readonly ResolvedSubagentItem[];
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
+  const { t, locale } = useI18n();
   const defaultOpen =
     autoExpandError &&
     item.item_type === "tool_call" &&
     (item.status === "failed" || item.status === "denied");
   const [expanded, setExpanded] = useState(defaultOpen);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const toolRowRef = useRef<HTMLDivElement | null>(null);
+
+  function renderStep(line: ReactNode, detail?: ReactNode, actions?: ReactNode, triggerLabel?: string) {
+    const summary = detail ? (
+      <TraceCollapsibleTrigger ref={triggerRef} aria-label={triggerLabel}>
+        {line}
+      </TraceCollapsibleTrigger>
+    ) : line;
+    const header = actions ? (
+      <div className="group/tool flex min-w-0 items-center gap-2">
+        {summary}
+        {actions}
+      </div>
+    ) : summary;
+
+    if (!detail) return header;
+    return (
+      <TraceCollapsible
+        open={expanded}
+        onOpenChange={(open) => holdViewport(triggerRef.current, () => setExpanded(open), "top", {
+          intent: open ? "expand" : "collapse",
+        })}
+      >
+        {header}
+        <TraceCollapsibleContent>{detail}</TraceCollapsibleContent>
+      </TraceCollapsible>
+    );
+  }
 
   if (item.item_type === "assistant_thinking") {
-    const trimmedThinking = item.text.trim();
-    const headline = extractThinkingHeadline(trimmedThinking, isActivelyThinking);
-    const canExpand = trimmedThinking.length > 0;
-    const thoughtLabel = isActivelyThinking
-      ? "Thinking"
-      : formatThoughtSummaryLabel(thoughtDurationMs, 1);
-
-    return (
-      <div>
-        <button
-          ref={triggerRef}
-          type="button"
-          disabled={!canExpand}
-          onClick={() => {
-            if (!canExpand) return;
-            holdViewport(triggerRef.current, () => setExpanded((v) => !v));
-          }}
-          className="group/step hover:bg-accent/55 -ml-1.5 flex w-full max-w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-left text-[13px] transition-colors disabled:cursor-default"
-        >
-          <span className="text-muted-foreground group-hover/step:text-foreground/80 relative flex size-4 shrink-0 items-center justify-center">
-            {canExpand ? (
-              expanded ? (
-                <ChevronRight className="size-3.5 rotate-90 stroke-[1.9] transition-transform duration-150" />
-              ) : (
-                <>
-                  <Sparkles className="size-3.5 stroke-[1.75] transition-opacity duration-100 group-hover/step:opacity-0" />
-                  <ChevronRight className="absolute size-3.5 stroke-[1.9] opacity-0 transition-opacity duration-100 group-hover/step:opacity-100" />
-                </>
-              )
-            ) : (
-              <Sparkles className="size-3.5 stroke-[1.75]" />
-            )}
-          </span>
-          <span
-            className={cn(
-              "shrink-0 font-normal",
-              isActivelyThinking
-                ? "agent-text-shimmer"
-                : "text-foreground/72 group-hover/step:text-foreground",
-            )}
-          >
-            {thoughtLabel}
-          </span>
-          {!expanded && headline && (
-            <span
-              className={cn(
-                "truncate text-[12.5px]",
-                isActivelyThinking ? "agent-text-shimmer" : "text-muted-foreground/80",
-              )}
-            >
-              {headline}
-            </span>
-          )}
-        </button>
-
-        {expanded && (
-          <ScrollArea
-            className="border-border my-1 ml-4 border-l"
-            viewportClassName="max-h-56 overscroll-contain pl-3"
-          >
-            <pre className="selectable-text text-muted-foreground m-0 font-mono text-[12px] leading-relaxed whitespace-pre-wrap">
-              {trimmedThinking}
-            </pre>
-          </ScrollArea>
+    const trimmed = item.text.trim();
+    const headline = extractThinkingHeadline(trimmed, isActivelyThinking);
+    const label = isActivelyThinking
+      ? t("stage.thinking")
+      : formatThoughtSummaryLabel(thoughtDurationMs, 1, locale);
+    return renderStep(
+      <TraceLine status={isActivelyThinking ? "running" : undefined}>
+        <TraceIcon><Sparkles /></TraceIcon>
+        <TraceTitle>{label}</TraceTitle>
+        {!expanded && headline && (
+          <TraceDescription className="min-w-0 shrink truncate font-sans">{headline}</TraceDescription>
         )}
-      </div>
+      </TraceLine>,
+      trimmed && (
+        <StepOutput text={item.text} className="bg-transparent" viewportClassName="max-h-56">
+          <ThinkingMarkdown text={trimmed} />
+        </StepOutput>
+      ),
     );
   }
 
   if (item.item_type === "assistant_message") {
     const trimmed = item.text.trim();
     if (!trimmed) return null;
-    const singleLinePreview = trimmed.replace(/\s+/g, " ");
-    const isCompactSingleLine = !trimmed.includes("\n") && singleLinePreview.length <= 120;
-
-    if (isCompactSingleLine) {
+    const preview = trimmed.replace(/\s+/g, " ");
+    const compact = !trimmed.includes("\n") && preview.length <= 120;
+    if (compact && item.blocks.length > 0) {
       return (
-        <div className="text-muted-foreground flex items-start gap-2 py-1 text-[13px] leading-[1.5]">
-          <span className="text-muted-foreground/75 mt-[2px] flex size-4 shrink-0 items-center justify-center">
-            <MessageSquareText className="size-3.5 stroke-[1.75]" />
-          </span>
-          {item.blocks.length > 0 ? (
-            <div className="min-w-0 flex-1">
-              <MarkdownBlocksView blocks={item.blocks} streaming={item.streaming} compact />
-            </div>
-          ) : (
-            <span className="selectable-text text-foreground/78">{trimmed}</span>
-          )}
-        </div>
+        <TraceLine render={<div />} className="items-start">
+          <TraceIcon><MessageSquareText /></TraceIcon>
+          <TraceTitle render={<div />} className="overflow-visible whitespace-normal">
+            <MarkdownBlocksView blocks={item.blocks} streaming={item.streaming} compact />
+          </TraceTitle>
+        </TraceLine>
       );
     }
-
-    return (
-      <div>
-        <button
-          ref={triggerRef}
-          type="button"
-          onClick={() => holdViewport(triggerRef.current, () => setExpanded((v) => !v))}
-          className="group/note hover:bg-accent/55 -ml-1.5 flex w-full max-w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-left text-[13px] transition-colors"
-        >
-          <span className="text-muted-foreground group-hover/note:text-foreground/80 relative flex size-4 shrink-0 items-center justify-center">
-            {expanded ? (
-              <ChevronRight className="size-3.5 rotate-90 stroke-[1.9] transition-transform duration-150" />
-            ) : (
-              <>
-                <MessageSquareText className="size-3.5 stroke-[1.75] transition-opacity duration-100 group-hover/note:opacity-0" />
-                <ChevronRight className="absolute size-3.5 stroke-[1.9] opacity-0 transition-opacity duration-100 group-hover/note:opacity-100" />
-              </>
-            )}
-          </span>
-          <span className="text-foreground/72 group-hover/note:text-foreground truncate">
-            {singleLinePreview}
-          </span>
-        </button>
-
-        {expanded && (
-          <div className="border-border my-1 ml-4 border-l pl-3 text-[13.5px]">
+    return renderStep(
+      <TraceLine>
+        <TraceIcon><MessageSquareText /></TraceIcon>
+        <TraceTitle className={compact ? "selectable-text whitespace-normal" : undefined}>{preview}</TraceTitle>
+      </TraceLine>,
+      !compact && (
+        <StepOutput text={item.text} className="bg-transparent" viewportClassName="pl-0">
+          {item.blocks.length ? (
             <MarkdownBlocksView blocks={item.blocks} streaming={item.streaming} />
-          </div>
-        )}
-      </div>
+          ) : (
+            <p className="selectable-text whitespace-pre-wrap">{trimmed}</p>
+          )}
+        </StepOutput>
+      ),
     );
   }
 
   if (item.item_type === "permission_request") {
-    const denied = /deny|reject|decline|cancel/i.test(item.resolved_decision ?? "");
+    const decision = item.resolved_decision;
+    if (decision == null) return null;
+    const denied = /deny|denied|reject|decline|cancel/i.test(decision);
+    let decisionLabel = decision.replace(/_/g, " ") || t("stage.resolved");
+    if (denied) decisionLabel = t("stage.permissionDenied");
+    else if (decision === "allow_always" || decision === "always") decisionLabel = t("stage.permissionAlwaysAllowed");
+    else if (decision === "allow" || decision === "allow_once" || decision === "accept") decisionLabel = t("stage.permissionAllowed");
     return (
-      <div className="text-muted-foreground flex items-center gap-2 py-0.5 text-[12.5px]">
-        <span className="flex size-4 shrink-0 items-center justify-center">
-          {denied ? (
-            <AlertTriangle className="size-3.5 text-rose-500" />
-          ) : (
-            <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
-          )}
-        </span>
-        <span className="truncate">
-          {item.title} ·{" "}
-          <span className="text-foreground/75">
-            {(item.resolved_decision ?? "resolved").replace(/_/g, " ")}
-          </span>
-        </span>
-      </div>
+      <TraceLine status={denied ? "error" : undefined}>
+        <TraceIcon>{denied ? <AlertTriangle /> : <Check className="text-signal-success" />}</TraceIcon>
+        <TraceTitle>{item.title} · {decisionLabel}</TraceTitle>
+      </TraceLine>
     );
   }
 
   if (item.item_type === "question_request") {
+    if (!item.resolved_answers) return null;
     return (
-      <div className="text-muted-foreground flex items-center gap-2 py-0.5 text-[12.5px]">
-        <span className="flex size-4 shrink-0 items-center justify-center">
-          <Check className="size-3.5 text-sky-600 dark:text-sky-400" />
-        </span>
-        <span className="truncate">
-          Answered {item.questions.length} clarifying{" "}
-          {item.questions.length === 1 ? "question" : "questions"}
-        </span>
-      </div>
+      <TraceLine>
+        <TraceIcon><Check className="text-signal-info" /></TraceIcon>
+        <TraceTitle>
+          {t(item.questions.length === 1 ? "stage.answeredQuestion" : "stage.answeredQuestions", { count: item.questions.length })}
+        </TraceTitle>
+      </TraceLine>
     );
   }
 
@@ -489,7 +599,7 @@ export const StepItemRow = memo(function StepItemRow({
     return null;
   }
 
-  const desc = describeToolStep(item, cwd);
+  const desc = describeToolStep(item, cwd, locale);
   const isError = desc.isFailed || desc.isDenied;
   const IconComp = resolveToolStepIcon(item, desc.kind);
 
@@ -512,7 +622,6 @@ export const StepItemRow = memo(function StepItemRow({
     sessionSubagents ?? EMPTY_SUBAGENTS,
     hostId,
   );
-  const isSubagentStep = item.detail.kind === "subagent" || resolvedSubagentMatch !== null;
   const handleOpenResolvedSubagent = () => {
     if (!resolvedSubagentMatch) return;
     if (onOpenSubagent) {
@@ -545,6 +654,7 @@ export const StepItemRow = memo(function StepItemRow({
     }
     if (canOpenFileDirect) {
       orbitActions.openFileInSidePanel(openFilePath, {
+        hostId,
         cwd,
         focusLine: readStartLine,
         focusEndLine: readEndLine,
@@ -552,282 +662,116 @@ export const StepItemRow = memo(function StepItemRow({
     }
   };
 
-  return (
-    <div>
-      <div
-        className={cn(
-          "group/tool -ml-1.5 flex items-center justify-between gap-2 rounded-md px-1.5 py-1 text-[13px] transition-colors",
-          (hasExpandableDetail || canOpenFileInDiff || canOpenFileDirect || isSubagentStep) &&
-            "hover:bg-accent/55",
-        )}
-      >
-        <div
-          ref={toolRowRef}
-          onClick={
-            hasExpandableDetail
-              ? () => holdViewport(toolRowRef.current, () => setExpanded((v) => !v))
-              : undefined
+  const openTarget = resolvedSubagentMatch
+    ? handleOpenResolvedSubagent
+    : canOpenTargetDirectly ? handleOpenTargetFile : undefined;
+  const targetTitle = resolvedSubagentMatch
+    ? t("stage.openSubagentDetails")
+    : t(canOpenFileInDiff ? "stage.openTargetDiff" : "stage.openTargetInPanel", { target: displayTarget });
+  const line = (
+    <TraceLine status={isError ? "error" : desc.isRunning ? "running" : undefined}>
+      <TraceIcon>{isError ? <AlertTriangle /> : <IconComp />}</TraceIcon>
+      <TraceTitle>
+        {desc.verb}
+        {displayTarget && !openTarget && <> <span className="font-mono">{displayTarget}</span></>}
+      </TraceTitle>
+      {desc.secondaryMeta && !canOpenFileDirect && (
+        <TraceDescription className="min-w-0 shrink truncate">{desc.secondaryMeta}</TraceDescription>
+      )}
+      {(desc.additions > 0 || desc.deletions > 0) && (
+        <TraceDescription><DiffStat size="xs" additions={desc.additions} deletions={desc.deletions} /></TraceDescription>
+      )}
+      {desc.kind === "shell" && !desc.isRunning && desc.exitCode !== null && desc.exitCode !== 0 && (
+        <TraceDescription className="text-destructive">{t("stage.exitCode", { code: desc.exitCode })}</TraceDescription>
+      )}
+    </TraceLine>
+  );
+
+  const handlePrefetchTargetHover =
+    canOpenFileDirect && !canOpenFileInDiff && openFilePath
+      ? () =>
+          scheduleHoverPrefetch(() =>
+            orbitActions.prefetchWorkspaceFile(openFilePath, { hostId, cwd, intent: "hover" }),
+          )
+      : undefined;
+  const handlePrefetchTargetLeave =
+    canOpenFileDirect && !canOpenFileInDiff && openFilePath ? cancelHoverPrefetch : undefined;
+  const handlePrefetchTargetPointerDown =
+    canOpenFileDirect && !canOpenFileInDiff && openFilePath
+      ? (e: PointerEvent) => {
+          if (shouldPrefetchOnPointerDown(e)) {
+            cancelHoverPrefetch();
+            orbitActions.prefetchWorkspaceFile(openFilePath, { hostId, cwd, intent: "press" });
           }
+        }
+      : undefined;
+
+  const actions = (openTarget || canOpenFileInDiff || canOpenFileDirect) && (
+    <>
+      {displayTarget && openTarget && (
+        <button
+          type="button"
+          title={targetTitle}
+          onMouseEnter={!resolvedSubagentMatch ? handlePrefetchTargetHover : undefined}
+          onMouseLeave={!resolvedSubagentMatch ? handlePrefetchTargetLeave : undefined}
+          onPointerDown={!resolvedSubagentMatch ? handlePrefetchTargetPointerDown : undefined}
+          onClick={openTarget}
           className={cn(
-            "flex min-w-0 flex-1 items-center gap-2 text-left",
-            hasExpandableDetail ? "cursor-pointer" : "cursor-default",
+            "min-w-0 cursor-pointer truncate rounded-sm text-left text-[13px] leading-[18px] hover:underline",
+            resolvedSubagentMatch ? "font-medium" : "font-mono",
+            desc.isRunning ? "shimmer" : "text-ink-secondary hover:text-ink-primary",
           )}
         >
-          <span
-            className={cn(
-              "relative flex size-4 shrink-0 items-center justify-center",
-              isError
-                ? "text-rose-500"
-                : "text-muted-foreground group-hover/tool:text-foreground/80",
-            )}
-          >
-            {hasExpandableDetail ? (
-              expanded ? (
-                <ChevronRight className="size-3.5 rotate-90 stroke-[1.9] transition-transform duration-150" />
-              ) : (
-                <>
-                  {isError ? (
-                    <AlertTriangle className="size-3.5 stroke-[1.85] transition-opacity duration-100 group-hover/tool:opacity-0" />
-                  ) : (
-                    <IconComp className="size-3.5 stroke-[1.75] transition-opacity duration-100 group-hover/tool:opacity-0" />
-                  )}
-                  <ChevronRight className="absolute size-3.5 stroke-[1.9] opacity-0 transition-opacity duration-100 group-hover/tool:opacity-100" />
-                </>
-              )
-            ) : isError ? (
-              <AlertTriangle className="size-3.5 stroke-[1.85]" />
-            ) : (
-              <IconComp className="size-3.5 stroke-[1.75]" />
-            )}
-          </span>
-
-          <span
-            className={cn(
-              "shrink-0 font-normal",
-              isError
-                ? "text-rose-600 dark:text-rose-400"
-                : desc.isRunning
-                  ? "agent-text-shimmer"
-                  : "text-foreground/75 group-hover/tool:text-foreground",
-            )}
-          >
-            {desc.verb}
-          </span>
-
-          {displayTarget &&
-            (resolvedSubagentMatch ? (
-              <button
-                type="button"
-                title="Open subagent details"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleOpenResolvedSubagent();
-                }}
-                className={cn(
-                  "min-w-0 cursor-pointer truncate text-left text-[12.5px] font-medium hover:underline underline-offset-2",
-                  desc.isRunning
-                    ? "agent-text-shimmer"
-                    : "text-foreground/82 group-hover/tool:text-foreground",
-                )}
-              >
-                {displayTarget}
-              </button>
-            ) : canOpenTargetDirectly ? (
-              <button
-                type="button"
-                title={
-                  canOpenFileInDiff
-                    ? `Open ${displayTarget} diff`
-                    : `Open ${displayTarget} in Side Panel`
-                }
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleOpenTargetFile();
-                }}
-                className={cn(
-                  "min-w-0 cursor-pointer truncate text-left font-mono text-[12px] hover:underline",
-                  desc.isRunning
-                    ? "agent-text-shimmer"
-                    : "text-muted-foreground group-hover/tool:text-foreground/70 hover:text-foreground",
-                )}
-              >
-                {displayTarget}
-              </button>
-            ) : (
-              <span
-                className={cn(
-                  "truncate font-mono text-[12px]",
-                  desc.isRunning
-                    ? "agent-text-shimmer"
-                    : "text-muted-foreground group-hover/tool:text-foreground/70",
-                )}
-              >
-                {displayTarget}
-              </span>
-            ))}
-
-          {desc.secondaryMeta &&
-            (canOpenFileDirect && openFilePath ? (
-              <button
-                type="button"
-                title={`Jump to ${desc.target ?? openFilePath} (${desc.secondaryMeta})`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleOpenTargetFile();
-                }}
-                className="text-muted-foreground/75 hover:text-foreground shrink-0 cursor-pointer font-mono text-[11.5px] hover:underline"
-              >
-                {desc.secondaryMeta}
-              </button>
-            ) : (
-              <span className="text-muted-foreground/70 shrink-0 font-mono text-[11.5px]">
-                {desc.secondaryMeta}
-              </span>
-            ))}
-        </div>
-
-        <div className="tabular-nums flex shrink-0 items-center gap-2 font-mono text-[11.5px]">
-          {(desc.additions > 0 || desc.deletions > 0) && (
-            <span className="flex items-center gap-1.5">
-              {desc.additions > 0 && (
-                <span className="text-emerald-600 dark:text-emerald-400">
-                  +{desc.additions}
-                </span>
-              )}
-              {desc.deletions > 0 && (
-                <span className="text-rose-600 dark:text-rose-400">-{desc.deletions}</span>
-              )}
-            </span>
-          )}
-
-          {desc.kind === "shell" &&
-            !desc.isRunning &&
-            desc.exitCode !== null &&
-            desc.exitCode !== 0 && (
-              <span className="text-rose-500">exit {desc.exitCode}</span>
-            )}
-
-          {canOpenFileInDiff && openFilePath && (
-            <button
-              type="button"
-              title="Open in Diff Review"
-              onClick={(e) => {
-                e.stopPropagation();
-                orbitActions.openInspectorForFile(openFilePath, "session_turns");
-              }}
-              className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
-            >
-              <FileSymlink className="size-3.5" />
-            </button>
-          )}
-
-          {canOpenFileDirect && openFilePath && (
-            <button
-              type="button"
-              title="Open File in Side Panel"
-              onClick={(e) => {
-                e.stopPropagation();
-                orbitActions.openFileInSidePanel(openFilePath, {
-                  cwd,
-                  focusLine: readStartLine,
-                  focusEndLine: readEndLine,
-                });
-              }}
-              className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
-            >
-              <FileSymlink className="size-3.5" />
-            </button>
-          )}
-
-          {resolvedSubagentMatch && (
-            <button
-              type="button"
-              title="Open subagent details"
-              onClick={(e) => {
-                e.stopPropagation();
-                handleOpenResolvedSubagent();
-              }}
-              className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
-            >
-              <ArrowUpRight className="size-3.5" />
-            </button>
-          )}
-        </div>
-      </div>
-
-      {expanded && hasExpandableDetail && (
-        <div className="orbit-stage-enter my-1.5 ml-4 pl-3">
-          {item.detail.kind === "shell" && (
-            <ScrollArea
-              className={cn(
-                "rounded-lg border",
-                isError
-                  ? "border-rose-500/30 bg-rose-500/[0.04]"
-                  : "border-border bg-muted/45 dark:bg-muted/25",
-              )}
-              viewportClassName="max-h-56 overscroll-contain px-3 py-2"
-            >
-              <pre
-                className={cn(
-                  "selectable-text font-mono text-[12px] leading-relaxed whitespace-pre-wrap",
-                  isError ? "text-foreground/90" : "text-foreground/88",
-                )}
-              >
-                <span className="text-muted-foreground select-none">$ </span>
-                {item.detail.command}
-                {item.detail.output_preview ? (
-                  `\n\n${item.detail.output_preview}`
-                ) : !desc.isRunning ? (
-                  <span className="text-muted-foreground select-none">{"\n\n(no output)"}</span>
-                ) : (
-                  ""
-                )}
-              </pre>
-            </ScrollArea>
-          )}
-
-          {item.detail.kind === "file_edit" && diffLines.length > 0 && (
-            <InlineStepDiffPreview lines={diffLines} />
-          )}
-
-          {item.detail.kind === "subagent" && item.detail.prompt_preview && (
-            <ScrollArea
-              className="border-border bg-muted/45 dark:bg-muted/25 rounded-lg border"
-              viewportClassName="max-h-44 overscroll-contain px-3 py-2"
-            >
-              <pre className="selectable-text text-muted-foreground font-mono text-[12px] whitespace-pre-wrap">
-                {item.detail.prompt_preview}
-              </pre>
-            </ScrollArea>
-          )}
-
-          {item.detail.kind === "generic" && item.detail.arguments_json && (() => {
-            const msgCall = extractSubagentMessageCall(item);
-            if (msgCall && msgCall.message) {
-              return (
-                <ScrollArea
-                  className="border-border bg-muted/45 dark:bg-muted/25 rounded-lg border"
-                  viewportClassName="max-h-60 overscroll-contain px-3 py-2"
-                >
-                  <pre className="selectable-text text-foreground/85 font-sans text-[12.5px] leading-relaxed whitespace-pre-wrap break-words">
-                    {msgCall.message}
-                  </pre>
-                </ScrollArea>
-              );
-            }
-            return (
-              <ScrollArea
-                className="border-border bg-muted/45 dark:bg-muted/25 rounded-lg border"
-                viewportClassName="max-h-44 overscroll-contain px-3 py-2"
-              >
-                <pre className="selectable-text text-muted-foreground font-mono text-[12px] whitespace-pre-wrap">
-                  {formatJsonPreview(item.detail.arguments_json)}
-                </pre>
-              </ScrollArea>
-            );
-          })()}
-        </div>
+          {displayTarget}
+        </button>
       )}
-    </div>
+      {canOpenFileDirect && desc.secondaryMeta && (
+        <button
+          type="button"
+          title={t("stage.jumpToFileLine", { target: desc.target || openFilePath || "", range: desc.secondaryMeta })}
+          onMouseEnter={handlePrefetchTargetHover}
+          onMouseLeave={handlePrefetchTargetLeave}
+          onPointerDown={handlePrefetchTargetPointerDown}
+          onClick={handleOpenTargetFile}
+          className="text-ink-muted hover:text-ink-primary shrink-0 cursor-pointer font-mono text-[11px] hover:underline"
+        >
+          {desc.secondaryMeta}
+        </button>
+      )}
+      {(canOpenFileInDiff || canOpenFileDirect) && (
+        <button
+          type="button"
+          aria-label={t(canOpenFileInDiff ? "stage.openDiffReview" : "stage.openFileInPanel")}
+          title={t(canOpenFileInDiff ? "stage.openDiffReview" : "stage.openFileInPanel")}
+          onMouseEnter={handlePrefetchTargetHover}
+          onMouseLeave={handlePrefetchTargetLeave}
+          onPointerDown={handlePrefetchTargetPointerDown}
+          onClick={handleOpenTargetFile}
+          className={quickActionClass}
+        >
+          <FileSymlink className="size-3.5" />
+        </button>
+      )}
+      {resolvedSubagentMatch && (
+        <button
+          type="button"
+          aria-label={t("stage.openSubagentDetails")}
+          title={t("stage.openSubagentDetails")}
+          onClick={handleOpenResolvedSubagent}
+          className={quickActionClass}
+        >
+          <ArrowUpRight className="size-3.5" />
+        </button>
+      )}
+    </>
+  );
+
+  return renderStep(
+    line,
+    hasExpandableDetail && (
+      <ToolStepDetail item={item} diffLines={diffLines} onOpenDiffReview={canOpenFileInDiff ? handleOpenTargetFile : undefined} />
+    ),
+    actions,
+    openTarget && displayTarget ? `${desc.verb} ${displayTarget}` : undefined,
   );
 });

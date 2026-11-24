@@ -67,6 +67,7 @@ import type {
   SidebarThreadFilter,
   SlashDirective,
   TerminalTabSession,
+  UndoArchiveEntry,
   WorktreeHandoffDialogTarget,
 } from "../store-types";
 
@@ -863,14 +864,58 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
     selectAgent(hostId: string, agentId: string, jumpToSeq?: number | null): void {
       flushPendingSeenMarks();
       ctx.setPendingDraftCreate(null);
+      const detail = getState().hostDetails[hostId];
+      const ag = detail?.agents.find((a) => a.agent_id === agentId);
+      // Child subagents are inspected exclusively in the right Side Panel, never as a
+      // standalone Main Stage view. Route any selection of a managed child to its root
+      // parent thread and open the child inspector tab on the right.
+      if (ag?.parent_agent_id) {
+        let rootHostId = hostId;
+        let rootAgentId = agentId;
+        let cursor = ag;
+        const visited = new Set<string>([`${hostId}::${agentId}`]);
+        while (cursor?.parent_agent_id) {
+          const nextHostId = cursor.parent_host_id ?? rootHostId;
+          const nextAgentId = cursor.parent_agent_id;
+          const visitKey = `${nextHostId}::${nextAgentId}`;
+          if (visited.has(visitKey)) break;
+          visited.add(visitKey);
+          const parentAg = getState().hostDetails[nextHostId]?.agents.find(
+            (a) => a.agent_id === nextAgentId,
+          );
+          if (!parentAg || parentAg.archived_at_rfc3339) break;
+          rootHostId = nextHostId;
+          rootAgentId = nextAgentId;
+          cursor = parentAg;
+        }
+        if (rootAgentId !== agentId || rootHostId !== hostId) {
+          const snap = getState();
+          const parentAlreadyActive =
+            snap.activeView === "workspace" &&
+            snap.workspacePanel === "conversation" &&
+            !snap.isDraftNewSession &&
+            snap.selectedHostId === rootHostId &&
+            snap.selectedAgentId === rootAgentId;
+          if (!parentAlreadyActive) {
+            ctx.actions.selectAgent(rootHostId, rootAgentId);
+          }
+          ctx.actions.openSubagentTab({
+            callId: ag.agent_id,
+            role: ag.title || ag.agent_id,
+            promptPreview: ag.task_summary ?? "",
+            childAgentId: ag.agent_id,
+            childHostId: hostId,
+            parentAgentId: rootAgentId,
+          });
+          return;
+        }
+      }
       const isSwitchingThread =
         getState().activeView !== "workspace" ||
         getState().workspacePanel !== "conversation" ||
         getState().isDraftNewSession ||
         getState().selectedHostId !== hostId ||
         getState().selectedAgentId !== agentId;
-      const detail = getState().hostDetails[hostId];
-      const ag = detail?.agents.find((a) => a.agent_id === agentId);
       const nextCwd = ag?.cwd ?? getState().selectedWorkspaceCwd;
       const tKey = threadScopeKey(hostId, agentId);
       if (getState().stages[tKey]) {
@@ -1679,6 +1724,20 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         fallbackAgentId = nextCandidate?.agent_id ?? null;
       }
 
+      const preArchive = getState();
+      const undoEntry: UndoArchiveEntry = {
+        hostId,
+        agentId,
+        title: targetAgent?.title ?? agentId,
+        draft: preArchive.composerDrafts[tKey] ?? "",
+        slashDirective: preArchive.slashDirectives[tKey] ?? null,
+        inlineMentions: [...(preArchive.inlineMentions[tKey] ?? [])],
+        contexts: [...(preArchive.contextItems[tKey] ?? [])],
+        pastes: [...(preArchive.pastedAttachments[tKey] ?? [])],
+        quotes: [...(preArchive.diffQuotes[tKey] ?? [])],
+        sideQuestionDraft: preArchive.sideQuestionDrafts[tKey] ?? "",
+      };
+
       const archivedKeySet = new Set([tKey]);
       setState(
         (s) => ({
@@ -1694,6 +1753,8 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           },
           composerDrafts: omitRecordKeys(s.composerDrafts, archivedKeySet),
           slashDirectives: omitRecordKeys(s.slashDirectives, archivedKeySet),
+          inlineMentions: omitRecordKeys(s.inlineMentions, archivedKeySet),
+          contextItems: omitRecordKeys(s.contextItems, archivedKeySet),
           pastedAttachments: omitRecordKeys(s.pastedAttachments, archivedKeySet),
           diffQuotes: omitRecordKeys(s.diffQuotes, archivedKeySet),
           sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, archivedKeySet),
@@ -1713,11 +1774,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       if (wasSelected && fallbackAgentId) {
         ctx.actions.selectAgent(hostId, fallbackAgentId);
       }
-      notifyToast(t("store.conversationArchived"), {
-        hostId,
-        agentId,
-        title: targetAgent?.title ?? agentId,
-      });
+      notifyToast(t("store.conversationArchived"), undoEntry);
     },
 
 
@@ -1837,7 +1894,62 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
     undoLastArchive(): void {
       const entry = getState().lastArchivedUndo;
       if (!entry) return;
+      const tKey = threadScopeKey(entry.hostId, entry.agentId);
+      const hasDraftSnapshot =
+        Boolean(entry.draft) ||
+        Boolean(entry.slashDirective) ||
+        Boolean(entry.inlineMentions?.length) ||
+        Boolean(entry.contexts?.length) ||
+        Boolean(entry.pastes?.length) ||
+        Boolean(entry.quotes?.length) ||
+        Boolean(entry.sideQuestionDraft);
+
       ctx.actions.restoreArchivedThread(entry.hostId, entry.agentId);
+
+      if (hasDraftSnapshot) {
+        setState((s) => {
+          const curDraft = s.composerDrafts[tKey] ?? "";
+          const curDirective = s.slashDirectives[tKey] ?? null;
+          const curInline = s.inlineMentions[tKey] ?? [];
+          const curContexts = s.contextItems[tKey] ?? [];
+          const curPastes = s.pastedAttachments[tKey] ?? [];
+          const curQuotes = s.diffQuotes[tKey] ?? [];
+          const curSideQuestion = s.sideQuestionDrafts[tKey] ?? "";
+
+          return {
+            ...s,
+            composerDrafts:
+              !curDraft && entry.draft
+                ? { ...s.composerDrafts, [tKey]: entry.draft }
+                : s.composerDrafts,
+            slashDirectives:
+              !curDirective && entry.slashDirective
+                ? { ...s.slashDirectives, [tKey]: entry.slashDirective }
+                : s.slashDirectives,
+            inlineMentions:
+              curInline.length === 0 && entry.inlineMentions && entry.inlineMentions.length > 0
+                ? { ...s.inlineMentions, [tKey]: [...entry.inlineMentions] }
+                : s.inlineMentions,
+            contextItems:
+              curContexts.length === 0 && entry.contexts && entry.contexts.length > 0
+                ? { ...s.contextItems, [tKey]: [...entry.contexts] }
+                : s.contextItems,
+            pastedAttachments:
+              curPastes.length === 0 && entry.pastes && entry.pastes.length > 0
+                ? { ...s.pastedAttachments, [tKey]: [...entry.pastes] }
+                : s.pastedAttachments,
+            diffQuotes:
+              curQuotes.length === 0 && entry.quotes && entry.quotes.length > 0
+                ? { ...s.diffQuotes, [tKey]: [...entry.quotes] }
+                : s.diffQuotes,
+            sideQuestionDrafts:
+              !curSideQuestion && entry.sideQuestionDraft
+                ? { ...s.sideQuestionDrafts, [tKey]: entry.sideQuestionDraft }
+                : s.sideQuestionDrafts,
+          };
+        });
+        draftPersistence.flushNow();
+      }
     },
 
 

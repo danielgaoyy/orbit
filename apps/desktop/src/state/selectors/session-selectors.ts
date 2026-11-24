@@ -290,21 +290,33 @@ export function selectScopedTerminalCount(
 
 /**
  * Returns true if ANY remote host (other than `hostId`) currently holds a managed child agent
- * belonging to `(hostId, agentId)`. Returning a boolean lets `useOrbitSelector` short-circuit
- * remote host heartbeats with zero re-renders for the 99% local-only session case.
+ * or dispatched workspace peer belonging to `(hostId, agentId)`. Returning a boolean lets
+ * `useOrbitSelector` short-circuit remote host heartbeats with zero re-renders for the 99%
+ * local-only session case.
  */
 export function hasCrossHostChildAgents(
   hostDetails: Record<string, HostDetailView>,
   hostId: string | null,
   agentId: string | null,
+  insightsSubagents?: readonly SessionSubagentEntryView[],
 ): boolean {
   if (!hostId || !agentId) return false;
+  let dispatchedIds: Set<string> | null = null;
+  if (insightsSubagents && insightsSubagents.length > 0) {
+    for (const sa of insightsSubagents) {
+      if (sa.child_agent_id?.startsWith("ag_")) {
+        dispatchedIds ??= new Set();
+        dispatchedIds.add(sa.child_agent_id);
+      }
+    }
+  }
   for (const [hid, detail] of Object.entries(hostDetails)) {
     if (hid === hostId) continue;
     for (const ag of detail.agents) {
       if (
-        ag.parent_agent_id === agentId &&
-        (!ag.parent_host_id || ag.parent_host_id === hostId)
+        (ag.parent_agent_id === agentId &&
+          (!ag.parent_host_id || ag.parent_host_id === hostId)) ||
+        (dispatchedIds !== null && dispatchedIds.has(ag.agent_id))
       ) {
         return true;
       }
@@ -314,22 +326,33 @@ export function hasCrossHostChildAgents(
 }
 
 /**
- * Returns true if the given host currently has any Orbit managed child agents or provider-native
- * subagent descriptors belonging to `(hostId, agentId)`.
+ * Returns true if the given host currently has any Orbit managed child agents, dispatched
+ * workspace peers, or provider-native subagent descriptors belonging to `(hostId, agentId)`.
  */
 export function hasLocalSubagentRecords(
   hostDetail: HostDetailView | null | undefined,
   hostId: string | null,
   agentId: string | null,
+  insightsSubagents?: readonly SessionSubagentEntryView[],
 ): boolean {
   if (!hostDetail || !hostId || !agentId) return false;
   if ((hostDetail.provider_subagents?.[agentId]?.length ?? 0) > 0) {
     return true;
   }
+  let dispatchedIds: Set<string> | null = null;
+  if (insightsSubagents && insightsSubagents.length > 0) {
+    for (const sa of insightsSubagents) {
+      if (sa.child_agent_id?.startsWith("ag_")) {
+        dispatchedIds ??= new Set();
+        dispatchedIds.add(sa.child_agent_id);
+      }
+    }
+  }
   for (const ag of hostDetail.agents) {
     if (
-      ag.parent_agent_id === agentId &&
-      (!ag.parent_host_id || ag.parent_host_id === hostId)
+      (ag.parent_agent_id === agentId &&
+        (!ag.parent_host_id || ag.parent_host_id === hostId)) ||
+      (dispatchedIds !== null && dispatchedIds.has(ag.agent_id))
     ) {
       return true;
     }

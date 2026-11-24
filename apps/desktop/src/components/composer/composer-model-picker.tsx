@@ -595,7 +595,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
           <button
             type="button"
             disabled
-            className="inline-flex h-8.5 max-w-76 cursor-not-allowed items-center gap-1.5 rounded-full px-2.5 text-[13.5px] opacity-65"
+            className="inline-flex h-8.5 max-w-76 cursor-not-allowed items-center gap-1.5 rounded-full px-2.5 text-[13px] opacity-65"
           >
             <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
             <span className="text-ink-primary truncate font-normal opacity-90">
@@ -606,7 +606,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                 <span aria-hidden="true" className="text-ink-faint text-[11px]">
                   ·
                 </span>
-                <span className="text-ink-muted shrink-0 text-[12.5px] font-normal">
+                <span className="text-ink-muted shrink-0 text-[13px] font-normal">
                   {activeEffortLabel}
                 </span>
               </>
@@ -641,7 +641,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
         <PopoverTrigger asChild>
           <button
             type="button"
-            className="hover:text-ink-primary hover:bg-accent inline-flex h-8.5 max-w-76 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13.5px] transition-colors"
+            className="hover:text-ink-primary hover:bg-accent inline-flex h-8.5 max-w-76 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors"
           >
             <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
             <span className="text-ink-primary truncate font-normal opacity-90">
@@ -652,7 +652,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                 <span aria-hidden="true" className="text-ink-faint text-[11px]">
                   ·
                 </span>
-                <span className="text-ink-muted shrink-0 text-[12.5px] font-normal">
+                <span className="text-ink-muted shrink-0 text-[13px] font-normal">
                   {activeEffortLabel}
                 </span>
               </>
@@ -780,7 +780,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
             >
               {canSwitchAgentEngine && profiles.length > 0 && effectiveBrowsedProvider !== "acp" && (
                 <div className="border-border-subtle mb-1 flex flex-col gap-0.5 border-b pb-1">
-                  <div className="text-ink-muted flex items-center gap-1 px-2 py-0.5 text-[10.5px] font-medium uppercase">
+                  <div className="text-ink-muted flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium uppercase">
                     <Sparkles className="size-3" />
                     <span>{t("composer.profiles")}</span>
                   </div>
@@ -821,14 +821,14 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                           <span className="flex min-w-0 flex-col">
                             <span
                               className={cn(
-                                "truncate text-[12.5px] leading-tight",
+                                "truncate text-[13px] leading-tight",
                                 isActiveProf ? "font-medium" : "font-normal",
                               )}
                             >
                               {prof.name}
                             </span>
                             {profMeta && (
-                              <span className="text-ink-faint truncate text-[10.5px] leading-tight">
+                              <span className="text-ink-faint truncate text-[11px] leading-tight">
                                 {profMeta}
                               </span>
                             )}
@@ -872,7 +872,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                             <div className="flex min-w-0 items-center gap-1.5">
                               <span
                                 className={cn(
-                                  "truncate text-[12.5px]",
+                                  "truncate text-[13px]",
                                   isSelectedAcp
                                     ? "text-ink-primary font-medium"
                                     : "text-ink-secondary font-normal",
@@ -881,7 +881,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                                 {item.spec.name}
                               </span>
                               {item.spec.source === "custom" && (
-                                <span className="text-ink-muted shrink-0 text-[10.5px]">
+                                <span className="text-ink-muted shrink-0 text-[11px]">
                                   {t("common.custom")}
                                 </span>
                               )}
@@ -900,7 +900,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                               setModelPopoverOpen(false);
                               orbitActions.openSettings(`host:${selectedHostId}:acp`);
                             }}
-                            className="text-ink-muted hover:text-ink-primary hover:bg-accent/65 flex h-[26px] w-full cursor-pointer items-center rounded-[7px] px-2 text-left text-[11.5px] transition-colors"
+                            className="text-ink-muted hover:text-ink-primary hover:bg-accent/65 flex h-[26px] w-full cursor-pointer items-center rounded-[7px] px-2 text-left text-[13px] transition-colors"
                           >
                             {t("composer.manageAcpAgents")}
                           </button>
@@ -909,7 +909,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                     </>
                   ) : (
                     <>
-                      <div className="text-ink-primary flex items-center justify-between gap-2 px-2 py-1 text-[12.5px] font-medium">
+                      <div className="text-ink-primary flex items-center justify-between gap-2 px-2 py-1 text-[13px] font-medium">
                         <span className="truncate">
                           {activeAcpSpec?.name ??
                             effectiveAcpAgentId ??
@@ -929,7 +929,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                               setModelPopoverOpen(false);
                               orbitActions.openSettings(`host:${selectedHostId}:acp`);
                             }}
-                            className="text-ink-muted hover:text-ink-primary hover:bg-accent/65 flex h-[26px] w-full cursor-pointer items-center rounded-[7px] px-2 text-left text-[11.5px] transition-colors"
+                            className="text-ink-muted hover:text-ink-primary hover:bg-accent/65 flex h-[26px] w-full cursor-pointer items-center rounded-[7px] px-2 text-left text-[13px] transition-colors"
                           >
                             {t("composer.manageAcpAgents")}
                           </button>
@@ -1038,7 +1038,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                           <div className="flex min-w-0 items-baseline gap-1.5">
                             <span
                               className={cn(
-                                "shrink-0 text-[12.5px] leading-normal",
+                                "shrink-0 text-[13px] leading-normal",
                                 row.kind === "model" && "truncate",
                                 isModelActive
                                   ? "text-ink-primary font-medium"
@@ -1167,7 +1167,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                     )}
                   >
                     {hoveredRow.kind === "group" ? (
-                      <div className="text-popover-foreground floating-surface orbit-inline-flyout-side border-border-default relative flex w-[188px] flex-col gap-0.5 rounded-[11px] border p-1">
+                      <div
+                        data-side={submenuPos.flipLeft ? "left" : "right"}
+                        className="text-popover-foreground floating-surface orbit-inline-flyout-side border-border-default relative flex w-[188px] flex-col gap-0.5 rounded-[11px] border p-1"
+                      >
                         {hoveredRow.children.map((child) => {
                           const isChildActive =
                             effectiveBrowsedProvider === activeProvider &&
@@ -1238,7 +1241,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                                 <div className="flex min-w-0 items-baseline gap-1.5">
                                   <span
                                     className={cn(
-                                      "truncate text-[12.5px] leading-normal",
+                                      "truncate text-[13px] leading-normal",
                                       isChildActive
                                         ? "text-ink-primary font-medium"
                                         : "text-ink-secondary group-hover/submodel:text-ink-primary font-normal",
@@ -1356,7 +1359,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                                 level3Pos.flipLeft ? "right-full pr-1.5" : "left-full pl-1.5",
                               )}
                             >
-                              <div className="text-popover-foreground floating-surface orbit-inline-flyout-side border-border-default flex w-max min-w-[132px] max-w-[184px] flex-col gap-0.5 rounded-[11px] border p-1">
+                              <div
+                                data-side={level3Pos.flipLeft ? "left" : "right"}
+                                className="text-popover-foreground floating-surface orbit-inline-flyout-side border-border-default flex w-max min-w-[132px] max-w-[184px] flex-col gap-0.5 rounded-[11px] border p-1"
+                              >
                                 {hoveredSubModel.thinkingOptions.map((opt) => {
                                   const isHoveredSubActive =
                                     effectiveBrowsedProvider === activeProvider &&
@@ -1389,7 +1395,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                                     >
                                       <span
                                         className={cn(
-                                          "truncate text-[12.5px] leading-normal",
+                                          "truncate text-[13px] leading-normal",
                                           isSelected
                                             ? "text-ink-primary font-medium"
                                             : "text-ink-secondary font-normal",
@@ -1408,7 +1414,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                           )}
                       </div>
                     ) : (
-                      <div className="text-popover-foreground floating-surface orbit-inline-flyout-side border-border-default flex w-max min-w-[132px] max-w-[184px] flex-col gap-0.5 rounded-[11px] border p-1">
+                      <div
+                        data-side={submenuPos.flipLeft ? "left" : "right"}
+                        className="text-popover-foreground floating-surface orbit-inline-flyout-side border-border-default flex w-max min-w-[132px] max-w-[184px] flex-col gap-0.5 rounded-[11px] border p-1"
+                      >
                         {hoveredRow.thinkingOptions.map((opt) => {
                           const isHoveredModelActive =
                             effectiveBrowsedProvider === activeProvider &&
@@ -1443,7 +1452,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                             >
                               <span
                                 className={cn(
-                                  "truncate text-[12.5px] leading-normal",
+                                  "truncate text-[13px] leading-normal",
                                   isSelected
                                     ? "text-ink-primary font-medium"
                                     : "text-ink-secondary font-normal",
@@ -1505,7 +1514,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                                 >
                                   <span
                                     className={cn(
-                                      "inline-flex items-center gap-1.5 truncate text-[12.5px] leading-normal",
+                                      "inline-flex items-center gap-1.5 truncate text-[13px] leading-normal",
                                       fastChecked
                                         ? "text-ink-primary font-medium"
                                         : "text-ink-secondary font-normal",

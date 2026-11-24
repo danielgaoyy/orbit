@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUpRight,
   Bot,
@@ -27,7 +27,12 @@ import {
 } from "@/lib/orbit-ipc";
 import { isImeKeyEvent, useImeCompositionGuard } from "@/lib/ime";
 import { type MessageKey, useI18n } from "@/lib/i18n";
-import { modSymbol } from "@/lib/keybindings";
+import {
+  COMPOSER_INPUT_SELECTOR,
+  isFocusInsideSidePanel,
+  shouldSubmitQuestionDockOnModEnter,
+} from "@/lib/file-viewer-shortcuts";
+import { isConfirmDialogOpen, modSymbol } from "@/lib/keybindings";
 import {
   isAlwaysDecision,
   isDenyDecision,
@@ -53,15 +58,100 @@ import { cn } from "@/lib/utils";
 type PendingPermissionItem = Extract<TimelineItemView, { item_type: "permission_request" }>;
 type PendingQuestionItem = Extract<TimelineItemView, { item_type: "question_request" }>;
 
-interface QuestionDraftState {
+export interface QuestionDraftState {
   selections: Record<number, string[]>;
   customAnswers: Record<number, string>;
+  /** For single-select questions: tracks whether the preserved custom answer is active over preset options. */
+  useCustom: Record<number, boolean>;
 }
 
-const EMPTY_QUESTION_DRAFT: QuestionDraftState = {
+export const EMPTY_QUESTION_DRAFT: QuestionDraftState = {
   selections: {},
   customAnswers: {},
+  useCustom: {},
 };
+
+export function applyQuestionOptionToggle(
+  prev: QuestionDraftState,
+  qIdx: number,
+  opt: string,
+  multi: boolean,
+): QuestionDraftState {
+  const cur = prev.selections[qIdx] ?? [];
+  if (!multi) {
+    return {
+      selections: { ...prev.selections, [qIdx]: [opt] },
+      customAnswers: prev.customAnswers,
+      useCustom: { ...prev.useCustom, [qIdx]: false },
+    };
+  }
+  return {
+    selections: {
+      ...prev.selections,
+      [qIdx]: cur.includes(opt) ? cur.filter((x) => x !== opt) : [...cur, opt],
+    },
+    customAnswers: prev.customAnswers,
+    useCustom: prev.useCustom,
+  };
+}
+
+export function applyQuestionCustomChange(
+  prev: QuestionDraftState,
+  qIdx: number,
+  value: string,
+  multi: boolean,
+): QuestionDraftState {
+  const nextCustom = { ...prev.customAnswers, [qIdx]: value };
+  if (!multi) {
+    const hasText = value.trim().length > 0;
+    return {
+      selections:
+        hasText && prev.selections[qIdx]?.length
+          ? { ...prev.selections, [qIdx]: [] }
+          : prev.selections,
+      customAnswers: nextCustom,
+      useCustom: { ...prev.useCustom, [qIdx]: hasText },
+    };
+  }
+  return {
+    selections: prev.selections,
+    customAnswers: nextCustom,
+    useCustom: prev.useCustom,
+  };
+}
+
+export function activateQuestionCustomAnswer(
+  prev: QuestionDraftState,
+  qIdx: number,
+  multi: boolean,
+): QuestionDraftState {
+  if (multi) return prev;
+  if ((prev.customAnswers[qIdx] ?? "").trim().length === 0) return prev;
+  if (prev.useCustom[qIdx] === true && !(prev.selections[qIdx]?.length)) return prev;
+  return {
+    selections: { ...prev.selections, [qIdx]: [] },
+    customAnswers: prev.customAnswers,
+    useCustom: { ...prev.useCustom, [qIdx]: true },
+  };
+}
+
+export function resolveQuestionAnswers(
+  questions: readonly Pick<QuestionItem, "is_multi_select">[],
+  draft: QuestionDraftState,
+): string[][] {
+  return questions.map((q, idx) => {
+    const custom = (draft.customAnswers[idx] ?? "").trim();
+    const chosen = draft.selections[idx] ?? [];
+    if (!q.is_multi_select) {
+      const isCustomActive = draft.useCustom[idx] ?? (chosen.length === 0 && custom.length > 0);
+      if (isCustomActive && custom.length > 0) {
+        return [custom];
+      }
+      return chosen;
+    }
+    return custom && !chosen.includes(custom) ? [...chosen, custom] : chosen;
+  });
+}
 
 type QueuedDecision =
   | {
@@ -370,11 +460,13 @@ function DecisionQueueStepper({
   total,
   onPrev,
   onNext,
+  showShortcuts = true,
 }: {
   activeIndex: number;
   total: number;
   onPrev: () => void;
   onNext: () => void;
+  showShortcuts?: boolean;
 }) {
   const { t } = useI18n();
   const mod = modSymbol();
@@ -382,7 +474,11 @@ function DecisionQueueStepper({
 
   return (
     <div className="bg-surface-recessed border-border-subtle inline-flex items-center rounded-full border p-0.5">
-      <SimpleTooltip label={t("approval.previousRequest")} shortcut={`${mod}[`} side="top">
+      <SimpleTooltip
+        label={t("approval.previousRequest")}
+        shortcut={showShortcuts ? `${mod}[` : undefined}
+        side="top"
+      >
         <button
           type="button"
           onClick={onPrev}
@@ -395,7 +491,11 @@ function DecisionQueueStepper({
       <span className="text-ink-muted tabular-nums px-1.5 font-mono text-[11px] font-medium">
         {activeIndex + 1}/{total}
       </span>
-      <SimpleTooltip label={t("approval.nextRequest")} shortcut={`${mod}]`} side="top">
+      <SimpleTooltip
+        label={t("approval.nextRequest")}
+        shortcut={showShortcuts ? `${mod}]` : undefined}
+        side="top"
+      >
         <button
           type="button"
           onClick={onNext}
@@ -416,7 +516,7 @@ function PermissionDetailExpanded({ content, isDiff }: { content: string; isDiff
     <ScrollArea
       orientation="both"
       className="border-border-subtle bg-surface-recessed mt-2 rounded-xl border"
-      viewportClassName="selectable-text max-h-44 overscroll-contain px-3 py-2 font-mono text-[12px] leading-[1.5]"
+      viewportClassName="selectable-text max-h-44 overscroll-contain px-3 py-2 font-mono text-[13px] leading-[1.5]"
     >
       {isDiff ? (
         lines.map((line, i) => {
@@ -440,7 +540,7 @@ function PermissionDetailExpanded({ content, isDiff }: { content: string; isDiff
           );
         })
       ) : (
-        <pre className="text-ink-primary m-0 font-mono text-[12px] leading-[1.5] whitespace-pre-wrap break-words">
+        <pre className="text-ink-primary m-0 font-mono text-[13px] leading-[1.5] whitespace-pre-wrap break-words">
           {content}
         </pre>
       )}
@@ -464,6 +564,7 @@ function PermissionApprovalCard({
   queueTotal,
   onStepPrev,
   onStepNext,
+  registerGlobalShortcuts = true,
 }: {
   queueKey: string;
   hostId: string;
@@ -480,14 +581,24 @@ function PermissionApprovalCard({
   queueTotal: number;
   onStepPrev: () => void;
   onStepNext: () => void;
+  registerGlobalShortcuts?: boolean;
 }) {
   const { t } = useI18n();
   const mod = modSymbol();
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
   const [submittingDecision, setSubmittingDecision] = useState<string | null>(null);
   const submittingRef = useRef<string | null>(null);
   submittingRef.current = submittingDecision;
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!submittingDecision) return;
@@ -521,6 +632,7 @@ function PermissionApprovalCard({
 
   // Register exact target (parent OR child subagent) and live resolve handler for `⌘Y / ⌘⇧Y / ⌘⌫`
   useEffect(() => {
+    if (!registerGlobalShortcuts) return;
     setFocusedDecisionTarget({
       kind: "permission",
       queueKey,
@@ -535,13 +647,19 @@ function PermissionApprovalCard({
     return () => {
       setFocusedDecisionTarget(null);
     };
-  }, [queueKey, hostId, agentId, requestId, decisions, handleResolve]);
+  }, [registerGlobalShortcuts, queueKey, hostId, agentId, requestId, decisions, handleResolve]);
 
   const handleCopyPreview = () => {
     if (!target.copyText) return;
     void navigator.clipboard.writeText(target.copyText).then(() => {
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1400);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        copyTimerRef.current = null;
+        setCopied(false);
+      }, 1400);
     });
   };
 
@@ -575,7 +693,7 @@ function PermissionApprovalCard({
   return (
     <div
       data-risk={riskTone}
-      className="approval-dock-surface orbit-dock-enter overflow-hidden rounded-2xl"
+      className="approval-dock-surface overflow-hidden rounded-2xl"
     >
       <div className="border-border-subtle flex items-center justify-between gap-3 border-b px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-2">
@@ -594,7 +712,7 @@ function PermissionApprovalCard({
             />
           )}
           <KindIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
-          <span className="text-ink-primary truncate text-[12.5px] font-medium">
+          <span className="text-ink-primary truncate text-[13px] font-medium">
             {subagent ? `${subagent.title} · ${displayHeaderTitle}` : displayHeaderTitle}
           </span>
         </div>
@@ -635,6 +753,7 @@ function PermissionApprovalCard({
             total={queueTotal}
             onPrev={onStepPrev}
             onNext={onStepNext}
+            showShortcuts={registerGlobalShortcuts}
           />
         </div>
       </div>
@@ -643,13 +762,13 @@ function PermissionApprovalCard({
         {guardianAssessment && !isLowRisk && (
           <div
             className={cn(
-              "mb-2 flex items-start gap-2 rounded-lg border px-2.5 py-1.5 text-[11.5px] leading-[1.45]",
+              "mb-2 flex items-start gap-2 rounded-lg border px-2.5 py-1.5 text-[13px] leading-[1.45]",
               riskTone === "danger"
                 ? "bg-signal-danger-bg border-signal-danger-border text-signal-danger"
                 : "bg-signal-warning-bg border-signal-warning-border text-signal-warning",
             )}
           >
-            <ShieldAlert className="mt-[2px] size-3.5 shrink-0 stroke-[1.8]" />
+            <ShieldAlert className="mt-[2.5px] size-3.5 shrink-0 stroke-[1.8]" />
             <div className="flex min-w-0 flex-1 flex-col gap-1">
               <div className="line-clamp-3 min-w-0 break-words">
                 <span className="font-medium">
@@ -660,7 +779,9 @@ function PermissionApprovalCard({
                       : t("approval.mediumRisk")}
                 </span>
                 {guardianTierLabel && (
-                  <span className="ml-1.5 font-normal opacity-75">({guardianTierLabel})</span>
+                  <span className="ml-1.5 text-[11px] font-normal opacity-75">
+                    ({guardianTierLabel})
+                  </span>
                 )}
                 {guardianReasonText && (
                   <>
@@ -674,7 +795,7 @@ function PermissionApprovalCard({
                   {guardianSignals.map((sig) => (
                     <span
                       key={sig}
-                      className="rounded border border-current/15 bg-current/8 px-1.5 py-0.2 font-mono text-[10px] leading-[15px] opacity-90"
+                      className="rounded border border-current/15 bg-current/8 px-1.5 py-0.2 font-mono text-[11px] leading-[15px] opacity-90"
                     >
                       {formatSignalLabel(sig)}
                     </span>
@@ -687,7 +808,7 @@ function PermissionApprovalCard({
 
         <div className="group/preview bg-surface-recessed border-border-subtle relative flex items-start justify-between gap-2 rounded-xl border px-3 py-1.5">
           <div className="min-w-0 flex-1 py-[3px]">
-            <div className="selectable-text text-ink-primary line-clamp-2 font-mono text-[12px] leading-[1.5] break-words [overflow-wrap:anywhere]">
+            <div className="selectable-text text-ink-primary line-clamp-2 font-mono text-[13px] leading-[1.5] break-words [overflow-wrap:anywhere]">
               {target.isShell && (
                 <span className="text-ink-muted mr-1.5 select-none">$</span>
               )}
@@ -697,7 +818,7 @@ function PermissionApprovalCard({
               )}
             </div>
             {target.secondaryMeta && target.isShell && (
-              <div className="text-ink-muted mt-0.5 truncate font-mono text-[10.5px]">
+              <div className="text-ink-muted mt-0.5 truncate font-mono text-[11px]">
                 {target.secondaryMeta}
               </div>
             )}
@@ -726,15 +847,24 @@ function PermissionApprovalCard({
                 >
                   <button
                     type="button"
-                    aria-label={t("approval.copyCommand")}
+                    aria-label={copied ? t("approval.copiedCommand") : t("approval.copyCommand")}
                     onClick={handleCopyPreview}
-                    className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-6 cursor-pointer items-center justify-center rounded-[6px] transition-colors"
+                    className="orbit-press text-ink-muted hover:text-ink-primary hover:bg-accent relative inline-flex size-6 cursor-pointer items-center justify-center rounded-[6px]"
                   >
-                    {copied ? (
-                      <Check className="text-signal-success size-3.5 stroke-[2]" />
-                    ) : (
-                      <Copy className="size-3.5 stroke-[1.75]" />
-                    )}
+                    <Copy
+                      aria-hidden="true"
+                      className={cn(
+                        "size-3.5 stroke-[1.75] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+                        copied ? "scale-50 -rotate-12 opacity-0" : "scale-100 rotate-0 opacity-100",
+                      )}
+                    />
+                    <Check
+                      aria-hidden="true"
+                      className={cn(
+                        "text-signal-success absolute size-3.5 stroke-[2] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+                        copied ? "scale-100 rotate-0 opacity-100" : "scale-50 rotate-12 opacity-0",
+                      )}
+                    />
                   </button>
                 </SimpleTooltip>
               )}
@@ -748,22 +878,28 @@ function PermissionApprovalCard({
               type="button"
               aria-expanded={expanded}
               onClick={() => setExpanded((v) => !v)}
-              className="text-ink-tertiary hover:text-ink-primary hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-[6px] px-1.5 py-0.5 text-[11.5px] font-medium transition-colors"
+              className="text-ink-tertiary hover:text-ink-primary hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-[6px] px-1.5 py-0.5 text-[11px] font-medium transition-colors"
             >
               <ChevronDown
                 className={cn(
-                  "size-3.5 stroke-[1.75] transition-transform duration-150",
+                  "size-3.5 stroke-[1.75] transition-transform duration-180 ease-[var(--ease-panel)]",
                   expanded && "rotate-180",
                 )}
               />
               <span>{expanded ? t("common.hide") : target.expandLabel}</span>
             </button>
-            {expanded && (
-              <PermissionDetailExpanded
-                content={target.expandableContent}
-                isDiff={target.isDiff}
-              />
-            )}
+            <div
+              inert={!expanded}
+              data-open={expanded ? "true" : "false"}
+              className="orbit-collapse-grid"
+            >
+              <div className="orbit-collapse-inner">
+                <PermissionDetailExpanded
+                  content={target.expandableContent}
+                  isDiff={target.isDiff}
+                />
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -786,7 +922,7 @@ function PermissionApprovalCard({
               disabled={disabled}
               onClick={() => void handleResolve(dec)}
               className={cn(
-                "orbit-press inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-full text-[12px] font-medium disabled:cursor-not-allowed disabled:opacity-50",
+                "orbit-press inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-full text-[13px] font-medium disabled:cursor-not-allowed disabled:opacity-50",
                 isDeny
                   ? "text-ink-tertiary hover:bg-signal-danger-bg hover:text-signal-danger px-3"
                   : isAlways
@@ -796,7 +932,7 @@ function PermissionApprovalCard({
             >
               {isThisSubmitting && <OrbitSpinner size={12} className="shrink-0" />}
               <span>{isThisSubmitting ? t("approval.submittingDecision") : label}</span>
-              {isPrimaryAllow && !isThisSubmitting && (
+              {isPrimaryAllow && !isThisSubmitting && registerGlobalShortcuts && (
                 <ShortcutKbd keys={`${mod}Y`} size="xs" variant="inverted" className="ml-0.5" />
               )}
             </button>
@@ -807,7 +943,7 @@ function PermissionApprovalCard({
               <SimpleTooltip
                 key={dec}
                 label={t("approval.alwaysAllowSessionTooltip")}
-                shortcut={`${mod}⇧Y`}
+                shortcut={registerGlobalShortcuts ? `${mod}⇧Y` : undefined}
                 side="top"
               >
                 {buttonEl}
@@ -817,7 +953,12 @@ function PermissionApprovalCard({
 
           if (isMatchedDeny) {
             return (
-              <SimpleTooltip key={dec} label={label} shortcut={`${mod}⌫`} side="top">
+              <SimpleTooltip
+                key={dec}
+                label={label}
+                shortcut={registerGlobalShortcuts ? `${mod}⌫` : undefined}
+                side="top"
+              >
                 {buttonEl}
               </SimpleTooltip>
             );
@@ -843,6 +984,7 @@ function StickyQuestionDockCard({
   queueTotal,
   onStepPrev,
   onStepNext,
+  registerGlobalShortcuts = true,
 }: {
   queueKey: string;
   hostId: string;
@@ -856,16 +998,21 @@ function StickyQuestionDockCard({
   queueTotal: number;
   onStepPrev: () => void;
   onStepNext: () => void;
+  registerGlobalShortcuts?: boolean;
 }) {
   const { t } = useI18n();
   const mod = modSymbol();
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  submittingRef.current = submitting;
+  const cardRef = useRef<HTMLDivElement | null>(null);
   const inputRefs = useRef<Array<HTMLInputElement | null>>([]);
   const ime = useImeCompositionGuard();
 
-  const { selections, customAnswers } = draft;
+  const { selections, customAnswers, useCustom } = draft;
 
   useEffect(() => {
+    if (!registerGlobalShortcuts) return;
     setFocusedDecisionTarget({
       kind: "question",
       queueKey,
@@ -876,7 +1023,7 @@ function StickyQuestionDockCard({
     return () => {
       setFocusedDecisionTarget(null);
     };
-  }, [queueKey, hostId, agentId, requestId]);
+  }, [registerGlobalShortcuts, queueKey, hostId, agentId, requestId]);
 
   useEffect(() => {
     if (!submitting) return;
@@ -887,20 +1034,7 @@ function StickyQuestionDockCard({
   const toggleOption = useCallback(
     (qIdx: number, opt: string, multi: boolean) => {
       if (submitting) return;
-      onDraftChange((prev) => {
-        const cur = prev.selections[qIdx] ?? [];
-        const nextSelections = !multi
-          ? { ...prev.selections, [qIdx]: [opt] }
-          : {
-              ...prev.selections,
-              [qIdx]: cur.includes(opt) ? cur.filter((x) => x !== opt) : [...cur, opt],
-            };
-        const nextCustom =
-          !multi && prev.customAnswers[qIdx]
-            ? { ...prev.customAnswers, [qIdx]: "" }
-            : prev.customAnswers;
-        return { selections: nextSelections, customAnswers: nextCustom };
-      });
+      onDraftChange((prev) => applyQuestionOptionToggle(prev, qIdx, opt, multi));
     },
     [submitting, onDraftChange],
   );
@@ -908,14 +1042,15 @@ function StickyQuestionDockCard({
   const handleCustomChange = useCallback(
     (qIdx: number, value: string, multi: boolean) => {
       if (submitting) return;
-      onDraftChange((prev) => {
-        const nextCustom = { ...prev.customAnswers, [qIdx]: value };
-        const nextSelections =
-          !multi && value.trim().length > 0 && prev.selections[qIdx]?.length
-            ? { ...prev.selections, [qIdx]: [] }
-            : prev.selections;
-        return { selections: nextSelections, customAnswers: nextCustom };
-      });
+      onDraftChange((prev) => applyQuestionCustomChange(prev, qIdx, value, multi));
+    },
+    [submitting, onDraftChange],
+  );
+
+  const activateCustom = useCallback(
+    (qIdx: number, multi: boolean) => {
+      if (submitting) return;
+      onDraftChange((prev) => activateQuestionCustomAnswer(prev, qIdx, multi));
     },
     [submitting, onDraftChange],
   );
@@ -925,10 +1060,11 @@ function StickyQuestionDockCard({
   const singleOptionCount = singleQuestion ? Math.min(9, singleQuestion.options.length) : 0;
 
   useEffect(() => {
-    if (!singleQuestion || singleOptionCount === 0 || submitting) return;
+    if (!registerGlobalShortcuts || !singleQuestion || singleOptionCount === 0 || submitting) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || isImeKeyEvent(e)) return;
       if (!/^[1-9]$/.test(e.key)) return;
+      if (isConfirmDialogOpen()) return;
       const activeEl = document.activeElement as HTMLElement | null;
       const activeTag = activeEl?.tagName;
       if (
@@ -943,35 +1079,92 @@ function StickyQuestionDockCard({
       if (idx >= 0 && idx < singleQuestion.options.length) {
         e.preventDefault();
         toggleOption(0, singleQuestion.options[idx], singleQuestion.is_multi_select);
+        cardRef.current?.focus({ preventScroll: true });
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [singleQuestion, singleOptionCount, submitting, toggleOption]);
+  }, [registerGlobalShortcuts, singleQuestion, singleOptionCount, submitting, toggleOption]);
 
-  const orderedAnswers = questions.map((q, idx) => {
-    const custom = (customAnswers[idx] ?? "").trim();
-    const chosen = selections[idx] ?? [];
-    if (!q.is_multi_select) {
-      return custom ? [custom] : chosen;
-    }
-    return custom && !chosen.includes(custom) ? [...chosen, custom] : chosen;
-  });
+  const orderedAnswers = useMemo(
+    () => resolveQuestionAnswers(questions, draft),
+    [questions, draft],
+  );
 
   const answeredCount = orderedAnswers.filter((vals) => vals.length > 0).length;
   const canSubmit = questions.length > 0 && answeredCount === questions.length;
 
-  const handleSubmit = async () => {
-    if (!canSubmit || submitting) return;
+  const handleSubmit = useCallback(async () => {
+    if (!canSubmit || submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       await orbitIpc.answerQuestion(hostId, agentId, requestId, orderedAnswers);
       onSubmitted();
     } catch (err) {
+      submittingRef.current = false;
       setSubmitting(false);
       orbitActions.showToast(t("approval.submitFailed", { error: String(err) }));
     }
-  };
+  }, [canSubmit, hostId, agentId, requestId, orderedAnswers, onSubmitted, t]);
+
+  // Window-level `⌘↵` / `Ctrl+Enter` submit for active question card so `1–9` → `⌘↵` works reliably
+  // without stealing `⌘↵` from OmniComposer, Side Panel editors, or modal dialogs.
+  useEffect(() => {
+    if (!registerGlobalShortcuts || !canSubmit || submitting) return;
+    const onWindowKeyDown = (e: KeyboardEvent) => {
+      const activeEl = document.activeElement as HTMLElement | null;
+      const activeTag = activeEl?.tagName ?? "";
+      const cardEl = cardRef.current;
+      const focusInsideQuestionCard = Boolean(
+        cardEl && activeEl && (cardEl === activeEl || cardEl.contains(activeEl)),
+      );
+      const focusInsideComposer = Boolean(
+        activeEl?.dataset?.orbitComposerInput === "true" ||
+          activeEl?.closest?.(COMPOSER_INPUT_SELECTOR),
+      );
+      const focusInsideOtherEditable =
+        !focusInsideQuestionCard &&
+        (activeTag === "INPUT" ||
+          activeTag === "TEXTAREA" ||
+          activeTag === "SELECT" ||
+          Boolean(activeEl?.isContentEditable));
+      const modalDialogOpen = Boolean(
+        document.querySelector(
+          '[data-slot="dialog-content"], [role="dialog"], [role="alertdialog"]',
+        ),
+      );
+      if (
+        shouldSubmitQuestionDockOnModEnter({
+          registerGlobalShortcuts,
+          canSubmit,
+          submitting: submittingRef.current,
+          confirmDialogOpen: isConfirmDialogOpen(),
+          modalDialogOpen,
+          event: {
+            key: e.key,
+            metaKey: e.metaKey,
+            ctrlKey: e.ctrlKey,
+            shiftKey: e.shiftKey,
+            altKey: e.altKey,
+            repeat: e.repeat,
+            defaultPrevented: e.defaultPrevented,
+            isComposing: isImeKeyEvent(e),
+          },
+          focusInsideQuestionCard,
+          focusInsideComposer,
+          focusInsideSidePanel:
+            !focusInsideQuestionCard && isFocusInsideSidePanel(e.target, activeEl),
+          focusInsideOtherEditable,
+        })
+      ) {
+        e.preventDefault();
+        void handleSubmit();
+      }
+    };
+    window.addEventListener("keydown", onWindowKeyDown);
+    return () => window.removeEventListener("keydown", onWindowKeyDown);
+  }, [registerGlobalShortcuts, canSubmit, submitting, handleSubmit]);
 
   const focusNextUnansweredInput = (currentIdx: number) => {
     for (let offset = 1; offset < questions.length; offset += 1) {
@@ -988,20 +1181,22 @@ function StickyQuestionDockCard({
 
   return (
     <div
+      ref={cardRef}
+      tabIndex={-1}
       onKeyDown={(e) => {
         if (isImeKeyEvent(e)) return;
-        if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && canSubmit && !submitting) {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && canSubmit && !submittingRef.current) {
           e.preventDefault();
           void handleSubmit();
         }
       }}
-      className="approval-dock-surface orbit-dock-enter overflow-hidden rounded-2xl"
+      className="approval-dock-surface overflow-hidden rounded-2xl outline-none"
     >
       <div className="border-border-subtle flex items-center justify-between gap-3 border-b px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-2">
           <span className="bg-signal-warning size-1.5 shrink-0 rounded-full" />
           <MessageCircleQuestion className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
-          <span className="text-ink-primary truncate text-[12.5px] font-medium">
+          <span className="text-ink-primary truncate text-[13px] font-medium">
             {t("approval.clarificationNeeded")}
           </span>
         </div>
@@ -1017,6 +1212,7 @@ function StickyQuestionDockCard({
             total={queueTotal}
             onPrev={onStepPrev}
             onNext={onStepNext}
+            showShortcuts={registerGlobalShortcuts}
           />
         </div>
       </div>
@@ -1028,6 +1224,10 @@ function StickyQuestionDockCard({
             const showHeader = Boolean(cleanHeader && cleanHeader !== q.question.trim());
             const customVal = customAnswers[qIdx] ?? "";
             const hasCustomText = customVal.trim().length > 0;
+            const chosenCount = selections[qIdx]?.length ?? 0;
+            const isCustomActive = q.is_multi_select
+              ? hasCustomText
+              : (useCustom[qIdx] ?? (chosenCount === 0 && hasCustomText)) && hasCustomText;
 
             return (
               <div
@@ -1043,16 +1243,16 @@ function StickyQuestionDockCard({
                       {cleanHeader}
                     </div>
                   )}
-                  <div className="selectable-text text-ink-primary text-[13.5px] leading-[1.45] font-medium">
+                  <div className="selectable-text text-ink-primary text-[13px] leading-[1.45] font-medium">
                     {questions.length > 1 && (
-                      <span className="text-ink-muted tabular-nums mr-1.5 font-mono text-[12.5px]">
+                      <span className="text-ink-muted tabular-nums mr-1.5 font-mono text-[13px] font-normal">
                         {qIdx + 1}.
                       </span>
                     )}
                     <span>{q.question}</span>
                   </div>
                   {q.is_multi_select && (
-                    <div className="text-ink-tertiary text-[11.5px]">
+                    <div className="text-ink-tertiary text-[11px]">
                       {t("approval.selectAllThatApply")}
                     </div>
                   )}
@@ -1078,30 +1278,41 @@ function StickyQuestionDockCard({
                       >
                         <span
                           className={cn(
-                            "mt-[2.5px] flex size-[15px] shrink-0 items-center justify-center border transition-colors",
+                            "mt-[2.5px] flex size-[15px] shrink-0 items-center justify-center border transition-colors duration-150 ease-[var(--ease-out-expo)]",
                             q.is_multi_select ? "rounded-[4px]" : "rounded-full",
                             chosen
                               ? "border-action-primary-bg bg-action-primary-bg"
                               : "border-border-strong",
                           )}
                         >
-                          {chosen &&
-                            (q.is_multi_select ? (
-                              <Check className="text-action-primary-fg size-2.5 stroke-[2.6]" />
-                            ) : (
-                              <span className="bg-action-primary-fg size-[5px] rounded-full" />
-                            ))}
+                          {q.is_multi_select ? (
+                            <Check
+                              aria-hidden="true"
+                              className={cn(
+                                "text-action-primary-fg size-2.5 stroke-[2.6] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+                                chosen ? "scale-100 opacity-100" : "scale-[0.6] opacity-0",
+                              )}
+                            />
+                          ) : (
+                            <span
+                              aria-hidden="true"
+                              className={cn(
+                                "bg-action-primary-fg size-[5px] rounded-full transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+                                chosen ? "scale-100 opacity-100" : "scale-[0.6] opacity-0",
+                              )}
+                            />
+                          )}
                         </span>
                         <span className="min-w-0 flex-1 break-words">
                           <span>{label}</span>
                           {recommended && (
-                            <span className="bg-surface-recessed text-ink-tertiary border-border-subtle ml-1.5 inline-flex items-center rounded-full border px-1.5 py-0.5 align-middle text-[10.5px] leading-none font-medium">
+                            <span className="bg-surface-recessed text-ink-tertiary border-border-subtle ml-1.5 inline-flex items-center rounded-full border px-1.5 py-0.5 align-middle text-[11px] leading-none font-medium">
                               {t("common.recommended")}
                             </span>
                           )}
                         </span>
-                        {singleQuestion && optIdx < 9 && (
-                          <span className="text-ink-faint tabular-nums mt-0.5 shrink-0 font-mono text-[10.5px]">
+                        {registerGlobalShortcuts && singleQuestion && optIdx < 9 && (
+                          <span className="text-ink-faint tabular-nums mt-0.5 shrink-0 font-mono text-[11px]">
                             {optIdx + 1}
                           </span>
                         )}
@@ -1112,13 +1323,13 @@ function StickyQuestionDockCard({
                   <div
                     className={cn(
                       "flex items-center gap-2.5 px-3 py-2 transition-colors",
-                      hasCustomText && "bg-accent",
+                      isCustomActive && "bg-accent",
                     )}
                   >
                     <PenLine
                       className={cn(
                         "size-3.5 shrink-0 stroke-[1.75]",
-                        hasCustomText ? "text-ink-primary" : "text-ink-faint",
+                        isCustomActive ? "text-ink-primary" : "text-ink-faint",
                       )}
                     />
                     <input
@@ -1128,6 +1339,7 @@ function StickyQuestionDockCard({
                       type="text"
                       disabled={submitting}
                       value={customVal}
+                      onFocus={() => activateCustom(qIdx, q.is_multi_select)}
                       onChange={(e) => handleCustomChange(qIdx, e.target.value, q.is_multi_select)}
                       {...ime.compositionProps}
                       onKeyDown={(e) => {
@@ -1146,12 +1358,16 @@ function StickyQuestionDockCard({
                           ? t("approval.otherPlaceholder")
                           : t("approval.typeAnswerPlaceholder")
                       }
-                      className="text-ink-primary placeholder:text-ink-faint w-full bg-transparent text-[13px] leading-[1.45] outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                      className={cn(
+                        "placeholder:text-ink-faint w-full bg-transparent text-[13px] leading-[1.45] outline-none disabled:cursor-not-allowed disabled:opacity-60",
+                        hasCustomText && !isCustomActive ? "text-ink-muted" : "text-ink-primary",
+                      )}
                     />
                     {customVal.length > 0 && !submitting && (
                       <button
                         type="button"
                         aria-label={t("approval.clearCustomAnswer")}
+                        onMouseDown={(e) => e.preventDefault()}
                         onClick={() => handleCustomChange(qIdx, "", q.is_multi_select)}
                         className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors"
                       >
@@ -1167,13 +1383,13 @@ function StickyQuestionDockCard({
       </ScrollArea>
 
       <div className="border-border-subtle flex items-center justify-between gap-2 border-t px-4 py-2.5">
-        <span className="text-ink-muted inline-flex items-center gap-1.5 text-[11.5px]">
+        <span className="text-ink-muted inline-flex items-center gap-1.5 text-[11px]">
           {canSubmit ? (
             <>
               <ShortcutKbd keys={`${mod}↵`} size="xs" variant="subtle" />
               <span>{t("common.submit")}</span>
             </>
-          ) : singleOptionCount > 0 ? (
+          ) : registerGlobalShortcuts && singleOptionCount > 0 ? (
             t("approval.digitShortcutHint", { count: singleOptionCount })
           ) : (
             t("approval.chooseOptionOrWrite")
@@ -1184,7 +1400,7 @@ function StickyQuestionDockCard({
           size="sm"
           disabled={!canSubmit || submitting}
           onClick={() => void handleSubmit()}
-          className="rounded-full px-3.5"
+          className="rounded-full px-3.5 text-[13px]"
         >
           {submitting && <OrbitSpinner size={12} className="shrink-0" />}
           <span>{submitting ? t("common.submitting") : t("common.submit")}</span>
@@ -1195,6 +1411,7 @@ function StickyQuestionDockCard({
 }
 
 const EMPTY_SUBAGENT_PERMS: readonly UnifiedPendingSubagentPermission[] = [];
+const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
 function sameGuardian(
   a: GuardianAssessment | null | undefined,
@@ -1218,6 +1435,8 @@ export const DecisionDock = memo(
     permissions,
     questions,
     subagentPermissions = EMPTY_SUBAGENT_PERMS,
+    registerGlobalShortcuts = true,
+    compact = false,
   }: {
     hostId: string;
     agentId: string;
@@ -1225,10 +1444,16 @@ export const DecisionDock = memo(
     permissions: readonly PendingPermissionItem[];
     questions: readonly PendingQuestionItem[];
     subagentPermissions?: readonly UnifiedPendingSubagentPermission[];
+    registerGlobalShortcuts?: boolean;
+    compact?: boolean;
   }) {
     const [focusedKey, setFocusedKey] = useState<string | null>(null);
     const [fallbackSlotIndex, setFallbackSlotIndex] = useState<number>(0);
     const [questionDrafts, setQuestionDrafts] = useState<Record<string, QuestionDraftState>>({});
+    const [stepDirection, setStepDirection] = useState<-1 | 1>(1);
+    const pendingStepDirRef = useRef<-1 | 1 | null>(null);
+    const prevQueueKeyRef = useRef<string | null>(null);
+    const stepContentRef = useRef<HTMLDivElement | null>(null);
 
     const queue = useMemo<QueuedDecision[]>(() => {
       const seen = new Set<string>();
@@ -1320,25 +1545,70 @@ export const DecisionDock = memo(
     }, [queue, focusedKey, fallbackSlotIndex]);
 
     const activeEntry = queue[activeIndex] ?? null;
+    const activeQueueKey = activeEntry?.queueKey ?? null;
 
     const handleStep = useCallback(
       (delta: -1 | 1) => {
         if (queue.length <= 1) return;
         const nextIdx = (activeIndex + delta + queue.length) % queue.length;
+        pendingStepDirRef.current = delta;
+        setStepDirection(delta);
         setFallbackSlotIndex(nextIdx);
         setFocusedKey(queue[nextIdx].queueKey);
       },
       [queue, activeIndex],
     );
 
+    useIsomorphicLayoutEffect(() => {
+      if (!activeQueueKey) {
+        prevQueueKeyRef.current = null;
+        pendingStepDirRef.current = null;
+        return;
+      }
+      const prevKey = prevQueueKeyRef.current;
+      prevQueueKeyRef.current = activeQueueKey;
+      const dir = pendingStepDirRef.current ?? 1;
+      pendingStepDirRef.current = null;
+
+      // Initial dock appearance is animated once by `.orbit-dock-enter` on the outer wrapper.
+      if (prevKey === null || prevKey === activeQueueKey) return;
+      const el = stepContentRef.current;
+      if (!el) return;
+      const reducedMotion =
+        typeof window !== "undefined" &&
+        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+      if (reducedMotion) return;
+
+      el.style.transition = "none";
+      el.style.opacity = "0";
+      el.style.transform = `translate3d(${dir * 6}px, 0, 0)`;
+      void el.offsetWidth;
+      el.style.transition =
+        "transform 130ms var(--ease-out-expo), opacity 130ms var(--ease-out-expo)";
+      el.style.opacity = "1";
+      el.style.transform = "translate3d(0, 0, 0)";
+
+      const clearInlineStyles = () => {
+        el.style.transition = "";
+        el.style.opacity = "";
+        el.style.transform = "";
+      };
+      const timer = window.setTimeout(clearInlineStyles, 160);
+      return () => {
+        window.clearTimeout(timer);
+        clearInlineStyles();
+      };
+    }, [activeQueueKey]);
+
     useEffect(() => {
+      if (!registerGlobalShortcuts) return;
       if (queue.length <= 1) {
         setDecisionQueueStepper(null);
         return;
       }
       setDecisionQueueStepper(handleStep);
       return () => setDecisionQueueStepper(null);
-    }, [queue.length, handleStep]);
+    }, [registerGlobalShortcuts, queue.length, handleStep]);
 
     const updateQuestionDraft = useCallback(
       (queueKey: string, updater: (prev: QuestionDraftState) => QuestionDraftState) => {
@@ -1362,8 +1632,12 @@ export const DecisionDock = memo(
     if (!activeEntry) return null;
 
     return (
-      <div className="w-full px-[24px] pb-2">
-        <div className="mx-auto w-full max-w-[var(--orbit-stage-max-w,740px)]">
+      <div className={cn("orbit-dock-enter w-full pb-2", compact ? "px-3" : "px-[24px]")}>
+        <div
+          ref={stepContentRef}
+          data-step-direction={stepDirection}
+          className="mx-auto w-full max-w-[var(--orbit-stage-max-w,740px)]"
+        >
           {activeEntry.kind === "permission" ? (
             <PermissionApprovalCard
               key={activeEntry.queueKey}
@@ -1382,6 +1656,7 @@ export const DecisionDock = memo(
               queueTotal={queue.length}
               onStepPrev={() => handleStep(-1)}
               onStepNext={() => handleStep(1)}
+              registerGlobalShortcuts={registerGlobalShortcuts}
             />
           ) : (
             <StickyQuestionDockCard
@@ -1398,6 +1673,7 @@ export const DecisionDock = memo(
               queueTotal={queue.length}
               onStepPrev={() => handleStep(-1)}
               onStepNext={() => handleStep(1)}
+              registerGlobalShortcuts={registerGlobalShortcuts}
             />
           )}
         </div>
@@ -1408,6 +1684,8 @@ export const DecisionDock = memo(
     prev.hostId === next.hostId &&
     prev.agentId === next.agentId &&
     prev.cwd === next.cwd &&
+    prev.registerGlobalShortcuts === next.registerGlobalShortcuts &&
+    prev.compact === next.compact &&
     prev.permissions.length === next.permissions.length &&
     prev.questions.length === next.questions.length &&
     (prev.subagentPermissions?.length ?? 0) === (next.subagentPermissions?.length ?? 0) &&

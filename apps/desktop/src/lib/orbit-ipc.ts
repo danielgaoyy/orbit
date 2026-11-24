@@ -2362,7 +2362,24 @@ export interface SessionLinkView {
   last_seq: number;
 }
 
+export type SessionPlanStepStatus = "pending" | "in_progress" | "completed" | "skipped" | "failed";
+
+export interface SessionPlanStepView {
+  id: string;
+  title: string;
+  status: SessionPlanStepStatus;
+  active_form?: string;
+  updated_seq: number;
+}
+
+export interface SessionOutlinePromptView {
+  seq: number;
+  preview: string;
+}
+
 export interface SessionInsightsView {
+  outline_prompts?: SessionOutlinePromptView[];
+  plan_steps?: SessionPlanStepView[];
   touched_files: SessionTouchedFileView[];
   background_tasks: SessionBackgroundTaskView[];
   subagents: SessionSubagentEntryView[];

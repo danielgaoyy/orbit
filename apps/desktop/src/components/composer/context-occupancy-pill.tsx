@@ -311,7 +311,7 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
           className="w-[228px] rounded-[12px] p-3"
         >
           <div className="flex flex-col gap-2">
-            <span className="text-ink-secondary text-[12px]">{t("composer.contextLoadFailed")}</span>
+            <span className="text-ink-secondary text-[13px]">{t("composer.contextLoadFailed")}</span>
             <Button
               type="button"
               variant="outline"
@@ -320,7 +320,7 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
                 setLoadFailed(false);
                 void fetchBreakdown(hostId, agentId);
               }}
-              className="h-[28px] w-full gap-1.5 text-[11.5px]"
+              className="h-[28px] w-full gap-1.5 text-[13px]"
             >
               <RefreshCw className="size-3 stroke-[1.8]" />
               <span>{t("composer.contextRetry")}</span>
@@ -421,6 +421,7 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
               strokeDasharray={circumference}
               strokeDashoffset={dashOffset}
               strokeLinecap="round"
+              className="transition-[stroke-dashoffset] duration-300 ease-[var(--ease-out-expo)]"
             />
           </svg>
           {showCompactPct && (
@@ -446,12 +447,12 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
         <div className="flex flex-col gap-2">
           {/* Header: quiet label + crisp percentage */}
           <div className="flex items-baseline justify-between gap-2">
-            <span className="text-ink-primary truncate text-[12px] font-medium tracking-[-0.01em]">
+            <span className="text-ink-primary truncate text-[13px] font-medium tracking-[-0.01em]">
               {t("composer.contextWindow")}
             </span>
             <span
               className={cn(
-                "tabular-nums shrink-0 font-mono text-[11.5px] font-medium",
+                "tabular-nums shrink-0 font-mono text-[13px] font-medium",
                 isCritical
                   ? "text-signal-danger"
                   : isWarning
@@ -481,7 +482,7 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
                 );
               })}
             </div>
-            <div className="text-ink-muted tabular-nums flex items-center justify-between font-mono text-[10.5px]">
+            <div className="text-ink-muted tabular-nums flex items-center justify-between font-mono text-[11px]">
               <span>
                 {formatTokenShort(breakdown.total_used_tokens)} /{" "}
                 {formatTokenShort(breakdown.context_window_tokens)}
@@ -506,7 +507,7 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
                     key={seg.category}
                     onMouseEnter={() => setHoveredCategory(seg.category)}
                     className={cn(
-                      "flex items-center justify-between gap-2 rounded-[6px] px-1 py-0.5 text-[11.5px] leading-[16px] transition-colors",
+                      "flex items-center justify-between gap-2 rounded-[6px] px-1 py-0.5 text-[13px] leading-[18px] transition-colors",
                       active && "bg-accent/65",
                     )}
                   >
@@ -523,7 +524,7 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
                     </span>
                     <span className="text-ink-muted tabular-nums flex shrink-0 items-baseline gap-1.5 font-mono text-[11px]">
                       <span>{formatTokenShort(seg.tokens)}</span>
-                      <span className="text-ink-faint w-[28px] text-right text-[10px]">
+                      <span className="text-ink-faint w-[30px] text-right text-[11px]">
                         {segPct}
                       </span>
                     </span>

@@ -1,5 +1,5 @@
 import { memo, useEffect } from "react";
-import { FileWarning, Loader2 } from "lucide-react";
+import { FileWarning } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -7,9 +7,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { MediaPlayer } from "@/components/viewers/media-player";
 import { PdfViewer } from "@/components/viewers/pdf-viewer";
 import { basenameOfPath } from "@/lib/media-utils";
+import { useDelayedLoading } from "@/lib/use-delayed-loading";
 import { fileCacheKey, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 export const MediaPreviewModal = memo(function MediaPreviewModal() {
@@ -47,6 +49,10 @@ export const MediaPreviewModal = memo(function MediaPreviewModal() {
       : undefined;
 
   const data = cacheEntry?.data ?? null;
+  const isInitialLoading = Boolean(
+    needsRemoteLoad && (!cacheEntry || cacheEntry.status === "loading") && !data,
+  );
+  const showLoadingIndicator = useDelayedLoading(isInitialLoading);
   const effectiveKind =
     data && (data.content_kind === "pdf" || data.content_kind === "audio" || data.content_kind === "video")
       ? data.content_kind
@@ -73,11 +79,15 @@ export const MediaPreviewModal = memo(function MediaPreviewModal() {
 
         {target && (
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden pr-0">
-            {needsRemoteLoad && (!cacheEntry || cacheEntry.status === "loading") && !data ? (
-              <div className="text-muted-foreground flex flex-1 items-center justify-center gap-2 py-20 text-[13px]">
-                <Loader2 className="size-4 animate-spin" />
-                <span>Loading {displayName}…</span>
-              </div>
+            {isInitialLoading ? (
+              showLoadingIndicator ? (
+                <div className="orbit-stage-enter text-muted-foreground flex flex-1 items-center justify-center gap-2 py-20 text-[13px]">
+                  <OrbitSpinner size={15} />
+                  <span>Loading {displayName}…</span>
+                </div>
+              ) : (
+                <div className="flex flex-1 py-20" />
+              )
             ) : needsRemoteLoad && cacheEntry?.status === "error" && !data ? (
               <div className="text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 px-6 py-20 text-center">
                 <FileWarning className="size-5 opacity-65" />

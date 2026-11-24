@@ -248,7 +248,7 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
             className="hover:bg-accent flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors disabled:opacity-50"
           >
             <div className="min-w-0">
-              <div className="text-foreground text-[12.5px] font-medium">
+              <div className="text-foreground text-[13px] font-medium">
                 {t("peerStrip.addCodeReviewer")}
               </div>
               <div className="text-muted-foreground text-[11px]">
@@ -270,7 +270,7 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
               className="hover:bg-accent flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors disabled:opacity-50"
             >
               <div className="min-w-0">
-                <div className="text-foreground flex items-center gap-1.5 text-[12.5px] font-medium">
+                <div className="text-foreground flex items-center gap-1.5 text-[13px] font-medium">
                   <GitBranch className="h-[12px] w-[12px] opacity-75" />
                   <span>{t("peerStrip.parallelWorker")}</span>
                 </div>
@@ -301,7 +301,7 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
                     );
                     setOpen(false);
                   }}
-                  className="text-foreground/85 hover:bg-accent hover:text-foreground flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors"
+                  className="text-foreground/85 hover:bg-accent hover:text-foreground flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors"
                 >
                   <Layers className="text-muted-foreground h-[12.5px] w-[12.5px] shrink-0" />
                   <span className="truncate">{ws.title}</span>
@@ -323,13 +323,13 @@ export const StandaloneGroupButton = memo(function StandaloneGroupButton() {
                 }
               }}
               placeholder={t("peerStrip.newGroupNamePlaceholder")}
-              className="border-border bg-canvas text-foreground h-[26px] min-w-0 flex-1 rounded-md border px-2 text-[12px] outline-none"
+              className="border-border bg-canvas text-foreground h-[26px] min-w-0 flex-1 rounded-md border px-2 text-[13px] outline-none"
             />
             <button
               type="button"
               disabled={!newGroupTitle.trim()}
               onClick={() => void handleCreateGroup()}
-              className="bg-foreground text-background inline-flex h-[26px] shrink-0 cursor-pointer items-center rounded-md px-2.5 text-[11.5px] font-medium disabled:opacity-35"
+              className="bg-foreground text-background inline-flex h-[26px] shrink-0 cursor-pointer items-center rounded-md px-2.5 text-[13px] font-medium disabled:opacity-35"
             >
               {t("peerStrip.create")}
             </button>
@@ -624,7 +624,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   ? t("peerStrip.groupTitleTooltip", { title: workspace.title })
                   : t("peerStrip.manageGroup")
               }
-              className="text-foreground/78 hover:text-foreground inline-flex h-[22px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-1.5 text-[12px] font-medium transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06] @[480px]:gap-1.5"
+              className="text-foreground/78 hover:text-foreground inline-flex h-[22px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-1.5 text-[13px] font-medium transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06] @[480px]:gap-1.5"
             >
               <Layers className="text-muted-foreground h-[12px] w-[12px] shrink-0 stroke-[1.75]" />
               <span className="max-w-[72px] truncate @[480px]:max-w-[112px] @[640px]:max-w-[144px]">
@@ -674,14 +674,14 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       }
                     }}
                     placeholder={t("peerStrip.groupNameInputPlaceholder")}
-                    className="h-[26px] flex-1 rounded-[6px] px-2 text-[12px]"
+                    className="h-[26px] flex-1 rounded-[6px] px-2 text-[13px]"
                   />
                   <Button
                     type="button"
                     size="xs"
                     disabled={!groupRenameDraft.trim() || groupRenameDraft.trim() === workspace.title}
                     onClick={() => void handleRenameCurrentGroup()}
-                    className="h-[26px] shrink-0 px-2 text-[11.5px]"
+                    className="h-[26px] shrink-0 px-2 text-[13px]"
                   >
                     {t("peerStrip.save")}
                   </Button>
@@ -718,7 +718,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                           setGroupSwitcherOpen(false);
                         }}
                         className={cn(
-                          "flex w-full cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors",
+                          "flex w-full cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors",
                           isCurrent
                             ? "bg-foreground/[0.06] text-foreground font-medium"
                             : "text-foreground/82 hover:bg-accent hover:text-foreground",
@@ -759,14 +759,14 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     }
                   }}
                   placeholder={t("peerStrip.groupNamePlaceholder")}
-                  className="h-[26px] flex-1 rounded-[6px] px-2 text-[12px]"
+                  className="h-[26px] flex-1 rounded-[6px] px-2 text-[13px]"
                 />
                 <Button
                   type="button"
                   size="xs"
                   disabled={!newGroupTitle.trim()}
                   onClick={() => void handleCreateAndMoveGroup()}
-                  className="h-[26px] shrink-0 px-2 text-[11.5px]"
+                  className="h-[26px] shrink-0 px-2 text-[13px]"
                 >
                   {t("peerStrip.create")}
                 </Button>
@@ -786,7 +786,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     );
                     setGroupSwitcherOpen(false);
                   }}
-                  className="text-muted-foreground hover:text-foreground hover:bg-accent flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-left text-[12px] transition-colors"
+                  className="text-muted-foreground hover:text-foreground hover:bg-accent flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-left text-[13px] transition-colors"
                 >
                   <X className="h-[12.5px] w-[12.5px]" />
                   <span>{t("peerStrip.removeFromGroup")}</span>
@@ -827,7 +827,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
               <div
                 key={peer.agent_id}
                 className={cn(
-                  "group/peer inline-flex h-[22px] shrink-0 items-center gap-1 rounded-[6px] px-1.5 text-[12px] transition-colors @[520px]:px-2",
+                  "group/peer inline-flex h-[22px] shrink-0 items-center gap-1 rounded-[6px] px-1.5 text-[13px] transition-colors @[520px]:px-2",
                   isActive
                     ? "bg-black/[0.055] text-foreground font-medium dark:bg-white/[0.085]"
                     : "text-muted-foreground hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.06]",
@@ -856,7 +856,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                           setEditingPeerId(null);
                         }
                       }}
-                      className="bg-background text-foreground ring-foreground/25 h-[18px] w-24 rounded px-1 text-[11.5px] font-normal ring-1 outline-none"
+                      className="bg-background text-foreground ring-foreground/25 h-[18px] w-24 rounded px-1 text-[13px] font-normal ring-1 outline-none"
                     />
                   </div>
                 ) : (
@@ -894,7 +894,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       )}
                       <span className="max-w-[96px] truncate @[520px]:max-w-[132px]">{label}</span>
                       {peer.worktree_branch && (
-                        <span className="text-muted-foreground/70 hidden max-w-20 items-center gap-0.5 truncate font-mono text-[10.5px] @[640px]:inline-flex">
+                        <span className="text-muted-foreground/70 hidden max-w-20 items-center gap-0.5 truncate font-mono text-[11px] @[640px]:inline-flex">
                           <GitBranch className="h-[9.5px] w-[9.5px] shrink-0" />
                           <span className="truncate">{peer.worktree_branch}</span>
                         </span>
@@ -959,7 +959,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
             className="w-[312px] space-y-2.5 p-2.5 select-none"
           >
             <div className="flex items-center justify-between px-1">
-              <span className="text-foreground flex items-center gap-1.5 text-[12.5px] font-medium">
+              <span className="text-foreground flex items-center gap-1.5 text-[13px] font-medium">
                 <Users className="text-muted-foreground h-[13.5px] w-[13.5px]" />
                 <span>{t("peerStrip.addCollaborator")}</span>
               </span>
@@ -976,7 +976,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                 className="hover:bg-accent flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors disabled:opacity-50"
               >
                 <div className="min-w-0">
-                  <div className="text-foreground text-[12.5px] font-medium">
+                  <div className="text-foreground text-[13px] font-medium">
                     {t("peerStrip.codeReviewerTitle")}
                   </div>
                   <div className="text-muted-foreground text-[11px]">
@@ -998,7 +998,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   className="hover:bg-accent flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors disabled:opacity-50"
                 >
                   <div className="min-w-0">
-                    <div className="text-foreground flex items-center gap-1.5 text-[12.5px] font-medium">
+                    <div className="text-foreground flex items-center gap-1.5 text-[13px] font-medium">
                       <GitBranch className="h-[12px] w-[12px] opacity-75" />
                       <span>{t("peerStrip.parallelWorkerTitle")}</span>
                     </div>
@@ -1020,7 +1020,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   value={customHandle}
                   onChange={(e) => setCustomHandle(e.target.value)}
                   placeholder={t("peerStrip.labelPlaceholder")}
-                  className="h-[28px] rounded-[6px] px-2 text-[12px]"
+                  className="h-[28px] rounded-[6px] px-2 text-[13px]"
                 />
                 <Select<ProviderKind>
                   size="compact"
@@ -1031,7 +1031,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     value: p,
                     label: providerShortName(p),
                   }))}
-                  triggerClassName="h-[28px] w-full bg-canvas text-[12px]"
+                  triggerClassName="h-[28px] w-full bg-canvas text-[13px]"
                   menuClassName="min-w-[144px]"
                   onChange={(provider) => setCustomProvider(provider)}
                 />
@@ -1041,7 +1041,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                 value={customPrompt}
                 onChange={(e) => setCustomPrompt(e.target.value)}
                 placeholder={t("peerStrip.customPromptPlaceholder")}
-                className="min-h-[54px] resize-none rounded-[6px] p-2 text-[12px]"
+                className="min-h-[54px] resize-none rounded-[6px] p-2 text-[13px]"
               />
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
@@ -1051,12 +1051,12 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     ariaLabel={t("peerStrip.peerPermissionModeAria")}
                     value={typeof customMode === "string" ? customMode : "accept_edits"}
                     options={peerModeOptions}
-                    triggerClassName="h-[25px] bg-canvas"
+                    triggerClassName="h-[25px] bg-canvas text-[11px]"
                     menuClassName="min-w-[152px]"
                     onChange={(mode) => setCustomMode(mode)}
                   />
                   {canWorktree && (
-                    <label className="text-muted-foreground inline-flex cursor-pointer items-center gap-1.5 text-[11.5px] select-none">
+                    <label className="text-muted-foreground inline-flex cursor-pointer items-center gap-1.5 text-[11px] select-none">
                       <Checkbox
                         size="sm"
                         checked={customWorktree}
@@ -1071,7 +1071,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   size="xs"
                   disabled={!customPrompt.trim() || spawning}
                   onClick={() => void launchCustomPeer()}
-                  className="h-[26px] gap-1 px-2.5 text-[12px]"
+                  className="h-[26px] gap-1 px-2.5 text-[13px]"
                 >
                   {spawning ? (
                     <Loader2 className="h-[12px] w-[12px] animate-spin" />
@@ -1122,12 +1122,12 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                 workspace?.title,
               )
             }
-            className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center gap-1 rounded-[6px] px-0 text-[11.5px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06] @[480px]:w-auto @[480px]:px-1.5"
+            className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center gap-1 rounded-[6px] px-0 text-[11px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06] @[480px]:w-auto @[480px]:px-1.5"
           >
             <FileText className="h-[12px] w-[12px] shrink-0 stroke-[1.75]" />
             <span className="hidden @[480px]:inline">{t("peerStrip.notes")}</span>
             {boardRev > 0 && (
-              <span className="text-muted-foreground/65 hidden font-mono text-[10.5px] @[560px]:inline">
+              <span className="text-muted-foreground/65 hidden font-mono text-[11px] @[560px]:inline">
                 v{boardRev}
               </span>
             )}

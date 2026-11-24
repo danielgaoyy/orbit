@@ -16,7 +16,7 @@
 
 | 路径 | 管辖范围 (Scope Globs) | 何时必须先读 (Mandatory Pre-Read Trigger) | 权威边界 (Source of Truth) | 同步更新触发器 (Keep-in-Sync) |
 | --- | --- | --- | --- | --- |
-| `AGENTS.md` | `**` | 每次进入仓库开始任何任务时必读 | 5 条架构与安全红线、PR-First 流程铁律、任务触发路由表（硬上限 ≤ 140 行 / 8 KB） | 修改核心红线、发版流程或新增专题/领域文档入口 |
+| `AGENTS.md` | `**` | 每次进入仓库开始任何任务时必读 | 6 条核心架构与工程红线（含全局同源排查与联动预检）、PR-First 流程铁律、任务触发路由表（硬上限 ≤ 140 行 / 8 KB） | 修改核心红线、发版流程或新增专题/领域文档入口 |
 | `README.md` | `README.md` | 对外介绍能力矩阵、快速安装与源码构建命令时 | 项目对外总览、Quick Start 与各端构建命令索引 | 增减支持平台、主流 Provider 或变更仓库总览文档链接 |
 | `ARCHITECTURE.md` | `crates/**`, `apps/**` | 首次理解全栈分层与 13 个 crate / 4 个 app 拓扑关系时 | 宏观系统拓扑图与四端/多 crate 职责边界总览 | 新增/移除 crate 或 app、调整系统核心协议或 UI 基础库选型 |
 | `CONTRIBUTING.md` | `**` | 提交 PR、检查环境依赖或核对开源协作规范时 | PR 规范、本地环境前置依赖与验证命令清单 | 修改构建先决条件、CI 检查门禁或 PR 提交规范 |
@@ -30,11 +30,11 @@
 | 路径 | 管辖范围 (Scope Globs) | 何时必须先读 (Mandatory Pre-Read Trigger) | 权威边界 (Source of Truth) | 同步更新触发器 (Keep-in-Sync) |
 | --- | --- | --- | --- | --- |
 | `docs/INDEX.md` | `**/*.md`, `**/AGENTS.md`, `**/SKILL.md` | 新增、迁移、拆分或归档任何仓库文档前 | 全仓文档/Skill/子目录 `AGENTS.md` 注册表与路由边界 | 仓库新增、重命名、迁移或删除任何受管文档 |
-| `docs/CLIENT_BRIDGE_ARCHITECTURE.md` | `crates/orbit-client-core/**`, `crates/orbit-ffi-uniffi/**`, `crates/orbit-ffi-ohos/**`, `apps/**` | 增删 FFI/IPC 接口、修改 Stage 增量投影、Sidebar 树、图渲染或四端行为对齐前 | Client Bridge v2 数据流、FFI/IPC 契约表、AgentCard 创建时间、SQLite `client_thread_prefs` 与四端对齐矩阵 | 变更 `contract.rs`、`orbit-ffi-*`、Tauri IPC 命令或跨端交互语义 |
+| `docs/CLIENT_BRIDGE_ARCHITECTURE.md` | `crates/orbit-client-core/**`, `crates/orbit-ffi-uniffi/**`, `crates/orbit-ffi-ohos/**`, `apps/**` | 增删 FFI/IPC 接口、修改 Stage 增量投影、Sidebar 树、图渲染或四端行为对齐前 | Client Bridge v2 数据流、FFI/IPC 契约表、会话 `plan_steps` / 全量 `outline_prompts` 投影与各端绑定覆盖、AgentCard 创建时间、SQLite `client_thread_prefs` 与四端对齐矩阵 | 变更 `contract.rs`、`orbit-ffi-*`、Tauri IPC 命令或跨端交互语义 |
 | `docs/cloud-sync.md` | `crates/orbit-client-core/src/cloud_sync.rs`, `crates/orbit-crypto/**`, `crates/orbit-cli/**` | 修改 GitHub Gist Cloud Sync 加密、OAuth Device Flow 或 LWW 合并逻辑前 | 零知识 BYOS 云同步协议、`ORBIT_GITHUB_CLIENT_ID` 配置与使用流程 | 变更 vault 格式、OAuth Client ID / scope 或同步合并规则 |
 | `docs/architecture/daemon-shim-providers.md` | `crates/orbit-daemon/**`, `crates/orbit-shim/**`, `crates/orbit-providers/**`, `crates/orbit-protocol/**`, `crates/orbit-relay-transport/**` | 修改 Daemon 生命周期、Shim socket、`claude`/`codex`/`agy`/ACP 驱动、消息防错位、尾部分页或 Relay 心跳前 | Daemon/Shim 解耦、驱动矩阵、Turn 对齐与延迟 finalize 去重、尾部分页契约、Off-LAN Relay 同步 | 变更 Wire 协议、Provider 状态机、分页参数或 Relay 断线重连策略 |
 | `docs/architecture/mission-workspace-collab.md` | `crates/orbit-daemon/src/{workspace_board,workspace_organizer,workspace_cluster,worktree_handoff,timers,messaging}.rs`, `crates/orbit-store/src/{workspace_sync,orchestration,timers}.rs` | 修改 Mission Workspace、共享 `BOARD.md`、Worktree 隔离/handoff、`@handle` 别名或条件定时器前 | 并行优先协作、CAS 看板、Worktree 隔离标签、`orbit.handle_aliases` 历史解析与唤醒防风暴约束 | 变更协作工具 Schema、别名保留字段（含 `UpdateAgent`）或计时器语义 |
-| `docs/design/README.md` | `apps/**`, `.agents/skills/interface-design/**`, `.agents/skills/shadcn/**` | 进行任何 UI 视觉设计、交互重构、设计 Tokens、弹窗/表单或三语文案修改前 | Orbit UI/交互治理入口、与 `interface-design` / `shadcn` Skill 及 `.interface-design/system.md` 的衔接、Composer 首行指令交互、Subagent 分层 SVG 头像与 Desktop i18n 规范 | 确立或修改通用设计系统约束、交互规则或 i18n 语种列表 |
+| `docs/design/README.md` | `apps/**`, `.agents/skills/interface-design/**`, `.agents/skills/shadcn/**` | 进行任何 UI 视觉设计、交互重构、动效调整、设计 Tokens、弹窗/表单或三语文案修改前 | 全端 UX 八大原则（系统吸收复杂性）、以状态变化驱动的苹果级动效宪法七大准则、设计工作流路由（`interface-design` / `shadcn` Skill、`.interface-design/system.md`）、跨端边界与验证门禁 | 调整通用 UX/动效准则、设计系统约束、i18n 语种或 UI 验收命令 |
 | `.agents/skills/interface-design/SKILL.md` | `apps/**` | 动手设计、实现、审查或打磨 `apps/` 下任何界面与交互前（必读 Skill） | 界面质感与交互设计方法论、层级/留白/色彩/动效规范及自检标准 | 更新或升级 `interface-design` Skill 版本（同步 `skills-lock.json`） |
 | `.agents/skills/shadcn/SKILL.md` | `apps/desktop/**` | 在 Desktop 中新增、组合、重构或排查 shadcn/ui 组件、表单与样式前（必读 Skill） | 官方 shadcn/ui（Base UI）组件组合、表单 Field 原语、Styling 规范与 Registry 使用指南 | 更新或升级 `shadcn` Skill 版本（同步 `skills-lock.json`） |
 | `docs/engineering/git-pr-release-workflow.md` | `.github/**`, `Cargo.toml`, `apps/*/package.json`, `apps/ios/project.yml`, `apps/android/app/build.gradle.kts`, `apps/harmony/AppScope/app.json5` | 提交代码、创建 PR、修改分支保护、切版本号或打 `v*` Tag 发版前 | PR-First 强制工作流、GitHub Rulesets、13 文件版本清单与 Tag/Yank 规范 | 修改发版涉及的清单文件、Ruleset 策略或 Tag 触发条件 |
@@ -49,7 +49,7 @@
 | --- | --- | --- | --- | --- |
 | `crates/AGENTS.md` | `crates/**` | 修改任意 Rust crate 前 | Rust workspace 编码红线、向后兼容原则与提交前检查链 | 修改 workspace lint 等级、共有 FFI/Wire 兼容策略 |
 | `apps/AGENTS.md` | `apps/**` | 修改桌面端或任意移动端界面与客户端代码前 | 全端共用 UI 必读 Skill 约束与 Thin-UI 业务逻辑禁区 | 调整跨端共享原则或 UI Skill 挂载路径 |
-| `apps/desktop/AGENTS.md` | `apps/desktop/**` | 修改 React 前端、Tauri Rust 后端或构建/测试脚本前 | React 19 `useSyncExternalStore` 防 `#185` 规范、三语 i18n、Tauri IPC 同步与 Smoke 门禁 | 变更 Desktop 前端架构、状态订阅约束或必需验证命令 |
+| `apps/desktop/AGENTS.md` | `apps/desktop/**` | 修改 React 前端、Tauri Rust 后端或构建/测试脚本前 | React 19 `useSyncExternalStore` 防 `#185` 规范、13px 根字号换算、平行视图同源与容器联动自检、三语 i18n、Tauri IPC 同步与 Smoke 门禁 | 变更 Desktop 前端架构、状态订阅约束或必需验证命令 |
 | `apps/ios/AGENTS.md` | `apps/ios/**` | 修改 SwiftUI 视图、`OrbitIosStore.swift`、`project.yml` 或绑定脚本前 | iOS UniFFI 绑定刷新、`xcodegen generate` 与 arm64 Simulator 逻辑测试规范 | 变更 iOS 构建脚本、Simulator 目标或存储安全类约定 |
 | `apps/android/AGENTS.md` | `apps/android/**` | 修改 Kotlin / Compose UI、`build.gradle.kts` 或 Android JNI 绑定前 | Android NDK/UniFFI 绑定同步、API 29–36 构建与 Contract v2 对齐约定 | 变更 Android SDK 基线或 NDK 构建脚本 |
 | `apps/harmony/AGENTS.md` | `apps/harmony/**` | 修改 HarmonyOS ArkTS / ArkUI V2 或 `ohos-rs` N-API 绑定前 | HarmonyOS 7+ (API 26) 构建、防提交本机签名配置与 N-API 对齐约定 | 变更 HarmonyOS 构建/剥离签名脚本或目标 API 级别 |

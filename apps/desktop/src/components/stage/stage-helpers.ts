@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
-import { extractInlineArtifactDirectives } from "@/components/artifacts/mcp-app-bridge";
+import { DEFAULT_LOCALE, translate, type OrbitLocale } from "../../lib/i18n/index.ts";
+import { extractInlineArtifactDirectives } from "../artifacts/mcp-app-bridge.ts";
 import type {
   ArtifactSummary,
   DiffFileView,
@@ -12,7 +13,19 @@ import type {
   TimelineItemView,
   WorkSummaryResultView,
 } from "@/lib/orbit-ipc";
-import type { ResolvedSubagentItem } from "@/lib/subagents";
+import {
+  areResolvedSubagentsEqual,
+  classifyGenericSubagentTool,
+  type ResolvedSubagentItem,
+  type SubagentNameMatcher,
+} from "../../lib/subagents.ts";
+import {
+  selectPendingDecisions,
+  selectSessionSubagents,
+  type SessionSubagentWithAvatar,
+  type UnifiedPendingDecisions,
+} from "../../state/selectors/session-selectors.ts";
+import type { OrbitUiState } from "../../state/store-types.ts";
 
 export const USER_PROMPT_PREVIEW_MAX_PX = 124;
 
@@ -23,13 +36,159 @@ export interface TurnTimingRecord {
   workDurationMs: number | null;
 }
 
+export interface ViewportAnchorHoldOptions {
+  intent?: "expand" | "collapse";
+}
+
 export type ViewportAnchorHoldFn = (
   triggerEl: HTMLElement | null,
   apply: () => void,
   edge?: "top" | "bottom",
+  options?: ViewportAnchorHoldOptions,
 ) => void;
 
+export const STAGE_OCCLUSION_THRESHOLD_PX = 22;
+export const STAGE_JUMP_LATEST_THRESHOLD_PX = 72;
+export const STAGE_STICKY_REENGAGE_THRESHOLD_PX = 20;
+
+export function computeStageScrollState({
+  currentTop, previousTop, distanceFromBottom, stickToBottom,
+  holdActive = false, isShellLayoutMoving = false, hasTurns = true,
+}: {
+  currentTop: number;
+  previousTop: number;
+  distanceFromBottom: number;
+  stickToBottom: boolean;
+  holdActive?: boolean;
+  isShellLayoutMoving?: boolean;
+  hasTurns?: boolean;
+}) {
+  // Chrome clamps scrollTop when content shrinks. Only movement within the new
+  // scroll range can be a user scrolling up from the previously observed top.
+  const reachablePreviousTop = Math.min(previousTop, currentTop + Math.max(0, distanceFromBottom));
+  if (!holdActive) {
+    if (currentTop < reachablePreviousTop - 1.5 && !isShellLayoutMoving) {
+      stickToBottom = false;
+    } else if (currentTop > previousTop && distanceFromBottom <= STAGE_STICKY_REENGAGE_THRESHOLD_PX) {
+      stickToBottom = true;
+    }
+  }
+  return {
+    stickToBottom,
+    isOccludingText: hasTurns && !stickToBottom && distanceFromBottom > STAGE_OCCLUSION_THRESHOLD_PX,
+    showJumpLatest: hasTurns && !stickToBottom && distanceFromBottom > STAGE_JUMP_LATEST_THRESHOLD_PX,
+  };
+}
+
+export function computeDisclosureRevealDelta({
+  intent, beforeContainerHeight, containerRect, scrollerRect, triggerRect,
+}: {
+  intent?: ViewportAnchorHoldOptions["intent"];
+  beforeContainerHeight: number;
+  containerRect: Pick<DOMRect, "bottom" | "height">;
+  scrollerRect: Pick<DOMRect, "top" | "bottom" | "height">;
+  triggerRect: Pick<DOMRect, "top" | "bottom">;
+}): number {
+  if (intent === "collapse" || (!intent && containerRect.height < beforeContainerHeight - 2)) return 0;
+  const maxNudge = Math.max(0, triggerRect.top - scrollerRect.top - 24);
+  const overflowBelow = containerRect.bottom - scrollerRect.bottom;
+  if (overflowBelow <= 8 || maxNudge <= 4) return 0;
+  const fullReveal = Math.min(overflowBelow + 16, maxNudge);
+  if (containerRect.height <= scrollerRect.height * 0.55) return fullReveal;
+  const visibleBelowTrigger = Math.max(0, scrollerRect.bottom - triggerRect.bottom);
+  const targetReveal = Math.min(240, Math.round(scrollerRect.height * 0.35));
+  return Math.min(fullReveal, Math.max(0, targetReveal - visibleBelowTrigger));
+}
+
 export type ThinkingDurationLookupFn = (thinkKey: string) => number | null;
+
+interface StageTurnTimings {
+  timing?: TurnTimingRecord;
+  activeThinkingKey: string | null;
+  thinking: Record<string, TurnTimingRecord>;
+  thinkingVersion: number;
+  getThinkingDurationMs: ThinkingDurationLookupFn;
+}
+
+export const EMPTY_TURN_TIMINGS: StageTurnTimings = {
+  activeThinkingKey: null,
+  thinking: {},
+  thinkingVersion: 0,
+  getThinkingDurationMs: () => null,
+};
+
+// Evict a turn's version and durations together. A single long-running turn is bounded too.
+const MAX_TIMED_TURNS = 200;
+const MAX_THINKING_BLOCKS_PER_TURN = 200;
+export type StageTimingHistory = ReadonlyMap<string, StageTurnTimings>;
+
+export function updateStageTimingHistory(
+  history: StageTimingHistory,
+  hostId: string,
+  agentId: string,
+  turn: StageTurnView,
+  active: boolean,
+  now: number,
+): StageTimingHistory {
+  const key = `${hostId}::${agentId}::${turn.key}`;
+  const previous = history.get(key) ?? EMPTY_TURN_TIMINGS;
+  let { timing } = previous;
+  if (active && (!timing || timing.completedAtMs !== null)) {
+    const startedAtMs = Math.min(turn.started_at_ms ?? now, now);
+    timing = { startedAtMs, completedAtMs: null, durationMs: null, workDurationMs: null };
+  } else if (timing && timing.completedAtMs === null) {
+    const elapsed = Math.max(0, now - timing.startedAtMs);
+    if (!active) {
+      timing = {
+        ...timing,
+        completedAtMs: now,
+        durationMs: elapsed,
+        workDurationMs: timing.workDurationMs ?? elapsed,
+      };
+    } else if (turn.terminal_reply && timing.workDurationMs === null) {
+      timing = { ...timing, workDurationMs: elapsed };
+    } else if (!turn.terminal_reply && timing.workDurationMs !== null) {
+      timing = { ...timing, workDurationMs: null };
+    }
+  }
+
+  const lastSegment = turn.live_segments.at(-1);
+  const tail = active && lastSegment?.kind === "step_group" ? lastSegment.items.at(-1) : null;
+  const tailKey = tail?.item_type === "assistant_thinking"
+    ? `${agentId}::think::${tail.item_id || tail.seq}`
+    : null;
+  const activeThinkingKey = tailKey && previous.thinking[tailKey]?.completedAtMs == null ? tailKey : null;
+  let entry = previous;
+  if (activeThinkingKey !== previous.activeThinkingKey) {
+    const thinking = { ...previous.thinking };
+    if (previous.activeThinkingKey !== null) {
+      const block = thinking[previous.activeThinkingKey];
+      thinking[previous.activeThinkingKey] = {
+        ...block, completedAtMs: now, durationMs: Math.max(0, now - block.startedAtMs),
+      };
+    }
+    if (activeThinkingKey !== null) {
+      thinking[activeThinkingKey] = {
+        startedAtMs: now, completedAtMs: null, durationMs: null, workDurationMs: null,
+      };
+      const keys = Object.keys(thinking);
+      if (keys.length > MAX_THINKING_BLOCKS_PER_TURN) delete thinking[keys[0]];
+    }
+    entry = {
+      activeThinkingKey,
+      thinking,
+      thinkingVersion: previous.thinkingVersion + 1,
+      getThinkingDurationMs: (thinkKey) => thinking[thinkKey]?.durationMs ?? null,
+    };
+  }
+
+  if (timing === previous.timing && entry === previous) return history;
+  const next = new Map(history);
+  next.delete(key);
+  next.set(key, { ...entry, timing });
+  if (next.size > MAX_TIMED_TURNS) next.delete(next.keys().next().value!);
+  return next;
+}
 
 export interface UserPromptPresentation {
   cleanText: string;
@@ -125,122 +284,210 @@ export const EMPTY_WORK_COUNTS: WorkSummaryResultView["counts"] = {
   deletions: 0,
 };
 
-// Singleton Intl formatters & tooltip cache so N turns allocate zero formatter instances per render
-const SHORT_DATE_SAME_YEAR_FMT =
-  typeof Intl !== "undefined"
-    ? new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" })
-    : null;
-const SHORT_DATE_WITH_YEAR_FMT =
-  typeof Intl !== "undefined"
-    ? new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" })
-    : null;
-const FULL_TIMESTAMP_FMT =
-  typeof Intl !== "undefined"
-    ? new Intl.DateTimeFormat("en-US", {
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      })
-    : null;
-const fullTimestampTooltipCache = new Map<number, string>();
-
-// Shared singleton relative-time clocks (15s for recent < 1h, 60s for older >= 1h)
-const RECENT_CLOCK_THRESHOLD_MS = 3_600_000;
-let sharedRelativeNowMs = Date.now();
-let sharedSlowRelativeNowMs = Date.now();
-let sharedRelativeTimerId: number | null = null;
-let sharedSlowRelativeTimerId: number | null = null;
-const relativeClockListeners = new Set<() => void>();
-const slowRelativeClockListeners = new Set<() => void>();
-
-function subscribeRelativeClock(listener: () => void): () => void {
-  relativeClockListeners.add(listener);
-  if (sharedRelativeTimerId === null && typeof window !== "undefined") {
-    sharedRelativeNowMs = Date.now();
-    sharedRelativeTimerId = window.setInterval(() => {
-      sharedRelativeNowMs = Date.now();
-      for (const fn of relativeClockListeners) {
-        fn();
-      }
-    }, 15_000);
-  }
-  return () => {
-    relativeClockListeners.delete(listener);
-    if (relativeClockListeners.size === 0 && sharedRelativeTimerId !== null) {
-      window.clearInterval(sharedRelativeTimerId);
-      sharedRelativeTimerId = null;
-    }
-  };
+function sameItems(a: readonly unknown[], b: readonly unknown[]): boolean {
+  return a === b || (a.length === b.length && a.every((item, i) => item === b[i]));
 }
 
-function subscribeSlowRelativeClock(listener: () => void): () => void {
-  slowRelativeClockListeners.add(listener);
-  if (sharedSlowRelativeTimerId === null && typeof window !== "undefined") {
-    sharedSlowRelativeNowMs = Date.now();
-    sharedSlowRelativeTimerId = window.setInterval(() => {
-      sharedSlowRelativeNowMs = Date.now();
-      for (const fn of slowRelativeClockListeners) {
-        fn();
-      }
-    }, 60_000);
-  }
-  return () => {
-    slowRelativeClockListeners.delete(listener);
-    if (slowRelativeClockListeners.size === 0 && sharedSlowRelativeTimerId !== null) {
-      window.clearInterval(sharedSlowRelativeTimerId);
-      sharedSlowRelativeTimerId = null;
-    }
-  };
-}
-
-export function useSharedRelativeNow(timestampMs: number): number {
-  const isRecent = Date.now() - timestampMs < RECENT_CLOCK_THRESHOLD_MS;
-  return useSyncExternalStore(
-    isRecent ? subscribeRelativeClock : subscribeSlowRelativeClock,
-    () => (isRecent ? sharedRelativeNowMs : sharedSlowRelativeNowMs),
-    () => (isRecent ? sharedRelativeNowMs : sharedSlowRelativeNowMs),
+function sameStageSubagents(a: readonly SessionSubagentWithAvatar[], b: readonly SessionSubagentWithAvatar[]) {
+  return areResolvedSubagentsEqual(a, b) && a.every((sa, i) =>
+    sa.character === b[i].character && sa.remoteHostName === b[i].remoteHostName &&
+    sa.isManaged === b[i].isManaged && sa.childProvider === b[i].childProvider,
   );
 }
 
-export function formatRelativeTimeLabel(timestampMs: number, nowMs: number): string {
+/** Keep React's session snapshot stable across token deltas and unrelated host updates. */
+export function createStageSessionSelector(hostId: string | null, agentId: string | null) {
+  let inputs: readonly unknown[] = [];
+  let snapshot: {
+    subagents: readonly SessionSubagentWithAvatar[];
+    decisions: UnifiedPendingDecisions;
+  } | undefined;
+  return (state: Pick<OrbitUiState, "hostDetails" | "fleet" | "stages" | "archivedSubagents">) => {
+    const stage = hostId && agentId ? state.stages[`${hostId}::${agentId}`] : undefined;
+    // Archive filters only affect the visible roster. Stage and decisions both use the full roster.
+    const nextInputs = [
+      state.hostDetails, state.fleet.hosts, stage?.insights?.subagents,
+      stage?.pending_permissions, stage?.pending_questions,
+    ];
+    if (snapshot && sameItems(inputs, nextInputs)) return snapshot;
+
+    const all = selectSessionSubagents(state, hostId, agentId).all;
+    const subagents = snapshot && sameStageSubagents(snapshot.subagents, all) ? snapshot.subagents : all;
+    const decisions = selectPendingDecisions(state, hostId, agentId);
+    inputs = nextInputs;
+    if (snapshot && subagents === snapshot.subagents) {
+      const prev = snapshot.decisions;
+      if (
+        sameItems(prev.parentPermissions, decisions.parentPermissions) &&
+        sameItems(prev.parentQuestions, decisions.parentQuestions) &&
+        prev.subagentPermissions.length === decisions.subagentPermissions.length &&
+        decisions.subagentPermissions.every((item, i) =>
+          item.key === prev.subagentPermissions[i].key && item.permission === prev.subagentPermissions[i].permission,
+        )
+      ) return snapshot;
+    }
+    snapshot = { subagents, decisions };
+    return snapshot;
+  };
+}
+
+const subagentReferences = new WeakMap<StageTurnView, boolean>();
+
+export function turnHasSubagentReferences(turn: StageTurnView): boolean {
+  const cached = subagentReferences.get(turn);
+  if (cached !== undefined) return cached;
+  const hasReferences = Boolean(turn.agent_message) || turn.live_segments.some((seg) => {
+    if (seg.kind !== "step_group") return seg.kind === "agent_message";
+    return seg.items.some((item) => {
+      if (item.item_type !== "tool_call") return item.item_type === "agent_message";
+      return item.detail.kind === "subagent" ||
+        (item.detail.kind === "generic" && classifyGenericSubagentTool(item.detail.tool_name) !== null);
+    });
+  });
+  subagentReferences.set(turn, hasReferences);
+  return hasReferences;
+}
+
+/** Historical prose only depends on the roster when one of its rendered spans links a name. */
+export function createTurnProseMatcherLookup(matcher: SubagentNameMatcher | null) {
+  if (!matcher) return () => null;
+  const cache = new WeakMap<StageTurnView, boolean>();
+  const linksName = (span: InlineSpanView) => {
+    if (span.link_url || span.math_ml) return false;
+    return span.inline_code
+      ? Boolean(matcher.matchExact(span.text))
+      : matcher.splitText(span.text).some((part) => part.kind === "subagent");
+  };
+  return (turn: StageTurnView) => {
+    let found = cache.get(turn);
+    if (found === undefined) {
+      found = turn.live_segments.some((seg) =>
+        seg.kind === "assistant_message" && seg.item.item_type === "assistant_message" &&
+        seg.item.blocks.some((block) => {
+          if ("spans" in block) return block.spans.some(linksName);
+          if (block.kind !== "table") return false;
+          return block.headers.some((cell) => cell.spans.some(linksName)) ||
+            block.rows.some((row) => row.cells.some((cell) => cell.spans.some(linksName)));
+        }),
+      );
+      cache.set(turn, found);
+    }
+    return found ? matcher : null;
+  };
+}
+
+// Keep formatter construction off the render path after the first use of each locale.
+const dateStyles = {
+  sameYear: { month: "short", day: "numeric" },
+  withYear: { month: "short", day: "numeric", year: "numeric" },
+  full: { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false },
+} satisfies Record<string, Intl.DateTimeFormatOptions>;
+const dateFormatters = new Map<string, Intl.DateTimeFormat>();
+const fullTimestampTooltipCache = new Map<string, string>();
+
+function stageDateFormatter(locale: OrbitLocale, style: keyof typeof dateStyles): Intl.DateTimeFormat {
+  const key = `${locale}:${style}`;
+  let formatter = dateFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(locale, dateStyles[style]);
+    dateFormatters.set(key, formatter);
+  }
+  return formatter;
+}
+
+// Shared singleton relative-time clocks (15s for recent < 1h, 60s for older >= 1h)
+const RECENT_CLOCK_THRESHOLD_MS = 3_600_000;
+export function createRelativeClock(intervalMs: number) {
+  const listeners = new Set<() => void>();
+  let now = Date.now();
+  let interval: number | null = null;
+
+  function tick() {
+    if (typeof document !== "undefined" && document.hidden) return;
+    now = Date.now();
+    for (const listener of listeners) listener();
+  }
+
+  function stop() {
+    if (interval !== null) window.clearInterval(interval);
+    interval = null;
+  }
+
+  function syncVisibility() {
+    if (typeof document !== "undefined" && document.hidden) {
+      stop();
+    } else if (interval === null) {
+      interval = window.setInterval(tick, intervalMs);
+      tick();
+    }
+  }
+
+  function subscribe(listener: () => void) {
+    listeners.add(listener);
+    if (listeners.size === 1 && typeof window !== "undefined") {
+      if (typeof document !== "undefined") document.addEventListener("visibilitychange", syncVisibility);
+      syncVisibility();
+    }
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) {
+        if (typeof document !== "undefined") document.removeEventListener("visibilitychange", syncVisibility);
+        stop();
+      }
+    };
+  }
+
+  return { subscribe, getSnapshot: () => now };
+}
+
+const relativeClock = createRelativeClock(15_000);
+const slowRelativeClock = createRelativeClock(60_000);
+
+export function useSharedRelativeNow(timestampMs: number): number {
+  const clock = Date.now() - timestampMs < RECENT_CLOCK_THRESHOLD_MS ? relativeClock : slowRelativeClock;
+  return useSyncExternalStore(clock.subscribe, clock.getSnapshot, clock.getSnapshot);
+}
+
+export function formatRelativeTimeLabel(
+  timestampMs: number,
+  nowMs: number,
+  locale: OrbitLocale = DEFAULT_LOCALE,
+): string {
   const diffSec = Math.max(0, Math.floor((nowMs - timestampMs) / 1000));
   if (diffSec < 60) {
-    return "just now";
+    return translate(locale, "palette.justNow");
   }
   const mins = Math.floor(diffSec / 60);
   if (mins < 60) {
-    return `${mins}m ago`;
+    return translate(locale, "palette.minutesAgo", { n: mins });
   }
   const hours = Math.floor(mins / 60);
   if (hours < 24) {
-    return `${hours}h ago`;
+    return translate(locale, "palette.hoursAgo", { n: hours });
   }
   const days = Math.floor(hours / 24);
   if (days < 30) {
-    return `${days}d ago`;
+    return translate(locale, "palette.daysAgo", { n: days });
   }
   try {
     const d = new Date(timestampMs);
     const sameYear = d.getFullYear() === new Date(nowMs).getFullYear();
-    const fmt = sameYear ? SHORT_DATE_SAME_YEAR_FMT : SHORT_DATE_WITH_YEAR_FMT;
-    return fmt ? fmt.format(d) : `${days}d ago`;
+    return stageDateFormatter(locale, sameYear ? "sameYear" : "withYear").format(d);
   } catch {
-    return `${days}d ago`;
+    return translate(locale, "palette.daysAgo", { n: days });
   }
 }
 
-export function formatFullTimestampTooltip(timestampMs: number): string {
-  const cached = fullTimestampTooltipCache.get(timestampMs);
+export function formatFullTimestampTooltip(timestampMs: number, locale: OrbitLocale = DEFAULT_LOCALE): string {
+  const key = `${locale}:${timestampMs}`;
+  const cached = fullTimestampTooltipCache.get(key);
   if (cached !== undefined) return cached;
   try {
-    const formatted = FULL_TIMESTAMP_FMT ? FULL_TIMESTAMP_FMT.format(new Date(timestampMs)) : "";
+    const formatted = stageDateFormatter(locale, "full").format(timestampMs);
     if (fullTimestampTooltipCache.size > 1000) {
       fullTimestampTooltipCache.clear();
     }
-    fullTimestampTooltipCache.set(timestampMs, formatted);
+    fullTimestampTooltipCache.set(key, formatted);
     return formatted;
   } catch {
     return "";
@@ -474,7 +721,7 @@ export function resolveTurnForkSeq(turn: StageTurnView): number | null {
   for (const seg of turn.live_segments) {
     if (seg.kind === "step_group") {
       for (const item of seg.items) record(item.seq);
-    } else if (seg.kind === "assistant_message" || seg.kind === "notice") {
+    } else if (seg.kind === "assistant_message" || seg.kind === "agent_message" || seg.kind === "notice") {
       record(seg.item.seq);
     }
   }
@@ -532,10 +779,8 @@ export function buildTurnThinkingSignature(
   return sig;
 }
 
-const historicalThinkingSigCache = new WeakMap<
-  StageTurnView,
-  { agentId: string; timingsVersion: number; sig: string }
->();
+type HistoricalSignatures = WeakMap<StageTurnView, { agentId: string; timingsVersion: number; sig: string }>;
+const historicalThinkingSigCache = new WeakMap<Record<string, TurnTimingRecord>, HistoricalSignatures>();
 
 /**
  * O(1) WeakMap-memoized thinking signature lookup for immutable historical turns so
@@ -551,12 +796,17 @@ export function getCachedHistoricalThinkingSignature(
   if (isTurnActive) {
     return buildTurnThinkingSignature(turn, agentId, thinkingTimings);
   }
-  const cached = historicalThinkingSigCache.get(turn);
+  let signatures = historicalThinkingSigCache.get(thinkingTimings);
+  if (!signatures) {
+    signatures = new WeakMap();
+    historicalThinkingSigCache.set(thinkingTimings, signatures);
+  }
+  const cached = signatures.get(turn);
   if (cached && cached.agentId === agentId && cached.timingsVersion === timingsVersion) {
     return cached.sig;
   }
   const sig = buildTurnThinkingSignature(turn, agentId, thinkingTimings);
-  historicalThinkingSigCache.set(turn, { agentId, timingsVersion, sig });
+  signatures.set(turn, { agentId, timingsVersion, sig });
   return sig;
 }
 
@@ -585,6 +835,7 @@ export function areArtifactListsEquivalent(
 export function parseArtifactRefsFromMessage(
   text: string,
   knownArtifacts: readonly ArtifactSummary[],
+  locale: OrbitLocale = DEFAULT_LOCALE,
 ): InlineArtifactRef[] {
   const directives = extractInlineArtifactDirectives(text);
   if (directives.length === 0) {
@@ -611,7 +862,7 @@ export function parseArtifactRefsFromMessage(
     refs.push({
       key,
       artifactId: matched?.artifact_id ?? explicitId,
-      title: matched?.title ?? rawTitle ?? "Artifact",
+      title: matched?.title ?? rawTitle ?? translate(locale, "stage.artifact"),
       version: matched?.version,
       kindLabel: matched?.kind,
     });
@@ -622,6 +873,7 @@ export function parseArtifactRefsFromMessage(
 export function parseArtifactRefsFromTurnTools(
   turn: StageTurnView,
   knownArtifacts: readonly ArtifactSummary[],
+  locale: OrbitLocale = DEFAULT_LOCALE,
 ): InlineArtifactRef[] {
   const refs: InlineArtifactRef[] = [];
   const seen = new Set<string>();
@@ -652,7 +904,7 @@ export function parseArtifactRefsFromTurnTools(
         refs.push({
           key,
           artifactId: matched?.artifact_id ?? explicitId,
-          title: matched?.title ?? rawTitle ?? "Artifact",
+          title: matched?.title ?? rawTitle ?? translate(locale, "stage.artifact"),
           version: matched?.version,
           kindLabel: matched?.kind ?? (typeof parsed.kind === "string" ? parsed.kind : undefined),
         });
@@ -717,7 +969,7 @@ export function getCachedTurnHeight(key: string): number | undefined {
 }
 
 export function setCachedTurnHeight(key: string, height: number): void {
-  if (height <= 0 || !Number.isFinite(height)) return;
+  if (height < 0 || !Number.isFinite(height)) return;
   if (sessionTurnHeightCache.has(key)) {
     sessionTurnHeightCache.delete(key);
   } else if (sessionTurnHeightCache.size >= SESSION_TURN_HEIGHT_CACHE_LIMIT) {
@@ -727,7 +979,103 @@ export function setCachedTurnHeight(key: string, height: number): void {
   sessionTurnHeightCache.set(key, height);
 }
 
-export const TURN_LIST_GAP_PX = 32;
+export const TURN_LIST_GAP_PX = 28;
+export const CONTINUATION_TURN_GAP_PX = 12;
+
+export function isCompactionMarkerTurn(turn: StageTurnView): boolean {
+  return turn.is_compaction_command && turn.folded_steps.length === 0 &&
+    turn.terminal_reply === null && turn.notices.length === 0;
+}
+
+type FooterContent = { replyText: string | null; forkUpToSeq: number | null };
+const footerContentCache = new WeakMap<StageTurnView, FooterContent | null>();
+
+export function getTurnFooter(
+  turn: StageTurnView,
+  { isActive, isLastTurn, canFork, timing }: {
+    isActive?: boolean;
+    isLastTurn?: boolean;
+    canFork: boolean;
+    timing?: TurnTimingRecord;
+  },
+) {
+  if (isActive) return null;
+  let content = footerContentCache.get(turn);
+  if (content === undefined) {
+    // Coalescing a finish into its peer report still leaves a body. A turn made
+    // up entirely of suppressed wakeups or an opening prompt has no footer slot.
+    const hasBody = !isCompactionMarkerTurn(turn) && turn.live_segments.some(
+      (seg) => seg.kind !== "wakeup" || !isHiddenWakeupLabel(seg.label),
+    );
+    content = hasBody ? {
+      replyText: turn.last_assistant_reply?.item_type === "assistant_message"
+        ? turn.last_assistant_reply.text.trim() || null : null,
+      forkUpToSeq: resolveTurnForkSeq(turn),
+    } : null;
+    footerContentCache.set(turn, content);
+  }
+  if (!content) return null;
+  const completedAtMs = timing?.completedAtMs ?? turn.completed_at_ms;
+  const showFork = canFork && (isLastTurn || content.forkUpToSeq !== null);
+  if (!content.replyText && !showFork && completedAtMs === null) return null;
+  return { ...content, completedAtMs, showFork };
+}
+
+/** The preceding historical footer already supplies 24px of separation. */
+export function getTurnTopGapPx(turn: StageTurnView, previousHasFooter: boolean | undefined): number {
+  if (previousHasFooter === undefined) return 0;
+  if (turn.user_prompt !== null) return previousHasFooter ? 16 : TURN_LIST_GAP_PX;
+  return previousHasFooter ? 0 : CONTINUATION_TURN_GAP_PX;
+}
+
+export interface TurnListRow {
+  key: string;
+  topGapPx: number;
+  /** Top padding plus the fixed footer slot, both excluded from cached content heights. */
+  spacingPx: number;
+}
+
+export function getTurnItemHeight(turn: StageTurnView, row: TurnListRow, contentHeight?: number): number {
+  return row.spacingPx + (contentHeight ?? estimateTurnSizeFallback(turn));
+}
+
+export function getTurnContentStart(row: TurnListRow, itemStart: number): number {
+  return itemStart + row.topGapPx;
+}
+
+export function getTurnListRows(
+  turns: readonly StageTurnView[],
+  scope: string | null,
+  timings: StageTimingHistory,
+  isLatestTurnActive: boolean,
+  previousRows: readonly TurnListRow[] = [],
+): readonly TurnListRow[] {
+  let changedRows: TurnListRow[] | undefined;
+  let previousHasFooter: boolean | undefined;
+  for (const [index, turn] of turns.entries()) {
+    const isLastTurn = index === turns.length - 1;
+    const hasFooter = getTurnFooter(turn, {
+      isActive: isLastTurn && isLatestTurnActive,
+      isLastTurn,
+      canFork: true,
+      timing: timings.get(`${scope}::${turn.key}`)?.timing,
+    }) !== null;
+    const topGapPx = getTurnTopGapPx(turn, previousHasFooter);
+    const footerPx = hasFooter ? (isLastTurn ? 28 : 24) : 0;
+    const spacingPx = topGapPx + footerPx;
+    const row = previousRows[index];
+    if (row?.key === turn.key && row.topGapPx === topGapPx && row.spacingPx === spacingPx) {
+      changedRows?.push(row);
+    } else {
+      changedRows ??= previousRows.slice(0, index);
+      changedRows.push({ key: turn.key, topGapPx, spacingPx });
+    }
+    previousHasFooter = hasFooter;
+  }
+  // Stable rows preserve TanStack's measurements across live token deltas.
+  return changedRows ?? (turns.length === previousRows.length ? previousRows : previousRows.slice(0, turns.length));
+}
+
 export const IDLE_LOOKAHEAD_UP_PX = 900;
 export const IDLE_LOOKAHEAD_DOWN_PX = 1400;
 export const SCROLL_LEADING_PX = 3600;
@@ -836,7 +1184,7 @@ export function findTurnIndexForSeq(
         return { index: i, exact: true };
       }
       if (
-        (seg.kind === "assistant_message" || seg.kind === "notice") &&
+        (seg.kind === "assistant_message" || seg.kind === "agent_message" || seg.kind === "notice") &&
         seg.item.seq === targetSeq
       ) {
         return { index: i, exact: true };

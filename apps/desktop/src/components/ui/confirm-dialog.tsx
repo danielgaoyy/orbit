@@ -6,6 +6,21 @@ import { cn } from "@/lib/utils";
 
 export type ConfirmDefaultAction = "confirm" | "secondary" | "cancel";
 
+/**
+ * Resolves the default focused / Enter-triggered action for `ConfirmDialog`.
+ * Destructive (`tone === "danger"`) dialogs default to `"cancel"` unless a caller
+ * explicitly overrides `defaultAction`, preventing accidental Enter confirmation.
+ */
+export function resolveConfirmDefaultAction(
+  tone: "default" | "danger",
+  defaultAction?: ConfirmDefaultAction,
+): ConfirmDefaultAction {
+  if (defaultAction !== undefined) {
+    return defaultAction;
+  }
+  return tone === "danger" ? "cancel" : "confirm";
+}
+
 export interface ConfirmDialogSecondaryAction {
   label: string;
   onClick: () => void | Promise<void>;
@@ -43,10 +58,11 @@ export function ConfirmDialog({
   cancelLabel,
   tone = "default",
   secondaryAction,
-  defaultAction = "confirm",
+  defaultAction,
   onConfirm,
 }: ConfirmDialogProps) {
   const { t } = useI18n();
+  const resolvedDefaultAction = resolveConfirmDefaultAction(tone, defaultAction);
   const resolvedConfirmLabel = confirmLabel ?? t("common.confirm");
   const resolvedCancelLabel = cancelLabel ?? t("common.cancel");
   const [submitting, setSubmitting] = React.useState<"confirm" | "secondary" | null>(null);
@@ -109,14 +125,14 @@ export function ConfirmDialog({
   );
 
   const initialFocusRef = React.useMemo(() => {
-    if (defaultAction === "secondary" && secondaryAction) {
+    if (resolvedDefaultAction === "secondary" && secondaryAction) {
       return secondaryButtonRef;
     }
-    if (defaultAction === "cancel") {
+    if (resolvedDefaultAction === "cancel") {
       return cancelButtonRef;
     }
     return confirmButtonRef;
-  }, [defaultAction, secondaryAction]);
+  }, [resolvedDefaultAction, secondaryAction]);
 
   const handlePopupKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (busy || e.defaultPrevented || e.nativeEvent.isComposing || e.key !== "Enter") {
@@ -134,9 +150,9 @@ export function ConfirmDialog({
       return;
     }
     e.preventDefault();
-    if (defaultAction === "cancel") {
+    if (resolvedDefaultAction === "cancel") {
       handleOpenChange(false);
-    } else if (defaultAction === "secondary" && secondaryAction) {
+    } else if (resolvedDefaultAction === "secondary" && secondaryAction) {
       void runAction("secondary", secondaryAction.onClick);
     } else {
       void runAction("confirm", onConfirm);

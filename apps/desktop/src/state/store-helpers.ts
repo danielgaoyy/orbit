@@ -199,15 +199,56 @@ export function resolveTheme(mode: ThemeMode): ResolvedTheme {
   return mode === "system" ? detectSystemTheme() : mode;
 }
 
+let themeSwitchRafId: number | null = null;
+
 export function applyDocumentTheme(resolved: ResolvedTheme): void {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
-  if (resolved === "dark") {
+  const shouldBeDark = resolved === "dark";
+  const isAlreadyApplied =
+    typeof root.classList?.contains === "function" &&
+    root.classList.contains("dark") === shouldBeDark &&
+    root.style.colorScheme === resolved;
+  if (isAlreadyApplied) return;
+
+  root.classList.add("orbit-theme-switching");
+  if (shouldBeDark) {
     root.classList.add("dark");
     root.style.colorScheme = "dark";
   } else {
     root.classList.remove("dark");
     root.style.colorScheme = "light";
+  }
+
+  // Force a synchronous style flush so all theme tokens snap atomically before
+  // re-enabling CSS transitions on the next animation frame.
+  void root.offsetWidth;
+
+  const raf =
+    typeof window !== "undefined" && typeof window.requestAnimationFrame === "function"
+      ? window.requestAnimationFrame.bind(window)
+      : typeof globalThis.requestAnimationFrame === "function"
+        ? globalThis.requestAnimationFrame.bind(globalThis)
+        : null;
+  const cancelRaf =
+    typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function"
+      ? window.cancelAnimationFrame.bind(window)
+      : typeof globalThis.cancelAnimationFrame === "function"
+        ? globalThis.cancelAnimationFrame.bind(globalThis)
+        : null;
+
+  if (themeSwitchRafId !== null && cancelRaf) {
+    cancelRaf(themeSwitchRafId);
+    themeSwitchRafId = null;
+  }
+
+  if (raf) {
+    themeSwitchRafId = raf(() => {
+      themeSwitchRafId = null;
+      root.classList.remove("orbit-theme-switching");
+    });
+  } else {
+    root.classList.remove("orbit-theme-switching");
   }
 }
 

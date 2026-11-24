@@ -38,8 +38,9 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
     AgentStatus, AgentSummary, BackgroundTaskInfo, PromptBadge, ProviderKind, QueuedPromptView,
-    ReasoningEffort, SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
-    ToolCallStatus, WorkspaceClusterSuggestion, WorkspaceSetupStatus, WorkspaceSummary,
+    ReasoningEffort, SessionMode, TerminalSummary, TimelineEvent, TimelineOutlinePrompt,
+    TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceClusterSuggestion,
+    WorkspaceSetupStatus, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -2351,6 +2352,54 @@ impl OrbitStore {
             limit,
             max_bytes,
         )
+    }
+
+    /// Read user-prompt anchors in chronological order using the agent/type/sequence index.
+    pub fn fetch_timeline_outline_prompts(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<TimelineOutlinePrompt>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, payload_json FROM timeline_events
+             WHERE agent_id = ?1 AND event_type = 'user_prompt' ORDER BY seq ASC",
+        )?;
+        Self::collect_outline_prompts(&mut stmt, agent_id)
+    }
+
+    /// Read user-prompt anchors from the local client replica in chronological order using
+    /// `idx_replica_agent_type_seq` so tail-hydrated stages retain pre-tail outline anchors.
+    pub fn fetch_replica_outline_prompts(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<TimelineOutlinePrompt>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, payload_json FROM client_replica_events
+             WHERE agent_id = ?1 AND event_type = 'user_prompt' ORDER BY seq ASC",
+        )?;
+        Self::collect_outline_prompts(&mut stmt, agent_id)
+    }
+
+    fn collect_outline_prompts(
+        stmt: &mut rusqlite::CachedStatement<'_>,
+        agent_id: &str,
+    ) -> Result<Vec<TimelineOutlinePrompt>, StoreError> {
+        let mut rows = stmt.query([agent_id])?;
+        let mut prompts = Vec::new();
+        while let Some(row) = rows.next()? {
+            let seq = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
+            if seq == 0 {
+                continue;
+            }
+            let json = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+            if let Ok(TimelinePayload::UserPrompt { text, badges, .. }) = serde_json::from_str(json)
+                && let Some(prompt) = TimelineOutlinePrompt::from_user_prompt(seq, &text, &badges)
+            {
+                prompts.push(prompt);
+            }
+        }
+        Ok(prompts)
     }
 
     /// Fetch the newest timeline events (tail-first) for `agent_id`, bounded by `limit` and
@@ -6844,8 +6893,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tail_and_before_timeline_pagination_respect_limits_and_ascending_order() {
+    fn store_with_tail_agent() -> OrbitStore {
         let store = OrbitStore::open_in_memory().expect("open store");
         let now = Utc::now();
         store
@@ -6911,6 +6959,115 @@ mod tests {
             )
             .expect("upsert");
 
+        store
+    }
+
+    #[test]
+    fn outline_query_reads_only_this_agents_prompts_across_pages() {
+        let store = store_with_tail_agent();
+        let mut other = store
+            .get_agent("ag_tail")
+            .expect("read")
+            .expect("seed agent");
+        other.agent_id = "other".into();
+        store.upsert_agent(&other, None).expect("second agent");
+        let append = |agent: &str, text: &str, badges| {
+            store
+                .append_timeline_event(
+                    agent,
+                    0,
+                    None,
+                    TimelinePayload::UserPrompt {
+                        message_id: text.into(),
+                        text: text.into(),
+                        badges,
+                    },
+                )
+                .expect("append prompt")
+                .seq
+        };
+        let first = append(
+            "ag_tail",
+            "<orbit-context>hidden</orbit-context> first\n prompt",
+            vec![],
+        );
+        append("other", "different agent", vec![]);
+        append(
+            "ag_tail",
+            "",
+            vec![PromptBadge {
+                kind: "slash".into(),
+                label: "/compact".into(),
+                path: None,
+            }],
+        );
+        let last = append("ag_tail", "last", vec![]);
+        store
+            .append_timeline_event(
+                "ag_tail",
+                0,
+                None,
+                TimelinePayload::AssistantMessage {
+                    item_id: "reply".into(),
+                    text: "tail".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append reply");
+        assert!(
+            store
+                .fetch_timeline_tail_budgeted("ag_tail", 1, usize::MAX)
+                .expect("tail")
+                .1
+        );
+        assert_eq!(
+            store
+                .fetch_timeline_outline_prompts("ag_tail")
+                .expect("outline"),
+            vec![
+                TimelineOutlinePrompt {
+                    seq: first,
+                    preview: "first prompt".into()
+                },
+                TimelineOutlinePrompt {
+                    seq: last,
+                    preview: "last".into()
+                },
+            ]
+        );
+
+        let all_events = store
+            .fetch_timeline_since("ag_tail", 0, 100)
+            .expect("all")
+            .0;
+        store
+            .upsert_replica_timeline_events_batch_for_host("host_1", &all_events)
+            .expect("replica upsert");
+        let (rep_tail, rep_has_older) = store
+            .fetch_replica_timeline_tail("ag_tail", 1)
+            .expect("replica tail");
+        assert_eq!(rep_tail.len(), 1);
+        assert!(rep_has_older);
+        assert_eq!(
+            store
+                .fetch_replica_outline_prompts("ag_tail")
+                .expect("replica outline"),
+            vec![
+                TimelineOutlinePrompt {
+                    seq: first,
+                    preview: "first prompt".into()
+                },
+                TimelineOutlinePrompt {
+                    seq: last,
+                    preview: "last".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tail_and_before_timeline_pagination_respect_limits_and_ascending_order() {
+        let store = store_with_tail_agent();
         let mut seqs = Vec::new();
         for i in 1..=5 {
             let ev = store

@@ -11,6 +11,7 @@
 3. **多主机一等公民（Multi-Host Fleet First）**：协议层与 `orbit-client-core` 中一切状态、`(HostId, CursorSeq)` 游标与连接池均需支持多台主机同时在线，严禁客户端硬编码单主机假设。
 4. **私有零知识安全边界（Zero-Knowledge & Loopback-by-Default）**：Daemon 默认绑定 `127.0.0.1:6868` 并校验持久化 `pairing_secret` 与严格 `Origin`；远程穿透流量经 `Noise_NKpsk0_25519_ChaChaPoly_SHA256`（`orbit-relay-e2ee/2`）端到端加密，`orbit relay` 支持 `--allow-pubkey` 白名单且不接触明文；严禁通过进程 `argv` 传递敏感凭据。
 5. **零 `unsafe` 与禁止生产 `.unwrap()`**：Workspace 强制 `unsafe_code = "deny"` 与 `clippy::unwrap_used = "warn"`，生产路径统一通过 `thiserror` / `anyhow` 显式传递错误。
+6. **全局同源排查与联动预检（Systemic Parity First）**：修复任意缺陷、布局间距、交互或状态边界前，**必须先全仓检索所有同类调用点、平行视图（如主 Stage 与子代理/Peer 侧栏、多端实现、相似行/卡片组件）及相邻容器联动（如滚动区与底部 Dock/Shelf 高度联动）**；优先抽离共享原语/计算函数消除重复实现；若发现影响范围超出当前要求的同类隐患，主动向用户给出方案并确认是否一并优化，绝不“只修一处、等用户再追问才发现旁处”。
 
 ---
 

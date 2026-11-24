@@ -205,7 +205,7 @@ export function MentionMenu({
       className="text-popover-foreground floating-surface orbit-inline-menu-up border-border-default absolute right-0 bottom-full left-0 z-40 mb-2 overflow-hidden rounded-[14px] border"
     >
       {items.length === 0 ? (
-        <div className="text-ink-muted flex items-center gap-2 px-3 py-2.5 text-[12px]">
+        <div className="text-ink-muted flex items-center gap-2 px-3 py-2.5 text-[13px]">
           {loading ? (
             <>
               <OrbitSpinner size={12} className="shrink-0" />
@@ -236,7 +236,7 @@ export function MentionMenu({
                   {showHeader && (
                     <div
                       className={cn(
-                        "text-ink-muted px-2.5 pt-1 pb-1 text-[10.5px] font-medium tracking-[0.04em] uppercase select-none",
+                        "text-ink-muted px-2.5 pt-1 pb-1 text-[11px] font-medium tracking-[0.04em] uppercase select-none",
                         idx > 0 && "border-border-subtle mt-1 border-t pt-2",
                       )}
                     >
@@ -256,7 +256,7 @@ export function MentionMenu({
                       onSelect(item);
                     }}
                     className={cn(
-                      "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors",
+                      "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                       active
                         ? "bg-accent text-ink-primary"
                         : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
@@ -283,7 +283,7 @@ export function MentionMenu({
                         </span>
                       )}
                     </div>
-                    <span className="text-ink-muted truncate font-mono text-[11.5px]">
+                    <span className="text-ink-muted truncate font-mono text-[11px]">
                       {locLabel}
                     </span>
                   </button>
@@ -311,7 +311,7 @@ export function MentionMenu({
                     onSelect(item);
                   }}
                   className={cn(
-                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors",
+                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                     active
                       ? "bg-accent text-ink-primary"
                       : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
@@ -323,13 +323,13 @@ export function MentionMenu({
                       {basename}
                     </span>
                     {dirPath && (
-                      <span className="text-ink-muted truncate font-mono text-[11.5px]">
+                      <span className="text-ink-muted truncate font-mono text-[11px]">
                         {dirPath}
                       </span>
                     )}
                   </div>
                   {item.git_status && (
-                    <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 font-mono text-[10.5px] font-medium">
+                    <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 font-mono text-[11px] font-medium">
                       {item.git_status}
                     </span>
                   )}
@@ -352,7 +352,7 @@ export function MentionMenu({
                     onSelect(item);
                   }}
                   className={cn(
-                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors",
+                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                     active
                       ? "bg-accent text-ink-primary"
                       : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
@@ -363,11 +363,11 @@ export function MentionMenu({
                     <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
                       {item.title}
                     </span>
-                    <span className="text-ink-muted truncate text-[12px]">
+                    <span className="text-ink-muted truncate text-[11px]">
                       {item.subtitle}
                     </span>
                   </div>
-                  <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[10.5px] font-medium">
+                  <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
                     {item.git_status || t("composer.mentionBadgeRule")}
                   </span>
                 </button>
@@ -394,7 +394,7 @@ export function MentionMenu({
                     onSelect(item);
                   }}
                   className={cn(
-                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors",
+                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                     active
                       ? "bg-accent text-ink-primary"
                       : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
@@ -405,11 +405,11 @@ export function MentionMenu({
                     <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
                       {item.title}
                     </span>
-                    <span className="text-ink-muted truncate text-[12px]">
+                    <span className="text-ink-muted truncate text-[11px]">
                       {peerSubtitle}
                     </span>
                   </div>
-                  <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[10.5px] font-medium">
+                  <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
                     {isBroadcast
                       ? t("composer.mentionBadgeBroadcast")
                       : t("composer.mentionBadgePeer")}
@@ -447,7 +447,7 @@ export function MentionMenu({
                   onSelect(item);
                 }}
                 className={cn(
-                  "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors",
+                  "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                   active
                     ? "bg-accent text-ink-primary"
                     : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
@@ -458,7 +458,7 @@ export function MentionMenu({
                   <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
                     {item.title}
                   </span>
-                  <span className="text-ink-muted truncate text-[12px]">
+                  <span className="text-ink-muted truncate text-[11px]">
                     {builtinSubtitle}
                   </span>
                 </div>

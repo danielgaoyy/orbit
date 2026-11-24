@@ -25,6 +25,7 @@ export function Progress({
 }: ProgressProps) {
   const safeMax = max > 0 ? max : 100;
   const clamped = Math.min(safeMax, Math.max(0, Number.isFinite(value) ? value : 0));
+  const ratio = clamped / safeMax;
 
   return (
     <BaseProgress.Root
@@ -43,8 +44,9 @@ export function Progress({
       >
         <BaseProgress.Indicator
           data-slot="progress-indicator"
+          style={{ width: "100%", transform: `scaleX(${ratio})` }}
           className={cn(
-            "bg-ink-primary/80 h-full rounded-full transition-[width] duration-300 ease-[var(--ease-out-expo)]",
+            "bg-ink-primary/80 h-full w-full origin-left rounded-full transition-transform duration-200 ease-[var(--ease-out-expo)]",
             indicatorClassName,
           )}
         />

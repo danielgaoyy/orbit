@@ -4,7 +4,7 @@ import { SimpleTooltip } from "@/components/ui/overlays";
 import { cn } from "@/lib/utils";
 
 const iconButtonVariants = cva(
-  "orbit-press inline-flex shrink-0 cursor-pointer items-center justify-center rounded-[6px] outline-none transition-[color,background-color,border-color,opacity,transform] focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-45 [&_svg]:pointer-events-none [&_svg]:shrink-0",
+  "orbit-press inline-flex shrink-0 cursor-pointer items-center justify-center rounded-[6px] outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-45 [&_svg]:pointer-events-none [&_svg]:shrink-0",
   {
     variants: {
       size: {

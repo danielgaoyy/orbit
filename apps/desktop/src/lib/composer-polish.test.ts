@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, it } from "node:test";
 import { canSkipCappedMeasurement, detectActiveTriggerKind } from "./composer-input.ts";
 import { MESSAGES, translate } from "./i18n/index.ts";
@@ -13,6 +15,7 @@ import type { ReasoningEffort, SlashCommandView } from "./orbit-ipc.ts";
 import {
   filterSlashCommands,
   isSlashCommandSessionRequired,
+  normalizeDirectiveLabel,
   resolveSlashCommandGroup,
   resolveSlashDescription,
   resolveComposerSubmission,
@@ -265,6 +268,37 @@ describe("composer directive submission", () => {
     assert.deepEqual(resolveComposerSubmission("plan", "/btw example"), { kind: "prompt", directive: "plan" });
     assert.deepEqual(resolveComposerSubmission(null, "/goalkeeper"), { kind: "prompt", directive: null });
     assert.deepEqual(resolveComposerSubmission("btw", "/goal example"), { kind: "btw", text: "/goal example" });
+  });
+
+  it("normalizes slash directive labels and shares frameless InlineDirectiveToken across surfaces", () => {
+    assert.equal(normalizeDirectiveLabel("/plan"), "plan");
+    assert.equal(normalizeDirectiveLabel("  ///orbit-handoff  "), "orbit-handoff");
+    assert.equal(normalizeDirectiveLabel("review"), "review");
+    assert.equal(normalizeDirectiveLabel(" / "), "");
+
+    const desktopSrc = resolve(import.meta.dirname, "..");
+    const tokenSrc = readFileSync(
+      resolve(desktopSrc, "components/composer/composer-directive-token.tsx"),
+      "utf8",
+    );
+    const bubbleSrc = readFileSync(
+      resolve(desktopSrc, "components/stage/stage-prompt-controls.tsx"),
+      "utf8",
+    );
+    const queueSrc = readFileSync(
+      resolve(desktopSrc, "components/composer/composer-queue-strip.tsx"),
+      "utf8",
+    );
+
+    assert.match(tokenSrc, /export const InlineDirectiveToken/);
+    assert.match(tokenSrc, /items-baseline align-baseline/);
+    assert.match(tokenSrc, /self-center/);
+    assert.doesNotMatch(tokenSrc, /bg-signal-info-bg|border-signal-info-border|font-mono/);
+
+    assert.match(bubbleSrc, /<InlineDirectiveToken/);
+    assert.doesNotMatch(bubbleSrc, /bg-signal-info-bg|border-signal-info-border/);
+
+    assert.match(queueSrc, /<InlineDirectiveToken/);
   });
 });
 

@@ -17,6 +17,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { resolveTokenColor } from "@/lib/code-highlight";
+import { shouldPrefetchOnPointerDown } from "@/lib/file-prefetch";
 import { extractFileHunks, type IndexedDiffHunk } from "@/lib/git-patch";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
@@ -386,6 +387,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   onAddComment,
   onDeleteComment,
   onOpenFile,
+  onPrefetchFile,
   onStageFile,
   onUnstageFile,
   onDiscardFile,
@@ -411,6 +413,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   onAddComment?: (draft: Omit<ReviewCommentDraft, "id">) => void;
   onDeleteComment?: (id: string) => void;
   onOpenFile?: (path: string, focusLine?: number | null) => void;
+  onPrefetchFile?: (path: string) => void;
   onStageFile?: (path: string) => void;
   onUnstageFile?: (path: string) => void;
   onDiscardFile?: (path: string) => void;
@@ -751,6 +754,11 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 <button
                   type="button"
                   title={t("review.openFullFile")}
+                  onPointerDown={(e) => {
+                    if (shouldPrefetchOnPointerDown(e)) {
+                      onPrefetchFile?.(row.file.path);
+                    }
+                  }}
                   onClick={() => onOpenFile(row.file.path)}
                   className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md opacity-70 transition-[color,background-color,opacity] hover:bg-black/[0.06] hover:opacity-100 dark:hover:bg-white/[0.08]"
                 >
@@ -856,6 +864,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
               <button
                 type="button"
                 title={`Open ${file.path} around line ${line.old_line}`}
+                onPointerDown={(e) => {
+                  if (shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
+                }}
                 onClick={() => onOpenFile(file.path, line.old_line)}
                 className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-1.5 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
               >
@@ -870,6 +881,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
               <button
                 type="button"
                 title={`Open ${file.path} at line ${line.new_line}`}
+                onPointerDown={(e) => {
+                  if (shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
+                }}
                 onClick={() => onOpenFile(file.path, line.new_line)}
                 className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-2 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
               >
@@ -962,6 +976,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 <button
                   type="button"
                   title={`Open ${file.path} around line ${left.old_line}`}
+                  onPointerDown={(e) => {
+                    if (shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
+                  }}
                   onClick={() => onOpenFile(file.path, left.old_line)}
                   className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-1.5 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
                 >
@@ -1042,6 +1059,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 <button
                   type="button"
                   title={`Open ${file.path} at line ${right.new_line}`}
+                  onPointerDown={(e) => {
+                    if (shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
+                  }}
                   onClick={() => onOpenFile(file.path, right.new_line)}
                   className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-1.5 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
                 >

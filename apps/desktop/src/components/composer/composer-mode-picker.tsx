@@ -52,7 +52,7 @@ export const ComposerModePicker = memo(function ComposerModePicker({
             disabled
             aria-label={t("composer.accessPermissionsAria", { mode: activeModeLabel })}
             className={cn(
-              "text-ink-secondary inline-flex h-8.5 shrink-0 cursor-not-allowed items-center rounded-full text-[13.5px] font-normal opacity-60",
+              "text-ink-secondary inline-flex h-8.5 shrink-0 cursor-not-allowed items-center rounded-full text-[13px] font-normal opacity-60",
               iconOnly ? "justify-center gap-0.5 px-2" : "gap-1.5 px-2.5",
             )}
           >
@@ -73,7 +73,7 @@ export const ComposerModePicker = memo(function ComposerModePicker({
             type="button"
             aria-label={t("composer.accessPermissionsAria", { mode: activeModeLabel })}
             className={cn(
-              "text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex h-8.5 shrink-0 cursor-pointer items-center rounded-full text-[13.5px] font-normal transition-colors",
+              "text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex h-8.5 shrink-0 cursor-pointer items-center rounded-full text-[13px] font-normal transition-colors",
               iconOnly ? "justify-center gap-0.5 px-2" : "gap-1.5 px-2.5",
             )}
           >
@@ -105,7 +105,7 @@ export const ComposerModePicker = memo(function ComposerModePicker({
                   <span className="text-ink-primary text-[13px] leading-tight font-medium">
                     {customModeName}
                   </span>
-                  <span className="text-ink-muted text-[11.5px] leading-snug">
+                  <span className="text-ink-muted text-[11px] leading-snug">
                     {t("common.custom")}
                   </span>
                 </div>
@@ -134,7 +134,7 @@ export const ComposerModePicker = memo(function ComposerModePicker({
                     <span className="text-ink-primary text-[13px] leading-tight font-medium">
                       {t(m.labelKey)}
                     </span>
-                    <span className="text-ink-muted text-[11.5px] leading-snug [text-wrap:pretty]">
+                    <span className="text-ink-muted text-[11px] leading-snug [text-wrap:pretty]">
                       {t(m.descKey)}
                     </span>
                   </div>

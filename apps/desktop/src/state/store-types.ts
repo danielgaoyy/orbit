@@ -103,6 +103,13 @@ export interface UndoArchiveEntry {
   hostId: string;
   agentId: string;
   title: string;
+  draft?: string;
+  slashDirective?: ComposerInlineDirective | null;
+  inlineMentions?: InlineMentionTarget[];
+  contexts?: ContextMentionItem[];
+  pastes?: PastedAttachment[];
+  quotes?: DiffQuoteSnippet[];
+  sideQuestionDraft?: string;
 }
 
 export interface PastedAttachment {
@@ -263,6 +270,8 @@ export interface FileViewCacheEntry {
   status: "loading" | "ready" | "error";
   data?: WorkspaceFileView;
   error?: string;
+  /** Marked stale after a workspace Git change; rendered immediately via stale-while-revalidate. */
+  stale?: boolean;
 }
 
 export type WorkspaceLineEnding = "lf" | "crlf" | "mixed";
@@ -286,21 +295,7 @@ export interface PendingUnsavedFileAction {
   fileKey: string;
   label: string;
   action:
-    | { kind: "focus_tab"; tabId: string }
     | { kind: "close_tab"; tabId: string }
-    | {
-        kind: "open_file";
-        rawPath: string;
-        opts?: {
-          focusLine?: number | null;
-          focusEndLine?: number | null;
-          hostId?: string;
-          cwd?: string;
-          fallbackPath?: string;
-          initialMode?: "view" | "edit";
-        };
-      }
-    | { kind: "new_tab" }
     | { kind: "switch_to_view"; hostId: string; cwd: string; path: string }
     | { kind: "reload"; hostId: string; cwd: string; path: string };
 }

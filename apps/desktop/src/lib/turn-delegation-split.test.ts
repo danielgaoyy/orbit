@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { TimelineItemView } from "./orbit-ipc.ts";
+import type { TimelineItemView, TurnLiveSegmentView } from "./orbit-ipc.ts";
 import {
+  coalescePeerFinishes,
   computeWorkChunkDurationMs,
   extractFallbackDispatchCall,
   extractStateChangeMilestoneCall,
@@ -53,6 +54,17 @@ function makeSendMessageTool(
     },
     diff_files: [],
   };
+}
+
+function genericTool(seq: number, toolName: string, args: object | string) {
+  return {
+    item_type: "tool_call", seq, call_id: `call-${seq}`, status: "completed", diff_files: [],
+    summary_title: toolName,
+    detail: {
+      kind: "generic", tool_name: toolName,
+      arguments_json: typeof args === "string" ? args : JSON.stringify(args),
+    },
+  } satisfies TimelineItemView;
 }
 
 function makeSubagentTool(
@@ -248,6 +260,7 @@ describe("turn-delegation-split", () => {
     const handoffInfo = extractStateChangeMilestoneCall(handoffCall);
     assert.equal(handoffInfo?.kind, "handoff");
     assert.equal(handoffInfo?.label, "Handoff (worktree → local)");
+    assert.match(handoffInfo?.preview ?? "", /worktree_to_local/);
   });
 });
 
@@ -265,4 +278,125 @@ it("promotes a space-normalized dispatch before its managed child arrives", () =
   assert.equal(item.detail.kind, "generic");
   item.detail.arguments_json = "";
   assert.equal(extractFallbackDispatchCall(item)?.label, "Subagent");
+});
+
+it("localizes live and settled summaries while preserving the file name", () => {
+  const read = makeReadTool(1, "/repo/Build.md");
+  for (const [locale, settled, live] of [
+    ["en", "Read Build.md", "Reading Build.md…"],
+    ["zh-CN", "已读取 Build.md", "正在读取 Build.md…"],
+    ["ja", "Build.md を読み取り", "Build.md を読み取り中…"],
+  ] as const) {
+    const summary = summarizeWorkChunk([read], null, locale);
+    assert.equal(summary.label, settled);
+    assert.equal(summary.live_label, live);
+    assert.equal(summary.counts.read_file_count, 1);
+  }
+});
+
+it("keeps timer maintenance and plan bookkeeping in one folded group between ordinary steps", () => {
+  const tools = [
+    genericTool(2, "mcp__orbit__orbit_timer", { action: "cancel", duration_seconds: 30 }),
+    genericTool(3, "Run mcp orbit orbit timer", { action: "list" }),
+    genericTool(4, "schedule", { Action: "CANCEL", CronExpression: "0 9 * * *" }),
+    genericTool(5, "schedule", { action: "list" }),
+    genericTool(6, "orbit_timer", '{"action":'),
+    ...["update_steps", "update_plan", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"]
+      .map((name, index) => genericTool(7 + index, name, { action: "create" })),
+  ];
+  const items = [makeShellTool(1, "pwd"), ...tools, makeReadTool(13, "/a")];
+  const split = splitStepGroupChronologically(items);
+  assert.equal(split.hasDelegations, false);
+  assert.equal(split.chunks[0].items, items);
+  for (const tool of tools) assert.equal(extractStateChangeMilestoneCall(tool), null);
+});
+
+it("keeps scheduled cron, duration and conditional wakeups in their chronological positions", () => {
+  const cron = genericTool(2, "schedule", { CronExpression: "0 9 * * *", Prompt: "Review" });
+  const timer = genericTool(3, "Run mcp orbit orbit timer", { action: "create", duration_seconds: 300 });
+  const condition = genericTool(5, "schedule", { TimerCondition: "all_peers" });
+  const items = [makeReadTool(1, "a"), cron, timer, genericTool(4, "orbit_timer", { action: "list" }), condition];
+  const split = splitStepGroupChronologically(items);
+  assert.deepEqual(split.chunks.map(chunk => [chunk.kind, chunk.items.map(item => item.seq)]), [
+    ["work", [1]], ["delegation", [2, 3]], ["work", [4]], ["delegation", [5]],
+  ]);
+  assert.equal(extractStateChangeMilestoneCall(cron)?.preview, "Review");
+  assert.equal(extractStateChangeMilestoneCall(timer)?.label, "Timer (5m)");
+});
+
+type AgentMessage = Extract<TimelineItemView, { item_type: "agent_message" }>;
+
+function message(seq: number, kind: AgentMessage["kind"], fields: Partial<AgentMessage> = {}): AgentMessage {
+  return {
+    item_type: "agent_message", seq, message_id: `m-${seq}`, kind, source_agent_id: "ag_reporter",
+    text: "Report ready", blocks: [], ...fields,
+  };
+}
+
+function segment(item: AgentMessage): TurnLiveSegmentView {
+  return { kind: "agent_message", key: item.message_id, item };
+}
+
+function work(seq: number): Extract<TurnLiveSegmentView, { kind: "step_group" }> {
+  const items = [makeShellTool(seq, "pwd")];
+  return {
+    kind: "step_group", key: `steps-${seq}`, first_seq: seq, items, summary: summarizeWorkChunk(items),
+    has_following_content: false, has_running_step: false,
+  };
+}
+
+it("attaches a finish to the turn-opening report and rejoins only the work split by that finish", () => {
+  const report = message(1, "direct_message");
+  const first = { ...work(2), has_following_content: true };
+  const last = work(4);
+  const finish = message(3, "finish_notification", { event: "finished", source_host_id: "local" });
+  const { segments, finishStatuses } = coalescePeerFinishes(report, [first, segment(finish), last], "local");
+  assert.equal(finishStatuses.get(report), "completed");
+  assert.equal(segments.length, 1);
+  const [steps] = segments;
+  assert.equal(steps.kind, "step_group");
+  assert.equal(steps.key, first.key);
+  assert.deepEqual(steps.items.map(it => it.seq), [2, 4]);
+  assert.equal(steps.summary.counts.command_count, 2);
+  assert.equal(steps.has_following_content, false);
+  assert.equal(first.items.length, 1);
+});
+
+it("attaches canceled and completed finishes to each peer's latest preceding direct report", () => {
+  const old = message(1, "direct_message");
+  const latest = message(2, "direct_message");
+  const remote = message(3, "direct_message", { source_host_id: "remote" });
+  const other = message(4, "direct_message", { source_agent_id: "other" });
+  const finishes = [
+    message(5, "finish_notification", { event: "cancelled" }),
+    message(6, "finish_notification", { event: "closed", source_host_id: "remote" }),
+    message(7, "finish_notification", { event: "finished", source_agent_id: "other" }),
+  ];
+  const { segments, finishStatuses } = coalescePeerFinishes(old, [latest, remote, other, ...finishes].map(segment), "local");
+  assert.deepEqual(segments.map(seg => seg.key), [latest.message_id, remote.message_id, other.message_id]);
+  assert.deepEqual([...finishStatuses], [[latest, "canceled"], [remote, "canceled"], [other, "completed"]]);
+});
+
+it("retains unmatched, failed, and permission notifications even when a report has the same display name", () => {
+  const report = message(1, "direct_message", { source_title: "Reviewer" });
+  const permission = { child_agent_id: "ag_reporter", permission_request_id: "req", title: "Read file", allowed_decisions: [] };
+  for (const fields of [
+    { event: "errored" }, { event: "error" }, { event: "failed" },
+    { text: "Agent ag_reporter (Reviewer) failed.\n\n<agent-response>Details</agent-response>" },
+    { event: "finished", text: "Agent ag_reporter (Reviewer) finished.\n\nError: disconnected\n<agent-response>Details</agent-response>" },
+    { event: "finished", text: "Report ready\nError: build lost its worker" },
+    { permission_context: permission }, { event: "permission_required" },
+    { source_agent_id: null }, { source_agent_id: "other" }, { source_host_id: "remote" },
+  ]) {
+    const finish = segment(message(2, "finish_notification", { source_title: "Reviewer", ...fields }));
+    const result = coalescePeerFinishes(report, [finish], "local");
+    assert.deepEqual(result.segments, [finish]);
+    assert.equal(result.finishStatuses.size, 0);
+  }
+  const finish = segment(message(2, "finish_notification"));
+  for (const opening of [null, message(1, "heartbeat"), { ...report, permission_context: permission }]) {
+    assert.deepEqual(coalescePeerFinishes(opening, [finish], "local").segments, [finish]);
+  }
+  const laterReport = segment(message(3, "direct_message"));
+  assert.deepEqual(coalescePeerFinishes(null, [finish, laterReport], "local").segments, [finish, laterReport]);
 });

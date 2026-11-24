@@ -17,6 +17,11 @@ import {
   useWorkspaceScripts,
 } from "@/components/side-panel/scripts-panel";
 import { DiffStat } from "@/components/ui/diff-stat";
+import {
+  cancelHoverPrefetch,
+  scheduleHoverPrefetch,
+  shouldPrefetchOnPointerDown,
+} from "@/lib/file-prefetch";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -531,14 +536,14 @@ export function SidePanelLaunchpad({
         <div
           className={cn(
             "border-border relative flex h-[36px] w-full items-center gap-2 rounded-[10px] border bg-black/[0.02] px-3 transition-colors",
-            "focus-within:border-primary/45 focus-within:bg-background focus-within:ring-primary/15 focus-within:ring-2",
-            "dark:bg-white/[0.03] dark:focus-within:border-primary/50 dark:focus-within:bg-white/[0.04] dark:focus-within:ring-primary/20",
+            "focus-within:border-signal-info/45 focus-within:bg-background focus-within:ring-signal-info/15 focus-within:ring-2",
+            "dark:bg-white/[0.03] dark:focus-within:border-signal-info/50 dark:focus-within:bg-white/[0.04] dark:focus-within:ring-signal-info/20",
           )}
         >
           {sideQuestionText ? (
-            <MessageCircleQuestion className="text-primary h-[14.5px] w-[14.5px] shrink-0 stroke-[1.8]" />
+            <MessageCircleQuestion className="text-signal-info h-[14.5px] w-[14.5px] shrink-0 stroke-[1.8]" />
           ) : detectedUrl ? (
-            <Globe className="text-primary h-[14.5px] w-[14.5px] shrink-0 stroke-[1.8]" />
+            <Globe className="text-signal-info h-[14.5px] w-[14.5px] shrink-0 stroke-[1.8]" />
           ) : (
             <Search className="text-muted-foreground/65 h-[14.5px] w-[14.5px] shrink-0 stroke-[1.8]" />
           )}
@@ -591,7 +596,7 @@ export function SidePanelLaunchpad({
                       className={rowClass}
                     >
                       <span className="flex min-w-0 items-center gap-2.5">
-                        <MessageCircleQuestion className="text-primary h-[15px] w-[15px] shrink-0 stroke-[1.75]" />
+                        <MessageCircleQuestion className="text-signal-info h-[15px] w-[15px] shrink-0 stroke-[1.75]" />
                         <span className="truncate font-medium">
                           {t("sidePanel.askSideQuestion", { question: entry.question })}
                         </span>
@@ -614,7 +619,7 @@ export function SidePanelLaunchpad({
                       className={rowClass}
                     >
                       <span className="flex min-w-0 items-center gap-2.5">
-                        <Globe className="text-primary h-[15px] w-[15px] shrink-0 stroke-[1.75]" />
+                        <Globe className="text-signal-info h-[15px] w-[15px] shrink-0 stroke-[1.75]" />
                         <span className="shrink-0 font-medium">{t("sidePanel.openInBrowser")}</span>
                         <span className="text-muted-foreground/70 truncate text-[12px]">
                           {entry.url}
@@ -743,7 +748,22 @@ export function SidePanelLaunchpad({
                             key={file.path}
                             type="button"
                             title={file.path}
-                            onClick={() => orbitActions.openFileInSidePanel(file.path)}
+                            onMouseEnter={() =>
+                              scheduleHoverPrefetch(() =>
+                                orbitActions.prefetchWorkspaceFile(file.path, { intent: "hover" }),
+                              )
+                            }
+                            onMouseLeave={cancelHoverPrefetch}
+                            onPointerDown={(e) => {
+                              if (shouldPrefetchOnPointerDown(e)) {
+                                cancelHoverPrefetch();
+                                orbitActions.prefetchWorkspaceFile(file.path, { intent: "press" });
+                              }
+                            }}
+                            onClick={() => {
+                              cancelHoverPrefetch();
+                              orbitActions.openFileInSidePanel(file.path);
+                            }}
                             className="text-foreground/85 flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2.5 text-left text-[12.5px] transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]"
                           >
                             <span className="flex min-w-0 flex-1 items-center gap-2.5">

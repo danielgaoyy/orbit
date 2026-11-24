@@ -50,8 +50,8 @@
   --signal-relay-bg: oklch(0.54 0.155 292 / 10%);
   --signal-relay-border: oklch(0.54 0.155 292 / 24%);
 
-  /* Official shadcn/ui Radius Scale (`--radius: 0.5rem` -> sm=4px, md=6px, lg=8px, xl=12px) */
-  --radius: 0.5rem;
+  /* Keep the 4 / 6 / 8 / 12px radius scale independent of the desktop root font. */
+  --radius: 8px;
   --radius-xs: 4px;
 
   /* Backward-Compatible Semantic Aliases (Sidebar & Stage share --surface-base) */
@@ -64,8 +64,8 @@
   --card-foreground: var(--ink-primary);
   --popover: var(--surface-overlay);
   --popover-foreground: var(--ink-primary);
-  --primary: var(--signal-info);
-  --primary-foreground: oklch(0.99 0 0);
+  --primary: var(--action-primary-bg);
+  --primary-foreground: var(--action-primary-fg);
   --secondary: var(--surface-recessed);
   --secondary-foreground: var(--ink-primary);
   --muted: var(--surface-recessed);
@@ -83,6 +83,11 @@
   --ease-panel: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-panel-out: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-exit: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 110ms;
+  --dur-ui: 150ms;
+  --dur-overlay: 190ms;
+  --dur-panel: 240ms;
+  --dur-exit: 130ms;
   --duration-panel-in: 260ms;
   --duration-panel-out: 225ms;
 }
@@ -138,8 +143,8 @@
   --card-foreground: var(--ink-primary);
   --popover: var(--surface-overlay);
   --popover-foreground: var(--ink-primary);
-  --primary: var(--signal-info);
-  --primary-foreground: oklch(0.15 0.006 258);
+  --primary: var(--action-primary-bg);
+  --primary-foreground: var(--action-primary-fg);
   --secondary: oklch(0.242 0.006 258);
   --secondary-foreground: var(--ink-primary);
   --muted: var(--surface-recessed);
@@ -275,7 +280,8 @@
     0 6px 20px -4px oklch(0 0 0 / 4.5%);
   transition:
     border-color 150ms var(--ease-out-expo),
-    box-shadow 150ms var(--ease-out-expo);
+    box-shadow 150ms var(--ease-out-expo),
+    opacity 180ms var(--ease-out-quart);
 }
 
 .composer-surface:focus-within {
@@ -519,27 +525,6 @@
   92.5% { transform: scaleY(0.12); }
 }
 
-/* Long Folded Activity Disclosure: bounded scroll track + sticky header when full-expanded */
-.orbit-disclosure-track {
-  background: color-mix(in oklch, var(--surface-recessed) 68%, transparent);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-}
-
-.orbit-disclosure-scroll {
-  overscroll-behavior: auto;
-  scrollbar-gutter: stable;
-}
-
-.orbit-sticky-disclosure-bar {
-  position: sticky;
-  top: 0;
-  z-index: 12;
-  background: color-mix(in oklch, var(--surface-base) 92%, transparent);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-}
-
 /*
  * Native Composited Scrollbars:
  * - On macOS (html.orbit-mac), leave scrollbars untouched so WebKit uses 120Hz compositor-thread overlay NSScroller.
@@ -594,10 +579,19 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   }
 }
 
-.agent-text-shimmer {
+@utility shimmer {
   color: var(--ink-primary);
-  will-change: opacity;
-  animation: orbit-status-pulse 1.8s ease-in-out infinite;
+  @media (prefers-reduced-motion: no-preference) {
+    will-change: opacity;
+    animation: orbit-status-pulse 1.8s ease-in-out infinite;
+  }
+  .orbit-window-hidden & {
+    animation-play-state: paused;
+  }
+}
+
+.agent-text-shimmer {
+  @apply shimmer;
 }
 
 /* ============================================================================
@@ -634,7 +628,6 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   transition:
     transform 165ms var(--ease-out-expo),
     opacity 145ms var(--ease-out-quart);
-  will-change: transform, opacity;
 }
 
 .orbit-floating-content[data-side="top"] {
@@ -655,6 +648,7 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
 .orbit-floating-content[data-ending-style] {
   opacity: 0;
   transform: translate3d(var(--orbit-slide-x, 0px), var(--orbit-slide-y, -4px), 0) scale(0.97);
+  will-change: transform, opacity;
 }
 
 .orbit-floating-content[data-ending-style] {
@@ -676,6 +670,16 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
 
 .orbit-tooltip-content[data-side="top"] {
   --orbit-slide-y: 3px;
+}
+
+.orbit-tooltip-content[data-side="left"] {
+  --orbit-slide-x: 3px;
+  --orbit-slide-y: 0px;
+}
+
+.orbit-tooltip-content[data-side="right"] {
+  --orbit-slide-x: -3px;
+  --orbit-slide-y: 0px;
 }
 
 .orbit-tooltip-content[data-starting-style],
@@ -708,6 +712,12 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   --orbit-slide-y: 0px;
   transform-origin: left top;
   animation: orbit-floating-in 145ms var(--ease-out-expo);
+}
+
+.orbit-inline-flyout-side[data-side="left"] {
+  --orbit-slide-x: 4px;
+  --orbit-slide-y: 0px;
+  transform-origin: right top;
 }
 
 /* Modal Backdrop & Centered Dialog (`⌘K`, Settings, Remote Folder Browser) */
@@ -790,8 +800,8 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   grid-template-rows: 0fr;
   opacity: 0;
   transition:
-    grid-template-rows 220ms var(--ease-panel),
-    opacity 180ms var(--ease-out-quart);
+    grid-template-rows 180ms var(--ease-panel),
+    opacity 150ms var(--ease-out-quart);
 }
 
 .orbit-collapse-grid[data-open="true"] {
@@ -870,7 +880,7 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
 }
 
 .orbit-stage-enter {
-  animation: orbit-stage-in 160ms var(--ease-out-quart);
+  animation: orbit-stage-in var(--dur-ui) var(--ease-out-quart);
 }
 
 .orbit-bubble-enter {
@@ -882,7 +892,7 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
 }
 
 .orbit-pill-enter {
-  animation: orbit-pill-in 150ms var(--ease-out-expo);
+  animation: orbit-pill-in var(--dur-ui) var(--ease-out-expo);
 }
 
 .orbit-toast-enter {
@@ -893,25 +903,34 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   animation: orbit-toast-out 160ms var(--ease-exit) forwards;
 }
 
-/* Subtle Tactile Press Compression */
-.orbit-press {
-  transition:
-    transform 105ms var(--ease-out-expo),
-    background-color 140ms ease,
-    border-color 140ms ease,
-    color 140ms ease,
-    opacity 140ms ease;
+/* Subtle Tactile Press Compression (layered so Tailwind utilities always win) */
+@layer components {
+  .orbit-press {
+    transition:
+      transform var(--dur-fast) var(--ease-out-expo),
+      background-color var(--dur-ui) ease,
+      border-color var(--dur-ui) ease,
+      color var(--dur-ui) ease,
+      opacity var(--dur-ui) ease;
+  }
+
+  .orbit-press:active:not(:disabled) {
+    transform: scale(0.975);
+  }
 }
 
-.orbit-press:active:not(:disabled) {
-  transform: scale(0.975);
+/* Atomic Light <-> Dark theme switch guard (prevents cross-component transition tearing) */
+html.orbit-theme-switching *,
+html.orbit-theme-switching *::before,
+html.orbit-theme-switching *::after {
+  transition: none !important;
 }
 
 /* Pause infinite ambient animations when the desktop window is hidden/minimized to save CPU/GPU. */
-html.orbit-window-hidden .agent-text-shimmer,
 html.orbit-window-hidden .animate-spin,
 html.orbit-window-hidden .animate-pulse,
-html.orbit-window-hidden [class*="animate-[spin"] {
+html.orbit-window-hidden [class*="animate-[spin"],
+html.orbit-window-hidden .orbit-spinner-reduced {
   animation-play-state: paused !important;
 }
 
@@ -931,6 +950,11 @@ html.orbit-linux .animate-spin {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+
+  .orbit-spinner-reduced {
+    animation: orbit-status-pulse 2.4s ease-in-out infinite !important;
+    will-change: opacity;
   }
 }
 

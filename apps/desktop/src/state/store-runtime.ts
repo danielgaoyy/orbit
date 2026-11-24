@@ -144,6 +144,7 @@ export interface OrbitCrossSliceActions {
       hostId?: string;
       cwd?: string;
       fallbackPath?: string;
+      intent?: "hover" | "press";
     },
   ): void;
   loadWorkspaceFile(
@@ -222,6 +223,15 @@ export interface OrbitCrossSliceActions {
     extraDirs?: string[],
   ): Promise<GitReposInspectionView | null>;
   openPeerSplitTab(hostId: string, peerAgentId: string, title?: string): void;
+  openSubagentTab(opts: {
+    callId: string;
+    role: string;
+    promptPreview?: string;
+    childAgentId?: string | null;
+    childHostId?: string | null;
+    providerSubagentId?: string | null;
+    parentAgentId?: string | null;
+  }): void;
   fetchWorkspaceBoardAndEvents(hostId: string, workspaceId: string): Promise<void>;
   showToast(msg: string, action?: ToastAction | null): void;
   hydrateSyncedPreferencesFromCore(): Promise<void>;

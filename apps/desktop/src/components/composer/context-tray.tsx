@@ -244,7 +244,7 @@ export const ContextTray = memo(function ContextTray({
                       ? t("composer.uploadingAttachments")
                       : `${basename}${metaSummary ? ` (${metaSummary})` : ""}`
                   }
-                  className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary hover:bg-accent inline-flex max-w-76 items-center gap-1 rounded-lg border py-0.5 pr-1 pl-2 text-[12px] transition-colors"
+                  className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary hover:bg-accent inline-flex max-w-76 items-center gap-1 rounded-lg border py-0.5 pr-1 pl-2 text-[13px] transition-colors"
                 >
                   <button
                     type="button"
@@ -294,7 +294,7 @@ export const ContextTray = memo(function ContextTray({
               <span
                 key={item.id}
                 title={item.uploading ? t("composer.uploadingAttachments") : displayTarget}
-                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px] transition-colors"
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[13px] transition-colors"
               >
                 {item.uploading ? (
                   <OrbitSpinner size={12} className="text-ink-muted shrink-0" />
@@ -324,7 +324,7 @@ export const ContextTray = memo(function ContextTray({
             return (
               <span
                 key={item.id}
-                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px]"
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[13px]"
               >
                 <DiffIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
                 <span className="font-medium">{item.label}</span>
@@ -344,7 +344,7 @@ export const ContextTray = memo(function ContextTray({
             return (
               <span
                 key={item.id}
-                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px]"
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[13px]"
               >
                 <SquareTerminal className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
                 <span className="font-medium">{item.label}</span>
@@ -366,9 +366,9 @@ export const ContextTray = memo(function ContextTray({
               <span
                 key={item.id}
                 title={item.signature || `${item.symbolName} (${item.path}:L${item.startLine})`}
-                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-1.5 text-[12px]"
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-1.5 text-[13px]"
               >
-                <span className="bg-surface-base text-ink-muted inline-flex size-4 shrink-0 items-center justify-center rounded font-mono text-[10.5px] font-semibold">
+                <span className="bg-surface-base text-ink-muted inline-flex size-4 shrink-0 items-center justify-center rounded font-mono text-[11px] font-semibold">
                   {glyphMeta.glyph}
                 </span>
                 <span className="truncate font-mono font-medium">{item.symbolName}</span>
@@ -392,7 +392,7 @@ export const ContextTray = memo(function ContextTray({
               <span
                 key={item.id}
                 title={item.description ? `${item.label} — ${item.description}` : item.label}
-                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px]"
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[13px]"
               >
                 <Sparkles className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
                 <span className="truncate font-mono font-medium">/{item.slug}</span>
@@ -418,7 +418,7 @@ export const ContextTray = memo(function ContextTray({
             <span
               key={q.id}
               title={q.code}
-              className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px]"
+              className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[13px]"
             >
               <Quote className="text-ink-tertiary size-3 shrink-0" />
               <span className="truncate font-mono">{quoteLabel}</span>
@@ -440,7 +440,7 @@ export const ContextTray = memo(function ContextTray({
           return (
             <span
               key={p.id}
-              className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary hover:bg-accent inline-flex items-center gap-1 rounded-lg border py-0.5 pr-1 pl-2 text-[12px] transition-colors"
+              className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary hover:bg-accent inline-flex items-center gap-1 rounded-lg border py-0.5 pr-1 pl-2 text-[13px] transition-colors"
             >
               <button
                 type="button"
@@ -530,7 +530,7 @@ export const ContextTray = memo(function ContextTray({
               className="border-border-subtle bg-surface-recessed min-h-0 flex-1 rounded-xl border"
               viewportClassName="selectable-text max-h-[60vh] p-3"
             >
-              <pre className="text-ink-primary m-0 font-mono text-[12px] leading-[1.55] whitespace-pre-wrap break-words">
+              <pre className="text-ink-primary m-0 font-mono text-[13px] leading-[1.55] whitespace-pre-wrap break-words">
                 {previewPaste.content}
               </pre>
             </ScrollArea>

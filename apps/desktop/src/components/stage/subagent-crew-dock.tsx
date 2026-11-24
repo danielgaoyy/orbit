@@ -1,4 +1,5 @@
 import { memo } from "react";
+import { Button } from "@/components/ui/button";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
 import { useI18n } from "@/lib/i18n";
@@ -9,7 +10,7 @@ import { cn } from "@/lib/utils";
 
 export function openSubagent(
   parentAgentId: string | undefined,
-  sa: ResolvedSubagentItem,
+  sa: Pick<ResolvedSubagentItem, "callId" | "title" | "promptPreview" | "childAgentId" | "childHostId" | "providerSubagentId">,
 ) {
   // A managed peer can appear in the transcript before the fleet publishes its card.
   // Keep the call-scoped tab usable until the card supplies its host.
@@ -29,6 +30,34 @@ export function openSubagent(
     providerSubagentId: sa.providerSubagentId,
     parentAgentId,
   });
+}
+
+export function SubagentPanelAction({
+  name, inspect = false, alwaysVisible = false, onClick,
+}: {
+  name: string;
+  inspect?: boolean;
+  alwaysVisible?: boolean;
+  onClick: () => void;
+}) {
+  const { t } = useI18n();
+  const label = t(inspect ? "approval.inspectSubagent" : "sidebar.remoteOpenAction");
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="xs"
+      aria-label={inspect ? `${label} · ${name}` : t("overview.openSubagent", { name })}
+      title={t("stage.openTargetInPanel", { target: name })}
+      onClick={onClick}
+      className={cn(
+        "h-[22px] rounded-[5px] px-1.5 text-[11px] text-ink-secondary",
+        !alwaysVisible && "opacity-0 group-hover/msgrow:opacity-100 group-focus-within/msgrow:opacity-100 [@media(hover:none)]:opacity-100",
+      )}
+    >
+      {label}
+    </Button>
+  );
 }
 
 type TranslateFn = ReturnType<typeof useI18n>["t"];
@@ -115,7 +144,7 @@ export const SubagentCrewList = memo(function SubagentCrewList({
               showStatusBadge={!isActive}
             />
             <span className="min-w-0 flex-1">
-              <span className="text-ink-primary block truncate text-[12px] leading-[16px] font-medium">
+              <span className="text-ink-primary block truncate text-[13px] leading-[18px] font-medium">
                 {sa.title}
               </span>
               <span

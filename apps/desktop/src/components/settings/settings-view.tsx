@@ -457,7 +457,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
           : "orbit-backdrop-in 195ms var(--ease-out-quart)",
       }}
       className={cn(
-        "fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-5 backdrop-blur-[3px] select-none",
+        "fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-5 select-none dark:bg-black/55",
         closing && "pointer-events-none",
       )}
     >

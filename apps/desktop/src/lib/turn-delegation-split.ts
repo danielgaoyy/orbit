@@ -1,4 +1,7 @@
-import type { TimelineItemView, WorkSummaryResultView } from "@/lib/orbit-ipc";
+import { DEFAULT_LOCALE, translate, type OrbitLocale } from "./i18n/index.ts";
+import { formatDurationCompact, formatThoughtSummaryLabel } from "./timeline-coalesce.ts";
+import { extractCleanAgentMessageBody } from "./agent-message-clean.ts";
+import type { StageTurnView, TimelineItemView, TurnLiveSegmentView, WorkSummaryResultView } from "@/lib/orbit-ipc";
 import { classifyGenericSubagentTool, resolveToolCallSubagent } from "./subagents.ts";
 
 export type ToolCallTimelineItem = Extract<TimelineItemView, { item_type: "tool_call" }>;
@@ -38,18 +41,104 @@ export interface StateChangeMilestoneInfo {
   status: "running" | "completed" | "failed" | "denied";
 }
 
-export function classifyStateChangeMilestoneTool(toolName: string): "timer" | "handoff" | null {
-  const stripped = toolName.trim().replace(/^run\s+/i, "");
-  if (!stripped) return null;
-  const firstToken = (stripped.split(/\s+/)[0] ?? "").toLowerCase();
-  const leaf = firstToken.split(/[:/.]|__/).pop() ?? firstToken;
-  if (leaf === "schedule" || leaf === "orbit_timer" || leaf === "mcp_orbit_orbit_timer") {
-    return "timer";
-  }
-  if (leaf === "handoff_worktree" || leaf === "mcp_orbit_handoff_worktree") {
-    return "handoff";
-  }
+type AgentMessage = Extract<TimelineItemView, { item_type: "agent_message" }>;
+export type CoalescedFinishStatus = "completed" | "canceled";
+
+export function peerFinishStatus(item: AgentMessage, cleanBody?: string): CoalescedFinishStatus | "failed" | null {
+  if (item.kind !== "finish_notification" || item.permission_context) return null;
+  const event = item.event?.trim().toLowerCase() ?? "";
+  if (
+    ["failed", "error", "errored"].includes(event) ||
+    /^Agent\s+\S+(?:\s+\(.*\))?\s+(?:failed|errored)\./im.test(item.text) ||
+    /^\s*(?:error|failed):/im.test(cleanBody ?? extractCleanAgentMessageBody(item.text))
+  ) return "failed";
+  if (["canceled", "cancelled", "stopped", "closed"].includes(event)) return "canceled";
+  if (["", "finished", "completed", "succeeded"].includes(event)) return "completed";
   return null;
+}
+
+/** Match each terminal event to the latest direct report in this turn, including its opening prompt. */
+export function coalescePeerFinishes(
+  openingMessage: StageTurnView["agent_message"],
+  segments: readonly TurnLiveSegmentView[],
+  hostId: string,
+) {
+  const reports = new Map<string, AgentMessage>();
+  const finishStatuses = new Map<AgentMessage, CoalescedFinishStatus>();
+  const visible: TurnLiveSegmentView[] = [];
+  function matchMessage(item: AgentMessage) {
+    if (!item.source_agent_id || item.permission_context) return false;
+    const source = JSON.stringify([item.source_host_id || hostId, item.source_agent_id]);
+    if (item.kind === "direct_message") {
+      reports.set(source, item);
+      return false;
+    }
+    const status = peerFinishStatus(item);
+    if (!status) return false;
+    const report = reports.get(source);
+    reports.delete(source);
+    if (!report || status === "failed") return false;
+    finishStatuses.set(report, status);
+    return true;
+  }
+  if (openingMessage?.item_type === "agent_message") matchMessage(openingMessage);
+  let removedFinish = false;
+  for (const seg of segments) {
+    if (seg.kind === "agent_message" && seg.item.item_type === "agent_message" && matchMessage(seg.item)) {
+      removedFinish = true;
+      continue;
+    }
+    // The core flushed its work group at the finish. Rejoin just that now-invisible boundary.
+    const prev = visible.at(-1);
+    if (removedFinish && prev?.kind === "step_group" && seg.kind === "step_group") {
+      const items = [...prev.items, ...seg.items];
+      const thoughtMs = (prev.thought_duration_ms ?? 0) + (seg.thought_duration_ms ?? 0) || null;
+      visible[visible.length - 1] = {
+        ...prev,
+        items,
+        thought_duration_ms: thoughtMs,
+        summary: summarizeWorkChunk(items, thoughtMs),
+        work_duration_ms: (prev.work_duration_ms ?? 0) + (seg.work_duration_ms ?? 0) || null,
+        latest_activity_ms: seg.latest_activity_ms ?? prev.latest_activity_ms,
+        has_running_step: prev.has_running_step || seg.has_running_step,
+        has_following_content: seg.has_following_content,
+      };
+    } else {
+      visible.push(seg);
+    }
+    removedFinish = false;
+  }
+  return { segments: visible, finishStatuses };
+}
+
+function milestoneArgs(raw: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(raw);
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch {
+    return null; // Tool arguments may still be streaming.
+  }
+}
+
+export function classifyStateChangeMilestoneTool(toolName: string, rawArgs = ""): "timer" | "handoff" | null {
+  const leaf = toolName.trim().toLowerCase().replace(/^run\s+/, "")
+    .split(/[:/.]|__/).at(-1)?.trim().replace(/\s+/g, "_");
+  if (leaf === "handoff_worktree" || leaf === "mcp_orbit_handoff_worktree") return "handoff";
+  if (leaf !== "schedule" && leaf !== "orbit_timer" && leaf !== "mcp_orbit_orbit_timer") return null;
+  const args = milestoneArgs(rawArgs);
+  if (!args) return null;
+  const action = args.action ?? args.Action;
+  if (action != null) {
+    return typeof action === "string" && action.trim().toLowerCase() === "create" ? "timer" : null;
+  }
+  // Older provider schedule calls omit the action and carry the schedule itself.
+  const seconds = args.duration_seconds ?? args.DurationSeconds;
+  const cron = args.cron_expression ?? args.CronExpression;
+  const condition = args.timer_condition ?? args.TimerCondition ?? args.condition;
+  const timed = typeof seconds === "number" && seconds > 0;
+  const scheduled = typeof cron === "string" && cron.trim().length > 0;
+  const conditional = typeof condition === "string" && /\S/.test(condition) && condition.trim().toLowerCase() !== "never";
+  return timed || scheduled || conditional ? "timer" : null;
 }
 
 function stableTimelineItemKey(item: TimelineItemView): string {
@@ -93,7 +182,7 @@ export function isDelegationMilestoneToolCall(
   if (item.detail.kind === "generic") {
     return (
       classifyGenericSubagentTool(item.detail.tool_name) !== null ||
-      classifyStateChangeMilestoneTool(item.detail.tool_name) !== null
+      classifyStateChangeMilestoneTool(item.detail.tool_name, item.detail.arguments_json) !== null
     );
   }
   return false;
@@ -189,59 +278,32 @@ export function extractFallbackDispatchCall(
  */
 export function extractStateChangeMilestoneCall(
   item: ToolCallTimelineItem,
+  locale: OrbitLocale = DEFAULT_LOCALE,
 ): StateChangeMilestoneInfo | null {
   if (item.detail.kind !== "generic") return null;
-  const kind = classifyStateChangeMilestoneTool(item.detail.tool_name);
+  const kind = classifyStateChangeMilestoneTool(item.detail.tool_name, item.detail.arguments_json);
   if (!kind) return null;
 
-  let label = kind === "timer" ? "Armed timer" : "Worktree handoff";
+  const t = translate.bind(null, locale);
+  let label = t(kind === "timer" ? "stage.timerArmed" : "stage.handoffWorktree");
   let preview = "";
-  const rawArgs = item.detail.arguments_json.trim();
-  if (rawArgs.startsWith("{")) {
-    try {
-      const parsed: unknown = JSON.parse(rawArgs);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const obj = parsed as Record<string, unknown>;
-        if (kind === "timer") {
-          const action = typeof obj.action === "string" ? obj.action.trim().toLowerCase() : "";
-          const secs =
-            typeof obj.duration_seconds === "number"
-              ? obj.duration_seconds
-              : typeof obj.DurationSeconds === "number"
-                ? obj.DurationSeconds
-                : null;
-          const cron =
-            typeof obj.CronExpression === "string" && obj.CronExpression.trim()
-              ? obj.CronExpression.trim()
-              : null;
-          if (action === "cancel") {
-            label = "Canceled timer";
-          } else if (cron) {
-            label = `Scheduled (${cron})`;
-          } else if (secs !== null && secs > 0) {
-            label = `Timer (${formatDurationCompact(secs * 1000)})`;
-          }
-          const prompt =
-            typeof obj.prompt === "string"
-              ? obj.prompt.trim()
-              : typeof obj.Prompt === "string"
-                ? obj.Prompt.trim()
-                : "";
-          preview = prompt;
-        } else {
-          const dryRun = obj.dry_run === true;
-          const dir =
-            typeof obj.direction === "string" && obj.direction === "local_to_worktree"
-              ? "local → worktree"
-              : "worktree → local";
-          label = dryRun ? `Preview handoff (${dir})` : `Handoff (${dir})`;
-          preview = typeof obj.branch === "string" ? obj.branch.trim() : "";
-        }
-      }
-    } catch {
-      // Ignore partial JSON while streaming
+  const args = milestoneArgs(item.detail.arguments_json);
+  if (args && kind === "timer") {
+    const seconds = args.duration_seconds ?? args.DurationSeconds;
+    const cron = args.cron_expression ?? args.CronExpression;
+    if (typeof cron === "string" && cron.trim()) {
+      label = t("stage.timerScheduled", { cron: cron.trim() });
+    } else if (typeof seconds === "number" && seconds > 0) {
+      label = t("stage.timerDuration", { duration: formatDurationCompact(seconds * 1000, locale) });
     }
+    const prompt = args.prompt ?? args.Prompt;
+    preview = typeof prompt === "string" ? prompt.trim() : "";
+  } else if (args) {
+    const direction = t(args.direction === "local_to_worktree" ? "stage.localToWorktree" : "stage.worktreeToLocal");
+    label = t(args.dry_run === true ? "stage.handoffPreview" : "stage.handoff", { direction });
+    preview = typeof args.branch === "string" ? args.branch.trim() : "";
   }
+  if (!preview && args && Object.keys(args).length) preview = JSON.stringify(args, null, 2);
 
   return {
     callId: item.call_id || `milestone-${item.seq}`,
@@ -273,8 +335,7 @@ export function computeWorkChunkDurationMs(items: readonly TimelineItemView[]): 
 
 // ---------------------------------------------------------------------------
 // Work-chunk summarizer (1:1 mirror of `crates/orbit-client-core/src/stage.rs`)
-// Used ONLY for `work` chunks inside split step groups (untouched step groups
-// reuse Rust's precomputed `seg.summary` verbatim).
+// Formats split chunks and localized display text for groups projected by core.
 // ---------------------------------------------------------------------------
 
 function basenameOfPath(filePath: string): string {
@@ -282,31 +343,6 @@ function basenameOfPath(filePath: string): string {
   const trimmed = filePath.replace(/[/\\]+$/, "");
   const parts = trimmed.split(/[/\\]/);
   return parts[parts.length - 1] ?? trimmed;
-}
-
-function formatDurationCompact(durationMs: number): string {
-  const totalSeconds = Math.max(1, Math.round(durationMs / 1000));
-  if (totalSeconds < 60) {
-    return `${totalSeconds}s`;
-  }
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes >= 60) {
-    const hours = Math.floor(minutes / 60);
-    const remMin = minutes % 60;
-    return remMin > 0 ? `${hours}h ${remMin}m` : `${hours}h`;
-  }
-  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
-}
-
-function formatThoughtSummaryLabel(durationMs?: number | null, thoughtCount = 1): string {
-  if (typeof durationMs === "number" && Number.isFinite(durationMs)) {
-    const roundedSec = Math.round(durationMs / 1000);
-    if (roundedSec >= 1) {
-      return `Thought for ${formatDurationCompact(durationMs)}`;
-    }
-  }
-  return thoughtCount > 1 ? "Thought process" : "Thought about it";
 }
 
 function extractThinkingHeadline(rawText: string, preferLatest = false): string {
@@ -449,80 +485,85 @@ function pushUnique(list: string[], value: string): void {
   }
 }
 
-function summarizeSingleToolCall(item: ToolCallTimelineItem): [string, boolean] {
+function summarizeSingleToolCall(item: ToolCallTimelineItem, locale: OrbitLocale): [string, boolean] {
+  const t = translate.bind(null, locale);
   if (item.status === "denied") {
     return [
-      item.detail.kind === "shell" ? "Stopped running the command" : "You declined",
+      item.detail.kind === "shell" ? t("stage.commandStopped") : t("stage.declined"),
       true,
     ];
   }
 
   const failed = item.status === "failed";
   const withFailed = (base: string): [string, boolean] =>
-    failed ? [`${base} (failed)`, true] : [base, false];
+    failed ? [t("stage.failedSummary", { action: base }), true] : [base, false];
 
   switch (item.detail.kind) {
     case "file_read": {
       const name = basenameOfPath(item.detail.path);
-      return withFailed(name ? `Read ${name}` : "Read a file");
+      return withFailed(name ? t("stage.readPath", { path: name }) : t("stage.readFile"));
     }
     case "file_edit": {
       const isCreate = isFileCreateToolCall(item);
       const name = basenameOfPath(item.detail.path);
-      const prefix = isCreate ? "Created" : "Edited";
-      return withFailed(name ? `${prefix} ${name}` : `${prefix} a file`);
+      return withFailed(name
+        ? t(isCreate ? "stage.createdPath" : "stage.editedPath", { path: name })
+        : t(isCreate ? "stage.createdFile" : "stage.editedFile"));
     }
     case "search": {
       const sub = classifySearchTool(item.detail.query, item.summary_title);
       if (sub === "web") {
-        return failed ? ["Failed to search the web", true] : ["Searched the web", false];
+        return failed ? [t("stage.webSearchFailed"), true] : [t("stage.searchedWeb"), false];
       }
       if (sub === "glob") {
-        return withFailed("Looked for files");
+        return withFailed(t("stage.foundFiles"));
       }
-      return withFailed("Searched files");
+      return withFailed(t("stage.searchedFiles"));
     }
     case "shell":
-      return failed ? ["Command failed", true] : ["Ran a command", false];
+      return failed ? [t("stage.commandFailed"), true] : [t("stage.ranCommand"), false];
     case "subagent":
-      return withFailed("Ran an agent");
+      return withFailed(t("stage.ranAgent"));
     case "generic": {
       const parsed = parseGenericToolName(item.detail.tool_name);
       if (parsed.serverName) {
-        return withFailed(`Used ${parsed.serverName} integration`);
+        return withFailed(t("stage.usedIntegration", { name: parsed.serverName }));
       }
       if (parsed.displayLabel && parsed.displayLabel !== "Tool") {
-        return withFailed(`Used ${parsed.displayLabel}`);
+        return withFailed(t("stage.usedNamedTool", { name: parsed.displayLabel }));
       }
-      return failed ? ["Failed", true] : ["Used a tool", false];
+      return failed ? [t("sidePanel.scriptFailed"), true] : [t("stage.usedTool"), false];
     }
   }
 }
 
-function buildLiveStepStatus(item: TimelineItemView | undefined): [string, string | null] {
-  if (!item) return ["Working…", null];
+function buildLiveStepStatus(item: TimelineItemView | undefined, locale: OrbitLocale): [string, string | null] {
+  const t = translate.bind(null, locale);
+  if (!item) return [t("stage.working"), null];
   if (item.item_type === "assistant_thinking") {
     const headline = extractThinkingHeadline(item.text, true);
-    return headline ? ["Thinking", headline] : ["Thinking…", null];
+    return headline ? [t("stage.thinking"), headline] : [t("stage.thinkingPending"), null];
   }
   if (item.item_type === "tool_call") {
     switch (item.detail.kind) {
       case "file_read": {
         const name = basenameOfPath(item.detail.path);
-        return [name ? `Reading ${name}…` : "Reading a file…", null];
+        return [name ? t("stage.readingPath", { path: name }) : t("stage.readingFile"), null];
       }
       case "file_edit": {
         const isCreate = isFileCreateToolCall(item);
         const name = basenameOfPath(item.detail.path);
-        const verb = isCreate ? "Creating" : "Editing";
-        return [name ? `${verb} ${name}…` : `${verb} a file…`, null];
+        const label = name
+          ? t(isCreate ? "stage.creatingPath" : "stage.editingPath", { path: name })
+          : t(isCreate ? "stage.creatingFile" : "stage.editingFile");
+        return [label, null];
       }
       case "search": {
         const sub = classifySearchTool(item.detail.query, item.summary_title);
-        if (sub === "web") return ["Searching the web…", null];
-        if (sub === "glob") return ["Looking for files…", null];
+        if (sub === "web") return [`${t("stage.searchingWeb")}…`, null];
+        if (sub === "glob") return [`${t("stage.findingFiles")}…`, null];
         const q = item.detail.query.trim().replace(/\s+/g, " ");
-        return [q.length >= 1 && q.length <= 28 ? `Searching "${q}"…` : "Searching files…", null];
+        return [q.length >= 1 && q.length <= 28 ? t("stage.searchingFor", { query: q }) : t("stage.searchingFiles"), null];
       }
       case "shell": {
         const firstLine =
@@ -530,28 +571,27 @@ function buildLiveStepStatus(item: TimelineItemView | undefined): [string, strin
             .split(/\r?\n/)
             .map((ln) => ln.trim().replace(/\s+/g, " "))
             .find(Boolean) ?? "";
-        if (!firstLine) return ["Running a command…", null];
+        if (!firstLine) return [t("stage.runningCommand"), null];
         const shortCmd = Array.from(firstLine).slice(0, 36).join("").trimEnd();
-        return [shortCmd.endsWith("…") ? `Running ${shortCmd}` : `Running ${shortCmd}…`, null];
+        return [t("stage.runningTarget", { target: shortCmd.replace(/…$/, "") }), null];
       }
       case "subagent": {
         const cleanRole = item.detail.role.trim().replace(/\s+/g, " ");
         return [
           cleanRole.length >= 1 && cleanRole.length <= 28
-            ? `Running ${cleanRole}…`
-            : "Running subagent…",
+            ? t("stage.runningTarget", { target: cleanRole })
+            : `${t("stage.subagentRunning")}…`,
           null,
         ];
       }
       case "generic": {
         const parsed = parseGenericToolName(item.detail.tool_name);
-        if (parsed.serverName) return [`Using ${parsed.serverName}…`, null];
-        if (parsed.displayLabel) return [`Using ${parsed.displayLabel}…`, null];
-        return ["Using a tool…", null];
+        const name = parsed.serverName || (item.detail.tool_name.trim() && parsed.displayLabel);
+        return [name ? t("stage.usingNamedTool", { name }) : t("stage.usingTool"), null];
       }
     }
   }
-  return ["Working…", null];
+  return [t("stage.working"), null];
 }
 
 /**
@@ -561,7 +601,9 @@ function buildLiveStepStatus(item: TimelineItemView | undefined): [string, strin
 export function summarizeWorkChunk(
   items: readonly TimelineItemView[],
   thoughtDurationMs?: number | null,
+  locale: OrbitLocale = DEFAULT_LOCALE,
 ): WorkSummaryResultView {
+  const t = translate.bind(null, locale);
   const toolCalls: ToolCallTimelineItem[] = [];
   let thoughtCount = 0;
   let narrationCount = 0;
@@ -720,29 +762,29 @@ export function summarizeWorkChunk(
   if (!activeTail) {
     activeTail = items[items.length - 1];
   }
-  const [liveLabel, liveDetail] = buildLiveStepStatus(activeTail);
+  const [liveLabel, liveDetail] = buildLiveStepStatus(activeTail, locale);
 
   let labelIncludesFailure = false;
   let label = "";
 
   if (toolCalls.length === 0) {
     if (thoughtCount > 0) {
-      label = formatThoughtSummaryLabel(thoughtDurationMs, thoughtCount);
+      label = formatThoughtSummaryLabel(thoughtDurationMs, thoughtCount, locale);
     } else if (questionCount > 0) {
-      label = questionCount === 1 ? "Asked a question" : `Asked ${questionCount} questions`;
+      label = questionCount === 1 ? t("stage.askedQuestion") : t("stage.askedQuestions", { count: questionCount });
     } else if (permissionCount > 0) {
-      label = "Checked permissions";
+      label = t("stage.checkedPermissions");
     } else if (narrationCount > 0) {
-      label = narrationCount === 1 ? "1 note" : `${narrationCount} notes`;
+      label = t(narrationCount === 1 ? "stage.noteCount" : "stage.notesCount", { count: narrationCount });
     } else {
-      label = "Completed steps";
+      label = t("stage.completedSteps");
     }
   } else if (toolCalls.length === 1) {
-    const [singleLabel, incFail] = summarizeSingleToolCall(toolCalls[0]);
+    const [singleLabel, incFail] = summarizeSingleToolCall(toolCalls[0], locale);
     label = singleLabel;
     labelIncludesFailure = incFail;
   } else if (deniedCount === totalTc) {
-    label = "You declined";
+    label = t("stage.declined");
     labelIncludesFailure = true;
   } else {
     interface Bucket {
@@ -759,10 +801,10 @@ export function summarizeWorkChunk(
         isSoleCategory && editedPaths.length === 1 ? basenameOfPath(editedPaths[0]) : "";
       buckets.push({
         label: soleName
-          ? `Edited ${soleName}`
+          ? t("stage.editedPath", { path: soleName })
           : editedFileCount === 1
-            ? "Edited a file"
-            : `Edited ${editedFileCount} files`,
+            ? t("stage.editedFile")
+            : t("stage.editedFiles", { count: editedFileCount }),
         tier: 1,
         rawCallCount: editCalls,
         firstOrder: firstSeen.get("edit") ?? 0,
@@ -774,10 +816,10 @@ export function summarizeWorkChunk(
         isSoleCategory && createdPaths.length === 1 ? basenameOfPath(createdPaths[0]) : "";
       buckets.push({
         label: soleName
-          ? `Created ${soleName}`
+          ? t("stage.createdPath", { path: soleName })
           : createdFileCount === 1
-            ? "Created a file"
-            : `Created ${createdFileCount} files`,
+            ? t("stage.createdFile")
+            : t("stage.createdFiles", { count: createdFileCount }),
         tier: 1,
         rawCallCount: createCalls,
         firstOrder: firstSeen.get("create") ?? 0,
@@ -786,7 +828,7 @@ export function summarizeWorkChunk(
 
     if (subagentCount > 0) {
       buckets.push({
-        label: subagentCount === 1 ? "Ran an agent" : `Ran ${subagentCount} agents`,
+        label: subagentCount === 1 ? t("stage.ranAgent") : t("stage.ranAgents", { count: subagentCount }),
         tier: 2,
         rawCallCount: subagentCount,
         firstOrder: firstSeen.get("subagent") ?? 0,
@@ -798,8 +840,8 @@ export function summarizeWorkChunk(
       buckets.push({
         label:
           mcpServerCount === 1
-            ? `Used ${firstServer} integration`
-            : `Used ${mcpServerCount} integrations`,
+            ? t("stage.usedIntegration", { name: firstServer })
+            : t("stage.usedIntegrations", { count: mcpServerCount }),
         tier: 2,
         rawCallCount: mcpCallCount,
         firstOrder: firstSeen.get("mcp") ?? 0,
@@ -811,10 +853,10 @@ export function summarizeWorkChunk(
         isSoleCategory && readPaths.length === 1 ? basenameOfPath(readPaths[0]) : "";
       buckets.push({
         label: soleName
-          ? `Read ${soleName}`
+          ? t("stage.readPath", { path: soleName })
           : readFileCount === 1
-            ? "Read a file"
-            : `Read ${readFileCount} files`,
+            ? t("stage.readFile")
+            : t("stage.readFiles", { count: readFileCount }),
         tier: 3,
         rawCallCount: readCalls,
         firstOrder: firstSeen.get("read") ?? 0,
@@ -823,7 +865,7 @@ export function summarizeWorkChunk(
 
     if (grepCount > 0) {
       buckets.push({
-        label: "Searched files",
+        label: t("stage.searchedFiles"),
         tier: 3,
         rawCallCount: grepCount,
         firstOrder: firstSeen.get("search_files") ?? 0,
@@ -832,7 +874,7 @@ export function summarizeWorkChunk(
 
     if (globCount > 0) {
       buckets.push({
-        label: "Looked for files",
+        label: t("stage.foundFiles"),
         tier: 3,
         rawCallCount: globCount,
         firstOrder: firstSeen.get("look_files") ?? 0,
@@ -841,7 +883,7 @@ export function summarizeWorkChunk(
 
     if (webSearchCount > 0) {
       buckets.push({
-        label: "Searched the web",
+        label: t("stage.searchedWeb"),
         tier: 3,
         rawCallCount: webSearchCount,
         firstOrder: firstSeen.get("search_web") ?? 0,
@@ -850,7 +892,7 @@ export function summarizeWorkChunk(
 
     if (commandCount > 0) {
       buckets.push({
-        label: commandCount === 1 ? "Ran a command" : `Ran ${commandCount} commands`,
+        label: commandCount === 1 ? t("stage.ranCommand") : t("stage.ranCommands", { count: commandCount }),
         tier: 4,
         rawCallCount: commandCount,
         firstOrder: firstSeen.get("shell") ?? 0,
@@ -859,7 +901,7 @@ export function summarizeWorkChunk(
 
     if (otherToolCount > 0) {
       buckets.push({
-        label: otherToolCount === 1 ? "Used a tool" : `Used ${otherToolCount} tools`,
+        label: otherToolCount === 1 ? t("stage.usedTool") : t("stage.usedTools", { count: otherToolCount }),
         tier: 4,
         rawCallCount: otherToolCount,
         firstOrder: firstSeen.get("other") ?? 0,
@@ -881,16 +923,17 @@ export function summarizeWorkChunk(
     }
     const formattedShown = buckets
       .slice(0, shownLen)
-      .map((b, idx) => (idx === 0 ? b.label : lowercaseClauseLead(b.label)))
-      .join(", ");
+      .map((b, idx) => (idx === 0 || locale !== "en" ? b.label : lowercaseClauseLead(b.label)))
+      .join(locale === "en" ? ", " : "、");
 
     if (shownLen > 0 && hiddenSteps > 0) {
-      const noun = hiddenSteps === 1 ? "step" : "steps";
-      label = `${formattedShown}, and ${hiddenSteps} more ${noun}`;
+      label = t(hiddenSteps === 1 ? "stage.oneMoreStep" : "stage.moreSteps", {
+        summary: formattedShown, count: hiddenSteps,
+      });
     } else if (formattedShown) {
       label = formattedShown;
     } else {
-      label = `Used ${totalTc} tools`;
+      label = t("stage.usedTools", { count: totalTc });
     }
   }
 

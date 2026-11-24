@@ -22,6 +22,15 @@ import { cn } from "@/lib/utils";
 
 const DRAFT_BADGE_CLASS = "text-ink-muted text-[11px] font-medium leading-none";
 
+export function canQuickArchiveThread(
+  agent: Pick<
+    AgentCardView,
+    "is_running" | "has_background_tasks" | "status_label" | "is_awaiting_permission"
+  >,
+): boolean {
+  return !isAgentForegroundRunning(agent) && !agent.is_awaiting_permission;
+}
+
 export interface SidebarConversationRowProps {
   threadKey: string;
   navId: string;
@@ -118,6 +127,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
 
   const isForegroundRunning = isAgentForegroundRunning(agent);
   const isRunning = isForegroundRunning || hasRunningSubagents;
+  const allowQuickArchive = canQuickArchiveThread(agent);
   const hasUnsentDraft = useHasThreadDraft(threadKey, !selected);
 
   useEffect(() => {
@@ -231,7 +241,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         });
       }}
       className={cn(
-        "group/item relative flex h-[30px] cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 transition-colors",
+        "group/item relative flex h-[30px] cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 transition-[background-color,color,opacity] duration-150",
         isChild && !inGroupRail && "border-border-subtle ml-[24px] border-l pl-2.5",
         isDragging && "opacity-45",
         selected
@@ -247,10 +257,10 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
       )}
     >
       {dropIndicator === "before" && (
-        <div className="bg-primary pointer-events-none absolute -top-[1px] right-1.5 left-1.5 z-20 h-[2px] rounded-full" />
+        <div className="bg-signal-info pointer-events-none absolute -top-[1px] right-1.5 left-1.5 z-20 h-[2px] animate-[orbit-stage-in_110ms_var(--ease-out-quart)] rounded-full" />
       )}
       {dropIndicator === "after" && (
-        <div className="bg-primary pointer-events-none absolute right-1.5 -bottom-[1px] left-1.5 z-20 h-[2px] rounded-full" />
+        <div className="bg-signal-info pointer-events-none absolute right-1.5 -bottom-[1px] left-1.5 z-20 h-[2px] animate-[orbit-stage-in_110ms_var(--ease-out-quart)] rounded-full" />
       )}
 
       <div
@@ -313,10 +323,10 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         <div className="grid shrink-0 items-center justify-items-end">
           <div
             className={cn(
-              "col-start-1 row-start-1 flex items-center gap-1.5",
+              "col-start-1 row-start-1 flex items-center gap-1.5 transition-opacity duration-150 ease-[var(--ease-out-quart)]",
               menuOpen
-                ? "pointer-events-none invisible"
-                : "group-hover/item:pointer-events-none group-hover/item:invisible group-focus-within/item:pointer-events-none group-focus-within/item:invisible",
+                ? "pointer-events-none opacity-0"
+                : "opacity-100 group-hover/item:pointer-events-none group-hover/item:opacity-0 group-focus-within/item:pointer-events-none group-focus-within/item:opacity-0 [@media(hover:none)]:pointer-events-none [@media(hover:none)]:opacity-0",
             )}
           >
             {contextLabel && (
@@ -347,19 +357,22 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
           <div
             data-thread-action="true"
             className={cn(
-              "col-start-1 row-start-1 flex items-center gap-0.5",
-              !menuOpen &&
-                "pointer-events-none invisible group-hover/item:pointer-events-auto group-hover/item:visible group-focus-within/item:pointer-events-auto group-focus-within/item:visible",
+              "col-start-1 row-start-1 flex items-center gap-0.5 transition-opacity duration-150 ease-[var(--ease-out-quart)]",
+              menuOpen
+                ? "pointer-events-auto opacity-100"
+                : "pointer-events-none opacity-0 group-hover/item:pointer-events-auto group-hover/item:opacity-100 group-focus-within/item:pointer-events-auto group-focus-within/item:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100",
             )}
             onClick={(e) => e.stopPropagation()}
           >
-            <IconButton
-              size="xs"
-              tooltip={t("sidebar.archiveConversation")}
-              onClick={() => orbitActions.archiveThread(host.host_id, agent.agent_id)}
-            >
-              <Archive className="size-[13px] stroke-[1.75]" />
-            </IconButton>
+            {allowQuickArchive && (
+              <IconButton
+                size="xs"
+                tooltip={t("sidebar.archiveConversation")}
+                onClick={() => orbitActions.archiveThread(host.host_id, agent.agent_id)}
+              >
+                <Archive className="size-[13px] stroke-[1.75]" />
+              </IconButton>
+            )}
 
             <IconButton
               size="xs"

@@ -43,6 +43,11 @@ import {
   useOrbitSelector,
 } from "@/state/orbit-store";
 
+type PendingRelayConfirm =
+  | { kind: "clear" }
+  | { kind: "share_all"; relayUrl: string }
+  | { kind: "deploy_ssh"; ssh: SshHostItem };
+
 function redactRelayForDisplay(url: string): string {
   return url
     .replace(/([?&])ft=[^&#]*/gi, "$1ft=***")
@@ -66,6 +71,8 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   const [deployingSsh, setDeployingSsh] = useState<string | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [confirmRemoveOpen, setConfirmRemoveOpen] = useState(false);
+  const [relayConfirmOpen, setRelayConfirmOpen] = useState(false);
+  const [pendingRelayConfirm, setPendingRelayConfirm] = useState<PendingRelayConfirm | null>(null);
   const [pairingQrOpen, setPairingQrOpen] = useState(false);
   const [relayExpanded, setRelayExpanded] = useState(false);
   const ime = useImeCompositionGuard();
@@ -78,10 +85,20 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
     setPairingQrOpen(false);
   }, [host?.host_id, host?.relay_url]);
 
+  useEffect(() => {
+    setRelayConfirmOpen(false);
+    setPendingRelayConfirm(null);
+  }, [host?.host_id]);
+
   if (!host) return null;
 
   const isLocal = isLocalHostCard(host);
   const relayDirty = relayInput.trim() !== (host.relay_url ?? "").trim();
+
+  const openRelayConfirm = (action: PendingRelayConfirm) => {
+    setPendingRelayConfirm(action);
+    setRelayConfirmOpen(true);
+  };
 
   const copyValue = async (field: string, value: string) => {
     await navigator.clipboard.writeText(value);
@@ -96,8 +113,16 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
     orbitActions.showToast(val ? "Saved relay endpoint" : "Cleared relay endpoint");
   };
 
-  const handleShareRelayAllHosts = async () => {
-    const val = relayInput.trim();
+  const handleRequestSaveRelay = () => {
+    if (!relayInput.trim() && host.relay_url) {
+      openRelayConfirm({ kind: "clear" });
+      return;
+    }
+    void handleSaveRelay(false);
+  };
+
+  const handleShareRelayAllHosts = async (relayUrl?: string) => {
+    const val = (relayUrl ?? relayInput).trim();
     if (!val) return;
     setSharingRelay(true);
     try {
@@ -106,6 +131,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
       orbitActions.showToast(`Shared relay with ${count} host${count === 1 ? "" : "s"}`);
     } catch (err) {
       setRelayStatusMsg(String(err));
+      throw err;
     } finally {
       setSharingRelay(false);
     }
@@ -127,6 +153,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
       setRelayStatusMsg(`Active across fleet on ${redactRelayForDisplay(url)}`);
     } catch (err) {
       setRelayStatusMsg(String(err));
+      throw err;
     } finally {
       setDeployingSsh(null);
     }
@@ -389,7 +416,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               {...ime.compositionProps}
               onKeyDown={(e) => {
                 if (ime.shouldIgnoreKeyDown(e)) return;
-                if (e.key === "Enter" && relayDirty) void handleSaveRelay(false);
+                if (e.key === "Enter" && relayDirty) handleRequestSaveRelay();
               }}
               placeholder="wss://relay.example.com"
               className="h-[34px] min-w-[200px] flex-1 px-3 font-mono"
@@ -397,7 +424,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             <Button
               type="button"
               disabled={!relayDirty}
-              onClick={() => void handleSaveRelay(false)}
+              onClick={handleRequestSaveRelay}
               className="h-[34px] px-3.5"
             >
               Save
@@ -407,7 +434,9 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                 type="button"
                 variant="outline"
                 disabled={sharingRelay}
-                onClick={() => void handleShareRelayAllHosts()}
+                onClick={() =>
+                  openRelayConfirm({ kind: "share_all", relayUrl: relayInput.trim() })
+                }
                 className="h-[34px] gap-1.5 px-3 text-[12.5px]"
               >
                 {sharingRelay && <OrbitSpinner size={13.5} className="size-[13.5px]" />}
@@ -418,7 +447,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => void handleSaveRelay(true)}
+                onClick={() => openRelayConfirm({ kind: "clear" })}
                 className="h-[34px] px-3"
               >
                 Clear
@@ -459,7 +488,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                         variant="outline"
                         size="xs"
                         disabled={deployingSsh !== null}
-                        onClick={() => void handleDeploySshRelay(s)}
+                        onClick={() => openRelayConfirm({ kind: "deploy_ssh", ssh: s })}
                         className="shrink-0 gap-1.5 text-[11.5px]"
                       >
                         {deployingSsh === s.alias ? (
@@ -510,7 +539,65 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         description="Unpairs this machine from Orbit Desktop. Running agents and shells on the host keep running, and you can pair it again later."
         confirmLabel="Remove"
         tone="danger"
+        defaultAction="cancel"
         onConfirm={handleRemoveHost}
+      />
+
+      <ConfirmDialog
+        open={relayConfirmOpen && pendingRelayConfirm !== null}
+        onOpenChange={setRelayConfirmOpen}
+        title={
+          pendingRelayConfirm?.kind === "clear"
+            ? `Clear relay for ${host.display_name}?`
+            : pendingRelayConfirm?.kind === "share_all"
+              ? `Overwrite relay on all ${fleet.hosts.length} hosts?`
+              : pendingRelayConfirm?.kind === "deploy_ssh"
+                ? `Deploy relay to ${pendingRelayConfirm.ssh.alias}?`
+                : ""
+        }
+        description={
+          pendingRelayConfirm?.kind === "clear"
+            ? "Removes the saved relay endpoint from this host. Remote and mobile access off your local network will stop working until a relay is configured again."
+            : pendingRelayConfirm?.kind === "share_all"
+              ? "Replaces the saved relay endpoint across every host in your fleet. Hosts using a different relay will disconnect and reconnect through this URL."
+              : pendingRelayConfirm?.kind === "deploy_ssh"
+                ? `Installs and starts an Orbit relay service on port 7878 over SSH, then overwrites the relay endpoint on all ${fleet.hosts.length} ${fleet.hosts.length === 1 ? "host" : "hosts"} in your fleet.`
+                : undefined
+        }
+        detail={
+          pendingRelayConfirm?.kind === "clear" && host.relay_url ? (
+            <span className="selectable-text font-mono text-[11.5px] break-all">
+              {redactRelayForDisplay(host.relay_url)}
+            </span>
+          ) : pendingRelayConfirm?.kind === "share_all" ? (
+            <span className="selectable-text font-mono text-[11.5px] break-all">
+              {redactRelayForDisplay(pendingRelayConfirm.relayUrl)}
+            </span>
+          ) : pendingRelayConfirm?.kind === "deploy_ssh" ? (
+            <span className="selectable-text font-mono text-[11.5px] break-all">
+              {pendingRelayConfirm.ssh.alias} ({pendingRelayConfirm.ssh.display_target})
+            </span>
+          ) : undefined
+        }
+        confirmLabel={
+          pendingRelayConfirm?.kind === "clear"
+            ? "Clear relay"
+            : pendingRelayConfirm?.kind === "share_all"
+              ? "Overwrite all hosts"
+              : "Deploy & overwrite"
+        }
+        tone="danger"
+        defaultAction="cancel"
+        onConfirm={async () => {
+          if (!pendingRelayConfirm) return;
+          if (pendingRelayConfirm.kind === "clear") {
+            await handleSaveRelay(true);
+          } else if (pendingRelayConfirm.kind === "share_all") {
+            await handleShareRelayAllHosts(pendingRelayConfirm.relayUrl);
+          } else {
+            await handleDeploySshRelay(pendingRelayConfirm.ssh);
+          }
+        }}
       />
 
       <PairingQrDialog

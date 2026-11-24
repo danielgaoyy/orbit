@@ -4,6 +4,10 @@ import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog-tabs";
 import { Kbd } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  QUICK_OPEN_PREFETCH_DELAY_MS,
+  shouldPrefetchOnPointerDown,
+} from "@/lib/file-prefetch";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -100,10 +104,24 @@ function QuickOpenFileInner() {
   }, [files, parsed.pathQuery, gitStatusMap]);
 
   const safeIdx = matches.length === 0 ? 0 : Math.min(activeIndex, matches.length - 1);
+  const activeMatchPath = matches[safeIdx] ?? null;
 
   useEffect(() => {
     itemRefs.current.get(safeIdx)?.scrollIntoView({ block: "nearest" });
   }, [safeIdx]);
+
+  // Quietly warm the currently highlighted Quick Open target after brief dwell so Enter opens instantly
+  useEffect(() => {
+    if (!hostId || !activeMatchPath) return;
+    const timer = window.setTimeout(() => {
+      orbitActions.prefetchWorkspaceFile(activeMatchPath, {
+        hostId,
+        cwd,
+        intent: "hover",
+      });
+    }, QUICK_OPEN_PREFETCH_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [hostId, cwd, activeMatchPath]);
 
   const openSelected = (filePath: string) => {
     if (!hostId) return;
@@ -147,7 +165,7 @@ function QuickOpenFileInner() {
           className="text-foreground placeholder:text-muted-foreground min-w-0 flex-1 bg-transparent text-[13px] outline-none"
         />
         {parsed.line != null && (
-          <span className="bg-primary/12 text-primary rounded px-1.5 py-0.5 font-mono text-[11px]">
+          <span className="bg-signal-info/12 text-signal-info rounded px-1.5 py-0.5 font-mono text-[11px]">
             L{parsed.line}
           </span>
         )}
@@ -178,6 +196,15 @@ function QuickOpenFileInner() {
                 }}
                 type="button"
                 onMouseEnter={() => setActiveIndex(idx)}
+                onPointerDown={(e) => {
+                  if (hostId && shouldPrefetchOnPointerDown(e)) {
+                    orbitActions.prefetchWorkspaceFile(filePath, {
+                      hostId,
+                      cwd,
+                      intent: "press",
+                    });
+                  }
+                }}
                 onClick={() => openSelected(filePath)}
                 className={cn(
                   "flex w-full cursor-pointer items-center justify-between gap-3 rounded-lg px-2.5 py-1.5 text-left transition-colors",

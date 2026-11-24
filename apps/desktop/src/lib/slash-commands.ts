@@ -12,6 +12,11 @@ export function isComposerInlineDirective(value: unknown): value is ComposerInli
   return typeof value === "string" && inlineDirectives.has(value);
 }
 
+/** Strips any leading slash(es) and outer whitespace so `/plan` and `plan` render identically. */
+export function normalizeDirectiveLabel(raw: string): string {
+  return raw.trim().replace(/^\/+/, "");
+}
+
 export function resolveComposerSubmission(directive: ComposerInlineDirective | null, draft: string) {
   if (directive === "btw" || directive === "goal") {
     return { kind: directive, text: draft.trim() } as const;

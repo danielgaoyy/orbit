@@ -158,8 +158,8 @@ export const ConversationComposer = memo(function ConversationComposer({
 
   const textStyleClass =
     variant === "compact"
-      ? "px-[12px] py-[9px] text-[13.5px] leading-[20px]"
-      : "px-[14px] py-[13px] text-[15px] leading-[20px]";
+      ? "px-[12px] py-[9px] text-[13px] leading-[20px]"
+      : "px-[14px] py-[12px] text-[15px] leading-[22px]";
 
   const resolvedRightControls =
     typeof rightControlsSlot === "function"

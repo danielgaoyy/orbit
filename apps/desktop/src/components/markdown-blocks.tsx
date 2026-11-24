@@ -1,7 +1,9 @@
 import {
   createContext,
   memo,
+  useCallback,
   useContext,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -12,6 +14,7 @@ import { ArrowUpRight, Check, Copy } from "lucide-react";
 import { DiagramBlock } from "@/components/diagram-block";
 import { InlineMathSpan, MathBlockView } from "@/components/math-block";
 import { resolveTokenColor } from "@/lib/code-highlight";
+import { useI18n } from "@/lib/i18n";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   type InlineSpanView,
@@ -22,6 +25,11 @@ import {
   detectDiagramKind,
 } from "@/lib/orbit-ipc";
 import { openOrbitLink, parseOrbitLinkTarget, prefetchOrbitLink } from "@/lib/file-links";
+import {
+  cancelHoverPrefetch,
+  scheduleHoverPrefetch,
+  shouldPrefetchOnPointerDown,
+} from "@/lib/file-prefetch";
 import {
   type ResolvedSubagentItem,
   type SubagentNameMatcher,
@@ -205,12 +213,26 @@ const InlineSpans = memo(
                 title={linkTitle}
                 onMouseEnter={() => {
                   if (parsed?.kind === "file") {
-                    prefetchOrbitLink(href, linkCtx);
+                    scheduleHoverPrefetch(() =>
+                      prefetchOrbitLink(href, { ...linkCtx, intent: "hover" }),
+                    );
+                  }
+                }}
+                onMouseLeave={() => {
+                  if (parsed?.kind === "file") {
+                    cancelHoverPrefetch();
+                  }
+                }}
+                onPointerDown={(e) => {
+                  if (parsed?.kind === "file" && shouldPrefetchOnPointerDown(e)) {
+                    cancelHoverPrefetch();
+                    prefetchOrbitLink(href, { ...linkCtx, intent: "press" });
                   }
                 }}
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                  cancelHoverPrefetch();
                   openOrbitLink(href, linkCtx);
                 }}
                 className={`text-foreground decoration-foreground/30 hover:decoration-foreground cursor-pointer font-medium underline-offset-3 hover:underline ${className}`}
@@ -218,7 +240,7 @@ const InlineSpans = memo(
                 {span.math_ml ? (
                   <InlineMathSpan tex={span.text} mathMl={span.math_ml} />
                 ) : span.inline_code ? (
-                  <code className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.86em] leading-[1.35] [overflow-wrap:anywhere] dark:bg-white/[0.09]">
+                  <code className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.88em] leading-[1.35] [overflow-wrap:anywhere] dark:bg-white/[0.09]">
                     {span.text}
                   </code>
                 ) : (
@@ -257,7 +279,7 @@ const InlineSpans = memo(
                     onOpen(matchedSubagent);
                   }}
                   className={cn(
-                    "group/salink text-foreground/92 hover:text-foreground inline cursor-pointer rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.86em] leading-[1.35] underline decoration-foreground/25 decoration-dotted underline-offset-2 transition-colors hover:bg-black/[0.085] hover:decoration-foreground/75 [overflow-wrap:anywhere] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]",
+                    "group/salink text-foreground/92 hover:text-foreground inline cursor-pointer rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.88em] leading-[1.35] underline decoration-foreground/25 decoration-dotted underline-offset-2 transition-colors hover:bg-black/[0.085] hover:decoration-foreground/75 [overflow-wrap:anywhere] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]",
                     className,
                   )}
                 >
@@ -269,7 +291,7 @@ const InlineSpans = memo(
             return (
               <code
                 key={idx}
-                className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.86em] leading-[1.35] [overflow-wrap:anywhere] dark:bg-white/[0.09]"
+                className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.88em] leading-[1.35] [overflow-wrap:anywhere] dark:bg-white/[0.09]"
               >
                 {span.text}
               </code>
@@ -319,6 +341,31 @@ const InlineSpans = memo(
   (prev, next) => spansAreEqual(prev.spans, next.spans),
 );
 
+/** Copy feedback belongs to the latest click, even if an older write resolves later. */
+export function useClipboardCopy(text: string) {
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | undefined>(undefined);
+  const requestRef = useRef(0);
+
+  useEffect(() => () => {
+    requestRef.current++;
+    window.clearTimeout(copyTimerRef.current);
+  }, []);
+
+  const copy = useCallback(() => {
+    const request = ++requestRef.current;
+    window.clearTimeout(copyTimerRef.current);
+    setCopied(false);
+    void navigator.clipboard?.writeText(text).then(() => {
+      if (request !== requestRef.current) return;
+      setCopied(true);
+      copyTimerRef.current = window.setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {});
+  }, [text]);
+
+  return { copied, copy };
+}
+
 export const HighlightedCodeBlock = memo(
   function HighlightedCodeBlock({
     language,
@@ -332,13 +379,8 @@ export const HighlightedCodeBlock = memo(
     embedded?: boolean;
     settled?: boolean;
   }) {
-    const [copied, setCopied] = useState(false);
-
-    const handleCopy = async () => {
-      await navigator.clipboard.writeText(raw_code);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    };
+    const { t } = useI18n();
+    const { copied, copy } = useClipboardCopy(raw_code);
 
     const codeBody = (
       <ScrollArea
@@ -347,7 +389,7 @@ export const HighlightedCodeBlock = memo(
       >
         {lines.map((line) => (
           <div key={line.line_number} className="flex min-w-fit">
-            <span className="tabular-nums mr-3.5 w-6 shrink-0 text-right text-zinc-400 select-none dark:text-zinc-600">
+            <span className="text-ink-faint tabular-nums mr-3.5 w-6 shrink-0 text-right select-none">
               {line.line_number}
             </span>
             <span className="whitespace-pre">
@@ -381,16 +423,16 @@ export const HighlightedCodeBlock = memo(
           settled ? { containIntrinsicBlockSize: `auto ${intrinsicHeight}px` } : undefined
         }
         className={cn(
-          "border-border my-3 overflow-hidden rounded-xl border bg-zinc-50 text-zinc-800 dark:bg-[#141519] dark:text-zinc-200",
+          "border-border-subtle bg-surface-recessed text-ink-primary my-3 overflow-hidden rounded-xl border",
           settled && "orbit-heavy-block-settled",
         )}
       >
-        <div className="border-border text-muted-foreground flex items-center justify-between border-b bg-black/[0.02] px-3.5 py-1.5 text-xs select-none dark:bg-white/[0.02]">
-          <span className="font-mono text-[11.5px]">{language || "text"}</span>
+        <div className="border-border-subtle text-ink-muted flex items-center justify-between border-b px-3.5 py-1.5 text-[11px] select-none">
+          <span className="font-mono text-[11px]">{language || "text"}</span>
           <button
             type="button"
-            onClick={() => void handleCopy()}
-            className="text-muted-foreground hover:text-foreground orbit-press inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] hover:bg-black/[0.05] dark:hover:bg-white/[0.06]"
+            onClick={copy}
+            className="text-ink-muted hover:text-ink-primary hover:bg-accent orbit-press inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11px]"
           >
             <span className="relative inline-flex size-3.5 items-center justify-center">
               <Copy
@@ -399,12 +441,12 @@ export const HighlightedCodeBlock = memo(
                 }`}
               />
               <Check
-                className={`absolute size-3.5 text-emerald-600 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] dark:text-emerald-400 ${
+                className={`text-signal-success absolute size-3.5 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] ${
                   copied ? "scale-100 rotate-0 opacity-100" : "scale-50 rotate-12 opacity-0"
                 }`}
               />
             </span>
-            <span>{copied ? "Copied" : "Copy"}</span>
+            <span>{t(copied ? "common.copied" : "common.copy")}</span>
           </button>
         </div>
         {codeBody}
@@ -478,14 +520,14 @@ const MarkdownTableBlock = memo(
           }}
           className="orbit-native-scroll w-full overflow-x-auto overflow-y-hidden overscroll-x-contain"
         >
-          <table className="w-full border-collapse text-[13.5px] leading-[1.55]">
+          <table className="w-full border-collapse text-[13px] leading-[1.55]">
             {headers.length > 0 && (
               <thead className="border-border border-b bg-black/[0.035] dark:bg-white/[0.045]">
                 <tr>
                   {colIndices.map((colIdx) => (
                     <th
                       key={colIdx}
-                      className={`border-border/70 text-foreground border-r px-3.5 py-2 font-semibold whitespace-pre-wrap last:border-r-0 ${tableAlignClass(
+                      className={`border-border/70 text-ink-secondary border-r px-3.5 py-2 text-[11px] leading-[1.45] font-semibold tracking-[0.03em] uppercase whitespace-pre-wrap last:border-r-0 ${tableAlignClass(
                         alignments[colIdx],
                       )}`}
                     >
@@ -628,10 +670,10 @@ function renderGroupedNodeContent(
     case "heading": {
       const sizeClass =
         block.level === 1
-          ? "text-[18px] font-semibold tracking-[-0.01em] text-foreground mt-4"
+          ? "text-[20px] leading-[1.3] font-semibold tracking-[-0.02em] text-foreground mt-4"
           : block.level === 2
-            ? "text-[16px] font-semibold tracking-[-0.01em] text-foreground mt-3.5"
-            : "text-[14.5px] font-semibold text-foreground mt-3";
+            ? "text-[17px] leading-[1.35] font-semibold tracking-[-0.015em] text-foreground mt-3.5"
+            : "text-[15px] leading-[1.45] font-semibold text-foreground mt-3";
       return (
         <div className={sizeClass}>
           <InlineSpans spans={block.spans} />
@@ -660,7 +702,7 @@ function renderGroupedNodeContent(
     }
     case "block_quote":
       return (
-        <blockquote className="border-border text-muted-foreground border-l-2 pl-3.5 text-[14px] leading-[1.68]">
+        <blockquote className="border-border text-muted-foreground border-l-2 pl-3.5">
           <InlineSpans spans={block.spans} />
         </blockquote>
       );
@@ -759,10 +801,10 @@ export const MarkdownBlocksView = memo(function MarkdownBlocksView({
   const groupedNodes = useMemo(() => groupMarkdownBlocks(blocks), [blocks]);
 
   const containerClass = compact
-    ? "selectable-text text-foreground/78 min-w-0 space-y-1 text-[13px] leading-[1.58] break-words"
+    ? "selectable-text text-foreground/82 min-w-0 space-y-1 text-[13px] leading-[1.55] break-words"
     : bubble
-      ? "selectable-text text-foreground/95 min-w-0 space-y-2 text-[14.5px] leading-[1.68] break-words"
-      : "selectable-text text-foreground/95 min-w-0 space-y-3 text-[14.5px] leading-[1.68] break-words";
+      ? "selectable-text text-foreground/95 min-w-0 space-y-2 text-[15px] leading-[1.65] break-words"
+      : "selectable-text text-foreground/95 min-w-0 space-y-3 text-[15px] leading-[1.65] break-words";
   const listSpacingClass = compact || bubble ? "space-y-0.5" : "space-y-1";
 
   return (

@@ -93,6 +93,96 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
     Pick<QueuedPromptItem, "slashDirective" | "contexts" | "pastes" | "quotes">
   >();
 
+  interface ComposerDraftSnapshot {
+    draft: string;
+    slashDirective: ComposerInlineDirective | null;
+    inlineMentions: InlineMentionTarget[];
+    contextItems: ContextMentionItem[];
+    pastedAttachments: PastedAttachment[];
+    diffQuotes: DiffQuoteSnippet[];
+  }
+
+  function formatSubmitErrorToast(err: unknown): string {
+    const detail = err instanceof Error ? err.message : String(err);
+    const trimmed = detail.trim();
+    const base = translateGlobal("common.actionFailed");
+    return trimmed ? `${base} (${trimmed})` : base;
+  }
+
+  function captureComposerDraftSnapshot(scopeKey: string): ComposerDraftSnapshot {
+    const cur = getState();
+    return {
+      draft: cur.composerDrafts[scopeKey] ?? "",
+      slashDirective: cur.slashDirectives[scopeKey] ?? null,
+      inlineMentions: [...(cur.inlineMentions[scopeKey] ?? [])],
+      contextItems: [...(cur.contextItems[scopeKey] ?? [])],
+      pastedAttachments: [...(cur.pastedAttachments[scopeKey] ?? [])],
+      diffQuotes: [...(cur.diffQuotes[scopeKey] ?? [])],
+    };
+  }
+
+  function mergeRestoredDraftText(snapshotDraft: string, currentDraft: string): string {
+    if (currentDraft.trim().length > 0 && snapshotDraft.trim().length > 0) {
+      return `${snapshotDraft}\n\n${currentDraft}`;
+    }
+    if (snapshotDraft.trim().length > 0) {
+      return snapshotDraft;
+    }
+    return currentDraft || snapshotDraft;
+  }
+
+  function restoreComposerDraftSnapshot(
+    scopeKey: string,
+    snapshot: ComposerDraftSnapshot,
+  ): void {
+    setState((s) => {
+      const currentDraft = s.composerDrafts[scopeKey] ?? "";
+      const mergedDraft = mergeRestoredDraftText(snapshot.draft, currentDraft);
+
+      const currentDirective = s.slashDirectives[scopeKey] ?? null;
+      const mergedDirective = currentDirective ?? snapshot.slashDirective;
+
+      const currentInline = s.inlineMentions[scopeKey] ?? [];
+      const seenInlineTokens = new Set(currentInline.map((m) => m.token));
+      const mergedInline = [
+        ...snapshot.inlineMentions.filter((m) => !seenInlineTokens.has(m.token)),
+        ...currentInline,
+      ];
+
+      const currentContexts = s.contextItems[scopeKey] ?? [];
+      const seenContextIds = new Set(currentContexts.map((c) => c.id));
+      const mergedContexts = [
+        ...snapshot.contextItems.filter((c) => !seenContextIds.has(c.id)),
+        ...currentContexts,
+      ];
+
+      const currentPastes = s.pastedAttachments[scopeKey] ?? [];
+      const seenPasteIds = new Set(currentPastes.map((p) => p.id));
+      const mergedPastes = [
+        ...snapshot.pastedAttachments.filter((p) => !seenPasteIds.has(p.id)),
+        ...currentPastes,
+      ];
+
+      const currentQuotes = s.diffQuotes[scopeKey] ?? [];
+      const seenQuoteIds = new Set(currentQuotes.map((q) => q.id));
+      const mergedQuotes = [
+        ...snapshot.diffQuotes.filter((q) => !seenQuoteIds.has(q.id)),
+        ...currentQuotes,
+      ];
+
+      return {
+        ...s,
+        composerDrafts: { ...s.composerDrafts, [scopeKey]: mergedDraft },
+        slashDirectives: { ...s.slashDirectives, [scopeKey]: mergedDirective },
+        inlineMentions: { ...s.inlineMentions, [scopeKey]: mergedInline },
+        contextItems: { ...s.contextItems, [scopeKey]: mergedContexts },
+        pastedAttachments: { ...s.pastedAttachments, [scopeKey]: mergedPastes },
+        diffQuotes: { ...s.diffQuotes, [scopeKey]: mergedQuotes },
+      };
+    });
+    draftPersistence.flushNow();
+  }
+
   function rememberLocalQueuedDraftExtras(
     queueId: string,
     extras: Pick<QueuedPromptItem, "slashDirective" | "contexts" | "pastes" | "quotes">,
@@ -1058,8 +1148,26 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           ctx.actions.focusComposer();
           return;
         }
+        const prevGoalDraft = getState().composerDrafts[key] ?? "";
+        const prevGoalDirective = getState().slashDirectives[key] ?? null;
         clearDirectiveDraft();
-        await ctx.actions.startGoalRun({ hostId, agentId, objective: submission.text });
+        try {
+          await ctx.actions.startGoalRun({ hostId, agentId, objective: submission.text });
+        } catch (err) {
+          setState((s) => ({
+            ...s,
+            composerDrafts: {
+              ...s.composerDrafts,
+              [key]: mergeRestoredDraftText(prevGoalDraft, s.composerDrafts[key] ?? ""),
+            },
+            slashDirectives: {
+              ...s.slashDirectives,
+              [key]: s.slashDirectives[key] ?? prevGoalDirective,
+            },
+          }));
+          draftPersistence.flushNow();
+          notifyToast(formatSubmitErrorToast(err));
+        }
         return;
       }
 
@@ -1357,95 +1465,103 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
       let workingDiffText: string | null = null;
       let stagedDiffText: string | null = null;
-      if (needsWorkingDiff) {
-        await orbitIpc.fetchGitDiff(submitTarget.hostId, cwd, null, false);
-        const gr = await orbitIpc.getGitReview(submitTarget.hostId, cwd, null);
-        if (gr.raw_diff.trim()) workingDiffText = gr.raw_diff;
-      }
-      if (needsStagedDiff) {
-        await orbitIpc.fetchGitDiff(submitTarget.hostId, cwd, null, true);
-        const gr = await orbitIpc.getGitReview(submitTarget.hostId, cwd, null);
-        if (gr.raw_diff.trim()) stagedDiffText = gr.raw_diff;
-      }
+      let composed: Awaited<ReturnType<typeof orbitIpc.composePrompt>>;
+      try {
+        if (needsWorkingDiff) {
+          await orbitIpc.fetchGitDiff(submitTarget.hostId, cwd, null, false);
+          const gr = await orbitIpc.getGitReview(submitTarget.hostId, cwd, null);
+          if (gr.raw_diff.trim()) workingDiffText = gr.raw_diff;
+        }
+        if (needsStagedDiff) {
+          await orbitIpc.fetchGitDiff(submitTarget.hostId, cwd, null, true);
+          const gr = await orbitIpc.getGitReview(submitTarget.hostId, cwd, null);
+          if (gr.raw_diff.trim()) stagedDiffText = gr.raw_diff;
+        }
 
-      const providerForCompose: ProviderKind = submitTarget.providerForCompose;
+        const providerForCompose: ProviderKind = submitTarget.providerForCompose;
+
+        const nonSkillContexts = mergedContexts.filter((c) => c.kind !== "skill");
+
+        const contextInputs: ComposerContextInput[] = nonSkillContexts.map((ctx) => {
+          switch (ctx.kind) {
+            case "image":
+              return { kind: "image", path: ctx.path, filename: ctx.filename };
+            case "file": {
+              if (ctx.stagedHostId) {
+                const fname = ctx.filename || ctx.path;
+                if (ctx.mediaKind === "pdf") {
+                  return { kind: "pdf", path: ctx.path, filename: fname };
+                }
+                if (ctx.mediaKind === "audio") {
+                  return { kind: "audio", path: ctx.path, filename: fname };
+                }
+                if (ctx.mediaKind === "video") {
+                  return { kind: "video", path: ctx.path, filename: fname };
+                }
+                return {
+                  kind: "staged_file",
+                  path: ctx.path,
+                  filename: fname,
+                };
+              }
+              return { kind: "workspace_file", path: ctx.path };
+            }
+            case "git_diff":
+              return {
+                kind: "git_diff",
+                staged: ctx.staged,
+                label: ctx.label,
+                diff_text: ctx.staged ? stagedDiffText : workingDiffText,
+              };
+            case "terminal_output":
+              return {
+                kind: "terminal_output",
+                label: ctx.label,
+                content: ctx.content,
+              };
+            case "code_symbol":
+              return {
+                kind: "code_symbol",
+                name: ctx.symbolName,
+                symbol_kind: ctx.symbolKind,
+                path: ctx.path,
+                start_line: ctx.startLine,
+                end_line: ctx.endLine,
+                signature: ctx.signature ?? null,
+                container: ctx.container ?? null,
+                language: ctx.language,
+                snippet: ctx.snippet ?? resolvedSymbolSnippets.get(ctx.id) ?? null,
+              };
+          }
+        });
+
+        composed = await orbitIpc.composePrompt({
+          provider: providerForCompose,
+          raw_text: rawDraft,
+          explicit_directive: storedDirective,
+          host_id: submitTarget.hostId,
+          cwd,
+          contexts: contextInputs,
+          quotes: quotes.map((q) => ({
+            path: q.path,
+            line_number: q.lineNumber,
+            code: q.code,
+          })),
+          pastes: pastes.map((p) => ({
+            label: p.label,
+            filename: p.filename ?? null,
+            content: p.content,
+          })),
+        });
+      } catch (err) {
+        notifyToast(formatSubmitErrorToast(err));
+        return;
+      }
 
       const skillContexts = mergedContexts.filter(
         (c): c is Extract<ContextMentionItem, { kind: "skill" }> => c.kind === "skill",
       );
       const nonSkillContexts = mergedContexts.filter((c) => c.kind !== "skill");
-
-      const contextInputs: ComposerContextInput[] = nonSkillContexts.map((ctx) => {
-        switch (ctx.kind) {
-          case "image":
-            return { kind: "image", path: ctx.path, filename: ctx.filename };
-          case "file": {
-            if (ctx.stagedHostId) {
-              const fname = ctx.filename || ctx.path;
-              if (ctx.mediaKind === "pdf") {
-                return { kind: "pdf", path: ctx.path, filename: fname };
-              }
-              if (ctx.mediaKind === "audio") {
-                return { kind: "audio", path: ctx.path, filename: fname };
-              }
-              if (ctx.mediaKind === "video") {
-                return { kind: "video", path: ctx.path, filename: fname };
-              }
-              return {
-                kind: "staged_file",
-                path: ctx.path,
-                filename: fname,
-              };
-            }
-            return { kind: "workspace_file", path: ctx.path };
-          }
-          case "git_diff":
-            return {
-              kind: "git_diff",
-              staged: ctx.staged,
-              label: ctx.label,
-              diff_text: ctx.staged ? stagedDiffText : workingDiffText,
-            };
-          case "terminal_output":
-            return {
-              kind: "terminal_output",
-              label: ctx.label,
-              content: ctx.content,
-            };
-          case "code_symbol":
-            return {
-              kind: "code_symbol",
-              name: ctx.symbolName,
-              symbol_kind: ctx.symbolKind,
-              path: ctx.path,
-              start_line: ctx.startLine,
-              end_line: ctx.endLine,
-              signature: ctx.signature ?? null,
-              container: ctx.container ?? null,
-              language: ctx.language,
-              snippet: ctx.snippet ?? resolvedSymbolSnippets.get(ctx.id) ?? null,
-            };
-        }
-      });
-
-      const composed = await orbitIpc.composePrompt({
-        provider: providerForCompose,
-        raw_text: rawDraft,
-        explicit_directive: storedDirective,
-        host_id: submitTarget.hostId,
-        cwd,
-        contexts: contextInputs,
-        quotes: quotes.map((q) => ({
-          path: q.path,
-          line_number: q.lineNumber,
-          code: q.code,
-        })),
-        pastes: pastes.map((p) => ({
-          label: p.label,
-          filename: p.filename ?? null,
-          content: p.content,
-        })),
-      });
 
       if (composed.is_fork) {
         if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
@@ -1518,20 +1634,60 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           notifyToast(translateGlobal("composer.toastSessionRequiredCompact"));
           return;
         }
+        const prevCompactDraft = getState().composerDrafts[submitTarget.scopeKey] ?? "";
+        const prevCompactDirective = getState().slashDirectives[submitTarget.scopeKey] ?? null;
         setState((s) => ({
           ...s,
           composerDrafts: { ...s.composerDrafts, [submitTarget.scopeKey]: "" },
           slashDirectives: { ...s.slashDirectives, [submitTarget.scopeKey]: null },
         }));
         draftPersistence.flushNow();
-        await orbitIpc.sendPrompt(submitTarget.hostId, submitTarget.agentId, composed.wire_prompt, {
-          displayPrompt: composed.display_prompt,
-          badges: composed.badges,
-        });
+        try {
+          await orbitIpc.sendPrompt(submitTarget.hostId, submitTarget.agentId, composed.wire_prompt, {
+            displayPrompt: composed.display_prompt,
+            badges: composed.badges,
+          });
+        } catch (err) {
+          setState((s) => ({
+            ...s,
+            composerDrafts: {
+              ...s.composerDrafts,
+              [submitTarget.scopeKey]: mergeRestoredDraftText(
+                prevCompactDraft,
+                s.composerDrafts[submitTarget.scopeKey] ?? "",
+              ),
+            },
+            slashDirectives: {
+              ...s.slashDirectives,
+              [submitTarget.scopeKey]: s.slashDirectives[submitTarget.scopeKey] ?? prevCompactDirective,
+            },
+          }));
+          draftPersistence.flushNow();
+          notifyToast(formatSubmitErrorToast(err));
+        }
         return;
       }
 
       if (composed.is_empty && skillContexts.length === 0) {
+        return;
+      }
+
+      // Perform upfront validation BEFORE revoking preview URLs or clearing any draft state.
+      const isCreatingNewAgent = submitTarget.isDraftNewSession || !submitTarget.agentId;
+      const hostDetailForCreate = isCreatingNewAgent
+        ? getState().hostDetails[submitTarget.hostId]
+        : undefined;
+      const installedProviders = hostDetailForCreate?.host.available_providers ?? [];
+      const installedAcpList = (hostDetailForCreate?.acp_agents ?? []).filter(
+        (a) => a.installed && a.spec.enabled,
+      );
+      if (
+        isCreatingNewAgent &&
+        hostDetailForCreate &&
+        installedProviders.length === 0 &&
+        installedAcpList.length === 0
+      ) {
+        ctx.actions.showToast(translateGlobal("composer.toastNoAgentCli"));
         return;
       }
 
@@ -1541,18 +1697,17 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const filePathQueueByLabel = new Map<string, string[]>();
       const sentImages: SentImagePreviewMeta[] = [];
       const targetAgentId = submitTarget.agentId;
-      const revokedLocalUrls = new Set<string>();
+      const pendingRevokeUrls = new Set<string>();
       for (const ctx of nonSkillContexts) {
         if (ctx.kind === "image") {
           if (ctx.path && ctx.previewUrl) {
             seedPromptImagePreview(submitTarget.hostId, ctx.path, ctx.previewUrl, true);
           } else if (ctx.previewUrl?.startsWith("blob:")) {
-            URL.revokeObjectURL(ctx.previewUrl);
-            revokedLocalUrls.add(ctx.previewUrl);
+            pendingRevokeUrls.add(ctx.previewUrl);
           }
           const cachedEntry = ctx.path ? getCachedPromptImage(submitTarget.hostId, ctx.path) : null;
           const safePreviewUrl =
-            ctx.previewUrl && !revokedLocalUrls.has(ctx.previewUrl) ? ctx.previewUrl : null;
+            ctx.previewUrl && !pendingRevokeUrls.has(ctx.previewUrl) ? ctx.previewUrl : null;
           const cachedPreview =
             safePreviewUrl || (cachedEntry?.status === "ready" ? cachedEntry.url : null);
           sentImages.push({
@@ -1567,8 +1722,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           }
         } else if (ctx.kind === "file") {
           if (ctx.previewUrl?.startsWith("blob:")) {
-            URL.revokeObjectURL(ctx.previewUrl);
-            revokedLocalUrls.add(ctx.previewUrl);
+            pendingRevokeUrls.add(ctx.previewUrl);
           }
           if (ctx.path) {
             const label = ctx.filename || basenameFromPath(ctx.path);
@@ -1577,9 +1731,6 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
             else filePathQueueByLabel.set(label, [ctx.path]);
           }
         }
-      }
-      if (sentImages.length > 0) {
-        recordRecentSentTurnImages(submitTarget.hostId, targetAgentId, cleanUserText, sentImages);
       }
       const skillBadges: PromptBadge[] = skillContexts.map((sk) => ({
         kind: "skill",
@@ -1617,10 +1768,9 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           : skillPrefix
         : composed.wire_prompt;
 
-      const nextHistory =
-        cleanUserText && getState().promptHistory[getState().promptHistory.length - 1] !== cleanUserText
-          ? [...getState().promptHistory.slice(-29), cleanUserText]
-          : getState().promptHistory;
+      // Snapshot all cleared per-scope slices BEFORE clearing them so any downstream failure
+      // can restore the user's draft, mentions, attachments, pastes, and quotes without data loss.
+      const draftSnapshot = captureComposerDraftSnapshot(submitTarget.scopeKey);
 
       setState(
         (s) => ({
@@ -1631,277 +1781,304 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           contextItems: { ...s.contextItems, [submitTarget.scopeKey]: [] },
           pastedAttachments: { ...s.pastedAttachments, [submitTarget.scopeKey]: [] },
           diffQuotes: { ...s.diffQuotes, [submitTarget.scopeKey]: [] },
-          promptHistory: nextHistory,
-          mediaPreviewTarget:
-            s.mediaPreviewTarget?.localUrl && revokedLocalUrls.has(s.mediaPreviewTarget.localUrl)
-              ? null
-              : s.mediaPreviewTarget,
         }),
         true,
       );
       draftPersistence.flushNow();
 
-      if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
-        const hostDetailForCreate = getState().hostDetails[submitTarget.hostId];
-        const installedProviders = hostDetailForCreate?.host.available_providers ?? [];
-        const installedAcpList = (hostDetailForCreate?.acp_agents ?? []).filter(
-          (a) => a.installed && a.spec.enabled,
-        );
-        if (hostDetailForCreate && installedProviders.length === 0 && installedAcpList.length === 0) {
-          ctx.actions.showToast(translateGlobal("composer.toastNoAgentCli"));
-          return;
+      const commitSubmissionSuccess = () => {
+        if (sentImages.length > 0) {
+          recordRecentSentTurnImages(submitTarget.hostId, targetAgentId, cleanUserText, sentImages);
         }
-        const effectiveProvider = resolveAvailableDraftProvider(
-          hostDetailForCreate,
-          submitTarget.draftProvider,
-        );
-        const effectiveAcpAgentId =
-          effectiveProvider === "acp"
-            ? submitTarget.draftAcpAgentId &&
-              installedAcpList.some((a) => a.spec.id === submitTarget.draftAcpAgentId)
-              ? submitTarget.draftAcpAgentId
-              : (installedAcpList[0]?.spec.id ?? submitTarget.draftAcpAgentId)
+        for (const url of pendingRevokeUrls) {
+          URL.revokeObjectURL(url);
+        }
+        setState((s) => {
+          const nextHistory =
+            cleanUserText && s.promptHistory[s.promptHistory.length - 1] !== cleanUserText
+              ? [...s.promptHistory.slice(-29), cleanUserText]
+              : s.promptHistory;
+          const shouldClearPreview =
+            Boolean(s.mediaPreviewTarget?.localUrl) &&
+            pendingRevokeUrls.has(s.mediaPreviewTarget!.localUrl!);
+          if (nextHistory === s.promptHistory && !shouldClearPreview) {
+            return s;
+          }
+          return {
+            ...s,
+            promptHistory: nextHistory,
+            mediaPreviewTarget: shouldClearPreview ? null : s.mediaPreviewTarget,
+          };
+        }, true);
+      };
+
+      try {
+        if (isCreatingNewAgent) {
+          const effectiveProvider = resolveAvailableDraftProvider(
+            hostDetailForCreate,
+            submitTarget.draftProvider,
+          );
+          const effectiveAcpAgentId =
+            effectiveProvider === "acp"
+              ? submitTarget.draftAcpAgentId &&
+                installedAcpList.some((a) => a.spec.id === submitTarget.draftAcpAgentId)
+                ? submitTarget.draftAcpAgentId
+                : (installedAcpList[0]?.spec.id ?? submitTarget.draftAcpAgentId)
+              : null;
+
+          const branchSeed =
+            cleanUserText ||
+            (effectiveDirective === "review"
+              ? "code-review"
+              : effectiveDirective === "plan"
+                ? "plan"
+                : badges[0]?.label ?? "task");
+
+          const selectedCwd = submitTarget.workspaceCwd;
+          const gitCacheKey = `${submitTarget.hostId}::${selectedCwd}`;
+          const cachedInspection =
+            getState().gitReposCache[gitCacheKey] ??
+            hostDetailForCreate?.git_repos_by_cwd?.[selectedCwd] ??
+            null;
+          const sidebarProj = getState().sidebarView?.projects.find(
+            (p) =>
+              p.host_id === submitTarget.hostId &&
+              matchesProjectDirectory(p.directories, selectedCwd),
+          );
+          const discoveredProj = hostDetailForCreate?.discovered_projects.find(
+            (p) => p.path === selectedCwd,
+          );
+          const isDirectGitRepo =
+            cachedInspection?.is_git_repo ??
+            sidebarProj?.is_git_repo ??
+            discoveredProj?.is_git_repo ??
+            false;
+          const nestedRepos =
+            cachedInspection?.nested_git_repos ??
+            sidebarProj?.nested_git_repos ??
+            discoveredProj?.nested_git_repos ??
+            [];
+          const chosenNestedRepo = submitTarget.draftWorktreeRepoPath
+            ? nestedRepos.find((r) => r.path === submitTarget.draftWorktreeRepoPath)?.path ??
+              submitTarget.draftWorktreeRepoPath
             : null;
 
-        const branchSeed =
-          cleanUserText ||
-          (effectiveDirective === "review"
-            ? "code-review"
-            : effectiveDirective === "plan"
-              ? "plan"
-              : badges[0]?.label ?? "task");
-
-        const selectedCwd = submitTarget.workspaceCwd;
-        const gitCacheKey = `${submitTarget.hostId}::${selectedCwd}`;
-        const cachedInspection =
-          getState().gitReposCache[gitCacheKey] ??
-          hostDetailForCreate?.git_repos_by_cwd?.[selectedCwd] ??
-          null;
-        const sidebarProj = getState().sidebarView?.projects.find(
-          (p) =>
-            p.host_id === submitTarget.hostId &&
-            matchesProjectDirectory(p.directories, selectedCwd),
-        );
-        const discoveredProj = hostDetailForCreate?.discovered_projects.find(
-          (p) => p.path === selectedCwd,
-        );
-        const isDirectGitRepo =
-          cachedInspection?.is_git_repo ??
-          sidebarProj?.is_git_repo ??
-          discoveredProj?.is_git_repo ??
-          false;
-        const nestedRepos =
-          cachedInspection?.nested_git_repos ??
-          sidebarProj?.nested_git_repos ??
-          discoveredProj?.nested_git_repos ??
-          [];
-        const chosenNestedRepo = submitTarget.draftWorktreeRepoPath
-          ? nestedRepos.find((r) => r.path === submitTarget.draftWorktreeRepoPath)?.path ??
-            submitTarget.draftWorktreeRepoPath
-          : null;
-
-        let effectiveCwd = selectedCwd;
-        let effectiveExtraDirs: string[] = [];
-        let worktreeBranch: string | null = null;
-        if (submitTarget.draftUseWorktree) {
-          const canUseWorktree = isDirectGitRepo || Boolean(chosenNestedRepo);
-          if (canUseWorktree) {
-            const manual = submitTarget.draftWorktreeBranch.trim();
-            if (manual) {
-              worktreeBranch = manual;
-            } else if (
-              submitTarget.worktreeBranchPrefix.trim() &&
-              submitTarget.worktreeBranchPrefix.trim() !== "auto"
-            ) {
-              worktreeBranch = slugifyPrefixedBranch(submitTarget.worktreeBranchPrefix, branchSeed);
-            } else {
-              worktreeBranch = "auto";
-            }
-            if (!isDirectGitRepo && chosenNestedRepo) {
-              effectiveCwd = chosenNestedRepo;
-              const parentDirs = new Set<string>([
-                selectedCwd,
-                ...(sidebarProj?.directories ?? []),
-              ]);
-              parentDirs.delete(chosenNestedRepo);
-              parentDirs.delete("~");
-              effectiveExtraDirs = Array.from(parentDirs).filter(Boolean);
+          let effectiveCwd = selectedCwd;
+          let effectiveExtraDirs: string[] = [];
+          let worktreeBranch: string | null = null;
+          if (submitTarget.draftUseWorktree) {
+            const canUseWorktree = isDirectGitRepo || Boolean(chosenNestedRepo);
+            if (canUseWorktree) {
+              const manual = submitTarget.draftWorktreeBranch.trim();
+              if (manual) {
+                worktreeBranch = manual;
+              } else if (
+                submitTarget.worktreeBranchPrefix.trim() &&
+                submitTarget.worktreeBranchPrefix.trim() !== "auto"
+              ) {
+                worktreeBranch = slugifyPrefixedBranch(submitTarget.worktreeBranchPrefix, branchSeed);
+              } else {
+                worktreeBranch = "auto";
+              }
+              if (!isDirectGitRepo && chosenNestedRepo) {
+                effectiveCwd = chosenNestedRepo;
+                const parentDirs = new Set<string>([
+                  selectedCwd,
+                  ...(sidebarProj?.directories ?? []),
+                ]);
+                parentDirs.delete(chosenNestedRepo);
+                parentDirs.delete("~");
+                effectiveExtraDirs = Array.from(parentDirs).filter(Boolean);
+              }
             }
           }
-        }
-        const explicitDraftModel = submitTarget.draftModels[effectiveProvider] ?? null;
-        const resolvedSel = await orbitIpc
-          .resolveModelSelection({
-            host_id: submitTarget.hostId,
-            provider: effectiveProvider,
-            desired_model: explicitDraftModel,
-            desired_effort: submitTarget.draftEffort,
-          })
-          .catch(() => null);
-        const cat = getCatalogForProvider(
-          hostDetailForCreate?.provider_catalogs,
-          effectiveProvider,
-        );
-        const spec = resolveActiveModelSpec(cat, explicitDraftModel);
-        const resolvedModel =
-          effectiveProvider === "acp"
-            ? explicitDraftModel
-            : (resolvedSel?.selected_model_id ?? explicitDraftModel ?? spec?.id ?? null);
-        const resolvedEffort =
-          effectiveProvider === "acp"
-            ? null
-            : (resolvedSel?.selected_effort ??
-              resolveSupportedEffortForModel(
-                spec,
-                submitTarget.draftEffort,
-                cat.configured_default_effort,
-              ));
-        const supportsFast =
-          effectiveProvider === "acp" || effectiveProvider === "antigravity"
-            ? false
-            : (resolvedSel?.supports_fast_mode ?? modelSupportsFastMode(effectiveProvider, spec));
+          const explicitDraftModel = submitTarget.draftModels[effectiveProvider] ?? null;
+          const resolvedSel = await orbitIpc
+            .resolveModelSelection({
+              host_id: submitTarget.hostId,
+              provider: effectiveProvider,
+              desired_model: explicitDraftModel,
+              desired_effort: submitTarget.draftEffort,
+            })
+            .catch(() => null);
+          const cat = getCatalogForProvider(
+            hostDetailForCreate?.provider_catalogs,
+            effectiveProvider,
+          );
+          const spec = resolveActiveModelSpec(cat, explicitDraftModel);
+          const resolvedModel =
+            effectiveProvider === "acp"
+              ? explicitDraftModel
+              : (resolvedSel?.selected_model_id ?? explicitDraftModel ?? spec?.id ?? null);
+          const resolvedEffort =
+            effectiveProvider === "acp"
+              ? null
+              : (resolvedSel?.selected_effort ??
+                resolveSupportedEffortForModel(
+                  spec,
+                  submitTarget.draftEffort,
+                  cat.configured_default_effort,
+                ));
+          const supportsFast =
+            effectiveProvider === "acp" || effectiveProvider === "antigravity"
+              ? false
+              : (resolvedSel?.supports_fast_mode ?? modelSupportsFastMode(effectiveProvider, spec));
 
-        const stillOnOriginDraft =
-          getState().selectedHostId === submitTarget.hostId &&
-          getState().isDraftNewSession &&
-          (getState().selectedWorkspaceCwd || "~") === submitTarget.workspaceCwd;
-        let localPendingRef: PendingDraftCreateState | null = null;
-        if (stillOnOriginDraft) {
-          localPendingRef = {
-            hostId: submitTarget.hostId,
-            optimisticAgentId: null,
-            startedAt: Date.now(),
-          };
-          ctx.setPendingDraftCreate(localPendingRef);
-        }
-        let optimisticId: string | undefined;
-        try {
-          optimisticId = await orbitIpc.createAgent({
-            hostId: submitTarget.hostId,
-            cwd: effectiveCwd,
-            extraDirs: effectiveExtraDirs,
-            provider: effectiveProvider,
-            acpAgentId: effectiveAcpAgentId,
-            model: resolvedModel,
-            effort: resolvedEffort,
-            fastMode: Boolean(submitTarget.draftFastMode && supportsFast),
-            mode: submitTarget.draftMode,
-            initialPrompt: assembledWirePrompt,
-            initialDisplayPrompt: cleanUserText,
-            initialBadges: badges,
-            worktreeBranch,
-            profileId: submitTarget.draftProfileId,
-            workspaceId: submitTarget.draftWorkspaceId,
-          });
-        } catch (err) {
-          if (localPendingRef && ctx.getPendingDraftCreate() === localPendingRef) {
-            ctx.setPendingDraftCreate(null);
+          const stillOnOriginDraft =
+            getState().selectedHostId === submitTarget.hostId &&
+            getState().isDraftNewSession &&
+            (getState().selectedWorkspaceCwd || "~") === submitTarget.workspaceCwd;
+          let localPendingRef: PendingDraftCreateState | null = null;
+          if (stillOnOriginDraft) {
+            localPendingRef = {
+              hostId: submitTarget.hostId,
+              optimisticAgentId: null,
+              startedAt: Date.now(),
+            };
+            ctx.setPendingDraftCreate(localPendingRef);
           }
-          throw err;
+          let optimisticId: string | undefined;
+          try {
+            optimisticId = await orbitIpc.createAgent({
+              hostId: submitTarget.hostId,
+              cwd: effectiveCwd,
+              extraDirs: effectiveExtraDirs,
+              provider: effectiveProvider,
+              acpAgentId: effectiveAcpAgentId,
+              model: resolvedModel,
+              effort: resolvedEffort,
+              fastMode: Boolean(submitTarget.draftFastMode && supportsFast),
+              mode: submitTarget.draftMode,
+              initialPrompt: assembledWirePrompt,
+              initialDisplayPrompt: cleanUserText,
+              initialBadges: badges,
+              worktreeBranch,
+              profileId: submitTarget.draftProfileId,
+              workspaceId: submitTarget.draftWorkspaceId,
+            });
+          } catch (err) {
+            if (localPendingRef && ctx.getPendingDraftCreate() === localPendingRef) {
+              ctx.setPendingDraftCreate(null);
+            }
+            throw err;
+          }
+          commitSubmissionSuccess();
+          const stillOnOriginDraftAfterCreate =
+            getState().selectedHostId === submitTarget.hostId &&
+            getState().isDraftNewSession &&
+            (getState().selectedWorkspaceCwd || "~") === submitTarget.workspaceCwd;
+          if (
+            optimisticId &&
+            stillOnOriginDraftAfterCreate &&
+            localPendingRef &&
+            ctx.getPendingDraftCreate() === localPendingRef
+          ) {
+            ctx.setPendingDraftCreate({
+              hostId: submitTarget.hostId,
+              optimisticAgentId: optimisticId,
+              startedAt: Date.now(),
+            });
+          }
+          if (stillOnOriginDraftAfterCreate) {
+            setState((s) => ({
+              ...s,
+              draftProvider: effectiveProvider,
+              draftWorktreeBranch: "",
+              draftWorkspaceId: null,
+            }));
+          }
+          return;
         }
-        const stillOnOriginDraftAfterCreate =
-          getState().selectedHostId === submitTarget.hostId &&
-          getState().isDraftNewSession &&
-          (getState().selectedWorkspaceCwd || "~") === submitTarget.workspaceCwd;
-        if (
-          optimisticId &&
-          stillOnOriginDraftAfterCreate &&
-          localPendingRef &&
-          ctx.getPendingDraftCreate() === localPendingRef
-        ) {
-          ctx.setPendingDraftCreate({
-            hostId: submitTarget.hostId,
-            optimisticAgentId: optimisticId,
-            startedAt: Date.now(),
-          });
+
+        const agentId = submitTarget.agentId!;
+        const detail = getState().hostDetails[submitTarget.hostId];
+        const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
+        const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
+
+        if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
+          if (steerImmediately) {
+            await orbitIpc.sendPrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
+              displayPrompt: cleanUserText,
+              badges,
+              activeTurnBehavior: "steer",
+            });
+            commitSubmissionSuccess();
+          } else if (supportsServerQueue) {
+            const queuedContexts: ContextMentionItem[] = mergedContexts.map((ctx) => {
+              if (ctx.kind === "file" && ctx.previewUrl && pendingRevokeUrls.has(ctx.previewUrl)) {
+                return { ...ctx, previewUrl: undefined };
+              }
+              if (ctx.kind === "image" && ctx.previewUrl && pendingRevokeUrls.has(ctx.previewUrl)) {
+                return { ...ctx, previewUrl: "" };
+              }
+              return ctx;
+            });
+            const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            rememberLocalQueuedDraftExtras(queueId, {
+              slashDirective: effectiveDirective,
+              contexts: queuedContexts,
+              pastes,
+              quotes,
+            });
+            try {
+              await orbitIpc.enqueuePrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
+                displayPrompt: cleanUserText,
+                badges,
+                queueId,
+              });
+            } catch (err) {
+              localQueuedDraftExtras.delete(queueId);
+              throw err;
+            }
+            commitSubmissionSuccess();
+          } else {
+            const queuedContexts: ContextMentionItem[] = mergedContexts.map((ctx) => {
+              if (ctx.kind === "file" && ctx.previewUrl && pendingRevokeUrls.has(ctx.previewUrl)) {
+                return { ...ctx, previewUrl: undefined };
+              }
+              if (ctx.kind === "image" && ctx.previewUrl && pendingRevokeUrls.has(ctx.previewUrl)) {
+                return { ...ctx, previewUrl: "" };
+              }
+              return ctx;
+            });
+            const queuedItem: QueuedPromptItem = {
+              id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              wirePrompt: assembledWirePrompt,
+              displayText: cleanUserText,
+              badges,
+              slashDirective: effectiveDirective,
+              contexts: queuedContexts,
+              pastes,
+              quotes,
+            };
+            setState((s) => ({
+              ...s,
+              queuedPrompts: {
+                ...s.queuedPrompts,
+                [submitTarget.scopeKey]: [...(s.queuedPrompts[submitTarget.scopeKey] ?? []), queuedItem],
+              },
+            }));
+            commitSubmissionSuccess();
+          }
+          return;
         }
-        if (stillOnOriginDraftAfterCreate) {
-          setState((s) => ({
-            ...s,
-            draftProvider: effectiveProvider,
-            draftWorktreeBranch: "",
-            draftWorkspaceId: null,
-          }));
-        }
-        return;
+
+        setState((s) =>
+          s.selectedHostId === submitTarget.hostId &&
+          !s.isDraftNewSession &&
+          s.selectedAgentId === agentId
+            ? { ...s, sessionScrollNonce: s.sessionScrollNonce + 1 }
+            : s,
+        );
+        await orbitIpc.sendPrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
+          displayPrompt: cleanUserText,
+          badges,
+        });
+        commitSubmissionSuccess();
+      } catch (err) {
+        restoreComposerDraftSnapshot(submitTarget.scopeKey, draftSnapshot);
+        notifyToast(formatSubmitErrorToast(err));
       }
-
-      const agentId = submitTarget.agentId;
-      const detail = getState().hostDetails[submitTarget.hostId];
-      const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
-      const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
-
-      if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
-        if (steerImmediately) {
-          await orbitIpc.sendPrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
-            displayPrompt: cleanUserText,
-            badges,
-            activeTurnBehavior: "steer",
-          });
-        } else if (supportsServerQueue) {
-          const queuedContexts: ContextMentionItem[] = mergedContexts.map((ctx) => {
-            if (ctx.kind === "file" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
-              return { ...ctx, previewUrl: undefined };
-            }
-            if (ctx.kind === "image" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
-              return { ...ctx, previewUrl: "" };
-            }
-            return ctx;
-          });
-          const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-          rememberLocalQueuedDraftExtras(queueId, {
-            slashDirective: effectiveDirective,
-            contexts: queuedContexts,
-            pastes,
-            quotes,
-          });
-          await orbitIpc.enqueuePrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
-            displayPrompt: cleanUserText,
-            badges,
-            queueId,
-          });
-        } else {
-          const queuedContexts: ContextMentionItem[] = mergedContexts.map((ctx) => {
-            if (ctx.kind === "file" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
-              return { ...ctx, previewUrl: undefined };
-            }
-            if (ctx.kind === "image" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
-              return { ...ctx, previewUrl: "" };
-            }
-            return ctx;
-          });
-          const queuedItem: QueuedPromptItem = {
-            id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            wirePrompt: assembledWirePrompt,
-            displayText: cleanUserText,
-            badges,
-            slashDirective: effectiveDirective,
-            contexts: queuedContexts,
-            pastes,
-            quotes,
-          };
-          setState((s) => ({
-            ...s,
-            queuedPrompts: {
-              ...s.queuedPrompts,
-              [submitTarget.scopeKey]: [...(s.queuedPrompts[submitTarget.scopeKey] ?? []), queuedItem],
-            },
-          }));
-        }
-        return;
-      }
-
-      setState((s) =>
-        s.selectedHostId === submitTarget.hostId &&
-        !s.isDraftNewSession &&
-        s.selectedAgentId === agentId
-          ? { ...s, sessionScrollNonce: s.sessionScrollNonce + 1 }
-          : s,
-      );
-      await orbitIpc.sendPrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
-        displayPrompt: cleanUserText,
-        badges,
-      });
     },
 
 

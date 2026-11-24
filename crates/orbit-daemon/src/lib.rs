@@ -4401,6 +4401,10 @@ async fn handle_wire_rpc(
                         subscribed_agents.insert(agent_id.clone());
                         Some(WireMessage::TimelineCatchup {
                             request_id,
+                            outline_prompts: runtime
+                                .store
+                                .fetch_timeline_outline_prompts(&agent_id)
+                                .unwrap_or_default(),
                             agent_id,
                             events,
                             has_more: false,
@@ -4424,6 +4428,14 @@ async fn handle_wire_rpc(
                         }
                         Some(WireMessage::TimelineCatchup {
                             request_id,
+                            outline_prompts: if since_seq == 0 || tail_limit.is_some() {
+                                runtime
+                                    .store
+                                    .fetch_timeline_outline_prompts(&agent_id)
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            },
                             agent_id,
                             events,
                             has_more,

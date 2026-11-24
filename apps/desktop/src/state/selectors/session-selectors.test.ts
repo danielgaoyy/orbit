@@ -494,6 +494,28 @@ describe("session-selectors", () => {
       ),
       true,
     );
+    assert.equal(
+      hasLocalSubagentRecords(
+        makeHostDetail(localHost, [
+          parent,
+          makeAgent({ agent_id: "ag_peer_1", parent_agent_id: null, handle: "@stage-batch-a" }),
+        ]),
+        "local",
+        "parent-1",
+        [
+          {
+            id: "call_peer_1",
+            role: "Batch A",
+            prompt_preview: "Fix stage hooks",
+            status: "completed",
+            child_agent_id: "ag_peer_1",
+            provider_subagent_id: null,
+            last_seq: 42,
+          },
+        ],
+      ),
+      true,
+    );
   });
 
   it("merges pull requests, combines local/external links, and splits modified vs read touched files", () => {

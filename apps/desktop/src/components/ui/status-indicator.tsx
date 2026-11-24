@@ -32,47 +32,52 @@ export const StatusIndicator = memo(function StatusIndicator({
   const iconClass =
     size === "xs" ? "size-[11px]" : size === "md" ? "size-[14px]" : "size-[12px]";
 
+  const dotTransition =
+    "transition-[background-color,opacity] duration-150 motion-reduce:transition-none";
+  const iconTransition =
+    "transition-[color,opacity] duration-150 motion-reduce:transition-none";
+
   switch (status) {
     case "running":
       return (
         <OrbitSpinner
           size={spinnerPx}
-          className={cn("text-ink-secondary shrink-0", className)}
+          className={cn("text-ink-secondary shrink-0", iconTransition, className)}
         />
       );
     case "awaiting":
       return (
         <span
           aria-hidden="true"
-          className={cn("bg-signal-warning shrink-0 rounded-full", dotClass, className)}
+          className={cn("bg-signal-warning shimmer shrink-0 rounded-full", dotClass, dotTransition, className)}
         />
       );
     case "completed":
       return (
         <Check
           aria-hidden="true"
-          className={cn("text-signal-success shrink-0 stroke-[2.2]", iconClass, className)}
+          className={cn("text-signal-success shrink-0 stroke-[2.2]", iconClass, iconTransition, className)}
         />
       );
     case "failed":
       return (
         <span
           aria-hidden="true"
-          className={cn("bg-signal-danger shrink-0 rounded-full", dotClass, className)}
+          className={cn("bg-signal-danger shrink-0 rounded-full", dotClass, dotTransition, className)}
         />
       );
     case "canceled":
       return (
         <X
           aria-hidden="true"
-          className={cn("text-ink-muted shrink-0 stroke-[2]", iconClass, className)}
+          className={cn("text-ink-muted shrink-0 stroke-[2]", iconClass, iconTransition, className)}
         />
       );
     case "unread":
       return (
         <span
           aria-hidden="true"
-          className={cn("bg-signal-info shrink-0 rounded-full", dotClass, className)}
+          className={cn("bg-signal-info shrink-0 rounded-full", dotClass, dotTransition, className)}
         />
       );
     case "idle":
@@ -80,7 +85,7 @@ export const StatusIndicator = memo(function StatusIndicator({
       return (
         <span
           aria-hidden="true"
-          className={cn("bg-ink-muted/45 shrink-0 rounded-full", dotClass, className)}
+          className={cn("bg-ink-muted/45 shrink-0 rounded-full", dotClass, dotTransition, className)}
         />
       );
   }
@@ -139,12 +144,12 @@ export const HostStatusIndicator = memo(function HostStatusIndicator({
       className={cn("inline-flex shrink-0 items-center gap-1.5", className)}
     >
       {meta.spinning ? (
-        <OrbitSpinner size={11} className={meta.textClass} />
+        <OrbitSpinner size={11} className={cn("transition-[color,opacity] duration-150 motion-reduce:transition-none", meta.textClass)} />
       ) : (
-        <span aria-hidden="true" className={cn("size-[6px] shrink-0 rounded-full", meta.dotClass)} />
+        <span aria-hidden="true" className={cn("size-[6px] shrink-0 rounded-full transition-[background-color,opacity] duration-150 motion-reduce:transition-none", meta.dotClass)} />
       )}
       {showLabel && (
-        <span className={cn("text-[12px] leading-none font-medium", meta.textClass)}>
+        <span className={cn("text-[12px] leading-none font-medium transition-colors duration-150 motion-reduce:transition-none", meta.textClass)}>
           {meta.label}
         </span>
       )}

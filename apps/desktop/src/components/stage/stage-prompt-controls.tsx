@@ -12,32 +12,30 @@ import { createPortal } from "react-dom";
 import {
   AlertTriangle,
   Check,
+  ChevronRight,
   Copy,
   FileCode2,
   FileDiff,
   FileImage,
-  FileSearch,
   FileSymlink,
   FileText,
   Film,
-  FoldVertical,
   GitBranch,
   GitCompareArrows,
   GitFork,
-  Layers,
-  ListTodo,
   Music,
   Quote,
-  Send,
   Sparkles,
   SquareTerminal,
   Undo2,
-  Users,
   type LucideIcon,
 } from "lucide-react";
+import { InlineDirectiveToken } from "@/components/composer/composer-directive-token";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
-import { MarkdownBlocksView } from "@/components/markdown-blocks";
+import { resolveSlashCommandIcon } from "@/components/composer/slash-menu";
+import { MarkdownBlocksView, useClipboardCopy } from "@/components/markdown-blocks";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { DiffStat } from "@/components/ui/diff-stat";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import {
@@ -54,7 +52,13 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
-import { openOrbitLink } from "@/lib/file-links";
+import { openOrbitLink, prefetchOrbitLink } from "@/lib/file-links";
+import {
+  cancelHoverPrefetch,
+  scheduleHoverPrefetch,
+  shouldPrefetchOnPointerDown,
+} from "@/lib/file-prefetch";
+import { useI18n } from "@/lib/i18n";
 import { isImeKeyEvent } from "@/lib/ime";
 import { detectRichMediaKind } from "@/lib/media-utils";
 import type {
@@ -70,12 +74,12 @@ import {
   type PromptImageEntry,
 } from "@/lib/prompt-image-cache";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
+import { normalizeDirectiveLabel } from "@/lib/slash-commands";
 import { cn } from "@/lib/utils";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import {
   type PromptImagePreviewTarget,
   type RewindRequestTarget,
-  type TurnTimingRecord,
   USER_PROMPT_PREVIEW_MAX_PX,
   type ViewportAnchorHoldFn,
   extractUserPromptPresentation,
@@ -87,14 +91,7 @@ import {
 function resolvePromptBadgeIcon(badge: PromptBadge): LucideIcon {
   switch (badge.kind) {
     case "slash":
-      if (badge.label === "/plan") return ListTodo;
-      if (badge.label === "/review") return FileSearch;
-      if (badge.label === "/compact") return FoldVertical;
-      if (badge.label === "/orbit") return Layers;
-      if (badge.label === "/orbit-handoff") return Send;
-      if (badge.label === "/orbit-committee") return Users;
-      if (badge.label === "/orbit-advisor") return Sparkles;
-      return Sparkles;
+      return resolveSlashCommandIcon(normalizeDirectiveLabel(badge.label));
     case "skill":
       return Sparkles;
     case "file":
@@ -139,6 +136,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
   cwd: string;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
+  const { t } = useI18n();
   const recent = useMemo(
     () =>
       !badge.path
@@ -200,7 +198,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
     return (
       <div
         title={badge.label}
-        className="border-border bg-muted/55 size-[56px] shrink-0 animate-pulse rounded-[12px] border"
+        className="border-border-subtle bg-surface-recessed size-[56px] shrink-0 animate-pulse rounded-[12px] border"
       />
     );
   }
@@ -211,7 +209,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
     return (
       <button
         type="button"
-        title={`Preview ${badge.label}`}
+        title={t("stage.preview", { name: badge.label })}
         onClick={() =>
           onPreviewImage({
             url: imgUrl,
@@ -221,7 +219,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
             cwd,
           })
         }
-        className="group/img border-border bg-muted/40 relative size-[56px] shrink-0 cursor-pointer overflow-hidden rounded-[12px] border shadow-[0_1px_3px_rgba(0,0,0,0.06)] transition-[border-color,box-shadow] duration-150 hover:border-foreground/25 dark:shadow-[0_1px_6px_rgba(0,0,0,0.26)]"
+        className="group/img border-border-subtle bg-surface-recessed relative size-[56px] shrink-0 cursor-pointer overflow-hidden rounded-[12px] border shadow-sm transition-[border-color,box-shadow] duration-150 hover:border-border-strong"
       >
         <img
           src={imgUrl}
@@ -240,7 +238,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
   return (
     <span
       title={badge.label}
-      className="text-foreground/85 inline-flex items-center gap-1.5 rounded-xl border border-black/[0.075] bg-black/[0.03] px-2.5 py-1 text-[12px] dark:border-white/[0.10] dark:bg-white/[0.055]"
+      className="text-ink-secondary inline-flex items-center gap-1.5 rounded-xl border border-border-subtle bg-surface-recessed px-2.5 py-1 text-[13px] leading-[18px]"
     >
       <FileImage className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
       <span className="max-w-[180px] truncate font-medium">{badge.label}</span>
@@ -255,15 +253,16 @@ export const PromptImageLightbox = memo(function PromptImageLightbox({
   target: PromptImagePreviewTarget | null;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <Dialog open={target !== null} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="w-fit max-w-[92vw] gap-3 p-4 sm:p-5">
         <DialogHeader className="gap-1 pr-8">
-          <DialogTitle className="truncate font-mono text-[13.5px] font-medium">
+          <DialogTitle className="truncate font-mono text-[13px] font-medium">
             {target?.label ?? ""}
           </DialogTitle>
           {target?.path && (
-            <DialogDescription className="truncate font-mono text-[11.5px]">
+            <DialogDescription className="truncate font-mono text-[11px]">
               {target.path}
             </DialogDescription>
           )}
@@ -271,7 +270,7 @@ export const PromptImageLightbox = memo(function PromptImageLightbox({
 
         {target && (
           <div className="flex flex-col items-end gap-3">
-            <div className="border-border bg-muted/30 flex max-h-[76vh] max-w-[86vw] items-center justify-center overflow-hidden rounded-xl border p-1.5">
+            <div className="border-border-subtle bg-surface-recessed flex max-h-[76vh] max-w-[86vw] items-center justify-center overflow-hidden rounded-xl border p-1.5">
               <img
                 src={target.url}
                 alt={target.label}
@@ -293,10 +292,10 @@ export const PromptImageLightbox = memo(function PromptImageLightbox({
                     orbitActions.openFileInSidePanel(p, { hostId: h, cwd: c });
                   }
                 }}
-                className="gap-1.5 text-[12px]"
+                className="gap-1.5 text-[13px]"
               >
                 <FileSymlink className="size-3.5" />
-                Open in Side Panel
+                {t("stage.openInPanel")}
               </Button>
             )}
           </div>
@@ -328,6 +327,7 @@ export const HoverPillTooltip = memo(function HoverPillTooltip({
   }) => ReactElement;
 }) {
   const [anchorPos, setAnchorPos] = useState<{ x: number; y: number } | null>(null);
+  const [entering, setEntering] = useState(false);
   const [shiftX, setShiftX] = useState(0);
   const timerRef = useRef<number | null>(null);
   const tooltipRef = useRef<HTMLDivElement | null>(null);
@@ -358,6 +358,20 @@ export const HoverPillTooltip = memo(function HoverPillTooltip({
     setShiftX(nextShift);
   }, [anchorPos, label]);
 
+  useEffect(() => {
+    if (!anchorPos || !entering) return;
+    let raf2 = 0;
+    const raf1 = window.requestAnimationFrame(() => {
+      raf2 = window.requestAnimationFrame(() => {
+        setEntering(false);
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(raf1);
+      if (raf2) window.cancelAnimationFrame(raf2);
+    };
+  }, [anchorPos, entering]);
+
   const scheduleShow = useCallback(
     (el: HTMLElement | null) => {
       clearTimer();
@@ -366,7 +380,11 @@ export const HoverPillTooltip = memo(function HoverPillTooltip({
         timerRef.current = null;
         if (!el.isConnected) return;
         const rect = el.getBoundingClientRect();
+        const prefersReducedMotion =
+          typeof window !== "undefined" &&
+          window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
         setShiftX(0);
+        setEntering(!prefersReducedMotion);
         setAnchorPos({ x: rect.left + rect.width / 2, y: rect.top - 6 });
       }, delay);
     },
@@ -376,8 +394,22 @@ export const HoverPillTooltip = memo(function HoverPillTooltip({
   const hide = useCallback(() => {
     clearTimer();
     setAnchorPos(null);
+    setEntering(false);
     setShiftX(0);
   }, [clearTimer]);
+
+  useEffect(() => {
+    if (!anchorPos) return;
+    const options = { capture: true, passive: true };
+    window.addEventListener("scroll", hide, options);
+    window.addEventListener("wheel", hide, options);
+    window.addEventListener("resize", hide, options);
+    return () => {
+      window.removeEventListener("scroll", hide, options);
+      window.removeEventListener("wheel", hide, options);
+      window.removeEventListener("resize", hide, options);
+    };
+  }, [anchorPos, hide]);
 
   return (
     <>
@@ -400,9 +432,12 @@ export const HoverPillTooltip = memo(function HoverPillTooltip({
             className="pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-full whitespace-nowrap"
           >
             <div
+              data-side="top"
+              data-starting-style={entering ? "" : undefined}
+              style={{ transformOrigin: "bottom center" }}
               className={cn(
-                "bg-elevated text-foreground rounded-full border border-black/[0.08] px-2.5 py-0.5 text-[11.5px] leading-normal font-normal whitespace-nowrap shadow-[0_4px_14px_rgba(0,0,0,0.08)] select-none dark:border-white/[0.11] dark:shadow-[0_4px_16px_rgba(0,0,0,0.36)]",
-                tabularNums && "tabular-nums px-3 py-1 text-[12px]",
+                "orbit-tooltip-content bg-surface-overlay text-ink-primary rounded-full border border-border-subtle px-2.5 py-0.5 text-[11px] leading-normal font-normal whitespace-nowrap shadow-md select-none",
+                tabularNums && "tabular-nums px-3 py-1",
               )}
             >
               {label}
@@ -414,7 +449,7 @@ export const HoverPillTooltip = memo(function HoverPillTooltip({
   );
 });
 
-/** Shared pill-styled Copy icon button (`13px` icon in `22×22px` hit target, balanced with `14.5px` prose). */
+/** Shared pill-styled Copy icon button (`13px` icon in `22×22px` hit target, balanced with `15px` prose). */
 export const CopyActionButton = memo(function CopyActionButton({
   copied,
   label,
@@ -426,14 +461,16 @@ export const CopyActionButton = memo(function CopyActionButton({
   onClick: () => void;
   className?: string;
 }) {
+  const { t } = useI18n();
+  const actionLabel = copied ? t("common.copied") : label;
   return (
     <HoverPillTooltip
-      label={copied ? "Copied" : label}
+      label={actionLabel}
       delay={240}
       renderTrigger={(handlers) => (
         <button
           type="button"
-          aria-label={copied ? "Copied" : label}
+          aria-label={actionLabel}
           onClick={onClick}
           {...handlers}
           className={cn(
@@ -449,7 +486,7 @@ export const CopyActionButton = memo(function CopyActionButton({
           />
           <Check
             className={cn(
-              "absolute size-[13px] stroke-[2] text-emerald-600 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] dark:text-emerald-400",
+              "absolute size-[13px] stroke-[2] text-signal-success transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
               copied ? "scale-100 rotate-0 opacity-100" : "scale-50 rotate-12 opacity-0",
             )}
           />
@@ -458,6 +495,14 @@ export const CopyActionButton = memo(function CopyActionButton({
     />
   );
 });
+
+export function StageCopyButton({ text, className }: { text: string; className?: string }) {
+  const { t } = useI18n();
+  const { copied, copy } = useClipboardCopy(text);
+  return (
+    <CopyActionButton label={t("common.copy")} copied={copied} onClick={copy} className={className} />
+  );
+}
 
 /** Semantic Undo / Rewind icon button matching `CopyActionButton` (`13px` icon in `22×22px` hit target). */
 export const UndoActionButton = memo(function UndoActionButton({
@@ -506,17 +551,18 @@ export const ForkActionButton = memo(function ForkActionButton({
   align?: "start" | "end";
   className?: string;
 }) {
+  const { t } = useI18n();
   const [menuOpen, setMenuOpen] = useState(false);
 
   if (!canUseWorktree) {
     return (
       <HoverPillTooltip
-        label="Fork from here"
+        label={t("stage.forkFromHere")}
         delay={240}
         renderTrigger={(handlers) => (
           <button
             type="button"
-            aria-label="Fork from here"
+            aria-label={t("stage.forkFromHere")}
             onClick={() => onFork(false)}
             {...handlers}
             className={cn(
@@ -534,13 +580,13 @@ export const ForkActionButton = memo(function ForkActionButton({
   return (
     <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
       <HoverPillTooltip
-        label={menuOpen ? "" : "Fork…"}
+        label={menuOpen ? "" : t("stage.forkMenu")}
         delay={240}
         renderTrigger={(handlers) => (
           <DropdownMenuTrigger asChild>
             <button
               type="button"
-              aria-label="Fork from here"
+              aria-label={t("stage.forkFromHere")}
               data-fork-menu-open={menuOpen ? "true" : undefined}
               {...handlers}
               className={cn(
@@ -559,13 +605,13 @@ export const ForkActionButton = memo(function ForkActionButton({
           <DropdownMenuItem onSelect={() => onFork(false)}>
             <span className="flex items-center gap-2 whitespace-nowrap">
               <GitFork className="text-ink-muted size-[13px] stroke-[1.8]" />
-              <span>Fork here</span>
+              <span>{t("sidebar.forkHere")}</span>
             </span>
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => onFork(true)}>
             <span className="flex items-center gap-2 whitespace-nowrap">
               <GitBranch className="text-ink-muted size-[13px] stroke-[1.8]" />
-              <span>Fork in new worktree</span>
+              <span>{t("sidebar.forkInNewWorktree")}</span>
             </span>
           </DropdownMenuItem>
         </DropdownMenuGroup>
@@ -580,9 +626,10 @@ export const RelativeTimestampPill = memo(function RelativeTimestampPill({
 }: {
   timestampMs: number;
 }) {
+  const { locale } = useI18n();
   const nowMs = useSharedRelativeNow(timestampMs);
-  const relativeText = formatRelativeTimeLabel(timestampMs, nowMs);
-  const fullText = formatFullTimestampTooltip(timestampMs);
+  const relativeText = formatRelativeTimeLabel(timestampMs, nowMs, locale);
+  const fullText = formatFullTimestampTooltip(timestampMs, locale);
 
   return (
     <HoverPillTooltip
@@ -592,7 +639,7 @@ export const RelativeTimestampPill = memo(function RelativeTimestampPill({
       renderTrigger={(handlers) => (
         <span
           {...handlers}
-          className="text-muted-foreground hover:text-foreground/85 tabular-nums inline-flex cursor-default items-center rounded px-1 py-0.5 text-[12px] leading-none transition-colors select-none"
+          className="text-muted-foreground hover:text-ink-secondary tabular-nums inline-flex cursor-default items-center rounded px-1 py-0.5 text-[11px] leading-none transition-colors select-none"
         >
           {relativeText}
         </span>
@@ -632,8 +679,9 @@ export const UserPromptBubble = memo(function UserPromptBubble({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const { t } = useI18n();
+  const imagesRef = useRef<HTMLDivElement | null>(null);
+  const actionsRef = useRef<HTMLDivElement | null>(null);
   const bubbleRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
 
@@ -670,7 +718,8 @@ export const UserPromptBubble = memo(function UserPromptBubble({
     if (!expanded) return;
     const handleClickOutside = (event: MouseEvent) => {
       if (!(event.target instanceof Element)) return;
-      if (containerRef.current?.contains(event.target)) return;
+      if (bubbleRef.current?.contains(event.target) || imagesRef.current?.contains(event.target) ||
+          actionsRef.current?.contains(event.target)) return;
       if (event.target.closest('[data-slot="dialog-content"], .orbit-dialog-overlay')) {
         return;
       }
@@ -685,7 +734,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
       ) {
         return;
       }
-      holdViewport(bubbleRef.current, () => setExpanded(false), "top");
+      holdViewport(bubbleRef.current, () => setExpanded(false), "top", { intent: "collapse" });
     };
     document.addEventListener("click", handleClickOutside);
     return () => {
@@ -694,13 +743,6 @@ export const UserPromptBubble = memo(function UserPromptBubble({
   }, [expanded, holdViewport]);
 
   const copyPayload = cleanText || badges.map((b) => b.label).join(" ");
-
-  const handleCopy = useCallback(() => {
-    void navigator.clipboard.writeText(copyPayload).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1400);
-    });
-  }, [copyPayload]);
 
   const handleRewindClick = useCallback(() => {
     onRequestRewind?.(item.seq, cleanText, badges);
@@ -712,7 +754,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
     if (target?.closest("a, button")) return;
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) return;
-    holdViewport(bubbleRef.current, () => setExpanded(true), "top");
+    holdViewport(bubbleRef.current, () => setExpanded(true), "top", { intent: "expand" });
   };
 
   const imageBadges = useMemo(
@@ -727,10 +769,9 @@ export const UserPromptBubble = memo(function UserPromptBubble({
     () => badges.filter((b) => b.kind !== "slash" && b.kind !== "image"),
     [badges],
   );
+  const slashDirectiveLabel = slashBadge ? normalizeDirectiveLabel(slashBadge.label) : "";
   const hasBubbleContent =
-    attachmentBadges.length > 0 || Boolean(slashBadge) || cleanText.length > 0;
-  const SlashIcon = slashBadge ? resolvePromptBadgeIcon(slashBadge) : null;
-  const slashLabel = slashBadge ? slashBadge.label.replace(/^\//, "") : "";
+    attachmentBadges.length > 0 || slashDirectiveLabel.length > 0 || cleanText.length > 0;
   const promptTimestampMs =
     typeof item.timestamp_ms === "number" &&
     Number.isFinite(item.timestamp_ms) &&
@@ -740,7 +781,6 @@ export const UserPromptBubble = memo(function UserPromptBubble({
 
   return (
     <div
-      ref={containerRef}
       className={cn(
         "group/user flex flex-col items-end",
         animateEntrance && "orbit-bubble-enter",
@@ -748,6 +788,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
     >
       {imageBadges.length > 0 && (
         <div
+          ref={imagesRef}
           className={cn(
             "flex max-w-[80%] flex-wrap justify-end gap-1.5 select-none",
             hasBubbleContent && "mb-1.5",
@@ -771,6 +812,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
       {hasBubbleContent && (
         <div
           ref={bubbleRef}
+          data-orbit-disclosure-root=""
           onClick={handleBubbleClick}
           className={cn(
             "prompt-bubble-surface text-foreground relative min-w-0 max-w-[80%] overflow-hidden rounded-[20px] px-4 py-2.5",
@@ -810,7 +852,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
                       <button
                         key={`${badge.kind}-${badge.label}-${idx}`}
                         type="button"
-                        title={`Preview ${badge.label}`}
+                        title={t("stage.preview", { name: badge.label })}
                         onClick={(e) => {
                           e.stopPropagation();
                           orbitActions.openMediaPreview({
@@ -821,7 +863,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
                             cwd: cwd || "~",
                           });
                         }}
-                        className="text-foreground/85 hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] transition-colors hover:border-black/[0.14] hover:bg-black/[0.055] dark:border-white/[0.10] dark:bg-white/[0.055] dark:hover:border-white/[0.18] dark:hover:bg-white/[0.095]"
+                        className="text-ink-secondary hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-border-subtle bg-surface-recessed px-2 py-0.5 text-[13px] leading-[18px] transition-colors hover:border-border-strong hover:bg-accent"
                       >
                         <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
                         <span className="font-mono leading-normal font-medium hover:underline">
@@ -835,12 +877,25 @@ export const UserPromptBubble = memo(function UserPromptBubble({
                       <button
                         key={`${badge.kind}-${badge.label}-${idx}`}
                         type="button"
-                        title={`Open ${badge.label} in Side Panel`}
+                        title={t("stage.openTargetInPanel", { target: badge.label })}
+                        onMouseEnter={() =>
+                          scheduleHoverPrefetch(() =>
+                            prefetchOrbitLink(fileTarget, { hostId, cwd, intent: "hover" }),
+                          )
+                        }
+                        onMouseLeave={cancelHoverPrefetch}
+                        onPointerDown={(e) => {
+                          if (shouldPrefetchOnPointerDown(e)) {
+                            cancelHoverPrefetch();
+                            prefetchOrbitLink(fileTarget, { hostId, cwd, intent: "press" });
+                          }
+                        }}
                         onClick={(e) => {
                           e.stopPropagation();
+                          cancelHoverPrefetch();
                           openOrbitLink(fileTarget, { hostId, cwd });
                         }}
-                        className="text-foreground/85 hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] transition-colors hover:border-black/[0.14] hover:bg-black/[0.055] dark:border-white/[0.10] dark:bg-white/[0.055] dark:hover:border-white/[0.18] dark:hover:bg-white/[0.095]"
+                        className="text-ink-secondary hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-border-subtle bg-surface-recessed px-2 py-0.5 text-[13px] leading-[18px] transition-colors hover:border-border-strong hover:bg-accent"
                       >
                         <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
                         <span className="font-mono leading-normal font-medium hover:underline">
@@ -852,7 +907,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
                   return (
                     <span
                       key={`${badge.kind}-${badge.label}-${idx}`}
-                      className="text-foreground/85 inline-flex items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] dark:border-white/[0.10] dark:bg-white/[0.055]"
+                      className="text-ink-secondary inline-flex items-center gap-1.5 rounded-lg border border-border-subtle bg-surface-recessed px-2 py-0.5 text-[13px] leading-[18px]"
                     >
                       <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
                       <span className={cn("leading-normal font-medium", isMono && "font-mono")}>
@@ -864,25 +919,20 @@ export const UserPromptBubble = memo(function UserPromptBubble({
               </div>
             )}
 
-            {slashBadge && SlashIcon ? (
-              <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
-                <span
-                  className={cn(
-                    "mr-1.5 inline-flex items-center gap-1 rounded-md border px-1.5 py-[1px] align-baseline font-mono text-[12px] leading-[18px] font-medium select-none",
-                    slashBadge.label === "/plan"
-                      ? "bg-signal-info-bg border-signal-info-border text-signal-info"
-                      : "bg-surface-recessed border-border-subtle text-ink-primary",
-                  )}
-                >
-                  <SlashIcon className="size-[12.5px] shrink-0 stroke-[1.8]" />
-                  <span>/{slashLabel}</span>
-                </span>
+            {slashDirectiveLabel ? (
+              <p className="selectable-text text-foreground text-[15px] leading-[1.65] whitespace-pre-wrap">
+                <InlineDirectiveToken
+                  directive={slashDirectiveLabel}
+                  size="bubble"
+                  showTitle
+                  className={cleanText.length > 0 ? "mr-[8px]" : undefined}
+                />
                 {cleanText}
               </p>
             ) : (
               cleanText.length > 0 &&
               (sanitizedLegacy ? (
-                <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
+                <p className="selectable-text text-foreground text-[15px] leading-[1.65] whitespace-pre-wrap">
                   {cleanText}
                 </p>
               ) : (
@@ -891,33 +941,36 @@ export const UserPromptBubble = memo(function UserPromptBubble({
             )}
           </div>
 
-          {!expanded && overflowing && (
+          {overflowing && (
             <div
               aria-hidden="true"
-              className="pointer-events-none absolute inset-x-0 bottom-0 h-14 rounded-b-[19px]"
+              className={cn(
+                "pointer-events-none absolute inset-x-0 bottom-0 h-14 rounded-b-[19px] transition-opacity duration-150 motion-reduce:transition-none",
+                expanded ? "opacity-0" : "opacity-100",
+              )}
               style={{
                 background:
-                  "linear-gradient(to top, var(--surface-elevated) 14%, color-mix(in oklab, var(--surface-elevated) 82%, transparent) 52%, transparent 100%)",
+                  "linear-gradient(to top, var(--surface-raised) 14%, color-mix(in oklab, var(--surface-raised) 82%, transparent) 52%, transparent 100%)",
               }}
             />
           )}
         </div>
       )}
 
-      <div className="mt-3 flex h-[22px] shrink-0 items-center justify-end gap-1 pr-1 whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100">
+      <div ref={actionsRef} className="mt-1 flex h-[20px] shrink-0 items-center justify-end gap-1 pr-1 whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100 [@media(hover:none)]:opacity-100 motion-reduce:transition-none">
         {promptTimestampMs !== null && (
           <RelativeTimestampPill timestampMs={promptTimestampMs} />
         )}
-        <CopyActionButton copied={copied} label="Copy" onClick={handleCopy} />
+        <StageCopyButton text={copyPayload} />
         {onRequestRewind && item.seq > 0 && (
-          <UndoActionButton label="Undo to this point" onClick={handleRewindClick} />
+          <UndoActionButton label={t("stage.undoToHere")} onClick={handleRewindClick} />
         )}
       </div>
     </div>
   );
 });
 
-/** Turn-end aggregated diff summary pill (`N files changed · +A -D · Review ▸`). */
+/** Turn-end summary linking the changed files to Diff Review. */
 export const TurnChangesBar = memo(function TurnChangesBar({
   diffs,
   cwd,
@@ -925,6 +978,7 @@ export const TurnChangesBar = memo(function TurnChangesBar({
   diffs: TurnFileDiffSummaryView[];
   cwd: string;
 }) {
+  const { t } = useI18n();
   if (diffs.length === 0) return null;
   const totalAdd = diffs.reduce((acc, d) => acc + d.additions, 0);
   const totalDel = diffs.reduce((acc, d) => acc + d.deletions, 0);
@@ -932,20 +986,23 @@ export const TurnChangesBar = memo(function TurnChangesBar({
 
   const label =
     diffs.length === 1 && primaryPath
-      ? `Edited ${stripWorkspacePrefix(primaryPath, cwd)}`
-      : `${diffs.length} files changed`;
+      ? t("stage.editedPath", { path: stripWorkspacePrefix(primaryPath, cwd) })
+      : t(diffs.length === 1 ? "stage.fileChanged" : "stage.filesChanged", { count: diffs.length });
 
   return (
     <div className="pt-1.5">
       <button
         type="button"
         onClick={() => orbitActions.openInspectorForFile(primaryPath, "session_turns")}
-        className="border-border-subtle bg-surface-raised hover:bg-accent/70 hover:border-border-default inline-flex max-w-full cursor-pointer items-center gap-2 rounded-full border px-3 py-1 text-[12px] transition-colors"
+        className="border-border-subtle bg-surface-raised/85 hover:bg-accent/70 hover:border-border-default inline-flex h-[32px] max-w-full cursor-pointer items-center gap-2 rounded-lg border px-2.5 text-[13px] leading-[18px] transition-colors"
       >
         <FileCode2 className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
         <span className="text-ink-primary truncate font-medium">{label}</span>
         <DiffStat additions={totalAdd} deletions={totalDel} />
-        <span className="text-ink-tertiary shrink-0 text-[11px]">Review ▸</span>
+        <span className="text-ink-tertiary inline-flex shrink-0 items-center gap-0.5 text-[11px]">
+          {t("overview.review")}
+          <ChevronRight className="size-3" />
+        </span>
       </button>
     </div>
   );
@@ -959,6 +1016,7 @@ export const ForkedFromBanner = memo(function ForkedFromBanner({
   hostId: string;
   agent: AgentCardView | null;
 }) {
+  const { t } = useI18n();
   const sourceId = agent?.forked_from_agent_id ?? null;
   const parentAgent = useOrbitSelector((s) =>
     sourceId
@@ -978,6 +1036,7 @@ export const ForkedFromBanner = memo(function ForkedFromBanner({
     customTitle?.trim() ||
     parentAgent?.title?.trim() ||
     (sourceId.length > 14 ? `${sourceId.slice(0, 12)}…` : sourceId);
+  const [forkPrefix, forkSuffix] = t("stage.forkedFrom").split("{title}");
   const canJump = Boolean(
     parentAgent && !parentAgent.archived_at_rfc3339 && !isLocallyArchived,
   );
@@ -992,13 +1051,13 @@ export const ForkedFromBanner = memo(function ForkedFromBanner({
         >
           <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-70" />
           <span className="truncate">
-            Forked from <span className="text-ink-primary font-medium">{parentTitle}</span>
+            {forkPrefix}<span className="text-ink-primary font-medium">{parentTitle}</span>{forkSuffix}
           </span>
         </button>
       ) : (
         <span className="text-ink-muted inline-flex max-w-full items-center gap-1.5 py-0.5 text-[11px] leading-tight">
           <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-60" />
-          <span className="truncate">Forked from {parentTitle}</span>
+          <span className="truncate">{t("stage.forkedFrom", { title: parentTitle })}</span>
         </span>
       )}
     </div>
@@ -1018,6 +1077,7 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
   onOpenChange: (open: boolean) => void;
   onConfirm: (restoreFiles: boolean) => void;
 }) {
+  const { t } = useI18n();
   const [restoreFiles, setRestoreFiles] = useState(true);
   const files = target?.editedFiles ?? [];
   const hasFiles = files.length > 0;
@@ -1033,8 +1093,7 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
     const onKeyDown = (e: KeyboardEvent) => {
       if (isImeKeyEvent(e)) return;
       if (e.key !== "Enter" || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-      const activeTag = (document.activeElement as HTMLElement | null)?.tagName;
-      if (activeTag === "BUTTON" || activeTag === "INPUT") return;
+      if (document.activeElement?.closest('button, input, [role="checkbox"]')) return;
       e.preventDefault();
       onConfirm(hasFiles ? restoreFiles : false);
     };
@@ -1056,38 +1115,26 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
     <Dialog open={target !== null} onOpenChange={(open) => !submitting && onOpenChange(open)}>
       <DialogContent className="max-w-[440px] gap-3.5 p-5">
         <DialogHeader className="gap-1.5 pr-6">
-          <DialogTitle className="text-[15.5px] font-semibold">Confirm Undo</DialogTitle>
+          <DialogTitle className="text-[15px] font-semibold">{t("stage.confirmUndo")}</DialogTitle>
           <DialogDescription className="text-[13px] leading-snug">
-            {hasFiles
-              ? "Confirming this undo action will make the following changes:"
-              : `Confirming this undo action will rewind ${
-                  target && target.affectedTurnsCount > 1
-                    ? `${target.affectedTurnsCount} turns`
-                    : "this turn"
-                } and restore the prompt to the composer.`}
+            {target && target.affectedTurnsCount > 1
+              ? t("stage.undoTurns", { count: target.affectedTurnsCount })
+              : t("stage.undoTurn")}
+            {hasFiles && <> {t("stage.undoFiles")}</>}
           </DialogDescription>
         </DialogHeader>
 
         {hasFiles && (
           <div className="min-w-0 space-y-2.5">
             <label className="inline-flex cursor-pointer items-center gap-2.5 select-none">
-              <button
-                type="button"
-                role="checkbox"
-                aria-checked={restoreFiles}
+              <Checkbox
+                checked={restoreFiles}
+                onCheckedChange={setRestoreFiles}
                 disabled={submitting}
-                onClick={() => setRestoreFiles((v) => !v)}
-                className={cn(
-                  "flex size-4 shrink-0 cursor-pointer items-center justify-center rounded-[4px] border transition-colors disabled:opacity-60",
-                  restoreFiles
-                    ? "border-primary bg-primary text-primary-foreground"
-                    : "border-muted-foreground/45 bg-background hover:border-foreground/50",
-                )}
-              >
-                {restoreFiles && <Check className="size-3 stroke-[2.5]" />}
-              </button>
-              <span className="text-foreground text-[13.5px] font-medium">
-                Revert file changes
+                aria-label={t("stage.revertFiles")}
+              />
+              <span className="text-foreground text-[13px] font-medium">
+                {t("stage.revertFiles")}
               </span>
             </label>
 
@@ -1137,9 +1184,9 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
         )}
 
         {isAgentRunning && (
-          <div className="flex items-center gap-2 rounded-lg border border-amber-500/25 bg-amber-500/[0.07] px-3 py-2 text-[12px] text-amber-700 dark:text-amber-300">
+          <div className="flex items-center gap-2 rounded-lg border border-signal-warning-border bg-signal-warning-bg px-3 py-2 text-[13px] leading-[1.45] text-signal-warning">
             <AlertTriangle className="size-3.5 shrink-0" />
-            <span>Active turn will be stopped first.</span>
+            <span>{t("stage.stopActiveTurn")}</span>
           </div>
         )}
 
@@ -1151,7 +1198,7 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
             disabled={submitting}
             onClick={() => onOpenChange(false)}
           >
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button
             type="button"
@@ -1161,7 +1208,7 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
             className="gap-1.5"
           >
             {submitting && <OrbitSpinner size={13} />}
-            <span>Confirm</span>
+            <span>{t("common.confirm")}</span>
             {!submitting && <span className="text-[11px] opacity-75">↵</span>}
           </Button>
         </div>
@@ -1175,56 +1222,39 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
  * Hidden while a turn is active since live elapsed duration lives inline in `TurnActivityDisclosure`.
  */
 export const TurnFooter = memo(function TurnFooter({
-  isTurnActive,
-  timing,
   completedAtMs,
   replyText,
   forkUpToSeq,
-  isLastTurn = false,
+  showFork,
+  isLastTurn,
   canForkWorktree = false,
   onRequestFork,
 }: {
-  isTurnActive: boolean;
-  timing?: TurnTimingRecord;
   completedAtMs: number | null;
   replyText: string | null;
-  forkUpToSeq?: number | null;
+  forkUpToSeq: number | null;
+  showFork: boolean;
   isLastTurn?: boolean;
   canForkWorktree?: boolean;
   onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
 }) {
-  const [copied, setCopied] = useState(false);
-
-  const resolvedCompletedAtMs = timing?.completedAtMs ?? completedAtMs;
-  const showFork = Boolean(
-    onRequestFork &&
-      (isLastTurn || (forkUpToSeq !== null && forkUpToSeq !== undefined && forkUpToSeq > 0)),
-  );
-
-  const handleCopy = useCallback(() => {
-    if (!replyText) return;
-    void navigator.clipboard.writeText(replyText).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    });
-  }, [replyText]);
-
   const handleFork = useCallback(
     (worktree: boolean) => {
-      onRequestFork?.(isLastTurn ? null : (forkUpToSeq ?? null), worktree);
+      onRequestFork?.(isLastTurn ? null : forkUpToSeq, worktree);
     },
     [onRequestFork, isLastTurn, forkUpToSeq],
   );
 
-  const hasReply = Boolean(replyText && replyText.trim().length > 0);
-  if (isTurnActive || !hasReply) {
-    return null;
-  }
-
   return (
-    <div className="flex h-[22px] items-center gap-1">
+    <div className={cn(
+      "flex items-center gap-1",
+      isLastTurn ? "mt-[6px] h-[22px]" :
+        'mt-[4px] h-[20px] opacity-0 transition-opacity duration-150 group-hover/turn:opacity-100 group-focus-within/turn:opacity-100 has-[[data-fork-menu-open="true"]]:opacity-100 [@media(hover:none)]:opacity-100 motion-reduce:transition-none [&_button]:h-[20px]',
+      // The non-virtualized subagent panel renders turn sections as direct siblings.
+      isLastTurn === undefined && "group-last/turn:opacity-100",
+    )}>
       {replyText && (
-        <CopyActionButton copied={copied} label="Copy" onClick={handleCopy} className="-ml-1" />
+        <StageCopyButton text={replyText} className="-ml-1" />
       )}
 
       {showFork && onRequestFork && (
@@ -1236,8 +1266,8 @@ export const TurnFooter = memo(function TurnFooter({
         />
       )}
 
-      {resolvedCompletedAtMs !== null && (
-        <RelativeTimestampPill timestampMs={resolvedCompletedAtMs} />
+      {completedAtMs !== null && (
+        <RelativeTimestampPill timestampMs={completedAtMs} />
       )}
     </div>
   );

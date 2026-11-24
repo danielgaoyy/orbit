@@ -5,20 +5,29 @@ import {
   ArrowRight,
   ArrowUp,
   Blocks,
-  Check,
   ChevronRight,
-  Copy,
-  Maximize2,
-  Minimize2,
+  ListChecks,
   RotateCw,
   Scissors,
+  Sparkles,
   Timer,
 } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { DiffStat } from "@/components/ui/diff-stat";
-import { IconButton } from "@/components/ui/icon-button";
+import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
+import {
+  Trace,
+  TraceCollapsible,
+  TraceCollapsibleContent,
+  TraceCollapsibleTrigger,
+  TraceDescription,
+  TraceIcon,
+  TraceLine,
+  TraceTitle,
+} from "@/components/ui/trace";
 import { useI18n } from "@/lib/i18n";
 import { sharedDisclosureStateStore } from "@/lib/disclosure-state";
 import type { TimelineItemView, WorkSummaryResultView } from "@/lib/orbit-ipc";
@@ -31,12 +40,12 @@ import {
   type SubagentCharacterSpec,
   resolveSubagentCharacter,
 } from "@/lib/subagent-avatar";
-import { formatDurationCompact } from "@/lib/timeline-coalesce";
+import { formatDurationCompact, formatThoughtSummaryLabel } from "@/lib/timeline-coalesce";
 import {
   type ToolCallTimelineItem,
   extractStateChangeMilestoneCall,
+  summarizeWorkChunk,
 } from "@/lib/turn-delegation-split";
-import { cn } from "@/lib/utils";
 import { orbitActions } from "@/state/orbit-store";
 import {
   EMPTY_SUBAGENTS,
@@ -46,7 +55,13 @@ import {
   formatJsonPreview,
   stableStepItemKey,
 } from "./stage-helpers";
-import { openSubagent } from "./subagent-crew-dock";
+import { openSubagent, SubagentPanelAction } from "./subagent-crew-dock";
+import {
+  LazyMarkdownMessageBody,
+  PeerMessageRow,
+  SubagentDispatchRow,
+} from "./subagents-track";
+import { StageCopyButton } from "./stage-prompt-controls";
 import {
   InlineLiveElapsed,
   LiveStallInterruptButton,
@@ -57,16 +72,12 @@ type SubagentMaybeWithAvatar = ResolvedSubagentItem & {
   readonly character?: SubagentCharacterSpec;
 };
 
-/** Step count threshold above which an expanded work group uses bounded internal scroll + sticky label. */
-const LONG_DISCLOSURE_STEP_THRESHOLD = 9;
-
 /** Vertical step connector rail for expanded turn activity steps. */
 export const StepTimelineRail = memo(function StepTimelineRail({
   items,
   hostId,
   cwd,
   holdViewport,
-  indented = false,
   isLiveActive = false,
   autoExpandErrors = false,
   agentId,
@@ -79,7 +90,6 @@ export const StepTimelineRail = memo(function StepTimelineRail({
   hostId?: string;
   cwd: string;
   holdViewport: ViewportAnchorHoldFn;
-  indented?: boolean;
   isLiveActive?: boolean;
   autoExpandErrors?: boolean;
   agentId: string;
@@ -93,12 +103,7 @@ export const StepTimelineRail = memo(function StepTimelineRail({
   const lastSeq = items[items.length - 1]?.seq;
 
   return (
-    <div
-      className={cn(
-        "space-y-0.5",
-        indented && "border-border-subtle mt-1 ml-[7px] border-l pl-3.5",
-      )}
-    >
+    <Trace className="gap-1">
       {items.map((sub, i) => {
         const isLastInLiveGroup = isLiveActive && sub.seq === lastSeq;
         const thinkingKey =
@@ -125,7 +130,7 @@ export const StepTimelineRail = memo(function StepTimelineRail({
           />
         );
       })}
-    </div>
+    </Trace>
   );
 });
 
@@ -136,7 +141,7 @@ type DelegationMilestoneEntry =
       subagent: SubagentMaybeWithAvatar;
       character: SubagentCharacterSpec;
       linked: boolean;
-      callStatus: "running" | "completed" | "failed" | "denied";
+      startedAtMs: number | null;
     }
   | {
       kind: "inter_agent_message";
@@ -155,17 +160,15 @@ type DelegationMilestoneEntry =
       milestoneKind: "timer" | "handoff";
       label: string;
       detailText: string;
-      detailIsMono: boolean;
       status: "running" | "completed" | "failed" | "denied";
     };
 
 /**
  * First-class chronological milestone row rendered outside folded step groups:
- * 1. Subagent dispatches (`invoke_subagent`, `create_agent`, `spawn_workspace_peer`) — compact horizontal
- *    chips featuring each subagent's animal avatar (bouncing while working, quiet when done).
+ * 1. Subagent dispatches open the child directly from the inline status row.
  * 2. Inter-agent messages (`send_message`, `message_peer`, `send_agent_prompt`) — compact expandable
  *    left-aligned rows matching `AgentMessageCard` with clean left-rail body (never card-inside-card).
- * 3. Session state milestones (Timers, Worktree Handoffs) — subtle inline chips.
+ * 3. Session state milestones (Timers, Worktree Handoffs) — inline disclosures.
  */
 export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
   items,
@@ -174,6 +177,7 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
   sessionSubagents,
   dispatches,
   parentMessageLabel,
+  holdViewport,
 }: {
   items: readonly ToolCallTimelineItem[];
   hostId?: string;
@@ -181,11 +185,11 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
   sessionSubagents?: readonly SubagentMaybeWithAvatar[];
   dispatches?: ReturnType<typeof resolveDelegationDispatches>;
   parentMessageLabel?: string | null;
+  holdViewport?: ViewportAnchorHoldFn;
 }) {
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
-
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const subagentFallback = t("approval.subagent");
   const sentMessageLabel = parentMessageLabel || t("stage.sentMessage");
   const entries = useMemo(() => {
     const out: DelegationMilestoneEntry[] = [];
@@ -211,7 +215,7 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
           out.push({
             kind: "inter_agent_message",
             key: `msg:${it.call_id || it.seq}`,
-            label: `→ ${enriched.title}`,
+            label: `→ ${enriched.title === "Subagent" ? subagentFallback : enriched.title}`,
             preview,
             detailText,
             detailIsMono: !msgCall?.message && detailText.length > 0,
@@ -228,7 +232,7 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
           subagent: enriched,
           character,
           linked: resolved.linked,
-          callStatus: it.status,
+          startedAtMs: enriched.activeStartedAtMs ?? it.timestamp_ms ?? (enriched.createdAtMs || null),
         });
         continue;
       }
@@ -261,7 +265,7 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
         continue;
       }
 
-      const stateMilestone = extractStateChangeMilestoneCall(it);
+      const stateMilestone = extractStateChangeMilestoneCall(it, locale);
       if (stateMilestone) {
         out.push({
           kind: "state_change",
@@ -269,7 +273,6 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
           milestoneKind: stateMilestone.kind,
           label: stateMilestone.label,
           detailText: stateMilestone.preview,
-          detailIsMono: false,
           status: stateMilestone.status,
         });
         continue;
@@ -277,293 +280,142 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
     }
 
     return out;
-  }, [items, sessionSubagents, hostId, sentMessageLabel, dispatches]);
+  }, [items, sessionSubagents, hostId, sentMessageLabel, dispatches, locale, subagentFallback]);
 
   if (entries.length === 0) return null;
 
-  const chipEntries = entries.filter(
-    (e): e is Exclude<DelegationMilestoneEntry, { kind: "inter_agent_message" }> =>
-      e.kind !== "inter_agent_message",
-  );
-  const messageEntries = entries.filter(
-    (e): e is Extract<DelegationMilestoneEntry, { kind: "inter_agent_message" }> =>
-      e.kind === "inter_agent_message",
-  );
-
   const openSubagentRecord = (subagent: ResolvedSubagentItem) => openSubagent(agentId, subagent);
 
-  const activeChipDetail = expandedKey
-    ? (chipEntries.find(
-        (e): e is Extract<DelegationMilestoneEntry, { kind: "state_change" }> =>
-          e.kind === "state_change" && e.key === expandedKey,
-      ) ?? null)
-    : null;
-
   return (
-    <div className="space-y-1.5">
-      {/* 1. Compact horizontal row for Subagent dispatches (with animal avatars) & state chips */}
-      {chipEntries.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5">
-          {chipEntries.map((entry) => {
-            if (entry.kind === "subagent_dispatch") {
-              const { subagent, character, callStatus } = entry;
-              const effectiveStatus = subagent.status;
-              const starting = effectiveStatus === "running" && !entry.linked;
-              const actionKey =
-                callStatus === "failed" || callStatus === "denied"
-                  ? "stage.subagentLaunch"
-                  : starting && callStatus === "running"
-                    ? "stage.creatingSubagent"
-                    : "stage.spawnedSubagent";
-              const statusKey = {
-                running: starting ? "stage.subagentStarting" : "overview.subagentWorking",
-                awaiting_permission: "overview.subagentApprovalRequired",
-                failed: "overview.subagentFailed",
-                completed: "stage.subagentDone",
-                canceled: "overview.subagentStopped",
-              } as const;
-              const isFailed = effectiveStatus === "failed";
-              const isAwaiting = effectiveStatus === "awaiting_permission";
+    <div className="flex min-w-0 flex-col gap-0.5">
+      {entries.map((entry) => {
+        if (entry.kind === "subagent_dispatch") {
+          const { subagent, character } = entry;
+          const name = subagent.title === "Subagent" ? subagentFallback : subagent.title;
+          const effectiveStatus = subagent.status;
+          const starting = effectiveStatus === "running" && !entry.linked;
+          const statusKey = {
+            running: starting ? "stage.subagentStarting" : "overview.subagentWorking",
+            awaiting_permission: "overview.subagentApprovalRequired",
+            failed: "overview.subagentFailed",
+            completed: "stage.subagentDone",
+            canceled: "overview.subagentStopped",
+          } as const;
+          const isFailed = effectiveStatus === "failed";
+          const isAwaiting = effectiveStatus === "awaiting_permission";
 
-              return (
-                <button
-                  key={entry.key}
-                  type="button"
-                  title={subagent.promptPreview || t("overview.openSubagent", { name: subagent.title })}
-                  onClick={() => openSubagentRecord(subagent)}
-                  className={cn(
-                    "group/sachip inline-flex min-h-[34px] min-w-0 max-w-full cursor-pointer items-center gap-2 rounded-[10px] border px-2.5 py-1 text-left text-[12px] leading-none transition-colors",
-                    isFailed
-                      ? "border-signal-danger-border bg-signal-danger-bg/65 text-ink-primary hover:bg-signal-danger-bg"
-                      : isAwaiting
-                        ? "border-signal-warning-border bg-signal-warning-bg/75 text-ink-primary hover:bg-signal-warning-bg"
-                        : "border-border-subtle bg-surface-raised/85 text-ink-primary hover:border-border-default hover:bg-accent/70",
-                  )}
-                >
-                  <span className="text-ink-tertiary text-[11px]">{t(actionKey)}</span>
-                  <SubagentAvatar
-                    character={character}
-                    status={effectiveStatus}
-                    size="sm"
-                    showStatusBadge={false}
-                  />
-                  {(entry.linked || subagent.title !== "Subagent") && (
-                    <span className="min-w-0 max-w-[440px] truncate font-medium">{subagent.title}</span>
-                  )}
-                  <span className="text-ink-secondary ml-auto shrink-0 pl-1 text-[11px]">{t(statusKey[effectiveStatus])}</span>
-                </button>
-              );
-            }
+          return (
+            <SubagentDispatchRow
+              key={entry.key}
+              title={subagent.promptPreview || t("stage.openTargetInPanel", { target: name })}
+              onClick={() => openSubagentRecord(subagent)}
+              tone={isFailed ? "danger" : isAwaiting ? "warning" : "normal"}
+              name={name}
+              statusLabel={t(statusKey[effectiveStatus])}
+              avatar={
+                <SubagentAvatar
+                  character={character}
+                  status={effectiveStatus}
+                  size="sm"
+                  showStatusBadge={
+                    effectiveStatus === "completed" || isFailed || effectiveStatus === "canceled"
+                  }
+                />
+              }
+              trailing={
+                (effectiveStatus === "running" || isAwaiting) && entry.startedAtMs != null ? (
+                  <InlineLiveElapsed startedAtMs={entry.startedAtMs} stallLabel={null} />
+                ) : undefined
+              }
+            />
+          );
+        }
 
-            const isOpen = expandedKey === entry.key;
-            const canToggle = entry.detailText.length > 0;
-            const isFailed = entry.status === "failed" || entry.status === "denied";
-            return (
-              <button
-                key={entry.key}
-                type="button"
-                disabled={!canToggle}
-                title={entry.detailText ? entry.detailText.slice(0, 180) : entry.label}
-                onClick={() => {
-                  if (!canToggle) return;
-                  setExpandedKey((prev) => (prev === entry.key ? null : entry.key));
-                }}
-                className={cn(
-                  "group/sachip inline-flex h-[28px] max-w-[260px] items-center gap-1.5 rounded-[8px] border px-2.5 text-[12px] leading-none transition-colors",
-                  isFailed
-                    ? "border-signal-danger-border bg-signal-danger-bg/60 text-signal-danger"
-                    : "border-border-subtle bg-surface-recessed/65 text-ink-secondary",
-                  canToggle && "hover:border-border-default hover:text-ink-primary cursor-pointer",
-                  isOpen && "border-border-default bg-accent/70 text-ink-primary",
-                )}
-              >
-                <span className="flex size-3.5 shrink-0 items-center justify-center">
-                  {entry.status === "running" ? (
-                    <OrbitSpinner size={11} className="text-ink-secondary" />
-                  ) : isFailed ? (
-                    <AlertTriangle className="text-signal-danger size-3" />
-                  ) : entry.milestoneKind === "timer" ? (
-                    <Timer className="text-signal-warning size-3" />
-                  ) : (
-                    <ArrowLeftRight className="text-signal-info size-3" />
-                  )}
-                </span>
-                <span className="min-w-0 truncate font-medium">{entry.label}</span>
-                {canToggle && (
-                  <ChevronRight
-                    className={cn(
-                      "text-ink-muted size-3 shrink-0 transition-transform duration-150",
-                      isOpen && "rotate-90",
-                    )}
-                  />
-                )}
-              </button>
-            );
-          })}
-        </div>
-      )}
+        const isOpen = expandedKey === entry.key;
+        const changeOpen = (open: boolean) => setExpandedKey(open ? entry.key : null);
+        const isFailed = entry.status === "failed" || entry.status === "denied";
+        if (entry.kind === "state_change") {
+          const Icon = entry.milestoneKind === "timer" ? Timer : ArrowLeftRight;
+          const line = (
+            <TraceLine status={isFailed ? "error" : entry.status === "running" ? "running" : undefined} className="min-h-[28px]">
+              <TraceIcon>{entry.status === "running" ? <OrbitSpinner /> : <Icon />}</TraceIcon>
+              <TraceTitle>{entry.label}</TraceTitle>
+            </TraceLine>
+          );
+          return (
+            <Trace key={entry.key}>
+              {entry.detailText ? (
+                <TraceCollapsible open={isOpen} onOpenChange={changeOpen}>
+                  <TraceCollapsibleTrigger>{line}</TraceCollapsibleTrigger>
+                  <TraceCollapsibleContent className="flex items-start gap-2">
+                    <ScrollArea className="min-w-0 flex-1" viewportClassName="max-h-56 overscroll-contain">
+                      <p className="selectable-text text-[13px] leading-[1.5] whitespace-pre-wrap break-words text-ink-secondary">
+                        {entry.detailText}
+                      </p>
+                    </ScrollArea>
+                    <StageCopyButton text={entry.detailText} className="shrink-0" />
+                  </TraceCollapsibleContent>
+                </TraceCollapsible>
+              ) : line}
+            </Trace>
+          );
+        }
 
-      {activeChipDetail && activeChipDetail.detailText && (
-        <div className="orbit-stage-enter border-border-default ml-2 border-l-2 pl-3">
-          <div className="mb-1 flex items-center justify-between gap-2">
-            <span className="text-ink-tertiary text-[11px] font-medium">
-              {activeChipDetail.label}
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                void navigator.clipboard.writeText(activeChipDetail.detailText);
-                setCopiedKey(activeChipDetail.key);
-                window.setTimeout(() => {
-                  setCopiedKey((cur) => (cur === activeChipDetail.key ? null : cur));
-                }, 1400);
-              }}
-              className="text-ink-tertiary hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 rounded-[6px] px-1.5 py-0.5 text-[11px] transition-colors"
-            >
-              {copiedKey === activeChipDetail.key ? (
-                <>
-                  <Check className="text-signal-success size-3" />
-                  <span>Copied</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="size-3" />
-                  <span>Copy</span>
-                </>
-              )}
-            </button>
-          </div>
-          <ScrollArea viewportClassName="max-h-56 overscroll-contain">
-            <pre
-              className={cn(
-                "selectable-text text-ink-secondary leading-relaxed whitespace-pre-wrap break-words",
-                activeChipDetail.detailIsMono ? "font-mono text-[12px]" : "font-sans text-[12px]",
-              )}
-            >
-              {activeChipDetail.detailText}
-            </pre>
-          </ScrollArea>
-        </div>
-      )}
-
-      {/* 2. Inter-agent message rows (unified compact expandable bar + clean left-rail body) */}
-      {messageEntries.map((msg) => {
-        const isOpen = expandedKey === msg.key;
-        const canExpand = msg.detailText.length > 0;
-        const isFailed = msg.status === "failed" || msg.status === "denied";
-
+        const recipient = entry.subagent;
         return (
-          <div key={msg.key} className="min-w-0">
-            <div
-              className={cn(
-                "group/msgrow flex min-h-[34px] items-center gap-1.5 rounded-[10px] border pr-1.5 transition-colors",
-                isFailed
-                  ? "border-signal-danger-border bg-signal-danger-bg/45"
-                  : "border-border-subtle bg-surface-recessed/55 hover:border-border-default",
-              )}
-            >
-              <button
-                type="button"
-                disabled={!msg.subagent && !canExpand}
-                aria-expanded={!msg.subagent && canExpand ? isOpen : undefined}
-                title={msg.subagent ? t("overview.openSubagent", { name: msg.subagent.title }) : msg.preview || msg.label}
-                onClick={() => {
-                  if (msg.subagent) return openSubagentRecord(msg.subagent);
-                  if (!canExpand) return;
-                  setExpandedKey((prev) => (prev === msg.key ? null : msg.key));
-                }}
-                className={cn(
-                  "flex min-h-[34px] min-w-0 flex-1 items-center gap-2 py-1 pl-2 pr-1 text-left text-[12px]",
-                  msg.subagent || canExpand ? "cursor-pointer" : "cursor-default",
-                )}
-              >
-                {msg.character ? (
-                  <SubagentAvatar
-                    character={msg.character}
-                    status={msg.subagent?.status ?? (msg.status === "running" ? "running" : "completed")}
-                    size="sm"
-                  />
-                ) : (
-                  <span className="bg-surface-raised border-border-subtle flex size-[20px] shrink-0 items-center justify-center rounded-full border">
-                    {msg.status === "running" ? (
-                      <OrbitSpinner size={11} className="text-ink-secondary" />
-                    ) : isFailed ? (
-                      <AlertTriangle className="text-signal-danger size-3" />
-                    ) : (
-                      <ArrowRight className="text-ink-tertiary size-3 stroke-[1.9]" />
-                    )}
-                  </span>
-                )}
-                <span className="text-ink-primary shrink-0 font-medium">{msg.label}</span>
-                {!isOpen && msg.preview && (
-                  <>
-                    <span aria-hidden="true" className="text-ink-muted shrink-0">
-                      ·
-                    </span>
-                    <span className="text-ink-tertiary min-w-0 flex-1 truncate">
-                      {msg.preview}
-                    </span>
-                  </>
-                )}
-              </button>
-
-              <div className="flex shrink-0 items-center gap-0.5">
-                {canExpand && (
-                  <IconButton
-                    size="xs"
-                    aria-expanded={isOpen}
-                    aria-label={t(isOpen ? "stage.collapseMessage" : "stage.expandMessage")}
-                    onClick={() => setExpandedKey((prev) => (prev === msg.key ? null : msg.key))}
-                  >
-                    <ChevronRight
-                      className={cn(
-                        "size-3.5 transition-transform duration-150",
-                        isOpen && "rotate-90",
-                      )}
-                    />
-                  </IconButton>
-                )}
-              </div>
-            </div>
-
-            {isOpen && canExpand && (
-              <div className="orbit-stage-enter border-border-default mt-1.5 ml-3 border-l-2 pl-3">
-                <ScrollArea viewportClassName="max-h-64 overscroll-contain py-0.5">
-                  <pre
-                    className={cn(
-                      "selectable-text text-ink-secondary leading-[1.6] whitespace-pre-wrap break-words",
-                      msg.detailIsMono ? "font-mono text-[12px]" : "font-sans text-[12px]",
-                    )}
-                  >
-                    {msg.detailText}
-                  </pre>
-                </ScrollArea>
-              </div>
+          <PeerMessageRow
+            key={entry.key}
+            open={isOpen}
+            onOpenChange={changeOpen}
+            holdViewport={holdViewport}
+            label={entry.label}
+            preview={entry.preview}
+            failed={isFailed}
+            statusLabel={isFailed ? t("stage.failed") : undefined}
+            avatar={entry.character ? (
+              <SubagentAvatar
+                character={entry.character}
+                status={recipient?.status ?? (entry.status === "running" ? "running" : "completed")}
+                size="sm"
+              />
+            ) : entry.status === "running" ? (
+              <OrbitSpinner size={14} />
+            ) : isFailed ? (
+              <AlertTriangle className="size-3.5 shrink-0 text-signal-danger" />
+            ) : (
+              <ArrowRight className="size-3.5 shrink-0 text-ink-tertiary" />
             )}
-          </div>
+            action={recipient && (
+              <SubagentPanelAction
+                name={recipient.title === "Subagent" ? subagentFallback : recipient.title}
+                onClick={() => openSubagentRecord(recipient)}
+              />
+            )}
+          >
+            {entry.detailText && (
+              <ScrollArea viewportClassName="max-h-64 overscroll-contain">
+                {entry.detailIsMono ? (
+                  <pre className="selectable-text text-ink-secondary whitespace-pre-wrap break-words">{entry.detailText}</pre>
+                ) : (
+                  <LazyMarkdownMessageBody text={entry.detailText} />
+                )}
+              </ScrollArea>
+            )}
+          </PeerMessageRow>
         );
       })}
     </div>
   );
 });
 
-/**
- * Unified Turn Activity Disclosure with smart long-run handling:
- * - Collapsed (default): clean quiet single line (`Read 8 files, edited 3 files · 24s ›`).
- * - Short expanded (<= 8 steps): lightweight inline indented vertical timeline rail.
- * - Long expanded (>= 9 steps):
- *   1) Default bounded internal scroll mode (`max-h-[340px]`) with a FIXED 32px Label Bar pinned
- *      above the scroll area so the summary & collapse action never scroll out of view; auto-follows
- *      the latest step while working.
- *   2) Optional Full-Expand toggle (`⤢`) releasing the height cap while pinning the 32px Label Bar
- *      as `position: sticky; top: 0` inside the main reading viewport + a quiet bottom collapse button.
- */
 export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   items,
   isWorkActive,
   liveLabel,
   liveDetail,
   settledLabel,
+  hasProjectedSummary = false,
+  thoughtDurationMs,
   summaryCounts,
   labelIncludesFailure,
   defaultCollapsed,
@@ -593,6 +445,8 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   liveLabel: string;
   liveDetail: string | null;
   settledLabel: string;
+  hasProjectedSummary?: boolean;
+  thoughtDurationMs?: number | null;
   summaryCounts: WorkSummaryResultView["counts"];
   labelIncludesFailure: boolean;
   defaultCollapsed: boolean;
@@ -617,6 +471,18 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   sessionSubagents?: readonly SubagentMaybeWithAvatar[];
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
+  const { t, locale } = useI18n();
+  // Core projects English display labels. Reuse the chunk formatter for other locales
+  // while keeping core counts, activity and disclosure decisions authoritative.
+  const localizedSummary = useMemo(
+    () => hasProjectedSummary && locale !== "en" ? summarizeWorkChunk(items, thoughtDurationMs, locale) : null,
+    [hasProjectedSummary, items, thoughtDurationMs, locale],
+  );
+  const activeLabel = localizedSummary?.live_label ?? liveLabel;
+  const thoughtOnly = summaryCounts.action_steps === 0 && summaryCounts.thought_count > 0;
+  const finishedLabel = thoughtOnly
+    ? formatThoughtSummaryLabel(thoughtDurationMs, summaryCounts.thought_count, locale)
+    : localizedSummary?.label ?? settledLabel;
   const canPersist =
     typeof turnIndex === "number" &&
     typeof turnAnchorSeq === "number" &&
@@ -628,10 +494,7 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
       ? sharedDisclosureStateStore.get(agentId, turnIndex, workOrdinal, turnAnchorSeq)
       : null,
   );
-  const [fullHeightExpanded, setFullHeightExpanded] = useState(false);
   const foldBtnRef = useRef<HTMLButtonElement | null>(null);
-  const innerScrollRef = useRef<HTMLDivElement | null>(null);
-  const pointerToggledRef = useRef(false);
   const fallbackStartRef = useRef<number>(Date.now());
   const effectiveLiveStartedAtMs = liveStartedAtMs ?? fallbackStartRef.current;
 
@@ -643,324 +506,112 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
 
   const defaultOpen = !defaultCollapsed || autoOpenForError;
   const isExpanded = userExpanded !== null ? userExpanded : defaultOpen;
-  const isLongGroup = items.length >= LONG_DISCLOSURE_STEP_THRESHOLD;
-  const useBoundedScroll = isExpanded && isLongGroup && !fullHeightExpanded;
-  const useStickyFullMode = isExpanded && isLongGroup && fullHeightExpanded;
 
-  // Gently keep the latest step visible inside bounded inner scroll while active
-  useEffect(() => {
-    if (!useBoundedScroll || !isWorkActive) return;
-    const el = innerScrollRef.current;
-    if (!el) return;
-    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (distFromBottom < 80) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [useBoundedScroll, isWorkActive, items.length]);
+  if (items.length === 0 && !isWorkActive) return null;
 
-  if (items.length === 0) {
-    if (!isWorkActive) return null;
-    const emptyStallLabel = isBackgroundWait ? null : undefined;
-    return (
-      <div className="text-ink-tertiary flex max-w-full flex-wrap items-center gap-1.5 py-0.5 text-[13px] font-normal">
-        <span className="agent-text-shimmer truncate">{liveLabel || "Working…"}</span>
-        <InlineLiveElapsed
-          startedAtMs={effectiveLiveStartedAtMs}
-          lastActivityMs={latestActivityMs}
-          lastVisibleProgressMs={latestVisibleProgressMs}
-          isNetworkOffline={isNetworkOffline}
-          stallLabel={emptyStallLabel}
-          queuedNotificationCount={queuedNotificationCount}
-        />
-        <LiveStallInterruptButton
-          startedAtMs={effectiveLiveStartedAtMs}
-          lastActivityMs={latestActivityMs}
-          lastVisibleProgressMs={latestVisibleProgressMs}
-          isNetworkOffline={isNetworkOffline}
-          stallLabel={emptyStallLabel}
-          queuedNotificationCount={queuedNotificationCount}
-          onInterruptAndContinue={onInterruptAndContinue}
-        />
-      </div>
-    );
-  }
-
-  const toggleExpanded = () => {
-    holdViewport(foldBtnRef.current, () => {
-      setUserExpanded((prev) => {
-        const next = !(prev !== null ? prev : defaultOpen);
-        if (!next) {
-          setFullHeightExpanded(false);
-        }
+  const handleOpenChange = (open: boolean) => {
+    holdViewport(
+      foldBtnRef.current,
+      () => {
+        setUserExpanded(open);
         if (canPersist) {
-          sharedDisclosureStateStore.set(agentId, turnIndex, workOrdinal, turnAnchorSeq, next);
+          sharedDisclosureStateStore.set(agentId, turnIndex, workOrdinal, turnAnchorSeq, open);
         }
-        return next;
-      });
-    });
+      },
+      "top",
+      { intent: open ? "expand" : "collapse" },
+    );
   };
 
   const showFailureBadge =
     !isWorkActive && summaryCounts.unrecovered_failure_count > 0 && !labelIncludesFailure;
   const showDiffNumbers =
-    isWorkActive && (summaryCounts.additions > 0 || summaryCounts.deletions > 0);
+    isWorkActive && items.length > 0 && (summaryCounts.additions > 0 || summaryCounts.deletions > 0);
   const showSettledDuration =
     !isWorkActive &&
     settledDurationMs !== null &&
     settledDurationMs >= 1000 &&
-    !settledLabel.startsWith("Thought for ");
+    !(thoughtOnly && Math.round((thoughtDurationMs ?? 0) / 1000) >= 1);
 
-  const activeStallLabel = isBackgroundWait ? "running in background" : undefined;
-
-  const labelContent = isWorkActive ? (
-    <>
-      <span className={cn("agent-text-shimmer", liveDetail ? "shrink-0" : "truncate")}>
-        {liveLabel}
-      </span>
-      {liveDetail && (
-        <span className="agent-text-shimmer truncate text-[12px] opacity-80">
-          {liveDetail}
-        </span>
+  const hasFailure = !isWorkActive && (labelIncludesFailure || showFailureBadge);
+  const SummaryIcon = hasFailure ? AlertTriangle : thoughtOnly || items.length === 0 ? Sparkles : ListChecks;
+  const activeStallLabel = isBackgroundWait
+    ? items.length > 0
+      ? t("stage.runningInBackground")
+      : null
+    : undefined;
+  const line = (
+    <TraceLine status={isWorkActive ? "running" : hasFailure ? "error" : undefined} className="text-[13px]">
+      <TraceIcon><SummaryIcon /></TraceIcon>
+      <TraceTitle>
+        {isWorkActive ? activeLabel || t("stage.working") : finishedLabel}
+        {isWorkActive && liveDetail && items.length > 0 && <> {liveDetail}</>}
+      </TraceTitle>
+      {isWorkActive && items.length >= 2 && (
+        <TraceDescription>· {t("stage.stepCount", { count: items.length })}</TraceDescription>
       )}
-      {items.length >= 2 && (
-        <span className="text-ink-muted tabular-nums shrink-0 text-[12px]">
-          · {items.length} steps
-        </span>
-      )}
-      <InlineLiveElapsed
-        startedAtMs={effectiveLiveStartedAtMs}
-        lastActivityMs={latestActivityMs}
-        lastVisibleProgressMs={latestVisibleProgressMs}
-        isNetworkOffline={isNetworkOffline}
-        stallLabel={activeStallLabel}
-        queuedNotificationCount={queuedNotificationCount}
-      />
-      {showDiffNumbers && (
-        <DiffStat
-          size="xs"
-          additions={summaryCounts.additions}
-          deletions={summaryCounts.deletions}
+      {isWorkActive && (
+        <InlineLiveElapsed
+          startedAtMs={effectiveLiveStartedAtMs}
+          lastActivityMs={latestActivityMs}
+          lastVisibleProgressMs={latestVisibleProgressMs}
+          isNetworkOffline={isNetworkOffline}
+          stallLabel={activeStallLabel}
+          queuedNotificationCount={queuedNotificationCount}
         />
       )}
-    </>
-  ) : (
-    <>
-      <span className={cn("truncate", labelIncludesFailure && "text-signal-danger")}>
-        {settledLabel}
-      </span>
+      {showDiffNumbers && (
+        <TraceDescription>
+          <DiffStat size="xs" additions={summaryCounts.additions} deletions={summaryCounts.deletions} />
+        </TraceDescription>
+      )}
       {showFailureBadge && (
-        <span className="text-signal-danger shrink-0 text-[12px]">
-          · {summaryCounts.unrecovered_failure_count} failed
-        </span>
+        <TraceDescription className="text-destructive">
+          · {t("stage.failedCount", { count: summaryCounts.unrecovered_failure_count })}
+        </TraceDescription>
       )}
       {showSettledDuration && (
-        <span className="text-ink-muted tabular-nums shrink-0 text-[12px]">
-          · {formatDurationCompact(settledDurationMs)}
-        </span>
+        <TraceDescription>· {formatDurationCompact(settledDurationMs, locale)}</TraceDescription>
       )}
-    </>
+    </TraceLine>
   );
 
-  const bindTogglePointer = {
-    onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
-      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-      pointerToggledRef.current = true;
-      e.preventDefault();
-      toggleExpanded();
-      const clearGuard = () => {
-        window.removeEventListener("pointerup", clearGuard);
-        window.removeEventListener("pointercancel", clearGuard);
-        window.setTimeout(() => {
-          pointerToggledRef.current = false;
-        }, 0);
-      };
-      window.addEventListener("pointerup", clearGuard, { once: true });
-      window.addEventListener("pointercancel", clearGuard, { once: true });
-    },
-    onClick: () => {
-      if (pointerToggledRef.current) {
-        pointerToggledRef.current = false;
-        return;
-      }
-      toggleExpanded();
-    },
-  };
+  const interruptButton = isWorkActive ? (
+    <LiveStallInterruptButton
+      startedAtMs={effectiveLiveStartedAtMs}
+      lastActivityMs={latestActivityMs}
+      lastVisibleProgressMs={latestVisibleProgressMs}
+      isNetworkOffline={isNetworkOffline}
+      stallLabel={activeStallLabel}
+      queuedNotificationCount={queuedNotificationCount}
+      onInterruptAndContinue={onInterruptAndContinue}
+    />
+  ) : null;
 
-  // Long Group — Bounded Scroll Track (Fixed 32px Top Label Bar + max-h 340px Inner Scroll)
-  if (useBoundedScroll) {
+  if (items.length === 0) {
     return (
-      <div className="orbit-disclosure-track overflow-hidden">
-        <div className="border-border-subtle flex h-[32px] items-center justify-between gap-2 border-b px-2.5">
-          <button
-            ref={foldBtnRef}
-            type="button"
-            aria-expanded="true"
-            {...bindTogglePointer}
-            className="group/fold text-ink-secondary hover:text-ink-primary flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left text-[13px] font-normal transition-colors"
-          >
-            <ChevronRight className="text-ink-muted size-3.5 shrink-0 rotate-90 transition-transform duration-150" />
-            {labelContent}
-          </button>
-
-          <div className="flex shrink-0 items-center gap-1">
-            {isWorkActive && (
-              <LiveStallInterruptButton
-                startedAtMs={effectiveLiveStartedAtMs}
-                lastActivityMs={latestActivityMs}
-                lastVisibleProgressMs={latestVisibleProgressMs}
-                isNetworkOffline={isNetworkOffline}
-                stallLabel={activeStallLabel}
-                queuedNotificationCount={queuedNotificationCount}
-                onInterruptAndContinue={onInterruptAndContinue}
-              />
-            )}
-            <IconButton
-              size="xs"
-              tooltip="Expand full list"
-              onClick={() => setFullHeightExpanded(true)}
-            >
-              <Maximize2 className="size-3" />
-            </IconButton>
-          </div>
+      <Trace>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {line}
+          {interruptButton}
         </div>
-
-        <div
-          ref={innerScrollRef}
-          className="orbit-native-scroll orbit-disclosure-scroll max-h-[340px] overflow-y-auto px-3 py-2"
-        >
-          <StepTimelineRail
-            items={items}
-            hostId={hostId}
-            cwd={cwd}
-            holdViewport={holdViewport}
-            indented
-            isLiveActive={isWorkActive}
-            autoExpandErrors={
-              !isWorkActive && (summaryCounts.failed_count > 0 || summaryCounts.denied_count > 0)
-            }
-            agentId={agentId}
-            thinkingSignature={thinkingSignature}
-            getThinkingDurationMs={getThinkingDurationMs}
-            sessionSubagents={sessionSubagents}
-            onOpenSubagent={onOpenSubagent}
-          />
-        </div>
-      </div>
+      </Trace>
     );
   }
 
-  // Long Group — Full-Height Expanded with Sticky Top Label Bar + Bottom Collapse Anchor
-  if (useStickyFullMode) {
-    return (
-      <div className="min-w-0">
-        <div className="orbit-sticky-disclosure-bar border-border-subtle -mx-2.5 flex h-[32px] items-center justify-between gap-2 border-b px-2.5">
-          <button
-            ref={foldBtnRef}
-            type="button"
-            aria-expanded="true"
-            {...bindTogglePointer}
-            className="group/fold text-ink-secondary hover:text-ink-primary flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left text-[13px] font-normal transition-colors"
-          >
-            <ChevronRight className="text-ink-muted size-3.5 shrink-0 rotate-90 transition-transform duration-150" />
-            {labelContent}
-          </button>
-
-          <div className="flex shrink-0 items-center gap-1">
-            {isWorkActive && (
-              <LiveStallInterruptButton
-                startedAtMs={effectiveLiveStartedAtMs}
-                lastActivityMs={latestActivityMs}
-                lastVisibleProgressMs={latestVisibleProgressMs}
-                isNetworkOffline={isNetworkOffline}
-                stallLabel={activeStallLabel}
-                queuedNotificationCount={queuedNotificationCount}
-                onInterruptAndContinue={onInterruptAndContinue}
-              />
-            )}
-            <IconButton
-              size="xs"
-              tooltip="Use compact scroll box"
-              onClick={() => setFullHeightExpanded(false)}
-            >
-              <Minimize2 className="size-3" />
-            </IconButton>
-          </div>
-        </div>
-
-        <div className="orbit-stage-enter pt-1">
-          <StepTimelineRail
-            items={items}
-            hostId={hostId}
-            cwd={cwd}
-            holdViewport={holdViewport}
-            indented
-            isLiveActive={isWorkActive}
-            autoExpandErrors={
-              !isWorkActive && (summaryCounts.failed_count > 0 || summaryCounts.denied_count > 0)
-            }
-            agentId={agentId}
-            thinkingSignature={thinkingSignature}
-            getThinkingDurationMs={getThinkingDurationMs}
-            sessionSubagents={sessionSubagents}
-            onOpenSubagent={onOpenSubagent}
-          />
-          <div className="mt-1.5 pl-4">
-            <button
-              type="button"
-              onClick={toggleExpanded}
-              className="text-ink-tertiary hover:text-ink-primary hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-colors"
-            >
-              <ArrowUp className="size-3" />
-              <span>Collapse {items.length} steps</span>
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Collapsed or Short Expanded (<= 8 steps) — Crisp, Frameless Inline Disclosure
   return (
-    <div>
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          ref={foldBtnRef}
-          type="button"
-          aria-expanded={isExpanded}
-          {...bindTogglePointer}
-          className="group/fold text-ink-tertiary hover:text-ink-primary hover:bg-accent/65 -ml-1.5 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-[6px] px-1.5 py-0.5 text-[13px] font-normal transition-colors"
-        >
-          {labelContent}
-
-          <ChevronRight
-            className={cn(
-              "size-3.5 shrink-0 opacity-65 transition-transform duration-150 group-hover/fold:opacity-100",
-              isExpanded && "rotate-90",
-            )}
-          />
-        </button>
-
-        {isWorkActive && (
-          <LiveStallInterruptButton
-            startedAtMs={effectiveLiveStartedAtMs}
-            lastActivityMs={latestActivityMs}
-            lastVisibleProgressMs={latestVisibleProgressMs}
-            isNetworkOffline={isNetworkOffline}
-            stallLabel={activeStallLabel}
-            queuedNotificationCount={queuedNotificationCount}
-            onInterruptAndContinue={onInterruptAndContinue}
-          />
-        )}
-      </div>
-
-      {isExpanded && (
-        <div className="orbit-stage-enter">
+    <Trace>
+      <TraceCollapsible open={isExpanded} onOpenChange={handleOpenChange}>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <TraceCollapsibleTrigger ref={foldBtnRef}>{line}</TraceCollapsibleTrigger>
+          {interruptButton}
+        </div>
+        <TraceCollapsibleContent>
           <StepTimelineRail
             items={items}
             hostId={hostId}
             cwd={cwd}
             holdViewport={holdViewport}
-            indented
             isLiveActive={isWorkActive}
             autoExpandErrors={
               !isWorkActive && (summaryCounts.failed_count > 0 || summaryCounts.denied_count > 0)
@@ -971,9 +622,25 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
             sessionSubagents={sessionSubagents}
             onOpenSubagent={onOpenSubagent}
           />
-        </div>
-      )}
-    </div>
+          {items.length >= 10 && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              className="mt-1"
+              onClick={() => {
+                foldBtnRef.current?.focus({ preventScroll: true });
+                foldBtnRef.current?.scrollIntoView({ block: "nearest" });
+                handleOpenChange(false);
+              }}
+            >
+              <ArrowUp data-icon="inline-start" />
+              {t("stage.collapseSteps", { count: items.length })}
+            </Button>
+          )}
+        </TraceCollapsibleContent>
+      </TraceCollapsible>
+    </Trace>
   );
 });
 
@@ -982,22 +649,26 @@ export const CompactionMilestoneRow = memo(function CompactionMilestoneRow({
 }: {
   label?: string;
 }) {
+  const { t } = useI18n();
   return (
-    <div className="py-0.5 select-none">
-      <span className="text-ink-tertiary border-border-subtle bg-surface-recessed/70 inline-flex h-[26px] max-w-full items-center gap-1.5 rounded-[8px] border px-2.5 text-[12px] font-normal">
-        <Scissors className="size-3 shrink-0 opacity-75" />
-        <span className="truncate">{label || "Context compacted"}</span>
-      </span>
-    </div>
+    <Marker variant="separator" className="py-1">
+      <MarkerIcon><Scissors /></MarkerIcon>
+      <MarkerContent className="group-data-[variant=separator]/marker:shrink">
+        {!label || label === "Context compacted" ? t("stage.compacted") : label}
+      </MarkerContent>
+    </Marker>
   );
 });
 
 export const WakeupEventRow = memo(function WakeupEventRow({ label }: { label?: string }) {
+  const { t } = useI18n();
   return (
-    <div className="text-ink-tertiary flex items-center gap-1.5 py-0.5 text-[12px] font-normal select-none">
-      <RotateCw className="size-3 shrink-0 opacity-75" />
-      <span className="truncate">{label || "Resumed from background task"}</span>
-    </div>
+    <Marker className="py-1">
+      <MarkerIcon><RotateCw /></MarkerIcon>
+      <MarkerContent>
+        {!label || label === "Resumed from background task" ? t("stage.resumedFromBackground") : label}
+      </MarkerContent>
+    </Marker>
   );
 });
 
@@ -1008,6 +679,7 @@ export const InlineArtifactCard = memo(function InlineArtifactCard({
   hostId: string;
   artifact: InlineArtifactRef;
 }) {
+  const { t } = useI18n();
   return (
     <button
       type="button"
@@ -1017,10 +689,10 @@ export const InlineArtifactCard = memo(function InlineArtifactCard({
           artifactId: artifact.artifactId,
         })
       }
-      className="border-border-subtle bg-surface-raised/70 hover:bg-accent/70 hover:border-border-default group inline-flex h-[30px] max-w-full cursor-pointer items-center gap-2 rounded-[8px] border px-2.5 text-left text-[12px] transition-colors"
+      className="border-border-subtle bg-surface-raised/70 hover:bg-surface-recessed hover:border-border-default group inline-flex h-[30px] max-w-full cursor-pointer items-center gap-2 rounded-lg border px-2.5 text-left text-[13px] leading-[18px] transition-colors"
     >
       <Blocks className="text-ink-tertiary group-hover:text-ink-primary size-[13px] shrink-0 stroke-[1.75]" />
-      <span className="text-ink-tertiary shrink-0 text-[11px]">Artifact</span>
+      <span className="text-ink-tertiary shrink-0 text-[11px]">{t("stage.artifact")}</span>
       <span className="text-ink-muted shrink-0">·</span>
       <span className="text-ink-primary truncate font-medium">{artifact.title}</span>
       {artifact.version != null && (

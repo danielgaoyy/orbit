@@ -66,7 +66,7 @@ export function ContextBanner({
     <div
       role="status"
       className={cn(
-        "@container orbit-stage-enter flex min-w-0 items-center justify-between gap-2 overflow-hidden text-[12px]",
+        "@container orbit-stage-enter flex min-w-0 items-center justify-between gap-2 overflow-hidden text-[13px] transition-[background-color,border-color,color] duration-[var(--dur-ui)] ease-[var(--ease-out-quart)]",
         variant === "strip"
           ? cn("min-h-[30px] shrink-0 px-3 py-1 @[560px]:px-4", styles.strip)
           : cn("min-h-[32px] rounded-[10px] px-3 py-1.5", styles.inline),

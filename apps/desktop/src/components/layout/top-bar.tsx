@@ -102,26 +102,28 @@ export const TopBar = memo(function TopBar() {
     return isAgentInGitRepo(s.selectedHostId, ag, detail, s.sidebarView);
   });
 
-  const currentHostDetail = useOrbitSelector((s) =>
-    hasActiveSession && s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
-  );
-  const crossHostDetails = useOrbitSelector((s) =>
-    hasActiveSession && hasCrossHostChildAgents(s.hostDetails, s.selectedHostId, s.selectedAgentId)
-      ? s.hostDetails
-      : EMPTY_HOST_DETAILS,
-  );
-  const crossHostFleetHosts = useOrbitSelector((s) =>
-    hasActiveSession && hasCrossHostChildAgents(s.hostDetails, s.selectedHostId, s.selectedAgentId)
-      ? s.fleet.hosts
-      : EMPTY_FLEET_HOSTS,
-  );
-  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const insightSubagents = useOrbitSelector((s) =>
     hasActiveSession && s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights?.subagents ??
         EMPTY_INSIGHT_SUBAGENTS)
       : EMPTY_INSIGHT_SUBAGENTS,
   );
+  const currentHostDetail = useOrbitSelector((s) =>
+    hasActiveSession && s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
+  );
+  const crossHostDetails = useOrbitSelector((s) =>
+    hasActiveSession &&
+    hasCrossHostChildAgents(s.hostDetails, s.selectedHostId, s.selectedAgentId, insightSubagents)
+      ? s.hostDetails
+      : EMPTY_HOST_DETAILS,
+  );
+  const crossHostFleetHosts = useOrbitSelector((s) =>
+    hasActiveSession &&
+    hasCrossHostChildAgents(s.hostDetails, s.selectedHostId, s.selectedAgentId, insightSubagents)
+      ? s.fleet.hosts
+      : EMPTY_FLEET_HOSTS,
+  );
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const insightBackgroundTasks = useOrbitSelector((s) =>
     hasActiveSession && s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights?.background_tasks ??

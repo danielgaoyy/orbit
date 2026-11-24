@@ -83,8 +83,10 @@ function pathsMatch(a: string, b: string, cwd: string): boolean {
 
 export const ReviewTab = memo(function ReviewTab({
   selectedHostId,
+  visible = true,
 }: {
   selectedHostId: string;
+  visible?: boolean;
 }) {
   const { t } = useI18n();
   const reviewScope = useOrbitSelector((s) => s.reviewScope);
@@ -310,6 +312,17 @@ export const ReviewTab = memo(function ReviewTab({
         hostId: selectedHostId,
         cwd: selectedCwd,
         focusLine,
+      });
+    },
+    [selectedHostId, selectedCwd],
+  );
+
+  const handlePrefetchFile = useCallback(
+    (path: string) => {
+      orbitActions.prefetchWorkspaceFile(path, {
+        hostId: selectedHostId,
+        cwd: selectedCwd,
+        intent: "press",
       });
     },
     [selectedHostId, selectedCwd],
@@ -784,7 +797,12 @@ export const ReviewTab = memo(function ReviewTab({
     isWorkingTreeWritable && (diffStaged ? stagedCount > 0 : unstagedCount > 0);
 
   return (
-    <div className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div
+      className={cn(
+        "orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden",
+        !visible && "hidden",
+      )}
+    >
       {/* Compact Scope & View Sub-Bar */}
       <div className="border-border flex h-[36px] shrink-0 items-center justify-between gap-2 border-b px-3">
         <div className="bg-muted inline-flex h-[26px] items-center rounded-lg p-0.5 text-[11.5px]">
@@ -1142,6 +1160,7 @@ export const ReviewTab = memo(function ReviewTab({
         onAddComment={handleAddComment}
         onDeleteComment={handleDeleteComment}
         onOpenFile={handleOpenFile}
+        onPrefetchFile={handlePrefetchFile}
         onStageFile={isWorkingTreeWritable ? (path) => void handleStageFile(path) : undefined}
         onUnstageFile={isWorkingTreeWritable ? (path) => void handleUnstageFile(path) : undefined}
         onDiscardFile={isWorkingTreeWritable ? handleRequestDiscardFile : undefined}
@@ -1318,7 +1337,7 @@ export const ReviewTab = memo(function ReviewTab({
 
       {/* Unified Destructive Confirmation Dialog for Discard File & Discard Hunk */}
       <ConfirmDialog
-        open={pendingDiscard !== null}
+        open={visible && pendingDiscard !== null}
         onOpenChange={(nextOpen) => {
           if (!nextOpen) setPendingDiscard(null);
         }}
@@ -1359,7 +1378,7 @@ export const ReviewTab = memo(function ReviewTab({
       {/* Restrained Create Pull Request Dialog */}
       {isWorkingTreeWritable && selectedCwd && (
         <CreatePrDialog
-          open={prDialogOpen}
+          open={visible && prDialogOpen}
           onOpenChange={setPrDialogOpen}
           hostId={selectedHostId}
           cwd={selectedCwd}

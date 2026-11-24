@@ -871,6 +871,111 @@ pub struct PromptBadge {
     pub path: Option<String>,
 }
 
+/// A lightweight jump target, independent of the page of timeline events being delivered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineOutlinePrompt {
+    pub seq: u64,
+    pub preview: String,
+}
+
+impl TimelineOutlinePrompt {
+    /// Project the same bounded, user-visible preview for stored, live and replica prompts.
+    pub fn from_user_prompt(seq: u64, raw: &str, badges: &[PromptBadge]) -> Option<Self> {
+        let (text, directive) = display_prompt_parts(raw);
+        if is_compact_prompt(text, directive, badges) {
+            return None;
+        }
+        let preview = if text.is_empty() {
+            let mut labels = badges
+                .iter()
+                .flat_map(|badge| badge.label.split_whitespace())
+                .peekable();
+            if labels.peek().is_some() {
+                outline_preview(labels)
+            } else {
+                outline_preview(directive.unwrap_or("Prompt").split_whitespace())
+            }
+        } else {
+            outline_preview(text.split_whitespace())
+        };
+        Some(Self { seq, preview })
+    }
+}
+
+fn outline_preview<'a>(words: impl Iterator<Item = &'a str>) -> String {
+    let mut preview: String = words
+        .flat_map(|w| w.chars().chain(std::iter::once(' ')))
+        .take(110)
+        .collect();
+    preview.truncate(preview.trim_end().len());
+    preview
+}
+
+/// Whether a user turn is represented by a compaction milestone on the stage.
+pub fn is_compaction_command(raw: &str, badges: &[PromptBadge]) -> bool {
+    let (text, directive) = display_prompt_parts(raw);
+    is_compact_prompt(text, directive, badges)
+}
+
+fn is_compact_prompt(text: &str, directive: Option<&str>, badges: &[PromptBadge]) -> bool {
+    const COMMAND: &str = "/compact";
+    text.get(..COMMAND.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(COMMAND))
+        && text[COMMAND.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        || text.is_empty()
+            && (directive == Some(COMMAND)
+                || badges
+                    .iter()
+                    .any(|badge| badge.kind == "slash" && badge.label == COMMAND))
+}
+
+// Legacy records can contain the wire prompt. Only unwrap Orbit's leading envelopes,
+// preserving examples of these tags in the user's actual request.
+fn display_prompt_parts(raw: &str) -> (&str, Option<&str>) {
+    let mut rest = raw.trim();
+    let mut directive = None;
+    while let Some(tag) = rest.strip_prefix('<') {
+        let name = tag
+            .split(['>', ' ', '\n', '\t', '\r'])
+            .next()
+            .unwrap_or_default();
+        let close = match name {
+            "orbit-context" => "</orbit-context>",
+            "orbit-workspace" => "</orbit-workspace>",
+            "orbit-workspace-delta" => "</orbit-workspace-delta>",
+            "orbit-fleet-state" => "</orbit-fleet-state>",
+            "orbit-fleet-delta" => "</orbit-fleet-delta>",
+            "orbit-system" => "</orbit-system>",
+            "WORKSPACE_RULES" => "</WORKSPACE_RULES>",
+            "WORKFLOW_INSTRUCTION" => "</WORKFLOW_INSTRUCTION>",
+            "ATTACHED_CONTEXT" => "</ATTACHED_CONTEXT>",
+            _ => break,
+        };
+        let Some((block, tail)) = tag.split_once(close) else {
+            break;
+        };
+        if name == "WORKFLOW_INSTRUCTION" {
+            directive = block.split_once('>').and_then(|(opening, _)| {
+                opening
+                    .split_once("command=\"")?
+                    .1
+                    .split_once('"')
+                    .map(|(command, _)| command)
+            });
+        }
+        rest = tail.trim_start();
+    }
+    let text = rest
+        .strip_prefix("<USER_REQUEST>")
+        .and_then(|body| body.strip_suffix("</USER_REQUEST>"))
+        .unwrap_or(rest)
+        .trim();
+    (text, directive)
+}
+
 /// Monotonically sequenced timeline event stored in SQLite WAL and streamed to clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEvent {
@@ -1631,6 +1736,7 @@ pub enum WireMessage {
         /// Client passes its local SQLite cursor for instant catch-up without full reload.
         since_seq: u64,
         /// When `since_seq == 0` and set, return only the latest `tail_limit` events (tail-first).
+        /// An explicit open with a saved cursor can set this to request the outline alongside incremental events.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tail_limit: Option<u32>,
     },
@@ -1641,6 +1747,8 @@ pub enum WireMessage {
         has_more: bool,
         #[serde(default)]
         has_older_history: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        outline_prompts: Vec<TimelineOutlinePrompt>,
     },
     FetchTimelineBefore {
         request_id: Uuid,
@@ -3153,6 +3261,67 @@ impl TerminalBinaryFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_catchup_accepts_legacy_and_omits_empty_outlines() {
+        let legacy = serde_json::json!({
+            "op": "timeline_catchup", "request_id": Uuid::nil(),
+            "agent_id": "agent", "events": [], "has_more": false
+        });
+        let wire: WireMessage = serde_json::from_value(legacy.clone()).expect("legacy catchup");
+        assert!(
+            matches!(&wire, WireMessage::TimelineCatchup { outline_prompts, .. } if outline_prompts.is_empty())
+        );
+        assert!(
+            serde_json::to_value(wire)
+                .expect("wire JSON")
+                .get("outline_prompts")
+                .is_none()
+        );
+
+        let mut modern = legacy;
+        modern["outline_prompts"] = serde_json::json!([{ "seq": 7, "preview": "before the tail" }]);
+        let wire: WireMessage = serde_json::from_value(modern.clone()).expect("modern catchup");
+        assert_eq!(
+            serde_json::to_value(wire).expect("wire JSON")["outline_prompts"],
+            modern["outline_prompts"]
+        );
+    }
+
+    #[test]
+    fn outline_previews_unwrap_wire_sections_and_bound_unicode() {
+        let body = "界🙂".repeat(100);
+        let raw = format!(
+            "<orbit-context>hidden</orbit-context><orbit-workspace id=\"w\">hidden</orbit-workspace>\n<WORKFLOW_INSTRUCTION command=\"/plan\">hidden</WORKFLOW_INSTRUCTION><ATTACHED_CONTEXT>hidden</ATTACHED_CONTEXT>\n<USER_REQUEST>  first\n\t{body}  </USER_REQUEST>"
+        );
+        let prompt = TimelineOutlinePrompt::from_user_prompt(7, &raw, &[]).expect("anchor");
+        assert_eq!(prompt.preview, format!("first {}", "界🙂".repeat(52)));
+        let badge = PromptBadge {
+            kind: "file".into(),
+            label: "file name".into(),
+            path: None,
+        };
+        assert_eq!(
+            TimelineOutlinePrompt::from_user_prompt(9, "", &[badge])
+                .expect("badge")
+                .preview,
+            "file name"
+        );
+        for command in [
+            "/COMPACT",
+            "<orbit-workspace>hidden</orbit-workspace> /compact",
+            "<WORKFLOW_INSTRUCTION command=\"/compact\">hidden</WORKFLOW_INSTRUCTION>",
+        ] {
+            assert!(TimelineOutlinePrompt::from_user_prompt(1, command, &[]).is_none());
+        }
+        let literal = "/compaction and <orbit-context>literal</orbit-context>";
+        assert_eq!(
+            TimelineOutlinePrompt::from_user_prompt(1, literal, &[])
+                .expect("literal")
+                .preview,
+            literal
+        );
+    }
 
     #[test]
     fn zstd_wire_roundtrip() {

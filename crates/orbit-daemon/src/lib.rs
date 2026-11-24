@@ -30,6 +30,7 @@ pub mod lsp;
 pub mod manager;
 pub mod mcp;
 pub mod mcp_servers;
+mod memory;
 pub mod messaging;
 pub mod permission_rules;
 pub mod personal_router;
@@ -345,6 +346,8 @@ pub struct DaemonPersistedConfig {
     pub relay_url: Option<String>,
     #[serde(default)]
     pub orchestration: OrchestrationConfig,
+    #[serde(default)]
+    pub memory_embedding: orbit_protocol::MemoryEmbeddingConfig,
 }
 
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -483,6 +486,35 @@ pub struct DaemonRuntime {
 }
 
 impl DaemonRuntime {
+    fn spawn_memory_rpc<F: Future<Output = anyhow::Result<WireMessage>> + Send + 'static>(
+        &self,
+        request_id: Uuid,
+        path: PathBuf,
+        out_tx: &mpsc::Sender<SessionFrame>,
+        zstd: bool,
+        run: impl FnOnce(memory::MemoryEngine, String) -> F + Send + 'static,
+    ) {
+        let store = self.store.clone();
+        let engine = self.orchestrator.memory.clone();
+        let tx = out_tx.clone();
+        tokio::spawn(async move {
+            let msg = match authorize_workspace_mutation_cwd(&store, &path).await {
+                Ok(root) => match root.to_str() {
+                    Some(root) => run(engine, root.to_owned())
+                        .await
+                        .unwrap_or_else(|e| rpc_err(request_id, "project_memory_error", e)),
+                    None => rpc_err(
+                        request_id,
+                        "project_memory_error",
+                        "workspace path must be UTF-8",
+                    ),
+                },
+                Err(e) => rpc_err(request_id, "workspace_denied", e),
+            };
+            let _ = tx.send(SessionFrame::Wire { msg, zstd }).await;
+        });
+    }
+
     /// Lightweight, side-effect-free runtime bootstrap (safe for `orbit pair`, `orbit status`,
     /// and tests). Call [`DaemonRuntime::activate_server`] after binding the TCP listener to start
     /// shim recovery, connected hosts, finish subscriptions, scheduler, and idle cleanup.
@@ -666,6 +698,16 @@ impl DaemonRuntime {
         let workspace_watcher =
             crate::workspace_watcher::WorkspaceWatcherManager::new(move |batch| {
                 sym_for_watch.invalidate(&batch.canonical_root);
+                let memory = orch_for_watch.memory.clone();
+                let root = batch.canonical_root.clone();
+                let paths = batch.changed_paths.clone();
+                tokio::spawn(async move {
+                    if let Some(cwd) = root.to_str()
+                        && let Err(error) = memory.changed(cwd, paths).await
+                    {
+                        tracing::warn!(%error, "project memory watcher reconciliation failed");
+                    }
+                });
                 if batch.skills_or_rules_changed {
                     let orch_bg = Arc::clone(&orch_for_watch);
                     let ws_id = batch.workspace_id.clone();
@@ -4359,6 +4401,130 @@ async fn handle_wire_rpc(
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
+            None
+        }
+        WireMessage::ListProjectMemories {
+            request_id,
+            cwd,
+            status,
+            category,
+            query,
+            limit,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let items = engine.list(&root, status, category, query, limit).await?;
+                    Ok(WireMessage::ProjectMemoriesList {
+                        request_id,
+                        cwd,
+                        items,
+                    })
+                },
+            );
+            None
+        }
+        WireMessage::UpsertProjectMemory {
+            request_id,
+            cwd,
+            id,
+            title,
+            content,
+            category,
+            status,
+            file_paths,
+            tags,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let item = engine
+                        .save(
+                            &root,
+                            memory::MemoryDraft {
+                                id,
+                                title,
+                                content,
+                                category,
+                                status,
+                                file_paths,
+                                tags,
+                            },
+                            None,
+                        )
+                        .await?;
+                    Ok(WireMessage::ProjectMemorySaved { request_id, item })
+                },
+            );
+            None
+        }
+        WireMessage::ConfirmProjectMemory {
+            request_id,
+            cwd,
+            id,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let item = engine.confirm(&root, id).await?;
+                    Ok(WireMessage::ProjectMemorySaved { request_id, item })
+                },
+            );
+            None
+        }
+        WireMessage::DeleteProjectMemory {
+            request_id,
+            cwd,
+            id,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let deleted = engine.forget(&root, id.clone()).await?;
+                    Ok(WireMessage::ProjectMemoryDeleted {
+                        request_id,
+                        id,
+                        deleted,
+                    })
+                },
+            );
+            None
+        }
+        WireMessage::RecallProjectMemories {
+            request_id,
+            cwd,
+            query,
+            limit,
+            include_unconfirmed,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let hits = engine
+                        .recall(&root, query, limit, include_unconfirmed.unwrap_or(false))
+                        .await?;
+                    Ok(WireMessage::ProjectMemoryRecallResult {
+                        request_id,
+                        cwd,
+                        hits,
+                    })
+                },
+            );
             None
         }
         WireMessage::ListWorkspaceFiles { request_id, cwd } => {

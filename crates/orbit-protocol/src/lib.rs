@@ -1137,6 +1137,85 @@ pub struct RemoteMessageSearchHit {
     pub cwd: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryStatus {
+    Hypothesis,
+    Confirmed,
+    NeedsRevalidation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCategory {
+    Architecture,
+    Convention,
+    Debugging,
+    Workflow,
+    Decision,
+    Preference,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectMemoryItem {
+    pub id: String,
+    pub workspace_root: String,
+    pub title: String,
+    pub content: String,
+    pub category: MemoryCategory,
+    pub status: MemoryStatus,
+    pub confidence: f32,
+    #[serde(default)]
+    pub file_paths: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub source_provider: Option<String>,
+    pub source_agent_id: Option<String>,
+    pub source_path: Option<String>,
+    pub access_count: u64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_accessed_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectMemorySearchHit {
+    pub item: ProjectMemoryItem,
+    pub score: f64,
+    pub fts_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEmbeddingProvider {
+    #[default]
+    BuiltinHash,
+    OpenAiCompatible,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryEmbeddingConfig {
+    pub provider: MemoryEmbeddingProvider,
+    pub endpoint_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    pub auto_inject_budget_tokens: u32,
+}
+
+impl Default for MemoryEmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: MemoryEmbeddingProvider::BuiltinHash,
+            endpoint_url: None,
+            model: None,
+            api_key_env: None,
+            auto_inject_budget_tokens: 1200,
+        }
+    }
+}
+
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -1156,6 +1235,64 @@ pub enum WireMessage {
     },
     Pong {
         ts_ms: u64,
+    },
+
+    ListProjectMemories {
+        request_id: Uuid,
+        cwd: String,
+        status: Option<MemoryStatus>,
+        category: Option<MemoryCategory>,
+        query: Option<String>,
+        limit: Option<u32>,
+    },
+    ProjectMemoriesList {
+        request_id: Uuid,
+        cwd: String,
+        items: Vec<ProjectMemoryItem>,
+    },
+    UpsertProjectMemory {
+        request_id: Uuid,
+        cwd: String,
+        id: Option<String>,
+        title: String,
+        content: String,
+        category: MemoryCategory,
+        status: Option<MemoryStatus>,
+        #[serde(default)]
+        file_paths: Vec<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+    ProjectMemorySaved {
+        request_id: Uuid,
+        item: ProjectMemoryItem,
+    },
+    ConfirmProjectMemory {
+        request_id: Uuid,
+        cwd: String,
+        id: String,
+    },
+    DeleteProjectMemory {
+        request_id: Uuid,
+        cwd: String,
+        id: String,
+    },
+    ProjectMemoryDeleted {
+        request_id: Uuid,
+        id: String,
+        deleted: bool,
+    },
+    RecallProjectMemories {
+        request_id: Uuid,
+        cwd: String,
+        query: String,
+        limit: Option<u32>,
+        include_unconfirmed: Option<bool>,
+    },
+    ProjectMemoryRecallResult {
+        request_id: Uuid,
+        cwd: String,
+        hits: Vec<ProjectMemorySearchHit>,
     },
 
     // Workspaces, Directory Browser & Git / Worktrees
@@ -3620,6 +3757,20 @@ impl TerminalBinaryFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_memory_config_defaults_allow_offline_and_open_ai_compatible()
+    -> Result<(), serde_json::Error> {
+        let offline: MemoryEmbeddingConfig = serde_json::from_str("{}")?;
+        assert_eq!(offline.provider, MemoryEmbeddingProvider::BuiltinHash);
+        assert_eq!(offline.auto_inject_budget_tokens, 1200);
+        let dense: MemoryEmbeddingConfig = serde_json::from_value(serde_json::json!({
+            "provider":"open_ai_compatible","endpoint_url":"http://localhost:11434/v1/embeddings","model":"local"
+        }))?;
+        assert_eq!(dense.provider, MemoryEmbeddingProvider::OpenAiCompatible);
+        assert_eq!(dense.auto_inject_budget_tokens, 1200);
+        Ok(())
+    }
 
     #[test]
     fn timeline_catchup_accepts_legacy_and_omits_empty_outlines() {

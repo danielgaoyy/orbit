@@ -469,7 +469,7 @@ async fn run_debouncer_loop(
             let Some(ev) = raw_rx.recv().await else {
                 break;
             };
-            ingest_raw_event(&state, &mut pending, ev);
+            ingest_raw_event(&state, &mut pending, ev, &on_change);
             continue;
         };
 
@@ -487,7 +487,7 @@ async fn run_debouncer_loop(
             }
             maybe_ev = raw_rx.recv() => {
                 match maybe_ev {
-                    Some(ev) => ingest_raw_event(&state, &mut pending, ev),
+                    Some(ev) => ingest_raw_event(&state, &mut pending, ev, &on_change),
                     None => {
                         flush_pending_roots(
                             &state,
@@ -508,6 +508,7 @@ fn ingest_raw_event(
     state: &Arc<Mutex<WatcherRegistryState>>,
     pending: &mut HashMap<PathBuf, PendingRootBatch>,
     ev: Event,
+    on_change: &WatchCallback,
 ) {
     let roots: Vec<PathBuf> = {
         let Ok(guard) = state.lock() else {
@@ -530,12 +531,16 @@ fn ingest_raw_event(
                 continue;
             };
             let entry = pending.entry(root.clone()).or_default();
+            // Bound each notification while preserving paths needed for memory revalidation.
+            if entry.changed_paths.len() == MAX_COALESCED_PATHS_PER_EVENT
+                && !entry.changed_paths.contains(&classified.rel_path)
+            {
+                emit_root_batch(state, root, std::mem::take(entry), on_change);
+            }
             if entry.first_event_at.is_none() {
                 entry.first_event_at = Some(now);
             }
-            if entry.changed_paths.len() < MAX_COALESCED_PATHS_PER_EVENT {
-                entry.changed_paths.insert(classified.rel_path);
-            }
+            entry.changed_paths.insert(classified.rel_path);
             if classified.is_git_state {
                 entry.git_changed = true;
             }
@@ -573,38 +578,47 @@ fn flush_pending_roots(
         let Some(batch) = pending.remove(&root) else {
             continue;
         };
-        if batch.changed_paths.is_empty() && !batch.git_changed && !batch.skills_or_rules_changed {
-            continue;
-        }
-        let targets: Vec<(String, String)> = {
-            let Ok(guard) = state.lock() else {
-                continue;
-            };
-            guard
-                .root_to_workspaces
-                .get(&root)
-                .map(|ws_ids| {
-                    ws_ids
-                        .iter()
-                        .filter_map(|ws_id| {
-                            let (_, cwd) = guard.workspace_to_root.get(ws_id)?;
-                            Some((ws_id.clone(), cwd.clone()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+        emit_root_batch(state, &root, batch, on_change);
+    }
+}
+
+fn emit_root_batch(
+    state: &Arc<Mutex<WatcherRegistryState>>,
+    root: &Path,
+    batch: PendingRootBatch,
+    on_change: &WatchCallback,
+) {
+    if batch.changed_paths.is_empty() && !batch.git_changed && !batch.skills_or_rules_changed {
+        return;
+    }
+    let targets: Vec<(String, String)> = {
+        let Ok(guard) = state.lock() else {
+            return;
         };
-        let changed_paths: Vec<String> = batch.changed_paths.into_iter().collect();
-        for (workspace_id, cwd) in targets {
-            on_change(WorkspaceWatchBatch {
-                workspace_id,
-                cwd,
-                canonical_root: root.clone(),
-                changed_paths: changed_paths.clone(),
-                git_changed: batch.git_changed,
-                skills_or_rules_changed: batch.skills_or_rules_changed,
-            });
-        }
+        guard
+            .root_to_workspaces
+            .get(root)
+            .map(|ws_ids| {
+                ws_ids
+                    .iter()
+                    .filter_map(|ws_id| {
+                        let (_, cwd) = guard.workspace_to_root.get(ws_id)?;
+                        Some((ws_id.clone(), cwd.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let changed_paths: Vec<String> = batch.changed_paths.into_iter().collect();
+    for (workspace_id, cwd) in targets {
+        on_change(WorkspaceWatchBatch {
+            workspace_id,
+            cwd,
+            canonical_root: root.to_path_buf(),
+            changed_paths: changed_paths.clone(),
+            git_changed: batch.git_changed,
+            skills_or_rules_changed: batch.skills_or_rules_changed,
+        });
     }
 }
 
@@ -620,6 +634,87 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp watch dir");
         crate::platform::canonicalize_clean(&dir).unwrap_or(dir)
+    }
+
+    #[tokio::test]
+    async fn memory_revalidation_receives_every_path_across_a_full_batch() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let root = crate::platform::canonicalize_clean(project.path())?;
+        let cwd = root
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("workspace path"))?;
+        let store = Arc::new(orbit_store::OrbitStore::open_in_memory()?);
+        let engine = crate::memory::MemoryEngine::new(store.clone(), Default::default(), None);
+        let draft = crate::memory::MemoryDraft {
+            id: Some("watch".into()),
+            title: "Storage".into(),
+            content: "Keep the index local.".into(),
+            category: orbit_protocol::MemoryCategory::Convention,
+            status: Some(orbit_protocol::MemoryStatus::Confirmed),
+            file_paths: vec!["src/index.rs".into()],
+            tags: vec![],
+        };
+        engine.save(cwd, draft, None).await?;
+        let state = Arc::new(Mutex::new(WatcherRegistryState {
+            raw_tx: mpsc::channel(1).0,
+            root_watchers: HashMap::new(),
+            workspace_to_root: HashMap::from([("ws".into(), (root.clone(), cwd.into()))]),
+            root_to_workspaces: HashMap::from([(root.clone(), HashSet::from(["ws".into()]))]),
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let callback: WatchCallback = Arc::new(move |batch| {
+            let _ = tx.send(batch);
+        });
+        let mut event = Event::new(EventKind::Any);
+        event.paths.extend(
+            (0..MAX_COALESCED_PATHS_PER_EVENT).map(|i| root.join(format!("src/file{i}.rs"))),
+        );
+        event.paths.push(root.join("src/index.rs"));
+        let mut pending = HashMap::new();
+        ingest_raw_event(&state, &mut pending, event, &callback);
+        flush_pending_roots(
+            &state,
+            &mut pending,
+            Duration::ZERO,
+            Duration::ZERO,
+            &callback,
+        );
+        let mut count = 0;
+        while let Ok(batch) = rx.try_recv() {
+            assert!(batch.changed_paths.len() <= MAX_COALESCED_PATHS_PER_EVENT);
+            count += batch.changed_paths.len();
+            engine.changed(&batch.cwd, batch.changed_paths).await?;
+        }
+        assert_eq!(count, MAX_COALESCED_PATHS_PER_EVENT + 1);
+        assert_eq!(
+            store.project_memory(cwd, "watch")?.map(|i| i.status),
+            Some(orbit_protocol::MemoryStatus::NeedsRevalidation)
+        );
+        let path = root.join(".orbit/memory/watch.md");
+        std::fs::write(
+            &path,
+            std::fs::read_to_string(&path)?.replace("Keep the index local.", "Rebuild locally."),
+        )?;
+        ingest_raw_event(
+            &state,
+            &mut pending,
+            Event::new(EventKind::Any).add_path(path),
+            &callback,
+        );
+        flush_pending_roots(
+            &state,
+            &mut pending,
+            Duration::ZERO,
+            Duration::ZERO,
+            &callback,
+        );
+        let batch = rx.try_recv()?;
+        engine.changed(&batch.cwd, batch.changed_paths).await?;
+        assert_eq!(
+            store.project_memory(cwd, "watch")?.map(|i| i.content),
+            Some("Rebuild locally.".into())
+        );
+        Ok(())
     }
 
     #[test]

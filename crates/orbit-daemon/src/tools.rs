@@ -1,7 +1,7 @@
 //! Transport-neutral Orbit Orchestration Tool Catalog.
 //!
 //! Exposed to agents via the built-in MCP Server (`POST /mcp/agents`) and `orbit mcp` stdio bridge.
-//! Exposes a compact Core Pack (11 tools) plus startup-locked optional Capability Packs (up to 18
+//! Exposes a compact Core Pack (12 tools) plus startup-locked optional Capability Packs (up to 19
 //! total composite tools in `tools/list`) to minimize LLM context overhead and preserve prompt cache
 //! prefixes, while keeping 100% backward compatibility in `execute_tool` for all legacy tool names.
 
@@ -745,6 +745,11 @@ async fn execute_tool_inner(
         resolve_target_host_id(rt, args.get("host_id").and_then(|v| v.as_str())).await?;
 
     match name {
+        "orbit_memory" => {
+            let caller = caller
+                .ok_or_else(|| anyhow::anyhow!("orbit_memory requires a workspace-bound caller"))?;
+            crate::memory::execute_tool(&rt.orchestrator.memory, &caller, args).await
+        }
         // ==================== AGENTS ====================
         "create_agent" => {
             let profile_id = opt_str(args, "profile_id").or_else(|| opt_str(args, "profile"));
@@ -4854,7 +4859,7 @@ fn summarize_timeline_event(ev: &orbit_protocol::TimelineEvent) -> Value {
 
 fn pack_tool_definitions() -> Vec<PackToolDefinition> {
     vec![
-        // ==================== CORE PACK (11 tools, compact schemas) ====================
+        // ==================== CORE PACK (12 tools, compact schemas) ====================
         PackToolDefinition {
             pack: McpToolPack::Core,
             def: ToolDefinition {
@@ -5108,6 +5113,20 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                 }),
             },
         },
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "orbit_memory",
+                description: "Recall, remember, confirm or forget shared cross-provider project memory.",
+                input_schema: json!({"type":"object","required":["action"],"additionalProperties":false,"properties":{
+                    "action":{"type":"string","enum":["recall","remember","confirm","forget"]},
+                    "query":{"type":"string"},"id":{"type":"string"},"title":{"type":"string"},"content":{"type":"string"},
+                    "category":{"type":"string","enum":["architecture","convention","debugging","workflow","decision","preference"]},
+                    "file_paths":{"type":"array","items":{"type":"string"}},"tags":{"type":"array","items":{"type":"string"}},
+                    "limit":{"type":"integer","minimum":0},"include_unconfirmed":{"type":"boolean"}
+                }}),
+            },
+        },
         // ==================== OPTIONAL CAPABILITY PACKS (7 tools) ====================
         PackToolDefinition {
             pack: McpToolPack::Browser,
@@ -5330,8 +5349,8 @@ mod tests {
         let core_defs = list_tool_definitions(&core_policy);
         assert_eq!(
             core_defs.len(),
-            11,
-            "Core pack must expose 11 compact tools"
+            12,
+            "Core pack must expose 12 compact tools"
         );
         let core_json = serde_json::to_string(
             &core_defs
@@ -5355,8 +5374,8 @@ mod tests {
         let full_defs = list_tool_definitions(&McpToolPolicy::default());
         assert_eq!(
             full_defs.len(),
-            18,
-            "Full MCP catalog must expose 18 composite tools (11 Core + 7 optional packs)"
+            19,
+            "Full MCP catalog must expose 19 composite tools (12 Core + 7 optional packs)"
         );
         let full_json = serde_json::to_string(
             &full_defs
@@ -5683,7 +5702,7 @@ mod tests {
 
         let caller_tools =
             list_tool_definitions_for_caller(&rt, Some("ag_cas_1"), &McpToolPolicy::default());
-        assert_eq!(caller_tools.len(), 11);
+        assert_eq!(caller_tools.len(), 12);
 
         let ok_res = execute_tool(
             &rt,

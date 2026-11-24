@@ -6,6 +6,7 @@ pub mod artifacts;
 pub mod goals;
 pub mod guardian;
 pub mod im_channels;
+pub mod memory;
 pub mod orchestration;
 pub mod permission_rules;
 pub mod push;
@@ -523,6 +524,7 @@ impl OrbitStore {
             ",
         )?;
         search::migrate_fts5_schema(&mut conn)?;
+        memory::migrate(&conn)?;
         // Idempotent Wave 2 column migrations checked via `PRAGMA table_info` (NO `PRAGMA user_version` bump)
         for (table, col, col_type) in [
             ("agents", "forked_from_agent_id", "TEXT"),
@@ -2392,6 +2394,12 @@ impl OrbitStore {
              WHERE agent_id = ?1 AND event_type = 'user_prompt' ORDER BY seq ASC",
         )?;
         Self::collect_outline_prompts(&mut stmt, agent_id)
+    }
+
+    pub fn has_prompt_history(&self, agent_id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM timeline_events WHERE agent_id=?1 AND event_type IN ('user_prompt','agent_message'))",
+            [agent_id], |row| row.get(0))?)
     }
 
     /// Read user-prompt anchors from the local client replica in chronological order using

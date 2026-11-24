@@ -245,6 +245,7 @@ impl Drop for EvaluatingPermissionGuard {
 }
 
 pub struct AgentOrchestrator {
+    pub(crate) memory: crate::memory::MemoryEngine,
     home_dir: PathBuf,
     orbit_exe: PathBuf,
     host_id: String,
@@ -382,7 +383,13 @@ impl AgentOrchestrator {
                 Arc::clone(&provider_catalogs),
             ))),
         );
+        let memory = crate::memory::MemoryEngine::new(
+            store.clone(),
+            crate::DaemonPersistedConfig::load(&home_dir).memory_embedding,
+            crate::platform::resolve_user_home_dir().map(|p| p.join(".hermes/memories")),
+        );
         Arc::new(Self {
+            memory,
             home_dir,
             orbit_exe,
             host_id,
@@ -2450,12 +2457,19 @@ impl AgentOrchestrator {
                     }
                     if let Some((turn_id, _)) = initial_turn {
                         let sanitized = sanitize_human_prompt_for_wire(&initial_prompt, &turn_id);
+                        let enriched = mgr
+                            .with_first_turn_memory(
+                                &summary_bg.cwd,
+                                &initial_prompt,
+                                sanitized.clone(),
+                            )
+                            .await;
                         let with_rules = mgr
                             .augment_prompt_with_path_rules(
                                 &ag_id_bg,
                                 &initial_rule_badges,
                                 &sanitized,
-                                sanitized.clone(),
+                                enriched,
                             )
                             .await;
                         let wire = mgr
@@ -3042,13 +3056,15 @@ impl AgentOrchestrator {
                             return;
                         }
                         let sanitized = sanitize_human_prompt_for_wire(&prompt_text, &msg_id);
-                        let with_rules = mgr
-                            .augment_prompt_with_path_rules(
-                                &ag_id_bg,
-                                &[],
-                                &sanitized,
+                        let enriched = mgr
+                            .with_first_turn_memory(
+                                &summary_bg.cwd,
+                                &prompt_text,
                                 sanitized.clone(),
                             )
+                            .await;
+                        let with_rules = mgr
+                            .augment_prompt_with_path_rules(&ag_id_bg, &[], &sanitized, enriched)
                             .await;
                         let wire = mgr
                             .augment_prompt_with_workspace_context(&ag_id_bg, with_rules)
@@ -3532,11 +3548,12 @@ impl AgentOrchestrator {
         batch: CoalescedDispatchBatch,
     ) -> anyhow::Result<()> {
         let recipient_lookup = batch.recipient_id.clone();
-        let ag = self
-            .try_store(move |s| -> anyhow::Result<AgentSummary> {
-                s.get_agent(&recipient_lookup)?.ok_or_else(|| {
+        let (ag, first_turn) = self
+            .try_store(move |s| -> anyhow::Result<_> {
+                let agent = s.get_agent(&recipient_lookup)?.ok_or_else(|| {
                     anyhow::anyhow!("recipient agent `{recipient_lookup}` not found")
-                })
+                })?;
+                Ok((agent, !s.has_prompt_history(&recipient_lookup)?))
             })
             .await?;
         if ag.archived_at.is_some() {
@@ -3563,8 +3580,18 @@ impl AgentOrchestrator {
 
         // Pre-compute workspace context augmentation BEFORE persisting `AgentMessage` events so
         // there is no async gap between timeline persistence and driver dispatch.
+        let prompt = if first_turn {
+            let query = batch
+                .entries
+                .first()
+                .map_or("", |entry| entry.body.as_str());
+            self.with_first_turn_memory(&ag.cwd, query, batch.wire_prompt)
+                .await
+        } else {
+            batch.wire_prompt
+        };
         let wire_prompt = self
-            .augment_prompt_with_workspace_context(&batch.recipient_id, batch.wire_prompt)
+            .augment_prompt_with_workspace_context(&batch.recipient_id, prompt)
             .await;
 
         // Persist structured `TimelinePayload::AgentMessage` cards for each entry in the coalesced batch
@@ -3734,20 +3761,29 @@ impl AgentOrchestrator {
         // so there is ZERO async `.await` gap between persisting `UserPrompt` and sending
         // `DriverCommand::SendPrompt` to the driver.
         let aid_cwd = agent_id.to_string();
-        let ag_cwd = self
-            .try_store(move |s| s.get_agent(&aid_cwd))
+        let prompt_state = self
+            .try_store(move |s| -> anyhow::Result<_> {
+                let first_turn = !s.has_prompt_history(&aid_cwd)?;
+                Ok(s.get_agent(&aid_cwd)?.map(|ag| (ag.cwd, first_turn)))
+            })
             .await
             .ok()
-            .flatten()
-            .map(|ag| ag.cwd);
-        let tree_oid = if let Some(cwd_str) = ag_cwd {
-            capture_git_tree_snapshot(Path::new(&cwd_str)).await
+            .flatten();
+        let tree_oid = if let Some((cwd_str, _)) = &prompt_state {
+            capture_git_tree_snapshot(Path::new(cwd_str)).await
         } else {
             None
         };
         let with_handoff = match handoff_context {
             Some(ctx) => format!("{ctx}\n\n[Latest User Request]\n{sanitized}"),
             None => sanitized.clone(),
+        };
+        let with_handoff = match prompt_state {
+            Some((cwd, true)) => {
+                self.with_first_turn_memory(&cwd, &prompt, with_handoff)
+                    .await
+            }
+            _ => with_handoff,
         };
         let with_rules = self
             .augment_prompt_with_path_rules(agent_id, &badges, &sanitized, with_handoff)
@@ -6132,6 +6168,25 @@ impl AgentOrchestrator {
             prompt
         } else {
             format!("{}\n\n{prompt}", matched.injected_markdown)
+        }
+    }
+
+    async fn with_first_turn_memory(&self, cwd: &str, query: &str, prompt: String) -> String {
+        match self
+            .memory
+            .build_confirmed_memory_context(
+                cwd,
+                query,
+                self.memory.config.auto_inject_budget_tokens,
+            )
+            .await
+        {
+            Ok(context) if !context.is_empty() => format!("{context}\n\n{prompt}"),
+            Err(error) => {
+                tracing::warn!(%error,"could not load first-turn project memory");
+                prompt
+            }
+            _ => prompt,
         }
     }
 
@@ -9481,6 +9536,66 @@ mod streaming_buffer_tests {
             StreamPushOutcome::Buffered => panic!("non-streaming event must flush immediately"),
         }
         assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_dispatched_prompt_contains_memory_and_history_keeps_the_user_text()
+    -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let project = tempfile::tempdir()?;
+        let cwd = project
+            .path()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("workspace path"))?;
+        let rt = crate::memory::tests::fixture(cwd, home.path()).await?;
+        let orch = &rt.orchestrator;
+        orch.memory
+            .save(
+                cwd,
+                crate::memory::MemoryDraft {
+                    id: None,
+                    title: "Quorum".into(),
+                    content: "Require two peers.".into(),
+                    category: orbit_protocol::MemoryCategory::Architecture,
+                    status: Some(orbit_protocol::MemoryStatus::Confirmed),
+                    file_paths: vec![],
+                    tags: vec![],
+                },
+                None,
+            )
+            .await?;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let agent = "memory-agent";
+        orch.live_agents.write().await.insert(
+            agent.into(),
+            LiveAgentEntry {
+                generation: orch.bump_generation(agent).await,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: tokio::spawn(async {}).abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        for (query, first) in [("Explain quorum", true), ("Repeat quorum", false)] {
+            orch.dispatch_user_prompt_with_handoff(
+                agent,
+                query.into(),
+                None,
+                vec![],
+                None,
+                ActiveTurnBehavior::Steer,
+                None,
+            )
+            .await?;
+            let Some(DriverCommand::SendPrompt { prompt, .. }) = cmd_rx.recv().await else {
+                anyhow::bail!("expected prompt")
+            };
+            assert_eq!(prompt.contains("<orbit_project_memory>"), first);
+            assert!(prompt.contains(query));
+            let timeline = rt.store.fetch_timeline_outline_prompts(agent)?;
+            assert_eq!(timeline.last().map(|p| p.preview.as_str()), Some(query));
+        }
+        Ok(())
     }
 
     async fn setup_test_orchestrator(home_dir: &Path) -> (Arc<AgentOrchestrator>, Arc<OrbitStore>) {

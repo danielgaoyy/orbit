@@ -244,7 +244,7 @@ pub fn serialize_rule_document(doc: &ParsedRuleDocument) -> String {
     out
 }
 
-fn split_frontmatter(text: &str) -> (Option<&str>, String) {
+pub(crate) fn split_frontmatter(text: &str) -> (Option<&str>, String) {
     let rest = if let Some(r) = text.strip_prefix("---\r\n") {
         r
     } else if let Some(r) = text.strip_prefix("---\n") {

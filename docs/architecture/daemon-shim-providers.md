@@ -57,3 +57,24 @@
 - **跨主机 Relay 配置传播**：
   - 通过 `WireMessage::ConfigureHostRelay` 与 `apply_relay_to_fleet` 同步各主机的 Relay 地址并写入云端加密 Vault，使脱离局域网的移动端无需回到 Mac 旁也能与已配置机群重建连接。
   - **必跑验证**：改动连接池、Relay 配置分发或移动网络切换逻辑必跑 `pitfall_04`。
+
+## 跨 Provider 项目记忆
+
+Daemon 以本机规范化的工作目录隔离项目记忆。每条记录保存在 `.orbit/memory/<id 或 slug>.md`，YAML frontmatter 保存 ID、分类、审核状态、置信度、绑定的相对路径、标签、来源及时间戳，正文可直接用编辑器修改。相同的 Markdown ID 可以出现在不同 checkout。首次访问会从磁盘重建索引，后续访问检查变动文件。Watcher 处理编辑、改名与删除，并在绑定的源文件变化时把已确认记录改为 `needs_revalidation`，同时写回 Markdown。旧版 `~/.hermes/memories/*.md` 以只读假设导入，带 `workspace_root` 的条目属于指定目录，未指定的属于 `~/.hermes`。
+
+SQLite 维持 `user_version = 6`。FTS5 的 BM25 排名与余弦相似度排名采用 RRF（常数 60）合并，再以状态、近期更新和访问情况微调。内置 256 维特征哈希支持英文词、标识符和中文字符片段。新建记忆与已有本地记录的余弦相似度高于 0.92 时合并。默认召回与首轮注入仅使用 `confirmed` 记录。初始问题宽泛时优先选取置信度高的架构与约定条目。注入内容只进入 Provider 的首轮输入，字符预算包含 `<orbit_project_memory>` 标签。
+
+Core Pack 提供一个 `orbit_memory`，由调用 Agent 的工作目录确定作用域。四个 action 为 `recall`、`remember`、`confirm`、`forget`。AI 新建记录从 `hypothesis` 开始，显式 `confirm` 后参与首轮注入。`recall` 可传 `include_unconfirmed: true` 查看待核验记录。已配对客户端可按 `request_id` 调用 `ListProjectMemories`、`UpsertProjectMemory`、`ConfirmProjectMemory`、`DeleteProjectMemory`、`RecallProjectMemories`。
+
+默认内置索引离线运行。可在本机 `$ORBIT_HOME/config.json` 中设置以下字段并重启 Daemon。启用后，Daemon 将记忆的标题、正文、标签及召回查询发送到配置的端点。密钥通过 `api_key_env` 指定的环境变量读取，本地无鉴权端点可省略此字段。请求超时为 3 秒，端点不可用时自动使用本地向量。
+
+```json
+{
+  "memory_embedding": {
+    "provider": "open_ai_compatible",
+    "endpoint_url": "http://127.0.0.1:11434/v1/embeddings",
+    "model": "nomic-embed-text",
+    "auto_inject_budget_tokens": 1200
+  }
+}
+```

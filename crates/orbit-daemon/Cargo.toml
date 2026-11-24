@@ -36,3 +36,9 @@ zeroize.workspace = true
 vt100.workspace = true
 reqwest.workspace = true
 notify.workspace = true
+cap-std = "3"
+cap-fs-ext = "3"
+serde-saphyr = { version = "2.2", default-features = false, features = ["serialize", "deserialize"] }
+
+[dev-dependencies]
+tempfile = "3"

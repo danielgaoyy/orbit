@@ -597,6 +597,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }
         | WireMessage::WorktreeHandoffExecuted { request_id, .. }
         | WireMessage::ArtifactsSnapshot { request_id, .. }
+        | WireMessage::ProjectMemorySaved { request_id, .. }
+        | WireMessage::ProjectMemoriesList { request_id, .. }
+        | WireMessage::ProjectMemoryRecallResult { request_id, .. }
+        | WireMessage::ProjectMemoryDeleted { request_id, .. }
         | WireMessage::ArtifactContent { request_id, .. }
         | WireMessage::InstructionFilesSnapshot { request_id, .. }
         | WireMessage::InstructionFileContentResponse { request_id, .. }

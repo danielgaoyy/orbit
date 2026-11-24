@@ -1,4 +1,5 @@
 export const SIDE_PANEL_SELECTOR = '[data-orbit-side-panel="true"]';
+export const CODE_EDITOR_SELECTOR = '[data-orbit-code-editor="true"]';
 export const COMPOSER_INPUT_SELECTOR = '[data-orbit-composer-input="true"]';
 export const SETTINGS_ESCAPE_OVERLAY_SELECTOR =
   '[data-slot="dialog-content"], [role="dialog"], [role="alertdialog"], [data-slot="popover-content"], [role="menu"], [role="listbox"]';
@@ -187,6 +188,25 @@ export function isFocusInsideSidePanel(
     return isFocusInsideFileViewerPane(sidePanelEl, eventTarget, activeElement);
   }
   return false;
+}
+
+/**
+ * Returns true when focus (or event target) resides inside the mounted CodeMirror 6
+ * editor surface (`[data-orbit-code-editor="true"]`), so editor chords (`⌘K` inline AI edit,
+ * `⌘D` multi-cursor select next occurrence) yield cleanly from global window handlers.
+ */
+export function isFocusInsideCodeEditor(
+  eventTarget: EventTarget | null,
+  activeElement: Element | null,
+  doc: ShortcutDocumentLike | null = typeof document !== "undefined" ? document : null,
+): boolean {
+  const isSpecificActive =
+    activeElement !== null &&
+    activeElement !== doc?.body &&
+    activeElement !== doc?.documentElement;
+
+  const candidate = isSpecificActive ? activeElement : eventTarget;
+  return matchesClosestSelector(candidate, CODE_EDITOR_SELECTOR);
 }
 
 /**

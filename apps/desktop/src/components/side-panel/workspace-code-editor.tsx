@@ -1,86 +1,114 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, Copy, Loader2, RefreshCw, Save, X } from "lucide-react";
+import { Compartment, EditorSelection, EditorState, Prec } from "@codemirror/state";
 import {
-  type HighlightedLineView,
+  EditorView,
+  crosshairCursor,
+  drawSelection,
+  dropCursor,
+  highlightActiveLine,
+  highlightActiveLineGutter,
+  highlightSpecialChars,
+  hoverTooltip,
+  keymap,
+  lineNumbers,
+  rectangularSelection,
+} from "@codemirror/view";
+import {
+  defaultKeymap,
+  history,
+  historyKeymap,
+  indentWithTab,
+} from "@codemirror/commands";
+import {
+  bracketMatching,
+  indentOnInput,
+  indentUnit,
+} from "@codemirror/language";
+import {
+  type CompletionContext,
+  type CompletionResult,
+  autocompletion,
+  closeBrackets,
+  closeBracketsKeymap,
+  completionKeymap,
+} from "@codemirror/autocomplete";
+import {
+  type Diagnostic as CmDiagnostic,
+  lintGutter,
+  lintKeymap,
+  linter,
+  setDiagnostics,
+} from "@codemirror/lint";
+import {
+  highlightSelectionMatches,
+  openSearchPanel,
+  search,
+  searchKeymap,
+} from "@codemirror/search";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Copy,
+  FileCode2,
+  Loader2,
+  PencilLine,
+  RefreshCw,
+  Save,
+  SearchCode,
+  Sparkles,
+  Wrench,
+  X,
+} from "lucide-react";
+import {
+  type LspCodeAction,
   type LspDiagnostic,
+  type LspReferenceLocation,
   type WorkspaceFileConflict,
   orbitIpc,
 } from "@/lib/orbit-ipc";
-import { resolveTokenColor } from "@/lib/code-highlight";
+import {
+  convertLspTextEditsToChanges,
+  extractIdentifierAtOffset,
+  formatEditorLanguageLabel,
+  formatEditorLineEndingLabel,
+  lineColToOffset,
+  mapLspCompletionItems,
+  mapLspDiagnosticsToCodeMirror,
+  offsetToLineCol,
+  parseHoverContentBlocks,
+} from "@/lib/codemirror-helpers";
+import { createCodeMirrorLanguageExtension } from "@/lib/codemirror-languages";
+import { createOrbitCodeMirrorTheme } from "@/lib/codemirror-theme";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { ShortcutKbd } from "@/components/ui/kbd";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { SimpleTooltip } from "@/components/ui/overlays";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
-import { ShortcutKbd } from "@/components/ui/kbd";
 import { formatFileSizeCompact } from "@/lib/session-insights";
+import { orbitActions } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-const LINE_HEIGHT_PX = 20;
-const VIRTUAL_OVERSCAN_LINES = 30;
-const SMALL_FILE_HIGHLIGHT_THRESHOLD_BYTES = 50 * 1024;
-const MAX_LIVE_HIGHLIGHT_BYTES = 512 * 1024;
-
-const LANGUAGE_LABELS: Record<string, string> = {
-  rs: "Rust",
-  ts: "TypeScript",
-  tsx: "TSX",
-  js: "JavaScript",
-  jsx: "JSX",
-  json: "JSON",
-  toml: "TOML",
-  yaml: "YAML",
-  markdown: "Markdown",
-  py: "Python",
-  go: "Go",
-  swift: "Swift",
-  kotlin: "Kotlin",
-  java: "Java",
-  c: "C",
-  cpp: "C++",
-  sh: "Shell",
-  css: "CSS",
-  html: "HTML",
-  sql: "SQL",
-  dockerfile: "Dockerfile",
-  makefile: "Makefile",
-  text: "Plain Text",
-};
-
-function formatLanguageLabel(language: string): string {
-  const key = language.trim().toLowerCase();
-  return LANGUAGE_LABELS[key] ?? (key ? key.toUpperCase() : "Plain Text");
-}
-
-function formatLineEndingLabel(lineEnding?: string | null): "LF" | "CRLF" | "Mixed" {
-  if (lineEnding === "crlf") return "CRLF";
-  if (lineEnding === "mixed") return "Mixed";
-  return "LF";
-}
-
-function computeLineCol(text: string, offset: number): { line: number; col: number } {
-  const clamped = Math.max(0, Math.min(offset, text.length));
-  let line = 1;
-  let lastNewline = -1;
-  for (let i = 0; i < clamped; i += 1) {
-    if (text.charCodeAt(i) === 10) {
-      line += 1;
-      lastNewline = i;
-    }
-  }
-  return { line, col: clamped - lastNewline };
-}
-
 export interface WorkspaceCodeEditorProps {
+  hostId: string;
+  cwd: string;
+  filePath: string;
+  relPath: string;
   value: string;
   language: string;
   lineEnding?: "lf" | "crlf" | "mixed" | string | null;
-  initialHighlightedLines: HighlightedLineView[];
-  initialContent: string;
   isDark: boolean;
   dirty: boolean;
   saving: boolean;
   saveError: string | null;
   conflict: WorkspaceFileConflict | null;
+  isLspEligible?: boolean;
   onChange: (nextValue: string) => void;
-  onSave: (force?: boolean) => void;
+  onSave: (force?: boolean) => void | Promise<"saved" | "conflict" | "error">;
   onReloadFromConflict: () => void;
   onDismissError: () => void;
   onCopyMine: () => void;
@@ -88,377 +116,1028 @@ export interface WorkspaceCodeEditorProps {
   diagnostics?: readonly LspDiagnostic[];
   jumpTarget?: { line: number; col?: number; nonce: number } | null;
   onGotoDefinition?: (line: number, col: number) => void;
+  onJumpToFileLocation?: (targetPath: string, line: number, col?: number) => void;
+  onAfterLspWorkspaceEdit?: (modifiedFiles: readonly string[]) => Promise<void> | void;
 }
 
-export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
-  value,
-  language,
-  lineEnding,
-  initialHighlightedLines,
-  initialContent,
-  isDark,
-  dirty,
-  saving,
-  saveError,
-  conflict,
-  onChange,
-  onSave,
-  onReloadFromConflict,
-  onDismissError,
-  onCopyMine,
-  initialFocusLine,
-  diagnostics,
-  jumpTarget,
-  onGotoDefinition,
-}: WorkspaceCodeEditorProps) {
-  const viewportContainerRef = useRef<HTMLDivElement | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const backdropInnerRef = useRef<HTMLDivElement | null>(null);
-  const gutterInnerRef = useRef<HTMLDivElement | null>(null);
-  const highlightSeqRef = useRef(0);
-  const scrollRafRef = useRef<number | null>(null);
-  const copiedMineTimerRef = useRef<number | null>(null);
-  const ime = useImeCompositionGuard();
-  const mod = modSymbol();
+interface InlineAiEditState {
+  startLine: number;
+  endLine: number;
+  selectedCode: string;
+  surroundingContext: string;
+  topPx: number;
+}
 
-  const [cursor, setCursor] = useState<{ line: number; col: number }>({
+interface InlineRenameState {
+  line: number;
+  col: number;
+  originalName: string;
+  nextName: string;
+  topPx: number;
+  submitting: boolean;
+  error: string | null;
+}
+
+interface CodeActionsPopoverState {
+  topPx: number;
+  loading: boolean;
+  actions: LspCodeAction[];
+  activeIdx: number;
+}
+
+interface ReferencesDrawerState {
+  open: boolean;
+  collapsed: boolean;
+  loading: boolean;
+  symbolLabel: string;
+  items: LspReferenceLocation[];
+  error: string | null;
+}
+
+function normalizeRelCompare(p: string): string {
+  return p.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function buildHoverDom(rawMarkdown: string): HTMLElement {
+  const root = document.createElement("div");
+  root.className = "orbit-cm-hover";
+  const blocks = parseHoverContentBlocks(rawMarkdown);
+  for (const block of blocks) {
+    if (block.kind === "code") {
+      const pre = document.createElement("pre");
+      pre.className = "orbit-cm-hover-code";
+      pre.textContent = block.code;
+      root.appendChild(pre);
+    } else if (block.kind === "divider") {
+      const hr = document.createElement("div");
+      hr.className = "orbit-cm-hover-divider";
+      root.appendChild(hr);
+    } else {
+      const p = document.createElement("p");
+      p.className = "orbit-cm-hover-para";
+      p.textContent = block.text;
+      root.appendChild(p);
+    }
+  }
+  return root;
+}
+
+export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
+  props: WorkspaceCodeEditorProps,
+) {
+  const {
+    hostId,
+    cwd,
+    filePath,
+    relPath,
+    value,
+    language,
+    lineEnding,
+    isDark,
+    dirty,
+    saving,
+    saveError,
+    conflict,
+    isLspEligible = false,
+    onSave,
+    onReloadFromConflict,
+    onDismissError,
+    onCopyMine,
+    initialFocusLine,
+    diagnostics,
+    jumpTarget,
+    onJumpToFileLocation,
+  } = props;
+
+  const { t } = useI18n();
+  const mod = modSymbol();
+  const imeAi = useImeCompositionGuard();
+  const imeRename = useImeCompositionGuard();
+
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const editorHostRef = useRef<HTMLDivElement | null>(null);
+  const viewRef = useRef<EditorView | null>(null);
+  const themeCompartmentRef = useRef<Compartment>(new Compartment());
+  const languageCompartmentRef = useRef<Compartment>(new Compartment());
+  const lastEmittedValueRef = useRef<string>(value);
+  const copiedMineTimerRef = useRef<number | null>(null);
+  const aiInputRef = useRef<HTMLInputElement | null>(null);
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
+  const codeActionsMenuRef = useRef<HTMLDivElement | null>(null);
+  const refsSeqRef = useRef<number>(0);
+  const codeActionSeqRef = useRef<number>(0);
+
+  // Latest-props ref so CodeMirror extensions never capture stale closures or force remounts
+  const propsRef = useRef(props);
+  propsRef.current = props;
+
+  const [cursor, setCursor] = useState<{
+    line: number;
+    col: number;
+    cursors: number;
+    selectedChars: number;
+  }>({
     line: initialFocusLine && initialFocusLine > 0 ? initialFocusLine : 1,
     col: 1,
+    cursors: 1,
+    selectedChars: 0,
   });
   const [copiedMine, setCopiedMine] = useState(false);
-  const [viewport, setViewport] = useState<{ scrollTop: number; height: number }>({
-    scrollTop: 0,
-    height: 640,
+
+  // Inline Cmd+K AI Edit popover state
+  const [aiEdit, setAiEdit] = useState<InlineAiEditState | null>(null);
+  const [aiInstruction, setAiInstruction] = useState("");
+  const [aiSubmitting, setAiSubmitting] = useState(false);
+
+  // Inline F2 Rename popover state
+  const [renameState, setRenameState] = useState<InlineRenameState | null>(null);
+
+  // Quick Fix / Code Actions popover (`Mod-.`)
+  const [codeActionsState, setCodeActionsState] = useState<CodeActionsPopoverState | null>(null);
+
+  // Collapsible LSP References drawer (`Shift+F12`)
+  const [refsDrawer, setRefsDrawer] = useState<ReferencesDrawerState>({
+    open: false,
+    collapsed: false,
+    loading: false,
+    symbolLabel: "",
+    items: [],
+    error: null,
   });
-
-  // Cached syntax-highlighted lines from Orbit's pure-Rust `syntect` engine
-  const [highlightState, setHighlightState] = useState<{
-    lines: HighlightedLineView[];
-    plainByLine: string[];
-  }>(() => ({
-    lines: initialHighlightedLines,
-    plainByLine: initialContent.split("\n").map((l) => l.replace(/\r$/, "")),
-  }));
-
-  // Reset highlight cache & invalidate any in-flight highlight requests when switching files or reloading
-  useEffect(() => {
-    highlightSeqRef.current += 1;
-    setHighlightState({
-      lines: initialHighlightedLines,
-      plainByLine: initialContent.split("\n").map((l) => l.replace(/\r$/, "")),
-    });
-  }, [initialHighlightedLines, initialContent]);
 
   useEffect(() => {
     return () => {
       if (copiedMineTimerRef.current !== null) {
         window.clearTimeout(copiedMineTimerRef.current);
       }
-      if (scrollRafRef.current !== null) {
-        window.cancelAnimationFrame(scrollRafRef.current);
+    };
+  }, []);
+
+  const computeAnchorTopPx = useCallback((view: EditorView, pos: number, overlayHeight = 64) => {
+    const surface = surfaceRef.current;
+    if (!surface) return 12;
+    const surfaceRect = surface.getBoundingClientRect();
+    const coords = view.coordsAtPos(pos);
+    if (!coords) return 12;
+    const relativeTop = coords.top - surfaceRect.top;
+    const preferred = relativeTop - overlayHeight - 6;
+    if (preferred >= 8) {
+      return Math.min(preferred, Math.max(8, surfaceRect.height - overlayHeight - 10));
+    }
+    const below = coords.bottom - surfaceRect.top + 8;
+    return Math.max(8, Math.min(below, Math.max(8, surfaceRect.height - overlayHeight - 10)));
+  }, []);
+
+  const applyCodeAction = useCallback(async (action: LspCodeAction) => {
+    const p = propsRef.current;
+    const view = viewRef.current;
+    if (!action.edit || action.edit.file_edits.length === 0) {
+      orbitActions.showToast(
+        t("sidePanel.editorQuickFixUnavailable", { title: action.title }),
+      );
+      return;
+    }
+
+    const currentNorm = normalizeRelCompare(p.relPath);
+    const singleSameFile =
+      action.edit.file_edits.length === 1 &&
+      normalizeRelCompare(action.edit.file_edits[0].path) === currentNorm;
+
+    if (singleSameFile && view) {
+      const docText = view.state.doc.toString();
+      const changes = convertLspTextEditsToChanges(docText, action.edit.file_edits[0].edits);
+      if (changes.length > 0) {
+        view.dispatch({ changes });
+        view.focus();
+        orbitActions.showToast(
+          t("sidePanel.editorQuickFixApplied", { title: action.title }),
+        );
+      }
+      return;
+    }
+
+    if (p.dirty) {
+      const outcome = await p.onSave(false);
+      if (outcome && outcome !== "saved") {
+        return;
+      }
+    }
+
+    try {
+      const res = await orbitIpc.lspApplyWorkspaceEdit({
+        hostId: p.hostId,
+        cwd: p.cwd,
+        edit: action.edit,
+      });
+      if (res.applied) {
+        await p.onAfterLspWorkspaceEdit?.(res.modified_files);
+        orbitActions.showToast(
+          t("sidePanel.editorQuickFixApplied", { title: action.title }),
+        );
+      }
+    } catch (err) {
+      orbitActions.showToast(
+        t("sidePanel.editorQuickFixFailed", { error: String(err) }),
+      );
+    }
+  }, [t]);
+
+  const applyCodeActionRef = useRef(applyCodeAction);
+  applyCodeActionRef.current = applyCodeAction;
+
+  const openInlineAiEdit = useCallback(
+    (view: EditorView) => {
+      const sel = view.state.selection.main;
+      const startLineObj = view.state.doc.lineAt(sel.from);
+      const endPos = sel.to > sel.from && view.state.doc.lineAt(sel.to).from === sel.to
+        ? sel.to - 1
+        : sel.to;
+      const endLineObj = view.state.doc.lineAt(Math.max(sel.from, endPos));
+      const selectedCode = sel.empty ? "" : view.state.sliceDoc(sel.from, sel.to);
+
+      let surroundingContext = "";
+      if (sel.empty) {
+        const ctxStartLine = Math.max(1, startLineObj.number - 2);
+        const ctxEndLine = Math.min(view.state.doc.lines, startLineObj.number + 2);
+        const ctxFrom = view.state.doc.line(ctxStartLine).from;
+        const ctxTo = view.state.doc.line(ctxEndLine).to;
+        surroundingContext = view.state.sliceDoc(ctxFrom, ctxTo);
+      }
+
+      const topPx = computeAnchorTopPx(view, sel.from, 74);
+      setRenameState(null);
+      setCodeActionsState(null);
+      setAiInstruction("");
+      setAiEdit({
+        startLine: startLineObj.number,
+        endLine: endLineObj.number,
+        selectedCode,
+        surroundingContext,
+        topPx,
+      });
+      window.requestAnimationFrame(() => aiInputRef.current?.focus());
+    },
+    [computeAnchorTopPx],
+  );
+
+  const openInlineRename = useCallback(
+    (view: EditorView) => {
+      const p = propsRef.current;
+      if (!p.isLspEligible) {
+        orbitActions.showToast(t("sidePanel.editorLspUnavailable"));
+        return;
+      }
+      const head = view.state.selection.main.head;
+      const docText = view.state.doc.toString();
+      const { line, col } = offsetToLineCol(docText, head);
+      const ident = extractIdentifierAtOffset(docText, head);
+      const initialName = ident?.word ?? "";
+      const topPx = computeAnchorTopPx(view, head, 68);
+      setAiEdit(null);
+      setCodeActionsState(null);
+      setRenameState({
+        line,
+        col,
+        originalName: initialName,
+        nextName: initialName,
+        topPx,
+        submitting: false,
+        error: null,
+      });
+      window.requestAnimationFrame(() => {
+        renameInputRef.current?.focus();
+        renameInputRef.current?.select();
+      });
+    },
+    [computeAnchorTopPx, t],
+  );
+
+  const triggerFindReferences = useCallback(
+    async (view: EditorView) => {
+      const p = propsRef.current;
+      if (!p.isLspEligible) {
+        orbitActions.showToast(t("sidePanel.editorLspUnavailable"));
+        return;
+      }
+      const head = view.state.selection.main.head;
+      const docText = view.state.doc.toString();
+      const { line, col } = offsetToLineCol(docText, head);
+      const ident = extractIdentifierAtOffset(docText, head);
+      const symbolLabel = ident?.word || `${p.relPath}:${line}:${col}`;
+      const seq = ++refsSeqRef.current;
+
+      setRefsDrawer({
+        open: true,
+        collapsed: false,
+        loading: true,
+        symbolLabel,
+        items: [],
+        error: null,
+      });
+
+      try {
+        const items = await orbitIpc.lspReferences({
+          hostId: p.hostId,
+          cwd: p.cwd,
+          path: p.filePath,
+          line,
+          col,
+          includeDeclaration: true,
+          content: docText,
+        });
+        if (refsSeqRef.current !== seq) return;
+        setRefsDrawer({
+          open: true,
+          collapsed: false,
+          loading: false,
+          symbolLabel,
+          items,
+          error: null,
+        });
+      } catch (err) {
+        if (refsSeqRef.current !== seq) return;
+        setRefsDrawer({
+          open: true,
+          collapsed: false,
+          loading: false,
+          symbolLabel,
+          items: [],
+          error: String(err),
+        });
+      }
+    },
+    [t],
+  );
+
+  const triggerCodeActionsAtCursor = useCallback(
+    async (view: EditorView) => {
+      const p = propsRef.current;
+      if (!p.isLspEligible) {
+        orbitActions.showToast(t("sidePanel.editorLspUnavailable"));
+        return;
+      }
+      const sel = view.state.selection.main;
+      const docText = view.state.doc.toString();
+      const start = offsetToLineCol(docText, sel.from);
+      const end = offsetToLineCol(docText, sel.to);
+      const topPx = computeAnchorTopPx(view, sel.from, 140);
+      const overlappingDiags = (p.diagnostics ?? []).filter(
+        (d) => d.line <= end.line && Math.max(d.line, d.end_line) >= start.line,
+      );
+      const seq = ++codeActionSeqRef.current;
+
+      setAiEdit(null);
+      setRenameState(null);
+      setCodeActionsState({
+        topPx,
+        loading: true,
+        actions: [],
+        activeIdx: 0,
+      });
+
+      try {
+        const actions = await orbitIpc.lspCodeAction({
+          hostId: p.hostId,
+          cwd: p.cwd,
+          path: p.filePath,
+          line: start.line,
+          col: start.col,
+          endLine: end.line,
+          endCol: end.col,
+          diagnostics: overlappingDiags,
+          content: docText,
+        });
+        if (codeActionSeqRef.current !== seq) return;
+        if (actions.length === 0) {
+          setCodeActionsState(null);
+          orbitActions.showToast(t("sidePanel.editorNoCodeActions"));
+          return;
+        }
+        setCodeActionsState({
+          topPx,
+          loading: false,
+          actions,
+          activeIdx: 0,
+        });
+        window.requestAnimationFrame(() => codeActionsMenuRef.current?.focus());
+      } catch {
+        if (codeActionSeqRef.current !== seq) return;
+        setCodeActionsState(null);
+        orbitActions.showToast(t("sidePanel.editorNoCodeActions"));
+      }
+    },
+    [computeAnchorTopPx, t],
+  );
+
+  const openFindAndReplace = useCallback((view: EditorView) => {
+    openSearchPanel(view);
+    window.requestAnimationFrame(() => {
+      const replaceInput = view.dom.querySelector<HTMLInputElement>(
+        '.cm-panel.cm-search input[name="replace"]',
+      );
+      if (replaceInput) {
+        replaceInput.focus();
+        replaceInput.select();
+      }
+    });
+  }, []);
+
+  const handlersRef = useRef({
+    openInlineAiEdit,
+    openInlineRename,
+    triggerFindReferences,
+    triggerCodeActionsAtCursor,
+    openFindAndReplace,
+  });
+  handlersRef.current = {
+    openInlineAiEdit,
+    openInlineRename,
+    triggerFindReferences,
+    triggerCodeActionsAtCursor,
+    openFindAndReplace,
+  };
+
+  // Build & mount CodeMirror 6 once per editor lifecycle; reactive props reconfigure compartments cleanly
+  useEffect(() => {
+    const host = editorHostRef.current;
+    if (!host) return;
+
+    const lspHoverExtension = hoverTooltip(
+      async (view, pos) => {
+        const p = propsRef.current;
+        if (!p.isLspEligible) return null;
+        const docText = view.state.doc.toString();
+        const ch = docText[pos] ?? docText[pos - 1] ?? "";
+        if (!ch || /^\s$/.test(ch)) return null;
+        const { line, col } = offsetToLineCol(docText, pos);
+        try {
+          const hover = await orbitIpc.lspHover({
+            hostId: p.hostId,
+            cwd: p.cwd,
+            path: p.filePath,
+            line,
+            col,
+            content: docText,
+          });
+          if (!hover || !hover.contents.trim()) return null;
+          const rangeFrom = hover.range
+            ? lineColToOffset(docText, hover.range.line, hover.range.col)
+            : pos;
+          const rangeTo = hover.range
+            ? Math.max(
+                rangeFrom,
+                lineColToOffset(docText, hover.range.end_line, hover.range.end_col),
+              )
+            : undefined;
+          return {
+            pos: Math.max(0, Math.min(rangeFrom, docText.length)),
+            end: rangeTo !== undefined ? Math.min(rangeTo, docText.length) : undefined,
+            above: true,
+            create() {
+              return { dom: buildHoverDom(hover.contents) };
+            },
+          };
+        } catch {
+          return null;
+        }
+      },
+      { hoverTime: 320 },
+    );
+
+    const lspCompletionSource = async (
+      context: CompletionContext,
+    ): Promise<CompletionResult | null> => {
+      const p = propsRef.current;
+      if (!p.isLspEligible) return null;
+
+      const word = context.matchBefore(/[\w$]+/);
+      const prevChar = context.pos > 0 ? context.state.sliceDoc(context.pos - 1, context.pos) : "";
+      const isTrigger = [".", ":", ">", "/", "@", "#"].includes(prevChar);
+
+      if (!context.explicit && !isTrigger && (!word || word.text.length < 2)) {
+        return null;
+      }
+
+      const docText = context.state.doc.toString();
+      const { line, col } = offsetToLineCol(docText, context.pos);
+      try {
+        const items = await orbitIpc.lspCompletion({
+          hostId: p.hostId,
+          cwd: p.cwd,
+          path: p.filePath,
+          line,
+          col,
+          triggerCharacter: isTrigger ? prevChar : null,
+          content: docText,
+        });
+        if (context.aborted || items.length === 0) return null;
+        const options = mapLspCompletionItems(items);
+        return {
+          from: word ? word.from : context.pos,
+          options,
+          validFor: /^[\w$]*$/,
+        };
+      } catch {
+        return null;
       }
     };
-  }, []);
 
-  // Measure container height so virtualization window adapts seamlessly on side-panel resize
-  useEffect(() => {
-    const el = viewportContainerRef.current;
-    if (!el) return;
-    const updateHeight = () => {
-      const h = Math.max(200, Math.round(el.clientHeight));
-      setViewport((prev) => (prev.height === h ? prev : { ...prev, height: h }));
-    };
-    updateHeight();
-    if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(updateHeight);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
+    const customKeymap = Prec.high(
+      keymap.of([
+        {
+          key: "Mod-s",
+          preventDefault: true,
+          run: () => {
+            const p = propsRef.current;
+            if (!p.saving) {
+              void p.onSave(false);
+            }
+            return true;
+          },
+        },
+        {
+          key: "Mod-k",
+          preventDefault: true,
+          run: (view) => {
+            handlersRef.current.openInlineAiEdit(view);
+            return true;
+          },
+        },
+        {
+          key: "Mod-h",
+          preventDefault: true,
+          run: (view) => {
+            handlersRef.current.openFindAndReplace(view);
+            return true;
+          },
+        },
+        {
+          key: "Mod-.",
+          preventDefault: true,
+          run: (view) => {
+            void handlersRef.current.triggerCodeActionsAtCursor(view);
+            return true;
+          },
+        },
+        {
+          key: "F12",
+          preventDefault: true,
+          run: (view) => {
+            const p = propsRef.current;
+            if (!p.onGotoDefinition) return false;
+            const pos = offsetToLineCol(
+              view.state.doc.toString(),
+              view.state.selection.main.head,
+            );
+            p.onGotoDefinition(pos.line, pos.col);
+            return true;
+          },
+        },
+        {
+          key: "Shift-F12",
+          preventDefault: true,
+          run: (view) => {
+            void handlersRef.current.triggerFindReferences(view);
+            return true;
+          },
+        },
+        {
+          key: "F2",
+          preventDefault: true,
+          run: (view) => {
+            handlersRef.current.openInlineRename(view);
+            return true;
+          },
+        },
+      ]),
+    );
 
-  const rawLines = useMemo(
-    () => value.split("\n").map((l) => l.replace(/\r$/, "")),
-    [value],
-  );
-  const lineCount = Math.max(1, rawLines.length);
+    const cmdClickGotoDef = EditorView.domEventHandlers({
+      mousedown(event, view) {
+        const p = propsRef.current;
+        if (
+          !p.onGotoDefinition ||
+          !(event.metaKey || event.ctrlKey) ||
+          event.altKey ||
+          event.shiftKey ||
+          event.button !== 0
+        ) {
+          return false;
+        }
+        const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+        if (pos === null) return false;
+        event.preventDefault();
+        const loc = offsetToLineCol(view.state.doc.toString(), pos);
+        p.onGotoDefinition(loc.line, loc.col);
+        return true;
+      },
+    });
 
-  const syncScroll = useCallback(() => {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const top = ta.scrollTop;
-    const left = ta.scrollLeft;
-    if (backdropInnerRef.current) {
-      backdropInnerRef.current.style.transform = `translate3d(${-left}px, ${-top}px, 0)`;
-    }
-    if (gutterInnerRef.current) {
-      gutterInnerRef.current.style.transform = `translate3d(0, ${-top}px, 0)`;
-    }
-    if (scrollRafRef.current === null) {
-      scrollRafRef.current = window.requestAnimationFrame(() => {
-        scrollRafRef.current = null;
-        const latestTop = textareaRef.current?.scrollTop ?? top;
-        setViewport((prev) =>
-          Math.abs(prev.scrollTop - latestTop) < LINE_HEIGHT_PX
-            ? prev
-            : { ...prev, scrollTop: latestTop },
+    const updateListener = EditorView.updateListener.of((update) => {
+      if (update.docChanged) {
+        const nextText = update.state.doc.toString();
+        lastEmittedValueRef.current = nextText;
+        propsRef.current.onChange(nextText);
+      }
+      if (update.selectionSet || update.docChanged) {
+        const main = update.state.selection.main;
+        const lineObj = update.state.doc.lineAt(main.head);
+        const col = main.head - lineObj.from + 1;
+        const cursors = update.state.selection.ranges.length;
+        const selectedChars = update.state.selection.ranges.reduce(
+          (sum, r) => sum + Math.abs(r.to - r.from),
+          0,
         );
+        setCursor((prev) =>
+          prev.line === lineObj.number &&
+          prev.col === col &&
+          prev.cursors === cursors &&
+          prev.selectedChars === selectedChars
+            ? prev
+            : { line: lineObj.number, col, cursors, selectedChars },
+        );
+      }
+    });
+
+    const initialDoc = propsRef.current.value;
+    lastEmittedValueRef.current = initialDoc;
+
+    const startState = EditorState.create({
+      doc: initialDoc,
+      extensions: [
+        themeCompartmentRef.current.of(createOrbitCodeMirrorTheme(propsRef.current.isDark)),
+        languageCompartmentRef.current.of(
+          createCodeMirrorLanguageExtension(propsRef.current.language, propsRef.current.filePath),
+        ),
+        lineNumbers(),
+        highlightActiveLineGutter(),
+        highlightSpecialChars(),
+        history(),
+        drawSelection(),
+        dropCursor(),
+        EditorState.allowMultipleSelections.of(true),
+        EditorState.tabSize.of(2),
+        indentUnit.of("  "),
+        indentOnInput(),
+        bracketMatching(),
+        closeBrackets(),
+        rectangularSelection(),
+        crosshairCursor(),
+        highlightActiveLine(),
+        highlightSelectionMatches(),
+        search({ top: true }),
+        EditorView.clickAddsSelectionRange.of(
+          (event) => event.altKey && !event.metaKey && !event.ctrlKey,
+        ),
+        lintGutter(),
+        linter(null),
+        lspHoverExtension,
+        autocompletion({
+          override: [lspCompletionSource],
+          icons: true,
+          activateOnTyping: true,
+          maxRenderedOptions: 80,
+        }),
+        customKeymap,
+        keymap.of([
+          ...closeBracketsKeymap,
+          ...defaultKeymap,
+          ...searchKeymap,
+          ...historyKeymap,
+          ...completionKeymap,
+          ...lintKeymap,
+          indentWithTab,
+        ]),
+        cmdClickGotoDef,
+        updateListener,
+        EditorView.contentAttributes.of({
+          "aria-label": "Workspace code editor",
+          spellcheck: "false",
+          autocorrect: "off",
+          autocapitalize: "off",
+        }),
+      ],
+    });
+
+    const view = new EditorView({
+      state: startState,
+      parent: host,
+    });
+    viewRef.current = view;
+    view.focus();
+
+    // Preserve scroll line on entry from read-only View mode or link focus
+    const entryLine = propsRef.current.initialFocusLine;
+    if (entryLine && entryLine > 1) {
+      const clampedLine = Math.min(entryLine, view.state.doc.lines);
+      const lineInfo = view.state.doc.line(clampedLine);
+      view.dispatch({
+        selection: EditorSelection.cursor(lineInfo.from),
+        effects: EditorView.scrollIntoView(lineInfo.from, { y: "center" }),
       });
     }
+
+    return () => {
+      viewRef.current = null;
+      view.destroy();
+    };
   }, []);
 
-  // Focus editor and jump to focused line on entry
+  // Reconfigure theme compartment without disturbing Undo/Redo history or selection
   useEffect(() => {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    ta.focus();
-    if (initialFocusLine && initialFocusLine > 1) {
-      const targetIdx = Math.min(initialFocusLine - 1, rawLines.length - 1);
-      let offset = 0;
-      const splitRaw = value.split("\n");
-      for (let i = 0; i < targetIdx && i < splitRaw.length; i += 1) {
-        offset += splitRaw[i].length + 1;
-      }
-      ta.setSelectionRange(offset, offset);
-      const scrollY = Math.max(0, (targetIdx - 4) * LINE_HEIGHT_PX);
-      ta.scrollTop = scrollY;
-      setViewport((prev) => ({ ...prev, scrollTop: scrollY }));
-      syncScroll();
-      setCursor({ line: targetIdx + 1, col: 1 });
-    }
-    // Only run on initial mount of editor surface
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: themeCompartmentRef.current.reconfigure(createOrbitCodeMirrorTheme(isDark)),
+    });
+  }, [isDark]);
 
-  // Jump cleanly to any requested diagnostic or Go-to-Definition line inside Edit mode
+  // Reconfigure language compartment reactively
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: languageCompartmentRef.current.reconfigure(
+        createCodeMirrorLanguageExtension(language, filePath),
+      ),
+    });
+  }, [language, filePath]);
+
+  // Sync external buffer reloads (e.g. conflict reload or F2 Rename) without breaking local edits
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const currentDoc = view.state.doc.toString();
+    if (value === currentDoc || value === lastEmittedValueRef.current) {
+      return;
+    }
+    lastEmittedValueRef.current = value;
+    const prevHead = view.state.selection.main.head;
+    const clampedHead = Math.min(prevHead, value.length);
+    view.dispatch({
+      changes: { from: 0, to: currentDoc.length, insert: value },
+      selection: EditorSelection.cursor(clampedHead),
+    });
+  }, [value]);
+
+  // Jump cleanly to diagnostic / Go-to-Definition / References target line & column
   useEffect(() => {
     if (!jumpTarget || jumpTarget.line < 1) return;
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const splitRaw = value.split("\n");
-    const targetIdx = Math.min(jumpTarget.line - 1, Math.max(0, splitRaw.length - 1));
-    let offset = 0;
-    for (let i = 0; i < targetIdx && i < splitRaw.length; i += 1) {
-      offset += splitRaw[i].length + 1;
-    }
-    const targetCol = Math.max(1, jumpTarget.col ?? 1);
-    const colOffset = Math.min(targetCol - 1, splitRaw[targetIdx]?.length ?? 0);
-    const caret = offset + colOffset;
-    ta.focus();
-    ta.setSelectionRange(caret, caret);
-    const scrollY = Math.max(0, (targetIdx - 4) * LINE_HEIGHT_PX);
-    ta.scrollTop = scrollY;
-    setViewport((prev) => ({ ...prev, scrollTop: scrollY }));
-    syncScroll();
-    setCursor({ line: targetIdx + 1, col: colOffset + 1 });
-    // Triggered solely on explicit jumpTarget nonce updates
+    const view = viewRef.current;
+    if (!view) return;
+    const docText = view.state.doc.toString();
+    const offset = lineColToOffset(docText, jumpTarget.line, jumpTarget.col ?? 1);
+    view.focus();
+    view.dispatch({
+      selection: EditorSelection.cursor(offset),
+      effects: EditorView.scrollIntoView(offset, { y: "center" }),
+    });
+    // Trigger strictly on jumpTarget nonce updates
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jumpTarget?.nonce]);
 
-  const diagByLine = useMemo(() => {
-    const map = new Map<number, LspDiagnostic>();
-    if (!diagnostics || diagnostics.length === 0) return map;
-    const rank = (sev: LspDiagnostic["severity"]) =>
-      sev === "error" ? 0 : sev === "warning" ? 1 : sev === "info" ? 2 : 3;
-    for (const d of diagnostics) {
-      const existing = map.get(d.line);
-      if (!existing || rank(d.severity) < rank(existing.severity)) {
-        map.set(d.line, d);
-      }
-    }
-    return map;
-  }, [diagnostics]);
-
-  // Adaptive debounced Rust `syntect` re-highlighting while typing
+  // Push LSP diagnostics into CodeMirror's linter + attach async inline Quick Fix buttons inside tooltip
   useEffect(() => {
-    const seq = ++highlightSeqRef.current;
-    if (value === initialContent && initialHighlightedLines.length >= rawLines.length) {
-      return;
-    }
-    if (value.length > MAX_LIVE_HIGHLIGHT_BYTES) {
-      return;
-    }
-    const debounceMs = value.length < SMALL_FILE_HIGHLIGHT_THRESHOLD_BYTES ? 90 : 300;
-    const timer = window.setTimeout(() => {
-      const cap = Math.max(2500, rawLines.length + 100);
-      void orbitIpc
-        .highlightWorkspaceCode(language, value, cap)
-        .then((lines) => {
-          if (highlightSeqRef.current !== seq) return;
-          setHighlightState({
-            lines,
-            plainByLine: value.split("\n").map((l) => l.replace(/\r$/, "")),
-          });
-        })
-        .catch(() => {
-          // Plain foreground fallback remains active on transient highlight failure
-        });
-    }, debounceMs);
-    return () => window.clearTimeout(timer);
-  }, [value, language, initialContent, initialHighlightedLines.length, rawLines.length]);
+    const view = viewRef.current;
+    if (!view) return;
+    const docText = view.state.doc.toString();
+    const mapped = mapLspDiagnosticsToCodeMirror(docText, diagnostics ?? []);
 
-  const refreshCursor = useCallback(
-    (ta: HTMLTextAreaElement | null, textOverride?: string) => {
-      if (!ta) return;
-      const src = textOverride ?? ta.value;
-      setCursor(computeLineCol(src, ta.selectionStart ?? 0));
-    },
-    [],
-  );
+    const cmDiags: CmDiagnostic[] = mapped.map((item) => ({
+      from: item.from,
+      to: item.to,
+      severity: item.severity,
+      message: item.message,
+      source: item.source,
+      renderMessage: (editorView) => {
+        const wrap = document.createElement("div");
+        const msgEl = document.createElement("div");
+        msgEl.textContent = item.message;
+        wrap.appendChild(msgEl);
 
-  const applyControlledEdit = useCallback(
-    (nextValue: string, selStart: number, selEnd: number) => {
-      onChange(nextValue);
-      window.requestAnimationFrame(() => {
-        const ta = textareaRef.current;
-        if (!ta) return;
-        ta.setSelectionRange(selStart, selEnd);
-        refreshCursor(ta, nextValue);
-        syncScroll();
+        if (item.source) {
+          const srcEl = document.createElement("div");
+          srcEl.className = "cm-diagnosticSource";
+          srcEl.textContent = item.source;
+          wrap.appendChild(srcEl);
+        }
+
+        const p = propsRef.current;
+        if (p.isLspEligible) {
+          const actionsEl = document.createElement("div");
+          actionsEl.className = "orbit-cm-diag-actions";
+          wrap.appendChild(actionsEl);
+
+          const curText = editorView.state.doc.toString();
+          void orbitIpc
+            .lspCodeAction({
+              hostId: p.hostId,
+              cwd: p.cwd,
+              path: p.filePath,
+              line: item.original.line,
+              col: item.original.col,
+              endLine: Math.max(item.original.line, item.original.end_line),
+              endCol: item.original.end_col,
+              diagnostics: [item.original],
+              content: curText,
+            })
+            .then((actions) => {
+              if (!actionsEl.isConnected) return;
+              const fixActions = actions.filter((a) => a.edit && a.edit.file_edits.length > 0);
+              if (fixActions.length === 0) {
+                actionsEl.remove();
+                return;
+              }
+              for (const action of fixActions.slice(0, 4)) {
+                const btn = document.createElement("button");
+                btn.type = "button";
+                btn.className = "orbit-cm-diag-fix-btn";
+                if (action.is_preferred) {
+                  btn.dataset.preferred = "true";
+                }
+                btn.textContent = action.title;
+                btn.addEventListener("mousedown", (ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
+                  void applyCodeActionRef.current(action);
+                });
+                actionsEl.appendChild(btn);
+              }
+            })
+            .catch(() => {
+              actionsEl.remove();
+            });
+        }
+        return wrap;
+      },
+    }));
+
+    view.dispatch(setDiagnostics(view.state, cmDiags));
+  }, [diagnostics, hostId, cwd, filePath, isLspEligible]);
+
+  const handleSubmitInlineAiEdit = useCallback(async () => {
+    if (!aiEdit || aiSubmitting) return;
+    const trimmed = aiInstruction.trim();
+    if (!trimmed) return;
+    setAiSubmitting(true);
+    try {
+      await orbitActions.dispatchInlineCodeEdit({
+        filePath: relPath,
+        language,
+        startLine: aiEdit.startLine,
+        endLine: aiEdit.endLine,
+        selectedCode: aiEdit.selectedCode,
+        surroundingContext: aiEdit.surroundingContext,
+        instruction: trimmed,
       });
-    },
-    [onChange, refreshCursor, syncScroll],
-  );
+      setAiEdit(null);
+      setAiInstruction("");
+      viewRef.current?.focus();
+    } catch (err) {
+      orbitActions.showToast(
+        t("sidePanel.editorAiEditFailed", { error: String(err) }),
+      );
+    } finally {
+      setAiSubmitting(false);
+    }
+  }, [aiEdit, aiSubmitting, aiInstruction, relPath, language, t]);
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (ime.shouldIgnoreKeyDown(e)) return;
-
-    // F12 Go-to-Definition via LSP
-    if (e.key === "F12" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-      if (onGotoDefinition) {
-        e.preventDefault();
-        e.stopPropagation();
-        const pos = computeLineCol(e.currentTarget.value, e.currentTarget.selectionStart ?? 0);
-        onGotoDefinition(pos.line, pos.col);
-      }
+  const handleSubmitRename = useCallback(async () => {
+    if (!renameState || renameState.submitting) return;
+    const trimmed = renameState.nextName.trim();
+    if (!trimmed || trimmed === renameState.originalName) {
+      setRenameState(null);
+      viewRef.current?.focus();
       return;
     }
 
-    // Cmd+S / Ctrl+S atomic save
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "s") {
-      e.preventDefault();
-      e.stopPropagation();
-      if (!saving) {
-        onSave(false);
+    setRenameState((prev) => (prev ? { ...prev, submitting: true, error: null } : null));
+    try {
+      if (propsRef.current.dirty) {
+        const outcome = await propsRef.current.onSave(false);
+        if (outcome && outcome !== "saved") {
+          setRenameState((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  submitting: false,
+                  error: t("sidePanel.editorRenameSaveFirstError"),
+                }
+              : null,
+          );
+          return;
+        }
       }
-      return;
-    }
-
-    const ta = e.currentTarget;
-    const start = ta.selectionStart ?? 0;
-    const end = ta.selectionEnd ?? start;
-
-    // Tab / Shift+Tab 2-space indentation
-    if (e.key === "Tab" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      e.preventDefault();
-      if (start === end && !e.shiftKey) {
-        const next = `${value.slice(0, start)}  ${value.slice(end)}`;
-        applyControlledEdit(next, start + 2, start + 2);
+      const res = await orbitIpc.lspRename({
+        hostId: propsRef.current.hostId,
+        cwd: propsRef.current.cwd,
+        path: propsRef.current.filePath,
+        line: renameState.line,
+        col: renameState.col,
+        newName: trimmed,
+      });
+      if (!res.applied) {
+        setRenameState((prev) =>
+          prev
+            ? {
+                ...prev,
+                submitting: false,
+                error: t("sidePanel.editorRenameNoChanges"),
+              }
+            : null,
+        );
         return;
       }
+      await propsRef.current.onAfterLspWorkspaceEdit?.(res.modified_files);
+      setRenameState(null);
+      viewRef.current?.focus();
+      orbitActions.showToast(
+        t("sidePanel.editorRenameSuccess", {
+          files: res.modified_files.length,
+          edits: res.total_edits,
+        }),
+      );
+    } catch (err) {
+      setRenameState((prev) =>
+        prev ? { ...prev, submitting: false, error: String(err) } : null,
+      );
+    }
+  }, [renameState, t]);
 
-      const blockStart = value.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
-      const endCheckIdx = end > start && value[end - 1] === "\n" ? end - 1 : end;
-      const nextNl = value.indexOf("\n", endCheckIdx);
-      const blockEnd = nextNl === -1 ? value.length : nextNl;
-      const block = value.slice(blockStart, blockEnd);
-      const lines = block.split("\n");
-
-      if (e.shiftKey) {
-        let firstRemoved = 0;
-        let totalRemoved = 0;
-        const updated = lines.map((line, idx) => {
-          let removed = 0;
-          if (line.startsWith("  ")) removed = 2;
-          else if (line.startsWith(" ") || line.startsWith("\t")) removed = 1;
-          if (idx === 0) firstRemoved = removed;
-          totalRemoved += removed;
-          return line.slice(removed);
+  const handleReferenceClick = useCallback(
+    (refLoc: LspReferenceLocation) => {
+      const isSameFile = normalizeRelCompare(refLoc.path) === normalizeRelCompare(relPath);
+      if (isSameFile && viewRef.current) {
+        const view = viewRef.current;
+        const offset = lineColToOffset(
+          view.state.doc.toString(),
+          refLoc.line,
+          refLoc.character,
+        );
+        view.focus();
+        view.dispatch({
+          selection: EditorSelection.cursor(offset),
+          effects: EditorView.scrollIntoView(offset, { y: "center" }),
         });
-        const next = `${value.slice(0, blockStart)}${updated.join("\n")}${value.slice(blockEnd)}`;
-        const nextStart = Math.max(blockStart, start - firstRemoved);
-        const nextEnd = Math.max(nextStart, end - totalRemoved);
-        applyControlledEdit(next, nextStart, nextEnd);
-      } else {
-        const updated = lines.map((line) => `  ${line}`);
-        const next = `${value.slice(0, blockStart)}${updated.join("\n")}${value.slice(blockEnd)}`;
-        const nextStart = start + 2;
-        const nextEnd = end + lines.length * 2;
-        applyControlledEdit(next, nextStart, nextEnd);
+        return;
       }
-      return;
-    }
-
-    // Auto-indent on Enter (always insert `\n` inside normalized textarea; save restores CRLF)
-    if (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      e.preventDefault();
-      const lineStart = value.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
-      const lineBeforeCursor = value.slice(lineStart, start);
-      const indentMatch = lineBeforeCursor.match(/^[ \t]*/);
-      let indent = indentMatch ? indentMatch[0] : "";
-      const trimmedBefore = lineBeforeCursor.trimEnd();
-      if (
-        trimmedBefore.endsWith("{") ||
-        trimmedBefore.endsWith("[") ||
-        trimmedBefore.endsWith("(") ||
-        trimmedBefore.endsWith(":")
-      ) {
-        indent += "  ";
-      }
-      const insert = `\n${indent}`;
-      const next = `${value.slice(0, start)}${insert}${value.slice(end)}`;
-      const caret = start + insert.length;
-      applyControlledEdit(next, caret, caret);
-    }
-  };
-
-  // Virtualization window for large files (exact 20px integer row height)
-  const visibleStart = Math.max(
-    0,
-    Math.floor(viewport.scrollTop / LINE_HEIGHT_PX) - VIRTUAL_OVERSCAN_LINES,
+      onJumpToFileLocation?.(refLoc.path, refLoc.line, refLoc.character);
+    },
+    [relPath, onJumpToFileLocation],
   );
-  const visibleCount = Math.ceil(viewport.height / LINE_HEIGHT_PX) + VIRTUAL_OVERSCAN_LINES * 2;
-  const visibleEnd = Math.min(rawLines.length, visibleStart + visibleCount);
-  const topSpacerPx = visibleStart * LINE_HEIGHT_PX;
-  const bottomSpacerPx = Math.max(0, (rawLines.length - visibleEnd) * LINE_HEIGHT_PX);
-  const visibleSlice = rawLines.slice(visibleStart, visibleEnd);
 
-  const lineEndingLabel = useMemo(() => formatLineEndingLabel(lineEnding), [lineEnding]);
-  const languageLabel = useMemo(() => formatLanguageLabel(language), [language]);
-  const gutterMinWidthCh = Math.max(3, String(lineCount).length + 1);
+  const lineEndingLabel = useMemo(() => formatEditorLineEndingLabel(lineEnding), [lineEnding]);
+  const languageLabel = useMemo(() => formatEditorLanguageLabel(language), [language]);
+  const referenceFileCount = useMemo(
+    () => new Set(refsDrawer.items.map((r) => r.path)).size,
+    [refsDrawer.items],
+  );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div
+      data-orbit-code-editor="true"
+      className="flex min-h-0 flex-1 flex-col overflow-hidden"
+    >
       {/* External Disk Conflict Banner */}
       {conflict && (
-        <div className="border-b border-amber-500/25 bg-amber-500/[0.08] px-3 py-2 text-[12px]">
+        <div className="border-signal-warning-border bg-signal-warning-bg border-b px-3 py-2 text-[12px]">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex min-w-0 items-center gap-2">
-              <AlertTriangle className="h-[14px] w-[14px] shrink-0 text-amber-600 dark:text-amber-400" />
-              <span className="text-foreground font-medium">File changed on disk</span>
-              <span className="text-muted-foreground tabular-nums text-[11px]">
+              <AlertTriangle className="text-signal-warning size-[14px] shrink-0" />
+              <span className="text-ink-primary font-medium">
+                {t("sidePanel.editorConflictTitle")}
+              </span>
+              <span className="text-ink-tertiary tabular-nums text-[11px]">
                 ({formatFileSizeCompact(conflict.current_size_bytes)})
               </span>
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
-              <button
+              <Button
                 type="button"
+                variant="outline"
+                size="xs"
                 disabled={saving}
                 onClick={onReloadFromConflict}
-                className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium transition-colors disabled:opacity-50"
+                className="h-[24px] px-2 text-[11.5px]"
               >
-                <RefreshCw className="h-[11.5px] w-[11.5px]" />
-                Reload
-              </button>
-              <button
+                <RefreshCw className="size-[11.5px]" />
+                {t("sidePanel.editorConflictReload")}
+              </Button>
+              <Button
                 type="button"
+                variant="secondary"
+                size="xs"
                 disabled={saving}
-                onClick={() => onSave(true)}
-                className="inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md border border-amber-500/35 bg-amber-500/15 px-2 text-[11.5px] font-medium text-amber-800 transition-colors hover:bg-amber-500/25 disabled:opacity-50 dark:text-amber-200"
+                onClick={() => void onSave(true)}
+                className="border-signal-warning-border text-signal-warning h-[24px] px-2 text-[11.5px]"
               >
-                <Save className="h-[11.5px] w-[11.5px]" />
-                Overwrite
-              </button>
-              <button
+                <Save className="size-[11.5px]" />
+                {t("sidePanel.editorConflictOverwrite")}
+              </Button>
+              <Button
                 type="button"
+                variant="ghost"
+                size="xs"
                 onClick={() => {
                   onCopyMine();
                   setCopiedMine(true);
@@ -470,15 +1149,15 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
                     setCopiedMine(false);
                   }, 1400);
                 }}
-                className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] transition-colors"
+                className="h-[24px] px-2 text-[11.5px]"
               >
                 {copiedMine ? (
-                  <Check className="h-[11.5px] w-[11.5px] text-emerald-500" />
+                  <Check className="text-signal-success size-[11.5px]" />
                 ) : (
-                  <Copy className="h-[11.5px] w-[11.5px]" />
+                  <Copy className="size-[11.5px]" />
                 )}
-                Copy mine
-              </button>
+                {t("sidePanel.editorConflictCopyMine")}
+              </Button>
             </div>
           </div>
         </div>
@@ -486,182 +1165,458 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
 
       {/* Save Error Banner */}
       {saveError && (
-        <div className="flex items-center justify-between gap-2 border-b border-rose-500/25 bg-rose-500/[0.08] px-3 py-1.5 text-[11.5px] text-rose-700 dark:text-rose-300">
+        <div className="border-signal-danger-border bg-signal-danger-bg text-signal-danger flex items-center justify-between gap-2 border-b px-3 py-1.5 text-[11.5px]">
           <span className="min-w-0 truncate">{saveError}</span>
           <button
             type="button"
             onClick={onDismissError}
-            aria-label="Dismiss error"
-            className="inline-flex h-[20px] w-[20px] shrink-0 cursor-pointer items-center justify-center rounded hover:bg-rose-500/15"
+            aria-label={t("sidePanel.editorDismissError")}
+            className="hover:bg-signal-danger/15 inline-flex size-[20px] shrink-0 cursor-pointer items-center justify-center rounded"
           >
-            <X className="h-[12px] w-[12px]" />
+            <X className="size-[12px]" />
           </button>
         </div>
       )}
 
-      {/* Main Editor Surface: Synchronized Line Gutter + Highlight Backdrop + Transparent Textarea */}
+      {/* Main CodeMirror 6 Editor Surface + Anchored Inline Overlays */}
       <div
-        ref={viewportContainerRef}
-        className="bg-canvas relative flex min-h-0 flex-1 overflow-hidden"
+        ref={surfaceRef}
+        className="bg-surface-base relative flex min-h-0 flex-1 flex-col overflow-hidden"
       >
-        {/* Line Numbers Gutter */}
-        <div
-          aria-hidden="true"
-          style={{ width: `${gutterMinWidthCh + 1.5}ch` }}
-          className="border-border/60 bg-canvas relative shrink-0 overflow-hidden border-r select-none"
-        >
+        <div ref={editorHostRef} className="min-h-0 flex-1 overflow-hidden" />
+
+        {/* Inline Cmd+K AI Edit Popover */}
+        {aiEdit && (
           <div
-            ref={gutterInnerRef}
-            className="py-2.5 pr-2.5 pl-2 font-mono text-[11px] leading-[20px] will-change-transform"
-          >
-            {topSpacerPx > 0 && <div style={{ height: `${topSpacerPx}px` }} />}
-            {visibleSlice.map((_, relIdx) => {
-              const ln = visibleStart + relIdx + 1;
-              const isActive = ln === cursor.line;
-              const lineDiag = diagByLine.get(ln);
-              return (
-                <div
-                  key={ln}
-                  className={cn(
-                    "tabular-nums flex h-[20px] items-center justify-end gap-1 leading-[20px]",
-                    isActive
-                      ? "text-foreground/85 font-medium"
-                      : "text-zinc-400 dark:text-zinc-600",
-                  )}
-                >
-                  {lineDiag && (
-                    <span
-                      className={cn(
-                        "size-[5px] shrink-0 rounded-full",
-                        lineDiag.severity === "error"
-                          ? "bg-rose-500"
-                          : lineDiag.severity === "warning"
-                            ? "bg-amber-500"
-                            : "bg-sky-500",
-                      )}
-                    />
-                  )}
-                  <span>{ln}</span>
-                </div>
-              );
-            })}
-            {bottomSpacerPx > 0 && <div style={{ height: `${bottomSpacerPx}px` }} />}
-          </div>
-        </div>
-
-        {/* Synchronized Code Backdrop + Native Transparent Textarea */}
-        <div className="relative min-w-0 flex-1 overflow-hidden">
-          <div
-            aria-hidden="true"
-            className="pointer-events-none absolute inset-0 overflow-hidden select-none"
-          >
-            <div
-              ref={backdropInnerRef}
-              style={{ tabSize: 2 }}
-              className="min-w-full w-max px-3 py-2.5 font-mono text-[12px] leading-[20px] will-change-transform"
-            >
-              {topSpacerPx > 0 && <div style={{ height: `${topSpacerPx}px` }} />}
-              {visibleSlice.map((lineText, relIdx) => {
-                const idx = visibleStart + relIdx;
-                const isActive = idx + 1 === cursor.line;
-                const cachedPlain = highlightState.plainByLine[idx];
-                const hlLine =
-                  cachedPlain === lineText ? highlightState.lines[idx] : undefined;
-
-                return (
-                  <div
-                    key={idx}
-                    className={cn(
-                      "h-[20px] leading-[20px] whitespace-pre",
-                      isActive && "bg-black/[0.028] dark:bg-white/[0.032]",
-                    )}
-                  >
-                    {lineText.length === 0 ? (
-                      " "
-                    ) : hlLine && hlLine.tokens.length > 0 ? (
-                      hlLine.tokens.map((tok, tIdx) => (
-                        <span
-                          key={tIdx}
-                          style={{
-                            color: resolveTokenColor(tok, isDark),
-                            fontStyle: tok.italic ? "italic" : undefined,
-                          }}
-                        >
-                          {tok.text}
-                        </span>
-                      ))
-                    ) : (
-                      <span className="text-foreground">{lineText}</span>
-                    )}
-                  </div>
-                );
-              })}
-              {bottomSpacerPx > 0 && <div style={{ height: `${bottomSpacerPx}px` }} />}
-            </div>
-          </div>
-
-          <textarea
-            ref={textareaRef}
-            value={value}
-            spellCheck={false}
-            autoCapitalize="off"
-            autoCorrect="off"
-            autoComplete="off"
-            wrap="off"
-            aria-label="Workspace code editor"
-            style={{ tabSize: 2 }}
-            {...ime.compositionProps}
-            onChange={(e) => {
-              onChange(e.target.value);
-              refreshCursor(e.currentTarget, e.target.value);
-            }}
-            onScroll={syncScroll}
-            onKeyDown={handleKeyDown}
-            onKeyUp={(e) => refreshCursor(e.currentTarget)}
-            onClick={(e) => {
-              refreshCursor(e.currentTarget);
-              if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && onGotoDefinition) {
-                const ta = e.currentTarget;
-                if (ta.selectionStart !== ta.selectionEnd) return;
-                const pos = computeLineCol(ta.value, ta.selectionStart ?? 0);
-                onGotoDefinition(pos.line, pos.col);
+            role="dialog"
+            aria-label={t("sidePanel.editorAiEditTitle")}
+            style={{ top: `${aiEdit.topPx}px` }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                setAiEdit(null);
+                viewRef.current?.focus();
               }
             }}
-            onSelect={(e) => refreshCursor(e.currentTarget)}
-            className="caret-foreground selection:bg-signal-info/25 selectable-text absolute inset-0 h-full w-full resize-none overflow-auto bg-transparent px-3 py-2.5 font-mono text-[12px] leading-[20px] whitespace-pre text-transparent outline-none"
-          />
-        </div>
+            className="floating-surface orbit-inline-menu-up absolute right-3 left-3 z-20 mx-auto max-w-[540px] rounded-xl border p-2"
+          >
+            <div className="flex items-center gap-1.5">
+              <Sparkles className="text-signal-info size-[13px] shrink-0" />
+              <span className="bg-surface-recessed border-border-subtle text-ink-secondary tabular-nums shrink-0 rounded-[5px] border px-1.5 py-0.5 font-mono text-[11px]">
+                {aiEdit.startLine === aiEdit.endLine
+                  ? `L${aiEdit.startLine}`
+                  : `L${aiEdit.startLine}–L${aiEdit.endLine}`}
+              </span>
+              <Input
+                ref={aiInputRef}
+                type="text"
+                value={aiInstruction}
+                disabled={aiSubmitting}
+                onChange={(e) => setAiInstruction(e.target.value)}
+                {...imeAi.compositionProps}
+                onKeyDown={(e) => {
+                  if (imeAi.shouldIgnoreKeyDown(e)) return;
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void handleSubmitInlineAiEdit();
+                  }
+                }}
+                placeholder={
+                  aiEdit.startLine === aiEdit.endLine
+                    ? t("sidePanel.editorAiEditPlaceholderLine", {
+                        line: aiEdit.startLine,
+                      })
+                    : t("sidePanel.editorAiEditPlaceholderRange", {
+                        start: aiEdit.startLine,
+                        end: aiEdit.endLine,
+                      })
+                }
+                className="h-[26px] flex-1 border-transparent bg-transparent px-1 text-[12px] shadow-none focus-visible:border-transparent focus-visible:ring-0"
+              />
+              <Button
+                type="button"
+                size="xs"
+                disabled={aiSubmitting || !aiInstruction.trim()}
+                onClick={() => void handleSubmitInlineAiEdit()}
+                className="h-[24px] px-2.5 text-[11.5px]"
+              >
+                {aiSubmitting ? <OrbitSpinner size={11} /> : t("sidePanel.editorAiEditSend")}
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={t("common.close")}
+                onClick={() => {
+                  setAiEdit(null);
+                  viewRef.current?.focus();
+                }}
+                className="size-[22px]"
+              >
+                <X className="size-[12px]" />
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Inline F2 Symbol Rename Popover */}
+        {renameState && (
+          <div
+            role="dialog"
+            aria-label={t("sidePanel.editorRenameTitle")}
+            style={{ top: `${renameState.topPx}px` }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                setRenameState(null);
+                viewRef.current?.focus();
+              }
+            }}
+            className="floating-surface orbit-inline-menu-up absolute right-3 left-3 z-20 mx-auto max-w-[360px] rounded-xl border p-2"
+          >
+            <div className="flex items-center gap-1.5">
+              <PencilLine className="text-ink-tertiary size-[13px] shrink-0" />
+              <Input
+                ref={renameInputRef}
+                type="text"
+                value={renameState.nextName}
+                disabled={renameState.submitting}
+                onChange={(e) =>
+                  setRenameState((prev) =>
+                    prev ? { ...prev, nextName: e.target.value, error: null } : null,
+                  )
+                }
+                {...imeRename.compositionProps}
+                onKeyDown={(e) => {
+                  if (imeRename.shouldIgnoreKeyDown(e)) return;
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void handleSubmitRename();
+                  }
+                }}
+                placeholder={t("sidePanel.editorRenamePlaceholder")}
+                className="h-[26px] flex-1 font-mono text-[12px]"
+              />
+              <Button
+                type="button"
+                size="xs"
+                disabled={renameState.submitting || !renameState.nextName.trim()}
+                onClick={() => void handleSubmitRename()}
+                className="h-[24px] px-2.5 text-[11.5px]"
+              >
+                {renameState.submitting ? (
+                  <OrbitSpinner size={11} />
+                ) : (
+                  t("sidePanel.editorRenameApply")
+                )}
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={t("common.close")}
+                onClick={() => {
+                  setRenameState(null);
+                  viewRef.current?.focus();
+                }}
+                className="size-[22px]"
+              >
+                <X className="size-[12px]" />
+              </Button>
+            </div>
+            {renameState.error && (
+              <div className="text-signal-danger mt-1.5 px-1 text-[11px]">
+                {renameState.error}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Quick Fix / Code Actions Popover (Cmd+.) */}
+        {codeActionsState && (
+          <div
+            ref={codeActionsMenuRef}
+            role="menu"
+            aria-label={t("sidePanel.editorQuickFixesTitle")}
+            style={{ top: `${codeActionsState.topPx}px` }}
+            tabIndex={-1}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                setCodeActionsState(null);
+                viewRef.current?.focus();
+              } else if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setCodeActionsState((prev) =>
+                  prev && prev.actions.length > 0
+                    ? { ...prev, activeIdx: (prev.activeIdx + 1) % prev.actions.length }
+                    : prev,
+                );
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setCodeActionsState((prev) =>
+                  prev && prev.actions.length > 0
+                    ? {
+                        ...prev,
+                        activeIdx:
+                          (prev.activeIdx - 1 + prev.actions.length) % prev.actions.length,
+                      }
+                    : prev,
+                );
+              } else if (e.key === "Enter") {
+                e.preventDefault();
+                const chosen = codeActionsState.actions[codeActionsState.activeIdx];
+                if (chosen) {
+                  setCodeActionsState(null);
+                  void applyCodeAction(chosen);
+                }
+              }
+            }}
+            className="floating-surface orbit-inline-menu-up absolute right-3 left-3 z-20 mx-auto max-w-[420px] rounded-xl border p-1.5"
+          >
+            <div className="text-ink-tertiary flex items-center justify-between px-2 py-1 text-[11px] font-medium">
+              <span className="inline-flex items-center gap-1.5">
+                <Wrench className="size-[11.5px]" />
+                {t("sidePanel.editorQuickFixesTitle")}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setCodeActionsState(null);
+                  viewRef.current?.focus();
+                }}
+                aria-label={t("common.close")}
+                className="hover:bg-accent text-ink-tertiary hover:text-ink-primary inline-flex size-[18px] cursor-pointer items-center justify-center rounded"
+              >
+                <X className="size-[11px]" />
+              </button>
+            </div>
+            {codeActionsState.loading ? (
+              <div className="text-ink-tertiary flex items-center gap-2 px-2 py-2 text-[12px]">
+                <OrbitSpinner size={12} />
+                <span>{t("sidePanel.editorLoadingQuickFixes")}</span>
+              </div>
+            ) : (
+              <div className="max-h-[200px] overflow-auto">
+                {codeActionsState.actions.map((action, idx) => (
+                  <button
+                    key={`${action.title}:${idx}`}
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setCodeActionsState(null);
+                      void applyCodeAction(action);
+                    }}
+                    className={cn(
+                      "flex w-full cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors",
+                      idx === codeActionsState.activeIdx
+                        ? "bg-accent text-ink-primary"
+                        : "text-ink-secondary hover:bg-accent hover:text-ink-primary",
+                    )}
+                  >
+                    <span className="min-w-0 truncate font-medium">{action.title}</span>
+                    <span className="flex shrink-0 items-center gap-1">
+                      {action.is_preferred && (
+                        <span className="bg-signal-info-bg text-signal-info rounded px-1 py-0.5 text-[10px] font-medium">
+                          {t("sidePanel.editorPreferredBadge")}
+                        </span>
+                      )}
+                      {action.kind && (
+                        <span className="text-ink-faint font-mono text-[10px]">
+                          {action.kind}
+                        </span>
+                      )}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
-      {/* Subtle Editor Status Footer */}
-      <div className="border-border bg-elevated/45 text-muted-foreground flex h-[26px] shrink-0 items-center justify-between gap-2 border-t px-3 font-mono text-[11px]">
+      {/* Collapsible LSP References Drawer (Shift+F12) */}
+      {refsDrawer.open && (
+        <div className="border-border-default bg-surface-recessed/75 flex shrink-0 flex-col border-t">
+          <div className="border-border-subtle flex h-[28px] items-center justify-between gap-2 border-b px-3 text-[11px]">
+            <button
+              type="button"
+              onClick={() =>
+                setRefsDrawer((prev) => ({ ...prev, collapsed: !prev.collapsed }))
+              }
+              className="text-ink-secondary hover:text-ink-primary flex min-w-0 cursor-pointer items-center gap-1.5 font-medium"
+            >
+              {refsDrawer.collapsed ? (
+                <ChevronUp className="size-[12px] shrink-0" />
+              ) : (
+                <ChevronDown className="size-[12px] shrink-0" />
+              )}
+              <SearchCode className="size-[12px] shrink-0" />
+              <span className="truncate font-mono">{refsDrawer.symbolLabel}</span>
+              {!refsDrawer.loading && !refsDrawer.error && (
+                <span className="text-ink-tertiary tabular-nums shrink-0 font-sans font-normal">
+                  ·{" "}
+                  {t("sidePanel.editorReferencesCount", {
+                    count: refsDrawer.items.length,
+                    files: referenceFileCount,
+                  })}
+                </span>
+              )}
+            </button>
+            <button
+              type="button"
+              aria-label={t("common.close")}
+              onClick={() => {
+                setRefsDrawer((prev) => ({ ...prev, open: false }));
+                viewRef.current?.focus();
+              }}
+              className="text-ink-tertiary hover:bg-accent hover:text-ink-primary inline-flex size-[20px] shrink-0 cursor-pointer items-center justify-center rounded"
+            >
+              <X className="size-[12px]" />
+            </button>
+          </div>
+
+          {!refsDrawer.collapsed && (
+            <div className="max-h-[168px] overflow-auto">
+              {refsDrawer.loading ? (
+                <div className="text-ink-tertiary flex items-center gap-2 px-3 py-3 text-[11.5px]">
+                  <OrbitSpinner size={12} />
+                  <span>{t("sidePanel.editorFindingReferences")}</span>
+                </div>
+              ) : refsDrawer.error ? (
+                <div className="text-signal-danger px-3 py-2 text-[11.5px]">
+                  {refsDrawer.error}
+                </div>
+              ) : refsDrawer.items.length === 0 ? (
+                <div className="text-ink-tertiary px-3 py-3 text-[11.5px]">
+                  {t("sidePanel.editorNoReferences")}
+                </div>
+              ) : (
+                <div className="divide-border-subtle divide-y">
+                  {refsDrawer.items.map((refLoc, idx) => (
+                    <button
+                      key={`${refLoc.path}:${refLoc.line}:${refLoc.character}:${idx}`}
+                      type="button"
+                      onClick={() => handleReferenceClick(refLoc)}
+                      className="hover:bg-accent flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left transition-colors"
+                    >
+                      <FileCode2 className="text-ink-faint size-[12px] shrink-0" />
+                      <span className="text-ink-secondary shrink-0 font-mono text-[11px]">
+                        {refLoc.path}
+                      </span>
+                      <span className="text-ink-faint tabular-nums shrink-0 font-mono text-[10.5px]">
+                        {refLoc.line}:{refLoc.character}
+                      </span>
+                      {refLoc.preview_line && (
+                        <span className="text-ink-primary/85 min-w-0 flex-1 truncate font-mono text-[11px]">
+                          {refLoc.preview_line}
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Subtle Editor Status Footer (26px, T3 Meta typography) */}
+      <div className="border-border-subtle bg-surface-recessed/70 text-ink-tertiary flex h-[26px] shrink-0 items-center justify-between gap-2 border-t px-3 font-mono text-[11px]">
         <div className="flex min-w-0 items-center gap-2">
           <span className="tabular-nums">
             Ln {cursor.line}, Col {cursor.col}
           </span>
+          {cursor.cursors > 1 && (
+            <>
+              <span className="opacity-40">·</span>
+              <span className="text-signal-info tabular-nums font-sans">
+                {t("sidePanel.editorCursorsCount", { count: cursor.cursors })}
+              </span>
+            </>
+          )}
+          {cursor.selectedChars > 0 && (
+            <>
+              <span className="opacity-40">·</span>
+              <span className="tabular-nums font-sans">
+                {t("sidePanel.editorSelectedChars", { count: cursor.selectedChars })}
+              </span>
+            </>
+          )}
           <span className="opacity-40">·</span>
           <span>{lineEndingLabel}</span>
           <span className="opacity-40">·</span>
           <span className="truncate font-sans">{languageLabel}</span>
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 font-sans">
+
+        <div className="flex shrink-0 items-center gap-2 font-sans">
+          {isLspEligible && (
+            <div className="hidden items-center gap-1 sm:flex">
+              <SimpleTooltip label={t("sidePanel.editorFindReferencesTooltip")} shortcut="⇧F12">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (viewRef.current) void triggerFindReferences(viewRef.current);
+                  }}
+                  className="text-ink-tertiary hover:bg-accent hover:text-ink-primary inline-flex h-[19px] cursor-pointer items-center gap-1 rounded px-1.5 text-[11px] transition-colors"
+                >
+                  {t("sidePanel.editorRefsAction")}
+                </button>
+              </SimpleTooltip>
+              <SimpleTooltip label={t("sidePanel.editorRenameTooltip")} shortcut="F2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (viewRef.current) openInlineRename(viewRef.current);
+                  }}
+                  className="text-ink-tertiary hover:bg-accent hover:text-ink-primary inline-flex h-[19px] cursor-pointer items-center gap-1 rounded px-1.5 text-[11px] transition-colors"
+                >
+                  {t("sidePanel.editorRenameAction")}
+                </button>
+              </SimpleTooltip>
+            </div>
+          )}
+
+          <SimpleTooltip label={t("sidePanel.editorAiEditTooltip")} shortcut={`${mod}K`}>
+            <button
+              type="button"
+              onClick={() => {
+                if (viewRef.current) openInlineAiEdit(viewRef.current);
+              }}
+              className="text-ink-secondary hover:bg-accent hover:text-ink-primary inline-flex h-[19px] cursor-pointer items-center gap-1 rounded px-1.5 text-[11px] font-medium transition-colors"
+            >
+              <Sparkles className="size-[10.5px]" />
+              <span>{t("sidePanel.editorAiEditAction")}</span>
+              <ShortcutKbd keys={`${mod}K`} size="xs" variant="subtle" />
+            </button>
+          </SimpleTooltip>
+
+          <span className="opacity-30">|</span>
+
           {saving ? (
             <span className="inline-flex items-center gap-1">
-              <Loader2 className="h-[11px] w-[11px] animate-spin" />
-              Saving…
+              <Loader2 className="size-[11px] animate-spin" />
+              {t("sidePanel.editorStatusSaving")}
             </span>
           ) : conflict ? (
-            <span className="text-amber-600 dark:text-amber-400">Conflict</span>
+            <span className="text-signal-warning">{t("sidePanel.editorStatusConflict")}</span>
           ) : dirty ? (
             <span className="inline-flex items-center gap-1.5">
-              <span>Unsaved</span>
+              <span>{t("sidePanel.editorStatusUnsaved")}</span>
               <ShortcutKbd keys={`${mod}S`} size="xs" variant="subtle" />
             </span>
           ) : (
-            <span className="opacity-70">Saved</span>
+            <span className="opacity-70">{t("sidePanel.editorStatusSaved")}</span>
           )}
         </div>
       </div>
     </div>
   );
 });
+
+export default WorkspaceCodeEditor;

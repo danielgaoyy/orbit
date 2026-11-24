@@ -80,7 +80,8 @@ use orbit_protocol::{
     ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
     EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult, GitCreatePrResult,
     GitMutationOutcome, GitPushResult, GuardianPolicyConfig, HookExecutionRecord, HookScope,
-    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo, LspLocation,
+    LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult,
     ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
     ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
@@ -2685,6 +2686,127 @@ async fn lsp_goto_definition(
 }
 
 #[tauri::command]
+async fn lsp_hover(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    content: Option<String>,
+) -> Result<Option<LspHoverInfo>, String> {
+    state
+        .core
+        .lsp_hover_on_host(&host_id, &cwd, &path, line, col, content)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn lsp_references(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    include_declaration: Option<bool>,
+    content: Option<String>,
+) -> Result<Vec<LspReferenceLocation>, String> {
+    state
+        .core
+        .lsp_references_on_host(
+            &host_id,
+            &cwd,
+            &path,
+            line,
+            col,
+            include_declaration.unwrap_or(true),
+            content,
+        )
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn lsp_completion(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    trigger_character: Option<String>,
+    content: Option<String>,
+) -> Result<Vec<LspCompletionItem>, String> {
+    state
+        .core
+        .lsp_completion_on_host(&host_id, &cwd, &path, line, col, trigger_character, content)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn lsp_code_action(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    end_line: u32,
+    end_col: u32,
+    diagnostics: Option<Vec<LspDiagnostic>>,
+    content: Option<String>,
+) -> Result<Vec<LspCodeAction>, String> {
+    state
+        .core
+        .lsp_code_action_on_host(
+            &host_id,
+            &cwd,
+            &path,
+            line,
+            col,
+            end_line,
+            end_col,
+            diagnostics.unwrap_or_default(),
+            content,
+        )
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn lsp_rename(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    new_name: String,
+    content: Option<String>,
+) -> Result<LspWorkspaceEditResult, String> {
+    state
+        .core
+        .lsp_rename_on_host(&host_id, &cwd, &path, line, col, &new_name, content)
+        .await
+}
+
+#[tauri::command]
+async fn lsp_apply_workspace_edit(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    edit: LspWorkspaceEdit,
+) -> Result<LspWorkspaceEditResult, String> {
+    state
+        .core
+        .lsp_apply_workspace_edit_on_host(&host_id, &cwd, edit)
+        .await
+}
+
+#[tauri::command]
 async fn restart_lsp_server(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -4243,6 +4365,12 @@ pub fn run() {
             lsp_query_symbols,
             lsp_get_diagnostics,
             lsp_goto_definition,
+            lsp_hover,
+            lsp_references,
+            lsp_completion,
+            lsp_code_action,
+            lsp_rename,
+            lsp_apply_workspace_edit,
             restart_lsp_server,
             get_usage_insights,
             get_context_occupancy,

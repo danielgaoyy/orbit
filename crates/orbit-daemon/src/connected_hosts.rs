@@ -607,6 +607,11 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::LspSymbolsResponse { request_id, .. }
         | WireMessage::LspDiagnosticsResponse { request_id, .. }
         | WireMessage::LspLocationsResponse { request_id, .. }
+        | WireMessage::LspHoverResponse { request_id, .. }
+        | WireMessage::LspReferencesResponse { request_id, .. }
+        | WireMessage::LspCompletionResponse { request_id, .. }
+        | WireMessage::LspCodeActionResponse { request_id, .. }
+        | WireMessage::LspWorkspaceEditResponse { request_id, .. }
         | WireMessage::UsageInsightsResponse { request_id, .. }
         | WireMessage::ContextOccupancyResponse { request_id, .. }
         | WireMessage::LifecycleHooksSnapshot { request_id, .. }

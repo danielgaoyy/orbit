@@ -132,7 +132,20 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
         case "list_monitor_watches":
         case "list_artifacts":
         case "get_workspace_files":
+        case "list_lsp_servers":
+        case "lsp_query_symbols":
+        case "lsp_get_diagnostics":
+        case "lsp_goto_definition":
+        case "lsp_references":
+        case "lsp_completion":
+        case "lsp_code_action":
+        case "restart_lsp_server":
           return [];
+        case "lsp_hover":
+          return null;
+        case "lsp_rename":
+        case "lsp_apply_workspace_edit":
+          return { applied: false, modified_files: [], total_edits: 0 };
         case "get_cloud_sync_status":
           return null;
         case "get_fleet_overview":

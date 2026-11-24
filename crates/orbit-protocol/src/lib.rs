@@ -2636,6 +2636,91 @@ pub enum WireMessage {
         cwd: String,
         locations: Vec<LspLocation>,
     },
+    LspHover {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspHoverResponse {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hover: Option<LspHoverInfo>,
+    },
+    LspReferences {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        #[serde(default = "wire_default_true")]
+        include_declaration: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspReferencesResponse {
+        request_id: Uuid,
+        cwd: String,
+        references: Vec<LspReferenceLocation>,
+    },
+    LspCompletion {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_character: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspCompletionResponse {
+        request_id: Uuid,
+        cwd: String,
+        items: Vec<LspCompletionItem>,
+    },
+    LspCodeActionRequest {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        end_line: u32,
+        end_col: u32,
+        #[serde(default)]
+        diagnostics: Vec<LspDiagnostic>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspCodeActionResponse {
+        request_id: Uuid,
+        cwd: String,
+        actions: Vec<LspCodeAction>,
+    },
+    LspRename {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        new_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspApplyWorkspaceEdit {
+        request_id: Uuid,
+        cwd: String,
+        edit: LspWorkspaceEdit,
+    },
+    LspWorkspaceEditResponse {
+        request_id: Uuid,
+        cwd: String,
+        result: LspWorkspaceEditResult,
+    },
     RestartLspServer {
         request_id: Uuid,
         cwd: String,

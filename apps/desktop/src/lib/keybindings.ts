@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import {
   hasOpenSettingsBlockingOverlay,
+  isFocusInsideCodeEditor,
   isFocusInsideFileViewerPane,
   isFocusInsideSidePanel,
   shouldCloseSettingsOnEscape,
@@ -45,8 +46,11 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 1. Command Palette (`⌘K` / `Ctrl+K`) — yield to terminal clear/kill-line when terminal is focused
+      // 1. Command Palette (`⌘K` / `Ctrl+K`) — yield to terminal clear/kill-line and inline CodeMirror AI Edit
       if (mod && !e.shiftKey && !e.altKey && keyLower === "k" && !snap.terminalFocused) {
+        if (!snap.commandPaletteOpen && isFocusInsideCodeEditor(e.target, document.activeElement)) {
+          return;
+        }
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.setCommandPaletteOpen(!snap.commandPaletteOpen);
@@ -201,8 +205,11 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 6. Toggle Diff Review Tab (`⌘D` / `Ctrl+D`)
+      // 6. Toggle Diff Review Tab (`⌘D` / `Ctrl+D`) — yield to CodeMirror multi-cursor `selectNextOccurrence`
       if (mod && !e.shiftKey && !e.altKey && keyLower === "d") {
+        if (isFocusInsideCodeEditor(e.target, document.activeElement)) {
+          return;
+        }
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.toggleReviewTab();
@@ -361,6 +368,7 @@ export function useGlobalErgonomicKeybindings(): void {
       // 11. Double-Escape to Interrupt Active Agent Turn safely
       if (
         e.key === "Escape" &&
+        !e.defaultPrevented &&
         !snap.commandPaletteOpen &&
         !snap.pairDialogOpen &&
         !snap.relayDialogOpen &&

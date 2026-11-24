@@ -22,8 +22,9 @@ use orbit_protocol::{
     ExternalMcpServerRecord, GitCommitResult, GitCreatePrResult, GitMutationOutcome, GitPushResult,
     GitStatusSnapshot, GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
     HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform,
-    ImThreadBinding, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation,
-    LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption,
+    ImThreadBinding, KeepAwakeStatus, LifecycleHookRule, LspCodeAction, LspCompletionItem,
+    LspDiagnostic, LspHoverInfo, LspLocation, LspReferenceLocation, LspServerStatus, LspSymbolInfo,
+    LspWorkspaceEdit, LspWorkspaceEditResult, ManagedSkillRecord, McpProbeResult, ModelOption,
     MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
     PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
@@ -1100,6 +1101,16 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspDiagnostic>, String>>>,
     pending_lsp_locations:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspLocation>, String>>>,
+    pending_lsp_hover:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Option<LspHoverInfo>, String>>>,
+    pending_lsp_references:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspReferenceLocation>, String>>>,
+    pending_lsp_completions:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspCompletionItem>, String>>>,
+    pending_lsp_code_actions:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspCodeAction>, String>>>,
+    pending_lsp_workspace_edits:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<LspWorkspaceEditResult, String>>>,
     pending_usage_insights:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<UsageInsightsSnapshot, String>>>,
     pending_context_occupancy:
@@ -1298,6 +1309,11 @@ impl HostMemoryState {
             pending_lsp_symbols: HashMap::new(),
             pending_lsp_diagnostics: HashMap::new(),
             pending_lsp_locations: HashMap::new(),
+            pending_lsp_hover: HashMap::new(),
+            pending_lsp_references: HashMap::new(),
+            pending_lsp_completions: HashMap::new(),
+            pending_lsp_code_actions: HashMap::new(),
+            pending_lsp_workspace_edits: HashMap::new(),
             pending_usage_insights: HashMap::new(),
             pending_context_occupancy: HashMap::new(),
             pending_lifecycle_hooks: HashMap::new(),
@@ -6753,6 +6769,45 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(locations));
                     }
                 }
+                WireMessage::LspHoverResponse {
+                    request_id, hover, ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_hover.remove(&request_id) {
+                        let _ = tx.send(Ok(hover));
+                    }
+                }
+                WireMessage::LspReferencesResponse {
+                    request_id,
+                    references,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_references.remove(&request_id) {
+                        let _ = tx.send(Ok(references));
+                    }
+                }
+                WireMessage::LspCompletionResponse {
+                    request_id, items, ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_completions.remove(&request_id) {
+                        let _ = tx.send(Ok(items));
+                    }
+                }
+                WireMessage::LspCodeActionResponse {
+                    request_id,
+                    actions,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_code_actions.remove(&request_id) {
+                        let _ = tx.send(Ok(actions));
+                    }
+                }
+                WireMessage::LspWorkspaceEditResponse {
+                    request_id, result, ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_workspace_edits.remove(&request_id) {
+                        let _ = tx.send(Ok(result));
+                    }
+                }
                 WireMessage::UsageInsightsResponse {
                     request_id,
                     snapshot,
@@ -7278,6 +7333,26 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_lsp_locations.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_hover.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_references.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_completions.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_code_actions.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_workspace_edits.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -16434,6 +16509,528 @@ impl OrbitAppCore {
             .map_err(|_| "LSP goto-definition task cancelled".to_string())?
     }
 
+    /// Resolve `textDocument/hover` documentation at a 1-based `(line, col)` on any connected host.
+    pub async fn lsp_hover_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        content: Option<String>,
+    ) -> Result<Option<LspHoverInfo>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to inspect hover info".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_hover.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before hover query".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspHover {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_hover.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP hover request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(12), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected during hover query".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_hover.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP hover".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP hover task cancelled".to_string())?
+    }
+
+    /// Resolve workspace-confined `textDocument/references` locations on any connected host.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lsp_references_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        include_declaration: bool,
+        content: Option<String>,
+    ) -> Result<Vec<LspReferenceLocation>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to find references".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_references.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before references query".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspReferences {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    include_declaration,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_references.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP references request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while finding references".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_references.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP references".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP references task cancelled".to_string())?
+    }
+
+    /// Resolve `textDocument/completion` candidates on any connected host.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lsp_completion_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        trigger_character: Option<String>,
+        content: Option<String>,
+    ) -> Result<Vec<LspCompletionItem>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to fetch completions".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_completions.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before completion query".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspCompletion {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    trigger_character,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_completions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP completion request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(12), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while fetching completions".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_completions.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP completions".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP completion task cancelled".to_string())?
+    }
+
+    /// Resolve `textDocument/codeAction` quick fixes and refactors on any connected host.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lsp_code_action_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        end_line: u32,
+        end_col: u32,
+        diagnostics: Vec<LspDiagnostic>,
+        content: Option<String>,
+    ) -> Result<Vec<LspCodeAction>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to fetch code actions".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_code_actions.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before codeAction query".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspCodeActionRequest {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    end_line,
+                    end_col,
+                    diagnostics,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_code_actions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP codeAction request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while fetching code actions".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_code_actions.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP code actions".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP codeAction task cancelled".to_string())?
+    }
+
+    /// Execute `textDocument/rename` atomically inside the workspace on any connected host.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lsp_rename_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        new_name: &str,
+        content: Option<String>,
+    ) -> Result<LspWorkspaceEditResult, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let new_name = new_name.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to rename symbols".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_workspace_edits.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before rename".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspRename {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    new_name,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_workspace_edits.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP rename request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected during symbol rename".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_workspace_edits.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP rename".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP rename task cancelled".to_string())?
+    }
+
+    /// Apply a workspace-confined `LspWorkspaceEdit` atomically on any connected host.
+    pub async fn lsp_apply_workspace_edit_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        edit: LspWorkspaceEdit,
+    ) -> Result<LspWorkspaceEditResult, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to apply workspace edit".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_workspace_edits.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before applying workspace edit".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspApplyWorkspaceEdit {
+                    request_id: req_id,
+                    cwd,
+                    edit,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_workspace_edits.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!(
+                    "failed to send LSP apply-workspace-edit request: {e}"
+                )));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while applying workspace edit".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_workspace_edits.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP workspace edit".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP workspace edit task cancelled".to_string())?
+    }
+
     /// Fetch host-wide cost/token usage insights and quota depletion forecasts for any connected host.
     pub async fn get_usage_insights_on_host(
         self: &Arc<Self>,
@@ -19470,6 +20067,21 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_lsp_locations.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_hover.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_references.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_completions.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_code_actions.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_workspace_edits.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_usage_insights.drain() {

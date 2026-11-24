@@ -1196,6 +1196,86 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
+    async refreshWorkspaceFilesAfterLspEdit(
+      hostId: string,
+      cwd: string,
+      modifiedFiles: readonly string[],
+    ): Promise<void> {
+      if (!hostId || !cwd || modifiedFiles.length === 0) return;
+      const normSet = new Set(
+        modifiedFiles.map((p) => p.replace(/\\/g, "/").replace(/^\.\//, "")),
+      );
+      const matchesModified = (rawPath: string): boolean => {
+        const clean = rawPath.replace(/\\/g, "/").replace(/^\.\//, "");
+        if (normSet.has(clean)) return true;
+        const cwdNorm = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
+        if (cwdNorm && clean.startsWith(`${cwdNorm}/`)) {
+          return normSet.has(clean.slice(cwdNorm.length + 1));
+        }
+        return false;
+      };
+
+      const prefix = `${hostId}::${cwd}::`;
+      const state = getState();
+      const pathsToReload = new Set<string>();
+
+      // Mark cached entries stale and queue any open tabs or drafts matching modified files for force reload
+      const staleKeys: string[] = [];
+      for (const k of Object.keys(state.fileViewCache)) {
+        if (!k.startsWith(prefix)) continue;
+        const p = k.slice(prefix.length);
+        if (matchesModified(p)) {
+          staleKeys.push(k);
+        }
+      }
+      for (const tab of state.sidePanelTabs) {
+        if (tab.kind !== "file" || !tab.filePath) continue;
+        const tabHost = tab.hostId ?? state.selectedHostId ?? "";
+        const tabCwd = tab.cwd ?? state.selectedWorkspaceCwd ?? "~";
+        if (tabHost === hostId && tabCwd === cwd && matchesModified(tab.filePath)) {
+          pathsToReload.add(tab.filePath);
+        }
+      }
+      for (const rel of normSet) {
+        const k = fileCacheKey(hostId, cwd, rel);
+        if (k in state.fileEditorDrafts || k in state.fileViewCache) {
+          pathsToReload.add(rel);
+        }
+      }
+
+      if (staleKeys.length > 0) {
+        setState((s) => {
+          const nextCache = { ...s.fileViewCache };
+          for (const k of staleKeys) {
+            bumpFileLoadSeq(k);
+            inFlightFileReads.delete(k);
+            const cur = nextCache[k];
+            if (cur?.status === "ready" && cur.data) {
+              nextCache[k] = { status: "ready", data: cur.data, stale: true };
+            }
+          }
+          return { ...s, fileViewCache: nextCache };
+        });
+      }
+
+      await Promise.all(
+        Array.from(pathsToReload).map(async (p) => {
+          const k = fileCacheKey(hostId, cwd, p);
+          // Clear dirty flag only if we explicitly reloaded disk contents after an atomic LSP edit
+          const wasDirty = getState().fileEditorDrafts[k]?.dirty;
+          if (!wasDirty) {
+            await ctx.actions.loadWorkspaceFile(hostId, cwd, p, true);
+          }
+          void ctx.actions.loadFileDiagnostics(hostId, cwd, p, true);
+        }),
+      );
+
+      if (cwd && cwd !== "~") {
+        void ctx.actions.refreshGit(hostId, cwd, null, getState().diffStaged);
+      }
+    },
+
+
     async resolveUnsavedFileAction(choice: "save" | "discard" | "cancel"): Promise<void> {
       const pending = getState().pendingUnsavedFileAction;
       if (!pending) return;

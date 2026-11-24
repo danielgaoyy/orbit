@@ -5116,6 +5116,242 @@ async fn handle_wire_rpc(
             });
             None
         }
+        WireMessage::LspHover {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .hover(&authorized_cwd, &path, line, col, content.as_deref())
+                            .await
+                        {
+                            Ok(hover) => WireMessage::LspHoverResponse {
+                                request_id,
+                                cwd,
+                                hover,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_hover_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspReferences {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            include_declaration,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .references(
+                                &authorized_cwd,
+                                &path,
+                                line,
+                                col,
+                                include_declaration,
+                                content.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(references) => WireMessage::LspReferencesResponse {
+                                request_id,
+                                cwd,
+                                references,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_references_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspCompletion {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            trigger_character,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .completion(
+                                &authorized_cwd,
+                                &path,
+                                line,
+                                col,
+                                trigger_character.as_deref(),
+                                content.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(items) => WireMessage::LspCompletionResponse {
+                                request_id,
+                                cwd,
+                                items,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_completion_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspCodeActionRequest {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            end_line,
+            end_col,
+            diagnostics,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .code_action(
+                                &authorized_cwd,
+                                &path,
+                                orbit_protocol::LspRange {
+                                    line,
+                                    col,
+                                    end_line,
+                                    end_col,
+                                },
+                                &diagnostics,
+                                content.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(actions) => WireMessage::LspCodeActionResponse {
+                                request_id,
+                                cwd,
+                                actions,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_code_action_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspRename {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            new_name,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .rename(
+                                &authorized_cwd,
+                                &path,
+                                line,
+                                col,
+                                &new_name,
+                                content.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(result) => WireMessage::LspWorkspaceEditResponse {
+                                request_id,
+                                cwd,
+                                result,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_rename_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspApplyWorkspaceEdit {
+            request_id,
+            cwd,
+            edit,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp.apply_workspace_edit(&authorized_cwd, &edit).await {
+                            Ok(result) => WireMessage::LspWorkspaceEditResponse {
+                                request_id,
+                                cwd,
+                                result,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_apply_workspace_edit_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::RestartLspServer {
             request_id,
             cwd,

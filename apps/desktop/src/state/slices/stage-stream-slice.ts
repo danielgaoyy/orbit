@@ -49,6 +49,10 @@ import {
   extractLineSnippet,
 } from "@/lib/symbol-mentions";
 import {
+  type InlineAiEditPromptParams,
+  buildInlineAiEditPrompt,
+} from "@/lib/codemirror-helpers";
+import {
   MAX_ATTACHMENT_BYTES,
   basenameFromPath,
   composerScopeKey,
@@ -828,6 +832,85 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         };
       });
       ctx.actions.refreshSidebarView();
+    },
+
+
+    async dispatchInlineCodeEdit(
+      params: InlineAiEditPromptParams,
+    ): Promise<"sent" | "queued" | "composer"> {
+      const built = buildInlineAiEditPrompt(params);
+      const state = getState();
+      const hostId = state.selectedHostId;
+      const agentId = state.selectedAgentId;
+
+      if (!hostId || state.isDraftNewSession || !agentId) {
+        const key = composerScopeKey(state);
+        setState((s) => {
+          const existing = (s.composerDrafts[key] ?? "").trimEnd();
+          const nextText = existing ? `${existing}\n\n${built.wirePrompt}` : built.wirePrompt;
+          return {
+            ...s,
+            composerDrafts: {
+              ...s.composerDrafts,
+              [key]: nextText,
+            },
+          };
+        });
+        ctx.actions.refreshSidebarView();
+        ctx.actions.focusComposer();
+        notifyToast(translateGlobal("sidePanel.editorAiEditInsertedComposer"));
+        return "composer";
+      }
+
+      const detail = state.hostDetails[hostId];
+      const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
+      const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
+
+      if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
+        if (supportsServerQueue) {
+          const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          await orbitIpc.enqueuePrompt(hostId, agentId, built.wirePrompt, {
+            displayPrompt: built.displayPrompt,
+            queueId,
+          });
+        } else {
+          const key = composerScopeKey(state);
+          const queuedItem: QueuedPromptItem = {
+            id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            wirePrompt: built.wirePrompt,
+            displayText: built.displayPrompt,
+            badges: [],
+            slashDirective: null,
+            contexts: [],
+            pastes: [],
+            quotes: [],
+          };
+          setState((s) => ({
+            ...s,
+            queuedPrompts: {
+              ...s.queuedPrompts,
+              [key]: [...(s.queuedPrompts[key] ?? []), queuedItem],
+            },
+          }));
+        }
+        notifyToast(
+          translateGlobal("sidePanel.editorAiEditQueued", { range: built.rangeLabel }),
+        );
+        return "queued";
+      }
+
+      setState((s) =>
+        s.selectedHostId === hostId && !s.isDraftNewSession && s.selectedAgentId === agentId
+          ? { ...s, sessionScrollNonce: s.sessionScrollNonce + 1 }
+          : s,
+      );
+      await orbitIpc.sendPrompt(hostId, agentId, built.wirePrompt, {
+        displayPrompt: built.displayPrompt,
+      });
+      notifyToast(
+        translateGlobal("sidePanel.editorAiEditDispatched", { range: built.rangeLabel }),
+      );
+      return "sent";
     },
 
 

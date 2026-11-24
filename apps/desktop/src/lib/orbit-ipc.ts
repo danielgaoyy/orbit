@@ -2768,6 +2768,75 @@ export interface LspLocation {
   preview?: string | null;
 }
 
+export interface LspRange {
+  line: number;
+  col: number;
+  end_line: number;
+  end_col: number;
+}
+
+export interface LspHoverInfo {
+  contents: string;
+  format: "markdown" | "plaintext" | string;
+  range?: LspRange | null;
+}
+
+export interface LspReferenceLocation {
+  path: string;
+  line: number;
+  character: number;
+  end_line: number;
+  end_character: number;
+  preview_line?: string | null;
+}
+
+export interface LspCompletionItem {
+  label: string;
+  kind: string;
+  detail?: string | null;
+  documentation?: string | null;
+  insert_text?: string | null;
+  sort_text?: string | null;
+  filter_text?: string | null;
+}
+
+export interface LspTextEdit {
+  line: number;
+  col: number;
+  end_line: number;
+  end_col: number;
+  new_text: string;
+}
+
+export interface LspFileTextEdits {
+  path: string;
+  edits: LspTextEdit[];
+}
+
+export interface LspWorkspaceEdit {
+  file_edits: LspFileTextEdits[];
+}
+
+export interface LspCommand {
+  title: string;
+  command: string;
+  arguments?: unknown[];
+}
+
+export interface LspCodeAction {
+  title: string;
+  kind?: string | null;
+  is_preferred: boolean;
+  edit?: LspWorkspaceEdit | null;
+  command?: LspCommand | null;
+}
+
+export interface LspWorkspaceEditResult {
+  applied: boolean;
+  modified_files: string[];
+  total_edits: number;
+}
+
 export interface MentionRankRequest {
   host_id: string;
   cwd: string;
@@ -5068,6 +5137,130 @@ export const orbitIpc = {
       path: params.path,
       line: params.line,
       col: params.col,
+    });
+  },
+
+  lspHover: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    content?: string | null;
+  }): Promise<LspHoverInfo | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<LspHoverInfo | null>("lsp_hover", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      content: params.content ?? null,
+    });
+  },
+
+  lspReferences: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    includeDeclaration?: boolean;
+    content?: string | null;
+  }): Promise<LspReferenceLocation[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspReferenceLocation[]>("lsp_references", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      includeDeclaration: params.includeDeclaration ?? true,
+      content: params.content ?? null,
+    });
+  },
+
+  lspCompletion: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    triggerCharacter?: string | null;
+    content?: string | null;
+  }): Promise<LspCompletionItem[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspCompletionItem[]>("lsp_completion", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      triggerCharacter: params.triggerCharacter ?? null,
+      content: params.content ?? null,
+    });
+  },
+
+  lspCodeAction: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    endLine: number;
+    endCol: number;
+    diagnostics?: LspDiagnostic[];
+    content?: string | null;
+  }): Promise<LspCodeAction[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspCodeAction[]>("lsp_code_action", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      endLine: params.endLine,
+      endCol: params.endCol,
+      diagnostics: params.diagnostics ?? [],
+      content: params.content ?? null,
+    });
+  },
+
+  lspRename: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    newName: string;
+    content?: string | null;
+  }): Promise<LspWorkspaceEditResult> => {
+    if (!isTauriRuntime()) {
+      return { applied: false, modified_files: [], total_edits: 0 };
+    }
+    return invoke<LspWorkspaceEditResult>("lsp_rename", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      newName: params.newName,
+      content: params.content ?? null,
+    });
+  },
+
+  lspApplyWorkspaceEdit: async (params: {
+    hostId: string;
+    cwd: string;
+    edit: LspWorkspaceEdit;
+  }): Promise<LspWorkspaceEditResult> => {
+    if (!isTauriRuntime()) {
+      return { applied: false, modified_files: [], total_edits: 0 };
+    }
+    return invoke<LspWorkspaceEditResult>("lsp_apply_workspace_edit", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      edit: params.edit,
     });
   },
 

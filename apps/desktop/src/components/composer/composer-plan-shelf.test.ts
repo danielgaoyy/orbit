@@ -95,10 +95,21 @@ it("renders no empty wrapper, hides stale settled plans on fresh mount, and rend
     assert.match(liveSettled, /aria-valuenow="1"/);
     assert.doesNotMatch(liveSettled, /aria-label="Dismiss finished plan"/);
 
-    // Incomplete plan from an earlier turn stays visible as paused and can be dismissed.
-    const staleIncomplete = render([step("a", "in_progress", 2)], false, true, "stale-prev", 10);
-    assert.match(staleIncomplete, /aria-label="Dismiss finished plan"/);
-    assert.match(staleIncomplete, /paused/i);
+    // Incomplete plan from an earlier turn stays visible without a false "(paused)" tag
+    // while a continuation turn is actively running, and shows "(paused)" when stopped.
+    const staleRunningContinuation = render(
+      [step("a", "in_progress", 2)],
+      false,
+      true,
+      "stale-prev-run",
+      10,
+    );
+    assert.match(staleRunningContinuation, /aria-label="Dismiss finished plan"/);
+    assert.doesNotMatch(staleRunningContinuation, /paused/i);
+
+    const staleStopped = render([step("a", "in_progress", 2)], false, false, "stale-prev-stop", 10);
+    assert.match(staleStopped, /aria-label="Dismiss finished plan"/);
+    assert.match(staleStopped, /paused/i);
   } finally {
     await server.close();
   }
@@ -138,10 +149,13 @@ it("keeps stale progress static when idle or when belonging to a previous turn",
   assert.equal(paused?.state, "paused");
   assert.equal(paused.title, "Step current");
   assert.equal(traceStatus[paused.state], "pending");
-  // Even if a newer turn (anchor_seq 10) is actively running, turn 1's stale in_progress stays paused.
+  // When a newer turn (anchor_seq 10) is actively running, turn 1's carried-over in_progress
+  // steps neither spin as live `running` nor display misleading `paused`; they present as
+  // neutral `pending` while remaining the headline and dismissible until the new turn updates the plan.
   const prevTurnRunning = describePlan(rows, true, 10);
   assert.equal(prevTurnRunning?.isFromPreviousTurn, true);
-  assert.equal(prevTurnRunning?.headline?.state, "paused");
+  assert.equal(prevTurnRunning?.headline?.id, "current");
+  assert.equal(prevTurnRunning?.headline?.state, "pending");
   assert.equal(prevTurnRunning?.canDismiss, true);
   assert.equal(describePlan([...rows, step("error", "failed")], false)?.headline?.state, "failed");
   assert.equal(

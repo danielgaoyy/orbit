@@ -146,6 +146,7 @@ struct AgyStreamSegmentState {
     active_thought_id: Option<String>,
     msg_accum: HashMap<String, String>,
     thought_accum: HashMap<String, String>,
+    latest_msg_text: Option<String>,
 }
 
 fn build_agy_mcp_servers_http(cfg: &SessionLaunchConfig) -> Value {
@@ -254,6 +255,102 @@ fn prepend_handoff_context(ctx: Option<String>, prompt: &str) -> String {
         return prompt.to_string();
     }
     format!("{ctx}\n\n{prompt}")
+}
+
+fn prepend_interrupted_reply_handoff(handoff: Option<String>, prompt: &str) -> String {
+    let Some(ctx) = handoff.filter(|c| !c.trim().is_empty()) else {
+        return prompt.to_string();
+    };
+    if prompt.contains("[Interrupted Prior Turn Context]") {
+        return prompt.to_string();
+    }
+    format!("{ctx}\n\n{prompt}")
+}
+
+fn snapshot_active_partial_reply(seg_state: &AgyStreamSegmentState) -> Option<String> {
+    if let Some(ref mid) = seg_state.active_msg_id
+        && let Some(text) = seg_state.msg_accum.get(mid)
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    seg_state
+        .latest_msg_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn format_interrupted_reply_handoff(partial: &str) -> String {
+    let clipped = truncate_preview(partial.trim(), 1200);
+    format!(
+        "[Interrupted Prior Turn Context]\n\
+         In the previous turn you streamed the following partial reply to the user before being interrupted, and that uncommitted turn was rolled back from your history:\n\
+         \"\"\"\n\
+         {clipped}\n\
+         \"\"\"\n\
+         Do not repeat the above verbatim; continue directly from where you left off or address the user's new request below."
+    )
+}
+
+fn planner_texts_committed_reply(committed: &[String], partial: &str) -> bool {
+    let norm_partial = partial.split_whitespace().collect::<Vec<_>>().join(" ");
+    if norm_partial.is_empty() {
+        return true;
+    }
+    let char_count = norm_partial.chars().count();
+    let needle: String = if char_count <= 24 {
+        norm_partial
+    } else {
+        norm_partial.chars().take(80).collect()
+    };
+    committed.iter().any(|text| {
+        let norm_committed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        norm_committed.contains(&needle)
+    })
+}
+
+fn classify_agy_stderr_notice(line: &str) -> Option<(&'static str, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("no space left on device")
+        || lower.contains("disk is full")
+        || lower.contains("database or disk is full")
+        || lower.contains("enospc")
+    {
+        return Some((
+            "disk_full",
+            format!(
+                "Antigravity disk space error: {}",
+                truncate_preview(trimmed, 300)
+            ),
+        ));
+    }
+    if lower.contains("read-only file system") {
+        return Some((
+            "readonly_fs",
+            format!(
+                "Antigravity filesystem error: {}",
+                truncate_preview(trimmed, 300)
+            ),
+        ));
+    }
+    if lower.contains("cannot allocate memory") || lower.contains("out of memory") {
+        return Some((
+            "oom",
+            format!(
+                "Antigravity memory error: {}",
+                truncate_preview(trimmed, 300)
+            ),
+        ));
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -791,11 +888,14 @@ async fn run_agy_actor(
     let mut pending_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
     let mut active_turn_message_ids: Vec<String> = Vec::new();
-    let mut subagent_monitors: HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)> =
-        HashMap::new();
+    let mut subagent_monitors: HashMap<String, AgySubagentMonitorEntry> = HashMap::new();
 
     // Post-turn autonomous wakeup (`transcript_full.jsonl`) + first-class background-task tracking
-    let mut transcript_monitor = AgyTranscriptMonitor::new(&session_id);
+    let agy_data_dir = resolve_agy_data_dir_with_extra_env(&cfg.extra_env);
+    let mut transcript_monitor = AgyTranscriptMonitor::from_brain_dir_with_session(
+        agy_data_dir.join("brain").join(&session_id),
+        &session_id,
+    );
     // Skip any historical steps already recorded on disk when attaching/resuming, while:
     // 1. Remembering already-finished background task IDs so shim ring-buffer replay can never
     //    resurrect them,
@@ -805,7 +905,8 @@ async fn run_agy_actor(
     //    canonical `call_id` closes cleanly when they finish later, and
     // 4. Registering historical native subagents so Overview / SubagentsTrack reflect real state.
     let historical_bg_deltas = transcript_monitor.sync_silent_with_bg_tasks();
-    let mut wakeup_tools = WakeupToolRegistry::default();
+    transcript_monitor.clear_committed_planner_texts();
+    let mut wakeup_tools = WakeupToolRegistry::with_data_dir(agy_data_dir.clone());
     let mut bg_tracker = BackgroundTaskTracker::default();
     struct HistoricalBgStart {
         description: Option<String>,
@@ -841,12 +942,14 @@ async fn run_agy_actor(
                 role,
                 prompt_preview,
             } => {
-                register_agy_subagent_monitor(
+                register_agy_subagent_monitor_in_dir(
                     &cfg.agent_id,
                     &subagent_id,
                     &role,
                     &prompt_preview,
                     true,
+                    false,
+                    Some(agy_data_dir.as_path()),
                     &mut subagent_monitors,
                     &evt_tx,
                 )
@@ -957,8 +1060,12 @@ async fn run_agy_actor(
         None
     };
     let mut user_interrupted = false;
+    let mut turn_was_cancelled = false;
     let mut cancelling_active_turn = false;
     let mut cancel_deadline: Option<tokio::time::Instant> = None;
+    let mut pending_cancelled_partial_reply: Option<String> = None;
+    let mut pending_interrupted_reply_handoff: Option<String> = None;
+    let mut last_stderr_notice: HashMap<&'static str, Instant> = HashMap::new();
     let mut pending_self_heal: Option<PendingSelfHeal> = None;
     let mut consecutive_self_heals: u32 = 0;
     let mut last_ask_question_raw: Option<Vec<QuestionItem>> = None;
@@ -967,6 +1074,7 @@ async fn run_agy_actor(
 
     loop {
         tokio::select! {
+            biased;
             maybe_cmd = cmd_rx.recv() => {
                 idle_poll_tick = 0;
                 let Some(cmd) = maybe_cmd else { break; };
@@ -1015,7 +1123,18 @@ async fn run_agy_actor(
                                     &mut last_ask_question_raw,
                                 )
                                 .await;
+                                if let Some(partial) = snapshot_active_partial_reply(&seg_state) {
+                                    pending_cancelled_partial_reply = Some(partial);
+                                }
                                 finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+                                settle_cancelled_turn_resources(
+                                    &mut bg_tracker,
+                                    &mut wakeup_tools,
+                                    &mut subagent_monitors,
+                                    &evt_tx,
+                                )
+                                .await;
+                                turn_was_cancelled = true;
                                 cancelling_active_turn = true;
                                 cancel_deadline = Some(
                                     tokio::time::Instant::now() + Duration::from_secs(10),
@@ -1086,7 +1205,18 @@ async fn run_agy_actor(
                                 // `ActiveTurnBehavior::Steer` for human prompts: `agy acp` has no native mid-RPC steer without
                                 // `session/cancel`. Cancel cleanly, flush streaming buffers, preserve accepted
                                 // FIFO `pending_prompts`, and schedule this replacement as priority next turn.
+                                if let Some(partial) = snapshot_active_partial_reply(&seg_state) {
+                                    pending_cancelled_partial_reply = Some(partial);
+                                }
                                 finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+                                settle_cancelled_turn_resources(
+                                    &mut bg_tracker,
+                                    &mut wakeup_tools,
+                                    &mut subagent_monitors,
+                                    &evt_tx,
+                                )
+                                .await;
+                                turn_was_cancelled = true;
                                 cancelling_active_turn = true;
                                 cancel_deadline = Some(
                                     tokio::time::Instant::now() + Duration::from_secs(10),
@@ -1143,13 +1273,18 @@ async fn run_agy_actor(
                         }
 
                         cancelling_active_turn = false;
+                        turn_was_cancelled = false;
                         cancel_deadline = None;
-                        let effective_prompt = if inject_handoff_on_next_prompt {
+                        let with_handoff = if inject_handoff_on_next_prompt {
                             inject_handoff_on_next_prompt = false;
                             prepend_handoff_context(pending_handoff_context.take(), &prompt)
                         } else {
                             prompt
                         };
+                        let effective_prompt = prepend_interrupted_reply_handoff(
+                            pending_interrupted_reply_handoff.take(),
+                            &with_handoff,
+                        );
                         active_turn_message_ids = message_ids.clone();
                         last_dispatched_prompt = Some(QueuedDriverPrompt {
                             turn_id: turn_id.clone(),
@@ -1202,30 +1337,27 @@ async fn run_agy_actor(
                         let dropped_rep = pending_interrupt_replacement.take();
                         emit_dropped_queued_prompts(&evt_tx, dropped_rep, &mut pending_prompts)
                             .await;
+                        if let Some(partial) = snapshot_active_partial_reply(&seg_state) {
+                            pending_cancelled_partial_reply = Some(partial);
+                        }
                         finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
                         let had_active =
                             active_prompt_rpc_key.is_some() || active_turn_id.is_some();
                         cancelling_active_turn = had_active;
                         if had_active {
+                            turn_was_cancelled = true;
                             cancel_deadline =
                                 Some(tokio::time::Instant::now() + Duration::from_secs(10));
                         }
-                        bg_tracker.clear();
-                        cancel_agy_subagent_monitors(None, &mut subagent_monitors, &evt_tx).await;
+                        settle_cancelled_turn_resources(
+                            &mut bg_tracker,
+                            &mut wakeup_tools,
+                            &mut subagent_monitors,
+                            &evt_tx,
+                        )
+                        .await;
                         if autonomous_turn_id.take().is_some() {
                             transcript_monitor.sync_silent();
-                            for (cid, detail, bg_info) in
-                                wakeup_tools.settle_open_tools(&HashSet::new())
-                            {
-                                let _ = evt_tx
-                                    .send(DriverEvent::ToolCall {
-                                        call_id: cid,
-                                        status: ToolCallStatus::Failed,
-                                        detail,
-                                        background_task: bg_info,
-                                    })
-                                    .await;
-                            }
                             if active_turn_id.is_none() {
                                 let _ = evt_tx
                                     .send(DriverEvent::StatusChanged(AgentStatus::Idle))
@@ -1253,6 +1385,9 @@ async fn run_agy_actor(
                     DriverCommand::InterruptAndDrainQueue => {
                         user_interrupted = false;
                         pending_self_heal = None;
+                        if let Some(partial) = snapshot_active_partial_reply(&seg_state) {
+                            pending_cancelled_partial_reply = Some(partial);
+                        }
                         finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
                         cancel_pending_agy_perms_and_elicits(
                             &shim,
@@ -1261,9 +1396,17 @@ async fn run_agy_actor(
                             &mut last_ask_question_raw,
                         )
                         .await;
+                        settle_cancelled_turn_resources(
+                            &mut bg_tracker,
+                            &mut wakeup_tools,
+                            &mut subagent_monitors,
+                            &evt_tx,
+                        )
+                        .await;
                         let had_active =
                             active_prompt_rpc_key.is_some() || active_turn_id.is_some();
                         if had_active {
+                            turn_was_cancelled = true;
                             cancelling_active_turn = true;
                             cancel_deadline =
                                 Some(tokio::time::Instant::now() + Duration::from_secs(10));
@@ -1287,7 +1430,7 @@ async fn run_agy_actor(
                             .take()
                             .or_else(|| pending_prompts.pop_front())
                         {
-                            let effective_prompt = if inject_handoff_on_next_prompt {
+                            let with_handoff = if inject_handoff_on_next_prompt {
                                 inject_handoff_on_next_prompt = false;
                                 prepend_handoff_context(
                                     pending_handoff_context.take(),
@@ -1296,6 +1439,10 @@ async fn run_agy_actor(
                             } else {
                                 next.prompt
                             };
+                            let effective_prompt = prepend_interrupted_reply_handoff(
+                                pending_interrupted_reply_handoff.take(),
+                                &with_handoff,
+                            );
                             active_turn_message_ids = next.message_ids.clone();
                             last_dispatched_prompt = Some(QueuedDriverPrompt {
                                 turn_id: next.turn_id.clone(),
@@ -1341,6 +1488,11 @@ async fn run_agy_actor(
                                 None,
                             )
                             .await;
+                        } else if autonomous_turn_id.take().is_some() {
+                            transcript_monitor.sync_silent();
+                            let _ = evt_tx
+                                .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+                                .await;
                         }
                     }
                     DriverCommand::SetMode { mode: new_mode } => {
@@ -1709,8 +1861,17 @@ async fn run_agy_actor(
                                 if active_prompt_rpc_key.as_deref() == Some(key.as_str())
                                     || is_reattached_completion
                                 {
+                                    let stop_reason = val
+                                        .pointer("/result/stopReason")
+                                        .and_then(|v| v.as_str());
+                                    let was_cancelled = cancelling_active_turn
+                                        || turn_was_cancelled
+                                        || stop_reason == Some("cancelled");
+                                    let reconcile_in_place_only =
+                                        was_cancelled || pending_interrupt_replacement.is_some();
                                     reattached_turn_in_flight = false;
                                     cancelling_active_turn = false;
+                                    turn_was_cancelled = false;
                                     cancel_deadline = None;
                                     active_prompt_rpc_key = None;
                                     pending_perms.clear();
@@ -1855,10 +2016,34 @@ async fn run_agy_actor(
 
                                     // Fast-forward transcript reader past foreground steps while still
                                     // capturing any newly spawned/completed background task IDs.
-                                    let bg_deltas = transcript_monitor.sync_silent_with_bg_tasks();
-                                    apply_foreground_bg_deltas(
+                                    let (bg_deltas, committed_texts) =
+                                        transcript_monitor.sync_silent_for_turn_end();
+                                    if was_cancelled
+                                        && let Some(partial) = pending_cancelled_partial_reply.take()
+                                        && transcript_monitor.active_path().is_some()
+                                        && !planner_texts_committed_reply(
+                                            &committed_texts,
+                                            &partial,
+                                        )
+                                    {
+                                        pending_interrupted_reply_handoff =
+                                            Some(format_interrupted_reply_handoff(&partial));
+                                        if pending_interrupt_replacement.is_none() {
+                                            let _ = evt_tx
+                                                .send(DriverEvent::Notice {
+                                                    level: "info".into(),
+                                                    message: "Interrupted before completion; partial reply context will be carried into your next turn.".into(),
+                                                })
+                                                .await;
+                                        }
+                                    } else {
+                                        pending_cancelled_partial_reply = None;
+                                    }
+                                    apply_foreground_bg_deltas_with_mode(
                                         &cfg.agent_id,
                                         bg_deltas,
+                                        reconcile_in_place_only,
+                                        was_cancelled,
                                         &mut wakeup_tools,
                                         &mut bg_tracker,
                                         &mut tool_cache,
@@ -1866,32 +2051,66 @@ async fn run_agy_actor(
                                         &evt_tx,
                                     )
                                     .await;
-                                    // Settle any non-background foreground tools left open when the turn ended
-                                    let active_bg_calls = bg_tracker.active_call_ids();
-                                    let settle_status = if val.get("error").is_some() {
-                                        ToolCallStatus::Failed
+                                    if was_cancelled {
+                                        settle_cancelled_turn_resources(
+                                            &mut bg_tracker,
+                                            &mut wakeup_tools,
+                                            &mut subagent_monitors,
+                                            &evt_tx,
+                                        )
+                                        .await;
                                     } else {
-                                        ToolCallStatus::Completed
-                                    };
-                                    for (cid, detail, bg_info) in
-                                        wakeup_tools.settle_open_tools(&active_bg_calls)
-                                    {
-                                        let _ = evt_tx
-                                            .send(DriverEvent::ToolCall {
-                                                call_id: cid,
-                                                status: settle_status,
-                                                detail,
-                                                background_task: bg_info,
-                                            })
-                                            .await;
+                                        // Settle any non-background foreground tools left open when the turn ended
+                                        let active_bg_calls = bg_tracker.active_call_ids();
+                                        let settle_status = if val.get("error").is_some() {
+                                            ToolCallStatus::Failed
+                                        } else {
+                                            ToolCallStatus::Completed
+                                        };
+                                        if reconcile_in_place_only {
+                                            let settlements: Vec<(String, ToolCallStatus)> =
+                                                wakeup_tools
+                                                    .settle_open_tools(&active_bg_calls)
+                                                    .into_iter()
+                                                    .map(|(cid, _, _)| (cid, settle_status))
+                                                    .collect();
+                                            if !settlements.is_empty() {
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::ReconcileBackgroundTasks(
+                                                        settlements,
+                                                    ))
+                                                    .await;
+                                            }
+                                        } else {
+                                            for (cid, detail, bg_info) in
+                                                wakeup_tools.settle_open_tools(&active_bg_calls)
+                                            {
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::ToolCall {
+                                                        call_id: cid,
+                                                        status: settle_status,
+                                                        detail,
+                                                        background_task: bg_info,
+                                                    })
+                                                    .await;
+                                            }
+                                        }
                                     }
                                     // Drain interrupted-replacement or accepted FIFO queued prompt
                                     if let Some(next_q) = pending_interrupt_replacement
                                         .take()
                                         .or_else(|| pending_prompts.pop_front())
                                     {
+                                        let next_prompt = prepend_interrupted_reply_handoff(
+                                            pending_interrupted_reply_handoff.take(),
+                                            &next_q.prompt,
+                                        );
                                         active_turn_message_ids = next_q.message_ids.clone();
-                                        last_dispatched_prompt = Some(next_q.clone());
+                                        last_dispatched_prompt = Some(QueuedDriverPrompt {
+                                            turn_id: next_q.turn_id.clone(),
+                                            prompt: next_prompt.clone(),
+                                            message_ids: next_q.message_ids,
+                                        });
                                         wakeup_tools.begin_turn();
                                         if dispatch_agy_prompt(
                                             &shim,
@@ -1907,7 +2126,7 @@ async fn run_agy_actor(
                                             &mut last_ask_question_raw,
                                             &evt_tx,
                                             next_q.turn_id.clone(),
-                                            next_q.prompt,
+                                            next_prompt,
                                         )
                                         .await
                                         .is_err()
@@ -1956,7 +2175,10 @@ async fn run_agy_actor(
                                                 recoverable: true,
                                             }))
                                             .await;
-                                    } else if !user_interrupted && !bg_tracker.is_empty() {
+                                    } else if !user_interrupted
+                                        && !was_cancelled
+                                        && !bg_tracker.is_empty()
+                                    {
                                         // First-class background task state: remain active until all
                                         // tracked background tasks finish and their follow-up settles.
                                         let wait_tid =
@@ -2072,6 +2294,56 @@ async fn run_agy_actor(
                             .await;
                         }
                     }
+                    ShimFrame::StderrLine { line, .. } => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            if let Some((category, notice_msg)) = classify_agy_stderr_notice(trimmed)
+                            {
+                                warn!(
+                                    agent_id = %cfg.agent_id,
+                                    session_id = %session_id,
+                                    stderr_category = category,
+                                    stderr = %trimmed,
+                                    "Antigravity runtime reported fatal stderr error"
+                                );
+                                let now = Instant::now();
+                                let should_emit = last_stderr_notice
+                                    .get(category)
+                                    .is_none_or(|prev| {
+                                        now.duration_since(*prev) >= Duration::from_secs(30)
+                                    });
+                                if should_emit {
+                                    last_stderr_notice.insert(category, now);
+                                    let _ = evt_tx
+                                        .send(DriverEvent::Notice {
+                                            level: "error".into(),
+                                            message: notice_msg,
+                                        })
+                                        .await;
+                                }
+                            } else {
+                                let lower = trimmed.to_ascii_lowercase();
+                                if lower.contains("error")
+                                    || lower.contains("fatal")
+                                    || lower.contains("panic")
+                                {
+                                    warn!(
+                                        agent_id = %cfg.agent_id,
+                                        session_id = %session_id,
+                                        stderr = %trimmed,
+                                        "Antigravity stderr"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        agent_id = %cfg.agent_id,
+                                        session_id = %session_id,
+                                        stderr = %trimmed,
+                                        "Antigravity stderr"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     ShimFrame::Exited { code } => {
                         emit_dropped_queued_prompts(
                             &evt_tx,
@@ -2097,6 +2369,13 @@ async fn run_agy_actor(
                                 exit_code = ?code,
                                 "Antigravity shim process exited"
                             );
+                        } else {
+                            info!(
+                                agent_id = %cfg.agent_id,
+                                session_id = %session_id,
+                                exit_code = ?code,
+                                "Antigravity shim process exited cleanly"
+                            );
                         }
                         let _ = evt_tx.send(DriverEvent::Exited { code }).await;
                         break;
@@ -2108,7 +2387,7 @@ async fn run_agy_actor(
             _ = transcript_poll.tick() => {
                 let has_running_subagent = subagent_monitors
                     .values()
-                    .any(|(desc, _)| desc.status == ProviderSubagentStatus::Running);
+                    .any(|entry| entry.desc.status == ProviderSubagentStatus::Running);
                 let is_fully_idle = active_turn_id.is_none()
                     && autonomous_turn_id.is_none()
                     && bg_tracker.is_empty()
@@ -2128,17 +2407,33 @@ async fn run_agy_actor(
                 // Non-Running subagents are checked cheaply via `has_unconsumed_growth()` so resumed
                 // subagents (e.g. via `send_message` or after reconnect/compaction) self-heal back to
                 // `Running` and stream follow-up turns automatically.
-                for (sub_id, (desc, sub_mon)) in subagent_monitors.iter_mut() {
-                    if desc.status != ProviderSubagentStatus::Running
-                        && !sub_mon.has_unconsumed_growth()
+                for (sub_id, entry) in subagent_monitors.iter_mut() {
+                    if entry.desc.status != ProviderSubagentStatus::Running
+                        && !entry.monitor.has_unconsumed_growth()
                     {
                         continue;
                     }
-                    poll_agy_subagent_monitor(sub_id, desc, sub_mon, &evt_tx).await;
+                    poll_agy_subagent_monitor(sub_id, entry, &evt_tx).await;
                 }
 
-                // Only monitor post-turn autonomous wakeups & self-healing when foreground turn is idle
-                if active_turn_id.is_none() {
+                // Surface newly spawned subagents & background tasks even while foreground turn runs
+                // continuously without emitting assistant prose, and monitor post-turn wakeups when idle.
+                if !cancelling_active_turn {
+                    if active_turn_id.is_some() {
+                        let bg_deltas = transcript_monitor.poll_foreground_bg_deltas();
+                        if !bg_deltas.is_empty() {
+                            apply_foreground_bg_deltas(
+                                &cfg.agent_id,
+                                bg_deltas,
+                                &mut wakeup_tools,
+                                &mut bg_tracker,
+                                &mut tool_cache,
+                                &mut subagent_monitors,
+                                &evt_tx,
+                            )
+                            .await;
+                        }
+                    } else {
                     for wake_ev in transcript_monitor.poll_post_turn_wakeup() {
                         match wake_ev {
                             WakeupStep::Started { source } => {
@@ -2160,6 +2455,7 @@ async fn run_agy_actor(
                                 description,
                                 log_path,
                                 expires_at,
+                                command,
                             } => {
                                 let bg_info = BackgroundTaskInfo {
                                     task_id: Some(task_id.clone()),
@@ -2174,8 +2470,10 @@ async fn run_agy_actor(
                                         bg_tracker.call_id_for(&task_id).map(ToOwned::to_owned)
                                     })
                                     .or_else(|| {
-                                        wakeup_tools
-                                            .find_matching_call_id_for_bg_task(description.as_deref())
+                                        wakeup_tools.find_matching_call_id_for_bg_task(
+                                            description.as_deref(),
+                                            command.as_deref(),
+                                        )
                                     });
                                 if let Some(ref cid) = canon_cid {
                                     wakeup_tools.mark_background_task(cid, bg_info.clone());
@@ -2242,12 +2540,14 @@ async fn run_agy_actor(
                                         ref prompt_preview,
                                     } = emit_detail
                                     {
-                                        register_agy_subagent_monitor(
+                                        register_agy_subagent_monitor_in_dir(
                                             &cfg.agent_id,
                                             child_conv_id,
                                             role,
                                             prompt_preview,
                                             false,
+                                            false,
+                                            Some(agy_data_dir.as_path()),
                                             &mut subagent_monitors,
                                             &evt_tx,
                                         )
@@ -2278,12 +2578,14 @@ async fn run_agy_actor(
                                 role,
                                 prompt_preview,
                             } => {
-                                register_agy_subagent_monitor(
+                                register_agy_subagent_monitor_in_dir(
                                     &cfg.agent_id,
                                     &subagent_id,
                                     &role,
                                     &prompt_preview,
                                     false,
+                                    false,
+                                    Some(agy_data_dir.as_path()),
                                     &mut subagent_monitors,
                                     &evt_tx,
                                 )
@@ -2548,6 +2850,7 @@ async fn run_agy_actor(
                             }
                         }
                     }
+                    }
                 }
             }
 
@@ -2560,6 +2863,7 @@ async fn run_agy_actor(
             }, if cancel_deadline.is_some() => {
                 cancel_deadline = None;
                 cancelling_active_turn = false;
+                turn_was_cancelled = false;
                 reattached_turn_in_flight = false;
                 active_prompt_rpc_key = None;
                 let timed_out_tid = active_turn_id.take();
@@ -2578,6 +2882,33 @@ async fn run_agy_actor(
                 pending_elicits.clear();
                 last_ask_question_raw = None;
                 finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+                let (bg_deltas, committed_texts) = transcript_monitor.sync_silent_for_turn_end();
+                if let Some(partial) = pending_cancelled_partial_reply.take()
+                    && transcript_monitor.active_path().is_some()
+                    && !planner_texts_committed_reply(&committed_texts, &partial)
+                {
+                    pending_interrupted_reply_handoff =
+                        Some(format_interrupted_reply_handoff(&partial));
+                }
+                apply_foreground_bg_deltas_with_mode(
+                    &cfg.agent_id,
+                    bg_deltas,
+                    true,
+                    true,
+                    &mut wakeup_tools,
+                    &mut bg_tracker,
+                    &mut tool_cache,
+                    &mut subagent_monitors,
+                    &evt_tx,
+                )
+                .await;
+                settle_cancelled_turn_resources(
+                    &mut bg_tracker,
+                    &mut wakeup_tools,
+                    &mut subagent_monitors,
+                    &evt_tx,
+                )
+                .await;
                 let _ = evt_tx
                     .send(DriverEvent::Notice {
                         level: "warning".into(),
@@ -2588,8 +2919,16 @@ async fn run_agy_actor(
                     .take()
                     .or_else(|| pending_prompts.pop_front())
                 {
+                    let next_prompt = prepend_interrupted_reply_handoff(
+                        pending_interrupted_reply_handoff.take(),
+                        &next_q.prompt,
+                    );
                     active_turn_message_ids = next_q.message_ids.clone();
-                    last_dispatched_prompt = Some(next_q.clone());
+                    last_dispatched_prompt = Some(QueuedDriverPrompt {
+                        turn_id: next_q.turn_id.clone(),
+                        prompt: next_prompt.clone(),
+                        message_ids: next_q.message_ids,
+                    });
                     wakeup_tools.begin_turn();
                     if dispatch_agy_prompt(
                         &shim,
@@ -2605,7 +2944,7 @@ async fn run_agy_actor(
                         &mut last_ask_question_raw,
                         &evt_tx,
                         next_q.turn_id.clone(),
-                        next_q.prompt,
+                        next_prompt,
                     )
                     .await
                     .is_err()
@@ -2645,6 +2984,33 @@ async fn run_agy_actor(
     }
 }
 
+async fn settle_cancelled_turn_resources(
+    bg_tracker: &mut BackgroundTaskTracker,
+    wakeup_tools: &mut WakeupToolRegistry,
+    subagent_monitors: &mut HashMap<String, AgySubagentMonitorEntry>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let mut settlements: Vec<(String, ToolCallStatus)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for cid in bg_tracker.drain_and_finish_call_ids() {
+        let _ = wakeup_tools.finish_tool(&cid, ToolCallStatus::Failed);
+        if seen.insert(cid.clone()) {
+            settlements.push((cid, ToolCallStatus::Failed));
+        }
+    }
+    for (cid, _, _) in wakeup_tools.settle_open_tools(&HashSet::new()) {
+        if seen.insert(cid.clone()) {
+            settlements.push((cid, ToolCallStatus::Failed));
+        }
+    }
+    if !settlements.is_empty() {
+        let _ = evt_tx
+            .send(DriverEvent::ReconcileBackgroundTasks(settlements))
+            .await;
+    }
+    cancel_agy_subagent_monitors(None, subagent_monitors, evt_tx).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_foreground_bg_deltas(
     parent_agent_id: &str,
@@ -2652,9 +3018,36 @@ async fn apply_foreground_bg_deltas(
     wakeup_tools: &mut WakeupToolRegistry,
     bg_tracker: &mut BackgroundTaskTracker,
     tool_cache: &mut HashMap<String, ToolCallDetail>,
-    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    subagent_monitors: &mut HashMap<String, AgySubagentMonitorEntry>,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) {
+    apply_foreground_bg_deltas_with_mode(
+        parent_agent_id,
+        bg_deltas,
+        false,
+        false,
+        wakeup_tools,
+        bg_tracker,
+        tool_cache,
+        subagent_monitors,
+        evt_tx,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_foreground_bg_deltas_with_mode(
+    parent_agent_id: &str,
+    bg_deltas: Vec<BgTaskDelta>,
+    reconcile_in_place_only: bool,
+    turn_cancelled: bool,
+    wakeup_tools: &mut WakeupToolRegistry,
+    bg_tracker: &mut BackgroundTaskTracker,
+    tool_cache: &mut HashMap<String, ToolCallDetail>,
+    subagent_monitors: &mut HashMap<String, AgySubagentMonitorEntry>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let mut in_place_settlements: Vec<(String, ToolCallStatus)> = Vec::new();
     for delta in bg_deltas {
         match delta {
             BgTaskDelta::Started {
@@ -2663,6 +3056,7 @@ async fn apply_foreground_bg_deltas(
                 description,
                 log_path,
                 expires_at,
+                command,
             } => {
                 if bg_tracker.is_finished(&task_id) {
                     continue;
@@ -2675,8 +3069,32 @@ async fn apply_foreground_bg_deltas(
                 let resolved_cid = call_id
                     .or_else(|| bg_tracker.call_id_for(&task_id).map(ToOwned::to_owned))
                     .or_else(|| {
-                        wakeup_tools.find_matching_call_id_for_bg_task(description.as_deref())
+                        wakeup_tools.find_matching_call_id_for_bg_task(
+                            description.as_deref(),
+                            command.as_deref(),
+                        )
                     });
+                if reconcile_in_place_only {
+                    if let Some(cid) = resolved_cid {
+                        let _ = wakeup_tools.mark_background_task(&cid, bg_info.clone());
+                        bg_tracker.record_started_with_expiry(
+                            task_id,
+                            Some(cid),
+                            log_path,
+                            Some(bg_info),
+                            expires_at,
+                        );
+                    } else if !turn_cancelled {
+                        bg_tracker.record_started_with_expiry(
+                            task_id,
+                            None,
+                            log_path,
+                            Some(bg_info),
+                            expires_at,
+                        );
+                    }
+                    continue;
+                }
                 let (final_cid, emit_detail, emit_bg_info) = if let Some(cid) = resolved_cid {
                     match wakeup_tools.mark_background_task(&cid, bg_info.clone()) {
                         Some((det, merged_bg, true)) => (cid, Some(det), merged_bg),
@@ -2685,8 +3103,8 @@ async fn apply_foreground_bg_deltas(
                     }
                 } else {
                     let synth_id = format!("bg_task_{}", sanitize_bg_task_id(&task_id));
-                    let desc_text = description
-                        .clone()
+                    let desc_text = command
+                        .or_else(|| description.clone())
                         .unwrap_or_else(|| "Background task".to_string());
                     let is_schedule_bg = is_schedule_bg_task_description(description.as_deref());
                     let det = if is_schedule_bg {
@@ -2738,14 +3156,20 @@ async fn apply_foreground_bg_deltas(
                         ToolCallStatus::Completed
                     };
                     if let Some((detail, bg_info)) = wakeup_tools.finish_tool(cid, final_st) {
-                        let _ = evt_tx
-                            .send(DriverEvent::ToolCall {
-                                call_id: cid.clone(),
-                                status: final_st,
-                                detail,
-                                background_task: bg_info,
-                            })
-                            .await;
+                        if reconcile_in_place_only {
+                            in_place_settlements.push((cid.clone(), final_st));
+                        } else {
+                            let _ = evt_tx
+                                .send(DriverEvent::ToolCall {
+                                    call_id: cid.clone(),
+                                    status: final_st,
+                                    detail,
+                                    background_task: bg_info,
+                                })
+                                .await;
+                        }
+                    } else if reconcile_in_place_only {
+                        in_place_settlements.push((cid.clone(), final_st));
                     }
                 }
             }
@@ -2754,19 +3178,24 @@ async fn apply_foreground_bg_deltas(
                 role,
                 prompt_preview,
             } => {
-                register_agy_subagent_monitor(
+                let data_dir_opt = wakeup_tools.agy_data_dir.clone();
+                register_agy_subagent_monitor_in_dir(
                     parent_agent_id,
                     &subagent_id,
                     &role,
                     &prompt_preview,
                     false,
+                    turn_cancelled,
+                    data_dir_opt.as_deref(),
                     subagent_monitors,
                     evt_tx,
                 )
                 .await;
             }
             BgTaskDelta::SubagentMessaged { subagent_id } => {
-                resume_agy_subagent_monitor(&subagent_id, subagent_monitors, evt_tx).await;
+                if !turn_cancelled {
+                    resume_agy_subagent_monitor(&subagent_id, subagent_monitors, evt_tx).await;
+                }
             }
             BgTaskDelta::SubagentsCanceled { ids } => {
                 cancel_agy_subagent_monitors(ids.as_deref(), subagent_monitors, evt_tx).await;
@@ -2780,6 +3209,11 @@ async fn apply_foreground_bg_deltas(
                     .await;
             }
         }
+    }
+    if !in_place_settlements.is_empty() {
+        let _ = evt_tx
+            .send(DriverEvent::ReconcileBackgroundTasks(in_place_settlements))
+            .await;
     }
 }
 
@@ -2853,6 +3287,7 @@ async fn dispatch_agy_prompt(
     if autonomous_turn_id.take().is_some() {
         transcript_monitor.sync_silent();
     }
+    transcript_monitor.clear_committed_planner_texts();
     *active_turn_id = Some(turn_id.clone());
     *seg_state = AgyStreamSegmentState {
         turn_tag: turn_id.clone(),
@@ -2974,7 +3409,7 @@ async fn handle_acp_session_update(
     bg_tracker: &mut BackgroundTaskTracker,
     seg_state: &mut AgyStreamSegmentState,
     tool_cache: &mut HashMap<String, ToolCallDetail>,
-    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    subagent_monitors: &mut HashMap<String, AgySubagentMonitorEntry>,
     last_ask_question_raw: &mut Option<Vec<QuestionItem>>,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) -> Option<AcpSignalCancelEvent> {
@@ -2991,6 +3426,23 @@ async fn handle_acp_session_update(
     };
 
     match kind {
+        "session_info_update" => {
+            let title = update
+                .get("title")
+                .or_else(|| update.pointer("/info/title"))
+                .or_else(|| update.pointer("/sessionInfo/title"))
+                .and_then(|v| v.as_str())
+                .map(|raw| raw.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|s| !s.is_empty());
+            if let Some(title) = title {
+                let _ = evt_tx
+                    .send(DriverEvent::SessionTitleUpdated {
+                        title: truncate_preview(&title, 120),
+                    })
+                    .await;
+            }
+            None
+        }
         "agent_message_chunk" => {
             let chunk = update
                 .pointer("/content/text")
@@ -3029,6 +3481,7 @@ async fn handle_acp_session_update(
             };
             let entry = seg_state.msg_accum.entry(mid.clone()).or_default();
             entry.push_str(&cleaned_text);
+            seg_state.latest_msg_text = Some(entry.clone());
             let _ = evt_tx
                 .send(DriverEvent::AssistantText {
                     item_id: mid,
@@ -3206,12 +3659,15 @@ async fn handle_acp_session_update(
                 ref prompt_preview,
             } = detail
             {
-                register_agy_subagent_monitor(
+                let data_dir_opt = wakeup_tools.agy_data_dir.clone();
+                register_agy_subagent_monitor_in_dir(
                     parent_agent_id,
                     child_conv_id,
                     role,
                     prompt_preview,
                     false,
+                    false,
+                    data_dir_opt.as_deref(),
                     subagent_monitors,
                     evt_tx,
                 )
@@ -3433,14 +3889,64 @@ fn extract_send_message_recipient_from_detail(detail: &ToolCallDetail) -> Option
     )
 }
 
+struct AgySubagentMonitorEntry {
+    desc: ProviderSubagentDescriptor,
+    monitor: AgyTranscriptMonitor,
+    bg_tasks: HashMap<String, (String, ToolCallDetail, Option<BackgroundTaskInfo>)>,
+    open_tools: HashMap<String, (ToolCallDetail, Option<BackgroundTaskInfo>)>,
+    last_running_tool: Option<(String, ToolCallDetail)>,
+}
+
+impl AgySubagentMonitorEntry {
+    fn new(desc: ProviderSubagentDescriptor, monitor: AgyTranscriptMonitor) -> Self {
+        Self {
+            desc,
+            monitor,
+            bg_tasks: HashMap::new(),
+            open_tools: HashMap::new(),
+            last_running_tool: None,
+        }
+    }
+
+    fn drain_open_tool_timelines(&mut self, final_status: ToolCallStatus) -> Vec<TimelinePayload> {
+        let mut seen_call_ids = HashSet::new();
+        let mut out = Vec::new();
+        let mut open: Vec<_> = self.open_tools.drain().collect();
+        open.sort_by(|a, b| a.0.cmp(&b.0));
+        for (call_id, (detail, background_task)) in open {
+            seen_call_ids.insert(call_id.clone());
+            out.push(TimelinePayload::ToolCall {
+                call_id,
+                status: final_status,
+                detail,
+                background_task,
+            });
+        }
+        let mut bg: Vec<_> = self.bg_tasks.drain().collect();
+        bg.sort_by(|a, b| a.1.0.cmp(&b.1.0));
+        for (_, (call_id, detail, background_task)) in bg {
+            if seen_call_ids.insert(call_id.clone()) {
+                out.push(TimelinePayload::ToolCall {
+                    call_id,
+                    status: final_status,
+                    detail,
+                    background_task,
+                });
+            }
+        }
+        self.last_running_tool = None;
+        out
+    }
+}
+
 async fn cancel_agy_subagent_monitors(
     target_ids: Option<&[String]>,
-    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    subagent_monitors: &mut HashMap<String, AgySubagentMonitorEntry>,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) {
     let now = Utc::now();
-    for (sub_id, (desc, sub_mon)) in subagent_monitors.iter_mut() {
-        if desc.status != ProviderSubagentStatus::Running {
+    for (sub_id, entry) in subagent_monitors.iter_mut() {
+        if entry.desc.status != ProviderSubagentStatus::Running {
             continue;
         }
         let matches = match target_ids {
@@ -3450,160 +3956,311 @@ async fn cancel_agy_subagent_monitors(
         if !matches {
             continue;
         }
-        desc.status = ProviderSubagentStatus::Canceled;
-        desc.updated_at = now;
-        sub_mon.in_wakeup = false;
+        for payload in entry.drain_open_tool_timelines(ToolCallStatus::Failed) {
+            let _ = evt_tx
+                .send(DriverEvent::ProviderSubagentTimeline {
+                    subagent_id: sub_id.clone(),
+                    payload,
+                })
+                .await;
+        }
+        entry.desc.status = ProviderSubagentStatus::Canceled;
+        entry.desc.updated_at = now;
+        entry.monitor.in_wakeup = false;
         let _ = evt_tx
-            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
             .await;
     }
 }
 
 async fn resume_agy_subagent_monitor(
     recipient_id: &str,
-    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    subagent_monitors: &mut HashMap<String, AgySubagentMonitorEntry>,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) {
     let clean_id = recipient_id.trim();
     if clean_id.is_empty() {
         return;
     }
-    let Some((desc, sub_mon)) = subagent_monitors.get_mut(clean_id) else {
+    let Some(entry) = subagent_monitors.get_mut(clean_id) else {
         return;
     };
-    sub_mon.in_wakeup = true;
-    if desc.status != ProviderSubagentStatus::Running {
-        desc.status = ProviderSubagentStatus::Running;
-        desc.updated_at = Utc::now();
+    entry.monitor.in_wakeup = true;
+    if entry.desc.status != ProviderSubagentStatus::Running {
+        entry.desc.status = ProviderSubagentStatus::Running;
+        entry.desc.updated_at = Utc::now();
         let _ = evt_tx
-            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
             .await;
     }
 }
 
-async fn ensure_subagent_running(
-    desc: &mut ProviderSubagentDescriptor,
-    evt_tx: &mpsc::Sender<DriverEvent>,
-) {
-    if desc.status != ProviderSubagentStatus::Running {
-        desc.status = ProviderSubagentStatus::Running;
-        desc.updated_at = Utc::now();
-        let _ = evt_tx
-            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
-            .await;
-    }
-}
-
-async fn poll_agy_subagent_monitor(
-    sub_id: &str,
-    desc: &mut ProviderSubagentDescriptor,
-    sub_mon: &mut AgyTranscriptMonitor,
-    evt_tx: &mpsc::Sender<DriverEvent>,
-) {
-    for wake_ev in sub_mon.poll_post_turn_wakeup() {
+fn apply_subagent_wakeup_steps(
+    entry: &mut AgySubagentMonitorEntry,
+    steps: Vec<WakeupStep>,
+    force_terminal_cancel: bool,
+) -> (Vec<TimelinePayload>, Option<ProviderSubagentStatus>) {
+    let mut payloads = Vec::new();
+    let mut status_transition: Option<ProviderSubagentStatus> = None;
+    for wake_ev in steps {
         match wake_ev {
             WakeupStep::Started { .. } => {
-                ensure_subagent_running(desc, evt_tx).await;
+                if !force_terminal_cancel && entry.desc.status != ProviderSubagentStatus::Running {
+                    entry.desc.status = ProviderSubagentStatus::Running;
+                    entry.desc.updated_at = Utc::now();
+                    status_transition = Some(ProviderSubagentStatus::Running);
+                }
             }
             WakeupStep::UserMessage { id, text } => {
-                ensure_subagent_running(desc, evt_tx).await;
-                let _ = evt_tx
-                    .send(DriverEvent::ProviderSubagentTimeline {
-                        subagent_id: sub_id.to_string(),
-                        payload: TimelinePayload::UserPrompt {
-                            message_id: id,
-                            text,
-                            badges: Vec::new(),
-                        },
-                    })
-                    .await;
+                if !force_terminal_cancel && entry.desc.status != ProviderSubagentStatus::Running {
+                    entry.desc.status = ProviderSubagentStatus::Running;
+                    entry.desc.updated_at = Utc::now();
+                    status_transition = Some(ProviderSubagentStatus::Running);
+                }
+                payloads.push(TimelinePayload::UserPrompt {
+                    message_id: id,
+                    text,
+                    badges: Vec::new(),
+                });
             }
             WakeupStep::Thinking { id, text } => {
-                ensure_subagent_running(desc, evt_tx).await;
-                let _ = evt_tx
-                    .send(DriverEvent::ProviderSubagentTimeline {
-                        subagent_id: sub_id.to_string(),
-                        payload: TimelinePayload::AssistantThinking { item_id: id, text },
-                    })
-                    .await;
+                if !force_terminal_cancel && entry.desc.status != ProviderSubagentStatus::Running {
+                    entry.desc.status = ProviderSubagentStatus::Running;
+                    entry.desc.updated_at = Utc::now();
+                    status_transition = Some(ProviderSubagentStatus::Running);
+                }
+                payloads.push(TimelinePayload::AssistantThinking { item_id: id, text });
             }
             WakeupStep::Message { id, text } => {
-                ensure_subagent_running(desc, evt_tx).await;
-                let _ = evt_tx
-                    .send(DriverEvent::ProviderSubagentTimeline {
-                        subagent_id: sub_id.to_string(),
-                        payload: TimelinePayload::AssistantMessage {
-                            item_id: id,
-                            text,
-                            streaming: false,
-                        },
-                    })
-                    .await;
+                if !force_terminal_cancel && entry.desc.status != ProviderSubagentStatus::Running {
+                    entry.desc.status = ProviderSubagentStatus::Running;
+                    entry.desc.updated_at = Utc::now();
+                    status_transition = Some(ProviderSubagentStatus::Running);
+                }
+                payloads.push(TimelinePayload::AssistantMessage {
+                    item_id: id,
+                    text,
+                    streaming: false,
+                });
             }
             WakeupStep::Tool {
                 call_id,
                 status,
                 detail,
             } => {
-                ensure_subagent_running(desc, evt_tx).await;
-                let _ = evt_tx
-                    .send(DriverEvent::ProviderSubagentTimeline {
-                        subagent_id: sub_id.to_string(),
-                        payload: TimelinePayload::ToolCall {
-                            call_id,
-                            status,
-                            detail,
-                            background_task: None,
+                if !force_terminal_cancel && entry.desc.status != ProviderSubagentStatus::Running {
+                    entry.desc.status = ProviderSubagentStatus::Running;
+                    entry.desc.updated_at = Utc::now();
+                    status_transition = Some(ProviderSubagentStatus::Running);
+                }
+                if status == ToolCallStatus::Running {
+                    let existing_bg = entry
+                        .open_tools
+                        .get(&call_id)
+                        .and_then(|(_, bg)| bg.clone());
+                    entry
+                        .open_tools
+                        .insert(call_id.clone(), (detail.clone(), existing_bg));
+                    entry.last_running_tool = Some((call_id.clone(), detail.clone()));
+                } else {
+                    entry.open_tools.remove(&call_id);
+                    entry.bg_tasks.retain(|_, (cid, _, _)| cid != &call_id);
+                    if entry
+                        .last_running_tool
+                        .as_ref()
+                        .is_some_and(|(cid, _)| cid == &call_id)
+                    {
+                        entry.last_running_tool = None;
+                    }
+                }
+                payloads.push(TimelinePayload::ToolCall {
+                    call_id,
+                    status,
+                    detail,
+                    background_task: None,
+                });
+            }
+            WakeupStep::BackgroundTaskStarted {
+                task_id,
+                call_id,
+                description,
+                log_path,
+                command,
+                ..
+            } => {
+                if !force_terminal_cancel && entry.desc.status != ProviderSubagentStatus::Running {
+                    entry.desc.status = ProviderSubagentStatus::Running;
+                    entry.desc.updated_at = Utc::now();
+                    status_transition = Some(ProviderSubagentStatus::Running);
+                }
+                let (cid, det) = if let Some(c) = call_id {
+                    let matched = entry
+                        .open_tools
+                        .get(&c)
+                        .map(|(d, _)| d.clone())
+                        .or_else(|| {
+                            entry
+                                .last_running_tool
+                                .as_ref()
+                                .filter(|(lc, _)| lc == &c)
+                                .map(|(_, d)| d.clone())
+                        })
+                        .unwrap_or_else(|| ToolCallDetail::Shell {
+                            command: command
+                                .clone()
+                                .or_else(|| description.clone())
+                                .unwrap_or_else(|| "Background task".to_string()),
+                            cwd: None,
+                            exit_code: None,
+                            output_preview: None,
+                        });
+                    (c, matched)
+                } else if let Some((lc, ld)) = entry.last_running_tool.clone() {
+                    (lc, ld)
+                } else {
+                    (
+                        format!("sub_bg_{}", sanitize_bg_task_id(&task_id)),
+                        ToolCallDetail::Shell {
+                            command: command
+                                .clone()
+                                .or_else(|| description.clone())
+                                .unwrap_or_else(|| "Background task".to_string()),
+                            cwd: None,
+                            exit_code: None,
+                            output_preview: None,
                         },
-                    })
-                    .await;
+                    )
+                };
+                let bg_info = BackgroundTaskInfo {
+                    task_id: Some(task_id.clone()),
+                    label: description,
+                    log_path,
+                };
+                entry
+                    .open_tools
+                    .insert(cid.clone(), (det.clone(), Some(bg_info.clone())));
+                entry
+                    .bg_tasks
+                    .insert(task_id, (cid.clone(), det.clone(), Some(bg_info.clone())));
+                payloads.push(TimelinePayload::ToolCall {
+                    call_id: cid,
+                    status: ToolCallStatus::Running,
+                    detail: det,
+                    background_task: Some(bg_info),
+                });
+            }
+            WakeupStep::BackgroundTaskCompleted { task_id, canceled } => {
+                if let Some((cid, det, bg_info)) = entry.bg_tasks.remove(&task_id) {
+                    entry.open_tools.remove(&cid);
+                    if entry
+                        .last_running_tool
+                        .as_ref()
+                        .is_some_and(|(lc, _)| lc == &cid)
+                    {
+                        entry.last_running_tool = None;
+                    }
+                    payloads.push(TimelinePayload::ToolCall {
+                        call_id: cid,
+                        status: if canceled {
+                            ToolCallStatus::Failed
+                        } else {
+                            ToolCallStatus::Completed
+                        },
+                        detail: det,
+                        background_task: bg_info,
+                    });
+                }
             }
             WakeupStep::Settled => {
-                desc.status = ProviderSubagentStatus::Completed;
-                desc.updated_at = Utc::now();
-                let _ = evt_tx
-                    .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
-                    .await;
+                payloads.extend(entry.drain_open_tool_timelines(ToolCallStatus::Completed));
+                entry.desc.status = ProviderSubagentStatus::Completed;
+                entry.desc.updated_at = Utc::now();
+                status_transition = Some(ProviderSubagentStatus::Completed);
             }
             WakeupStep::Failed { message } => {
-                desc.status = ProviderSubagentStatus::Failed;
-                desc.subtitle = Some(message);
-                desc.updated_at = Utc::now();
-                let _ = evt_tx
-                    .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
-                    .await;
+                payloads.extend(entry.drain_open_tool_timelines(ToolCallStatus::Failed));
+                entry.desc.status = ProviderSubagentStatus::Failed;
+                entry.desc.subtitle = Some(message);
+                entry.desc.updated_at = Utc::now();
+                status_transition = Some(ProviderSubagentStatus::Failed);
             }
             WakeupStep::Notice { level, message } => {
-                let _ = evt_tx
-                    .send(DriverEvent::ProviderSubagentTimeline {
-                        subagent_id: sub_id.to_string(),
-                        payload: TimelinePayload::Notice { level, message },
-                    })
-                    .await;
+                payloads.push(TimelinePayload::Notice { level, message });
             }
-            WakeupStep::BackgroundTaskStarted { .. }
-            | WakeupStep::BackgroundTaskCompleted { .. }
-            | WakeupStep::SubagentSpawned { .. }
+            WakeupStep::SubagentSpawned { .. }
             | WakeupStep::SubagentMessaged { .. }
             | WakeupStep::SubagentsCanceled { .. } => {}
         }
     }
+    if force_terminal_cancel && entry.desc.status == ProviderSubagentStatus::Running {
+        payloads.extend(entry.drain_open_tool_timelines(ToolCallStatus::Failed));
+        entry.desc.status = ProviderSubagentStatus::Canceled;
+        entry.desc.updated_at = Utc::now();
+        entry.monitor.in_wakeup = false;
+        status_transition = Some(ProviderSubagentStatus::Canceled);
+    }
+    (payloads, status_transition)
 }
 
-async fn register_agy_subagent_monitor(
+async fn poll_agy_subagent_monitor(
+    sub_id: &str,
+    entry: &mut AgySubagentMonitorEntry,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let steps = entry.monitor.poll_post_turn_wakeup();
+    if steps.is_empty() {
+        return;
+    }
+    let prev_status = entry.desc.status;
+    let (payloads, status_transition) = apply_subagent_wakeup_steps(entry, steps, false);
+    // If the subagent transitioned back to Running (resume/follow-up turn), upsert Running BEFORE
+    // streaming the new turn's timeline items so clients reflect Running immediately.
+    if status_transition == Some(ProviderSubagentStatus::Running)
+        && prev_status != ProviderSubagentStatus::Running
+    {
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
+            .await;
+    }
+    for payload in payloads {
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentTimeline {
+                subagent_id: sub_id.to_string(),
+                payload,
+            })
+            .await;
+    }
+    if matches!(
+        status_transition,
+        Some(ProviderSubagentStatus::Completed | ProviderSubagentStatus::Failed)
+    ) {
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
+            .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_agy_subagent_monitor_in_dir(
     parent_agent_id: &str,
     child_conv_id: &str,
     role: &str,
     prompt_preview: &str,
     is_historical: bool,
-    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    force_canceled: bool,
+    data_dir: Option<&Path>,
+    subagent_monitors: &mut HashMap<String, AgySubagentMonitorEntry>,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) {
     let clean_id = child_conv_id.trim();
-    if clean_id.is_empty()
-        || clean_id.starts_with("ag_")
-        || subagent_monitors.contains_key(clean_id)
-    {
+    if clean_id.is_empty() || clean_id.starts_with("ag_") {
+        return;
+    }
+    if subagent_monitors.contains_key(clean_id) {
+        if force_canceled {
+            let target = vec![clean_id.to_string()];
+            cancel_agy_subagent_monitors(Some(&target), subagent_monitors, evt_tx).await;
+        }
         return;
     }
     let now = Utc::now();
@@ -3617,89 +4274,49 @@ async fn register_agy_subagent_monitor(
     } else {
         Some("Antigravity".into())
     };
-    let mut desc = ProviderSubagentDescriptor {
+    let desc = ProviderSubagentDescriptor {
         subagent_id: clean_id.to_string(),
         parent_agent_id: parent_agent_id.to_string(),
         parent_subagent_id: None,
         title,
         subtitle,
-        status: ProviderSubagentStatus::Running,
+        status: if force_canceled {
+            ProviderSubagentStatus::Canceled
+        } else {
+            ProviderSubagentStatus::Running
+        },
         created_at: now,
         updated_at: now,
     };
-    let mut sub_mon = AgyTranscriptMonitor::new_subagent(clean_id);
+    let sub_mon = match data_dir {
+        Some(dir) => AgyTranscriptMonitor::from_brain_dir_subagent(
+            dir.join("brain").join(clean_id),
+            clean_id,
+        ),
+        None => AgyTranscriptMonitor::new_subagent(clean_id),
+    };
+    let mut entry = AgySubagentMonitorEntry::new(desc, sub_mon);
 
-    if is_historical {
-        if sub_mon.active_path().is_none() {
-            // Historical subagent whose transcript is no longer on disk: mark completed so
-            // reattaching never leaves a stale permanent spinner.
-            desc.status = ProviderSubagentStatus::Completed;
+    if is_historical || force_canceled {
+        if entry.monitor.active_path().is_none() {
+            // Historical/canceled subagent without transcript on disk: settle immediately without Running flash.
+            entry.desc.status = if force_canceled {
+                ProviderSubagentStatus::Canceled
+            } else {
+                ProviderSubagentStatus::Completed
+            };
+            entry.monitor.in_wakeup = false;
             let _ = evt_tx
-                .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+                .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
                 .await;
-            subagent_monitors.insert(clean_id.to_string(), (desc, sub_mon));
+            subagent_monitors.insert(clean_id.to_string(), entry);
             return;
         }
-        // Poll historical transcript first so already-settled subagents emit their final status
-        // immediately without flashing `Running`.
-        let initial_steps = sub_mon.poll_post_turn_wakeup();
-        let mut initial_timeline = Vec::new();
-        for wake_ev in initial_steps {
-            match wake_ev {
-                WakeupStep::Thinking { id, text } => {
-                    initial_timeline.push(TimelinePayload::AssistantThinking { item_id: id, text });
-                }
-                WakeupStep::Message { id, text } => {
-                    initial_timeline.push(TimelinePayload::AssistantMessage {
-                        item_id: id,
-                        text,
-                        streaming: false,
-                    });
-                }
-                WakeupStep::Tool {
-                    call_id,
-                    status,
-                    detail,
-                } => {
-                    initial_timeline.push(TimelinePayload::ToolCall {
-                        call_id,
-                        status,
-                        detail,
-                        background_task: None,
-                    });
-                }
-                WakeupStep::Notice { level, message } => {
-                    initial_timeline.push(TimelinePayload::Notice { level, message });
-                }
-                WakeupStep::Settled => {
-                    desc.status = ProviderSubagentStatus::Completed;
-                    desc.updated_at = Utc::now();
-                }
-                WakeupStep::Failed { message } => {
-                    desc.status = ProviderSubagentStatus::Failed;
-                    desc.subtitle = Some(message);
-                    desc.updated_at = Utc::now();
-                }
-                WakeupStep::Started { .. } => {
-                    desc.status = ProviderSubagentStatus::Running;
-                    desc.updated_at = Utc::now();
-                }
-                WakeupStep::UserMessage { id, text } => {
-                    initial_timeline.push(TimelinePayload::UserPrompt {
-                        message_id: id,
-                        text,
-                        badges: Vec::new(),
-                    });
-                }
-                WakeupStep::BackgroundTaskStarted { .. }
-                | WakeupStep::BackgroundTaskCompleted { .. }
-                | WakeupStep::SubagentSpawned { .. }
-                | WakeupStep::SubagentMessaged { .. }
-                | WakeupStep::SubagentsCanceled { .. } => {}
-            }
-        }
+        let initial_steps = entry.monitor.poll_post_turn_wakeup();
+        let (initial_timeline, _) =
+            apply_subagent_wakeup_steps(&mut entry, initial_steps, force_canceled);
         let _ = evt_tx
-            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
             .await;
         for payload in initial_timeline {
             let _ = evt_tx
@@ -3709,15 +4326,15 @@ async fn register_agy_subagent_monitor(
                 })
                 .await;
         }
-        subagent_monitors.insert(clean_id.to_string(), (desc, sub_mon));
+        subagent_monitors.insert(clean_id.to_string(), entry);
         return;
     }
 
     let _ = evt_tx
-        .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+        .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
         .await;
-    poll_agy_subagent_monitor(clean_id, &mut desc, &mut sub_mon, evt_tx).await;
-    subagent_monitors.insert(clean_id.to_string(), (desc, sub_mon));
+    poll_agy_subagent_monitor(clean_id, &mut entry, evt_tx).await;
+    subagent_monitors.insert(clean_id.to_string(), entry);
 }
 
 fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCallDetail {
@@ -3847,12 +4464,58 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
     }
 }
 
+fn extract_subagent_conversation_id_from_value(val: &Value) -> Option<String> {
+    match val {
+        Value::Object(map) => {
+            if let Some(id) = map
+                .get("conversationId")
+                .or_else(|| map.get("conversation_id"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(id.to_string());
+            }
+            for key in [
+                "content",
+                "structuredContent",
+                "result",
+                "output",
+                "stdout",
+                "text",
+            ] {
+                if let Some(sub) = map.get(key)
+                    && let Some(found) = extract_subagent_conversation_id_from_value(sub)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(extract_subagent_conversation_id_from_value),
+        Value::String(text) => extract_subagent_conversation_id(None, Some(text)),
+        _ => None,
+    }
+}
+
 fn agy_subagent_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCallDetail {
     let mut dispatch = crate::managed_dispatch::acp_detail(update, prev);
     if let ToolCallDetail::Subagent { child_agent_id, .. } = &mut dispatch
         && child_agent_id.is_none()
     {
-        *child_agent_id = extract_subagent_conversation_id(update.get("rawOutput"), None);
+        *child_agent_id = extract_subagent_conversation_id(update.get("rawOutput"), None)
+            .or_else(|| {
+                update
+                    .get("content")
+                    .and_then(extract_subagent_conversation_id_from_value)
+            })
+            .or_else(|| {
+                update
+                    .get("content")
+                    .and_then(|c| extract_uuids_from_text(&c.to_string()).into_iter().next())
+            });
     }
     dispatch
 }
@@ -4426,6 +5089,7 @@ enum WakeupStep {
         description: Option<String>,
         log_path: Option<String>,
         expires_at: Option<DateTime<Utc>>,
+        command: Option<String>,
     },
     BackgroundTaskCompleted {
         task_id: String,
@@ -4496,6 +5160,7 @@ enum BgTaskDelta {
         description: Option<String>,
         log_path: Option<String>,
         expires_at: Option<DateTime<Utc>>,
+        command: Option<String>,
     },
     Completed {
         task_id: String,
@@ -4625,8 +5290,15 @@ impl BackgroundTaskTracker {
         self.tasks.is_empty()
     }
 
-    fn clear(&mut self) {
-        self.tasks.clear();
+    fn drain_and_finish_call_ids(&mut self) -> Vec<String> {
+        let mut call_ids = Vec::new();
+        for (task_id, info) in self.tasks.drain() {
+            self.finished_tasks.insert(task_id);
+            if let Some(cid) = info.call_id {
+                call_ids.push(cid);
+            }
+        }
+        call_ids
     }
 
     fn active_call_ids(&self) -> HashSet<String> {
@@ -4820,9 +5492,17 @@ struct WakeupToolRegistry {
     acp_to_canonical: HashMap<String, String>,
     wake_to_canonical: HashMap<String, String>,
     current_turn_gen: u64,
+    agy_data_dir: Option<PathBuf>,
 }
 
 impl WakeupToolRegistry {
+    fn with_data_dir(agy_data_dir: PathBuf) -> Self {
+        Self {
+            agy_data_dir: Some(agy_data_dir),
+            ..Self::default()
+        }
+    }
+
     fn begin_turn(&mut self) {
         self.current_turn_gen = self.current_turn_gen.saturating_add(1);
     }
@@ -4978,9 +5658,58 @@ impl WakeupToolRegistry {
         }
     }
 
+    fn shell_detail_is_finished(detail: &ToolCallDetail) -> bool {
+        match detail {
+            ToolCallDetail::Shell {
+                exit_code,
+                output_preview,
+                ..
+            } => {
+                exit_code.is_some()
+                    || output_preview.as_deref().is_some_and(|s| {
+                        let t = s.trim();
+                        !t.is_empty()
+                            && !t
+                                .to_ascii_lowercase()
+                                .contains("running as a background task")
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn is_ambiguous_shell_prefix(norm: &str) -> bool {
+        let lower = norm.trim().to_ascii_lowercase();
+        let trimmed = lower.trim_end_matches(['"', '\'', ' ']).trim();
+        matches!(
+            trimmed,
+            "python"
+                | "python3"
+                | "bash"
+                | "sh"
+                | "zsh"
+                | "node"
+                | "perl"
+                | "ruby"
+                | "python -c"
+                | "python3 -c"
+                | "bash -c"
+                | "sh -c"
+                | "zsh -c"
+                | "node -e"
+                | "perl -e"
+                | "ruby -e"
+        ) || (trimmed.len() <= 24
+            && (trimmed.ends_with(" -c")
+                || trimmed.ends_with(" -lc")
+                || trimmed.ends_with(" -e")
+                || trimmed.contains("<<")))
+    }
+
     /// Marks `call_id` as an active background task. Returns `(detail, merged_bg_info, changed)`
     /// where `changed` is `false` when the entry was already `Running` with identical metadata,
     /// preventing redundant post-reply re-emissions that would move the tool card below the reply.
+    /// Never regresses a shell entry that already completed with an exit code or real output.
     fn mark_background_task(
         &mut self,
         call_id: &str,
@@ -4988,6 +5717,10 @@ impl WakeupToolRegistry {
     ) -> Option<(ToolCallDetail, BackgroundTaskInfo, bool)> {
         let canon = self.canonical_id_for_wakeup(call_id).to_string();
         let entry = self.entries.get_mut(&canon)?;
+        if entry.status != ToolCallStatus::Running && Self::shell_detail_is_finished(&entry.detail)
+        {
+            return None;
+        }
         let merged = merge_bg_task_info(entry.bg_info.as_ref(), info);
         let changed = !entry.has_bg_task
             || entry.status != ToolCallStatus::Running
@@ -4998,7 +5731,11 @@ impl WakeupToolRegistry {
         Some((entry.detail.clone(), merged, changed))
     }
 
-    fn find_matching_call_id_for_bg_task(&self, description: Option<&str>) -> Option<String> {
+    fn find_matching_call_id_for_bg_task(
+        &self,
+        description: Option<&str>,
+        full_command: Option<&str>,
+    ) -> Option<String> {
         let current_gen = self.current_turn_gen;
         let is_unbound_in_turn = |e: &WakeupToolEntry| {
             !e.has_bg_task && e.bg_info.is_none() && e.turn_gen == current_gen
@@ -5025,6 +5762,46 @@ impl WakeupToolRegistry {
                     })
                     .cloned();
             }
+        }
+
+        let not_finished_shell = |e: &WakeupToolEntry| {
+            e.signature.kind == "shell"
+                && (e.status == ToolCallStatus::Running
+                    || !Self::shell_detail_is_finished(&e.detail))
+        };
+
+        // Prefer matching against the full command recorded in PLANNER_RESPONSE before falling back
+        // to the potentially truncated `bg_task` first-line description (e.g. `python3 -c`).
+        if let Some(cmd) = full_command.map(str::trim).filter(|s| !s.is_empty()) {
+            let norm_cmd = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+            let cmd_sig = ToolSignature {
+                kind: "shell",
+                target: norm_cmd,
+            };
+            if let Some(cid) = self.order.iter().find(|cid| {
+                self.entries.get(*cid).is_some_and(|e| {
+                    is_unbound_in_turn(e)
+                        && e.status == ToolCallStatus::Running
+                        && e.signature.kind == "shell"
+                        && signatures_match(&e.signature, &cmd_sig)
+                })
+            }) {
+                return Some(cid.clone());
+            }
+            if let Some(cid) = self.order.iter().find(|cid| {
+                self.entries.get(*cid).is_some_and(|e| {
+                    is_unbound_in_turn(e)
+                        && not_finished_shell(e)
+                        && signatures_match(&e.signature, &cmd_sig)
+                })
+            }) {
+                return Some(cid.clone());
+            }
+        }
+
+        if let Some(desc) = description.map(str::trim).filter(|s| !s.is_empty()) {
+            let norm_desc = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+            let ambiguous = Self::is_ambiguous_shell_prefix(&norm_desc);
             let desc_sig = ToolSignature {
                 kind: "shell",
                 target: norm_desc.clone(),
@@ -5046,12 +5823,15 @@ impl WakeupToolRegistry {
                 return Some(cid.clone());
             }
             // Fallback: unbound shell in the current turn whose ACP update already emitted a
-            // dispatch-ack `completed` status without `Tool is running as a background task`.
-            if let Some(cid) = self.order.iter().find(|cid| {
-                self.entries
-                    .get(*cid)
-                    .is_some_and(|e| is_unbound_in_turn(e) && shell_matches(e))
-            }) {
+            // dispatch-ack `completed` status (without exit code / real output). Skip ambiguous
+            // short prefixes like `python3 -c` unless full_command already matched above.
+            if !ambiguous
+                && let Some(cid) = self.order.iter().find(|cid| {
+                    self.entries.get(*cid).is_some_and(|e| {
+                        is_unbound_in_turn(e) && not_finished_shell(e) && shell_matches(e)
+                    })
+                })
+            {
                 return Some(cid.clone());
             }
         }
@@ -5734,8 +6514,12 @@ fn is_subagent_launch_tool(name_or_title: &str, args_or_raw_in: Option<&Value>) 
     }
     if clean == "invoke_subagent"
         || clean == "spawn_subagent"
+        || clean == "invoke subagent"
+        || clean == "spawn subagent"
         || clean.starts_with("invoke_subagent ")
         || clean.starts_with("spawn_subagent ")
+        || clean.starts_with("invoke subagent ")
+        || clean.starts_with("spawn subagent ")
     {
         return true;
     }
@@ -5791,6 +6575,25 @@ fn extract_subagent_conversation_id(
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
             {
                 return Some(id.to_string());
+            }
+        }
+    }
+    for key in [
+        "conversationId=",
+        "conversation_id=",
+        "conversationId:",
+        "conversation_id:",
+    ] {
+        if let Some(pos) = candidate_text.find(key) {
+            let after = candidate_text[pos + key.len()..]
+                .trim_start()
+                .trim_start_matches(['"', '\'']);
+            let id: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
             }
         }
     }
@@ -6126,6 +6929,9 @@ fn attach_transcript_tool_result(mut detail: ToolCallDetail, content: &str) -> T
 #[derive(Debug, Clone)]
 enum PendingTranscriptToolMeta {
     Other,
+    Shell {
+        command: String,
+    },
     Subagent {
         role: String,
         prompt_preview: String,
@@ -6173,6 +6979,7 @@ struct AgyTranscriptMonitor {
     seen_undelivered_files: HashSet<PathBuf>,
     last_checked_path: Option<PathBuf>,
     last_checked_mtime: Option<std::time::SystemTime>,
+    committed_planner_texts: Vec<String>,
 }
 
 impl AgyTranscriptMonitor {
@@ -6212,6 +7019,7 @@ impl AgyTranscriptMonitor {
             seen_undelivered_files: HashSet::new(),
             last_checked_path: None,
             last_checked_mtime: None,
+            committed_planner_texts: Vec::new(),
         }
     }
 
@@ -6249,6 +7057,16 @@ impl AgyTranscriptMonitor {
 
     fn sync_silent(&mut self) {
         let _ = self.sync_silent_with_bg_tasks();
+    }
+
+    fn clear_committed_planner_texts(&mut self) {
+        self.committed_planner_texts.clear();
+    }
+
+    fn sync_silent_for_turn_end(&mut self) -> (Vec<BgTaskDelta>, Vec<String>) {
+        let deltas = self.sync_silent_with_bg_tasks();
+        let texts = std::mem::take(&mut self.committed_planner_texts);
+        (deltas, texts)
     }
 
     /// Reads newly flushed foreground transcript lines for background-task / subagent metadata
@@ -6537,6 +7355,13 @@ impl AgyTranscriptMonitor {
             self.in_progress_thinking_lens.remove(&step_idx);
 
             let content = step.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if step_type == "PLANNER_RESPONSE"
+                && status == "DONE"
+                && !content.trim().is_empty()
+                && self.committed_planner_texts.len() < 128
+            {
+                self.committed_planner_texts.push(content.to_string());
+            }
 
             // Track tool calls emitted by `PLANNER_RESPONSE` even in silent foreground sync mode
             // so subsequent `GENERIC` steps can pair `invoke_subagent`, `schedule` (`TimerCondition`
@@ -6631,6 +7456,26 @@ impl AgyTranscriptMonitor {
                         }
                         self.pending_silent_tools
                             .push_back(PendingTranscriptToolMeta::Other);
+                    } else if matches!(
+                        tname
+                            .rsplit_once(':')
+                            .or_else(|| tname.rsplit_once('/'))
+                            .or_else(|| tname.rsplit_once("__"))
+                            .map(|(_, leaf)| leaf)
+                            .unwrap_or(tname)
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "run_command" | "execute_command" | "bash" | "shell" | "terminal"
+                    ) {
+                        if let Some(cmd) =
+                            transcript_arg_str(args, &["CommandLine", "command", "cmd"])
+                        {
+                            self.pending_silent_tools
+                                .push_back(PendingTranscriptToolMeta::Shell { command: cmd });
+                        } else {
+                            self.pending_silent_tools
+                                .push_back(PendingTranscriptToolMeta::Other);
+                        }
                     } else {
                         self.pending_silent_tools
                             .push_back(PendingTranscriptToolMeta::Other);
@@ -6643,6 +7488,7 @@ impl AgyTranscriptMonitor {
             // `TimerCondition` early cancellations, and `manage_task` (`kill`/`list`/`status`) results.
             let mut completed_bg_tasks: Vec<(String, bool)> = Vec::new();
             let mut started_bg_expires_at: Option<DateTime<Utc>> = None;
+            let mut started_shell_command: Option<String> = None;
 
             // Capture background-task & subagent lifecycle even in silent foreground sync mode.
             // Only `GENERIC` steps in `RUNNING` state with strict session-scoped header match
@@ -6658,6 +7504,10 @@ impl AgyTranscriptMonitor {
                         role,
                         prompt_preview,
                     } => Some((role.clone(), prompt_preview.clone())),
+                    _ => None,
+                };
+                let shell_command = match &pending_meta {
+                    PendingTranscriptToolMeta::Shell { command } => Some(command.clone()),
                     _ => None,
                 };
                 if (popped_subagent.is_some()
@@ -6701,6 +7551,7 @@ impl AgyTranscriptMonitor {
                         parse_step_created_at(&step, content),
                     );
                     started_bg_expires_at = expires_at;
+                    started_shell_command = shell_command.clone();
                     self.active_bg_tasks.insert(
                         task_id.clone(),
                         ActiveTranscriptBgTask {
@@ -6714,6 +7565,7 @@ impl AgyTranscriptMonitor {
                         description,
                         log_path,
                         expires_at,
+                        command: shell_command,
                     });
                 } else if status != "RUNNING" {
                     // Authoritative completions/cancellations returned by `manage_task` tools:
@@ -7002,12 +7854,17 @@ impl AgyTranscriptMonitor {
                     && let Some((task_id, description, log_path)) =
                         parse_bg_task_started(content, &self.session_id)
                 {
+                    let command = started_shell_command.or_else(|| match &detail {
+                        ToolCallDetail::Shell { command, .. } => Some(command.clone()),
+                        _ => None,
+                    });
                     out.push(WakeupStep::BackgroundTaskStarted {
                         task_id,
                         call_id: Some(cid.clone()),
                         description,
                         log_path,
                         expires_at: started_bg_expires_at,
+                        command,
                     });
                     // Keep the tool call visibly running while the background task executes
                     out.push(WakeupStep::Tool {
@@ -7037,6 +7894,7 @@ impl AgyTranscriptMonitor {
                     description,
                     log_path,
                     expires_at: started_bg_expires_at,
+                    command: started_shell_command,
                 });
             }
         }
@@ -7052,7 +7910,35 @@ impl AgyTranscriptMonitor {
     }
 }
 
+static AGY_DATA_DIR_OVERRIDE: std::sync::OnceLock<std::sync::RwLock<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// Register an in-process override for Antigravity's data directory (for deterministic E2E tests).
+pub fn set_agy_data_dir_override(dir: Option<PathBuf>) {
+    let lock = AGY_DATA_DIR_OVERRIDE.get_or_init(|| std::sync::RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = dir;
+    }
+}
+
+fn resolve_agy_data_dir_with_extra_env(extra_env: &HashMap<String, String>) -> PathBuf {
+    if let Some(dir) = extra_env
+        .get("ANTIGRAVITY_EXECUTABLE_DATA_DIR")
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return PathBuf::from(dir);
+    }
+    resolve_agy_data_dir()
+}
+
 pub fn resolve_agy_data_dir() -> PathBuf {
+    if let Some(lock) = AGY_DATA_DIR_OVERRIDE.get()
+        && let Ok(guard) = lock.read()
+        && let Some(ref dir) = *guard
+    {
+        return dir.clone();
+    }
     if let Ok(dir) = std::env::var("ANTIGRAVITY_EXECUTABLE_DATA_DIR")
         && !dir.trim().is_empty()
     {
@@ -9007,8 +9893,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let _ = evt_rx.try_recv();
 
         // 2. Transcript discovers `Timer: 8m` background task -> must bind onto `call_sched_1`
-        let matched =
-            wakeup_tools.find_matching_call_id_for_bg_task(Some("Timer: 8m, Prompt: watchdog"));
+        let matched = wakeup_tools
+            .find_matching_call_id_for_bg_task(Some("Timer: 8m, Prompt: watchdog"), None);
         assert_eq!(matched.as_deref(), Some("call_sched_1"));
 
         let bg_info = BackgroundTaskInfo {
@@ -9329,6 +10215,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 description: Some("set -a && source runtime.env && set +a &&".into()),
                 log_path: Some("/tmp/task-290.log".into()),
                 expires_at: None,
+                command: None,
             },
             BgTaskDelta::Started {
                 task_id: "sess_1/task-291".into(),
@@ -9336,6 +10223,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 description: Some("set -a && source runtime.env && set +a &&".into()),
                 log_path: Some("/tmp/task-291.log".into()),
                 expires_at: None,
+                command: None,
             },
             BgTaskDelta::Started {
                 task_id: "sess_1/task-292".into(),
@@ -9343,6 +10231,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 description: Some("Timer: 8m, Prompt: new watchdog".into()),
                 log_path: Some("/tmp/task-292.log".into()),
                 expires_at: None,
+                command: None,
             },
         ];
         apply_foreground_bg_deltas(
@@ -9609,7 +10498,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             },
         );
         assert_eq!(
-            reg.find_matching_call_id_for_bg_task(Some("Timer: 5m, Prompt: extra")),
+            reg.find_matching_call_id_for_bg_task(Some("Timer: 5m, Prompt: extra"), None),
             None,
             "unbound Timer must NEVER hijack a parallel running Shell command"
         );
@@ -10651,7 +11540,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
         let now = Utc::now();
         let sub_id = "sub_resume_1";
-        let mut desc = ProviderSubagentDescriptor {
+        let desc = ProviderSubagentDescriptor {
             subagent_id: sub_id.into(),
             parent_agent_id: "ag_parent".into(),
             parent_subagent_id: None,
@@ -10661,13 +11550,14 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             created_at: now,
             updated_at: now,
         };
-        let mut sub_mon = AgyTranscriptMonitor::from_brain_dir_subagent(tmp.clone(), sub_id);
+        let sub_mon = AgyTranscriptMonitor::from_brain_dir_subagent(tmp.clone(), sub_id);
+        let mut entry = AgySubagentMonitorEntry::new(desc, sub_mon);
         let (tx, mut rx) = mpsc::channel(64);
 
         // Poll Turn 1 -> settles to Completed.
-        poll_agy_subagent_monitor(sub_id, &mut desc, &mut sub_mon, &tx).await;
-        assert_eq!(desc.status, ProviderSubagentStatus::Completed);
-        assert!(!sub_mon.has_unconsumed_growth());
+        poll_agy_subagent_monitor(sub_id, &mut entry, &tx).await;
+        assert_eq!(entry.desc.status, ProviderSubagentStatus::Completed);
+        assert!(!entry.monitor.has_unconsumed_growth());
         while rx.try_recv().is_ok() {}
 
         // Turn 2 arrives via parent `send_message`: new SYSTEM_MESSAGE + active tool call.
@@ -10707,9 +11597,9 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         }
 
         // Self-healing fallback detects growth on the previously Completed subagent.
-        assert!(sub_mon.has_unconsumed_growth());
-        poll_agy_subagent_monitor(sub_id, &mut desc, &mut sub_mon, &tx).await;
-        assert_eq!(desc.status, ProviderSubagentStatus::Running);
+        assert!(entry.monitor.has_unconsumed_growth());
+        poll_agy_subagent_monitor(sub_id, &mut entry, &tx).await;
+        assert_eq!(entry.desc.status, ProviderSubagentStatus::Running);
 
         let mut saw_running_upsert = false;
         let mut saw_turn2_thinking = false;
@@ -10774,8 +11664,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             .expect("write step 5");
         }
 
-        poll_agy_subagent_monitor(sub_id, &mut desc, &mut sub_mon, &tx).await;
-        assert_eq!(desc.status, ProviderSubagentStatus::Completed);
+        poll_agy_subagent_monitor(sub_id, &mut entry, &tx).await;
+        assert_eq!(entry.desc.status, ProviderSubagentStatus::Completed);
 
         let mut saw_turn2_reply = false;
         let mut saw_completed_upsert = false;
@@ -10800,10 +11690,13 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
         // Also verify explicit parent `send_message` resume flips Completed -> Running immediately.
         let mut monitors = HashMap::new();
-        monitors.insert(sub_id.to_string(), (desc, sub_mon));
+        monitors.insert(sub_id.to_string(), entry);
         resume_agy_subagent_monitor(sub_id, &mut monitors, &tx).await;
-        assert_eq!(monitors[sub_id].0.status, ProviderSubagentStatus::Running);
-        assert!(monitors[sub_id].1.in_wakeup);
+        assert_eq!(
+            monitors[sub_id].desc.status,
+            ProviderSubagentStatus::Running
+        );
+        assert!(monitors[sub_id].monitor.in_wakeup);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -10896,13 +11789,13 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
         assert_eq!(
             subagent_monitors["11111111-1111-1111-1111-111111111111"]
-                .0
+                .desc
                 .status,
             ProviderSubagentStatus::Canceled
         );
         assert_eq!(
             subagent_monitors["22222222-2222-2222-2222-222222222222"]
-                .0
+                .desc
                 .status,
             ProviderSubagentStatus::Running
         );
@@ -10955,7 +11848,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
         assert_eq!(
             subagent_monitors["22222222-2222-2222-2222-222222222222"]
-                .0
+                .desc
                 .status,
             ProviderSubagentStatus::Canceled
         );
@@ -12238,5 +13131,1427 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             }
             other => panic!("expected Shell detail, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn agy_interrupt_and_drain_queue_clears_bg_tracker_and_returns_idle_on_empty_queue() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let tmp_data = std::env::temp_dir().join(format!("o_agy_empty_iq_{short_id}"));
+        let sess_id = format!("sess-empty-iq-{short_id}");
+        let logs_dir = tmp_data
+            .join("brain")
+            .join(&sess_id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs_dir).expect("mkdir logs");
+        let transcript_path = logs_dir.join("transcript_full.jsonl");
+        let sock_path = std::env::temp_dir().join(format!("o_agy_empty_iq_{short_id}.sock"));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path).await.expect("bind shim");
+
+        let prompts_seen: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let prompts_bg = Arc::clone(&prompts_seen);
+        let tx_path = transcript_path.clone();
+        let sess_srv = sess_id.clone();
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+            let mut inflight_prompt_id: Option<Value> = None;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+            }
+
+            while let Ok(Some(raw_line)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) =
+                    serde_json::from_str::<ShimFrame>(&raw_line)
+                else {
+                    continue;
+                };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "protocolVersion": 1 } }),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "sessionId": sess_srv } }),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        let text = req
+                            .pointer("/params/prompt/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        prompts_bg.lock().await.push(text.clone());
+                        if text == "START_BG_TURN" {
+                            inflight_prompt_id = Some(req["id"].clone());
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sess_srv,
+                                        "update": {
+                                            "sessionUpdate": "tool_call",
+                                            "toolCallId": "call_bg_empty_iq",
+                                            "kind": "execute",
+                                            "status": "in_progress",
+                                            "rawInput": { "CommandLine": "sleep 60" }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            let lines = [
+                                json!({
+                                    "step_index": 0,
+                                    "type": "PLANNER_RESPONSE",
+                                    "status": "DONE",
+                                    "content": "",
+                                    "tool_calls": [{
+                                        "id": "t_bg_1",
+                                        "name": "run_command",
+                                        "args": { "CommandLine": "sleep 60" }
+                                    }]
+                                }),
+                                json!({
+                                    "step_index": 1,
+                                    "type": "GENERIC",
+                                    "status": "RUNNING",
+                                    "content": format!("Tool is running as a background task with task id: {sess_srv}/task-1\nTask Description: sleep 60")
+                                }),
+                            ]
+                            .iter()
+                            .map(Value::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                                + "\n";
+                            std::fs::write(&tx_path, lines).expect("write transcript");
+                        } else {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sess_srv,
+                                        "update": {
+                                            "sessionUpdate": "agent_message_chunk",
+                                            "content": { "type": "text", "text": format!("reply:{text}") }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "stopReason": "end_turn" } }),
+                            )
+                            .await;
+                        }
+                    }
+                    "session/cancel" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} }),
+                        )
+                        .await;
+                        if let Some(pid) = inflight_prompt_id.take() {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({ "jsonrpc": "2.0", "id": pid, "result": { "stopReason": "cancelled" } }),
+                            )
+                            .await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let seq_tracker = Arc::new(AtomicU64::new(0));
+        let mut extra_env = HashMap::new();
+        extra_env.insert(
+            "ANTIGRAVITY_EXECUTABLE_DATA_DIR".into(),
+            tmp_data.to_string_lossy().to_string(),
+        );
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_empty_iq".into(),
+            provider: ProviderKind::Antigravity,
+            orbit_exe: PathBuf::from("/bin/true"),
+            executable: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env,
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: seq_tracker,
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t1".into(),
+                prompt: "START_BG_TURN".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("send t1");
+
+        // Wait until transcript poller binds `sess-empty-iq/task-1` onto `call_bg_empty_iq`.
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), evt_rx.recv())
+                .await
+                .expect("bg task attach timeout")
+                .expect("ev");
+            if matches!(
+                ev,
+                DriverEvent::ToolCall {
+                    ref call_id,
+                    status: ToolCallStatus::Running,
+                    background_task: Some(_),
+                    ..
+                } if call_id == "call_bg_empty_iq"
+            ) {
+                break;
+            }
+        }
+
+        // Send InterruptAndDrainQueue with an EMPTY queue: must settle to Idle, NOT bgwait!
+        cmd_tx
+            .send(DriverCommand::InterruptAndDrainQueue)
+            .await
+            .expect("send interrupt and drain");
+
+        let mut settled_idle = false;
+        let mut entered_bgwait = false;
+        let mut reconciled_bg = false;
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(4), evt_rx.recv()).await {
+            match ev {
+                DriverEvent::ReconcileBackgroundTasks(items)
+                    if items.iter().any(|(id, st)| {
+                        id == "call_bg_empty_iq" && *st == ToolCallStatus::Failed
+                    }) =>
+                {
+                    reconciled_bg = true;
+                }
+                DriverEvent::ToolCall {
+                    call_id,
+                    status: ToolCallStatus::Failed,
+                    ..
+                } if call_id == "call_bg_empty_iq" => {
+                    reconciled_bg = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::AutonomousWakeup { .. }) => {
+                    entered_bgwait = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) => {
+                    settled_idle = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            settled_idle,
+            "empty-queue InterruptAndDrainQueue must settle to Idle"
+        );
+        assert!(
+            !entered_bgwait,
+            "must NEVER enter waiting:* background state after cancel"
+        );
+        assert!(
+            reconciled_bg,
+            "open background shell must be settled Failed on cancel"
+        );
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t2".into(),
+                prompt: "FOLLOWUP_OK".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("send t2");
+        let mut saw_t2_reply = false;
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv()).await {
+            match ev {
+                DriverEvent::AssistantText { text, .. } if text == "reply:FOLLOWUP_OK" => {
+                    saw_t2_reply = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) if saw_t2_reply => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_t2_reply,
+            "follow-up prompt must succeed after interrupt"
+        );
+
+        let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+        let _ = actor.await;
+        server.abort();
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_dir_all(&tmp_data);
+    }
+
+    #[tokio::test]
+    async fn agy_human_steer_reconciles_bg_tasks_in_place_without_completed_regression_and_carries_rollback_handoff()
+     {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let tmp_data = std::env::temp_dir().join(format!("o_agy_steer_h_{short_id}"));
+        let sess_id = format!("sess-steer-{short_id}");
+        let logs_dir = tmp_data
+            .join("brain")
+            .join(&sess_id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs_dir).expect("mkdir logs");
+        let transcript_path = logs_dir.join("transcript_full.jsonl");
+        let sock_path = std::env::temp_dir().join(format!("o_agy_steer_h_{short_id}.sock"));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path).await.expect("bind shim");
+
+        let prompts_seen: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let prompts_bg = Arc::clone(&prompts_seen);
+        let tx_path = transcript_path.clone();
+        let sess_srv = sess_id.clone();
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+            let mut inflight_prompt_id: Option<Value> = None;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+            }
+
+            while let Ok(Some(raw_line)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) =
+                    serde_json::from_str::<ShimFrame>(&raw_line)
+                else {
+                    continue;
+                };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "protocolVersion": 1 } }),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "sessionId": sess_srv } }),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        let text = req
+                            .pointer("/params/prompt/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        prompts_bg.lock().await.push(text.clone());
+                        if text == "TURN1_SLOW" {
+                            inflight_prompt_id = Some(req["id"].clone());
+                            // 1) Finished short python3 shell BEFORE bg task
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sess_srv,
+                                        "update": {
+                                            "sessionUpdate": "tool_call",
+                                            "toolCallId": "call_done_py",
+                                            "kind": "execute",
+                                            "status": "completed",
+                                            "rawInput": { "CommandLine": "python3 -c \"print(1)\"" },
+                                            "rawOutput": { "exitCode": 0, "stdout": "1\n" }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            // 2) Long background python3 shell
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sess_srv,
+                                        "update": {
+                                            "sessionUpdate": "tool_call",
+                                            "toolCallId": "call_bg_py",
+                                            "kind": "execute",
+                                            "status": "in_progress",
+                                            "rawInput": { "CommandLine": "python3 -c \"import time; time.sleep(60)\"" }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            let lines = [
+                                json!({
+                                    "step_index": 0,
+                                    "type": "PLANNER_RESPONSE",
+                                    "status": "DONE",
+                                    "content": "",
+                                    "tool_calls": [
+                                        { "id": "tp_1", "name": "run_command", "args": { "CommandLine": "python3 -c \"print(1)\"" } },
+                                        { "id": "tp_2", "name": "run_command", "args": { "CommandLine": "python3 -c \"import time; time.sleep(60)\"" } }
+                                    ]
+                                }),
+                                json!({
+                                    "step_index": 1,
+                                    "type": "GENERIC",
+                                    "status": "DONE",
+                                    "content": "1\n"
+                                }),
+                                json!({
+                                    "step_index": 2,
+                                    "type": "GENERIC",
+                                    "status": "RUNNING",
+                                    "content": format!("Tool is running as a background task with task id: {sess_srv}/task-9\nTask Description: python3 -c")
+                                }),
+                            ]
+                            .iter()
+                            .map(Value::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                                + "\n";
+                            std::fs::write(&tx_path, lines).expect("write transcript");
+                            // 3) Partial streamed prose NOT committed to PLANNER_RESPONSE(DONE)
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sess_srv,
+                                        "update": {
+                                            "sessionUpdate": "agent_message_chunk",
+                                            "content": { "type": "text", "text": "PARTIAL_ROLLED_BACK_PROSE" }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                        } else if text.contains("HUMAN_STEER_2") {
+                            // Commit this turn's text to transcript_full so Turn 3 does not re-inject it.
+                            inflight_prompt_id = Some(req["id"].clone());
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sess_srv,
+                                        "update": {
+                                            "sessionUpdate": "agent_message_chunk",
+                                            "content": { "type": "text", "text": "COMMITTED_TURN2_PROSE" }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            let mut f = std::fs::OpenOptions::new()
+                                .append(true)
+                                .open(&tx_path)
+                                .expect("open tx");
+                            use std::io::Write;
+                            writeln!(
+                                f,
+                                "{}",
+                                json!({
+                                    "step_index": 3,
+                                    "type": "PLANNER_RESPONSE",
+                                    "status": "DONE",
+                                    "content": "COMMITTED_TURN2_PROSE"
+                                })
+                            )
+                            .expect("append committed");
+                        } else {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": sess_srv,
+                                        "update": {
+                                            "sessionUpdate": "agent_message_chunk",
+                                            "content": { "type": "text", "text": "TURN3_DONE" }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "stopReason": "end_turn" } }),
+                            )
+                            .await;
+                        }
+                    }
+                    "session/cancel" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} }),
+                        )
+                        .await;
+                        if let Some(pid) = inflight_prompt_id.take() {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({ "jsonrpc": "2.0", "id": pid, "result": { "stopReason": "cancelled" } }),
+                            )
+                            .await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut extra_env = HashMap::new();
+        extra_env.insert(
+            "ANTIGRAVITY_EXECUTABLE_DATA_DIR".into(),
+            tmp_data.to_string_lossy().to_string(),
+        );
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_steer_handoff".into(),
+            provider: ProviderKind::Antigravity,
+            orbit_exe: PathBuf::from("/bin/true"),
+            executable: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env,
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t1".into(),
+                prompt: "TURN1_SLOW".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("send t1");
+
+        let mut saw_bg_attached = false;
+        let mut saw_partial = false;
+        while !(saw_bg_attached && saw_partial) {
+            let ev = tokio::time::timeout(Duration::from_secs(5), evt_rx.recv())
+                .await
+                .expect("t1 stream timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::ToolCall {
+                    call_id,
+                    status: ToolCallStatus::Running,
+                    ..
+                } if call_id == "call_done_py" => {
+                    panic!("already-completed python shell regressed to Running!");
+                }
+                DriverEvent::ToolCall {
+                    call_id,
+                    status: ToolCallStatus::Running,
+                    background_task: Some(_),
+                    ..
+                } if call_id == "call_bg_py" => {
+                    saw_bg_attached = true;
+                }
+                DriverEvent::AssistantText { text, .. }
+                    if text.contains("PARTIAL_ROLLED_BACK_PROSE") =>
+                {
+                    saw_partial = true;
+                }
+                _ => {}
+            }
+        }
+
+        // Human Steer interrupts Turn 1.
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t2".into(),
+                prompt: "HUMAN_STEER_2".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("send t2 steer");
+
+        let mut saw_reconcile_bg = false;
+        let mut saw_t2_msg = false;
+        while !(saw_reconcile_bg && saw_t2_msg) {
+            let ev = tokio::time::timeout(Duration::from_secs(5), evt_rx.recv())
+                .await
+                .expect("t2 stream timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::ReconcileBackgroundTasks(items)
+                    if items
+                        .iter()
+                        .any(|(id, st)| id == "call_bg_py" && *st == ToolCallStatus::Failed) =>
+                {
+                    saw_reconcile_bg = true;
+                }
+                DriverEvent::ToolCall {
+                    call_id,
+                    status: ToolCallStatus::Running,
+                    ..
+                } if call_id == "call_done_py" => {
+                    panic!("completed python shell regressed during steer!");
+                }
+                DriverEvent::ToolCall { call_id, .. } if saw_t2_msg && call_id == "call_bg_py" => {
+                    panic!("turn 1 bg tool call re-emitted into turn 2 via ToolCall!");
+                }
+                DriverEvent::AssistantText { text, .. }
+                    if text.contains("COMMITTED_TURN2_PROSE") =>
+                {
+                    saw_t2_msg = true;
+                }
+                _ => {}
+            }
+        }
+
+        // Now steer Turn 2 (whose reply WAS committed to transcript_full.jsonl) with Turn 3:
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t3".into(),
+                prompt: "HUMAN_STEER_3".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("send t3 steer");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), evt_rx.recv())
+                .await
+                .expect("t3 settle timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        let prompts = prompts_seen.lock().await.clone();
+        assert_eq!(prompts.len(), 3);
+        assert!(
+            prompts[1].contains("[Interrupted Prior Turn Context]")
+                && prompts[1].contains("PARTIAL_ROLLED_BACK_PROSE")
+                && prompts[1].contains("HUMAN_STEER_2"),
+            "Turn 2 must carry rollback handoff for uncommitted Turn 1 partial prose, got: {}",
+            prompts[1]
+        );
+        assert!(
+            !prompts[2].contains("[Interrupted Prior Turn Context]"),
+            "Turn 3 must NOT duplicate handoff when Turn 2 reply already committed to transcript: {}",
+            prompts[2]
+        );
+
+        let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+        let _ = actor.await;
+        server.abort();
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_dir_all(&tmp_data);
+    }
+
+    #[test]
+    fn find_matching_call_id_for_bg_task_multiline_python_never_hijacks_earlier_completed_shell() {
+        let mut reg = WakeupToolRegistry::default();
+        reg.begin_turn();
+        reg.resolve_acp_tool(
+            "call_py_done",
+            ToolCallStatus::Completed,
+            ToolCallDetail::Shell {
+                command: "python3 -c \"print('done')\"".into(),
+                cwd: None,
+                exit_code: Some(0),
+                output_preview: Some("done".into()),
+            },
+            None,
+            false,
+        );
+        reg.resolve_acp_tool(
+            "call_py_bg",
+            ToolCallStatus::Running,
+            ToolCallDetail::Shell {
+                command: "python3 -c \"import time\ntime.sleep(60)\"".into(),
+                cwd: None,
+                exit_code: None,
+                output_preview: None,
+            },
+            None,
+            false,
+        );
+        assert_eq!(
+            reg.find_matching_call_id_for_bg_task(
+                Some("python3 -c"),
+                Some("python3 -c \"import time\ntime.sleep(60)\""),
+            ),
+            Some("call_py_bg".into())
+        );
+
+        // If ONLY an already-finished shell exists, an ambiguous truncated `python3 -c` must return None
+        // and `mark_background_task` must refuse to regress the finished shell back to Running.
+        let mut reg2 = WakeupToolRegistry::default();
+        reg2.begin_turn();
+        reg2.resolve_acp_tool(
+            "call_py_done_only",
+            ToolCallStatus::Completed,
+            ToolCallDetail::Shell {
+                command: "python3 -c \"print('done')\"".into(),
+                cwd: None,
+                exit_code: Some(0),
+                output_preview: Some("done".into()),
+            },
+            None,
+            false,
+        );
+        assert_eq!(
+            reg2.find_matching_call_id_for_bg_task(Some("python3 -c"), None),
+            None
+        );
+        assert!(
+            reg2.mark_background_task(
+                "call_py_done_only",
+                BackgroundTaskInfo {
+                    task_id: Some("sess/task-999".into()),
+                    label: Some("python3 -c".into()),
+                    log_path: None,
+                },
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn agy_subagent_content_uuid_foreground_polling_cancel_and_bg_task_settlement() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let tmp_data = std::env::temp_dir().join(format!("o_agy_sub_fg_{short_id}"));
+        let sess_id = format!("sess-sub-fg-{short_id}");
+        let sub_id = "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb";
+        let sub_logs = tmp_data
+            .join("brain")
+            .join(sub_id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&sub_logs).expect("mkdir sub logs");
+        let sub_tx_path = sub_logs.join("transcript_full.jsonl");
+        let sock_path = std::env::temp_dir().join(format!("o_agy_sub_fg_{short_id}.sock"));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path).await.expect("bind shim");
+
+        let sub_tx_srv = sub_tx_path.clone();
+        let sess_srv = sess_id.clone();
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+            let mut inflight_prompt_id: Option<Value> = None;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+            }
+
+            while let Ok(Some(raw_line)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) =
+                    serde_json::from_str::<ShimFrame>(&raw_line)
+                else {
+                    continue;
+                };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "protocolVersion": 1 } }),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "sessionId": sess_srv } }),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        inflight_prompt_id = Some(req["id"].clone());
+                        // Subagent spawned with conversationId embedded in `content`, not `rawOutput`.
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": sess_srv,
+                                    "update": {
+                                        "sessionUpdate": "tool_call",
+                                        "toolCallId": "call_sub_content",
+                                        "title": "Invoke subagent",
+                                        "status": "completed",
+                                        "rawInput": { "Role": "Inspector", "Prompt": "Inspect codebase" },
+                                        "content": [{
+                                            "type": "content",
+                                            "content": {
+                                                "type": "text",
+                                                "text": format!("Subagent launched conversationId={sub_id}")
+                                            }
+                                        }]
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                        let sub_lines = [
+                            json!({
+                                "step_index": 0,
+                                "type": "PLANNER_RESPONSE",
+                                "status": "DONE",
+                                "thinking": "Inspecting module now",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "sub_tool_1",
+                                    "name": "run_command",
+                                    "args": { "CommandLine": "sleep 30" }
+                                }]
+                            }),
+                            json!({
+                                "step_index": 1,
+                                "type": "GENERIC",
+                                "status": "RUNNING",
+                                "content": format!("Tool is running as a background task with task id: {sub_id}/task-1\nTask Description: sleep 30")
+                            }),
+                        ]
+                        .iter()
+                        .map(Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                            + "\n";
+                        std::fs::write(&sub_tx_srv, sub_lines).expect("write sub tx");
+                    }
+                    "session/cancel" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} }),
+                        )
+                        .await;
+                        if let Some(pid) = inflight_prompt_id.take() {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({ "jsonrpc": "2.0", "id": pid, "result": { "stopReason": "cancelled" } }),
+                            )
+                            .await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut extra_env = HashMap::new();
+        extra_env.insert(
+            "ANTIGRAVITY_EXECUTABLE_DATA_DIR".into(),
+            tmp_data.to_string_lossy().to_string(),
+        );
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_sub_fg".into(),
+            provider: ProviderKind::Antigravity,
+            orbit_exe: PathBuf::from("/bin/true"),
+            executable: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env,
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t1".into(),
+                prompt: "LAUNCH_SUB".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("send launch");
+
+        // Must observe live subagent Running + thinking + tool WHILE parent turn is STILL running!
+        let mut saw_running_upsert = false;
+        let mut saw_sub_thinking = false;
+        let mut saw_sub_tool_running = false;
+        while !(saw_running_upsert && saw_sub_thinking && saw_sub_tool_running) {
+            let ev = tokio::time::timeout(Duration::from_secs(5), evt_rx.recv())
+                .await
+                .expect("foreground subagent live timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::ProviderSubagentUpsert(d)
+                    if d.subagent_id == sub_id && d.status == ProviderSubagentStatus::Running =>
+                {
+                    saw_running_upsert = true;
+                }
+                DriverEvent::ProviderSubagentTimeline {
+                    subagent_id,
+                    payload: TimelinePayload::AssistantThinking { text, .. },
+                } if subagent_id == sub_id && text.contains("Inspecting module now") => {
+                    saw_sub_thinking = true;
+                }
+                DriverEvent::ProviderSubagentTimeline {
+                    subagent_id,
+                    payload:
+                        TimelinePayload::ToolCall {
+                            call_id,
+                            status: ToolCallStatus::Running,
+                            background_task: Some(_),
+                            ..
+                        },
+                } if subagent_id == sub_id && call_id == "sub_tool_1" => {
+                    saw_sub_tool_running = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) => {
+                    panic!("parent must still be running when subagent events arrive");
+                }
+                _ => {}
+            }
+        }
+
+        // Now interrupt parent turn -> subagent must transition Canceled and settle open tool Failed!
+        cmd_tx
+            .send(DriverCommand::Interrupt)
+            .await
+            .expect("interrupt parent");
+        let mut saw_sub_canceled = false;
+        let mut saw_sub_tool_failed = false;
+        let mut parent_idle = false;
+        while !(saw_sub_canceled && saw_sub_tool_failed && parent_idle) {
+            let ev = tokio::time::timeout(Duration::from_secs(5), evt_rx.recv())
+                .await
+                .expect("cancel subagent timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::ProviderSubagentUpsert(d)
+                    if d.subagent_id == sub_id && d.status == ProviderSubagentStatus::Canceled =>
+                {
+                    saw_sub_canceled = true;
+                }
+                DriverEvent::ProviderSubagentTimeline {
+                    subagent_id,
+                    payload:
+                        TimelinePayload::ToolCall {
+                            call_id,
+                            status: ToolCallStatus::Failed,
+                            ..
+                        },
+                } if subagent_id == sub_id && call_id == "sub_tool_1" => {
+                    saw_sub_tool_failed = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) => {
+                    parent_idle = true;
+                }
+                _ => {}
+            }
+        }
+
+        let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+        let _ = actor.await;
+        server.abort();
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_dir_all(&tmp_data);
+    }
+
+    #[tokio::test]
+    async fn agy_stderr_disk_full_emits_error_notice_and_session_info_update_sets_title() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let sock_path = std::env::temp_dir().join(format!("o_agy_stderr_{short_id}.sock"));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path).await.expect("bind shim");
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_frame(wh: &mut ShimWriteHalf, frame: ShimFrame) {
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+            }
+
+            while let Ok(Some(raw_line)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) =
+                    serde_json::from_str::<ShimFrame>(&raw_line)
+                else {
+                    continue;
+                };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_frame(
+                            &mut wh,
+                            ShimFrame::StdoutLine {
+                                seq: Some(seq),
+                                line: json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "protocolVersion": 1 } }).to_string(),
+                            },
+                        )
+                        .await;
+                        seq += 1;
+                    }
+                    "session/new" => {
+                        send_frame(
+                            &mut wh,
+                            ShimFrame::StdoutLine {
+                                seq: Some(seq),
+                                line: json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "sessionId": "sess-err-title" } }).to_string(),
+                            },
+                        )
+                        .await;
+                        seq += 1;
+                    }
+                    "session/prompt" => {
+                        send_frame(
+                            &mut wh,
+                            ShimFrame::StderrLine {
+                                seq: Some(seq),
+                                line: "harmless debug trace line".into(),
+                            },
+                        )
+                        .await;
+                        seq += 1;
+                        send_frame(
+                            &mut wh,
+                            ShimFrame::StderrLine {
+                                seq: Some(seq),
+                                line: "FATAL: No space left on device (os error 28)".into(),
+                            },
+                        )
+                        .await;
+                        seq += 1;
+                        send_frame(
+                            &mut wh,
+                            ShimFrame::StdoutLine {
+                                seq: Some(seq),
+                                line: json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": "sess-err-title",
+                                        "update": {
+                                            "sessionUpdate": "session_info_update",
+                                            "title": "  Fix   auth   refresh  "
+                                        }
+                                    }
+                                })
+                                .to_string(),
+                            },
+                        )
+                        .await;
+                        seq += 1;
+                        send_frame(
+                            &mut wh,
+                            ShimFrame::StdoutLine {
+                                seq: Some(seq),
+                                line: json!({ "jsonrpc": "2.0", "id": req["id"], "result": { "stopReason": "end_turn" } }).to_string(),
+                            },
+                        )
+                        .await;
+                        seq += 1;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_err_title".into(),
+            provider: ProviderKind::Antigravity,
+            orbit_exe: PathBuf::from("/bin/true"),
+            executable: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t1".into(),
+                prompt: "TRIGGER".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("send");
+
+        let mut saw_disk_notice = false;
+        let mut saw_title = false;
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(4), evt_rx.recv()).await {
+            match ev {
+                DriverEvent::Notice { level, message } => {
+                    assert!(
+                        !message.contains("harmless debug trace"),
+                        "benign stderr line should not become a UI notice"
+                    );
+                    if level == "error" && message.contains("No space left on device") {
+                        saw_disk_notice = true;
+                    }
+                }
+                DriverEvent::SessionTitleUpdated { title } if title == "Fix auth refresh" => {
+                    saw_title = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) if saw_disk_notice && saw_title => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_disk_notice, "disk full stderr must emit error Notice");
+        assert!(
+            saw_title,
+            "session_info_update must emit SessionTitleUpdated"
+        );
+
+        let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+        let _ = actor.await;
+        server.abort();
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn agy_subagent_cancel_settles_multiple_open_non_bg_planner_tools() {
+        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("o_agy_sub_multi_open_{short_id}"));
+        let logs = dir.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        let sub_id = format!("sub-multi-open-{short_id}");
+        let lines = [
+            json!({
+                "step_index": 0,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": "Start inspection"
+            }),
+            json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "thinking": "Running shell and reading file",
+                "content": "",
+                "tool_calls": [
+                    { "name": "run_command", "args": { "CommandLine": "sleep 20" } },
+                    { "name": "read_file", "args": { "Path": "/tmp/sample.txt" } }
+                ]
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        std::fs::write(logs.join("transcript_full.jsonl"), lines).expect("write tx");
+
+        let now = Utc::now();
+        let desc = ProviderSubagentDescriptor {
+            subagent_id: sub_id.clone(),
+            parent_agent_id: "ag_p".into(),
+            parent_subagent_id: None,
+            title: "Workspace Reader".into(),
+            subtitle: None,
+            status: ProviderSubagentStatus::Running,
+            created_at: now,
+            updated_at: now,
+        };
+        let mon = AgyTranscriptMonitor::from_brain_dir_subagent(dir.clone(), &sub_id);
+        let mut monitors = HashMap::new();
+        monitors.insert(sub_id.clone(), AgySubagentMonitorEntry::new(desc, mon));
+        let (evt_tx, mut evt_rx) = mpsc::channel(32);
+
+        if let Some(entry) = monitors.get_mut(&sub_id) {
+            poll_agy_subagent_monitor(&sub_id, entry, &evt_tx).await;
+        }
+        assert_eq!(monitors[&sub_id].open_tools.len(), 2);
+
+        cancel_agy_subagent_monitors(None, &mut monitors, &evt_tx).await;
+        assert!(monitors[&sub_id].open_tools.is_empty());
+        assert_eq!(
+            monitors[&sub_id].desc.status,
+            ProviderSubagentStatus::Canceled
+        );
+
+        let mut failed_calls = Vec::new();
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let DriverEvent::ProviderSubagentTimeline {
+                subagent_id,
+                payload:
+                    TimelinePayload::ToolCall {
+                        call_id,
+                        status: ToolCallStatus::Failed,
+                        ..
+                    },
+            } = ev
+                && subagent_id == sub_id
+            {
+                failed_calls.push(call_id);
+            }
+        }
+        failed_calls.sort();
+        assert_eq!(
+            failed_calls,
+            vec!["wake_tool_1_0".to_string(), "wake_tool_1_1".to_string()],
+            "both parallel open non-bg planner tools must settle Failed when subagent cancels"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

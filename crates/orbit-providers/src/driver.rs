@@ -150,6 +150,10 @@ pub enum DriverEvent {
         persistence_ref: String,
         model: Option<String>,
     },
+    /// Provider-advertised session title update (e.g. ACP `session_info_update`).
+    SessionTitleUpdated {
+        title: String,
+    },
     StatusChanged(AgentStatus),
     ThinkingText {
         item_id: String,

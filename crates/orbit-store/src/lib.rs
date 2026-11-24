@@ -6175,8 +6175,9 @@ mod tests {
                 .expect("empty check")
         );
 
-        // 1. Streaming thinking heartbeats for the same `wake_th_5` keep row count O(1) while
-        //    strictly advancing `seq > since_seq` on mutation so reconnecting clients never miss updates!
+        // 1. Streaming thinking heartbeats for the same `wake_th_5` keep row count O(1) and
+        //    preserve chronological `seq` while advancing `updated_seq` so reconnecting clients
+        //    with `since_seq = ev1.seq` still observe updates in their original timeline slot.
         let (ev1, m1) = store
             .append_provider_subagent_event_upsert(
                 "ag_parent_dedupe",
@@ -6199,9 +6200,9 @@ mod tests {
             )
             .expect("hb2");
         assert!(m2);
-        assert!(
-            ev2.seq > ev1.seq,
-            "mutated thinking heartbeat must advance seq past since_seq"
+        assert_eq!(
+            ev2.seq, ev1.seq,
+            "mutated thinking heartbeat must update in place keeping original seq"
         );
         assert_eq!(
             store
@@ -6214,7 +6215,11 @@ mod tests {
             .fetch_provider_subagent_events_since("ag_parent_dedupe", "sub_1", ev1.seq, 50)
             .expect("catchup after mutation");
         assert_eq!(caught_up.len(), 1);
-        assert_eq!(caught_up[0].seq, ev2.seq);
+        assert_eq!(caught_up[0].seq, ev1.seq);
+        assert!(matches!(
+            &caught_up[0].payload,
+            TimelinePayload::AssistantThinking { text, .. } if text.contains("step 2")
+        ));
 
         let (ev3, m3) = store
             .append_provider_subagent_event_upsert(
@@ -6229,7 +6234,7 @@ mod tests {
         assert!(!m3, "identical heartbeat must be a zero-write no-op");
         assert_eq!(ev3.seq, ev2.seq);
 
-        // 2. Tool call transition (Running -> Completed) keeps O(1) row while advancing seq
+        // 2. Tool call transition (Running -> Completed) keeps O(1) row and original `seq` before reply
         let (tool_run, m_tr) = store
             .append_provider_subagent_event_upsert(
                 "ag_parent_dedupe",
@@ -6262,9 +6267,6 @@ mod tests {
             },
             background_task: None,
         };
-        let (_, m_msg) = store
-            .append_provider_subagent_event_upsert("ag_parent_dedupe", "sub_1", msg_payload.clone())
-            .expect("msg");
         let (tool_done, m_tool) = store
             .append_provider_subagent_event_upsert(
                 "ag_parent_dedupe",
@@ -6272,14 +6274,53 @@ mod tests {
                 tool_payload.clone(),
             )
             .expect("tool");
+        let (msg_ev, m_msg) = store
+            .append_provider_subagent_event_upsert("ag_parent_dedupe", "sub_1", msg_payload.clone())
+            .expect("msg");
         assert!(m_msg && m_tool);
-        assert!(tool_done.seq > tool_run.seq);
+        assert_eq!(
+            tool_done.seq, tool_run.seq,
+            "completing a subagent tool call must preserve its chronological seq"
+        );
+        assert!(
+            tool_done.seq < msg_ev.seq,
+            "completed tool card must stay above assistant reply"
+        );
         assert_eq!(
             store
                 .provider_subagent_event_count("ag_parent_dedupe", "sub_1")
                 .expect("count"),
             3
         );
+
+        // Replaying a stale `Running` update for an already-completed tool call must be ignored.
+        let (downgrade_ev, downgrade_mut) = store
+            .append_provider_subagent_event_upsert(
+                "ag_parent_dedupe",
+                "sub_1",
+                TimelinePayload::ToolCall {
+                    call_id: "wake_tool_5_0".into(),
+                    status: ToolCallStatus::Running,
+                    detail: ToolCallDetail::FileRead {
+                        path: "src/lib.rs".into(),
+                        start_line: None,
+                        end_line: None,
+                    },
+                    background_task: None,
+                },
+            )
+            .expect("stale running downgrade replay");
+        assert!(
+            !downgrade_mut,
+            "terminal subagent tool call must not downgrade back to Running"
+        );
+        assert!(matches!(
+            downgrade_ev.payload,
+            TimelinePayload::ToolCall {
+                status: ToolCallStatus::Completed,
+                ..
+            }
+        ));
 
         // Replay the entire historical sequence twice (simulating 2 daemon restarts)
         for _ in 0..2 {
@@ -6318,6 +6359,25 @@ mod tests {
                 .expect("count after replay"),
             3
         );
+        let (ordered, _) = store
+            .fetch_provider_subagent_events_since("ag_parent_dedupe", "sub_1", 0, 50)
+            .expect("ordered fetch");
+        assert_eq!(ordered.len(), 3);
+        assert!(matches!(
+            ordered[0].payload,
+            TimelinePayload::AssistantThinking { .. }
+        ));
+        assert!(matches!(
+            ordered[1].payload,
+            TimelinePayload::ToolCall {
+                status: ToolCallStatus::Completed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ordered[2].payload,
+            TimelinePayload::AssistantMessage { .. }
+        ));
         assert!(
             store
                 .has_provider_subagent_events("ag_parent_dedupe", "sub_1")

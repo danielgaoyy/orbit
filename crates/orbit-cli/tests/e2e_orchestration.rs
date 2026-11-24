@@ -1847,3 +1847,195 @@ async fn scenario_11_relay_routed_fleet_mesh_and_direct_mismatch_fallback() {
 
     relay_handle.abort();
 }
+
+/// Scenario 11: Multi-Host Personal Router ("分工师") — remote host discovery, cross-host project
+/// context inspection (`AGENTS.md` / `README.md` / git branch), remote Worker dispatch from Host A
+/// to Host B via Orbit MCP, `<orbit-fleet-state>` remote visibility, and reactive finish wakeup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_11_personal_router_cross_host_project_context_and_dispatch() {
+    ensure_mock_claude_installed();
+    let home_a = new_temp_dir("orbit_e2e_s11_router_a");
+    let home_b = new_temp_dir("orbit_e2e_s11_worker_b");
+    let repo_a = new_temp_dir("orbit_e2e_s11_repo_a");
+    let repo_b = new_temp_dir("orbit_e2e_s11_repo_b");
+    init_temp_git_repo(&repo_a);
+    init_temp_git_repo(&repo_b);
+
+    // Seed real project context files on remote Host B
+    std::fs::write(
+        repo_b.join("AGENTS.md"),
+        "# Remote Service Rules\nAlways run cargo test before shipping.\n",
+    )
+    .expect("write AGENTS.md");
+    std::fs::write(
+        repo_b.join("README.md"),
+        "# Remote Billing Service\nHandles multi-currency invoicing.\n",
+    )
+    .expect("write README.md");
+    std::fs::create_dir_all(repo_b.join("src")).expect("mkdir src");
+    std::fs::write(
+        repo_b.join("src/lib.rs"),
+        "pub fn version() -> &'static str { \"1.0\" }\n",
+    )
+    .expect("write lib.rs");
+
+    let (_addr_a, rt_a) = spawn_embedded_daemon(home_a.to_path_buf(), None)
+        .await
+        .expect("daemon A");
+    let (addr_b, rt_b) = spawn_embedded_daemon(home_b.to_path_buf(), None)
+        .await
+        .expect("daemon B");
+
+    // Connect Daemon A (Primary Router host) -> Daemon B (Remote Project host)
+    let offer_b = rt_b
+        .build_pairing_offer(vec![format!("ws://{addr_b}/ws")], None)
+        .expect("pairing offer b");
+    let uri_b = offer_b.to_qr_uri().expect("pair uri b");
+    rt_a.connected_hosts
+        .add_from_pairing_uri(Some("Remote-Devbox-B".into()), &uri_b)
+        .await
+        .expect("add peer B");
+
+    let mesh_online = wait_until(Duration::from_secs(10), || async {
+        rt_a.connected_hosts.list_summaries().await.iter().any(|h| {
+            h.host_id.as_deref() == Some(rt_b.host_info.host_id.as_str())
+                && h.status == ConnectedHostStatus::Online
+        })
+    })
+    .await;
+    assert!(mesh_online, "Daemon A must connect to Daemon B");
+
+    // 1. Multi-Host Fleet Router Auto-Discovery sees BOTH Host A and Host B
+    let discovered = rt_a.personal_router.discover_fleet_router_hosts().await;
+    assert!(
+        discovered.len() >= 2,
+        "Expected at least 2 hosts in fleet discovery, got: {discovered:?}"
+    );
+    assert!(
+        discovered
+            .iter()
+            .any(|h| h.host_id == rt_b.host_info.host_id && h.online),
+        "Host B must appear online in fleet router discovery"
+    );
+
+    // 2. Activate canonical Personal Router on Host A (backed by mock Claude provider in test)
+    let router_cfg = orbit_protocol::PersonalRouterConfig {
+        enabled: true,
+        provider: ProviderKind::ClaudeCode,
+        acp_agent_id: None,
+        cwd: Some(repo_a.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let snap = rt_a
+        .personal_router
+        .configure(router_cfg, None, true)
+        .await
+        .expect("activate personal router on Host A");
+    let router_agent = snap
+        .router_agent
+        .expect("canonical router agent must be created");
+    assert!(router_agent.is_personal_router());
+
+    // 3. Router on Host A inspects remote project context on Host B via Orbit MCP!
+    let ctx_exec = orbit_daemon::tools::execute_tool(
+        &rt_a,
+        Some(&router_agent.agent_id),
+        "orbit_control",
+        serde_json::json!({
+            "action": "inspect_project_context",
+            "host_id": rt_b.host_info.host_id,
+            "cwd": repo_b.to_string_lossy().to_string(),
+        }),
+    )
+    .await;
+    assert!(
+        !ctx_exec.is_error,
+        "inspect_project_context over Fleet Mesh failed: {}",
+        ctx_exec.text
+    );
+    assert!(
+        ctx_exec.text.contains("Remote Service Rules"),
+        "Remote AGENTS.md must be returned: {}",
+        ctx_exec.text
+    );
+    assert!(
+        ctx_exec.text.contains("Remote Billing Service"),
+        "Remote README.md must be returned: {}",
+        ctx_exec.text
+    );
+    assert!(
+        ctx_exec.text.contains("src/"),
+        "Remote top-level directory entries must be returned: {}",
+        ctx_exec.text
+    );
+
+    // 4. Router on Host A dispatches a Worker onto Host B for `repo_b` via Orbit MCP
+    let dispatch_exec = orbit_daemon::tools::execute_tool(
+        &rt_a,
+        Some(&router_agent.agent_id),
+        "create_agent",
+        serde_json::json!({
+            "host_id": rt_b.host_info.host_id,
+            "cwd": repo_b.to_string_lossy().to_string(),
+            "provider": "claude_code",
+            "mode": "accept_edits",
+            "title": "Remote Billing Worker",
+            "initial_prompt": "[MOCK:QUICK] remote-router-task-done",
+            "notify_on_finish": true
+        }),
+    )
+    .await;
+    assert!(
+        !dispatch_exec.is_error,
+        "Cross-host create_agent from Router failed: {}",
+        dispatch_exec.text
+    );
+    let remote_worker_id = dispatch_exec
+        .structured
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .expect("remote worker agent_id")
+        .to_string();
+
+    // 5. Verify Host A's Personal Router receives reactive cross-host FinishNotification from Host B
+    let got_remote_finish = wait_until(Duration::from_secs(20), || async {
+        let Ok((events, _)) = rt_a
+            .store
+            .fetch_timeline_since(&router_agent.agent_id, 0, 500)
+        else {
+            return false;
+        };
+        events.iter().any(|e| {
+            matches!(
+                &e.payload,
+                TimelinePayload::AgentMessage {
+                    kind: AgentMessageKind::FinishNotification,
+                    source_agent_id: Some(src_aid),
+                    source_host_id: Some(src_hid),
+                    ..
+                } if src_aid == &remote_worker_id && src_hid == &rt_b.host_info.host_id
+            )
+        })
+    })
+    .await;
+    assert!(
+        got_remote_finish,
+        "Personal Router on Host A must receive cross-host finish wakeup from Worker on Host B"
+    );
+
+    // 6. Verify Host A's `<orbit-fleet-state>` reflects Host B & its remote Worker after cache refresh
+    rt_a.personal_router.reset_fleet_context_state().await;
+    let fleet_xml = rt_a
+        .personal_router
+        .build_fleet_context_incremental(&router_agent.agent_id)
+        .await
+        .expect("fleet context xml");
+    assert!(
+        fleet_xml.contains(&rt_b.host_info.host_id),
+        "Fleet state must include remote host B: {fleet_xml}"
+    );
+    assert!(
+        fleet_xml.contains(&remote_worker_id),
+        "Fleet state must include remote worker on host B: {fleet_xml}"
+    );
+}

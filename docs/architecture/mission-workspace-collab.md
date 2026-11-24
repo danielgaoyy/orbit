@@ -34,3 +34,11 @@ Mission Workspace 中会话标题与 `@handle` 会根据进展自动或手动更
 
 - 向同工作区伙伴发消息时，按实际需求设置 `notify_on_finish`；避免无意义互相 `@` 触发无穷唤醒回声链。
 - **必跑验证**：改动上述任何模块必跑 `pitfall_05`（`e2e_pitfall_regressions`）及 `e2e_workspace_sync_and_worktree`、`e2e_orchestration`。
+
+---
+
+## 5. Personal Router（常驻分工师）与跨主机项目上下文编排
+
+- **一等公民角色与全局主主机选择**：`AgentRole::PersonalRouter`（`orbit-protocol/src/router.rs`）允许用户在多主机 Fleet 中显式选择**任意一台在线主机**（例如远程常驻 Mac mini / 云端 Devbox 或本机）作为全局唯一主分工师（持久化于客户端 `primary_router_selection`），通过 `DiscoverFleetRouterHosts` 自动探测各主机的 `hermes` 安装状态与已有 `~/.hermes/memories/` 记忆。
+- **跨主机项目发现与上下文注入**：主分工师所在的 Host A 通过 `PersonalRouterManager`（`crates/orbit-daemon/src/personal_router.rs`）聚合全部在线远端主机的项目与活跃 Worker 注入 `<orbit-fleet-state>` / `<orbit-fleet-delta>`，并通过 Core Pack 的 `orbit_control(action="list_projects" | "inspect_project_context")` 在派单前免 SSH 拉取任意远端仓库的 `AGENTS.md` / `README.md` / 目录结构与 Git 分支上下文。
+- **三级风控与飞书双向闭环**：Tier-1 低危由 `GuardianManager` 自动放行；Tier-2 中危可由分工师结合上下文预审；Tier-3 高危（`High` / `Critical`）在协议层硬禁止分工师自动放行并强制交由人类在原生端或飞书交互卡片拍板。飞书通道支持 `ImRoutingMode::PersonalRouter` 直接路由至唯一常驻分工师会话。

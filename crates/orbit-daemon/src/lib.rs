@@ -28,6 +28,7 @@ pub mod manager;
 pub mod mcp;
 pub mod mcp_servers;
 pub mod messaging;
+pub mod personal_router;
 pub mod platform;
 pub mod push;
 pub mod rules;
@@ -463,6 +464,7 @@ pub struct DaemonRuntime {
     pub browser: Arc<BrowserManager>,
     pub hooks: Arc<HooksEngine>,
     pub im_channels: Arc<ImChannelBridge>,
+    pub personal_router: Arc<crate::personal_router::PersonalRouterManager>,
     pub push: Arc<PushManager>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
@@ -632,6 +634,21 @@ impl DaemonRuntime {
         };
 
         let (pairing_secret_rotated_tx, _) = broadcast::channel(16);
+        let personal_router = crate::personal_router::PersonalRouterManager::new(
+            home_dir.to_path_buf(),
+            host_info.clone(),
+            listen_port.clone(),
+            mcp_token.clone(),
+            store.clone(),
+            orchestrator.clone(),
+            connected_hosts.clone(),
+        );
+        orchestrator
+            .set_personal_router(personal_router.clone())
+            .await;
+        im_channels
+            .set_personal_router(personal_router.clone())
+            .await;
 
         Ok(Arc::new(Self {
             host_info,
@@ -662,6 +679,7 @@ impl DaemonRuntime {
             browser,
             hooks,
             im_channels,
+            personal_router,
             push,
             provider_catalogs,
             mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -6098,6 +6116,69 @@ async fn handle_wire_rpc(
                 Err(e) => Some(rpc_err(request_id, "save_config_failed", e)),
             }
         }
+        WireMessage::GetPersonalRouterStatus { request_id } => {
+            let status = runtime.personal_router.status_snapshot().await;
+            Some(WireMessage::PersonalRouterStatusSnapshot { request_id, status })
+        }
+        WireMessage::ConfigurePersonalRouter {
+            request_id,
+            config,
+            external_webhook_secret,
+            activate,
+        } => {
+            let pr = Arc::clone(&runtime.personal_router);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match pr
+                    .configure(config, external_webhook_secret, activate)
+                    .await
+                {
+                    Ok(status) => WireMessage::PersonalRouterStatusSnapshot { request_id, status },
+                    Err(e) => rpc_err(request_id, "configure_personal_router_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ProbeRouterCapabilities { request_id } => {
+            let capabilities = runtime.personal_router.probe_local_capabilities().await;
+            Some(WireMessage::RouterCapabilitiesResponse {
+                request_id,
+                capabilities,
+            })
+        }
+        WireMessage::DiscoverFleetRouterHosts { request_id } => {
+            let pr = Arc::clone(&runtime.personal_router);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let hosts = pr.discover_fleet_router_hosts().await;
+                let reply = WireMessage::FleetRouterHostsSnapshot { request_id, hosts };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ExportHermesBridgeConfig { request_id } => {
+            let bundle = runtime.personal_router.export_hermes_bridge_bundle().await;
+            Some(WireMessage::HermesBridgeConfigResponse { request_id, bundle })
+        }
+        WireMessage::InspectProjectContext { request_id, cwd } => {
+            let pr = Arc::clone(&runtime.personal_router);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match pr.inspect_local_project_context(&cwd).await {
+                    Ok(context) => WireMessage::ProjectContextResponse {
+                        request_id,
+                        context,
+                    },
+                    Err(e) => rpc_err(request_id, "inspect_project_context_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::GetKeepAwakeStatus { request_id } => {
             let status = runtime.keep_awake.status();
             Some(WireMessage::KeepAwakeStatusSnapshot { request_id, status })
@@ -6579,6 +6660,8 @@ async fn handle_wire_rpc(
             default_provider,
             default_mode,
             forward_approvals,
+            routing_mode,
+            router_mirror_policy,
         } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;
@@ -6599,6 +6682,8 @@ async fn handle_wire_rpc(
                     default_provider,
                     default_mode,
                     forward_approvals,
+                    routing_mode,
+                    router_mirror_policy,
                 };
                 let reply = match im.upsert_channel(spec).await {
                     Ok(snap) => WireMessage::ImChannelsSnapshot {

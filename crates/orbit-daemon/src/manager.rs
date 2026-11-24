@@ -259,6 +259,7 @@ pub struct AgentOrchestrator {
     auto_name_semaphore: Arc<tokio::sync::Semaphore>,
     conditional_timers: RwLock<Option<Arc<crate::timers::ConditionalTimerEngine>>>,
     message_delivery: RwLock<Option<Arc<AgentMessageDelivery>>>,
+    personal_router: RwLock<Option<Arc<crate::personal_router::PersonalRouterManager>>>,
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
 }
 
@@ -334,6 +335,7 @@ impl AgentOrchestrator {
             auto_name_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             conditional_timers: RwLock::new(None),
             message_delivery: RwLock::new(None),
+            personal_router: RwLock::new(None),
             broadcast_tx,
         })
     }
@@ -352,6 +354,17 @@ impl AgentOrchestrator {
 
     async fn message_delivery(&self) -> Option<Arc<AgentMessageDelivery>> {
         self.message_delivery.read().await.clone()
+    }
+
+    pub async fn set_personal_router(
+        &self,
+        router: Arc<crate::personal_router::PersonalRouterManager>,
+    ) {
+        *self.personal_router.write().await = Some(router);
+    }
+
+    async fn personal_router(&self) -> Option<Arc<crate::personal_router::PersonalRouterManager>> {
+        self.personal_router.read().await.clone()
     }
 
     pub fn are_all_workspace_peers_settled(&self, agent_id: &str) -> bool {
@@ -4498,6 +4511,14 @@ impl AgentOrchestrator {
         if agent.background {
             return prompt;
         }
+        if agent.is_personal_router() {
+            if let Some(router) = self.personal_router().await
+                && let Some(fleet_xml) = router.build_fleet_context_incremental(agent_id).await
+            {
+                return format!("{fleet_xml}\n\n{prompt}");
+            }
+            return prompt;
+        }
         let Ok(Some(ws)) = self.store.get_workspace(&agent.workspace_id) else {
             return prompt;
         };
@@ -5821,13 +5842,13 @@ impl AgentOrchestrator {
                     }
                 }
 
-                if let Some(ag) = agent_opt {
+                if let Some(ref ag) = agent_opt {
                     self.pending_permissions.write().await.insert(
                         (agent_id.to_string(), request_id.clone()),
                         PendingPermissionSummary {
                             agent_id: agent_id.to_string(),
-                            agent_title: ag.title,
-                            workspace_id: ag.workspace_id,
+                            agent_title: ag.title.clone(),
+                            workspace_id: ag.workspace_id.clone(),
                             request_id: request_id.clone(),
                             title: title.clone(),
                             detail: detail.clone(),
@@ -5836,6 +5857,82 @@ impl AgentOrchestrator {
                             created_at: Utc::now(),
                         },
                     );
+
+                    // Notify active Personal Router for Tier-2 Medium pre-review (Tier-3 High/Critical
+                    // stays strictly human-only!) and mirror event to optional external Hermes webhook.
+                    if !ag.is_personal_router()
+                        && let Some(router) = self.personal_router().await
+                    {
+                        let risk_level = guardian_assessment
+                            .as_ref()
+                            .map(|a| a.risk_level)
+                            .unwrap_or(orbit_protocol::GuardianRiskLevel::High);
+                        router.emit_external_webhook_event(
+                            "worker.permission_checkpoint",
+                            serde_json::json!({
+                                "agent_id": agent_id,
+                                "agent_title": ag.title,
+                                "workspace_id": ag.workspace_id,
+                                "request_id": request_id,
+                                "title": title,
+                                "risk_level": risk_level.as_str(),
+                            }),
+                        );
+                        let cfg = router.config().await;
+                        if matches!(
+                            cfg.pre_review_mode,
+                            orbit_protocol::RouterPreReviewMode::MediumRiskOnly
+                                | orbit_protocol::RouterPreReviewMode::AssistOnly
+                        ) && matches!(
+                            risk_level,
+                            orbit_protocol::GuardianRiskLevel::Low
+                                | orbit_protocol::GuardianRiskLevel::Medium
+                        ) && let Some(router_id) = router.active_router_agent_id().await
+                            && router_id != agent_id
+                            && let Some(delivery) = self.message_delivery().await
+                        {
+                            let body = format!(
+                                "Worker `{}` ({}) requests Tier-2 ({}) permission `{}`: {}.\n\
+                                 Evaluate whether this aligns with the user's stated intent. \
+                                 If aligned and mode allows, call `orbit_control(action=\"respond_permission\", agent_id=\"{}\", request_id=\"{}\", decision=\"allow\")`; \
+                                 otherwise deny or summarize for the human.",
+                                ag.title,
+                                agent_id,
+                                risk_level.as_str(),
+                                request_id,
+                                title,
+                                agent_id,
+                                request_id
+                            );
+                            let _ = delivery
+                                .enqueue(crate::messaging::QueuedAgentMessage {
+                                    recipient_id: router_id,
+                                    message_id: format!("pr_{}", Uuid::new_v4().simple()),
+                                    source: crate::messaging::AgentPromptSource {
+                                        kind: AgentMessageKind::FinishNotification,
+                                        source_agent_id: Some(agent_id.to_string()),
+                                        source_host_id: Some(self.host_id.clone()),
+                                        source_title: Some(ag.title.clone()),
+                                        event: Some("permission_pre_review".to_string()),
+                                        permission_context: Some(
+                                            orbit_protocol::PermissionCheckpointRef {
+                                                agent_id: agent_id.to_string(),
+                                                request_id: request_id.clone(),
+                                                host_id: Some(self.host_id.clone()),
+                                                title: title.clone(),
+                                                detail: detail.clone(),
+                                                allowed_decisions: allowed_decisions.clone(),
+                                            },
+                                        ),
+                                    },
+                                    body,
+                                    active_turn_behavior: ActiveTurnBehavior::Queue,
+                                    session_mode: None,
+                                    unarchive: false,
+                                })
+                                .await;
+                        }
+                    }
                 }
                 TimelinePayload::PermissionRequest {
                     request_id,

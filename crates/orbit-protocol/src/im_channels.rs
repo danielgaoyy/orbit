@@ -3,7 +3,18 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ProviderKind, SessionMode};
+use crate::{ProviderKind, RouterImMirrorPolicy, SessionMode};
+
+/// How inbound IM messages on a channel are routed to Orbit agent sessions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImRoutingMode {
+    /// Existing behavior: each IM chat/thread binds to its own dedicated coding agent conversation.
+    #[default]
+    PerThreadAgent,
+    /// Route all authorized messages directly into the host's canonical Personal Router ("分工师").
+    PersonalRouter,
+}
 
 fn im_default_true() -> bool {
     true
@@ -114,6 +125,10 @@ pub struct ImChannelRecord {
     pub default_mode: SessionMode,
     #[serde(default = "im_default_true")]
     pub forward_approvals: bool,
+    #[serde(default)]
+    pub routing_mode: ImRoutingMode,
+    #[serde(default)]
+    pub router_mirror_policy: RouterImMirrorPolicy,
     #[serde(default)]
     pub message_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

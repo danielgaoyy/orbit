@@ -4,8 +4,8 @@
 //! `CREATE INDEX IF NOT EXISTS` without bumping `PRAGMA user_version` (keeps `user_version = 6`).
 
 use orbit_protocol::{
-    ImChannelRecord, ImConnectionStatus, ImPlatform, ImThreadBinding, ProviderKind, SessionMode,
-    mask_im_secret,
+    ImChannelRecord, ImConnectionStatus, ImPlatform, ImRoutingMode, ImThreadBinding, ProviderKind,
+    RouterImMirrorPolicy, SessionMode, mask_im_secret,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -30,6 +30,8 @@ pub struct StoredImChannel {
     pub default_provider: ProviderKind,
     pub default_mode: SessionMode,
     pub forward_approvals: bool,
+    pub routing_mode: ImRoutingMode,
+    pub router_mirror_policy: RouterImMirrorPolicy,
     pub message_count: u64,
     pub last_activity_at_ms: Option<u64>,
     pub created_at_ms: u64,
@@ -61,6 +63,8 @@ impl std::fmt::Debug for StoredImChannel {
             .field("default_provider", &self.default_provider)
             .field("default_mode", &self.default_mode)
             .field("forward_approvals", &self.forward_approvals)
+            .field("routing_mode", &self.routing_mode)
+            .field("router_mirror_policy", &self.router_mirror_policy)
             .field("message_count", &self.message_count)
             .field("last_activity_at_ms", &self.last_activity_at_ms)
             .field("created_at_ms", &self.created_at_ms)
@@ -93,6 +97,8 @@ impl StoredImChannel {
             default_provider: self.default_provider,
             default_mode: self.default_mode.clone(),
             forward_approvals: self.forward_approvals,
+            routing_mode: self.routing_mode,
+            router_mirror_policy: self.router_mirror_policy,
             message_count: self.message_count,
             last_activity_at_ms: self.last_activity_at_ms,
             created_at_ms: self.created_at_ms,
@@ -123,6 +129,8 @@ pub(crate) fn migrate_im_channels_schema(conn: &Connection) -> Result<(), StoreE
             default_provider_json  TEXT NOT NULL,
             default_mode_json      TEXT NOT NULL,
             forward_approvals      INTEGER NOT NULL DEFAULT 1,
+            routing_mode           TEXT NOT NULL DEFAULT 'per_thread_agent',
+            router_mirror_policy   TEXT NOT NULL DEFAULT 'milestones_and_approvals',
             message_count          INTEGER NOT NULL DEFAULT 0,
             last_activity_at_ms    INTEGER,
             created_at_ms          INTEGER NOT NULL,
@@ -144,13 +152,23 @@ pub(crate) fn migrate_im_channels_schema(conn: &Connection) -> Result<(), StoreE
             ON im_channel_bindings(channel_id, updated_at_ms DESC);
         ",
     )?;
+    for (col, col_type) in [
+        ("routing_mode", "TEXT NOT NULL DEFAULT 'per_thread_agent'"),
+        (
+            "router_mirror_policy",
+            "TEXT NOT NULL DEFAULT 'milestones_and_approvals'",
+        ),
+    ] {
+        crate::ensure_table_column(conn, "im_channels", col, col_type)?;
+    }
     Ok(())
 }
 
 const IM_CHANNEL_SELECT_COLS: &str = "channel_id, name, platform, enabled, status, status_message, \
     webhook_path, app_id, primary_secret, signing_secret, allowed_chat_ids_json, \
     allowed_user_ids_json, default_workspace_cwd, default_provider_json, default_mode_json, \
-    forward_approvals, message_count, last_activity_at_ms, created_at_ms, updated_at_ms";
+    forward_approvals, message_count, last_activity_at_ms, created_at_ms, updated_at_ms, \
+    routing_mode, router_mirror_policy";
 
 fn map_im_channel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredImChannel> {
     let channel_id: String = row.get(0)?;
@@ -173,9 +191,19 @@ fn map_im_channel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredImChann
     let last_activity_raw: Option<i64> = row.get(17)?;
     let created_at_raw: i64 = row.get(18)?;
     let updated_at_raw: i64 = row.get(19)?;
+    let routing_mode_raw: String = row
+        .get(20)
+        .unwrap_or_else(|_| "per_thread_agent".to_string());
+    let mirror_policy_raw: String = row
+        .get(21)
+        .unwrap_or_else(|_| "milestones_and_approvals".to_string());
 
     let platform = ImPlatform::from_slug(&platform_raw).unwrap_or(ImPlatform::Lark);
     let status = ImConnectionStatus::from_slug(&status_raw);
+    let routing_mode: ImRoutingMode =
+        serde_json::from_str(&format!("\"{routing_mode_raw}\"")).unwrap_or_default();
+    let router_mirror_policy: RouterImMirrorPolicy =
+        serde_json::from_str(&format!("\"{mirror_policy_raw}\"")).unwrap_or_default();
     let allowed_chat_ids: Vec<String> =
         serde_json::from_str(&allowed_chat_ids_json).unwrap_or_default();
     let allowed_user_ids: Vec<String> =
@@ -202,6 +230,8 @@ fn map_im_channel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredImChann
         default_provider,
         default_mode,
         forward_approvals: forward_approvals_raw != 0,
+        routing_mode,
+        router_mirror_policy,
         message_count: u64::try_from(message_count_raw).unwrap_or(0),
         last_activity_at_ms: last_activity_raw.and_then(|v| u64::try_from(v).ok()),
         created_at_ms: u64::try_from(created_at_raw).unwrap_or(0),
@@ -260,6 +290,16 @@ impl OrbitStore {
         let created_at_i64 = i64::try_from(ch.created_at_ms).unwrap_or(i64::MAX);
         let updated_at_i64 = i64::try_from(ch.updated_at_ms).unwrap_or(i64::MAX);
 
+        let routing_mode_str = match ch.routing_mode {
+            ImRoutingMode::PerThreadAgent => "per_thread_agent",
+            ImRoutingMode::PersonalRouter => "personal_router",
+        };
+        let mirror_policy_str = match ch.router_mirror_policy {
+            RouterImMirrorPolicy::ReplyOriginOnly => "reply_origin_only",
+            RouterImMirrorPolicy::MilestonesAndApprovals => "milestones_and_approvals",
+            RouterImMirrorPolicy::MirrorAll => "mirror_all",
+        };
+
         conn.execute(
             "
             INSERT INTO im_channels (
@@ -267,7 +307,8 @@ impl OrbitStore {
                 webhook_path, app_id, primary_secret, signing_secret,
                 allowed_chat_ids_json, allowed_user_ids_json,
                 default_workspace_cwd, default_provider_json, default_mode_json,
-                forward_approvals, message_count, last_activity_at_ms,
+                forward_approvals, routing_mode, router_mirror_policy,
+                message_count, last_activity_at_ms,
                 created_at_ms, updated_at_ms
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
@@ -275,7 +316,8 @@ impl OrbitStore {
                 ?11, ?12,
                 ?13, ?14, ?15,
                 ?16, ?17, ?18,
-                ?19, ?20
+                ?19, ?20,
+                ?21, ?22
             )
             ON CONFLICT(channel_id) DO UPDATE SET
                 name = excluded.name,
@@ -293,6 +335,8 @@ impl OrbitStore {
                 default_provider_json = excluded.default_provider_json,
                 default_mode_json = excluded.default_mode_json,
                 forward_approvals = excluded.forward_approvals,
+                routing_mode = excluded.routing_mode,
+                router_mirror_policy = excluded.router_mirror_policy,
                 message_count = MAX(im_channels.message_count, excluded.message_count),
                 last_activity_at_ms = COALESCE(excluded.last_activity_at_ms, im_channels.last_activity_at_ms),
                 updated_at_ms = excluded.updated_at_ms
@@ -314,6 +358,8 @@ impl OrbitStore {
                 provider_json,
                 mode_json,
                 i32::from(ch.forward_approvals),
+                routing_mode_str,
+                mirror_policy_str,
                 message_count_i64,
                 last_activity_i64,
                 created_at_i64,
@@ -513,6 +559,8 @@ mod tests {
             default_provider: ProviderKind::ClaudeCode,
             default_mode: SessionMode::Default,
             forward_approvals: true,
+            routing_mode: ImRoutingMode::PersonalRouter,
+            router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
             message_count: 0,
             last_activity_at_ms: None,
             created_at_ms: 1_760_000_000_000,

@@ -137,6 +137,7 @@ export const zhCN: MessageDictionary = {
   // Sidebar
   "sidebar.newConversation": "新建对话",
   "sidebar.automations": "自动化",
+  "sidebar.personalRouter": "分工师总控台",
   "sidebar.needsAttention": "待处理",
   "sidebar.pinned": "已置顶",
   "sidebar.projects": "项目",
@@ -604,6 +605,7 @@ export const zhCN: MessageDictionary = {
   "settings.subTabImChannels": "IM 频道",
   "settings.subTabProvidersRuntime": "提供商与运行时",
   "settings.subTabAcpRegistry": "ACP 注册表",
+  "settings.subTabPersonalRouter": "分工师 (Router)",
   "settings.subTabGuardian": "Guardian",
   "settings.subTabUsage": "用量",
   "settings.subTabInstructions": "项目指令",

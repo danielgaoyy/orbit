@@ -2,6 +2,7 @@ import type { MessageKey } from "../../lib/i18n/locales/en.ts";
 
 export type HostSettingsTab =
   | "agents"
+  | "router"
   | "guardian"
   | "im_channels"
   | "skills"
@@ -54,6 +55,7 @@ export type SettingsSubTabId =
   | "add_host"
   | "im_channels"
   | "agents"
+  | "router"
   | "acp"
   | "guardian"
   | "usage"
@@ -81,6 +83,7 @@ export type SettingsLegacyAlias =
   | "capabilities"
   | "notifications_sync"
   | "connection"
+  | "router"
   | "acp"
   | "guardian"
   | "usage"
@@ -127,6 +130,7 @@ export interface SettingsSearchResult {
 
 const VALID_HOST_TABS = new Set<string>([
   "agents",
+  "router",
   "guardian",
   "im_channels",
   "skills",
@@ -550,6 +554,21 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
         ],
       },
       {
+        id: "router",
+        labelKey: "settings.subTabPersonalRouter",
+        requiresHost: true,
+        keywords: [
+          "router",
+          "personal router",
+          "hermes",
+          "orchestrator",
+          "chief of staff",
+          "分工师",
+          "总控台",
+          "ルーター",
+        ],
+      },
+      {
         id: "acp",
         labelKey: "settings.subTabAcpRegistry",
         requiresHost: true,
@@ -813,6 +832,8 @@ export function resolveSettingsSectionTarget(
     case "providers":
     case "models_agents":
       return defaultHostId ? `host:${defaultHostId}:agents` : "add_host";
+    case "router":
+      return defaultHostId ? `host:${defaultHostId}:router` : "add_host";
     case "acp":
       return defaultHostId ? `host:${defaultHostId}:acp` : "add_host";
     case "guardian":
@@ -865,6 +886,7 @@ export function resolveActiveSettingsLocation(
           section,
         };
       case "agents":
+      case "router":
       case "acp":
       case "guardian":
         return {
@@ -966,6 +988,7 @@ export function buildSettingsSectionForTarget(
       case "connection":
       case "im_channels":
       case "agents":
+      case "router":
       case "acp":
       case "guardian":
       case "usage":

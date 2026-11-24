@@ -297,6 +297,7 @@ interface ChannelFormState {
   defaultProvider: ProviderKind;
   defaultMode: SessionMode;
   forwardApprovals: boolean;
+  routeToPersonalRouter: boolean;
 }
 
 function ChannelModal({
@@ -381,6 +382,8 @@ function ChannelModal({
       default_provider: form.defaultProvider,
       default_mode: form.defaultMode,
       forward_approvals: form.forwardApprovals,
+      routing_mode: form.routeToPersonalRouter ? "personal_router" : "per_thread_agent",
+      router_mirror_policy: "milestones_and_approvals",
     });
   };
 
@@ -592,6 +595,26 @@ function ChannelModal({
             <div className="border-border flex items-center justify-between rounded-xl border px-3.5 py-2.5">
               <div className="pr-3">
                 <div className="text-foreground text-[12.5px] font-medium">
+                  Route to Personal Router
+                </div>
+                <div className="text-muted-foreground text-[11px]">
+                  Route all authorized IM messages into this host&apos;s canonical Personal Router
+                  session for bidirectional Desktop/Mobile sync and Worker dispatch.
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={form.routeToPersonalRouter}
+                disabled={saving}
+                ariaLabel="Route to Personal Router"
+                onChange={(routeToPersonalRouter) =>
+                  setForm((f) => ({ ...f, routeToPersonalRouter }))
+                }
+              />
+            </div>
+
+            <div className="border-border flex items-center justify-between rounded-xl border px-3.5 py-2.5">
+              <div className="pr-3">
+                <div className="text-foreground text-[12.5px] font-medium">
                   Forward Tool Approvals
                 </div>
                 <div className="text-muted-foreground text-[11px]">
@@ -700,6 +723,7 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
       defaultProvider: "claude_code",
       defaultMode: "default",
       forwardApprovals: true,
+      routeToPersonalRouter: false,
     });
   };
 
@@ -724,6 +748,7 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
       defaultProvider: ch.default_provider,
       defaultMode: ch.default_mode,
       forwardApprovals: ch.forward_approvals,
+      routeToPersonalRouter: ch.routing_mode === "personal_router",
     });
   };
 
@@ -743,6 +768,8 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
       default_provider: ch.default_provider,
       default_mode: ch.default_mode,
       forward_approvals: ch.forward_approvals,
+      routing_mode: ch.routing_mode ?? "per_thread_agent",
+      router_mirror_policy: ch.router_mirror_policy ?? "milestones_and_approvals",
     });
   };
 

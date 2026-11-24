@@ -552,6 +552,8 @@ mod tests {
             "-c",
             "commit.gpgsign=false",
             "-c",
+            "core.autocrlf=false",
+            "-c",
             "core.hooksPath=/dev/null",
         ];
         opts.extend_from_slice(args);

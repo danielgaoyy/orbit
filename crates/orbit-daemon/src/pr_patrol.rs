@@ -478,6 +478,8 @@ mod tests {
             "-c",
             "commit.gpgsign=false",
             "-c",
+            "core.autocrlf=false",
+            "-c",
             "core.hooksPath=/dev/null",
         ];
         options.extend(args);

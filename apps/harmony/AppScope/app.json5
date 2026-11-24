@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "dev.orbit.harmony",
     "vendor": "orbit",
-    "versionCode": 10004,
-    "versionName": "0.10.4",
+    "versionCode": 10005,
+    "versionName": "0.10.5",
     "icon": "$media:app_icon",
     "label": "$string:app_name",
     "bundleType": "app"

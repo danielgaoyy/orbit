@@ -2608,6 +2608,7 @@ mod tests {
         run_git(&["init"]);
         run_git(&["config", "user.email", "test@orbit.local"]);
         run_git(&["config", "user.name", "Orbit Test"]);
+        run_git(&["config", "core.autocrlf", "false"]);
 
         tokio::fs::write(dir.join("a.txt"), "alpha-v1\n")
             .await
@@ -2681,13 +2682,15 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(dir.join("a.txt"))
                 .await
-                .expect("read a"),
+                .expect("read a")
+                .replace("\r\n", "\n"),
             "alpha-v1\n"
         );
         assert_eq!(
             tokio::fs::read_to_string(dir.join("b.txt"))
                 .await
-                .expect("read b"),
+                .expect("read b")
+                .replace("\r\n", "\n"),
             "beta-external\n"
         );
         assert!(!dir.join("c.txt").exists());

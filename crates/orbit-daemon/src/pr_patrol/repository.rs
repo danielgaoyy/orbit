@@ -737,9 +737,9 @@ index 1111111..2222222 100644
         );
         let alt_text = std::fs::read_to_string(&alternates_path)?;
         let expected_objects = std::fs::canonicalize(root.join(".git").join("objects"))?;
+        let actual_objects = std::fs::canonicalize(Path::new(alt_text.trim()))?;
         assert!(
-            alt_text.trim().ends_with("objects")
-                && Path::new(alt_text.trim()) == expected_objects.as_path(),
+            alt_text.trim().ends_with("objects") && actual_objects == expected_objects,
             "unexpected alternates content: {alt_text:?} vs {}",
             expected_objects.display()
         );

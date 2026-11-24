@@ -305,7 +305,7 @@ mod tests {
         }
         assert!(OrbitStore::open_with_master_key(&path, Some([3; 32])).is_err());
         assert!(OrbitStore::open(&path).is_err());
-        std::fs::remove_file(path)?;
+        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 
@@ -335,7 +335,7 @@ mod tests {
         assert!(store.list_pending_outbox("b")?.is_empty());
         assert_eq!(store.prune_stale_outbox(i64::MAX)?, 0);
         drop(store);
-        std::fs::remove_file(path)?;
+        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 
@@ -373,7 +373,7 @@ mod tests {
         let hosts = keyed.list_client_hosts()?;
         assert_eq!(hosts[0].pairing_secret, "enc:v1:legacy-literal");
         drop(keyed);
-        std::fs::remove_file(path)?;
+        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 }

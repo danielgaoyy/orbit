@@ -253,6 +253,17 @@ enum class OrbitSidebarThreadFilter(val label: String) {
 }
 
 @Immutable
+data class OverviewPendingDecision(
+    val hostId: String,
+    val hostName: String,
+    val agentId: String,
+    val agentTitle: String,
+    val permission: FfiTimelineItem.PermissionRequest,
+    val isSafeLowRisk: Boolean,
+    val isPlanApproval: Boolean,
+)
+
+@Immutable
 data class OrbitUiState(
     val appearanceMode: OrbitAppearanceMode = OrbitAppearanceMode.SYSTEM,
     val isPermanentDrawerCollapsed: Boolean = false,
@@ -301,6 +312,7 @@ data class OrbitUiState(
     val pushRegistrationStatus: FfiPushRegistrationStatus? = null,
     val pushDevicesSnapshot: FfiPushDevicesSnapshot? = null,
     val showGlobalOverview: Boolean = false,
+    val overviewPendingDecisions: List<OverviewPendingDecision> = emptyList(),
     val stageHasOlderTurns: Boolean = false,
     val stageOldestLoadedSeq: ULong = 0uL,
     val stageAuxRevision: ULong = 0uL,
@@ -4138,10 +4150,75 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     fun openGlobalOverview() {
         _state.update { it.copy(showGlobalOverview = true, lastError = null) }
         refreshRouterAndMesh()
+        refreshOverviewPendingDecisions()
     }
 
     fun closeGlobalOverview() {
         _state.update { it.copy(showGlobalOverview = false) }
+    }
+
+    fun refreshOverviewPendingDecisions() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            val cur = _state.value
+            val hostNameById = cur.hosts.associate { it.hostId to it.displayName }
+            val collected = mutableListOf<OverviewPendingDecision>()
+            val seenKeys = HashSet<String>()
+
+            cur.hosts.forEach { host ->
+                val detail = runCatching { activeCore.hostDetail(host.hostId) }.getOrNull() ?: return@forEach
+                detail.agents
+                    .filter { it.isAwaitingPermission }
+                    .forEach { agent ->
+                        val delta = runCatching {
+                            activeCore.agentStageDelta(host.hostId, agent.agentId, 0uL)
+                        }.getOrNull() ?: return@forEach
+                        delta.pendingPermissions
+                            .filterIsInstance<FfiTimelineItem.PermissionRequest>()
+                            .filter { it.resolvedDecision == null }
+                            .forEach { perm ->
+                                val key = "${host.hostId}::${agent.agentId}::${perm.requestId}"
+                                if (seenKeys.add(key)) {
+                                    collected.add(
+                                        OverviewPendingDecision(
+                                            hostId = host.hostId,
+                                            hostName = hostNameById[host.hostId] ?: host.hostId,
+                                            agentId = agent.agentId,
+                                            agentTitle = agent.title.ifBlank {
+                                                OrbitFormatters.providerLabel(agent.provider)
+                                            },
+                                            permission = perm,
+                                            isSafeLowRisk = OverviewSafetyReducer.isSafeLowRiskBatchCandidate(perm),
+                                            isPlanApproval = PlanApprovalReducer.detectPlanApproval(perm) != null,
+                                        )
+                                    )
+                                }
+                            }
+                    }
+            }
+            _state.update { it.copy(overviewPendingDecisions = collected) }
+        }
+    }
+
+    fun resolvePermissionForHost(
+        hostId: String,
+        agentId: String,
+        requestId: String,
+        decision: String,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.resolvePermission(hostId, agentId, requestId, decision)
+                reloadFleetInternal()
+                reloadHostDetailInternal(hostId)
+                if (_state.value.selectedHostId == hostId && _state.value.selectedAgentId == agentId) {
+                    reloadStageInternal(hostId, agentId)
+                }
+                refreshOverviewPendingDecisions()
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to resolve approval"))
+            }
+        }
     }
 
     fun selectHostAndAgent(hostId: String, agentId: String) {
@@ -4173,6 +4250,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 _state.value.selectedAgentId?.let { aid ->
                     if (_state.value.selectedHostId == hostId) reloadStageInternal(hostId, aid)
                 }
+                refreshOverviewPendingDecisions()
                 postToast("Approved ${res.resolvedCount} safe requests")
             } catch (t: Throwable) {
                 postToast(extractErrorMessage(t, "Batch approval failed"))
@@ -4242,6 +4320,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                             acpAgentId = null,
                             model = cur.composer.model,
                             effort = cur.composer.effort,
+                            fastMode = cur.composer.fastMode,
                             mode = cur.composer.mode,
                             initialPrompt = trimmed,
                             initialDisplayPrompt = trimmed,

@@ -1,5 +1,6 @@
 import { OrbitHarmonyCore } from 'liborbit_ohos.so';
 import { ConfigurationConstant, common } from '@kit.AbilityKit';
+import { util } from '@kit.ArkTS';
 import {
   AgentCardDto,
   AgentStageDeltaDto,
@@ -14,10 +15,15 @@ import {
   ComposerContextInputDto,
   ComposerQuoteInputDto,
   ConditionalTimerRecordDto,
+  ConnectedHostSummaryDto,
   ControlGoalRunRequestDto,
+  ConversationSearchHitDto,
   CoreNotificationDto,
   CreateSchedulePayloadDto,
   CreateSessionRequestDto,
+  CreateWorkspaceEntryRequestDto,
+  DagStepSpecDto,
+  DeleteWorkspaceEntryRequestDto,
   DiffFileDto,
   DiffLineDto,
   ExportOptionsDto,
@@ -27,8 +33,17 @@ import {
   FleetSidebarRequestDto,
   ForkAgentRequestDto,
   ForkAgentResultDto,
+  GitCommitResultDto,
+  GitConflictEntryDto,
+  GitCreatePrResultDto,
+  GitGeneratedCommitMessageDto,
+  GitPrStatusDto,
+  GitRebaseStatusDto,
   GitReviewDto,
+  GitStashEntryDto,
   GitStatusSnapshotDto,
+  GithubDeviceFlowPollDto,
+  GithubDeviceFlowStartDto,
   GoalRunRecordDto,
   HostCardDto,
   HostDetailDto,
@@ -39,32 +54,54 @@ import {
   ModelOptionDto,
   ModelSelectionRequestDto,
   MonitorWatchRecordDto,
+  OrbitMeshPeerRow,
+  OverviewPendingApprovalItem,
+  PendingPlanApprovalDto,
+  PermissionBatchItemDto,
+  PersonalRouterConfigDto,
   PromptBadgeDto,
   ProviderModelCatalogDto,
   ProviderModelSpecDto,
+  ProviderSubagentTimelineDto,
+  PushPreferencesDto,
   QueuedPromptDto,
   QueuedPromptItem,
   QuotedDiffSnippet,
+  RegisterPushDeviceRequestDto,
+  RenameWorkspaceEntryRequestDto,
   RenderDiagramRequestDto,
   RenderDiagramViewDto,
   ResolvedModelSelectionDto,
   RewindAgentResultDto,
+  RouterHostCapabilitiesDto,
+  RouterStatusSnapshotDto,
+  ScheduleRunRecordDto,
   ScheduleSpecDto,
+  SearchMessagesRequestDto,
+  SearchMessagesResponseDto,
+  SessionPlanStepDto,
+  SessionSubagentEntryDto,
+  SessionUsageDto,
   SlashCommandDto,
   SpawnWorkspacePeerRequestDto,
   StageTurnDto,
   StagedAttachmentDto,
+  StartDagWorkflowRequestDto,
+  StartGoalRunRequestDto,
+  StartMonitorWatchRequestDto,
   StopMonitorWatchRequestDto,
   TerminalRowDto,
   TerminalScreenDto,
   ThreadPrefSeedDto,
   TimelineItemDto,
+  TimerConditionDto,
   ToolStepDescriptorDto,
   WorkflowRunRecordDto,
   WorkspaceBoardSnapshotDto,
   WorkspaceDto,
   WorkspaceEventRecordDto,
   WorkspaceFileViewDto,
+  WriteWorkspaceFileRequestDto,
   basenameOfPath,
   cwdPathsEquivalent,
   formatEffortLabel,
@@ -77,7 +114,10 @@ import {
   OrbitTokens,
   resolveOrbitPalette
 } from '../theme/OrbitTokens';
-import { orbitLogWarn } from './OrbitLogger';
+import { OrbitCoreBridge } from './OrbitCoreBridge';
+import { OrbitHuksMasterKey } from './OrbitHuksMasterKey';
+import { OrbitVoiceInputController } from './OrbitVoiceInput';
+import { orbitLogInfo, orbitLogWarn } from './OrbitLogger';
 import { OrbitPreferencesStore } from './OrbitPreferences';
 import {
   checkHarmonyNotificationEnabled,
@@ -120,15 +160,24 @@ interface SideQuestionEnvelopeDto {
 @ObservedV2
 export class OrbitHarmonyStore {
   private static instance: OrbitHarmonyStore | null = null;
+  private bridge: OrbitCoreBridge | null = null;
   private core: OrbitHarmonyCore | null = null;
   private appContext: common.ApplicationContext | null = null;
   private prefsStore: OrbitPreferencesStore = new OrbitPreferencesStore();
+  private voiceController: OrbitVoiceInputController = new OrbitVoiceInputController();
+  private voiceTimerId: number = -1;
   private pendingDeepLink: string = '';
+  private pendingDeepLinkEventKind: string = '';
   private pendingOpenHostId: string = '';
   private pendingOpenAgentId: string = '';
+  private pendingOpenEventKind: string = '';
   private automationsRefreshSeq: number = 0;
   private sideQuestionGen: number = 0;
   @Trace public isNewSessionDraft: boolean = false;
+  @Trace public keyProtectionMode: string = 'huks_hardware';
+  @Trace public isFoldableDevice: boolean = false;
+  @Trace public foldPosture: string = 'unknown';
+  @Trace public showGlobalOverview: boolean = true;
   private draftSelectionByProvider: Map<string, DraftModelSelection> = new Map<string, DraftModelSelection>();
   private hasUserCustomizedDraftModel: boolean = false;
 
@@ -158,6 +207,56 @@ export class OrbitHarmonyStore {
   @Trace public showWorkspaceBoardSheet: boolean = false;
   @Trace public showSideQuestionSheet: boolean = false;
   @Trace public showArchivedSessionsSheet: boolean = false;
+  @Trace public showFileExplorerSheet: boolean = false;
+  @Trace public showGlobalSearchSheet: boolean = false;
+  @Trace public showRouterMeshSheet: boolean = false;
+  @Trace public showExportTranscriptSheet: boolean = false;
+  @Trace public showSubagentSheet: boolean = false;
+  @Trace public overviewPendingApprovals: OverviewPendingApprovalItem[] = [];
+  @Trace public stagePendingPlanApproval: PendingPlanApprovalDto | null = null;
+  @Trace public stagePlanSteps: SessionPlanStepDto[] = [];
+  @Trace public stageSubagents: SessionSubagentEntryDto[] = [];
+  @Trace public stageHasOlderHistory: boolean = false;
+  @Trace public stageLoadingOlder: boolean = false;
+  @Trace public activeSessionUsage: SessionUsageDto | null = null;
+  @Trace public inspectedSubagentId: string = '';
+  @Trace public inspectedSubagentTitle: string = '';
+  @Trace public inspectedSubagentItems: TimelineItemDto[] = [];
+  @Trace public isVoiceRecording: boolean = false;
+  @Trace public voiceInterimTranscript: string = '';
+  @Trace public voiceElapsedSeconds: number = 0;
+  @Trace public terminalRawMode: boolean = true;
+  @Trace public inspectedFilePath: string = '';
+  @Trace public inspectedFileView: WorkspaceFileViewDto | null = null;
+  @Trace public fileExplorerBusy: boolean = false;
+  @Trace public gitWriteBusy: boolean = false;
+  @Trace public gitPrStatus: GitPrStatusDto | null = null;
+  @Trace public gitStashes: GitStashEntryDto[] = [];
+  @Trace public gitConflicts: GitConflictEntryDto[] = [];
+  @Trace public gitRebaseStatus: GitRebaseStatusDto | null = null;
+  @Trace public globalSearchQuery: string = '';
+  @Trace public globalSearchHits: ConversationSearchHitDto[] = [];
+  @Trace public globalSearchBusy: boolean = false;
+  @Trace public globalSearchRemoteQueried: number = 0;
+  @Trace public globalSearchRemoteFailed: number = 0;
+  @Trace public routerHosts: RouterHostCapabilitiesDto[] = [];
+  @Trace public activeRouterStatus: RouterStatusSnapshotDto | null = null;
+  @Trace public primaryRouterHostId: string = '';
+  @Trace public fleetMeshPeers: OrbitMeshPeerRow[] = [];
+  @Trace public routerMeshBusy: boolean = false;
+  @Trace public deviceLinkUri: string = '';
+  @Trace public githubDeviceFlow: GithubDeviceFlowStartDto | null = null;
+  @Trace public pushSyncedHostIds: string[] = [];
+  @Trace public pushPrefs: PushPreferencesDto = {
+    enabled: true,
+    notify_permission_required: true,
+    notify_turn_completed: true,
+    notify_agent_error: true,
+    notify_goal_finished: true,
+    notify_timer_fired: true,
+    include_message_preview: false
+  };
+  @Trace public scheduleRunsById: Record<string, ScheduleRunRecordDto[]> = {};
   @Trace public sidebarProjectSort: string = 'recent';
   @Trace public sidebarThreadFilter: string = 'all';
   @Trace public sidebarSearchQuery: string = '';
@@ -263,7 +362,17 @@ export class OrbitHarmonyStore {
     return OrbitHarmonyStore.instance;
   }
 
-  public initialize(dbPath: string): void {
+  public async initializeWithHuksAsync(
+    context: common.Context | undefined,
+    dbPath: string
+  ): Promise<void> {
+    const keyRes = await OrbitHuksMasterKey.resolveOrCreateMasterKey(context);
+    this.keyProtectionMode = keyRes.protectionMode;
+    this.primaryRouterHostId = this.prefsStore.getPrimaryRouterHostId();
+    this.initialize(dbPath, keyRes.masterKeyB64);
+  }
+
+  public initialize(dbPath: string, masterKeyB64: string = ''): void {
     if (this.pinnedThreadsFilePath.length === 0 && dbPath.length > 0) {
       this.pinnedThreadsFilePath = `${dbPath}.pinned_threads.json`;
     }
@@ -274,13 +383,16 @@ export class OrbitHarmonyStore {
     if (this.core !== null) {
       if (this.pendingDeepLink.length > 0) {
         const uri = this.pendingDeepLink;
+        const evKind = this.pendingDeepLinkEventKind;
         this.pendingDeepLink = '';
-        this.handleDeepLinkUri(uri);
+        this.pendingDeepLinkEventKind = '';
+        this.handleDeepLinkUri(uri, evKind);
       }
       return;
     }
     try {
-      this.core = new OrbitHarmonyCore(dbPath, true);
+      this.bridge = OrbitCoreBridge.openWithMasterKeyOrFallback(dbPath, masterKeyB64);
+      this.core = this.bridge.raw();
       this.nativeAvailable = true;
 
       if (!this.prefsStore.hasMigratedThreadPrefsV1()) {
@@ -334,10 +446,15 @@ export class OrbitHarmonyStore {
       this.refreshSidebar();
       this.refreshCloudSyncStatus();
       this.core.connectAllHosts();
+      if (this.pushToken.length > 0) {
+        this.syncPushTokenToAllHosts(false);
+      }
       if (this.pendingDeepLink.length > 0) {
         const uri = this.pendingDeepLink;
+        const evKind = this.pendingDeepLinkEventKind;
         this.pendingDeepLink = '';
-        this.handleDeepLinkUri(uri);
+        this.pendingDeepLinkEventKind = '';
+        this.handleDeepLinkUri(uri, evKind);
       }
     } catch (e) {
       this.nativeAvailable = false;
@@ -433,6 +550,21 @@ export class OrbitHarmonyStore {
     if (this.toastTimerId !== -1) {
       clearTimeout(this.toastTimerId);
       this.toastTimerId = -1;
+    }
+    if (this.voiceTimerId !== -1) {
+      clearInterval(this.voiceTimerId);
+      this.voiceTimerId = -1;
+    }
+    this.voiceController.cancel();
+  }
+
+  public updateFoldPosture(isFoldable: boolean, posture: string): void {
+    this.isFoldableDevice = isFoldable;
+    this.foldPosture = posture;
+    if (posture === 'expanded' && !this.isSidebarCollapsed) {
+      this.sidebarOpen = true;
+    } else if (posture === 'folded') {
+      this.sidebarOpen = false;
     }
   }
 
@@ -746,7 +878,7 @@ export class OrbitHarmonyStore {
     }
   }
 
-  public handleDeepLinkUri(uri: string): void {
+  public handleDeepLinkUri(uri: string, eventKind: string = ''): void {
     const trimmed = uri.trim();
     const hashIdx = trimmed.indexOf('#');
     const clean = hashIdx >= 0 ? trimmed.substring(0, hashIdx).trim() : trimmed;
@@ -756,6 +888,7 @@ export class OrbitHarmonyStore {
     }
     if (this.core === null) {
       this.pendingDeepLink = clean;
+      this.pendingDeepLinkEventKind = eventKind;
       return;
     }
     const isOpenRoute =
@@ -766,11 +899,21 @@ export class OrbitHarmonyStore {
       lower === 'orbit://pair' ||
       lower.startsWith('orbit://pair?') ||
       lower.startsWith('orbit://pair/');
+    const isDeviceLinkRoute =
+      lower.startsWith('orbit://sync') ||
+      lower.startsWith('orbit://link') ||
+      lower.startsWith('orbit://cloud-sync');
+
+    if (isDeviceLinkRoute) {
+      this.importCloudSyncDeviceLinkUri(clean);
+      return;
+    }
 
     if (isOpenRoute) {
       const qIdx = clean.indexOf('?');
       let hostId = '';
       let agentId = '';
+      let parsedEventKind = eventKind;
       if (qIdx >= 0 && qIdx + 1 < clean.length) {
         const queryStr = clean.substring(qIdx + 1);
         const parts = queryStr.split('&');
@@ -792,11 +935,13 @@ export class OrbitHarmonyStore {
             hostId = val;
           } else if (k === 'agent' || k === 'agent_id') {
             agentId = val;
+          } else if (k === 'event_kind' || k === 'event') {
+            parsedEventKind = val;
           }
         }
       }
       if (hostId.length > 0) {
-        this.openSessionFromDeepLink(hostId, agentId);
+        this.openSessionFromDeepLink(hostId, agentId, parsedEventKind);
       } else {
         this.showToast('Missing host in Orbit link', true);
       }
@@ -829,31 +974,45 @@ export class OrbitHarmonyStore {
     this.selectAgent(cleanAgent);
   }
 
-  public openSessionFromDeepLink(hostId: string, agentId: string): void {
+  public openSessionFromDeepLink(hostId: string, agentId: string, eventKind: string = ''): void {
     const cleanHost = hostId.trim();
     const cleanAgent = agentId.trim();
+    const cleanEvent = eventKind.trim().toLowerCase();
     if (cleanHost.length === 0) {
       return;
     }
     if (this.core === null) {
       this.pendingOpenHostId = cleanHost;
       this.pendingOpenAgentId = cleanAgent;
+      this.pendingOpenEventKind = cleanEvent;
       return;
     }
     const hostExists = this.hosts.some((h: HostCardDto): boolean => h.host_id === cleanHost);
     if (!hostExists) {
       this.pendingOpenHostId = cleanHost;
       this.pendingOpenAgentId = cleanAgent;
+      this.pendingOpenEventKind = cleanEvent;
       this.reloadFleet();
       return;
     }
     this.pendingOpenHostId = '';
     this.pendingOpenAgentId = '';
+    this.pendingOpenEventKind = '';
+    this.showGlobalOverview = false;
     if (this.selectedHostId !== cleanHost) {
       this.selectHost(cleanHost);
     }
     if (cleanAgent.length > 0) {
       this.selectValidatedDeepLinkAgent(cleanHost, cleanAgent);
+    }
+    if (cleanEvent === 'permission_required') {
+      this.reloadStage();
+      this.showToast('Approval waiting for your decision', false);
+    } else if (cleanEvent === 'goal_finished' || cleanEvent === 'timer_fired') {
+      this.openAutomationsSheet();
+    } else if (cleanEvent === 'agent_error') {
+      this.reloadStage();
+      this.showToast('Agent stopped with an error', true);
     }
   }
 
@@ -976,13 +1135,12 @@ export class OrbitHarmonyStore {
       if (this.pendingOpenHostId.length > 0) {
         const targetHost = this.pendingOpenHostId;
         const targetAgent = this.pendingOpenAgentId;
+        const targetEvent = this.pendingOpenEventKind;
         this.pendingOpenHostId = '';
         this.pendingOpenAgentId = '';
+        this.pendingOpenEventKind = '';
         if (snap.hosts.some((h: HostCardDto): boolean => h.host_id === targetHost)) {
-          this.selectHost(targetHost);
-          if (targetAgent.length > 0) {
-            this.selectValidatedDeepLinkAgent(targetHost, targetAgent);
-          }
+          this.openSessionFromDeepLink(targetHost, targetAgent, targetEvent);
         } else {
           this.showToast('Host not found', true);
           if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
@@ -995,6 +1153,10 @@ export class OrbitHarmonyStore {
         this.selectHost(snap.hosts[0].host_id);
       } else {
         this.refreshSidebar();
+      }
+      this.refreshOverviewApprovals();
+      if (this.pushToken.length > 0) {
+        this.syncPushTokenToAllHosts(false);
       }
     } catch (e) {
       this.lastError = (e as Error).message;
@@ -1355,6 +1517,7 @@ export class OrbitHarmonyStore {
   }
 
   public startNewSessionDraft(cwd?: string): void {
+    this.showGlobalOverview = false;
     this.isNewSessionDraft = true;
     this.selectedAgentId = '';
     this.currentAgent = null;
@@ -1364,6 +1527,12 @@ export class OrbitHarmonyStore {
     this.stageTurns = [];
     this.pendingPermissions = [];
     this.pendingQuestions = [];
+    this.stagePendingPlanApproval = null;
+    this.stagePlanSteps = [];
+    this.stageSubagents = [];
+    this.stageHasOlderHistory = false;
+    this.stageLoadingOlder = false;
+    this.activeSessionUsage = null;
     this.sessionDiffs = [];
     this.expandedTurnKeys = [];
     this.expandedToolIds = [];
@@ -1387,10 +1556,16 @@ export class OrbitHarmonyStore {
     if (agentId.length === 0) {
       return;
     }
+    this.showGlobalOverview = false;
     this.isNewSessionDraft = false;
     this.selectedAgentId = agentId;
     this.expandedTurnKeys = [];
     this.expandedToolIds = [];
+    this.stagePendingPlanApproval = null;
+    this.stagePlanSteps = [];
+    this.stageSubagents = [];
+    this.stageHasOlderHistory = false;
+    this.activeSessionUsage = null;
     if (this.core !== null && this.selectedHostId.length > 0) {
       const agents = this.currentHostDetail?.agents ?? [];
       let matchedSeq = 0;
@@ -1408,7 +1583,9 @@ export class OrbitHarmonyStore {
     }
     if (this.core !== null && this.selectedHostId.length > 0) {
       this.core.openAgentTimeline(this.selectedHostId, agentId);
+      this.core.listProviderSubagents(this.selectedHostId, agentId);
       this.reloadStage();
+      this.refreshSessionUsage();
       if (this.currentHostDetail !== null) {
         this.syncActiveWorkspaceBoardFromDetail(this.currentHostDetail);
       } else {
@@ -1453,7 +1630,19 @@ export class OrbitHarmonyStore {
       this.stageRevision = delta.revision;
       this.pendingPermissions = delta.pending_permissions;
       this.pendingQuestions = delta.pending_questions;
-      this.sessionDiffs = delta.session_turn_diffs;
+      this.stagePendingPlanApproval = delta.pending_plan_approval ?? null;
+      this.stageHasOlderHistory = delta.has_older_history === true || delta.has_older_turns === true;
+      this.stageLoadingOlder = false;
+      if (!delta.aux_unchanged) {
+        this.sessionDiffs = delta.session_turn_diffs;
+        if (delta.insights !== undefined) {
+          this.stagePlanSteps = delta.insights.plan_steps ?? [];
+          this.stageSubagents = delta.insights.subagents ?? [];
+        } else {
+          this.stagePlanSteps = [];
+          this.stageSubagents = [];
+        }
+      }
 
       if (delta.agent !== null) {
         const prevAgent = this.currentAgent;
@@ -3475,7 +3664,11 @@ export class OrbitHarmonyStore {
   }
 
   public sendTerminalKeys(rawKeys: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || rawKeys.length === 0) {
+    this.sendTerminalRawUtf8(rawKeys);
+  }
+
+  public sendTerminalRawUtf8(rawKeys: string): void {
+    if (this.bridge === null || this.selectedHostId.length === 0 || rawKeys.length === 0) {
       return;
     }
     let out = rawKeys;
@@ -3493,9 +3686,28 @@ export class OrbitHarmonyStore {
       this.altSticky = false;
     }
     try {
-      this.core.sendTerminalKeys(this.selectedHostId, out);
+      const slot = this.currentHostDetail !== null && this.currentHostDetail.active_terminal_slot > 0
+        ? this.currentHostDetail.active_terminal_slot
+        : 1;
+      const encoder = new util.TextEncoder();
+      const bytes = encoder.encodeInto(out);
+      this.bridge.sendTerminalBytes(this.selectedHostId, slot, bytes);
     } catch (err) {
-      orbitLogWarn('OrbitStore', 'sendTerminalKeys failed', err as Object);
+      orbitLogWarn('OrbitStore', 'sendTerminalRawUtf8 failed', err as Object);
+    }
+  }
+
+  public sendTerminalRawBytes(bytes: Uint8Array): void {
+    if (this.bridge === null || this.selectedHostId.length === 0 || bytes.length === 0) {
+      return;
+    }
+    try {
+      const slot = this.currentHostDetail !== null && this.currentHostDetail.active_terminal_slot > 0
+        ? this.currentHostDetail.active_terminal_slot
+        : 1;
+      this.bridge.sendTerminalBytes(this.selectedHostId, slot, bytes);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'sendTerminalRawBytes failed', err as Object);
     }
   }
 
@@ -4544,19 +4756,105 @@ export class OrbitHarmonyStore {
     }
   }
 
-  // 7. HarmonyOS Push Kit & Local Notification Deep-Link Hooks
+  // 7. HarmonyOS Push Kit Host Registration & Deep-Link Notifications
 
   public registerPushTokenSilently(): void {
     registerHarmonyPushToken().then((outcome) => {
       if (outcome.token.length > 0) {
         this.pushToken = outcome.token;
         this.pushStatusMessage = 'Push Kit token ready';
+        this.registerPushTokenInCore(outcome.token);
+        this.syncPushTokenToAllHosts(false);
       } else {
         this.pushStatusMessage = outcome.errorMessage;
       }
     }).catch((err: Object) => {
       orbitLogWarn('OrbitStore', 'registerPushTokenSilently failed', err);
     });
+  }
+
+  private registerPushTokenInCore(token: string): void {
+    if (this.bridge === null || token.trim().length === 0) {
+      return;
+    }
+    try {
+      this.bridge.registerPushTokenJson('harmony_push_kit', token.trim());
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'registerPushTokenJson failed', err as Object);
+    }
+  }
+
+  public async syncPushTokenToAllHosts(force: boolean = false): Promise<void> {
+    if (this.bridge === null || this.pushToken.trim().length === 0) {
+      return;
+    }
+    const deviceId = this.prefsStore.getOrCreateDeviceId();
+    const req: RegisterPushDeviceRequestDto = {
+      device_id: deviceId,
+      platform: 'harmony_push_kit',
+      device_name: this.isFoldableDevice ? 'HarmonyOS Foldable' : 'HarmonyOS Device',
+      device_token: this.pushToken.trim(),
+      live_activity_token: null,
+      sandbox: false
+    };
+    const reqJson = JSON.stringify(req);
+    let syncedCount = 0;
+    const nextSynced: string[] = force ? [] : this.pushSyncedHostIds.slice();
+    for (let i = 0; i < this.hosts.length; i++) {
+      const host = this.hosts[i];
+      const online = host.connection_state === 'online_direct' || host.connection_state === 'online_relay';
+      if (!online) {
+        continue;
+      }
+      if (!force && nextSynced.indexOf(host.host_id) >= 0) {
+        continue;
+      }
+      try {
+        await this.bridge.registerPushDeviceJson(host.host_id, reqJson);
+        if (nextSynced.indexOf(host.host_id) < 0) {
+          nextSynced.push(host.host_id);
+        }
+        syncedCount += 1;
+      } catch (err) {
+        orbitLogWarn('OrbitStore', `registerPushDeviceJson failed for ${host.host_id}`, err as Object);
+      }
+    }
+    this.pushSyncedHostIds = nextSynced;
+    if (syncedCount > 0) {
+      this.pushStatusMessage = `Synced to ${nextSynced.length} host${nextSynced.length === 1 ? '' : 's'}`;
+      orbitLogInfo('OrbitStore', `Registered HarmonyOS Push Kit token on ${syncedCount} host(s)`);
+    }
+  }
+
+  public async updatePushPreferences(nextPrefs: PushPreferencesDto): Promise<void> {
+    this.pushPrefs = nextPrefs;
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return;
+    }
+    try {
+      await this.bridge.updatePushPreferencesJson(this.selectedHostId, JSON.stringify(nextPrefs));
+      this.showToast('Push preferences updated', false);
+      this.triggerHaptic(6);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'updatePushPreferencesJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to update push preferences', true);
+    }
+  }
+
+  public async sendTestPushNotification(): Promise<void> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      this.showToast('Connect a host first', true);
+      return;
+    }
+    try {
+      const deviceId = this.prefsStore.getOrCreateDeviceId();
+      await this.bridge.testPushNotificationJson(this.selectedHostId, deviceId);
+      this.showToast('Test push sent from host', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'testPushNotificationJson failed', err as Object);
+      this.showToast((err as Error).message || 'Test push failed', true);
+    }
   }
 
   public async probeNotificationPermission(): Promise<void> {
@@ -4569,12 +4867,16 @@ export class OrbitHarmonyStore {
     const outcome = await registerHarmonyPushToken();
     if (outcome.token.length > 0) {
       this.pushToken = outcome.token;
-      this.pushStatusMessage = 'Push Kit token registered';
+      this.registerPushTokenInCore(outcome.token);
+      await this.syncPushTokenToAllHosts(true);
+      this.pushStatusMessage = this.pushSyncedHostIds.length > 0
+        ? `Registered on ${this.pushSyncedHostIds.length} host(s)`
+        : 'Push Kit token registered';
     } else {
       this.pushStatusMessage = outcome.errorMessage;
     }
     if (notifOk && outcome.token.length > 0) {
-      this.showToast('Push Kit & notifications ready', false);
+      this.showToast('Push Kit synced & notifications ready', false);
     } else if (notifOk) {
       this.showToast(
         outcome.errorMessage.length > 0
@@ -4583,7 +4885,7 @@ export class OrbitHarmonyStore {
         false
       );
     } else if (outcome.token.length > 0) {
-      this.showToast('Push Kit registered · enable notifications in Settings', false);
+      this.showToast('Push Kit synced · enable notifications in Settings', false);
     } else {
       this.showToast(outcome.errorMessage || 'Notifications unavailable', true);
     }
@@ -4608,6 +4910,1305 @@ export class OrbitHarmonyStore {
     );
     if (ok) {
       this.showToast('Notification dispatched', false);
+    }
+  }
+
+  // 8. Global Personal Agent Overview & Safe Batch Approval
+
+  public openGlobalOverview(): void {
+    this.showGlobalOverview = true;
+    this.refreshOverviewApprovals();
+    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+      this.sidebarOpen = false;
+    }
+    this.triggerHaptic(6);
+  }
+
+  private isLowRiskPermissionItem(item: TimelineItemDto): boolean {
+    const det = item.detail;
+    if (det === undefined) {
+      return false;
+    }
+    const kind = det.kind.toLowerCase();
+    if (kind === 'file_read' || kind === 'read' || kind === 'search' || kind === 'glob' || kind === 'grep') {
+      return true;
+    }
+    if (kind === 'shell' && (det.command ?? '').length > 0) {
+      const cmd = (det.command ?? '').trim().toLowerCase();
+      if (
+        cmd.indexOf('rm ') >= 0 ||
+        cmd.indexOf('sudo ') >= 0 ||
+        cmd.indexOf('git push') >= 0 ||
+        cmd.indexOf('git reset') >= 0 ||
+        cmd.indexOf('curl ') >= 0 ||
+        cmd.indexOf('chmod ') >= 0
+      ) {
+        return false;
+      }
+      return cmd.startsWith('git status') ||
+        cmd.startsWith('git diff') ||
+        cmd.startsWith('ls') ||
+        cmd.startsWith('cat ') ||
+        cmd.startsWith('cargo test') ||
+        cmd.startsWith('npm test');
+    }
+    return false;
+  }
+
+  public refreshOverviewApprovals(): void {
+    if (this.core === null) {
+      this.overviewPendingApprovals = [];
+      return;
+    }
+    const collected: OverviewPendingApprovalItem[] = [];
+    for (let hIdx = 0; hIdx < this.hosts.length; hIdx++) {
+      const host = this.hosts[hIdx];
+      if (host.pending_approval_count <= 0) {
+        continue;
+      }
+      try {
+        const detail = JSON.parse(this.core.hostDetailJson(host.host_id)) as HostDetailDto;
+        for (let aIdx = 0; aIdx < detail.agents.length; aIdx++) {
+          const ag = detail.agents[aIdx];
+          if (!ag.is_awaiting_permission) {
+            continue;
+          }
+          try {
+            const stage = JSON.parse(
+              this.core.agentStageDeltaJson(host.host_id, ag.agent_id, 0)
+            ) as AgentStageDeltaDto;
+            for (let pIdx = 0; pIdx < stage.pending_permissions.length; pIdx++) {
+              const perm = stage.pending_permissions[pIdx];
+              const reqId = perm.request_id ?? '';
+              if (reqId.length === 0) {
+                continue;
+              }
+              let preview = perm.title ?? 'Tool approval';
+              if (perm.detail !== undefined) {
+                if ((perm.detail.command ?? '').length > 0) {
+                  preview = `$ ${perm.detail.command ?? ''}`;
+                } else if ((perm.detail.path ?? '').length > 0) {
+                  preview = perm.detail.path ?? '';
+                } else if ((perm.detail.tool_name ?? '').length > 0) {
+                  preview = perm.detail.tool_name ?? '';
+                }
+              }
+              collected.push({
+                key: `${host.host_id}::${ag.agent_id}::${reqId}`,
+                host_id: host.host_id,
+                host_name: host.display_name,
+                agent_id: ag.agent_id,
+                agent_title: ag.title.trim().length > 0 ? ag.title.trim() : ag.provider_label,
+                request_id: reqId,
+                title: perm.title ?? 'Approval Required',
+                target_preview: preview,
+                is_low_risk: this.isLowRiskPermissionItem(perm)
+              });
+            }
+          } catch (_stageErr) {
+            // Skip unloaded agent stage gracefully
+          }
+        }
+      } catch (_hostErr) {
+        // Skip host detail error
+      }
+    }
+    this.overviewPendingApprovals = collected;
+  }
+
+  public resolveSingleOverviewApproval(item: OverviewPendingApprovalItem, decision: string): void {
+    if (this.core === null) {
+      return;
+    }
+    try {
+      this.core.resolvePermission(item.host_id, item.agent_id, item.request_id, decision);
+      this.triggerHaptic(10);
+      this.reloadFleet();
+      if (this.selectedHostId === item.host_id && this.selectedAgentId === item.agent_id) {
+        this.reloadStage();
+      }
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'resolveSingleOverviewApproval failed', err as Object);
+      this.showToast((err as Error).message || 'Approval failed', true);
+    }
+  }
+
+  public async approveSafeBatchPermissions(): Promise<void> {
+    if (this.bridge === null) {
+      return;
+    }
+    const byHost: Map<string, PermissionBatchItemDto[]> = new Map<string, PermissionBatchItemDto[]>();
+    for (let i = 0; i < this.overviewPendingApprovals.length; i++) {
+      const item = this.overviewPendingApprovals[i];
+      if (!item.is_low_risk) {
+        continue;
+      }
+      const existing = byHost.get(item.host_id) ?? [];
+      existing.push({
+        agent_id: item.agent_id,
+        permission_request_id: item.request_id
+      });
+      byHost.set(item.host_id, existing);
+    }
+    if (byHost.size === 0) {
+      this.showToast('No low-risk approvals eligible for batch approve', false);
+      return;
+    }
+    let resolvedTotal = 0;
+    const hostIds = Array.from(byHost.keys());
+    for (let i = 0; i < hostIds.length; i++) {
+      const hid = hostIds[i];
+      const batch = byHost.get(hid) ?? [];
+      if (batch.length === 0) {
+        continue;
+      }
+      try {
+        await this.bridge.resolvePermissionsBatchJson(hid, JSON.stringify(batch), 'allow');
+        resolvedTotal += batch.length;
+      } catch (err) {
+        orbitLogWarn('OrbitStore', `resolvePermissionsBatchJson failed on ${hid}`, err as Object);
+      }
+    }
+    this.reloadFleet();
+    if (this.selectedAgentId.length > 0) {
+      this.reloadStage();
+    }
+    if (resolvedTotal > 0) {
+      this.showToast(`Approved ${resolvedTotal} safe request${resolvedTotal === 1 ? '' : 's'}`, false);
+      this.triggerHaptic(14);
+    }
+  }
+
+  public submitPersonalAgentPrompt(promptText: string): void {
+    const clean = promptText.trim();
+    if (clean.length === 0) {
+      return;
+    }
+    // Route to configured Primary Personal Router when available
+    if (this.primaryRouterHostId.length > 0) {
+      const targetRouter = this.routerHosts.find(
+        (h: RouterHostCapabilitiesDto): boolean => h.host_id === this.primaryRouterHostId
+      );
+      if (targetRouter !== undefined && targetRouter.active_router_agent_id !== undefined &&
+        targetRouter.active_router_agent_id !== null && targetRouter.active_router_agent_id.length > 0) {
+        this.selectHost(targetRouter.host_id);
+        this.selectAgent(targetRouter.active_router_agent_id);
+        this.composerText = clean;
+        this.submitComposerPrompt(clean);
+        return;
+      }
+    }
+    // Otherwise start a fresh conversation on the active host
+    this.startNewSessionDraft();
+    this.composerText = clean;
+    this.submitComposerPrompt(clean);
+  }
+
+  // 9. Codex-Style Voice Dictation in Composer
+
+  public startVoiceDictation(context: common.Context | undefined): void {
+    if (this.isVoiceRecording) {
+      this.finishVoiceDictation();
+      return;
+    }
+    this.voiceInterimTranscript = '';
+    this.voiceElapsedSeconds = 0;
+    this.triggerHaptic(10);
+    this.voiceController.start(context, {
+      onPartialResult: (partial: string): void => {
+        this.voiceInterimTranscript = partial;
+      },
+      onFinalResult: (finalText: string): void => {
+        this.stopVoiceTimer();
+        this.isVoiceRecording = false;
+        this.voiceInterimTranscript = '';
+        const clean = finalText.trim();
+        if (clean.length > 0) {
+          const prefix = this.composerText.trim().length > 0 ? `${this.composerText.trimEnd()} ` : '';
+          this.composerText = `${prefix}${clean}`;
+          this.triggerHaptic(8);
+        }
+      },
+      onStateChanged: (recording: boolean): void => {
+        this.isVoiceRecording = recording;
+        if (recording) {
+          this.startVoiceTimer();
+        } else {
+          this.stopVoiceTimer();
+        }
+      },
+      onError: (msg: string): void => {
+        this.stopVoiceTimer();
+        this.isVoiceRecording = false;
+        this.voiceInterimTranscript = '';
+        this.showToast(msg, true);
+      }
+    }).catch((err: Object) => {
+      this.stopVoiceTimer();
+      this.isVoiceRecording = false;
+      orbitLogWarn('OrbitStore', 'startVoiceDictation error', err);
+    });
+  }
+
+  public finishVoiceDictation(): void {
+    const pending = this.voiceController.finish().trim();
+    const candidate = pending.length > 0 ? pending : this.voiceInterimTranscript.trim();
+    this.stopVoiceTimer();
+    this.isVoiceRecording = false;
+    this.voiceInterimTranscript = '';
+    if (candidate.length > 0) {
+      const prefix = this.composerText.trim().length > 0 ? `${this.composerText.trimEnd()} ` : '';
+      this.composerText = `${prefix}${candidate}`;
+      this.triggerHaptic(10);
+    }
+  }
+
+  public cancelVoiceDictation(): void {
+    this.voiceController.cancel();
+    this.stopVoiceTimer();
+    this.isVoiceRecording = false;
+    this.voiceInterimTranscript = '';
+    this.triggerHaptic(6);
+  }
+
+  private startVoiceTimer(): void {
+    this.stopVoiceTimer();
+    this.voiceElapsedSeconds = 0;
+    this.voiceTimerId = setInterval(() => {
+      this.voiceElapsedSeconds += 1;
+    }, 1000);
+  }
+
+  private stopVoiceTimer(): void {
+    if (this.voiceTimerId !== -1) {
+      clearInterval(this.voiceTimerId);
+      this.voiceTimerId = -1;
+    }
+  }
+
+  // 10. Stage Tail Pagination, Plan Approval, Subagents, Stall Recovery & Usage
+
+  public loadOlderHistory(): void {
+    if (
+      this.bridge === null ||
+      this.selectedHostId.length === 0 ||
+      this.selectedAgentId.length === 0 ||
+      this.stageLoadingOlder
+    ) {
+      return;
+    }
+    this.stageLoadingOlder = true;
+    try {
+      const requested = this.bridge.loadOlderAgentTimeline(
+        this.selectedHostId,
+        this.selectedAgentId,
+        120
+      );
+      if (!requested) {
+        this.stageLoadingOlder = false;
+        this.stageHasOlderHistory = false;
+      } else {
+        this.triggerHaptic(6);
+      }
+    } catch (err) {
+      this.stageLoadingOlder = false;
+      orbitLogWarn('OrbitStore', 'loadOlderAgentTimeline failed', err as Object);
+    }
+  }
+
+  public async resolvePlanApproval(
+    requestId: string,
+    action: string,
+    editedPlanMarkdown: string | null,
+    feedback: string | null,
+    targetMode: string
+  ): Promise<boolean> {
+    if (
+      this.bridge === null ||
+      this.selectedHostId.length === 0 ||
+      this.selectedAgentId.length === 0
+    ) {
+      return false;
+    }
+    try {
+      await this.bridge.resolvePlanApprovalJson(
+        this.selectedHostId,
+        this.selectedAgentId,
+        requestId,
+        JSON.stringify(action),
+        editedPlanMarkdown,
+        feedback,
+        JSON.stringify(targetMode)
+      );
+      this.stagePendingPlanApproval = null;
+      this.reloadStage();
+      this.showToast(
+        action === 'approve_and_build'
+          ? 'Plan approved · Building'
+          : (action === 'request_changes' ? 'Requested plan revisions' : 'Plan dismissed'),
+        false
+      );
+      this.triggerHaptic(12);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'resolvePlanApprovalJson failed', err as Object);
+      this.showToast((err as Error).message || 'Plan resolution failed', true);
+      return false;
+    }
+  }
+
+  public interruptAndContinueCurrentAgent(): void {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.interruptAgentAndContinue(this.selectedHostId, this.selectedAgentId);
+      this.showToast('Interrupted & continuing turn', false);
+      this.triggerHaptic(12);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'interruptAgentAndContinue failed', err as Object);
+      this.showToast((err as Error).message || 'Interrupt failed', true);
+    }
+  }
+
+  public async refreshSessionUsage(): Promise<void> {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+      this.activeSessionUsage = null;
+      return;
+    }
+    try {
+      const json = await this.bridge.getSessionUsageJson(this.selectedHostId, this.selectedAgentId);
+      this.activeSessionUsage = JSON.parse(json) as SessionUsageDto;
+    } catch (_err) {
+      this.activeSessionUsage = null;
+    }
+  }
+
+  public inspectSubagent(sub: SessionSubagentEntryDto): void {
+    if (sub.child_agent_id !== null && sub.child_agent_id.length > 0) {
+      this.selectAgent(sub.child_agent_id);
+      return;
+    }
+    const subId = (sub.provider_subagent_id !== undefined && sub.provider_subagent_id !== null && sub.provider_subagent_id.length > 0)
+      ? sub.provider_subagent_id
+      : sub.id;
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+      return;
+    }
+    this.inspectedSubagentId = subId;
+    this.inspectedSubagentTitle = sub.role.length > 0 ? sub.role : 'Subagent';
+    this.inspectedSubagentItems = [];
+    this.showSubagentSheet = true;
+    try {
+      this.bridge.openProviderSubagentTimeline(this.selectedHostId, this.selectedAgentId, subId);
+      const raw = this.bridge.providerSubagentTimelineJson(this.selectedHostId, this.selectedAgentId, subId);
+      const parsed = JSON.parse(raw) as ProviderSubagentTimelineDto;
+      this.inspectedSubagentItems = parsed.items ?? [];
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'providerSubagentTimelineJson failed', err as Object);
+    }
+    this.triggerHaptic(8);
+  }
+
+  // 11. File Explorer & Code Viewer (Read / Edit / Create / Rename / Delete)
+
+  public openFileExplorer(initialPath?: string): void {
+    this.ensureWorkspaceFilesLoaded();
+    this.showFileExplorerSheet = true;
+    if (initialPath !== undefined && initialPath.trim().length > 0) {
+      this.openWorkspaceFileInViewer(initialPath.trim());
+    }
+    this.triggerHaptic(8);
+  }
+
+  public async openWorkspaceFileInViewer(path: string): Promise<void> {
+    this.inspectedFilePath = path;
+    this.fileExplorerBusy = true;
+    try {
+      const view = await this.readWorkspaceFile(path);
+      this.inspectedFileView = view;
+    } finally {
+      this.fileExplorerBusy = false;
+    }
+  }
+
+  public async saveWorkspaceFile(path: string, content: string): Promise<boolean> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return false;
+    }
+    this.fileExplorerBusy = true;
+    try {
+      const req: WriteWorkspaceFileRequestDto = {
+        host_id: this.selectedHostId,
+        cwd: this.activeCwd,
+        path: path,
+        content: content,
+        expected_etag: null,
+        force: true
+      };
+      await this.bridge.writeWorkspaceFileJson(JSON.stringify(req));
+      await this.openWorkspaceFileInViewer(path);
+      this.showToast(`Saved ${basenameOfPath(path)}`, false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'writeWorkspaceFileJson failed', err as Object);
+      this.showToast((err as Error).message || 'Save failed', true);
+      return false;
+    } finally {
+      this.fileExplorerBusy = false;
+    }
+  }
+
+  public async createWorkspaceEntry(
+    path: string,
+    isDir: boolean,
+    initialContent: string | null
+  ): Promise<boolean> {
+    const clean = path.trim();
+    if (this.bridge === null || this.selectedHostId.length === 0 || clean.length === 0) {
+      return false;
+    }
+    this.fileExplorerBusy = true;
+    try {
+      const req: CreateWorkspaceEntryRequestDto = {
+        host_id: this.selectedHostId,
+        cwd: this.activeCwd,
+        path: clean,
+        is_dir: isDir,
+        initial_content: initialContent
+      };
+      await this.bridge.createWorkspaceEntryJson(JSON.stringify(req));
+      this.core?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      this.reloadWorkspaceFiles();
+      this.showToast(`Created ${basenameOfPath(clean)}`, false);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'createWorkspaceEntryJson failed', err as Object);
+      this.showToast((err as Error).message || 'Create failed', true);
+      return false;
+    } finally {
+      this.fileExplorerBusy = false;
+    }
+  }
+
+  public async renameWorkspaceEntry(oldPath: string, newPath: string): Promise<boolean> {
+    const cleanNew = newPath.trim();
+    if (this.bridge === null || this.selectedHostId.length === 0 || cleanNew.length === 0) {
+      return false;
+    }
+    this.fileExplorerBusy = true;
+    try {
+      const req: RenameWorkspaceEntryRequestDto = {
+        host_id: this.selectedHostId,
+        cwd: this.activeCwd,
+        old_path: oldPath,
+        new_path: cleanNew
+      };
+      await this.bridge.renameWorkspaceEntryJson(JSON.stringify(req));
+      this.core?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      this.reloadWorkspaceFiles();
+      this.inspectedFilePath = cleanNew;
+      await this.openWorkspaceFileInViewer(cleanNew);
+      this.showToast(`Renamed to ${basenameOfPath(cleanNew)}`, false);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'renameWorkspaceEntryJson failed', err as Object);
+      this.showToast((err as Error).message || 'Rename failed', true);
+      return false;
+    } finally {
+      this.fileExplorerBusy = false;
+    }
+  }
+
+  public async deleteWorkspaceEntry(path: string): Promise<boolean> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return false;
+    }
+    this.fileExplorerBusy = true;
+    try {
+      const req: DeleteWorkspaceEntryRequestDto = {
+        host_id: this.selectedHostId,
+        cwd: this.activeCwd,
+        path: path
+      };
+      await this.bridge.deleteWorkspaceEntryJson(JSON.stringify(req));
+      if (this.inspectedFilePath === path) {
+        this.inspectedFilePath = '';
+        this.inspectedFileView = null;
+      }
+      this.core?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      this.reloadWorkspaceFiles();
+      this.showToast(`Deleted ${basenameOfPath(path)}`, false);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'deleteWorkspaceEntryJson failed', err as Object);
+      this.showToast((err as Error).message || 'Delete failed', true);
+      return false;
+    } finally {
+      this.fileExplorerBusy = false;
+    }
+  }
+
+  // 12. Git Write / Commit / PR / Stash / Conflicts / Rebase
+
+  public async gitStagePaths(paths: string[], all: boolean): Promise<boolean> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return false;
+    }
+    this.gitWriteBusy = true;
+    try {
+      await this.bridge.gitStagePathsJson(this.selectedHostId, this.activeCwd, paths, all);
+      this.pullRefreshGitReview();
+      this.showToast(all ? 'Staged all changes' : 'Staged file', false);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitStagePathsJson failed', err as Object);
+      this.showToast((err as Error).message || 'Stage failed', true);
+      return false;
+    } finally {
+      this.gitWriteBusy = false;
+    }
+  }
+
+  public async gitUnstagePaths(paths: string[], all: boolean): Promise<boolean> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return false;
+    }
+    this.gitWriteBusy = true;
+    try {
+      await this.bridge.gitUnstagePathsJson(this.selectedHostId, this.activeCwd, paths, all);
+      this.pullRefreshGitReview();
+      this.showToast(all ? 'Unstaged all changes' : 'Unstaged file', false);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitUnstagePathsJson failed', err as Object);
+      this.showToast((err as Error).message || 'Unstage failed', true);
+      return false;
+    } finally {
+      this.gitWriteBusy = false;
+    }
+  }
+
+  public async gitGenerateCommitMessage(): Promise<string> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return '';
+    }
+    this.gitWriteBusy = true;
+    try {
+      const json = await this.bridge.gitGenerateCommitMessageJson(this.selectedHostId, this.activeCwd);
+      const parsed = JSON.parse(json) as GitGeneratedCommitMessageDto;
+      if (parsed.message !== undefined && parsed.message.trim().length > 0) {
+        return parsed.message.trim();
+      }
+      if (parsed.subject !== undefined && parsed.subject.trim().length > 0) {
+        const body = (parsed.body ?? '').trim();
+        return body.length > 0 ? `${parsed.subject.trim()}\n\n${body}` : parsed.subject.trim();
+      }
+      return '';
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitGenerateCommitMessageJson failed', err as Object);
+      this.showToast((err as Error).message || 'Unable to generate commit message', true);
+      return '';
+    } finally {
+      this.gitWriteBusy = false;
+    }
+  }
+
+  public async gitCommit(message: string, amend: boolean): Promise<boolean> {
+    const clean = message.trim();
+    if (this.bridge === null || this.selectedHostId.length === 0 || clean.length === 0) {
+      return false;
+    }
+    this.gitWriteBusy = true;
+    try {
+      const json = await this.bridge.gitCommitJson(this.selectedHostId, this.activeCwd, clean, amend);
+      const res = JSON.parse(json) as GitCommitResultDto;
+      this.pullRefreshGitReview();
+      this.refreshGitCollabStatus();
+      this.showToast(`Committed ${res.short_sha}`, false);
+      this.triggerHaptic(12);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitCommitJson failed', err as Object);
+      this.showToast((err as Error).message || 'Commit failed', true);
+      return false;
+    } finally {
+      this.gitWriteBusy = false;
+    }
+  }
+
+  public async refreshGitCollabStatus(): Promise<void> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return;
+    }
+    const hid = this.selectedHostId;
+    const cwd = this.activeCwd;
+    try {
+      const prJson = await this.bridge.gitPrStatusJson(hid, cwd);
+      this.gitPrStatus = JSON.parse(prJson) as GitPrStatusDto;
+    } catch (_e) {
+      this.gitPrStatus = null;
+    }
+    try {
+      const stashJson = await this.bridge.gitStashListJson(hid, cwd);
+      this.gitStashes = JSON.parse(stashJson) as GitStashEntryDto[];
+    } catch (_e) {
+      this.gitStashes = [];
+    }
+    try {
+      const confJson = await this.bridge.gitConflictsJson(hid, cwd);
+      this.gitConflicts = JSON.parse(confJson) as GitConflictEntryDto[];
+    } catch (_e) {
+      this.gitConflicts = [];
+    }
+    try {
+      const rebJson = await this.bridge.gitRebaseStatusJson(hid, cwd);
+      this.gitRebaseStatus = JSON.parse(rebJson) as GitRebaseStatusDto;
+    } catch (_e) {
+      this.gitRebaseStatus = null;
+    }
+  }
+
+  public async gitCreatePr(
+    title: string,
+    body: string,
+    base: string | null,
+    draft: boolean
+  ): Promise<GitCreatePrResultDto | null> {
+    if (this.bridge === null || this.selectedHostId.length === 0 || title.trim().length === 0) {
+      return null;
+    }
+    this.gitWriteBusy = true;
+    try {
+      const json = await this.bridge.gitCreatePrJson(
+        this.selectedHostId,
+        this.activeCwd,
+        title.trim(),
+        body.trim(),
+        base !== null && base.trim().length > 0 ? base.trim() : null,
+        draft
+      );
+      const res = JSON.parse(json) as GitCreatePrResultDto;
+      this.refreshGitCollabStatus();
+      this.showToast(`Created PR: ${res.title}`, false);
+      this.triggerHaptic(12);
+      return res;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitCreatePrJson failed', err as Object);
+      this.showToast((err as Error).message || 'Create PR failed', true);
+      return null;
+    } finally {
+      this.gitWriteBusy = false;
+    }
+  }
+
+  public async gitSaveStash(message: string | null, includeUntracked: boolean): Promise<boolean> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return false;
+    }
+    this.gitWriteBusy = true;
+    try {
+      await this.bridge.gitStashSaveJson(this.selectedHostId, this.activeCwd, message, includeUntracked);
+      this.pullRefreshGitReview();
+      this.refreshGitCollabStatus();
+      this.showToast('Saved working tree stash', false);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Stash failed', true);
+      return false;
+    } finally {
+      this.gitWriteBusy = false;
+    }
+  }
+
+  public async gitPopStash(stashRef: string, expectedOid: string | null): Promise<boolean> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return false;
+    }
+    this.gitWriteBusy = true;
+    try {
+      await this.bridge.gitStashPopJson(this.selectedHostId, this.activeCwd, stashRef, expectedOid);
+      this.pullRefreshGitReview();
+      this.refreshGitCollabStatus();
+      this.showToast(`Popped ${stashRef}`, false);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Pop stash failed', true);
+      return false;
+    } finally {
+      this.gitWriteBusy = false;
+    }
+  }
+
+  public async gitRebaseContinue(): Promise<boolean> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return false;
+    }
+    this.gitWriteBusy = true;
+    try {
+      await this.bridge.gitRebaseContinueJson(this.selectedHostId, this.activeCwd);
+      this.pullRefreshGitReview();
+      this.refreshGitCollabStatus();
+      this.showToast('Continued rebase', false);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Rebase continue failed', true);
+      return false;
+    } finally {
+      this.gitWriteBusy = false;
+    }
+  }
+
+  public async gitRebaseAbort(): Promise<boolean> {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
+      return false;
+    }
+    this.gitWriteBusy = true;
+    try {
+      await this.bridge.gitRebaseAbortJson(this.selectedHostId, this.activeCwd);
+      this.pullRefreshGitReview();
+      this.refreshGitCollabStatus();
+      this.showToast('Aborted rebase', false);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Rebase abort failed', true);
+      return false;
+    } finally {
+      this.gitWriteBusy = false;
+    }
+  }
+
+  // 13. Global Cross-Host Search
+
+  public openGlobalSearch(): void {
+    this.showGlobalSearchSheet = true;
+    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+      this.sidebarOpen = false;
+    }
+    this.triggerHaptic(8);
+  }
+
+  public runLocalGlobalSearch(query: string): void {
+    this.globalSearchQuery = query;
+    const clean = query.trim();
+    if (this.bridge === null || clean.length === 0) {
+      this.globalSearchHits = [];
+      this.globalSearchRemoteQueried = 0;
+      this.globalSearchRemoteFailed = 0;
+      return;
+    }
+    try {
+      const json = this.bridge.searchMessagesJson(clean, 40);
+      this.globalSearchHits = JSON.parse(json) as ConversationSearchHitDto[];
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'searchMessagesJson failed', err as Object);
+    }
+  }
+
+  public async runRemoteGlobalSearch(query: string): Promise<void> {
+    const clean = query.trim();
+    this.globalSearchQuery = query;
+    if (this.bridge === null || clean.length === 0) {
+      return;
+    }
+    this.globalSearchBusy = true;
+    try {
+      const req: SearchMessagesRequestDto = {
+        query: clean,
+        host_id: null,
+        agent_id: null,
+        limit: 50
+      };
+      const json = await this.bridge.searchMessagesRemoteJson(JSON.stringify(req));
+      const res = JSON.parse(json) as SearchMessagesResponseDto;
+      this.globalSearchHits = res.hits ?? [];
+      this.globalSearchRemoteQueried = res.remote_hosts_queried ?? 0;
+      this.globalSearchRemoteFailed = res.remote_hosts_failed ?? 0;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'searchMessagesRemoteJson failed', err as Object);
+      this.showToast((err as Error).message || 'Remote search failed', true);
+    } finally {
+      this.globalSearchBusy = false;
+    }
+  }
+
+  public jumpToSearchHit(hit: ConversationSearchHitDto): void {
+    this.showGlobalSearchSheet = false;
+    this.openSessionFromDeepLink(hit.host_id, hit.agent_id, '');
+    if (hit.is_unloaded) {
+      this.loadOlderHistory();
+    }
+  }
+
+  // 14. Personal Router & Fleet Mesh
+
+  public openRouterMeshSheet(): void {
+    this.showRouterMeshSheet = true;
+    this.refreshRouterAndMesh();
+    this.triggerHaptic(8);
+  }
+
+  public async refreshRouterAndMesh(): Promise<void> {
+    if (this.bridge === null) {
+      return;
+    }
+    this.routerMeshBusy = true;
+    try {
+      try {
+        const routersJson = await this.bridge.discoverFleetRouterHostsJson();
+        this.routerHosts = JSON.parse(routersJson) as RouterHostCapabilitiesDto[];
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'discoverFleetRouterHostsJson failed', err as Object);
+      }
+
+      const targetHost = this.primaryRouterHostId.length > 0
+        ? this.primaryRouterHostId
+        : (this.routerHosts.length > 0 ? this.routerHosts[0].host_id : this.selectedHostId);
+      if (targetHost.length > 0) {
+        await this.loadRouterStatusForHost(targetHost);
+      }
+
+      try {
+        const meshJson = await this.bridge.getFleetMeshSnapshotJson();
+        const meshMap = JSON.parse(meshJson) as Record<string, ConnectedHostSummaryDto[]>;
+        const rows: OrbitMeshPeerRow[] = [];
+        const keys = Object.keys(meshMap);
+        for (let i = 0; i < keys.length; i++) {
+          const ownerId = keys[i];
+          const peers = meshMap[ownerId] ?? [];
+          const ownerCard = this.hosts.find((h: HostCardDto): boolean => h.host_id === ownerId);
+          const ownerName = ownerCard !== undefined ? ownerCard.display_name : ownerId;
+          for (let j = 0; j < peers.length; j++) {
+            rows.push({
+              owner_host_id: ownerId,
+              owner_host_name: ownerName,
+              peer: peers[j]
+            });
+          }
+        }
+        this.fleetMeshPeers = rows;
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'getFleetMeshSnapshotJson failed', err as Object);
+      }
+    } finally {
+      this.routerMeshBusy = false;
+    }
+  }
+
+  public async loadRouterStatusForHost(hostId: string): Promise<void> {
+    if (this.bridge === null || hostId.length === 0) {
+      return;
+    }
+    try {
+      const json = await this.bridge.getRouterConfigJson(hostId);
+      this.activeRouterStatus = JSON.parse(json) as RouterStatusSnapshotDto;
+      this.primaryRouterHostId = hostId;
+      this.prefsStore.setPrimaryRouterHostId(hostId);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', `getRouterConfigJson failed for ${hostId}`, err as Object);
+    }
+  }
+
+  public async saveRouterConfig(
+    hostId: string,
+    config: PersonalRouterConfigDto,
+    activate: boolean
+  ): Promise<boolean> {
+    if (this.bridge === null || hostId.length === 0) {
+      return false;
+    }
+    this.routerMeshBusy = true;
+    try {
+      const json = await this.bridge.updateRouterConfigJson(
+        hostId,
+        JSON.stringify(config),
+        null,
+        activate
+      );
+      this.activeRouterStatus = JSON.parse(json) as RouterStatusSnapshotDto;
+      this.primaryRouterHostId = hostId;
+      this.prefsStore.setPrimaryRouterHostId(hostId);
+      this.showToast('Personal Router policy saved', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'updateRouterConfigJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to update router', true);
+      return false;
+    } finally {
+      this.routerMeshBusy = false;
+    }
+  }
+
+  public async toggleMeshPeerEnabled(
+    ownerHostId: string,
+    registrationId: string,
+    label: string,
+    enabled: boolean
+  ): Promise<void> {
+    if (this.bridge === null) {
+      return;
+    }
+    try {
+      await this.bridge.updateMeshPeerJson(ownerHostId, registrationId, label, enabled);
+      await this.refreshRouterAndMesh();
+      this.showToast(enabled ? `Enabled ${label}` : `Paused ${label}`, false);
+      this.triggerHaptic(6);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'updateMeshPeerJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to update mesh peer', true);
+    }
+  }
+
+  // 15. Zero-Passphrase Cloud Sync + Device Link QR + GitHub Device Flow + Daemon Upgrade
+
+  public exportCloudSyncDeviceLinkUri(): string {
+    if (this.bridge === null) {
+      return '';
+    }
+    try {
+      const uri = this.bridge.cloudSyncExportDeviceLinkUri();
+      this.deviceLinkUri = uri;
+      return uri;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncExportDeviceLinkUri failed', err as Object);
+      this.showToast((err as Error).message || 'Device Link QR unavailable', true);
+      return '';
+    }
+  }
+
+  public async importCloudSyncDeviceLinkUri(uri: string): Promise<boolean> {
+    const clean = uri.trim();
+    if (this.bridge === null || clean.length === 0) {
+      return false;
+    }
+    this.cloudSyncBusy = true;
+    try {
+      await this.bridge.cloudSyncImportDeviceLinkUriJson(clean);
+      this.refreshCloudSyncStatus();
+      this.reloadFleet();
+      this.showToast('Device linked & vault synced', false);
+      this.triggerHaptic(14);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncImportDeviceLinkUriJson failed', err as Object);
+      this.showToast((err as Error).message || 'Device Link failed', true);
+      return false;
+    } finally {
+      this.cloudSyncBusy = false;
+    }
+  }
+
+  public scanDeviceLinkQr(context: common.Context | undefined): void {
+    scanPairingQrCode(context).then((outcome) => {
+      if (outcome.cancelled) {
+        return;
+      }
+      if (outcome.uri.length > 0) {
+        this.importCloudSyncDeviceLinkUri(outcome.uri);
+      } else if (outcome.errorMessage.length > 0) {
+        this.showToast(outcome.errorMessage, true);
+      }
+    }).catch((err: Object) => {
+      orbitLogWarn('OrbitStore', 'scanDeviceLinkQr failed', err);
+    });
+  }
+
+  public async setCloudSyncManualPassphraseMode(requireManual: boolean): Promise<void> {
+    if (this.bridge === null) {
+      return;
+    }
+    this.cloudSyncBusy = true;
+    try {
+      const json = await this.bridge.cloudSyncSetManualPassphraseModeJson(requireManual);
+      this.cloudSyncStatus = JSON.parse(json) as CloudSyncStatusDto;
+      this.showToast(
+        requireManual ? 'Manual passphrase required' : 'Zero-passphrase instant unlock enabled',
+        false
+      );
+      this.triggerHaptic(8);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncSetManualPassphraseModeJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to update unlock mode', true);
+    } finally {
+      this.cloudSyncBusy = false;
+    }
+  }
+
+  public async startGithubDeviceFlow(): Promise<void> {
+    if (this.bridge === null) {
+      return;
+    }
+    this.cloudSyncBusy = true;
+    try {
+      const json = await this.bridge.cloudSyncStartGithubDeviceFlowJson(null);
+      this.githubDeviceFlow = JSON.parse(json) as GithubDeviceFlowStartDto;
+      this.copyToClipboard(this.githubDeviceFlow.user_code, `Copied code ${this.githubDeviceFlow.user_code}`);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncStartGithubDeviceFlowJson failed', err as Object);
+      this.showToast((err as Error).message || 'GitHub sign-in unavailable', true);
+    } finally {
+      this.cloudSyncBusy = false;
+    }
+  }
+
+  public async pollGithubDeviceFlow(): Promise<string> {
+    if (this.bridge === null || this.githubDeviceFlow === null) {
+      return 'idle';
+    }
+    try {
+      const json = await this.bridge.cloudSyncPollGithubDeviceFlowJson(
+        this.githubDeviceFlow.device_code,
+        null
+      );
+      const polled = JSON.parse(json) as GithubDeviceFlowPollDto;
+      if (polled.status === 'authorized') {
+        this.githubDeviceFlow = null;
+        this.refreshCloudSyncStatus();
+        this.reloadFleet();
+        this.showToast('Signed in with GitHub', false);
+        this.triggerHaptic(14);
+      } else if (polled.status === 'expired' || polled.status === 'denied') {
+        this.githubDeviceFlow = null;
+        this.showToast(`GitHub sign-in ${polled.status}`, true);
+      }
+      return polled.status;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'cloudSyncPollGithubDeviceFlowJson failed', err as Object);
+      return 'error';
+    }
+  }
+
+  public async upgradeHostDaemon(hostId: string): Promise<void> {
+    if (this.bridge === null || hostId.length === 0) {
+      return;
+    }
+    try {
+      this.showToast('Upgrading host daemon…', false);
+      const summary = await this.bridge.upgradeHostDaemonOverWire(hostId, null);
+      this.showToast(summary.length > 0 ? summary : 'Host daemon upgraded', false);
+      this.reloadFleet();
+      this.triggerHaptic(12);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'upgradeHostDaemonOverWire failed', err as Object);
+      this.showToast((err as Error).message || 'Daemon upgrade failed', true);
+    }
+  }
+
+  // 16. Automations Creation & Schedule Run History
+
+  public loadScheduleRuns(scheduleId: string): void {
+    if (this.core === null || this.selectedHostId.length === 0) {
+      return;
+    }
+    try {
+      this.core.fetchScheduleRuns(this.selectedHostId, scheduleId, 10);
+      const raw = this.core.scheduleRunsJson(this.selectedHostId, scheduleId);
+      const parsed = JSON.parse(raw) as ScheduleRunRecordDto[];
+      const next: Record<string, ScheduleRunRecordDto[]> = {};
+      const keys = Object.keys(this.scheduleRunsById);
+      for (let i = 0; i < keys.length; i++) {
+        next[keys[i]] = this.scheduleRunsById[keys[i]];
+      }
+      next[scheduleId] = parsed;
+      this.scheduleRunsById = next;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'scheduleRunsJson failed', err as Object);
+    }
+  }
+
+  public async createConditionalTimer(
+    durationSeconds: number,
+    prompt: string,
+    conditionKind: string
+  ): Promise<boolean> {
+    const cleanPrompt = prompt.trim();
+    if (
+      this.bridge === null ||
+      this.selectedHostId.length === 0 ||
+      this.selectedAgentId.length === 0 ||
+      cleanPrompt.length === 0
+    ) {
+      this.showToast('Select an active session to arm a timer', true);
+      return false;
+    }
+    try {
+      const condObj: TimerConditionDto = { kind: conditionKind };
+      const condJson = JSON.stringify(condObj);
+      await this.bridge.createTimerJson(
+        this.selectedHostId,
+        this.selectedAgentId,
+        Math.max(10, Math.round(durationSeconds)),
+        cleanPrompt,
+        condJson
+      );
+      await this.refreshAutomations();
+      this.showToast('Conditional timer armed', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'createTimerJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to arm timer', true);
+      return false;
+    }
+  }
+
+  public async startGoalRun(
+    objective: string,
+    criteriaLines: string[],
+    verifyCmd: string | null,
+    maxIterations: number
+  ): Promise<boolean> {
+    const cleanObj = objective.trim();
+    if (
+      this.bridge === null ||
+      this.selectedHostId.length === 0 ||
+      this.selectedAgentId.length === 0 ||
+      cleanObj.length === 0
+    ) {
+      this.showToast('Select an active session to start a goal', true);
+      return false;
+    }
+    try {
+      const req: StartGoalRunRequestDto = {
+        host_id: this.selectedHostId,
+        agent_id: this.selectedAgentId,
+        objective: cleanObj,
+        criteria: criteriaLines,
+        verify_command: verifyCmd !== null && verifyCmd.trim().length > 0 ? verifyCmd.trim() : null,
+        max_iterations: Math.max(1, maxIterations),
+        max_duration_secs: 7200
+      };
+      await this.bridge.startGoalJson(JSON.stringify(req));
+      await this.refreshAutomations();
+      this.showToast('Goal loop started', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'startGoalJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to start goal', true);
+      return false;
+    }
+  }
+
+  public async createMonitorWatch(
+    name: string,
+    kind: string,
+    target: string,
+    pattern: string | null
+  ): Promise<boolean> {
+    const cleanName = name.trim();
+    const cleanTarget = target.trim();
+    if (
+      this.bridge === null ||
+      this.selectedHostId.length === 0 ||
+      this.selectedAgentId.length === 0 ||
+      cleanName.length === 0 ||
+      cleanTarget.length === 0
+    ) {
+      this.showToast('Select an active session and provide a target', true);
+      return false;
+    }
+    try {
+      const req: StartMonitorWatchRequestDto = {
+        host_id: this.selectedHostId,
+        agent_id: this.selectedAgentId,
+        name: cleanName,
+        kind: kind === 'http_health'
+          ? { kind: 'http_health', url: cleanTarget }
+          : (kind === 'log_file_tail'
+            ? { kind: 'log_file_tail', path: cleanTarget, pattern: pattern }
+            : { kind: 'command_stream', command: cleanTarget, pattern: pattern }),
+        expires_in_secs: 3600
+      };
+      await this.bridge.createMonitorJson(JSON.stringify(req));
+      await this.refreshAutomations();
+      this.showToast('Monitor watch started', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'createMonitorJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to start monitor', true);
+      return false;
+    }
+  }
+
+  public async startDagWorkflow(name: string, stepPrompt: string): Promise<boolean> {
+    const cleanName = name.trim();
+    const cleanPrompt = stepPrompt.trim();
+    if (
+      this.bridge === null ||
+      this.selectedHostId.length === 0 ||
+      cleanName.length === 0 ||
+      cleanPrompt.length === 0
+    ) {
+      return false;
+    }
+    try {
+      const step: DagStepSpecDto = {
+        step_id: 'step_1',
+        name: cleanName,
+        prompt: cleanPrompt,
+        depends_on: []
+      };
+      const req: StartDagWorkflowRequestDto = {
+        host_id: this.selectedHostId,
+        name: cleanName,
+        cwd: this.activeCwd,
+        steps: [step],
+        default_provider: this.composerProvider,
+        default_mode: this.composerMode,
+        max_concurrency: 2
+      };
+      await this.bridge.startWorkflowJson(JSON.stringify(req));
+      await this.refreshAutomations();
+      this.showToast('Workflow started', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'startWorkflowJson failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to start workflow', true);
+      return false;
+    }
+  }
+
+  // 17. Transcript Export (Markdown / JSON / HTML)
+
+  public openExportTranscriptSheet(): void {
+    this.showExportTranscriptSheet = true;
+    this.triggerHaptic(8);
+  }
+
+  public exportCurrentSessionTranscript(
+    format: string,
+    includeThinking: boolean,
+    includeTools: boolean,
+    includeTimestamps: boolean
+  ): ExportedTranscriptDto | null {
+    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+      return null;
+    }
+    try {
+      const opts: ExportOptionsDto = {
+        format: format,
+        include_thinking: includeThinking,
+        include_tool_calls: includeTools,
+        include_timestamps: includeTimestamps
+      };
+      const raw = this.core.exportAgentTranscriptJson(
+        this.selectedHostId,
+        this.selectedAgentId,
+        JSON.stringify(opts)
+      );
+      return JSON.parse(raw) as ExportedTranscriptDto;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'exportAgentTranscriptJson failed', err as Object);
+      this.showToast((err as Error).message || 'Export failed', true);
+      return null;
     }
   }
 }

@@ -10,6 +10,7 @@ import {
   PromptBadgeDto,
   QueuedPromptItem,
   QuotedDiffSnippet,
+  SessionPlanStepDto,
   SlashCommandDto,
   formatModeLabel,
   normalizeModeSlug,
@@ -17,6 +18,7 @@ import {
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import { orbitLogWarn } from '../../model/OrbitLogger';
+import { OrbitTheme } from '../../theme/OrbitTheme';
 import {
   OrbitTokens,
   orbitButtonMeta,
@@ -42,6 +44,7 @@ interface AutocompleteTriggerState {
 @ComponentV2
 export struct OmniComposer {
   @Local dismissedTriggerToken: string = '';
+  @Local planShelfExpanded: boolean = false;
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
@@ -721,20 +724,195 @@ export struct OmniComposer {
     }
   }
 
-  private inputPlaceholder(): string {
+  private completedPlanCount(): number {
+    let done = 0;
+    for (let i = 0; i < this.store.stagePlanSteps.length; i++) {
+      if (this.store.stagePlanSteps[i].status === 'completed') {
+        done += 1;
+      }
+    }
+    return done;
+  }
+
+  private formatVoiceClock(sec: number): string {
+    const mins = Math.floor(sec / 60);
+    const rem = sec % 60;
+    return `${mins}:${rem.toString().padStart(2, '0')}`;
+  }
+
+  private planStepSymbol(status: string): Resource {
+    if (status === 'completed') {
+      return $r('sys.symbol.checkmark_circle_fill');
+    }
+    if (status === 'failed') {
+      return $r('sys.symbol.xmark_circle');
+    }
+    if (status === 'in_progress') {
+      return $r('sys.symbol.dot_circle');
+    }
+    return $r('sys.symbol.circle');
+  }
+
+  private planStepColor(status: string): ResourceColor {
+    if (status === 'completed') {
+      return this.store.palette.statusDirect;
+    }
+    if (status === 'failed') {
+      return this.store.palette.statusDanger;
+    }
+    if (status === 'in_progress') {
+      return this.store.palette.accentPrimary;
+    }
+    return this.store.palette.fgMuted;
+  }
+
+  @Builder
+  private renderPlanProgressShelf() {
+    if (
+      this.store.stagePlanSteps.length > 0 &&
+      this.store.stagePendingPlanApproval === null &&
+      this.store.pendingPermissions.length === 0 &&
+      this.store.pendingQuestions.length === 0
+    ) {
+      Column({ space: OrbitTokens.SPACE_XS }) {
+        Row({ space: OrbitTokens.SPACE_SM }) {
+          SymbolGlyph($r('sys.symbol.list_checkmark'))
+            .fontSize(14)
+            .fontColor([this.store.palette.iconSecondary])
+
+          Text($r('app.string.composer_plan_progress'))
+            .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
+            .layoutWeight(1)
+
+          Text(`${this.completedPlanCount()}/${this.store.stagePlanSteps.length}`)
+            .attributeModifier(orbitTextMono(this.store.palette.fgMuted, FontWeight.Medium))
+
+          SymbolGlyph(
+            this.planShelfExpanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_up')
+          )
+            .fontSize(12)
+            .fontColor([this.store.palette.fgMuted])
+        }
+        .width('100%')
+        .constraintSize({ minHeight: 34 })
+        .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+        .alignItems(VerticalAlign.Center)
+        .onClick(() => {
+          this.getUIContext().animateTo({ duration: OrbitTokens.DUR_UI, curve: Curve.FastOutSlowIn }, () => {
+            this.planShelfExpanded = !this.planShelfExpanded;
+          });
+        })
+
+        if (this.planShelfExpanded) {
+          Column({ space: 6 }) {
+            ForEach(
+              this.store.stagePlanSteps,
+              (step: SessionPlanStepDto) => {
+                Row({ space: OrbitTokens.SPACE_SM }) {
+                  SymbolGlyph(this.planStepSymbol(step.status))
+                    .fontSize(13)
+                    .fontColor([this.planStepColor(step.status)])
+                  Text(
+                    step.status === 'in_progress' &&
+                      step.active_form !== undefined &&
+                      step.active_form !== null &&
+                      step.active_form.length > 0
+                      ? step.active_form
+                      : step.title
+                  )
+                    .attributeModifier(
+                      orbitTextMeta(
+                        step.status === 'completed'
+                          ? this.store.palette.fgMuted
+                          : this.store.palette.fgPrimary,
+                        step.status === 'in_progress' ? FontWeight.Medium : FontWeight.Normal
+                      )
+                    )
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .layoutWeight(1)
+                }
+                .width('100%')
+                .alignItems(VerticalAlign.Center)
+              },
+              (step: SessionPlanStepDto): string => `plan_${step.id}_${step.status}_${step.updated_seq}`
+            )
+          }
+          .width('100%')
+          .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, bottom: OrbitTokens.SPACE_SM })
+        }
+      }
+      .width('100%')
+      .borderRadius(OrbitTokens.RADIUS_LG)
+      .attributeModifier(OrbitTheme.dockedCard(this.store.palette))
+    }
+  }
+
+  @Builder
+  private renderInlineVoiceStrip() {
+    if (this.store.isVoiceRecording) {
+      Row({ space: OrbitTokens.SPACE_SM }) {
+        Row()
+          .width(8)
+          .height(8)
+          .borderRadius(4)
+          .backgroundColor(this.store.palette.statusDanger)
+
+        Text(
+          this.store.voiceInterimTranscript.length > 0
+            ? this.store.voiceInterimTranscript
+            : $r('app.string.composer_voice_listening')
+        )
+          .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Normal))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+
+        Text(this.formatVoiceClock(this.store.voiceElapsedSeconds))
+          .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.xmark'))
+            .fontSize(13)
+            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+            .fontColor([this.store.palette.iconSecondary])
+        }
+        .width(32)
+        .height(32)
+        .padding(0)
+        .backgroundColor(this.store.palette.subtleSurface)
+        .accessibilityText($r('app.string.composer_voice_cancel'))
+        .onClick(() => {
+          this.store.cancelVoiceDictation();
+        })
+      }
+      .width('100%')
+      .padding({
+        left: OrbitTokens.SPACE_MD,
+        right: OrbitTokens.SPACE_SM,
+        top: OrbitTokens.SPACE_SM,
+        bottom: OrbitTokens.SPACE_XS
+      })
+      .alignItems(VerticalAlign.Center)
+    }
+  }
+
+  private inputPlaceholder(): ResourceStr {
     if (this.store.activeSlashDirective.length > 0) {
       return '';
     }
-    return 'Ask anything, @ to mention, / for actions';
+    return $r('app.string.composer_placeholder');
   }
 
   build() {
     Column({ space: OrbitTokens.SPACE_SM }) {
       this.renderAutocompletePopover()
+      this.renderPlanProgressShelf()
       this.renderQueuedPromptsTray()
 
-      // Main HarmonyOS 7 Floating Composer Card
+      // Main Orbital Quiet Precision Docked Composer Card
       Column() {
+        this.renderInlineVoiceStrip()
         this.renderAttachmentAndContextStrip()
 
         Row({ space: OrbitTokens.SPACE_XS }) {
@@ -917,8 +1095,23 @@ export struct OmniComposer {
           .accessibilityText(`Access Permissions: ${formatModeLabel(normalizeModeSlug(this.store.composerMode))}`)
           .bindMenu(this.renderPermissionModeMenu())
 
-          // Right Action Cluster: Send / Queue / Stop
-          if (this.isAgentRunning()) {
+          // SINGLE Stationary Right Action Circle (Codex-Style Voice: empty+idle -> Mic, text/attachment -> Send)
+          if (this.store.isVoiceRecording) {
+            Button({ type: ButtonType.Circle, stateEffect: true }) {
+              SymbolGlyph($r('sys.symbol.checkmark'))
+                .fontSize(16)
+                .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                .fontColor([this.store.palette.onAccent])
+            }
+            .width(OrbitTokens.HIT_COMPACT)
+            .height(OrbitTokens.HIT_COMPACT)
+            .padding(0)
+            .backgroundColor(this.store.palette.accentPrimaryFill)
+            .accessibilityText($r('app.string.composer_voice_stop'))
+            .onClick(() => {
+              this.store.finishVoiceDictation();
+            })
+          } else if (this.isAgentRunning()) {
             if (this.canSend()) {
               Row({ space: 2 }) {
                 Button({ type: ButtonType.Capsule, stateEffect: true }) {
@@ -926,7 +1119,7 @@ export struct OmniComposer {
                     SymbolGlyph($r('sys.symbol.stop_circle_fill'))
                       .fontSize(15)
                       .fontColor([this.store.palette.statusDanger])
-                    Text('Stop')
+                    Text($r('app.string.action_stop'))
                       .attributeModifier(orbitTextMeta(this.store.palette.statusDanger, FontWeight.Medium))
                   }
                 }
@@ -970,28 +1163,36 @@ export struct OmniComposer {
                 this.store.interruptCurrentAgent();
               })
             }
-          } else {
+          } else if (this.canSend()) {
             Button({ type: ButtonType.Circle, stateEffect: true }) {
               SymbolGlyph($r('sys.symbol.arrow_up'))
                 .fontSize(16)
                 .renderingStrategy(SymbolRenderingStrategy.SINGLE)
-                .fontColor([
-                  this.canSend() ? this.store.palette.onAccent : this.store.palette.fgMuted
-                ])
+                .fontColor([this.store.palette.onAccent])
             }
             .width(OrbitTokens.HIT_COMPACT)
             .height(OrbitTokens.HIT_COMPACT)
             .padding(0)
-            .backgroundColor(
-              this.canSend()
-                ? this.store.palette.accentPrimaryFill
-                : this.store.palette.subtleSurface
-            )
-            .accessibilityText('Send prompt')
+            .backgroundColor(this.store.palette.accentPrimaryFill)
+            .accessibilityText($r('app.string.action_send'))
             .onClick(() => {
-              if (this.canSend()) {
-                this.store.submitComposerPrompt();
-              }
+              this.store.submitComposerPrompt();
+            })
+          } else {
+            Button({ type: ButtonType.Circle, stateEffect: true }) {
+              SymbolGlyph($r('sys.symbol.mic'))
+                .fontSize(17)
+                .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                .fontColor([this.store.palette.iconPrimary])
+            }
+            .width(OrbitTokens.HIT_COMPACT)
+            .height(OrbitTokens.HIT_COMPACT)
+            .padding(0)
+            .backgroundColor(this.store.palette.subtleSurface)
+            .accessibilityText($r('app.string.composer_voice_start'))
+            .onClick(() => {
+              dismissHarmonyKeyboard(this.getUIContext());
+              this.store.startVoiceDictation(this.getUIContext().getHostContext());
             })
           }
         }
@@ -1000,17 +1201,12 @@ export struct OmniComposer {
         .alignItems(VerticalAlign.Center)
       }
       .width('100%')
+      .constraintSize({ maxWidth: OrbitTokens.STAGE_MAX_READING_WIDTH })
       .borderRadius(OrbitTokens.RADIUS_XXL)
-      .attributeModifier(
-        orbitSurface(
-          this.store.palette.listCard,
-          this.store.palette.hairline,
-          OrbitTokens.HAIRLINE,
-          ShadowStyle.OUTER_DEFAULT_SM
-        )
-      )
+      .attributeModifier(OrbitTheme.dockedCard(this.store.palette))
     }
     .width('100%')
+    .alignItems(HorizontalAlign.Center)
     .padding({
       left: OrbitTokens.SPACE_LG,
       right: OrbitTokens.SPACE_LG,

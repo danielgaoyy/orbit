@@ -7,6 +7,8 @@ import {
   DiffFileDto,
   DiffLineDto,
   FlatDiffRowDto,
+  GitCreatePrResultDto,
+  GitStashEntryDto,
   basenameOfPath,
   isAutoCollapsedDiffPath
 } from '../../model/OrbitTypes';
@@ -14,6 +16,8 @@ import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
   orbitButtonMeta,
+  orbitButtonSubhead,
+  orbitInputSubhead,
   orbitSegmentSelectedBg,
   orbitSegmentSelectedFg,
   orbitSpanMonoFont,
@@ -21,6 +25,7 @@ import {
   orbitTextMono,
   orbitTextSubhead
 } from '../../theme/OrbitTokens';
+import { OrbitTheme } from '../../theme/OrbitTheme';
 import { dismissHarmonyKeyboard } from '../common/OrbitCommonControls';
 
 const INITIAL_DIFF_LINE_CAP: number = 120;
@@ -37,10 +42,21 @@ export struct GitDiffSheet {
     { text: 'Unstaged' },
     { text: 'Staged' }
   ]);
+  @Local showCommitPanel: boolean = false;
+  @Local commitMessageInput: string = '';
+  @Local commitAmend: boolean = false;
+  @Local showPrPanel: boolean = false;
+  @Local prTitleInput: string = '';
+  @Local prBodyInput: string = '';
+  @Local prDraft: boolean = false;
 
   private refreshTimerId: number = -1;
   private navPathStack: NavPathStack = new NavPathStack();
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+
+  aboutToAppear(): void {
+    this.store.refreshGitCollabStatus();
+  }
 
   aboutToDisappear(): void {
     if (this.refreshTimerId !== -1) {
@@ -52,6 +68,7 @@ export struct GitDiffSheet {
   private handlePullRefresh(): void {
     this.isRefreshing = true;
     this.store.pullRefreshGitReview();
+    this.store.refreshGitCollabStatus();
     if (this.refreshTimerId !== -1) {
       clearTimeout(this.refreshTimerId);
     }
@@ -319,6 +336,24 @@ export struct GitDiffSheet {
             Text(`-${row.deletions}`)
               .attributeModifier(orbitTextMeta(this.store.palette.statusDanger, FontWeight.Bold))
           }
+
+          Button(
+            this.store.gitStagedMode ? $r('app.string.git_unstage') : $r('app.string.git_stage'),
+            { type: ButtonType.Capsule, stateEffect: true }
+          )
+            .attributeModifier(
+              orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+            )
+            .height(26)
+            .padding({ left: 8, right: 8 })
+            .enabled(!this.store.gitWriteBusy)
+            .onClick(() => {
+              if (this.store.gitStagedMode) {
+                this.store.gitUnstagePaths([row.filePath], false);
+              } else {
+                this.store.gitStagePaths([row.filePath], false);
+              }
+            })
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
@@ -412,6 +447,319 @@ export struct GitDiffSheet {
   }
 
   @Builder
+  private renderGitCollabPanels() {
+    Column({ space: OrbitTokens.SPACE_SM }) {
+      // Compact Git Write Action Strip
+      Scroll() {
+        Row({ space: OrbitTokens.SPACE_XS }) {
+          Button(
+            this.store.gitStagedMode ? $r('app.string.git_unstage_all') : $r('app.string.git_stage_all'),
+            { type: ButtonType.Capsule, stateEffect: true }
+          )
+            .attributeModifier(
+              orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.listCard)
+            )
+            .height(34)
+            .padding({ left: 12, right: 12 })
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+            .enabled(!this.store.gitWriteBusy)
+            .onClick(() => {
+              if (this.store.gitStagedMode) {
+                this.store.gitUnstagePaths([], true);
+              } else {
+                this.store.gitStagePaths([], true);
+              }
+            })
+
+          Button($r('app.string.git_commit'), { type: ButtonType.Capsule, stateEffect: true })
+            .attributeModifier(
+              orbitButtonMeta(
+                this.showCommitPanel ? this.store.palette.onAccent : this.store.palette.fgPrimary,
+                this.showCommitPanel ? this.store.palette.accentPrimaryFill : this.store.palette.listCard
+              )
+            )
+            .height(34)
+            .padding({ left: 12, right: 12 })
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+            .onClick(() => {
+              this.showCommitPanel = !this.showCommitPanel;
+              if (this.showCommitPanel) {
+                this.showPrPanel = false;
+              }
+            })
+
+          Button($r('app.string.git_pr_section'), { type: ButtonType.Capsule, stateEffect: true })
+            .attributeModifier(
+              orbitButtonMeta(
+                this.showPrPanel ? this.store.palette.onAccent : this.store.palette.fgPrimary,
+                this.showPrPanel ? this.store.palette.accentPrimaryFill : this.store.palette.listCard
+              )
+            )
+            .height(34)
+            .padding({ left: 12, right: 12 })
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+            .onClick(() => {
+              this.showPrPanel = !this.showPrPanel;
+              if (this.showPrPanel) {
+                this.showCommitPanel = false;
+                this.store.refreshGitCollabStatus();
+              }
+            })
+
+          Button($r('app.string.git_stash_save'), { type: ButtonType.Capsule, stateEffect: true })
+            .attributeModifier(
+              orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.listCard)
+            )
+            .height(34)
+            .padding({ left: 12, right: 12 })
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+            .enabled(!this.store.gitWriteBusy)
+            .onClick(() => {
+              this.store.gitSaveStash(null, true);
+            })
+
+          if (this.store.gitStashes.length > 0) {
+            Button($r('app.string.git_stash_pop'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(
+                orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+              )
+              .height(34)
+              .padding({ left: 12, right: 12 })
+              .enabled(!this.store.gitWriteBusy)
+              .onClick(() => {
+                const top: GitStashEntryDto = this.store.gitStashes[0];
+                this.store.gitPopStash(top.stash_ref, top.oid ?? null);
+              })
+          }
+        }
+        .padding({ left: this.horizontalPad(), right: this.horizontalPad() })
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+      .width('100%')
+
+      // Conflicts / Active Rebase Alert Strip
+      if (this.store.gitConflicts.length > 0 || (this.store.gitRebaseStatus !== null && this.store.gitRebaseStatus.in_progress)) {
+        Column({ space: OrbitTokens.SPACE_XS }) {
+          Row({ space: OrbitTokens.SPACE_SM }) {
+            SymbolGlyph($r('sys.symbol.exclamationmark_triangle_fill'))
+              .fontSize(14)
+              .fontColor([this.store.palette.statusDanger])
+            Text(
+              this.store.gitConflicts.length > 0
+                ? `${this.store.gitConflicts.length} merge conflict(s)`
+                : 'Rebase in progress'
+            )
+              .attributeModifier(orbitTextMeta(this.store.palette.statusDanger, FontWeight.Bold))
+              .layoutWeight(1)
+          }
+          .width('100%')
+
+          Row({ space: OrbitTokens.SPACE_SM }) {
+            Button($r('app.string.git_rebase_continue'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
+              .height(32)
+              .padding({ left: 12, right: 12 })
+              .enabled(!this.store.gitWriteBusy)
+              .onClick(() => {
+                this.store.gitRebaseContinue();
+              })
+            Button($r('app.string.git_rebase_abort'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonMeta(this.store.palette.statusDanger, this.store.palette.listCard))
+              .height(32)
+              .padding({ left: 12, right: 12 })
+              .enabled(!this.store.gitWriteBusy)
+              .onClick(() => {
+                this.store.gitRebaseAbort();
+              })
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding(OrbitTokens.SPACE_SM)
+        .margin({ left: this.horizontalPad(), right: this.horizontalPad() })
+        .backgroundColor(this.store.palette.statusDangerSoft)
+        .borderRadius(OrbitTokens.RADIUS_MD)
+      }
+
+      // Collapsible Commit Panel
+      if (this.showCommitPanel) {
+        Column({ space: OrbitTokens.SPACE_SM }) {
+          TextArea({
+            placeholder: $r('app.string.git_commit_placeholder'),
+            text: this.commitMessageInput
+          })
+            .fontSize(OrbitTokens.FONT_SUBHEAD)
+            .fontColor(this.store.palette.fgPrimary)
+            .placeholderColor(this.store.palette.fgMuted)
+            .backgroundColor(this.store.palette.recessed)
+            .borderRadius(OrbitTokens.RADIUS_MD)
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+            .padding(OrbitTokens.SPACE_SM)
+            .width('100%')
+            .constraintSize({ minHeight: 68, maxHeight: 120 })
+            .onChange((val: string) => {
+              this.commitMessageInput = val;
+            })
+
+          Row({ space: OrbitTokens.SPACE_SM }) {
+            Toggle({ type: ToggleType.Switch, isOn: this.commitAmend })
+              .selectedColor(this.store.palette.accentPrimaryFill)
+              .onChange((on: boolean) => {
+                this.commitAmend = on;
+              })
+            Text($r('app.string.git_amend'))
+              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+              .layoutWeight(1)
+
+            Button($r('app.string.git_generate_message'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft))
+              .height(34)
+              .padding({ left: 10, right: 10 })
+              .enabled(!this.store.gitWriteBusy)
+              .onClick(() => {
+                this.store.gitGenerateCommitMessage().then((msg: string) => {
+                  if (msg.length > 0) {
+                    this.commitMessageInput = msg;
+                  }
+                });
+              })
+
+            Button($r('app.string.git_commit'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
+              .height(34)
+              .padding({ left: 14, right: 14 })
+              .enabled(!this.store.gitWriteBusy && this.commitMessageInput.trim().length > 0)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                this.store.gitCommit(this.commitMessageInput, this.commitAmend).then((ok: boolean) => {
+                  if (ok) {
+                    this.commitMessageInput = '';
+                    this.commitAmend = false;
+                    this.showCommitPanel = false;
+                  }
+                });
+              })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+        }
+        .padding(OrbitTokens.SPACE_MD)
+        .margin({ left: this.horizontalPad(), right: this.horizontalPad() })
+        .borderRadius(OrbitTokens.RADIUS_MD)
+        .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
+      }
+
+      // Collapsible Pull Request Panel
+      if (this.showPrPanel) {
+        Column({ space: OrbitTokens.SPACE_SM }) {
+          if (
+            this.store.gitPrStatus !== null &&
+            this.store.gitPrStatus.number !== undefined &&
+            this.store.gitPrStatus.number !== null
+          ) {
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              Text(`#${this.store.gitPrStatus.number} ${this.store.gitPrStatus.title ?? ''}`)
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
+                .maxLines(2)
+                .layoutWeight(1)
+              Text((this.store.gitPrStatus.state ?? 'OPEN').toUpperCase())
+                .attributeModifier(orbitTextMeta(this.store.palette.statusDirect, FontWeight.Medium))
+                .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+                .backgroundColor(this.store.palette.statusDirectSoft)
+                .borderRadius(999)
+            }
+            .width('100%')
+
+            if ((this.store.gitPrStatus.url ?? '').length > 0) {
+              Row({ space: OrbitTokens.SPACE_SM }) {
+                Text(
+                  `${this.store.gitPrStatus.passing_checks ?? 0} passing · ${this.store.gitPrStatus.failing_checks ?? 0} failing`
+                )
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                  .layoutWeight(1)
+                Button($r('app.string.action_copy'), { type: ButtonType.Capsule, stateEffect: true })
+                  .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface))
+                  .height(30)
+                  .padding({ left: 10, right: 10 })
+                  .onClick(() => {
+                    this.store.copyToClipboard(this.store.gitPrStatus?.url ?? '', 'Copied PR URL');
+                  })
+              }
+              .width('100%')
+            }
+          } else {
+            TextInput({
+              placeholder: $r('app.string.git_pr_title_placeholder'),
+              text: this.prTitleInput
+            })
+              .attributeModifier(
+                orbitInputSubhead(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
+              )
+              .height(OrbitTokens.HIT_COMPACT)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .width('100%')
+              .onChange((val: string) => {
+                this.prTitleInput = val;
+              })
+
+            TextArea({
+              placeholder: $r('app.string.git_pr_body_placeholder'),
+              text: this.prBodyInput
+            })
+              .fontSize(OrbitTokens.FONT_SUBHEAD)
+              .fontColor(this.store.palette.fgPrimary)
+              .placeholderColor(this.store.palette.fgMuted)
+              .backgroundColor(this.store.palette.recessed)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .padding(OrbitTokens.SPACE_SM)
+              .width('100%')
+              .constraintSize({ minHeight: 56, maxHeight: 100 })
+              .onChange((val: string) => {
+                this.prBodyInput = val;
+              })
+
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              Toggle({ type: ToggleType.Switch, isOn: this.prDraft })
+                .selectedColor(this.store.palette.accentPrimaryFill)
+                .onChange((on: boolean) => {
+                  this.prDraft = on;
+                })
+              Text($r('app.string.git_pr_draft'))
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+                .layoutWeight(1)
+              Button($r('app.string.git_create_pr'), { type: ButtonType.Capsule, stateEffect: true })
+                .attributeModifier(orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
+                .height(34)
+                .padding({ left: 14, right: 14 })
+                .enabled(!this.store.gitWriteBusy && this.prTitleInput.trim().length > 0)
+                .onClick(() => {
+                  dismissHarmonyKeyboard(this.getUIContext());
+                  this.store.gitCreatePr(this.prTitleInput, this.prBodyInput, null, this.prDraft).then(
+                    (res: GitCreatePrResultDto | null) => {
+                      if (res !== null) {
+                        this.prTitleInput = '';
+                        this.prBodyInput = '';
+                        this.prDraft = false;
+                      }
+                    }
+                  );
+                })
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+          }
+        }
+        .padding(OrbitTokens.SPACE_MD)
+        .margin({ left: this.horizontalPad(), right: this.horizontalPad() })
+        .borderRadius(OrbitTokens.RADIUS_MD)
+        .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
+      }
+    }
+    .width('100%')
+  }
+
+  @Builder
   private renderDiffBody() {
     Column({ space: OrbitTokens.SPACE_MD }) {
       Row() {
@@ -430,6 +778,8 @@ export struct GitDiffSheet {
       }
       .width('100%')
       .padding({ left: this.horizontalPad(), right: this.horizontalPad() })
+
+      this.renderGitCollabPanels()
 
       if (this.displayedDiffFiles.length > 0) {
         Row({ space: OrbitTokens.SPACE_SM }) {

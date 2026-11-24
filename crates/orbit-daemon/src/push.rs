@@ -2014,7 +2014,7 @@ mod tests {
             token.refresh_at,
             claims["iat"].as_i64().expect("iat") + 3000
         );
-        std::fs::remove_file(path).expect("remove");
+        let _ = std::fs::remove_file(&path);
         assert_eq!(
             direct
                 .credentials(PushPlatform::Apns)

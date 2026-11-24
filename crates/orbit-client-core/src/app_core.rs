@@ -25115,7 +25115,7 @@ mod tests {
             .block_on(async { core.run_mobile_rpc(async { 42u32 }) });
         assert_eq!(val, 42);
         drop(core);
-        std::fs::remove_file(path).expect("cleanup");
+        let _ = std::fs::remove_file(&path);
     }
     #[test]
     fn app_core_persists_paired_host_projects_rename_and_optimistic_outbox() {

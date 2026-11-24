@@ -5432,7 +5432,7 @@ mod tests {
         );
         drop(core);
         assert!(OhosCoreFacade::open(&path).is_err());
-        std::fs::remove_file(path).expect("cleanup");
+        let _ = std::fs::remove_file(&path);
     }
     #[test]
     fn ohos_facade_exports_valid_fleet_json() {

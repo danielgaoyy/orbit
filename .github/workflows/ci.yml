@@ -118,30 +118,20 @@ jobs:
             . -> target
             apps/desktop/src-tauri -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: mozilla-actions/sccache-action@v0.0.11
-        with:
-          version: "v0.20.0"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: apps/desktop/package-lock.json
-      - name: Cargo check & tests on Windows
+      - name: Cargo build & tests on Windows
         env:
           CARGO_INCREMENTAL: "0"
-          RUSTC_WRAPPER: sccache
-          SCCACHE_DIR: ${{ runner.temp }}/sccache
-          SCCACHE_CACHE_SIZE: "4G"
         run: |
-          cargo check --workspace --all-targets
           cargo build -p orbit-cli --bin orbit
           cargo test --workspace -- --skip live_devbox_ssh_one_click_e2e
       - name: Build Desktop frontend & check Tauri Windows crate
         env:
           CARGO_INCREMENTAL: "0"
-          RUSTC_WRAPPER: sccache
-          SCCACHE_DIR: ${{ runner.temp }}/sccache
-          SCCACHE_CACHE_SIZE: "4G"
         run: |
           npm --prefix apps/desktop ci
           npm --prefix apps/desktop test
@@ -197,12 +187,6 @@ jobs:
       - name: Build & Launch on iOS Simulator with Live Orbit Daemon
         run: |
           set -euo pipefail
-          cargo build -p orbit-cli
-          ./target/debug/orbit daemon >/tmp/orbit-daemon.log 2>&1 &
-          DAEMON_PID=$!
-          trap 'kill $DAEMON_PID 2>/dev/null || true' EXIT
-          sleep 2
-
           SIM_UDID="$(xcrun simctl list devices available -j | python3 -c '
           import json, sys
           data = json.load(sys.stdin)
@@ -217,16 +201,13 @@ jobs:
           ')"
           echo "Selected Simulator UDID: $SIM_UDID"
           xcrun simctl boot "$SIM_UDID" || true
-          xcrun simctl bootstatus "$SIM_UDID" -b
 
-          xcodebuild \
-            -project apps/ios/OrbitMobile.xcodeproj \
-            -scheme OrbitMobile \
-            -configuration Debug \
-            -destination "platform=iOS Simulator,id=$SIM_UDID" \
-            -derivedDataPath apps/ios/build/SimDerivedData \
-            CODE_SIGNING_ALLOWED=NO \
-            build
+          cargo build -p orbit-cli
+          ./target/debug/orbit daemon >/tmp/orbit-daemon.log 2>&1 &
+          DAEMON_PID=$!
+          trap 'kill $DAEMON_PID 2>/dev/null || true' EXIT
+          sleep 2
+          xcrun simctl bootstatus "$SIM_UDID" -b
 
           xcodebuild \
             -project apps/ios/OrbitMobile.xcodeproj \
@@ -261,14 +242,14 @@ jobs:
                 xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" -orbitTheme dark -orbitOpenSheet "$mode"
               fi
             fi
-            sleep 3
+            sleep 2
             xcrun simctl io "$SIM_UDID" screenshot "/tmp/ios-sim-screenshots/${mode}.png"
           done
 
           for demo_theme in dark light; do
             xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
             xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" -orbitTheme "$demo_theme" -orbitDemoChat
-            sleep 3
+            sleep 2
             xcrun simctl io "$SIM_UDID" screenshot "/tmp/ios-sim-screenshots/demo-chat-${demo_theme}.png"
           done
           ls -la /tmp/ios-sim-screenshots

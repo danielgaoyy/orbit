@@ -109,10 +109,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "orbit-rust-cli-${{ matrix.target }}"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release static-linked single binary
         shell: bash
         run: |
@@ -124,8 +120,55 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
+  build-macos-cli:
+    name: Build macOS CLI & Daemon (orbit-cli-macos-arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build release macOS ARM64 CLI & Daemon binary
+        run: |
+          cargo build --release -p orbit-cli --target aarch64-apple-darwin
+          cp target/aarch64-apple-darwin/release/orbit orbit-cli-macos-arm64
+          chmod +x orbit-cli-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbit-cli-macos-arm64
+          path: orbit-cli-macos-arm64
+
+  build-macos-desktop-bin:
+    name: Build macOS Tauri v2 Binary (orbit-desktop)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build macOS Tauri v2 binary (--no-bundle)
+        working-directory: apps/desktop
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          npm ci
+          npx tauri build --no-bundle --target aarch64-apple-darwin
+          cp src-tauri/target/aarch64-apple-darwin/release/orbit-desktop _internal-orbit-desktop-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: _internal-orbit-desktop-macos-arm64
+          path: apps/desktop/_internal-orbit-desktop-macos-arm64
+
   build-macos-desktop:
-    name: Build macOS Tauri v2 Desktop App (Orbit.dmg)
+    name: Bundle & Sign macOS Tauri v2 Desktop App (Orbit.dmg)
+    needs:
+      - build-macos-cli
+      - build-macos-desktop-bin
     runs-on: macos-latest
     outputs:
       notarized: ${{ steps.macos-signing.outputs.notarized }}
@@ -139,16 +182,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          shared-key: "orbit-rust-macos-desktop"
-          workspaces: |
-            . -> target
-            apps/desktop/src-tauri -> target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: mozilla-actions/sccache-action@v0.0.11
+          name: orbit-cli-macos-arm64
+          path: apps/desktop/src-tauri/binaries
+      - uses: actions/download-artifact@v4
         with:
-          version: "v0.20.0"
+          name: _internal-orbit-desktop-macos-arm64
+          path: apps/desktop/src-tauri/target/aarch64-apple-darwin/release
       - name: Prepare macOS Signing & Notarization
         id: macos-signing
         env:
@@ -192,13 +233,9 @@ jobs:
             echo "api_key_path=" >> "$GITHUB_OUTPUT"
             echo "::notice::APPLE_CERTIFICATE secret is not configured; building an ad-hoc signed macOS bundle. Configure Developer ID + notarization secrets (see deploy/MACOS_SIGNING.md) for zero-warning public releases."
           fi
-      - name: Build Tauri v2 macOS Bundle
+      - name: Bundle & Sign Tauri v2 macOS App & DMG
         working-directory: apps/desktop
         env:
-          RUSTC_WRAPPER: sccache
-          CARGO_INCREMENTAL: "0"
-          SCCACHE_DIR: ${{ runner.temp }}/sccache
-          SCCACHE_CACHE_SIZE: "4G"
           CERT_B64: ${{ secrets.APPLE_CERTIFICATE }}
           CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           SIGNING_IDENTITY_OVERRIDE: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -236,16 +273,14 @@ jobs:
             TAURI_EXTRA_ARGS=(--config '{"bundle":{"externalBin":["binaries/orbit"],"macOS":{"hardenedRuntime":false}}}')
           fi
 
-          # Bundle matching `orbit` daemon/CLI binary inside Orbit.app for zero-friction local daemon upgrades
-          cargo build --release -p orbit-cli --target aarch64-apple-darwin --manifest-path ../../Cargo.toml
-          mkdir -p src-tauri/binaries
-          cp ../../target/aarch64-apple-darwin/release/orbit src-tauri/binaries/orbit-aarch64-apple-darwin
+          mv src-tauri/binaries/orbit-cli-macos-arm64 src-tauri/binaries/orbit-aarch64-apple-darwin
           chmod +x src-tauri/binaries/orbit-aarch64-apple-darwin
-          cp ../../target/aarch64-apple-darwin/release/orbit orbit-cli-macos-arm64
-          chmod +x orbit-cli-macos-arm64
+          mv src-tauri/target/aarch64-apple-darwin/release/_internal-orbit-desktop-macos-arm64 src-tauri/target/aarch64-apple-darwin/release/orbit-desktop
+          chmod +x src-tauri/target/aarch64-apple-darwin/release/orbit-desktop
 
+          mkdir -p dist
           npm ci
-          npx tauri build --target aarch64-apple-darwin --bundles app,dmg "${TAURI_EXTRA_ARGS[@]}"
+          npx tauri bundle --target aarch64-apple-darwin --bundles app,dmg "${TAURI_EXTRA_ARGS[@]}"
           cp src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg Orbit-macOS-AppleSilicon.dmg
       - name: Verify Signature & Notarize macOS DMG
         working-directory: apps/desktop
@@ -292,23 +327,19 @@ jobs:
         with:
           name: Orbit-macOS-AppleSilicon.dmg
           path: apps/desktop/Orbit-macOS-AppleSilicon.dmg
-      - uses: actions/upload-artifact@v4
-        with:
-          name: orbit-cli-macos-arm64
-          path: apps/desktop/orbit-cli-macos-arm64
 
-  build-linux-desktop:
-    name: Build Linux Tauri v2 Desktop App (${{ matrix.artifact }})
+  build-linux-desktop-bin:
+    name: Build Linux Tauri v2 Binary (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            arch: x64
             target: x86_64-unknown-linux-gnu
-            artifact: Orbit-Linux-x64.deb
           - os: ubuntu-24.04-arm
+            arch: arm64
             target: aarch64-unknown-linux-gnu
-            artifact: Orbit-Linux-arm64.deb
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -324,38 +355,98 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "orbit-rust-linux-desktop-${{ matrix.target }}"
-          workspaces: |
-            . -> target
-            apps/desktop/src-tauri -> target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: mozilla-actions/sccache-action@v0.0.11
-        with:
-          version: "v0.20.0"
-      - name: Build Tauri v2 Linux .deb Package
+      - name: Build Tauri v2 Linux binary (--no-bundle)
         working-directory: apps/desktop
         env:
-          RUSTC_WRAPPER: sccache
           CARGO_INCREMENTAL: "0"
-          SCCACHE_DIR: ${{ runner.temp }}/sccache
-          SCCACHE_CACHE_SIZE: "4G"
         run: |
-          cargo build --release -p orbit-cli --target ${{ matrix.target }} --manifest-path ../../Cargo.toml
-          mkdir -p src-tauri/binaries
-          cp ../../target/${{ matrix.target }}/release/orbit src-tauri/binaries/orbit-${{ matrix.target }}
-          chmod +x src-tauri/binaries/orbit-${{ matrix.target }}
           npm ci
-          npx tauri build --target ${{ matrix.target }} --bundles deb --config '{"bundle":{"externalBin":["binaries/orbit"]}}'
+          npx tauri build --no-bundle --target ${{ matrix.target }}
+          cp src-tauri/target/${{ matrix.target }}/release/orbit-desktop _internal-orbit-desktop-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: _internal-orbit-desktop-linux-${{ matrix.arch }}
+          path: apps/desktop/_internal-orbit-desktop-linux-${{ matrix.arch }}
+
+  build-linux-desktop:
+    name: Bundle Linux Tauri v2 Desktop App (${{ matrix.artifact }})
+    needs:
+      - build-host-binaries
+      - build-linux-desktop-bin
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x64
+            target: x86_64-unknown-linux-gnu
+            artifact: Orbit-Linux-x64.deb
+            cli_artifact: orbit-cli-linux-x64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            artifact: Orbit-Linux-arm64.deb
+            cli_artifact: orbit-cli-linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri v2 Linux runtime libraries for .deb dependency resolution
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.cli_artifact }}
+          path: apps/desktop/src-tauri/binaries
+      - uses: actions/download-artifact@v4
+        with:
+          name: _internal-orbit-desktop-linux-${{ matrix.arch }}
+          path: apps/desktop/src-tauri/target/${{ matrix.target }}/release
+      - name: Bundle Tauri v2 Linux .deb Package
+        working-directory: apps/desktop
+        run: |
+          set -euo pipefail
+          mv "src-tauri/binaries/${{ matrix.cli_artifact }}" "src-tauri/binaries/orbit-${{ matrix.target }}"
+          chmod +x "src-tauri/binaries/orbit-${{ matrix.target }}"
+          mv "src-tauri/target/${{ matrix.target }}/release/_internal-orbit-desktop-linux-${{ matrix.arch }}" "src-tauri/target/${{ matrix.target }}/release/orbit-desktop"
+          chmod +x "src-tauri/target/${{ matrix.target }}/release/orbit-desktop"
+          mkdir -p dist
+          npm ci
+          npx tauri bundle --target ${{ matrix.target }} --bundles deb --config '{"bundle":{"externalBin":["binaries/orbit"]}}'
           cp src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb "../${{ matrix.artifact }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: apps/${{ matrix.artifact }}
 
-  build-windows-desktop:
-    name: Build Windows Tauri v2 Desktop App (.msi & NSIS .exe)
+  build-windows-cli:
+    name: Build Windows CLI & Daemon (orbit-windows-x86_64.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build release Windows CLI & Daemon binary
+        shell: bash
+        run: |
+          cargo build --release -p orbit-cli --target x86_64-pc-windows-msvc
+          cp target/x86_64-pc-windows-msvc/release/orbit.exe orbit-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbit-windows-x86_64.exe
+          path: orbit-windows-x86_64.exe
+
+  build-windows-desktop-bin:
+    name: Build Windows Tauri v2 Binary (orbit-desktop.exe)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -367,32 +458,55 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "orbit-rust-windows-desktop"
-          workspaces: |
-            . -> target
-            apps/desktop/src-tauri -> target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: mozilla-actions/sccache-action@v0.0.11
-        with:
-          version: "v0.20.0"
-      - name: Build Tauri v2 Windows .msi & NSIS .exe Packages
+      - name: Build Windows Tauri v2 binary (--no-bundle)
         working-directory: apps/desktop
         shell: bash
         env:
-          RUSTC_WRAPPER: sccache
           CARGO_INCREMENTAL: "0"
-          SCCACHE_DIR: ${{ runner.temp }}/sccache
-          SCCACHE_CACHE_SIZE: "4G"
         run: |
           set -euo pipefail
-          cargo build --release -p orbit-cli --target x86_64-pc-windows-msvc --manifest-path ../../Cargo.toml
-          mkdir -p src-tauri/binaries
-          cp ../../target/x86_64-pc-windows-msvc/release/orbit.exe src-tauri/binaries/orbit-x86_64-pc-windows-msvc.exe
-          cp ../../target/x86_64-pc-windows-msvc/release/orbit.exe orbit-windows-x86_64.exe
           npm ci
-          npx tauri build --target x86_64-pc-windows-msvc --bundles msi,nsis --config '{"bundle":{"externalBin":["binaries/orbit"]}}'
+          npx tauri build --no-bundle --target x86_64-pc-windows-msvc
+          cp src-tauri/target/x86_64-pc-windows-msvc/release/orbit-desktop.exe _internal-orbit-desktop-windows-x64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: _internal-orbit-desktop-windows-x64
+          path: apps/desktop/_internal-orbit-desktop-windows-x64.exe
+
+  build-windows-desktop:
+    name: Bundle Windows Tauri v2 Desktop App (.msi & NSIS .exe)
+    needs:
+      - build-windows-cli
+      - build-windows-desktop-bin
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@v4
+        with:
+          name: orbit-windows-x86_64.exe
+          path: apps/desktop/src-tauri/binaries
+      - uses: actions/download-artifact@v4
+        with:
+          name: _internal-orbit-desktop-windows-x64
+          path: apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release
+      - name: Bundle Tauri v2 Windows .msi & NSIS .exe Packages
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv src-tauri/binaries/orbit-windows-x86_64.exe src-tauri/binaries/orbit-x86_64-pc-windows-msvc.exe
+          mv src-tauri/target/x86_64-pc-windows-msvc/release/_internal-orbit-desktop-windows-x64.exe src-tauri/target/x86_64-pc-windows-msvc/release/orbit-desktop.exe
+          mkdir -p dist
+          npm ci
+          npx tauri bundle --target x86_64-pc-windows-msvc --bundles msi,nsis --config '{"bundle":{"externalBin":["binaries/orbit"]}}'
           MSI_FILE="$(find src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi -maxdepth 2 -type f -name '*.msi' | head -n 1)"
           NSIS_FILE="$(find src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -maxdepth 2 -type f -name '*.exe' | head -n 1)"
           if [ -z "$MSI_FILE" ] || [ -z "$NSIS_FILE" ]; then
@@ -409,10 +523,6 @@ jobs:
         with:
           name: Orbit-Windows-x64-setup.exe
           path: apps/desktop/Orbit-Windows-x64-setup.exe
-      - uses: actions/upload-artifact@v4
-        with:
-          name: orbit-windows-x86_64.exe
-          path: apps/desktop/orbit-windows-x86_64.exe
 
   build-android-apk:
     name: Build Native Android APK (Jetpack Compose + UniFFI, minSdk 29)
@@ -549,7 +659,7 @@ jobs:
         uses: ErBWs/setup-ohos@v2
         with:
           version: "26.0.0.821"
-          cache: true
+          cache: false
       - name: Configure HarmonyOS SDK & Package Registries
         run: |
           echo "DEVECO_SDK_HOME=$HOS_SDK_HOME" >> "$GITHUB_ENV"
@@ -560,10 +670,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-ohos,x86_64-unknown-linux-ohos
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "orbit-rust-harmony"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build Rust N-API Libraries (arm64-v8a + x86_64)
         run: ./apps/harmony/scripts/build-rust-ohos.sh
       - name: Probe HarmonyOS Signing Secrets
@@ -654,8 +760,10 @@ jobs:
       - e2e-regression-matrix
       - desktop-frontend-quality
       - build-host-binaries
+      - build-macos-cli
       - build-macos-desktop
       - build-linux-desktop
+      - build-windows-cli
       - build-windows-desktop
       - build-android-apk
       - build-ios-ipa
@@ -672,6 +780,8 @@ jobs:
       - name: Compute SHA-256 Checksums
         working-directory: release-dist
         run: |
+          rm -f _internal-*
+          ls -la
           chmod +x orbit-cli-*
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt

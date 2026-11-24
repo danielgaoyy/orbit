@@ -43,3 +43,11 @@ Mission Workspace 中会话标题与 `@handle` 会根据进展自动或手动更
 - **跨主机项目发现、Peer-Bridge 连通性与上下文注入**：主分工师所在的 Host A 通过 `PersonalRouterManager`（`crates/orbit-daemon/src/personal_router.rs`）聚合全部在线远端主机的项目与活跃 Worker 注入 `<orbit-fleet-state>` / `<orbit-fleet-delta>`，并通过 Core Pack 的 `orbit_control(action="list_projects" | "inspect_project_context")` 在派单前免 SSH 拉取任意远端仓库的 `AGENTS.md` / `README.md` / 目录结构与 Git 分支上下文；无法直连或上 Relay 的内网隔绝主机可通过已配对节点的 `/ws/e2ee` Peer-Bridge 与 SSH Forward 隧道连通。
 - **后台定时器（Timer）空闲可对话不变量**：仅持有关闭后待触发定时器（`schedule` / `orbit_timer` / `waiting:N timer`）的会话与子代理保持 Idle 可随时继续对话（`is_running == false`，`has_background_tasks == true`，`has_armed_timers == true`），禁止在对话输入框或侧边栏显示阻塞性停止按钮或旋转加载圈。
 - **三级风控与飞书双向闭环**：Tier-1 低危由 `GuardianManager` 自动放行；Tier-2 中危可由分工师结合上下文预审；Tier-3 高危（`High` / `Critical`）在协议层硬禁止分工师自动放行并强制交由人类在原生端或飞书交互卡片拍板。飞书通道支持 `ImRoutingMode::PersonalRouter` 直接路由至唯一常驻分工师会话。
+
+---
+
+## 6. MCP 角色权限隔离不变量（Personal Router vs Coding Agent Harness vs Group Harness）
+
+- **UI / CLI 与 MCP 职责分离**：人类在桌面端 / 移动端 UI 或 `orbit` CLI 中管理会话与 Group 直接走 WebSocket / FFI RPC，**不经过 MCP 工具面**。在 MCP 工具面（`/mcp/agents` 与 `orbit mcp`）上，**唯一**拥有会话派生、分叉、搬迁、工作区编组、工作流及跨机编排权限的身份是 **`AgentRole::PersonalRouter`**（含 Orbit 导出的外部 Hermes 路由桥 `external_hermes_router`）。
+- **编码 Agent Harness 单会话收敛与 Fail-Closed**：所有 `AgentRole::Worker` 会话（无论独立会话还是位于人类创建的 Group 内），以及缺失/未知/已归档 `caller_agent_id` 的请求，一律 fail-closed 落入 `Worker` 权限：既不暴露也不允许执行会话派生与拓扑变更工具；内部子代理委派统一由各自 Harness 原生子代理工具承担（如 Claude `Agent`/`Task`、Codex 原生 subagent、Antigravity `invoke_subagent`）。在 Core 与可选能力包方面（且自动剔除 `Workflows`/`Schedules`），Worker 仅暴露 5 个不派生会话的协作/自管理辅助工具（`workspace_peers`、`message_peer`〔运行时强制仅限当前已编组 `is_curated == true` 的 Mission Workspace〕、`workspace_board`、`handoff_worktree`〔仅限自身会话与自身工作区〕、`orbit_timer`〔仅限自身会话〕）及不派生会话的可选能力包。
+- **启动前角色落盘与禁止隐式建组**：`CreateAgentSpec.role` 必须在 MCP 能力包探测与驱动启动前写入 `orbit.role`，消除 `PersonalRouter` 首轮启动竞态；带 `parent_agent_id` 的子代理创建永不隐式将普通独立工作区升格为 `is_curated = true`。

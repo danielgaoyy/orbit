@@ -261,8 +261,12 @@ while True:
             "initial_prompt": "ECHO=BETA_INIT",
             "notify_on_finish": False
         })
-        sc = res.get("result", {}).get("structuredContent", {})
-        reply_parts.append(f"FORK_OK={sc.get('agent_id', '')}")
+        r = res.get("result", {})
+        if r.get("isError"):
+            reply_parts.append("FORK_DENIED=True")
+        else:
+            sc = r.get("structuredContent", {})
+            reply_parts.append(f"FORK_OK={sc.get('agent_id', '')}")
 
     if "[MOCK:CHECK_PEERS]" in text:
         res = mcp_call("workspace_peers", {})
@@ -1478,7 +1482,7 @@ async fn pitfall_05_mission_workspace_parallel_worktree_isolation_and_handle_ali
             effort: None,
             fast_mode: None,
             mode: SessionMode::AcceptEdits,
-            initial_prompt: "[MOCK:FORK_WORKTREE]",
+            initial_prompt: "ECHO=ALPHA_INIT",
             initial_display_prompt: None,
             initial_badges: Vec::new(),
             worktree_branch: None,
@@ -1488,6 +1492,86 @@ async fn pitfall_05_mission_workspace_parallel_worktree_isolation_and_handle_ali
         },
         None,
     );
+
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            async move {
+                let Some(d) = c.host_detail(&hid) else {
+                    return false;
+                };
+                d.agents.iter().any(|a| {
+                    !a.agent_id.starts_with("opt_")
+                        && a.handle.as_deref() == Some("alpha")
+                        && !a.is_running
+                        && a.latest_seq > 0
+                })
+            }
+        })
+        .await,
+        "@alpha standalone session must settle"
+    );
+
+    let alpha_initial = core
+        .host_detail(&host_id)
+        .expect("detail")
+        .agents
+        .into_iter()
+        .find(|a| a.handle.as_deref() == Some("alpha"))
+        .expect("alpha");
+    let alpha_id = alpha_initial.agent_id.clone();
+    let alpha_ws_id = alpha_initial.workspace_id.clone();
+    core.open_agent_timeline(&host_id, &alpha_id);
+
+    // Issue #57 regression: a coding Harness Worker MUST be denied when calling `spawn_workspace_peer`,
+    // and its workspace must stay uncurated with only 1 agent (no implicit Group promotion).
+    core.send_prompt(&host_id, &alpha_id, "[MOCK:FORK_WORKTREE]");
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = alpha_id.clone();
+            async move { stage_settled_with_text(&c, &hid, &aid, "FORK_DENIED=True") }
+        })
+        .await,
+        "Coding Harness Worker @alpha must be denied from spawning sibling peers via MCP"
+    );
+    let alpha_ws = rt
+        .store
+        .get_workspace(&alpha_ws_id)
+        .expect("get ws")
+        .expect("ws exists");
+    assert!(
+        !alpha_ws.is_curated,
+        "Denied Worker spawn_workspace_peer must NOT implicitly promote standalone workspace to Group"
+    );
+    assert_eq!(
+        rt.store
+            .list_agents_filtered(Some(&alpha_ws_id), false, false, None)
+            .expect("list")
+            .len(),
+        1,
+        "Denied Worker spawn_workspace_peer must NOT create any peer conversation"
+    );
+
+    // Human UI explicitly spawns worktree-isolated @beta into @alpha's workspace to form a Group
+    core.spawn_workspace_peer(orbit_client_core::contract::SpawnWorkspacePeerRequest {
+        host_id: host_id.clone(),
+        workspace_id: alpha_ws_id.clone(),
+        cwd: repo.to_string_lossy().to_string(),
+        extra_dirs: Vec::new(),
+        provider: ProviderKind::ClaudeCode,
+        acp_agent_id: None,
+        model: None,
+        effort: None,
+        fast_mode: None,
+        mode: SessionMode::AcceptEdits,
+        initial_prompt: "ECHO=BETA_INIT".into(),
+        worktree_branch: Some("auto".into()),
+        handle: Some("beta".into()),
+        profile_id: None,
+    });
 
     assert!(
         wait_until(Duration::from_secs(20), || {
@@ -1516,7 +1600,7 @@ async fn pitfall_05_mission_workspace_parallel_worktree_isolation_and_handle_ali
             }
         })
         .await,
-        "@alpha and worktree-isolated @beta must both finish in the same Mission Workspace"
+        "@alpha and human-added worktree-isolated @beta must both finish in the same Mission Workspace"
     );
 
     let detail = core.host_detail(&host_id).expect("detail");
@@ -1535,10 +1619,8 @@ async fn pitfall_05_mission_workspace_parallel_worktree_isolation_and_handle_ali
         alpha.cwd, beta.cwd,
         "@beta spawned with worktree=true must run in an isolated checkout directory"
     );
-    let alpha_id = alpha.agent_id.clone();
     let beta_id = beta.agent_id.clone();
 
-    core.open_agent_timeline(&host_id, &alpha_id);
     core.open_agent_timeline(&host_id, &beta_id);
 
     // Check workspace_peers reports 0 shared checkout peers and beta isolated

@@ -3745,6 +3745,7 @@ async fn handle_wire_rpc(
                     handle,
                     auto_cluster,
                     acp_agent_id,
+                    role: orbit_protocol::AgentRole::Worker,
                 })
                 .await
             {

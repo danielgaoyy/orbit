@@ -3023,6 +3023,7 @@ mod tests {
                 handle: None,
                 auto_cluster: Some(false),
                 acp_agent_id: Some("mock-acp-hook-test".into()),
+                role: orbit_protocol::AgentRole::Worker,
             })
             .await
             .expect_err("PrePromptSubmit block must reject create_and_start_agent");

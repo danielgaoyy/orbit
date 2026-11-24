@@ -26,9 +26,9 @@ use chrono::Utc;
 use orbit_client_core::{HostSessionHandle, connect_direct};
 use orbit_daemon::spawn_embedded_daemon;
 use orbit_protocol::{
-    AgentMessageKind, AgentProfile, AgentStatus, ConnectedHostStatus, McpToolPolicy, ProviderKind,
-    ScheduleNewAgentConfig, ScheduleRunStatus, ScheduleTarget, SessionMode, TimelinePayload,
-    WireMessage, WorkspaceIsolation, WorktreeCreateMode,
+    AgentMessageKind, AgentProfile, AgentRole, AgentStatus, ConnectedHostStatus, McpToolPolicy,
+    ProviderKind, ScheduleNewAgentConfig, ScheduleRunStatus, ScheduleTarget, SessionMode,
+    TimelinePayload, WireMessage, WorkspaceIsolation, WorktreeCreateMode,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -456,6 +456,46 @@ async fn create_agent_rpc(
     }
 }
 
+async fn create_router_agent_rpc(
+    runtime: &orbit_daemon::DaemonRuntime,
+    cwd: &str,
+    prompt: &str,
+    mode: SessionMode,
+) -> orbit_protocol::AgentSummary {
+    runtime
+        .orchestrator
+        .create_and_start_agent(orbit_daemon::manager::CreateAgentSpec {
+            cwd: cwd.to_string(),
+            extra_dirs: Vec::new(),
+            title: Some("Personal Router".to_string()),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: None,
+            mode,
+            initial_prompt: prompt.to_string(),
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree: false,
+            workspace_id: None,
+            parent_agent_id: None,
+            parent_host_id: None,
+            profile_id: None,
+            background: false,
+            auto_archive: false,
+            base_ref: None,
+            worktree_mode: WorktreeCreateMode::BranchOff,
+            branch: None,
+            pr_number: None,
+            handle: Some("router".to_string()),
+            auto_cluster: Some(false),
+            acp_agent_id: None,
+            role: AgentRole::PersonalRouter,
+        })
+        .await
+        .expect("create PersonalRouter agent")
+}
+
 // ============================================================================
 // Scenario 1: Single-host delegation -> worktree -> auto finish wakeup + provider subagent
 // ============================================================================
@@ -472,6 +512,7 @@ async fn scenario_01_single_host_delegation_worktree_and_auto_finish_wakeup() {
     let client = connect_direct(&format!("ws://{addr}/ws"), &runtime.pairing_secret, None)
         .await
         .expect("connect ws");
+    drop(client);
 
     // Register a worker Profile
     let now = Utc::now();
@@ -495,19 +536,16 @@ async fn scenario_01_single_host_delegation_worktree_and_auto_finish_wakeup() {
         .upsert_profile(&worker_profile)
         .expect("upsert profile");
 
-    // Spawn parent that delegates via REAL HTTP MCP `/mcp/agents`
+    // Spawn PersonalRouter parent that delegates via REAL HTTP MCP `/mcp/agents`
     let prompt = format!(
         "[MOCK:DELEGATE_WORKTREE] [MOCK:TASK_SUBAGENT] PROFILE_ID=prof_worker REPO={}",
         repo.display()
     );
-    let parent = create_agent_rpc(
-        &client,
+    let parent = create_router_agent_rpc(
+        &runtime,
         &repo.to_string_lossy(),
         &prompt,
         SessionMode::AcceptEdits,
-        None,
-        None,
-        false,
     )
     .await;
 
@@ -611,14 +649,12 @@ async fn scenario_02_permission_checkpoint_forwarding_and_continued_watch() {
         "[MOCK:DELEGATE_WORKTREE] [MOCK:CHILD_NEEDS_PERM] PROFILE_ID=prof_perm REPO={}",
         repo.display()
     );
-    let parent = create_agent_rpc(
-        &client,
+    drop(client);
+    let parent = create_router_agent_rpc(
+        &runtime,
         &repo.to_string_lossy(),
         &prompt,
         SessionMode::AcceptEdits,
-        None,
-        None,
-        false,
     )
     .await;
 
@@ -675,14 +711,12 @@ async fn scenario_03_quiet_window_coalescing_single_parent_wakeup() {
         .await
         .expect("connect ws");
 
-    let parent = create_agent_rpc(
-        &client,
+    drop(client);
+    let parent = create_router_agent_rpc(
+        &runtime,
         &repo.to_string_lossy(),
         "[MOCK:DELEGATE_COALESCE]",
         SessionMode::AcceptEdits,
-        None,
-        None,
-        false,
     )
     .await;
 
@@ -1396,14 +1430,11 @@ async fn scenario_09_cross_host_fleet_mesh_delegation_and_idempotency() {
         rt_b.host_info.host_id,
         repo_b.display()
     );
-    let parent_a = create_agent_rpc(
-        &client_a,
+    let parent_a = create_router_agent_rpc(
+        &rt_a,
         &repo_a.to_string_lossy(),
         &prompt,
         SessionMode::AcceptEdits,
-        None,
-        None,
-        false,
     )
     .await;
 
@@ -1627,7 +1658,97 @@ async fn scenario_10_cli_orchestration_commands_mcp_stdio_bridge_and_policy_gati
             .contains("cli-hello")
     );
 
-    // 4. Test `orbit mcp` stdio bridge with caller using `prof_restricted` (`delete_agent` disabled!)
+    // 4a. Test `orbit mcp` stdio bridge for a default Worker session (Issue #57 boundary):
+    // must expose only the 5 non-spawning Core tools, emit native-subagent instructions,
+    // and reject session-spawning calls (`create_agent`, `spawn_workspace_peer`).
+    let mut worker_mcp_child = tokio::process::Command::new(&orbit_bin)
+        .args([
+            "--home",
+            &home.to_string_lossy(),
+            "mcp",
+            "--caller-agent-id",
+            &agent_id,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn worker orbit mcp");
+
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = worker_mcp_child.stdin.take().expect("stdin");
+        for req in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "create_agent", "arguments": {"initial_prompt": "sub"}}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "spawn_workspace_peer", "arguments": {"initial_prompt": "peer"}}}),
+        ] {
+            let line = format!("{req}\n");
+            stdin
+                .write_all(line.as_bytes())
+                .await
+                .expect("write worker mcp req");
+        }
+        stdin.shutdown().await.expect("close stdin");
+    }
+    let worker_mcp_out =
+        tokio::time::timeout(Duration::from_secs(20), worker_mcp_child.wait_with_output())
+            .await
+            .expect("worker mcp bridge timeout")
+            .expect("wait worker orbit mcp");
+    assert!(
+        worker_mcp_out.status.success(),
+        "worker orbit mcp failed: {}",
+        String::from_utf8_lossy(&worker_mcp_out.stderr)
+    );
+    let worker_lines: Vec<Value> = String::from_utf8_lossy(&worker_mcp_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).expect("valid worker json-rpc response"))
+        .collect();
+    assert_eq!(worker_lines.len(), 4);
+    let worker_inst = worker_lines[0]["result"]["instructions"]
+        .as_str()
+        .unwrap_or("");
+    assert!(worker_inst.contains("harness-native subagent"));
+    assert!(!worker_inst.contains("spawn_workspace_peer"));
+    let worker_tools = worker_lines[1]["result"]["tools"]
+        .as_array()
+        .expect("worker tools array");
+    assert_eq!(worker_tools.len(), 5);
+    assert!(!worker_tools.iter().any(|t| matches!(
+        t["name"].as_str(),
+        Some("create_agent" | "spawn_workspace_peer")
+    )));
+    assert_eq!(worker_lines[2]["result"]["isError"], true);
+    assert!(
+        worker_lines[2]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("permission_denied")
+    );
+    assert_eq!(worker_lines[3]["result"]["isError"], true);
+    assert!(
+        worker_lines[3]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("permission_denied")
+    );
+
+    // 4b. Promote caller to `PersonalRouter` and test `orbit mcp` stdio bridge with `prof_restricted` (`delete_agent` disabled!)
+    let mut router_ag = runtime
+        .store
+        .get_agent(&agent_id)
+        .expect("get agent")
+        .expect("agent exists");
+    router_ag.set_role(AgentRole::PersonalRouter);
+    runtime
+        .store
+        .upsert_agent(&router_ag, None)
+        .expect("promote agent to PersonalRouter");
+
     let mut mcp_child = tokio::process::Command::new(&orbit_bin)
         .args([
             "--home",

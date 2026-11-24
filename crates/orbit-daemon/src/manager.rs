@@ -9,8 +9,8 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, AgentStatus, AgentSummary, AttentionState, ForkTarget,
-    HostProjectEntry, HostSyncState, KeepAwakeStatus, OrchestrationConfig,
+    ActiveTurnBehavior, AgentMessageKind, AgentRole, AgentStatus, AgentSummary, AttentionState,
+    ForkTarget, HostProjectEntry, HostSyncState, KeepAwakeStatus, OrchestrationConfig,
     PendingPermissionSummary, PromptBadge, ProviderKind, ProviderModelCatalog,
     ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec,
     SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
@@ -210,6 +210,7 @@ pub struct CreateAgentSpec {
     pub handle: Option<String>,
     pub auto_cluster: Option<bool>,
     pub acp_agent_id: Option<String>,
+    pub role: AgentRole,
 }
 
 pub struct AgentOrchestrator {
@@ -1795,7 +1796,8 @@ impl AgentOrchestrator {
                 agent_cwd_override = Some(wt_str);
             }
             // Promoting an unclassified container to a curated Mission Workspace when explicitly targeted
-            if !existing_ws.is_curated && !effective_background {
+            // by a top-level action (human UI or Personal Router), never silently for child agents.
+            if !existing_ws.is_curated && !effective_background && spec.parent_agent_id.is_none() {
                 let promoted = self
                     .store
                     .set_workspace_curated(&existing_ws.workspace_id, true)?
@@ -1948,13 +1950,23 @@ impl AgentOrchestrator {
             agent_labels.insert("orbit.title_locked".into(), "1".into());
         }
         let is_subagent = spec.parent_agent_id.is_some() || effective_background;
+        if spec.role == AgentRole::PersonalRouter {
+            agent_labels.insert(
+                orbit_protocol::LABEL_AGENT_ROLE.into(),
+                orbit_protocol::AGENT_ROLE_PERSONAL_ROUTER.into(),
+            );
+        }
+        let can_orchestrate_sessions = spec.role == AgentRole::PersonalRouter && !is_subagent;
         let has_browser_binary = if crate::tools::prompt_mentions_browser(&human_seed) {
             crate::browser::discover_chrome_binary().is_some()
         } else {
             false
         };
-        let detected_packs =
-            crate::tools::detect_startup_mcp_packs(&human_seed, is_subagent, has_browser_binary);
+        let detected_packs = crate::tools::detect_startup_mcp_packs(
+            &human_seed,
+            can_orchestrate_sessions,
+            has_browser_binary,
+        );
         agent_labels.insert(
             crate::tools::LABEL_MCP_PACKS.into(),
             crate::tools::format_mcp_packs_label(&detected_packs),
@@ -7565,6 +7577,7 @@ mod fast_mode_orchestrator_tests {
             handle: None,
             auto_cluster: Some(false),
             acp_agent_id: None,
+            role: AgentRole::Worker,
         }
     }
 

@@ -591,6 +591,7 @@ impl ScheduleEngine {
                     handle: None,
                     auto_cluster: Some(false),
                     acp_agent_id: cfg.acp_agent_id.clone(),
+                    role: orbit_protocol::AgentRole::Worker,
                 };
                 match self.orchestrator.create_and_start_agent(spec).await {
                     Ok(agent) => {

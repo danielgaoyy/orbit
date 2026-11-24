@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, ArtifactKind, BestOfNCandidateSpec, BrowserActionRequest,
-    DagStepSpec, ForkTarget, McpToolPack, McpToolPolicy, MonitorKind, ProviderKind,
-    ReasoningEffort, ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode,
-    TimelinePayload, ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode,
-    WorktreeHandoffDirection, WorktreeHandoffMode,
+    ActiveTurnBehavior, AgentMessageKind, AgentRole, AgentSummary, ArtifactKind,
+    BestOfNCandidateSpec, BrowserActionRequest, DagStepSpec, ForkTarget, McpToolPack,
+    McpToolPolicy, MonitorKind, ProviderKind, ReasoningEffort, ScheduleNewAgentConfig,
+    ScheduleStatus, ScheduleTarget, SessionMode, TimelinePayload, ToolCallDetail, WireMessage,
+    WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffDirection, WorktreeHandoffMode,
 };
 use orbit_store::{ReceiptOutcome, UpsertArtifactInput};
 use serde_json::{Value, json};
@@ -103,7 +103,7 @@ pub fn prompt_mentions_browser(prompt: &str) -> bool {
 /// of the session so `tools/list` never mutates mid-conversation (protecting LLM prompt caches).
 pub fn detect_startup_mcp_packs(
     initial_prompt: &str,
-    is_subagent: bool,
+    can_orchestrate_sessions: bool,
     has_browser_binary: bool,
 ) -> Vec<McpToolPack> {
     let mut packs = vec![McpToolPack::Core];
@@ -116,19 +116,21 @@ pub fn detect_startup_mcp_packs(
     if has_browser_binary && prompt_mentions_browser(initial_prompt) {
         packs.push(McpToolPack::Browser);
     }
-    if has_any(&[
-        "cron",
-        "schedule",
-        "heartbeat",
-        "recurring",
-        "定时",
-        "每天",
-        "每小时",
-        "周期",
-    ]) {
+    if can_orchestrate_sessions
+        && has_any(&[
+            "cron",
+            "schedule",
+            "heartbeat",
+            "recurring",
+            "定时",
+            "每天",
+            "每小时",
+            "周期",
+        ])
+    {
         packs.push(McpToolPack::Schedules);
     }
-    if !is_subagent
+    if can_orchestrate_sessions
         && has_any(&[
             "batch",
             "csv",
@@ -233,6 +235,128 @@ pub fn resolve_caller_policy(
         .unwrap_or_default()
 }
 
+/// Orchestration authority level resolved from an MCP caller's session identity.
+///
+/// Humans manage sessions and Groups directly through the Orbit UI / CLI (WebSocket & FFI RPCs),
+/// not through `/mcp/agents`. On the MCP surface, `PersonalRouter` is the sole authority allowed
+/// to spawn, fork, move, or orchestrate Orbit sessions; missing, unknown, archived, or Worker
+/// caller IDs fail closed to `Worker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpCallerAuthority {
+    /// Top-level Personal Router (`AgentRole::PersonalRouter`) or bridged external Hermes router.
+    PersonalRouter,
+    /// Coding Agent Harness (`AgentRole::Worker`), plus fail-closed default for missing/unknown/archived callers.
+    Worker,
+}
+
+/// Resolve the orchestration authority level for an optional MCP `caller_agent_id`.
+pub fn resolve_caller_authority(
+    runtime: &DaemonRuntime,
+    caller_agent_id: Option<&str>,
+) -> McpCallerAuthority {
+    let Some(cid) = caller_agent_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        // Fail-closed: missing caller identity must never receive session-spawning privileges.
+        return McpCallerAuthority::Worker;
+    };
+    if cid == "external_hermes_router" {
+        return McpCallerAuthority::PersonalRouter;
+    }
+    if runtime
+        .store
+        .get_agent(cid)
+        .ok()
+        .flatten()
+        .is_some_and(|ag| ag.archived_at.is_none() && ag.is_personal_router())
+    {
+        McpCallerAuthority::PersonalRouter
+    } else {
+        McpCallerAuthority::Worker
+    }
+}
+
+fn is_tool_exposed_for_authority(tool_name: &str, authority: McpCallerAuthority) -> bool {
+    match authority {
+        McpCallerAuthority::PersonalRouter => true,
+        McpCallerAuthority::Worker => matches!(
+            tool_name,
+            "workspace_peers"
+                | "message_peer"
+                | "workspace_board"
+                | "handoff_worktree"
+                | "orbit_timer"
+                | "orbit_browser"
+                | "orbit_goal"
+                | "orbit_terminal"
+                | "orbit_artifact"
+                | "orbit_lsp"
+        ),
+    }
+}
+
+fn is_worker_forbidden_tool(canonical_name: &str) -> bool {
+    matches!(
+        canonical_name,
+        "create_agent"
+            | "spawn_workspace_peer"
+            | "fork_agent"
+            | "move_agent_to_workspace"
+            | "list_agents"
+            | "get_agent_status"
+            | "get_agent_activity"
+            | "update_agent"
+            | "set_agent_mode"
+            | "cancel_agent"
+            | "archive_agent"
+            | "kill_agent"
+            | "delete_agent"
+            | "create_workspace"
+            | "list_workspaces"
+            | "rename_workspace"
+            | "archive_workspace"
+            | "list_profiles"
+            | "list_providers"
+            | "list_models"
+            | "list_hosts"
+            | "list_projects"
+            | "inspect_project_context"
+            | "list_pending_permissions"
+            | "respond_to_permission"
+            | "run_batch_fanout"
+            | "run_dag_workflow"
+            | "run_best_of_n"
+            | "get_workflow_status"
+            | "cancel_workflow"
+            | "create_schedule"
+            | "list_schedules"
+            | "inspect_schedule"
+            | "pause_schedule"
+            | "resume_schedule"
+            | "update_schedule"
+            | "schedule_logs"
+            | "run_schedule_once"
+            | "delete_schedule"
+    )
+}
+
+fn require_worker_caller_workspace(
+    is_worker: bool,
+    caller: Option<&AgentSummary>,
+    ws_id: &str,
+) -> anyhow::Result<()> {
+    if is_worker {
+        let c = caller.ok_or_else(|| {
+            anyhow::anyhow!("permission_denied: unknown or archived caller agent")
+        })?;
+        if c.workspace_id != ws_id {
+            anyhow::bail!(
+                "permission_denied: coding Harness sessions can only access their own workspace `{}` (requested `{ws_id}`)",
+                c.workspace_id
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn resolve_effective_packs(
     runtime: &DaemonRuntime,
     caller_agent_id: Option<&str>,
@@ -241,6 +365,7 @@ pub fn resolve_effective_packs(
     if !policy.enabled {
         return Vec::new();
     }
+    let authority = resolve_caller_authority(runtime, caller_agent_id);
     let base: Vec<McpToolPack> = if let Some(ref explicit) = policy.enabled_packs {
         explicit.clone()
     } else if let Some(cid) = caller_agent_id {
@@ -254,12 +379,17 @@ pub fn resolve_effective_packs(
             vec![McpToolPack::Core]
         }
     } else {
-        // External MCP clients (no caller_agent_id) see the full 18-tool catalog unless disabled.
-        McpToolPack::ALL.to_vec()
+        // Missing caller_agent_id fails closed to the minimal Core pack (Worker authority).
+        vec![McpToolPack::Core]
     };
 
     let mut out = Vec::with_capacity(base.len());
     for pack in base {
+        if authority == McpCallerAuthority::Worker
+            && matches!(pack, McpToolPack::Workflows | McpToolPack::Schedules)
+        {
+            continue;
+        }
         if !policy.disabled_packs.contains(&pack) && !out.contains(&pack) {
             out.push(pack);
         }
@@ -297,11 +427,13 @@ pub fn list_tool_definitions_for_caller(
     if !policy.enabled {
         return Vec::new();
     }
+    let authority = resolve_caller_authority(runtime, caller_agent_id);
     let packs = resolve_effective_packs(runtime, caller_agent_id, policy);
     pack_tool_definitions()
         .into_iter()
         .filter(|entry| {
             packs.contains(&entry.pack)
+                && is_tool_exposed_for_authority(entry.def.name, authority)
                 && !policy.disabled_tools.iter().any(|d| d == entry.def.name)
         })
         .map(|entry| entry.def)
@@ -537,7 +669,14 @@ pub async fn execute_tool(
         ));
     }
 
-    match execute_tool_inner(runtime, caller_agent_id, &resolved, &args).await {
+    let authority = resolve_caller_authority(runtime, caller_agent_id);
+    if authority == McpCallerAuthority::Worker && is_worker_forbidden_tool(&resolved) {
+        return ToolExecResult::err(format!(
+            "permission_denied: tool `{resolved}` is restricted to the Personal Router; coding Harness sessions cannot spawn, fork, move, or orchestrate other Orbit sessions (use your harness-native subagent tool for in-session subagents)"
+        ));
+    }
+
+    match execute_tool_inner(runtime, caller_agent_id, authority, &resolved, &args).await {
         Ok(val) => ToolExecResult::ok(val),
         Err(e) => {
             if let Some(cas_err) = e.downcast_ref::<BoardCasConflictError>() {
@@ -564,9 +703,11 @@ pub async fn execute_tool(
 async fn execute_tool_inner(
     rt: &Arc<DaemonRuntime>,
     caller_agent_id: Option<&str>,
+    authority: McpCallerAuthority,
     name: &str,
     args: &Value,
 ) -> anyhow::Result<Value> {
+    let is_worker = authority == McpCallerAuthority::Worker;
     let caller = caller_agent_id.and_then(|id| rt.store.get_agent(id).ok().flatten());
     let target_host =
         resolve_target_host_id(rt, args.get("host_id").and_then(|v| v.as_str())).await?;
@@ -755,6 +896,7 @@ async fn execute_tool_inner(
                         handle: opt_str(args, "handle"),
                         auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
                         acp_agent_id: opt_str(args, "acp_agent_id"),
+                        role: AgentRole::Worker,
                     })
                     .await;
                 match res {
@@ -801,6 +943,17 @@ async fn execute_tool_inner(
 
         "send_agent_prompt" => {
             let agent_id = str_arg(args, "agent_id")?;
+            if is_worker {
+                let allowed_parent_report = caller.as_ref().is_some_and(|c| {
+                    c.parent_agent_id.as_deref() == Some(agent_id.as_str())
+                        && target_host == c.parent_host_id
+                });
+                if !allowed_parent_report {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions can only use `send_agent_prompt` to report progress to their own parent agent; use `message_peer` inside a curated Group"
+                    );
+                }
+            }
             let prompt = str_arg(args, "prompt")?;
             let behavior = parse_turn_behavior(opt_str(args, "active_turn_behavior").as_deref());
             let session_mode = opt_str(args, "session_mode").map(|s| parse_session_mode(&s));
@@ -1437,6 +1590,39 @@ async fn execute_tool_inner(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            if is_worker {
+                let c = caller.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("permission_denied: unknown or archived caller agent")
+                })?;
+                if target_host.is_some() {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions cannot target remote hosts in `handoff_worktree`"
+                    );
+                }
+                if workspace_id != c.workspace_id {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions can only run `handoff_worktree` within their own workspace `{}`",
+                        c.workspace_id
+                    );
+                }
+                if target_workspace_id
+                    .as_deref()
+                    .is_some_and(|t| t != c.workspace_id)
+                {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions cannot hand off across workspaces"
+                    );
+                }
+                if resolved_agent_id
+                    .as_deref()
+                    .is_some_and(|a| a != c.agent_id)
+                {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions can only run `handoff_worktree` for their own session"
+                    );
+                }
+            }
+
             let resolved_host_id = target_host
                 .clone()
                 .unwrap_or_else(|| rt.host_info.host_id.clone());
@@ -1536,6 +1722,7 @@ async fn execute_tool_inner(
             let workspace_id = opt_str(args, "workspace_id")
                 .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
                 .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            require_worker_caller_workspace(is_worker, caller.as_ref(), &workspace_id)?;
             let scripts = rt
                 .orchestrator
                 .list_workspace_scripts(&workspace_id)
@@ -1545,6 +1732,7 @@ async fn execute_tool_inner(
 
         "start_workspace_script" => {
             let workspace_id = str_arg(args, "workspace_id")?;
+            require_worker_caller_workspace(is_worker, caller.as_ref(), &workspace_id)?;
             let script_name = str_arg(args, "script_name")?;
             let info = rt
                 .orchestrator
@@ -1555,6 +1743,7 @@ async fn execute_tool_inner(
 
         "stop_workspace_script" => {
             let workspace_id = str_arg(args, "workspace_id")?;
+            require_worker_caller_workspace(is_worker, caller.as_ref(), &workspace_id)?;
             let script_name = str_arg(args, "script_name")?;
             let info = rt
                 .orchestrator
@@ -1775,6 +1964,16 @@ async fn execute_tool_inner(
                         "`create_heartbeat` requires an active caller agent or `agent_id`"
                     )
                 })?;
+            if is_worker {
+                let c = caller.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("permission_denied: unknown or archived caller agent")
+                })?;
+                if target_agent != c.agent_id {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions can only manage their own heartbeat"
+                    );
+                }
+            }
             let cron = str_arg(args, "cron")?;
             let prompt = str_arg(args, "prompt")?;
             let name = opt_str(args, "name").unwrap_or_else(|| "Agent Heartbeat".to_string());
@@ -1804,6 +2003,19 @@ async fn execute_tool_inner(
             let hid = opt_str(args, "heartbeat_id")
                 .or_else(|| opt_str(args, "schedule_id"))
                 .ok_or_else(|| anyhow::anyhow!("`heartbeat_id` is required"))?;
+            if is_worker {
+                let c = caller.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("permission_denied: unknown or archived caller agent")
+                })?;
+                let owns_hb = rt.store.get_schedule(&hid)?.is_some_and(|s| {
+                    matches!(s.target, ScheduleTarget::ExistingAgent { ref agent_id } if agent_id == &c.agent_id)
+                });
+                if !owns_hb {
+                    anyhow::bail!(
+                        "permission_denied: heartbeat `{hid}` not found for caller agent"
+                    );
+                }
+            }
             rt.scheduler.delete_schedule(&hid)?;
             Ok(json!({ "ok": true, "heartbeat_id": hid }))
         }
@@ -1821,6 +2033,21 @@ async fn execute_tool_inner(
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
                 None => orbit_protocol::TimerCondition::Never,
             };
+            if is_worker {
+                let c = caller.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("permission_denied: unknown or archived caller agent")
+                })?;
+                if target_host.is_some() {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions cannot create remote timers"
+                    );
+                }
+                if opt_str(args, "agent_id").is_some_and(|aid| aid != c.agent_id) {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions can only create timers for themselves"
+                    );
+                }
+            }
             if let Some(ref remote_host_id) = target_host {
                 let target_agent = opt_str(args, "agent_id").ok_or_else(|| {
                     anyhow::anyhow!(
@@ -1868,6 +2095,21 @@ async fn execute_tool_inner(
                 .get("include_resolved")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            if is_worker {
+                let c = caller.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("permission_denied: unknown or archived caller agent")
+                })?;
+                if target_host.is_some() {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions cannot list remote timers"
+                    );
+                }
+                if opt_str(args, "agent_id").is_some_and(|aid| aid != c.agent_id) {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions can only list their own timers"
+                    );
+                }
+            }
             if let Some(ref remote_host_id) = target_host {
                 let req_id = Uuid::new_v4();
                 let resp = rt
@@ -1901,6 +2143,26 @@ async fn execute_tool_inner(
 
         "cancel_timer" => {
             let timer_id = str_arg(args, "timer_id")?;
+            if is_worker {
+                let c = caller.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("permission_denied: unknown or archived caller agent")
+                })?;
+                if target_host.is_some() {
+                    anyhow::bail!(
+                        "permission_denied: coding Harness sessions cannot cancel remote timers"
+                    );
+                }
+                let owns_timer = rt
+                    .conditional_timers
+                    .list_timers(Some(&c.agent_id), true)?
+                    .iter()
+                    .any(|t| t.timer_id == timer_id);
+                if !owns_timer {
+                    anyhow::bail!(
+                        "permission_denied: timer `{timer_id}` not found for caller agent"
+                    );
+                }
+            }
             if let Some(ref remote_host_id) = target_host {
                 let req_id = Uuid::new_v4();
                 let resp = rt
@@ -2136,6 +2398,7 @@ async fn execute_tool_inner(
                         "`workspace_id` is required when called outside an agent session"
                     )
                 })?;
+            require_worker_caller_workspace(is_worker, caller.as_ref(), &ws_id)?;
             let ws = rt
                 .store
                 .get_workspace(&ws_id)?
@@ -2192,6 +2455,18 @@ async fn execute_tool_inner(
             let ws_id = opt_str(args, "workspace_id")
                 .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
                 .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            require_worker_caller_workspace(is_worker, caller.as_ref(), &ws_id)?;
+            if is_worker {
+                let ws = rt
+                    .store
+                    .get_workspace(&ws_id)?
+                    .ok_or_else(|| anyhow::anyhow!("workspace `{ws_id}` not found"))?;
+                if !ws.is_curated {
+                    anyhow::bail!(
+                        "permission_denied: `message_peer` is only available inside a curated Mission Workspace Group"
+                    );
+                }
+            }
             let handle_raw = str_arg(args, "handle")?;
             let prompt = opt_str(args, "message")
                 .or_else(|| opt_str(args, "prompt"))
@@ -2296,6 +2571,7 @@ async fn execute_tool_inner(
             let ws_id = opt_str(args, "workspace_id")
                 .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
                 .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            require_worker_caller_workspace(is_worker, caller.as_ref(), &ws_id)?;
             let handle_raw = str_arg(args, "handle")?;
             let limit = args
                 .get("limit")
@@ -2347,6 +2623,7 @@ async fn execute_tool_inner(
             let ws_id = opt_str(args, "workspace_id")
                 .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
                 .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            require_worker_caller_workspace(is_worker, caller.as_ref(), &ws_id)?;
             let board = rt.orchestrator.get_workspace_board(&ws_id)?;
             Ok(json!({ "board": board }))
         }
@@ -2355,6 +2632,7 @@ async fn execute_tool_inner(
             let ws_id = opt_str(args, "workspace_id")
                 .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
                 .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            require_worker_caller_workspace(is_worker, caller.as_ref(), &ws_id)?;
             let content = str_arg(args, "content")?;
             let section = opt_str(args, "section");
             let expected_revision = match args.get("expected_revision") {
@@ -2467,6 +2745,7 @@ async fn execute_tool_inner(
                     handle,
                     auto_cluster: Some(false),
                     acp_agent_id: opt_str(args, "acp_agent_id"),
+                    role: AgentRole::Worker,
                 })
                 .await?;
             if notify_on_finish && let Some(cid) = caller_agent_id {
@@ -4427,7 +4706,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "workspace_peers",
-                description: "Inspect Mission Workspace sibling peers, Shared Blackboard revision, and recent events/conflicts; pass `handle` to peek a specific peer's edited files and recent entries without waking it.",
+                description: "Inspect existing sibling peers, Shared Blackboard revision, and recent events/conflicts inside a curated Mission Workspace Group (`<orbit-workspace>`); pass `handle` to peek a peer's edited files and recent entries without waking it.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -4442,7 +4721,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "message_peer",
-                description: "Send a collaborative message to a sibling peer by `@handle` (historical handle aliases resolve automatically) or `all` in the same Mission Workspace (with optional finish notification).",
+                description: "Send a message to an existing sibling peer by `@handle` (historical handle aliases resolve automatically) or `all` inside a curated Mission Workspace Group (`<orbit-workspace>`). Never creates new sessions.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -4477,7 +4756,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "spawn_workspace_peer",
-                description: "Spawn a sibling peer in the current Mission Workspace with a `@handle` (set `worktree=true` for isolated parallel file edits).",
+                description: "Personal Router only: spawn a new top-level sibling peer inside a Mission Workspace Group with a `@handle` (visible in the sidebar Group; set `worktree=true` for parallel file edits).",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -4528,7 +4807,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "create_agent",
-                description: "Launch a new child/remote Orbit coding agent asynchronously with automatic finish notification.",
+                description: "Personal Router only: launch a new child/remote Orbit coding agent asynchronously with automatic finish notification (never curates standalone workspaces into Groups).",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -4949,30 +5228,42 @@ mod tests {
     }
 
     #[test]
-    fn startup_pack_detection_keeps_normal_chat_minimal_and_gates_subagents() {
+    fn startup_pack_detection_keeps_normal_chat_minimal_and_gates_workers() {
         let plain =
-            detect_startup_mcp_packs("Explain why this Rust function returns early", false, true);
+            detect_startup_mcp_packs("Explain why this Rust function returns early", true, true);
         assert_eq!(plain, vec![McpToolPack::Core]);
 
         let browser_no_bin =
-            detect_startup_mcp_packs("Open browser and take a screenshot", false, false);
+            detect_startup_mcp_packs("Open browser and take a screenshot", true, false);
         assert_eq!(browser_no_bin, vec![McpToolPack::Core]);
 
         let browser_with_bin =
-            detect_startup_mcp_packs("Open browser and take a screenshot", false, true);
+            detect_startup_mcp_packs("Open browser and take a screenshot", true, true);
         assert_eq!(
             browser_with_bin,
             vec![McpToolPack::Core, McpToolPack::Browser]
         );
 
-        let subagent_dag =
-            detect_startup_mcp_packs("Run a DAG workflow and cron schedule every 5m", true, false);
-        assert!(subagent_dag.contains(&McpToolPack::Core));
-        assert!(subagent_dag.contains(&McpToolPack::Schedules));
-        assert!(
-            !subagent_dag.contains(&McpToolPack::Workflows),
-            "subagents cannot launch recursive workflows and must not receive Workflows pack"
+        let worker_dag = detect_startup_mcp_packs(
+            "Run a DAG workflow and cron schedule every 5m",
+            false,
+            false,
         );
+        assert!(worker_dag.contains(&McpToolPack::Core));
+        assert!(
+            !worker_dag.contains(&McpToolPack::Schedules),
+            "coding Harness workers cannot create new-agent cron schedules"
+        );
+        assert!(
+            !worker_dag.contains(&McpToolPack::Workflows),
+            "coding Harness workers cannot launch multi-session workflows"
+        );
+
+        let router_dag =
+            detect_startup_mcp_packs("Run a DAG workflow and cron schedule every 5m", true, false);
+        assert!(router_dag.contains(&McpToolPack::Core));
+        assert!(router_dag.contains(&McpToolPack::Schedules));
+        assert!(router_dag.contains(&McpToolPack::Workflows));
     }
 
     #[test]
@@ -5076,7 +5367,7 @@ mod tests {
 
         let created = execute_tool(
             &rt,
-            None,
+            Some("external_hermes_router"),
             "create_schedule",
             json!({
                 "name": "TZ MCP Test",
@@ -5097,7 +5388,7 @@ mod tests {
         // Omitting `timezone` keeps existing `Asia/Shanghai`.
         let renamed = execute_tool(
             &rt,
-            None,
+            Some("external_hermes_router"),
             "update_schedule",
             json!({
                 "schedule_id": sid,
@@ -5111,7 +5402,7 @@ mod tests {
         // Updating `timezone` to canonical fixed offset works.
         let updated = execute_tool(
             &rt,
-            None,
+            Some("external_hermes_router"),
             "update_schedule",
             json!({
                 "schedule_id": sid,
@@ -5125,7 +5416,7 @@ mod tests {
         // Explicit empty string resets `timezone` back to host local (`None`).
         let reset = execute_tool(
             &rt,
-            None,
+            Some("external_hermes_router"),
             "update_schedule",
             json!({
                 "schedule_id": sid,
@@ -5139,7 +5430,7 @@ mod tests {
         // Non-string `timezone` (including null / number) is rejected.
         let bad_type = execute_tool(
             &rt,
-            None,
+            Some("external_hermes_router"),
             "update_schedule",
             json!({
                 "schedule_id": sid,
@@ -5150,7 +5441,7 @@ mod tests {
         assert!(bad_type.is_error);
         let null_type = execute_tool(
             &rt,
-            None,
+            Some("external_hermes_router"),
             "update_schedule",
             json!({
                 "schedule_id": sid,
@@ -5242,7 +5533,22 @@ mod tests {
 
         let caller_tools =
             list_tool_definitions_for_caller(&rt, Some("ag_cas_1"), &McpToolPolicy::default());
-        assert_eq!(caller_tools.len(), 11);
+        assert_eq!(
+            caller_tools.len(),
+            5,
+            "coding Harness Worker Core catalog must only expose the 5 non-spawning helpers"
+        );
+        let caller_names: Vec<&str> = caller_tools.iter().map(|t| t.name).collect();
+        assert_eq!(
+            caller_names,
+            vec![
+                "workspace_peers",
+                "message_peer",
+                "workspace_board",
+                "handoff_worktree",
+                "orbit_timer",
+            ]
+        );
 
         let ok_res = execute_tool(
             &rt,
@@ -5285,6 +5591,468 @@ mod tests {
             .unwrap_or("");
         assert!(board_txt.contains("Contract v1"));
         assert!(!board_txt.contains("Stale overwrite"));
+
+        rt.browser.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[tokio::test]
+    async fn issue_57_role_scoped_mcp_blocks_worker_session_spawning_and_allows_group_collab_and_router()
+     {
+        use std::sync::OnceLock;
+        static MOCK_BIN_INIT: OnceLock<()> = OnceLock::new();
+        MOCK_BIN_INIT.get_or_init(|| {
+            let exe = if cfg!(windows) {
+                std::env::current_exe().expect("current test exe")
+            } else if std::path::Path::new("/usr/bin/true").exists() {
+                std::path::PathBuf::from("/usr/bin/true")
+            } else {
+                std::path::PathBuf::from("/bin/true")
+            };
+            orbit_providers::set_provider_executable_override(ProviderKind::ClaudeCode, exe);
+        });
+
+        let tmp_home = std::env::temp_dir().join(format!("orbit-tools-issue57-{}", Uuid::new_v4()));
+        let ws_dir = tmp_home.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir repo");
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+        let cwd_str = ws_dir.to_string_lossy().to_string();
+        let now = Utc::now();
+
+        let mk_ws = |ws_id: &str, title: &str, is_curated: bool| orbit_protocol::WorkspaceSummary {
+            workspace_id: ws_id.into(),
+            title: title.into(),
+            cwd: cwd_str.clone(),
+            git_branch: None,
+            is_worktree: false,
+            updated_at: now,
+            source_cwd: None,
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: None,
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+            mission_goal: None,
+            project_root: None,
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
+            is_curated,
+        };
+        let mk_agent = |agent_id: &str, ws_id: &str, handle: &str, role: AgentRole| {
+            let mut labels = HashMap::new();
+            labels.insert(LABEL_MCP_PACKS.into(), "core,workflows,schedules".into());
+            let mut ag = orbit_protocol::AgentSummary {
+                agent_id: agent_id.into(),
+                workspace_id: ws_id.into(),
+                cwd: cwd_str.clone(),
+                title: handle.into(),
+                provider: ProviderKind::ClaudeCode,
+                model: None,
+                effort: None,
+                fast_mode: false,
+                mode: SessionMode::FullAccess,
+                status: orbit_protocol::AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 0,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels,
+                attention: orbit_protocol::AttentionState::None,
+                last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
+                read_seq: 0,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: Some(handle.into()),
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: None,
+            };
+            ag.set_role(role);
+            ag
+        };
+
+        // 0. Missing `caller_agent_id` (`None`) must fail closed to `Worker`:
+        // no Operator backdoor on `/mcp/agents`, only PersonalRouter can spawn/orchestrate.
+        let missing_tools = list_tool_definitions_for_caller(&rt, None, &McpToolPolicy::default());
+        let missing_names: Vec<&str> = missing_tools.iter().map(|t| t.name).collect();
+        assert_eq!(
+            missing_names,
+            vec![
+                "workspace_peers",
+                "message_peer",
+                "workspace_board",
+                "handoff_worktree",
+                "orbit_timer",
+            ]
+        );
+        for (tool, args) in [
+            (
+                "create_agent",
+                json!({ "initial_prompt": "sub", "provider": "claude_code" }),
+            ),
+            (
+                "spawn_workspace_peer",
+                json!({ "initial_prompt": "peer", "handle": "p2" }),
+            ),
+            (
+                "orbit_workspace",
+                json!({ "action": "create", "source_cwd": cwd_str }),
+            ),
+            (
+                "create_schedule",
+                json!({ "name": "s", "cron": "0 * * * *", "prompt": "hi", "cwd": cwd_str }),
+            ),
+        ] {
+            let denied = execute_tool(&rt, None, tool, args).await;
+            assert!(
+                denied.is_error && denied.text.contains("permission_denied"),
+                "missing caller_agent_id must fail closed for `{tool}`, got: {}",
+                denied.text
+            );
+        }
+
+        // 1. Standalone Worker (`!is_curated`)
+        rt.store
+            .upsert_workspace(&mk_ws("ws_solo", "Solo", false))
+            .expect("upsert solo ws");
+        rt.store
+            .upsert_agent(
+                &mk_agent("ag_solo", "ws_solo", "solo", AgentRole::Worker),
+                None,
+            )
+            .expect("upsert solo agent");
+
+        // Even with elevated `orbit.mcp_packs` or permissive policy, Worker only sees the 5 non-spawning tools.
+        let solo_tools =
+            list_tool_definitions_for_caller(&rt, Some("ag_solo"), &McpToolPolicy::default());
+        let solo_names: Vec<&str> = solo_tools.iter().map(|t| t.name).collect();
+        assert_eq!(
+            solo_names,
+            vec![
+                "workspace_peers",
+                "message_peer",
+                "workspace_board",
+                "handoff_worktree",
+                "orbit_timer",
+            ]
+        );
+
+        for (tool, args) in [
+            (
+                "create_agent",
+                json!({ "initial_prompt": "sub", "provider": "claude_code" }),
+            ),
+            (
+                "spawn_workspace_peer",
+                json!({ "initial_prompt": "peer", "handle": "p2" }),
+            ),
+            ("orbit_agent", json!({ "action": "fork" })),
+            ("orbit_agent", json!({ "action": "move_workspace" })),
+            ("orbit_agent", json!({ "action": "list" })),
+            (
+                "orbit_agent",
+                json!({ "action": "kill", "agent_id": "ag_solo" }),
+            ),
+            (
+                "orbit_workspace",
+                json!({ "action": "create", "source_cwd": cwd_str }),
+            ),
+            (
+                "send_agent_prompt",
+                json!({ "agent_id": "ag_solo", "prompt": "hi" }),
+            ),
+            ("orbit_control", json!({ "action": "list_hosts" })),
+            (
+                "orbit_schedule",
+                json!({ "action": "create", "name": "s", "cron": "0 * * * *", "prompt": "hi" }),
+            ),
+            ("orbit_workflow", json!({ "action": "dag", "steps": [] })),
+        ] {
+            let denied = execute_tool(&rt, Some("ag_solo"), tool, args).await;
+            assert!(
+                denied.is_error && denied.text.contains("permission_denied"),
+                "standalone Worker must be denied `{tool}`, got: {}",
+                denied.text
+            );
+        }
+        let msg_solo_denied = execute_tool(
+            &rt,
+            Some("ag_solo"),
+            "message_peer",
+            json!({ "handle": "all", "message": "ping" }),
+        )
+        .await;
+        assert!(
+            msg_solo_denied.is_error && msg_solo_denied.text.contains("curated"),
+            "standalone Worker must not call message_peer on uncurated workspace: {}",
+            msg_solo_denied.text
+        );
+        assert!(
+            !rt.store
+                .get_workspace("ws_solo")
+                .expect("get")
+                .expect("exists")
+                .is_curated
+        );
+        assert_eq!(
+            rt.store
+                .list_agents_filtered(Some("ws_solo"), false, false, None)
+                .expect("list")
+                .len(),
+            1
+        );
+
+        // 2. Human-created curated Group (`is_curated == true`) with @frontend & @backend Workers
+        rt.store
+            .upsert_workspace(&mk_ws("ws_group", "Frontend + Backend", true))
+            .expect("upsert group ws");
+        rt.store
+            .upsert_agent(
+                &mk_agent("ag_fe", "ws_group", "frontend", AgentRole::Worker),
+                None,
+            )
+            .expect("upsert fe");
+        rt.store
+            .upsert_agent(
+                &mk_agent("ag_be", "ws_group", "backend", AgentRole::Worker),
+                None,
+            )
+            .expect("upsert be");
+
+        let fe_tools =
+            list_tool_definitions_for_caller(&rt, Some("ag_fe"), &McpToolPolicy::default());
+        assert_eq!(fe_tools.len(), 5);
+        for (tool, args) in [
+            (
+                "spawn_workspace_peer",
+                json!({ "initial_prompt": "new peer", "handle": "qa" }),
+            ),
+            (
+                "create_agent",
+                json!({ "initial_prompt": "sub", "provider": "claude_code" }),
+            ),
+            ("fork_agent", json!({ "source_agent_id": "ag_fe" })),
+            (
+                "move_agent_to_workspace",
+                json!({ "agent_id": "ag_fe", "target_workspace_id": "ws_solo" }),
+            ),
+        ] {
+            let denied = execute_tool(&rt, Some("ag_fe"), tool, args).await;
+            assert!(
+                denied.is_error && denied.text.contains("permission_denied"),
+                "Group Worker must be denied `{tool}`, got: {}",
+                denied.text
+            );
+        }
+
+        let peers_ok = execute_tool(&rt, Some("ag_fe"), "workspace_peers", json!({})).await;
+        assert!(
+            !peers_ok.is_error,
+            "Group Worker can list peers: {}",
+            peers_ok.text
+        );
+        let board_ok = execute_tool(
+            &rt,
+            Some("ag_fe"),
+            "workspace_board",
+            json!({ "action": "update", "section": "Contracts", "content": "REST v1" }),
+        )
+        .await;
+        assert!(
+            !board_ok.is_error,
+            "Group Worker can update BOARD.md: {}",
+            board_ok.text
+        );
+        let msg_ok = execute_tool(
+            &rt,
+            Some("ag_fe"),
+            "message_peer",
+            json!({ "handle": "backend", "message": "API ready", "notify_on_finish": false }),
+        )
+        .await;
+        assert!(
+            !msg_ok.is_error,
+            "Group Worker can message existing peer: {}",
+            msg_ok.text
+        );
+
+        // Cross-workspace access from Group Worker must be blocked
+        let cross_ws_denied = execute_tool(
+            &rt,
+            Some("ag_fe"),
+            "workspace_peers",
+            json!({ "workspace_id": "ws_solo" }),
+        )
+        .await;
+        assert!(
+            cross_ws_denied.is_error && cross_ws_denied.text.contains("permission_denied"),
+            "Group Worker must not inspect foreign workspace: {}",
+            cross_ws_denied.text
+        );
+
+        // 3. PersonalRouter (`CreateAgentSpec { role: AgentRole::PersonalRouter, .. }`) & external_hermes_router
+        let router = rt
+            .orchestrator
+            .create_and_start_agent(CreateAgentSpec {
+                cwd: cwd_str.clone(),
+                extra_dirs: Vec::new(),
+                title: Some("Personal Router".into()),
+                provider: ProviderKind::ClaudeCode,
+                model: None,
+                effort: None,
+                fast_mode: None,
+                mode: SessionMode::AcceptEdits,
+                initial_prompt: "Run a DAG workflow and cron schedule every 1h".into(),
+                initial_display_prompt: None,
+                initial_badges: Vec::new(),
+                worktree: false,
+                workspace_id: None,
+                parent_agent_id: None,
+                parent_host_id: None,
+                profile_id: None,
+                background: false,
+                auto_archive: false,
+                base_ref: None,
+                worktree_mode: WorktreeCreateMode::BranchOff,
+                branch: None,
+                pr_number: None,
+                handle: Some("router".into()),
+                auto_cluster: Some(false),
+                acp_agent_id: None,
+                role: AgentRole::PersonalRouter,
+            })
+            .await
+            .expect("create PersonalRouter");
+        assert!(
+            router.is_personal_router(),
+            "CreateAgentSpec.role must persist orbit.role eagerly before driver spawn"
+        );
+        let router_packs = router
+            .labels
+            .get(LABEL_MCP_PACKS)
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(router_packs.contains("schedules") && router_packs.contains("workflows"));
+
+        let router_tools = list_tool_definitions_for_caller(
+            &rt,
+            Some(&router.agent_id),
+            &McpToolPolicy::default(),
+        );
+        assert!(router_tools.iter().any(|t| t.name == "create_agent"));
+        assert!(
+            router_tools
+                .iter()
+                .any(|t| t.name == "spawn_workspace_peer")
+        );
+        assert!(router_tools.iter().any(|t| t.name == "orbit_workspace"));
+        assert!(router_tools.iter().any(|t| t.name == "orbit_control"));
+
+        let hermes_tools = list_tool_definitions_for_caller(
+            &rt,
+            Some("external_hermes_router"),
+            &McpToolPolicy::default(),
+        );
+        assert_eq!(hermes_tools.len(), 11);
+
+        let create_ws_ok = execute_tool(
+            &rt,
+            Some(&router.agent_id),
+            "orbit_workspace",
+            json!({ "action": "create", "source_cwd": cwd_str, "title": "Router Group" }),
+        )
+        .await;
+        assert!(
+            !create_ws_ok.is_error,
+            "PersonalRouter can create curated workspace: {}",
+            create_ws_ok.text
+        );
+        let ctrl_ok = execute_tool(
+            &rt,
+            Some("external_hermes_router"),
+            "orbit_control",
+            json!({ "action": "list_hosts" }),
+        )
+        .await;
+        assert!(
+            !ctrl_ok.is_error,
+            "external_hermes_router can call orbit_control"
+        );
+
+        // PersonalRouter calling `create_agent` with `workspace_id = ws_solo` (standalone)
+        // must NOT implicitly curate `ws_solo` into a Group, while keeping `parent_agent_id` intact.
+        let spawned_child = execute_tool(
+            &rt,
+            Some(&router.agent_id),
+            "create_agent",
+            json!({
+                "provider": "claude_code",
+                "cwd": cwd_str,
+                "workspace_id": "ws_solo",
+                "initial_prompt": "Child work",
+                "notify_on_finish": false
+            }),
+        )
+        .await;
+        assert!(
+            !spawned_child.is_error,
+            "PersonalRouter create_agent must succeed: {}",
+            spawned_child.text
+        );
+        let child_id = spawned_child.structured["agent_id"]
+            .as_str()
+            .expect("child_id");
+        let child_row = rt
+            .store
+            .get_agent(child_id)
+            .expect("get child")
+            .expect("child exists");
+        assert_eq!(
+            child_row.parent_agent_id.as_deref(),
+            Some(router.agent_id.as_str())
+        );
+        assert!(
+            !rt.store
+                .get_workspace("ws_solo")
+                .expect("get ws_solo")
+                .expect("ws_solo exists")
+                .is_curated,
+            "Child create_agent must NOT silently curate standalone workspace into a Group"
+        );
+
+        let router_ws_id = create_ws_ok.structured["workspace"]["workspace_id"]
+            .as_str()
+            .expect("router ws id");
+        let peer_ok = execute_tool(
+            &rt,
+            Some(&router.agent_id),
+            "spawn_workspace_peer",
+            json!({
+                "workspace_id": router_ws_id,
+                "provider": "claude_code",
+                "handle": "worker-a",
+                "initial_prompt": "Peer work",
+                "notify_on_finish": false
+            }),
+        )
+        .await;
+        assert!(
+            !peer_ok.is_error,
+            "PersonalRouter spawn_workspace_peer must succeed: {}",
+            peer_ok.text
+        );
 
         rt.browser.shutdown_all().await;
         let _ = std::fs::remove_dir_all(&tmp_home);

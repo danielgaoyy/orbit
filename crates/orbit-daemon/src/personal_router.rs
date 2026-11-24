@@ -1544,6 +1544,7 @@ fn build_router_create_spec(
         handle: Some("router".to_string()),
         auto_cluster: Some(false),
         acp_agent_id,
+        role: AgentRole::PersonalRouter,
     }
 }
 
@@ -1749,5 +1750,6 @@ mod tests {
         assert_eq!(spec.fast_mode, None);
         assert_eq!(spec.provider, ProviderKind::Acp);
         assert_eq!(spec.acp_agent_id.as_deref(), Some("hermes"));
+        assert_eq!(spec.role, AgentRole::PersonalRouter);
     }
 }

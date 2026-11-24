@@ -811,6 +811,7 @@ impl WorkflowStepExecutor for OrchestratorStepExecutor {
                 handle: None,
                 auto_cluster: Some(false),
                 acp_agent_id: None,
+                role: orbit_protocol::AgentRole::Worker,
             };
 
             let agent = match orch.create_and_start_agent(spec).await {

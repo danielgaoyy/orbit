@@ -1330,6 +1330,7 @@ impl ImChannelBridge {
                 handle: None,
                 auto_cluster: None,
                 acp_agent_id: None,
+                role: orbit_protocol::AgentRole::Worker,
             })
             .await?;
 

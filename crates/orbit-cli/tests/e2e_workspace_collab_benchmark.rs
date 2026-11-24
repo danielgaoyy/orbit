@@ -554,9 +554,22 @@ async fn live_00_normal_chat_unblocked_and_cached() {
     let defs = list_tool_definitions_for_caller(&rt, Some(&t1.agent_id), &McpToolPolicy::default());
     assert_eq!(
         defs.len(),
-        11,
-        "Normal standalone chat MCP catalog must stay strictly at 11 Core tools"
+        5,
+        "Normal standalone coding Harness MCP catalog must stay strictly at 5 non-spawning Core tools"
     );
+    for forbidden in [
+        "create_agent",
+        "spawn_workspace_peer",
+        "orbit_agent",
+        "orbit_workspace",
+        "send_agent_prompt",
+        "orbit_control",
+    ] {
+        assert!(
+            !defs.iter().any(|d| d.name == forbidden),
+            "Coding Harness must not expose `{forbidden}`"
+        );
+    }
 
     let ws = rt
         .store

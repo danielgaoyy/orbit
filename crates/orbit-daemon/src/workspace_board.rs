@@ -272,7 +272,7 @@ fn build_full_workspace_xml(
     }
 
     let mut hint = String::from(
-        "You share this Mission Workspace with the peers above. Use Orbit MCP tools (`workspace_peers`, `message_peer`, `workspace_board`, `spawn_workspace_peer`, `orbit_agent(action=\"fork\", worktree=true)`, `handoff_worktree`, `orbit_timer`) to coordinate directly by @handle without polling. Parallel-first rule: release order != hard block — after aligning contracts/order, ONLY wait if strictly hard-blocked by an unbuilt dependency; otherwise self-isolate onto a dedicated git worktree (`orbit_agent(action=\"fork\", worktree=true, branch=..., initial_prompt=...)` keeps your context inside this same Mission Workspace, or `spawn_workspace_peer(worktree=true, ...)`) and keep developing in parallel, then rebase/merge later via `handoff_worktree`. If you genuinely must wait on a peer, NEVER go idle silently — arm `orbit_timer(action=\"create\", condition=\"all_peers\" | \"sender:@handle\", ...)` or pass `notify_on_finish=true` on `message_peer`.",
+        "You share this Mission Workspace Group with the existing peers above. Use Orbit MCP tools (`workspace_peers`, `message_peer`, `workspace_board`, `handoff_worktree`, `orbit_timer`) to coordinate directly with existing peers by @handle without polling. For internal subagent delegation within your own session, ALWAYS use your harness-native subagent tool — do NOT try to spawn sibling Orbit sessions or reorganize workspaces (only the Personal Router can spawn or move sessions via MCP; users manage Group sessions directly in the Orbit UI). Parallel-first rule: release order != hard block — after aligning contracts/order, ONLY wait if strictly hard-blocked by an unbuilt dependency; otherwise isolate your own worktree checkout (`handoff_worktree(direction=\"local_to_worktree\", mode=\"move\", branch=...)` for dirty local edits, or ask the user / Personal Router to open a worktree peer) and keep developing in parallel, then merge via `handoff_worktree`. If you genuinely must wait on a peer, NEVER go idle silently — arm `orbit_timer(action=\"create\", condition=\"all_peers\" | \"sender:@handle\", ...)` or pass `notify_on_finish=true` on `message_peer`.",
     );
     if !shared_checkout_peers.is_empty() {
         let peer_list = shared_checkout_peers
@@ -825,6 +825,8 @@ mod tests {
         .expect("shared xml");
         assert!(shared_xml.contains("Parallel-first rule: release order != hard block"));
         assert!(shared_xml.contains("NEVER go idle silently"));
+        assert!(!shared_xml.contains("spawn_workspace_peer"));
+        assert!(!shared_xml.contains("action=\"fork\""));
         assert!(
             shared_xml.contains("Shared-checkout notice: you currently share `/repo` with @perf")
         );

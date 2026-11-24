@@ -807,6 +807,7 @@ impl TriggerDispatcher for OrchestratorTriggerDispatcher {
                         handle: None,
                         auto_cluster: Some(false),
                         acp_agent_id: None,
+                        role: orbit_protocol::AgentRole::Worker,
                     };
                     let agent = self
                         .orchestrator

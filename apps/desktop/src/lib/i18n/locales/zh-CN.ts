@@ -1405,4 +1405,95 @@ export const zhCN: MessageDictionary = {
   "settings.advancedRelayAutoBadge": "自动托管",
   "settings.advancedRelayDesc":
     "网络拓扑已由云同步与 SSH Peer-Bridge 自动托管。仅当你需要为该主机手动覆盖自定义 Relay 地址时再展开。",
+
+  // Bidirectional IM Channels & Zero-Webhook Long-Connections
+  "im.title": "IM 频道",
+  "im.description":
+    "通过飞书 / Lark、Telegram、Slack 或 Discord 远程与 Agent 对话并审批工具调用。",
+  "im.addChannel": "添加频道",
+  "im.editChannel": "编辑 IM 频道",
+  "im.addChannelTitle": "添加 IM 频道",
+  "im.createChannel": "创建频道",
+  "im.saveChanges": "保存更改",
+  "im.refreshChannels": "刷新频道",
+  "im.hostOffline": "主机已离线，重新连接后可配置 IM 频道。",
+  "im.configuredChannels": "已配置频道",
+  "im.loading": "正在加载 IM 频道…",
+  "im.emptyTitle": "暂未配置 IM 频道",
+  "im.emptyDesc":
+    "连接飞书 / Lark、Telegram、Slack 或 Discord 机器人，随时在手机端下发任务并审批权限。",
+  "im.platform": "平台",
+  "im.channelName": "频道名称",
+  "im.channelNamePlaceholder": "例如：{platform} 运维",
+  "im.connectionMode": "连接模式",
+  "im.modeLongConnection": "长连接 — 无需公网地址",
+  "im.modeWebhook": "Webhook 回调",
+  "im.modeBadgeWs": "长连接",
+  "im.modeBadgePolling": "长轮询",
+  "im.modeBadgeWebhook": "Webhook",
+  "im.credentials": "凭证配置",
+  "im.clearSavedSecrets": "覆盖 / 清空已保存的密钥",
+  "im.savedMasked": "已保存：{masked}",
+  "im.keepSavedPlaceholder": "留空以保留已保存的密钥",
+  "im.slackAppTokenLabel": "应用级 Token (xapp-...)",
+  "im.slackAppTokenPlaceholder": "xapp-1-...",
+  "im.slackAppTokenHint":
+    "需要在 Socket Mode 下开启 connections:write 权限，内网穿透无需公网 Webhook。",
+  "im.discordPublicKeyLabel": "公钥 (Ed25519)",
+  "im.discordPublicKeyPlaceholder": "64 位十六进制 Application Public Key",
+  "im.discordPublicKeyHint":
+    "严格校验 Ed25519 签名（X-Signature-Ed25519）与 5 分钟防重放窗口。",
+  "im.larkLongConnHint":
+    "官方飞书 / Lark WebSocket 长连接模式，内网开箱即用，无需公网地址。",
+  "im.larkWebhookHint":
+    "Webhook 回调 + 租户 API。国际版 Lark 请在 App ID 前加 lark: 前缀。",
+  "im.slackLongConnHint":
+    "Slack Socket Mode (WSS) 实时接收消息与审批按钮，无需公网地址。",
+  "im.slackWebhookHint":
+    "Events API 与交互 Webhook，强制校验 X-Slack-Signature 签名。",
+  "im.discordLongConnHint":
+    "Discord Gateway v10 (WSS) 实时收发消息与审批按钮，请在后台开启 Message Content Intent。",
+  "im.discordWebhookHint":
+    "Discord Interactions Webhook，强制校验 Ed25519 签名。",
+  "im.telegramLongConnHint": "内置长轮询模式，位于 NAT 内网后也无需公网地址。",
+  "im.telegramWebhookHint":
+    "Telegram HTTP Webhook，校验 X-Telegram-Bot-Api-Secret-Token。",
+  "im.statusDisabled": "已停用",
+  "im.statusConnectedWs": "已连接 (WS)",
+  "im.statusConnected": "已连接",
+  "im.statusWebhookReady": "Webhook 就绪",
+  "im.statusConnecting": "连接中",
+  "im.statusReconnecting": "重连中",
+  "im.statusError": "异常",
+  "im.statusIdle": "空闲",
+  "im.badgeApprovals": "远程审批",
+  "im.allowlistEmpty": "白名单为空（默认拒绝）",
+  "im.allowlistSummary": "白名单：{chats} 个会话，{users} 位用户",
+  "im.activeSessions": "{count} 个活跃会话",
+  "im.messagesCount": "{count} 条消息",
+  "im.secretMasked": "密钥 {masked}",
+  "im.appTokenMasked": "应用 Token {masked}",
+  "im.copyWebhookUrl": "复制 Webhook 地址",
+  "im.test": "测试",
+  "im.testMessageDefault": "Orbit IM 测试消息 — 连接正常。",
+  "im.testChatPlaceholder": "目标会话 ID（{example}）",
+  "im.testMessagePlaceholder": "测试消息内容",
+  "im.allowedChatIds": "允许的会话 / 频道 ID",
+  "im.allowedUserIds": "允许的用户 ID",
+  "im.allowlistDefaultDenyHint":
+    "默认拒绝策略：至少添加一个会话 ID 或用户 ID 后才会响应入站指令。",
+  "im.defaultWorkspace": "默认工作区",
+  "im.defaultProvider": "默认引擎",
+  "im.defaultMode": "默认权限模式",
+  "im.routePersonalRouter": "路由至个人代理 (Personal Router)",
+  "im.routePersonalRouterDesc":
+    "将所有白名单 IM 消息统一路由到当前主机的个人代理会话，实现桌面 / 移动端与 IM 双向同步及多 Worker 分工。",
+  "im.forwardApprovals": "转发工具审批",
+  "im.forwardApprovalsDesc":
+    "当绑定的 Agent 请求敏感工具权限时，向该频道发送交互式同意 / 拒绝卡片。",
+  "im.errNameRequired": "请填写频道名称。",
+  "im.errWorkspaceRequired": "请填写默认工作区路径。",
+  "im.errSaveFailed": "保存 IM 频道失败，请检查配置后重试。",
+  "im.addId": "添加",
+  "im.removeId": "移除 {id}",
 };

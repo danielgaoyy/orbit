@@ -269,7 +269,13 @@ export interface GuardianConfigSnapshotView {
 }
 
 export type ImPlatform = "lark" | "telegram" | "slack" | "discord";
-export type ImConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
+export type ImTransportMode = "long_connection" | "webhook";
+export type ImConnectionStatus =
+  | "disconnected"
+  | "connecting"
+  | "reconnecting"
+  | "connected"
+  | "error";
 
 export type ImRoutingMode = "per_thread_agent" | "personal_router";
 export type RouterScope = "global_fleet" | "local_host_only";
@@ -339,14 +345,18 @@ export interface ImChannelRecord {
   name: string;
   platform: ImPlatform;
   enabled: boolean;
+  transport_mode?: ImTransportMode;
   status: ImConnectionStatus;
   status_message?: string | null;
   webhook_path: string;
   app_id?: string | null;
   has_primary_secret: boolean;
   has_signing_secret: boolean;
+  has_app_token?: boolean;
   masked_primary_secret?: string | null;
   masked_signing_secret?: string | null;
+  masked_app_token?: string | null;
+  public_key?: string | null;
   allowed_chat_ids: string[];
   allowed_user_ids: string[];
   default_workspace_cwd: string;
@@ -447,9 +457,12 @@ export interface UpsertImChannelRequest {
   name: string;
   platform: ImPlatform;
   enabled: boolean;
+  transport_mode?: ImTransportMode;
   app_id?: string | null;
   primary_secret?: string | null;
   signing_secret?: string | null;
+  app_token?: string | null;
+  public_key?: string | null;
   keep_existing_secrets: boolean;
   allowed_chat_ids: string[];
   allowed_user_ids: string[];

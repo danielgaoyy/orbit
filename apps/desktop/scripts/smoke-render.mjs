@@ -260,6 +260,14 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             occupancy_pct: 0,
             segments: [],
           };
+        case "list_im_channels":
+        case "upsert_im_channel":
+        case "delete_im_channel":
+          return {
+            channels: [],
+            bindings: [],
+            base_webhook_url: "http://127.0.0.1:6868",
+          };
         default:
           return null;
       }

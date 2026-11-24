@@ -745,11 +745,17 @@ pub struct UpsertImChannelRequest {
     pub platform: ImPlatform,
     pub enabled: bool,
     #[serde(default)]
+    pub transport_mode: orbit_protocol::ImTransportMode,
+    #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
     pub primary_secret: Option<String>,
     #[serde(default)]
     pub signing_secret: Option<String>,
+    #[serde(default)]
+    pub app_token: Option<String>,
+    #[serde(default)]
+    pub public_key: Option<String>,
     #[serde(default = "default_keep_existing_secrets")]
     pub keep_existing_secrets: bool,
     #[serde(default)]
@@ -774,6 +780,7 @@ impl std::fmt::Debug for UpsertImChannelRequest {
             .field("name", &self.name)
             .field("platform", &self.platform)
             .field("enabled", &self.enabled)
+            .field("transport_mode", &self.transport_mode)
             .field("app_id", &self.app_id)
             .field(
                 "primary_secret",
@@ -783,6 +790,8 @@ impl std::fmt::Debug for UpsertImChannelRequest {
                 "signing_secret",
                 &self.signing_secret.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("app_token", &self.app_token.as_ref().map(|_| "[REDACTED]"))
+            .field("public_key", &self.public_key)
             .field("keep_existing_secrets", &self.keep_existing_secrets)
             .field("allowed_chat_ids", &self.allowed_chat_ids)
             .field("allowed_user_ids", &self.allowed_user_ids)
@@ -16030,9 +16039,12 @@ impl OrbitAppCore {
                 name: req.name,
                 platform: req.platform,
                 enabled: req.enabled,
+                transport_mode: req.transport_mode,
                 app_id: req.app_id,
                 primary_secret: req.primary_secret,
                 signing_secret: req.signing_secret,
+                app_token: req.app_token,
+                public_key: req.public_key,
                 keep_existing_secrets: req.keep_existing_secrets,
                 allowed_chat_ids: req.allowed_chat_ids,
                 allowed_user_ids: req.allowed_user_ids,

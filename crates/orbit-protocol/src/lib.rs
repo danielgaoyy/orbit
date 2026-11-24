@@ -3133,11 +3133,17 @@ pub enum WireMessage {
         platform: ImPlatform,
         enabled: bool,
         #[serde(default)]
+        transport_mode: ImTransportMode,
+        #[serde(default)]
         app_id: Option<String>,
         #[serde(default)]
         primary_secret: Option<String>,
         #[serde(default)]
         signing_secret: Option<String>,
+        #[serde(default)]
+        app_token: Option<String>,
+        #[serde(default)]
+        public_key: Option<String>,
         #[serde(default = "wire_default_true")]
         keep_existing_secrets: bool,
         #[serde(default)]
@@ -5214,14 +5220,18 @@ mod tests {
             name: "Feishu Eng".into(),
             platform: ImPlatform::Lark,
             enabled: true,
+            transport_mode: ImTransportMode::LongConnection,
             status: ImConnectionStatus::Connected,
-            status_message: Some("Listening".into()),
+            status_message: Some("Connected (WS)".into()),
             webhook_path: "/im/lark/im_lark_01".into(),
             app_id: Some("cli_12345".into()),
             has_primary_secret: true,
             has_signing_secret: true,
+            has_app_token: false,
             masked_primary_secret: Some("••••9999".into()),
             masked_signing_secret: Some("••••8888".into()),
+            masked_app_token: None,
+            public_key: None,
             allowed_chat_ids: vec!["oc_1".into()],
             allowed_user_ids: vec!["ou_1".into()],
             default_workspace_cwd: "/workspace/orbit".into(),
@@ -5256,9 +5266,12 @@ mod tests {
                 name: "Feishu Eng".into(),
                 platform: ImPlatform::Lark,
                 enabled: true,
+                transport_mode: ImTransportMode::LongConnection,
                 app_id: Some("cli_12345".into()),
                 primary_secret: None,
                 signing_secret: None,
+                app_token: None,
+                public_key: None,
                 keep_existing_secrets: true,
                 allowed_chat_ids: vec!["oc_1".into()],
                 allowed_user_ids: vec!["ou_1".into()],

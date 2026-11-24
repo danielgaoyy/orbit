@@ -1430,6 +1430,97 @@ export const en = {
   "settings.advancedRelayAutoBadge": "Auto-managed",
   "settings.advancedRelayDesc":
     "Managed automatically via Cloud Sync and SSH Peer-Bridges. Expand only if you want to override a custom WebSocket E2EE relay for this host.",
+
+  // Bidirectional IM Channels & Zero-Webhook Long-Connections
+  "im.title": "IM Channels",
+  "im.description":
+    "Chat with agents and approve tool requests remotely from Lark / 飞书, Telegram, Slack, or Discord.",
+  "im.addChannel": "Add Channel",
+  "im.editChannel": "Edit IM Channel",
+  "im.addChannelTitle": "Add IM Channel",
+  "im.createChannel": "Create Channel",
+  "im.saveChanges": "Save Changes",
+  "im.refreshChannels": "Refresh channels",
+  "im.hostOffline": "Host is offline. Reconnect to configure IM channels.",
+  "im.configuredChannels": "Configured Channels",
+  "im.loading": "Loading IM channels…",
+  "im.emptyTitle": "No IM channels yet",
+  "im.emptyDesc":
+    "Connect a bot for Lark / 飞书, Telegram, Slack, or Discord to run prompts and resolve approvals from your phone.",
+  "im.platform": "Platform",
+  "im.channelName": "Channel Name",
+  "im.channelNamePlaceholder": "e.g. {platform} Ops",
+  "im.connectionMode": "Connection Mode",
+  "im.modeLongConnection": "Long Connection — No Public URL",
+  "im.modeWebhook": "Webhook",
+  "im.modeBadgeWs": "Long Connection",
+  "im.modeBadgePolling": "Long Polling",
+  "im.modeBadgeWebhook": "Webhook",
+  "im.credentials": "Credentials",
+  "im.clearSavedSecrets": "Overwrite / clear saved secrets",
+  "im.savedMasked": "Saved: {masked}",
+  "im.keepSavedPlaceholder": "Leave blank to keep saved secret",
+  "im.slackAppTokenLabel": "App-Level Token (xapp-...)",
+  "im.slackAppTokenPlaceholder": "xapp-1-...",
+  "im.slackAppTokenHint":
+    "Requires connections:write scope under Socket Mode. Works behind NAT with no public URL.",
+  "im.discordPublicKeyLabel": "Public Key (Ed25519)",
+  "im.discordPublicKeyPlaceholder": "64-character hex Application Public Key",
+  "im.discordPublicKeyHint":
+    "Verified with strict Ed25519 (X-Signature-Ed25519) and a 5-minute replay window.",
+  "im.larkLongConnHint":
+    "Official Feishu / Lark WebSocket long-connection. Works behind NAT with zero public URL.",
+  "im.larkWebhookHint":
+    "Webhook callback + Tenant API. Prefix App ID with lark: for open.larksuite.com.",
+  "im.slackLongConnHint":
+    "Slack Socket Mode (WSS) with instant approval buttons. Works behind NAT with no public URL.",
+  "im.slackWebhookHint":
+    "Events API + Interactivity webhook with X-Slack-Signature verification.",
+  "im.discordLongConnHint":
+    "Discord Gateway v10 (WSS) for real-time messages and approval buttons. Enable Message Content Intent.",
+  "im.discordWebhookHint":
+    "Discord Interactions webhook with strict Ed25519 signature verification.",
+  "im.telegramLongConnHint": "Built-in long-polling works behind NAT with no public URL.",
+  "im.telegramWebhookHint":
+    "Telegram HTTP webhook with X-Telegram-Bot-Api-Secret-Token verification.",
+  "im.statusDisabled": "Disabled",
+  "im.statusConnectedWs": "Connected (WS)",
+  "im.statusConnected": "Connected",
+  "im.statusWebhookReady": "Webhook ready",
+  "im.statusConnecting": "Connecting",
+  "im.statusReconnecting": "Reconnecting",
+  "im.statusError": "Error",
+  "im.statusIdle": "Idle",
+  "im.badgeApprovals": "Approvals",
+  "im.allowlistEmpty": "Allowlist empty (denied)",
+  "im.allowlistSummary": "Allowlist: {chats} chats, {users} users",
+  "im.activeSessions": "{count} active sessions",
+  "im.messagesCount": "{count} msgs",
+  "im.secretMasked": "Secret {masked}",
+  "im.appTokenMasked": "App Token {masked}",
+  "im.copyWebhookUrl": "Copy webhook URL",
+  "im.test": "Test",
+  "im.testMessageDefault": "Orbit IM test — connection verified.",
+  "im.testChatPlaceholder": "Target Chat ID ({example})",
+  "im.testMessagePlaceholder": "Test message",
+  "im.allowedChatIds": "Allowed Chat / Channel IDs",
+  "im.allowedUserIds": "Allowed User IDs",
+  "im.allowlistDefaultDenyHint":
+    "Default-deny: inbound commands are rejected until at least one chat ID or user ID is allowlisted.",
+  "im.defaultWorkspace": "Default Workspace",
+  "im.defaultProvider": "Default Provider",
+  "im.defaultMode": "Default Mode",
+  "im.routePersonalRouter": "Route to Personal Router",
+  "im.routePersonalRouterDesc":
+    "Route all authorized IM messages into this host's canonical Personal Router session for bidirectional Desktop/Mobile sync and Worker dispatch.",
+  "im.forwardApprovals": "Forward Tool Approvals",
+  "im.forwardApprovalsDesc":
+    "Send interactive approve / deny cards to this channel when bound agents request permission.",
+  "im.errNameRequired": "Channel name is required.",
+  "im.errWorkspaceRequired": "Default workspace path is required.",
+  "im.errSaveFailed": "Failed to save IM channel. Check the details and try again.",
+  "im.addId": "Add",
+  "im.removeId": "Remove {id}",
 } as const;
 
 export type MessageKey = keyof typeof en;

@@ -21,6 +21,7 @@ pub mod guardian;
 pub mod hooks;
 pub mod idle_cleanup;
 pub mod im_channels;
+pub mod im_longconn;
 pub mod instructions;
 pub mod keep_awake;
 pub mod lsp;
@@ -7393,9 +7394,12 @@ async fn handle_wire_rpc(
             name,
             platform,
             enabled,
+            transport_mode,
             app_id,
             primary_secret,
             signing_secret,
+            app_token,
+            public_key,
             keep_existing_secrets,
             allowed_chat_ids,
             allowed_user_ids,
@@ -7415,9 +7419,12 @@ async fn handle_wire_rpc(
                     name,
                     platform,
                     enabled,
+                    transport_mode,
                     app_id,
                     primary_secret,
                     signing_secret,
+                    app_token,
+                    public_key,
                     keep_existing_secrets,
                     allowed_chat_ids,
                     allowed_user_ids,

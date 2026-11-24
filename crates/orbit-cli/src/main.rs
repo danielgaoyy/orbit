@@ -594,8 +594,15 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
     let is_mcp_stdio = matches!(cli.command, Commands::Mcp { .. });
     if !is_mcp_stdio {
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        let mut env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        // Cap WebSocket dependency crates at INFO so RUST_LOG=trace can never dump signed
+        // Feishu/Slack WSS URLs or Discord Gateway IDENTIFY bot tokens into daemon logs.
+        for directive in ["tungstenite=info", "tokio_tungstenite=info"] {
+            if let Ok(parsed) = directive.parse() {
+                env_filter = env_filter.add_directive(parsed);
+            }
+        }
         let use_rotating_daemon_log = matches!(cli.command, Commands::Daemon { action: None, .. });
         if use_rotating_daemon_log
             && let Ok(log_writer) = orbit_client_core::logging::RotatingLogWriter::open(

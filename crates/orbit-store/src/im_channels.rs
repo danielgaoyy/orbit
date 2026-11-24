@@ -4,8 +4,8 @@
 //! `CREATE INDEX IF NOT EXISTS` without bumping `PRAGMA user_version` (keeps `user_version = 6`).
 
 use orbit_protocol::{
-    ImChannelRecord, ImConnectionStatus, ImPlatform, ImRoutingMode, ImThreadBinding, ProviderKind,
-    RouterImMirrorPolicy, SessionMode, mask_im_secret,
+    ImChannelRecord, ImConnectionStatus, ImPlatform, ImRoutingMode, ImThreadBinding,
+    ImTransportMode, ProviderKind, RouterImMirrorPolicy, SessionMode, mask_im_secret,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -18,12 +18,15 @@ pub struct StoredImChannel {
     pub name: String,
     pub platform: ImPlatform,
     pub enabled: bool,
+    pub transport_mode: ImTransportMode,
     pub status: ImConnectionStatus,
     pub status_message: Option<String>,
     pub webhook_path: String,
     pub app_id: Option<String>,
     pub primary_secret: Option<String>,
     pub signing_secret: Option<String>,
+    pub app_token: Option<String>,
+    pub public_key: Option<String>,
     pub allowed_chat_ids: Vec<String>,
     pub allowed_user_ids: Vec<String>,
     pub default_workspace_cwd: String,
@@ -45,6 +48,7 @@ impl std::fmt::Debug for StoredImChannel {
             .field("name", &self.name)
             .field("platform", &self.platform)
             .field("enabled", &self.enabled)
+            .field("transport_mode", &self.transport_mode)
             .field("status", &self.status)
             .field("status_message", &self.status_message)
             .field("webhook_path", &self.webhook_path)
@@ -57,6 +61,8 @@ impl std::fmt::Debug for StoredImChannel {
                 "signing_secret",
                 &self.signing_secret.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("app_token", &self.app_token.as_ref().map(|_| "[REDACTED]"))
+            .field("public_key", &self.public_key)
             .field("allowed_chat_ids", &self.allowed_chat_ids)
             .field("allowed_user_ids", &self.allowed_user_ids)
             .field("default_workspace_cwd", &self.default_workspace_cwd)
@@ -78,19 +84,24 @@ impl StoredImChannel {
     pub fn to_public_record(&self) -> ImChannelRecord {
         let masked_primary = mask_im_secret(self.primary_secret.as_deref());
         let masked_signing = mask_im_secret(self.signing_secret.as_deref());
+        let masked_app_token = mask_im_secret(self.app_token.as_deref());
         ImChannelRecord {
             channel_id: self.channel_id.clone(),
             name: self.name.clone(),
             platform: self.platform,
             enabled: self.enabled,
+            transport_mode: self.transport_mode,
             status: self.status,
             status_message: self.status_message.clone(),
             webhook_path: self.webhook_path.clone(),
             app_id: self.app_id.clone(),
             has_primary_secret: masked_primary.is_some(),
             has_signing_secret: masked_signing.is_some(),
+            has_app_token: masked_app_token.is_some(),
             masked_primary_secret: masked_primary,
             masked_signing_secret: masked_signing,
+            masked_app_token,
+            public_key: self.public_key.clone(),
             allowed_chat_ids: self.allowed_chat_ids.clone(),
             allowed_user_ids: self.allowed_user_ids.clone(),
             default_workspace_cwd: self.default_workspace_cwd.clone(),
@@ -117,12 +128,15 @@ pub(crate) fn migrate_im_channels_schema(conn: &Connection) -> Result<(), StoreE
             name                   TEXT NOT NULL,
             platform               TEXT NOT NULL,
             enabled                INTEGER NOT NULL DEFAULT 1,
+            transport_mode         TEXT NOT NULL DEFAULT 'long_connection',
             status                 TEXT NOT NULL DEFAULT 'disconnected',
             status_message         TEXT,
             webhook_path           TEXT NOT NULL,
             app_id                 TEXT,
             primary_secret         TEXT,
             signing_secret         TEXT,
+            app_token              TEXT,
+            public_key             TEXT,
             allowed_chat_ids_json  TEXT NOT NULL DEFAULT '[]',
             allowed_user_ids_json  TEXT NOT NULL DEFAULT '[]',
             default_workspace_cwd  TEXT NOT NULL,
@@ -158,6 +172,9 @@ pub(crate) fn migrate_im_channels_schema(conn: &Connection) -> Result<(), StoreE
             "router_mirror_policy",
             "TEXT NOT NULL DEFAULT 'milestones_and_approvals'",
         ),
+        ("transport_mode", "TEXT NOT NULL DEFAULT 'long_connection'"),
+        ("app_token", "TEXT"),
+        ("public_key", "TEXT"),
     ] {
         crate::ensure_table_column(conn, "im_channels", col, col_type)?;
     }
@@ -168,7 +185,7 @@ const IM_CHANNEL_SELECT_COLS: &str = "channel_id, name, platform, enabled, statu
     webhook_path, app_id, primary_secret, signing_secret, allowed_chat_ids_json, \
     allowed_user_ids_json, default_workspace_cwd, default_provider_json, default_mode_json, \
     forward_approvals, message_count, last_activity_at_ms, created_at_ms, updated_at_ms, \
-    routing_mode, router_mirror_policy";
+    routing_mode, router_mirror_policy, transport_mode, app_token, public_key";
 
 fn map_im_channel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredImChannel> {
     let channel_id: String = row.get(0)?;
@@ -197,9 +214,15 @@ fn map_im_channel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredImChann
     let mirror_policy_raw: String = row
         .get(21)
         .unwrap_or_else(|_| "milestones_and_approvals".to_string());
+    let transport_mode_raw: String = row
+        .get(22)
+        .unwrap_or_else(|_| "long_connection".to_string());
+    let app_token: Option<String> = row.get(23).unwrap_or(None);
+    let public_key: Option<String> = row.get(24).unwrap_or(None);
 
     let platform = ImPlatform::from_slug(&platform_raw).unwrap_or(ImPlatform::Lark);
     let status = ImConnectionStatus::from_slug(&status_raw);
+    let transport_mode = ImTransportMode::from_slug(&transport_mode_raw);
     let routing_mode: ImRoutingMode =
         serde_json::from_str(&format!("\"{routing_mode_raw}\"")).unwrap_or_default();
     let router_mirror_policy: RouterImMirrorPolicy =
@@ -218,12 +241,15 @@ fn map_im_channel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredImChann
         name,
         platform,
         enabled: enabled_raw != 0,
+        transport_mode,
         status,
         status_message,
         webhook_path,
         app_id,
         primary_secret,
         signing_secret,
+        app_token,
+        public_key,
         allowed_chat_ids,
         allowed_user_ids,
         default_workspace_cwd,
@@ -303,32 +329,35 @@ impl OrbitStore {
         conn.execute(
             "
             INSERT INTO im_channels (
-                channel_id, name, platform, enabled, status, status_message,
-                webhook_path, app_id, primary_secret, signing_secret,
+                channel_id, name, platform, enabled, transport_mode, status, status_message,
+                webhook_path, app_id, primary_secret, signing_secret, app_token, public_key,
                 allowed_chat_ids_json, allowed_user_ids_json,
                 default_workspace_cwd, default_provider_json, default_mode_json,
                 forward_approvals, routing_mode, router_mirror_policy,
                 message_count, last_activity_at_ms,
                 created_at_ms, updated_at_ms
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6,
-                ?7, ?8, ?9, ?10,
-                ?11, ?12,
-                ?13, ?14, ?15,
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15,
                 ?16, ?17, ?18,
-                ?19, ?20,
-                ?21, ?22
+                ?19, ?20, ?21,
+                ?22, ?23,
+                ?24, ?25
             )
             ON CONFLICT(channel_id) DO UPDATE SET
                 name = excluded.name,
                 platform = excluded.platform,
                 enabled = excluded.enabled,
+                transport_mode = excluded.transport_mode,
                 status = excluded.status,
                 status_message = excluded.status_message,
                 webhook_path = excluded.webhook_path,
                 app_id = excluded.app_id,
                 primary_secret = excluded.primary_secret,
                 signing_secret = excluded.signing_secret,
+                app_token = excluded.app_token,
+                public_key = excluded.public_key,
                 allowed_chat_ids_json = excluded.allowed_chat_ids_json,
                 allowed_user_ids_json = excluded.allowed_user_ids_json,
                 default_workspace_cwd = excluded.default_workspace_cwd,
@@ -346,12 +375,15 @@ impl OrbitStore {
                 ch.name,
                 ch.platform.slug(),
                 i32::from(ch.enabled),
+                ch.transport_mode.slug(),
                 ch.status.slug(),
                 ch.status_message,
                 ch.webhook_path,
                 ch.app_id,
                 ch.primary_secret,
                 ch.signing_secret,
+                ch.app_token,
+                ch.public_key,
                 allowed_chats_json,
                 allowed_users_json,
                 ch.default_workspace_cwd,
@@ -547,12 +579,15 @@ mod tests {
             name: "Engineering Feishu".into(),
             platform: ImPlatform::Lark,
             enabled: true,
+            transport_mode: ImTransportMode::LongConnection,
             status: ImConnectionStatus::Connected,
-            status_message: Some("Ready".into()),
+            status_message: Some("Connected (WS)".into()),
             webhook_path: ImPlatform::Lark.webhook_path_for("im_lark_1"),
             app_id: Some("cli_a1b2c3d4".into()),
             primary_secret: Some("sec_super_secret_9988".into()),
             signing_secret: Some("vtok_1234567890".into()),
+            app_token: Some("xapp-1-A12345-secret-4321".into()),
+            public_key: Some("a".repeat(64)),
             allowed_chat_ids: vec!["oc_chat_1".into()],
             allowed_user_ids: vec!["ou_user_1".into()],
             default_workspace_cwd: "/workspace/orbit".into(),
@@ -574,17 +609,23 @@ mod tests {
         assert_eq!(loaded, ch);
 
         let public = loaded.to_public_record();
+        assert_eq!(public.transport_mode, ImTransportMode::LongConnection);
         assert!(public.has_primary_secret);
         assert!(public.has_signing_secret);
+        assert!(public.has_app_token);
         assert_eq!(public.masked_primary_secret.as_deref(), Some("••••9988"));
         assert_eq!(public.masked_signing_secret.as_deref(), Some("••••7890"));
+        assert_eq!(public.masked_app_token.as_deref(), Some("••••4321"));
+        assert_eq!(public.public_key.as_deref(), Some("a".repeat(64).as_str()));
         let serialized = serde_json::to_string(&public).expect("serialize public record");
         assert!(!serialized.contains("sec_super_secret_9988"));
         assert!(!serialized.contains("vtok_1234567890"));
+        assert!(!serialized.contains("xapp-1-A12345-secret-4321"));
 
         let debug_str = format!("{loaded:?}");
         assert!(!debug_str.contains("sec_super_secret_9988"));
         assert!(!debug_str.contains("vtok_1234567890"));
+        assert!(!debug_str.contains("xapp-1-A12345-secret-4321"));
         assert!(debug_str.contains("[REDACTED]"));
 
         let binding = ImThreadBinding {

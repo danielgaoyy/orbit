@@ -1429,4 +1429,95 @@ export const ja: MessageDictionary = {
   "settings.advancedRelayAutoBadge": "自動管理",
   "settings.advancedRelayDesc":
     "クラウド同期と SSH Peer-Bridge により自動管理されます。このホストのリレーを手動で上書きする場合のみ展開してください。",
+
+  // Bidirectional IM Channels & Zero-Webhook Long-Connections
+  "im.title": "IM チャンネル",
+  "im.description":
+    "Lark / 飛書、Telegram、Slack、Discord からリモートでエージェントと対話し、ツール承認を行えます。",
+  "im.addChannel": "チャンネルを追加",
+  "im.editChannel": "IM チャンネルを編集",
+  "im.addChannelTitle": "IM チャンネルを追加",
+  "im.createChannel": "チャンネルを作成",
+  "im.saveChanges": "変更を保存",
+  "im.refreshChannels": "チャンネルを更新",
+  "im.hostOffline": "ホストがオフラインです。再接続してから IM チャンネルを設定してください。",
+  "im.configuredChannels": "設定済みチャンネル",
+  "im.loading": "IM チャンネルを読み込み中…",
+  "im.emptyTitle": "IM チャンネルはまだありません",
+  "im.emptyDesc":
+    "Lark / 飛書、Telegram、Slack、Discord の Bot を接続して、モバイルからプロンプト送信や承認を行えます。",
+  "im.platform": "プラットフォーム",
+  "im.channelName": "チャンネル名",
+  "im.channelNamePlaceholder": "例: {platform} Ops",
+  "im.connectionMode": "接続モード",
+  "im.modeLongConnection": "常時接続（公開 URL 不要）",
+  "im.modeWebhook": "Webhook",
+  "im.modeBadgeWs": "常時接続",
+  "im.modeBadgePolling": "ロングポーリング",
+  "im.modeBadgeWebhook": "Webhook",
+  "im.credentials": "認証情報",
+  "im.clearSavedSecrets": "保存済みシークレットを上書き / クリア",
+  "im.savedMasked": "保存済み: {masked}",
+  "im.keepSavedPlaceholder": "空欄のまま保存済みシークレットを維持",
+  "im.slackAppTokenLabel": "App-Level Token (xapp-...)",
+  "im.slackAppTokenPlaceholder": "xapp-1-...",
+  "im.slackAppTokenHint":
+    "Socket Mode で connections:write スコープが必要です。公開 Webhook URL なしで NAT 内から動作します。",
+  "im.discordPublicKeyLabel": "公開鍵 (Ed25519)",
+  "im.discordPublicKeyPlaceholder": "64 文字の 16 進数 Application Public Key",
+  "im.discordPublicKeyHint":
+    "厳格な Ed25519 署名（X-Signature-Ed25519）と 5 分間のリプレイ防止ウィンドウで検証します。",
+  "im.larkLongConnHint":
+    "公式 Feishu / Lark WebSocket 常時接続。公開 URL 不要で NAT 配下でもそのまま動作します。",
+  "im.larkWebhookHint":
+    "Webhook コールバック + Tenant API。国際版 Lark の場合は App ID の先頭に lark: を付けてください。",
+  "im.slackLongConnHint":
+    "Slack Socket Mode (WSS) でリアルタイムにメッセージと承認ボタンを受信します。公開 URL 不要です。",
+  "im.slackWebhookHint":
+    "Events API と Interactivity Webhook（X-Slack-Signature 署名検証付き）。",
+  "im.discordLongConnHint":
+    "Discord Gateway v10 (WSS) でリアルタイムにメッセージと承認ボタンを受信します。Message Content Intent を有効にしてください。",
+  "im.discordWebhookHint":
+    "厳格な Ed25519 署名検証付き Discord Interactions Webhook。",
+  "im.telegramLongConnHint": "組み込みロングポーリングにより公開 URL 不要で NAT 配下でも動作します。",
+  "im.telegramWebhookHint":
+    "X-Telegram-Bot-Api-Secret-Token 検証付き Telegram HTTP Webhook。",
+  "im.statusDisabled": "無効",
+  "im.statusConnectedWs": "接続済み (WS)",
+  "im.statusConnected": "接続済み",
+  "im.statusWebhookReady": "Webhook 待機中",
+  "im.statusConnecting": "接続中",
+  "im.statusReconnecting": "再接続中",
+  "im.statusError": "エラー",
+  "im.statusIdle": "待機中",
+  "im.badgeApprovals": "承認転送",
+  "im.allowlistEmpty": "許可リストが空です（全拒否）",
+  "im.allowlistSummary": "許可リスト: チャット {chats} 件、ユーザー {users} 名",
+  "im.activeSessions": "アクティブセッション {count} 件",
+  "im.messagesCount": "{count} 件",
+  "im.secretMasked": "シークレット {masked}",
+  "im.appTokenMasked": "App Token {masked}",
+  "im.copyWebhookUrl": "Webhook URL をコピー",
+  "im.test": "テスト",
+  "im.testMessageDefault": "Orbit IM テスト — 接続を確認しました。",
+  "im.testChatPlaceholder": "送信先チャット ID（{example}）",
+  "im.testMessagePlaceholder": "テストメッセージ",
+  "im.allowedChatIds": "許可するチャット / チャンネル ID",
+  "im.allowedUserIds": "許可するユーザー ID",
+  "im.allowlistDefaultDenyHint":
+    "デフォルト拒否：チャット ID またはユーザー ID を 1 つ以上登録するまで受信コマンドは拒否されます。",
+  "im.defaultWorkspace": "デフォルトワークスペース",
+  "im.defaultProvider": "デフォルトプロバイダー",
+  "im.defaultMode": "デフォルトモード",
+  "im.routePersonalRouter": "パーソナルルーターへ転送",
+  "im.routePersonalRouterDesc":
+    "許可されたすべての IM メッセージをこのホストのパーソナルルーターへ統合し、デスクトップ / モバイル同期とワーカー分散を実現します。",
+  "im.forwardApprovals": "ツール承認を転送",
+  "im.forwardApprovalsDesc":
+    "紐付いたエージェントが権限を要求した際、このチャンネルへ承認 / 拒否カードを送信します。",
+  "im.errNameRequired": "チャンネル名を入力してください。",
+  "im.errWorkspaceRequired": "デフォルトワークスペースのパスを入力してください。",
+  "im.errSaveFailed": "IM チャンネルの保存に失敗しました。入力内容を確認して再試行してください。",
+  "im.addId": "追加",
+  "im.removeId": "{id} を削除",
 };

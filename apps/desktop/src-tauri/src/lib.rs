@@ -4132,8 +4132,13 @@ fn init_desktop_file_logging() {
         .map(|home| home.join(".orbit").join("logs").join("desktop.log"))
         .unwrap_or_else(|| PathBuf::from("orbit-desktop.log"));
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    let mut env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    for directive in ["tungstenite=info", "tokio_tungstenite=info"] {
+        if let Ok(parsed) = directive.parse() {
+            env_filter = env_filter.add_directive(parsed);
+        }
+    }
 
     if let Ok(writer) = orbit_client_core::logging::RotatingLogWriter::open(
         log_path,

@@ -3587,6 +3587,12 @@ public final class OrbitIosStore: ObservableObject {
         hapticRigid()
     }
 
+    public func interruptAgentAndContinue() {
+        guard let hid = selectedHostId, let aid = selectedAgentId else { return }
+        core?.interruptAgentAndContinue(hostId: hid, agentId: aid)
+        hapticRigid()
+    }
+
     // MARK: - Tool Step Descriptor & Approvals / Questions
 
     public func describeTool(_ item: FfiTimelineItem) -> FfiToolStepDescriptor? {

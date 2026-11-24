@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
   ArrowUpRight,
@@ -18,14 +18,17 @@ import {
   extractCleanAgentMessageBody,
   formatCleanAgentMessagePreview,
 } from "@/lib/agent-message-clean";
+import { useI18n } from "@/lib/i18n";
 import type { ResolvedSubagentItem } from "@/lib/subagents";
 import {
   type SubagentCharacterSpec,
   resolveSubagentCharacter,
 } from "@/lib/subagent-avatar";
+import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { ContextBanner } from "@/components/ui/context-banner";
 import { IconButton } from "@/components/ui/icon-button";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -116,15 +119,40 @@ export const AgentMessageCard = memo(function AgentMessageCard({
   item,
   inline = false,
   sessionSubagents,
+  isParentTurnRunning = false,
+  onInterruptAndContinue = null,
 }: {
   hostId: string;
   agentId?: string | null;
   item: Extract<TimelineItemView, { item_type: "agent_message" }>;
   inline?: boolean;
   sessionSubagents?: readonly SubagentMaybeWithAvatar[];
+  isParentTurnRunning?: boolean;
+  onInterruptAndContinue?: (() => void) | null;
 }) {
+  const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const [resolvedLocal, setResolvedLocal] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const deliveryStatus = item.delivery_status ?? null;
+  useEffect(() => {
+    if (deliveryStatus !== "queued") return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [deliveryStatus]);
+
+  const queuedWaitedMs =
+    deliveryStatus === "queued" && typeof item.queued_at_ms === "number"
+      ? Math.max(0, nowMs - item.queued_at_ms)
+      : 0;
+  const settledWaitedMs =
+    deliveryStatus === "settled" &&
+    typeof item.queued_at_ms === "number" &&
+    typeof item.dispatched_at_ms === "number"
+      ? item.dispatched_at_ms - item.queued_at_ms
+      : 0;
 
   const cleanBody = useMemo(() => extractCleanAgentMessageBody(item.text), [item.text]);
   const cleanPreview = useMemo(() => formatCleanAgentMessagePreview(cleanBody), [cleanBody]);
@@ -360,6 +388,37 @@ export const AgentMessageCard = memo(function AgentMessageCard({
             )
           )}
 
+          {deliveryStatus === "queued" && (
+            <span className="border-signal-warning-border bg-signal-warning-bg text-signal-warning inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 font-mono text-[10.5px] font-medium tabular-nums">
+              {queuedWaitedMs >= 1000
+                ? t("stage.deliveryQueuedWaiting", {
+                    duration: formatDurationCompact(queuedWaitedMs),
+                  })
+                : t("stage.deliveryQueued")}
+            </span>
+          )}
+
+          {deliveryStatus === "dispatched" && (
+            <span className="border-signal-info-border bg-signal-info-bg text-signal-info inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[10.5px] font-medium">
+              <OrbitSpinner size={10} />
+              <span>{t("stage.deliveryProcessing")}</span>
+            </span>
+          )}
+
+          {deliveryStatus === "settled" && settledWaitedMs >= 2000 && (
+            <span className="text-ink-tertiary shrink-0 font-mono text-[11px] tabular-nums">
+              {t("stage.deliveryDeliveredWaited", {
+                duration: formatDurationCompact(settledWaitedMs),
+              })}
+            </span>
+          )}
+
+          {deliveryStatus === "dropped" && (
+            <span className="border-signal-danger-border bg-signal-danger-bg text-signal-danger inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[10.5px] font-medium">
+              {t("stage.deliveryDropped")}
+            </span>
+          )}
+
           {!expanded && cleanPreview.length > 0 && (
             <>
               <span aria-hidden="true" className="text-ink-muted shrink-0">
@@ -372,7 +431,25 @@ export const AgentMessageCard = memo(function AgentMessageCard({
           )}
         </button>
 
-        <div className="flex shrink-0 items-center gap-0.5">
+        <div className="flex shrink-0 items-center gap-1">
+          {deliveryStatus === "queued" &&
+            isParentTurnRunning &&
+            (onInterruptAndContinue || agentId) && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (onInterruptAndContinue) {
+                    onInterruptAndContinue();
+                  } else if (agentId) {
+                    void orbitIpc.interruptAgentAndContinue(hostId, agentId);
+                  }
+                }}
+                className="border-signal-warning-border bg-signal-warning-bg text-signal-warning hover:bg-signal-warning-bg/80 inline-flex h-[22px] shrink-0 cursor-pointer items-center rounded-[6px] border px-2 text-[11px] font-medium transition-colors"
+              >
+                {t("stage.interruptAndDeliver")}
+              </button>
+            )}
           {item.source_agent_id && (
             <button
               type="button"

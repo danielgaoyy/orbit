@@ -704,6 +704,7 @@ export type WorkspaceIsolation = "local" | "worktree";
 export type WorktreeCreateMode = "branch_off" | "checkout_branch" | "checkout_pr";
 export type WorkspaceSetupStatus = "none" | "idle" | "running" | "succeeded" | "failed";
 export type AgentMessageKind = "direct_message" | "finish_notification" | "heartbeat";
+export type AgentMessageDeliveryStatus = "queued" | "dispatched" | "settled" | "dropped";
 export type ProviderSubagentStatus = "running" | "completed" | "failed" | "stopped" | "canceled";
 export type ScheduleKind = "schedule" | "heartbeat";
 export type ScheduleStatus = "active" | "paused" | "completed";
@@ -1817,6 +1818,12 @@ export type TimelineItemView =
       event?: string | null;
       text: string;
       permission_context?: PermissionCheckpointRef | null;
+      delivery_status?: AgentMessageDeliveryStatus | null;
+      delivery_turn_id?: string | null;
+      blocking_turn_id?: string | null;
+      queued_at_ms?: number | null;
+      dispatched_at_ms?: number | null;
+      settled_at_ms?: number | null;
       blocks: RichBlockView[];
       timestamp_ms?: number | null;
     };
@@ -2276,6 +2283,8 @@ export interface StageTurnView {
   has_active_item: boolean;
   started_at_ms: number | null;
   completed_at_ms: number | null;
+  latest_activity_ms?: number | null;
+  latest_visible_progress_ms?: number | null;
 }
 
 export type SessionTouchedFileAction = "created" | "edited" | "read";
@@ -3525,6 +3534,11 @@ export const orbitIpc = {
   interruptAgent: async (hostId: string, agentId: string): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("interrupt_agent", { hostId, agentId });
+  },
+
+  interruptAgentAndContinue: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("interrupt_agent_and_continue", { hostId, agentId });
   },
 
   setSessionMode: async (

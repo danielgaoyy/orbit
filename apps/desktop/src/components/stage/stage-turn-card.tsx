@@ -150,6 +150,8 @@ export const TurnStageSection = memo(function TurnStageSection({
   sessionSubagentMatcher,
   onOpenSubagent,
   parentMessageLabel,
+  queuedNotificationCount = 0,
+  onInterruptAndContinue = null,
 }: {
   turn: StageTurnView;
   isTurnActive: boolean;
@@ -175,6 +177,8 @@ export const TurnStageSection = memo(function TurnStageSection({
   sessionSubagentMatcher?: SubagentNameMatcher | null;
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
   parentMessageLabel?: string | null;
+  queuedNotificationCount?: number;
+  onInterruptAndContinue?: (() => void) | null;
 }) {
   const rawSegments = turn.live_segments;
   // When `hostArtifacts` is passed from StreamStage, avoid touching `s.hostDetails` so
@@ -299,6 +303,8 @@ export const TurnStageSection = memo(function TurnStageSection({
           agentId={agentId}
           item={turn.agent_message}
           sessionSubagents={sessionSubagents}
+          isParentTurnRunning={isTurnActive}
+          onInterruptAndContinue={onInterruptAndContinue}
         />
       )}
 
@@ -349,6 +355,8 @@ export const TurnStageSection = memo(function TurnStageSection({
                       item={seg.item}
                       inline
                       sessionSubagents={sessionSubagents}
+                      isParentTurnRunning={isTurnActive}
+                      onInterruptAndContinue={onInterruptAndContinue}
                     />
                   );
                 }
@@ -412,6 +420,9 @@ export const TurnStageSection = memo(function TurnStageSection({
                       }
                       liveStartedAtMs={groupLiveStartMs}
                       latestActivityMs={seg.latest_activity_ms ?? groupLiveStartMs}
+                      latestVisibleProgressMs={turn.latest_visible_progress_ms ?? groupLiveStartMs}
+                      queuedNotificationCount={isGroupActive ? queuedNotificationCount : 0}
+                      onInterruptAndContinue={isGroupActive ? onInterruptAndContinue : null}
                       isNetworkOffline={isNetworkOffline}
                       isBackgroundWait={isBackgroundWait}
                       settledDurationMs={groupSettledDurationMs}
@@ -515,6 +526,9 @@ export const TurnStageSection = memo(function TurnStageSection({
                       }
                       liveStartedAtMs={chunkLiveStartMs}
                       latestActivityMs={chunkLatestActivityMs}
+                      latestVisibleProgressMs={turn.latest_visible_progress_ms ?? chunkLiveStartMs}
+                      queuedNotificationCount={isChunkActive ? queuedNotificationCount : 0}
+                      onInterruptAndContinue={isChunkActive ? onInterruptAndContinue : null}
                       isNetworkOffline={isNetworkOffline}
                       isBackgroundWait={chunkIsBackgroundWait}
                       settledDurationMs={chunkDurationMs}
@@ -573,7 +587,12 @@ export const TurnStageSection = memo(function TurnStageSection({
                   defaultCollapsed={autoFoldCompleted}
                   autoOpenForError={false}
                   liveStartedAtMs={liveStartedAtMs}
-                  latestActivityMs={turn.completed_at_ms ?? liveStartedAtMs}
+                  latestActivityMs={
+                    turn.latest_activity_ms ?? turn.completed_at_ms ?? liveStartedAtMs
+                  }
+                  latestVisibleProgressMs={turn.latest_visible_progress_ms ?? liveStartedAtMs}
+                  queuedNotificationCount={queuedNotificationCount}
+                  onInterruptAndContinue={onInterruptAndContinue}
                   isNetworkOffline={isNetworkOffline}
                   isBackgroundWait={isTrailingBackgroundWait}
                   settledDurationMs={null}
@@ -630,5 +649,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.sessionSubagents === next.sessionSubagents &&
   prev.sessionSubagentMatcher === next.sessionSubagentMatcher &&
   prev.onOpenSubagent === next.onOpenSubagent &&
-  prev.parentMessageLabel === next.parentMessageLabel,
+  prev.parentMessageLabel === next.parentMessageLabel &&
+  prev.queuedNotificationCount === next.queuedNotificationCount &&
+  prev.onInterruptAndContinue === next.onInterruptAndContinue,
 );

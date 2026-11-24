@@ -1,13 +1,14 @@
 //! Unified Actor interface (`DriverCommand` / `DriverEvent`) shared by Antigravity, Codex, and Claude Code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, BackgroundTaskInfo, ProviderKind, ProviderSubagentDescriptor,
-    QuestionItem, ReasoningEffort, SessionMode, TimelinePayload, ToolCallDetail, ToolCallStatus,
+    ActiveTurnBehavior, AgentMessageDeliveryStatus, AgentStatus, BackgroundTaskInfo, ProviderKind,
+    ProviderSubagentDescriptor, QuestionItem, ReasoningEffort, SessionMode, TimelinePayload,
+    ToolCallDetail, ToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -84,14 +85,37 @@ pub struct SessionLaunchConfig {
     pub acp_spec: Option<orbit_protocol::AcpAgentSpec>,
 }
 
+/// Origin of a `DriverCommand::SendPrompt` so provider drivers can distinguish human preemption
+/// from non-interrupting agent/peer notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromptOrigin {
+    #[default]
+    Human,
+    Agent,
+}
+
+/// Prompt entry held in a provider driver's FIFO queue while waiting for an active turn to settle.
+#[derive(Debug, Clone)]
+pub struct QueuedDriverPrompt {
+    pub turn_id: String,
+    pub prompt: String,
+    pub message_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum DriverCommand {
     SendPrompt {
         turn_id: String,
         prompt: String,
         behavior: ActiveTurnBehavior,
+        origin: PromptOrigin,
+        message_ids: Vec<String>,
     },
+    /// Hard user stop: cancels the active turn and drops all pending queued prompts.
     Interrupt,
+    /// Cancels only the active foreground turn while preserving queued FIFO notifications/prompts
+    /// so the driver drains them immediately once settlement completes.
+    InterruptAndDrainQueue,
     SetMode {
         mode: SessionMode,
     },
@@ -168,9 +192,66 @@ pub enum DriverEvent {
         last_call_prompt_tokens: Option<u64>,
         model: Option<String>,
     },
+    /// Authoritative delivery lifecycle transition for queued/dispatched/settled/dropped
+    /// agent-originated messages & finish notifications.
+    PromptDeliveryUpdated {
+        turn_id: String,
+        message_ids: Vec<String>,
+        status: AgentMessageDeliveryStatus,
+        blocking_turn_id: Option<String>,
+    },
     Exited {
         code: Option<i32>,
     },
+}
+
+/// Emit `DriverEvent::PromptDeliveryUpdated` when `message_ids` is non-empty.
+pub async fn emit_prompt_delivery(
+    evt_tx: &mpsc::Sender<DriverEvent>,
+    turn_id: &str,
+    message_ids: &[String],
+    status: AgentMessageDeliveryStatus,
+    blocking_turn_id: Option<String>,
+) {
+    if message_ids.is_empty() {
+        return;
+    }
+    let _ = evt_tx
+        .send(DriverEvent::PromptDeliveryUpdated {
+            turn_id: turn_id.to_string(),
+            message_ids: message_ids.to_vec(),
+            status,
+            blocking_turn_id,
+        })
+        .await;
+}
+
+/// Emit `Dropped` for all pending queued prompts being discarded on hard `Interrupt` or exit.
+pub async fn emit_dropped_queued_prompts(
+    evt_tx: &mpsc::Sender<DriverEvent>,
+    replacement: Option<QueuedDriverPrompt>,
+    queue: &mut VecDeque<QueuedDriverPrompt>,
+) {
+    if let Some(rep) = replacement {
+        emit_prompt_delivery(
+            evt_tx,
+            &rep.turn_id,
+            &rep.message_ids,
+            AgentMessageDeliveryStatus::Dropped,
+            None,
+        )
+        .await;
+    }
+    while let Some(item) = queue.pop_front() {
+        emit_prompt_delivery(
+            evt_tx,
+            &item.turn_id,
+            &item.message_ids,
+            AgentMessageDeliveryStatus::Dropped,
+            None,
+        )
+        .await;
+    }
 }
 
 pub struct ProviderSessionHandle {

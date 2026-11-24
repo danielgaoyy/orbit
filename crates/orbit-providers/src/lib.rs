@@ -362,8 +362,8 @@ pub use acp_registry::{
 };
 pub use claude::{reap_snapshotted_claude_mcp_configs, snapshot_claude_mcp_config_files};
 pub use driver::{
-    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, ProviderSessionHandle,
-    SessionLaunchConfig,
+    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, PromptOrigin,
+    ProviderSessionHandle, SessionLaunchConfig,
 };
 pub use readiness::{
     PRIMARY_READINESS_PROVIDERS, ProviderAuthStatus, ProviderReadinessInfo,

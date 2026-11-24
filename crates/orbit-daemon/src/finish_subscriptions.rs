@@ -560,9 +560,10 @@ impl FinishSubscriptionManager {
             allowed_decisions: perm.allowed_decisions.clone(),
         };
         let body = format_permission_notification_body(child, None, &perm_ref);
+        let message_id = format!("perm_chk_{}", Uuid::new_v4().simple());
         let msg = QueuedAgentMessage {
             recipient_id: sub.caller_agent_id.clone(),
-            message_id: format!("perm_chk_{}", Uuid::new_v4().simple()),
+            message_id: message_id.clone(),
             source: AgentPromptSource {
                 kind: AgentMessageKind::FinishNotification,
                 source_agent_id: Some(child.agent_id.clone()),
@@ -581,6 +582,13 @@ impl FinishSubscriptionManager {
             let _ = self
                 .store
                 .mark_finish_subscription_perm_delivered(&sub.id, request_id);
+            info!(
+                notification_id = %message_id,
+                caller = %sub.caller_agent_id,
+                child = %child.agent_id,
+                request_id = %request_id,
+                "Enqueued permission checkpoint notification for parent agent"
+            );
         }
     }
 
@@ -622,9 +630,10 @@ impl FinishSubscriptionManager {
             allowed_decisions: perm.allowed_decisions.clone(),
         };
         let body = format_permission_notification_body(child, Some(target_host_id), &perm_ref);
+        let message_id = format!("rperm_chk_{}", Uuid::new_v4().simple());
         let msg = QueuedAgentMessage {
             recipient_id: sub.caller_agent_id.clone(),
-            message_id: format!("rperm_chk_{}", Uuid::new_v4().simple()),
+            message_id: message_id.clone(),
             source: AgentPromptSource {
                 kind: AgentMessageKind::FinishNotification,
                 source_agent_id: Some(child.agent_id.clone()),
@@ -643,6 +652,14 @@ impl FinishSubscriptionManager {
             let _ = self
                 .store
                 .mark_finish_subscription_perm_delivered(&sub.id, request_id);
+            info!(
+                notification_id = %message_id,
+                caller = %sub.caller_agent_id,
+                child = %child.agent_id,
+                remote_host = %target_host_id,
+                request_id = %request_id,
+                "Enqueued remote permission checkpoint notification for parent agent"
+            );
         }
     }
 
@@ -668,9 +685,10 @@ impl FinishSubscriptionManager {
             .ok()
             .flatten();
         let body = format_terminal_notification_body(child, None, reason, last_msg.as_deref());
+        let message_id = format!("fin_{}", Uuid::new_v4().simple());
         let msg = QueuedAgentMessage {
             recipient_id: sub.caller_agent_id.clone(),
-            message_id: format!("fin_{}", Uuid::new_v4().simple()),
+            message_id: message_id.clone(),
             source: AgentPromptSource {
                 kind: AgentMessageKind::FinishNotification,
                 source_agent_id: Some(child.agent_id.clone()),
@@ -687,10 +705,11 @@ impl FinishSubscriptionManager {
         if self.enqueue_with_retry(msg).await {
             let _ = self.store.delete_finish_subscription(&sub.id);
             info!(
+                notification_id = %message_id,
                 caller = %sub.caller_agent_id,
                 child = %sub.child_agent_id,
                 reason = %reason,
-                "Delivered durable finish notification to parent agent"
+                "Enqueued durable finish notification for parent agent"
             );
         }
     }
@@ -738,9 +757,10 @@ impl FinishSubscriptionManager {
             reason,
             last_msg.as_deref(),
         );
+        let message_id = format!("rfin_{}", Uuid::new_v4().simple());
         let msg = QueuedAgentMessage {
             recipient_id: sub.caller_agent_id.clone(),
-            message_id: format!("rfin_{}", Uuid::new_v4().simple()),
+            message_id: message_id.clone(),
             source: AgentPromptSource {
                 kind: AgentMessageKind::FinishNotification,
                 source_agent_id: Some(child.agent_id.clone()),
@@ -756,6 +776,14 @@ impl FinishSubscriptionManager {
         };
         if self.enqueue_with_retry(msg).await {
             let _ = self.store.delete_finish_subscription(&sub.id);
+            info!(
+                notification_id = %message_id,
+                caller = %sub.caller_agent_id,
+                child = %sub.child_agent_id,
+                remote_host = %target_host_id,
+                reason = %reason,
+                "Enqueued remote finish notification for parent agent"
+            );
         }
     }
 

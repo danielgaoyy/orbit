@@ -13,8 +13,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use orbit_protocol::{
-    AcpAgentSource, AcpAgentSpec, ActiveTurnBehavior, AgentStatus, QuestionItem, ReasoningEffort,
-    SessionMode, ToolCallDetail, ToolCallStatus,
+    AcpAgentSource, AcpAgentSpec, ActiveTurnBehavior, AgentMessageDeliveryStatus, AgentStatus,
+    QuestionItem, ReasoningEffort, SessionMode, ToolCallDetail, ToolCallStatus,
 };
 use orbit_shim::{
     ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim_after, kill_existing_shim,
@@ -27,7 +27,8 @@ use tracing::warn;
 use crate::acp_registry::{get_acp_agent_spec, is_blocked_acp_env_key, resolve_acp_agent_command};
 use crate::attachments::{AcpPromptMediaCaps, build_acp_prompt_blocks_async, is_path_within_dir};
 use crate::driver::{
-    DriverCommand, DriverEvent, ProviderSessionHandle, RpcId, SessionLaunchConfig,
+    DriverCommand, DriverEvent, PromptOrigin, ProviderSessionHandle, QueuedDriverPrompt, RpcId,
+    SessionLaunchConfig, emit_dropped_queued_prompts, emit_prompt_delivery,
 };
 
 const ACP_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -947,11 +948,12 @@ async fn run_acp_actor(
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingAcpPerm> = HashMap::new();
     let mut pending_perm_order: VecDeque<String> = VecDeque::new();
-    let mut pending_prompts: VecDeque<(String, String)> = VecDeque::new();
-    let mut pending_interrupt_replacement: Option<(String, String)> = None;
+    let mut pending_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
+    let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
+    let mut active_turn_message_ids: Vec<String> = Vec::new();
     let mut cancelling_active_turn = false;
     let mut cancel_deadline: Option<tokio::time::Instant> = None;
-    let mut last_dispatched_prompt: Option<(String, String)> = None;
+    let mut last_dispatched_prompt: Option<QueuedDriverPrompt> = None;
     let mut recovered_missing_session = false;
 
     loop {
@@ -963,11 +965,35 @@ async fn run_acp_actor(
                         turn_id,
                         prompt,
                         behavior,
+                        origin,
+                        message_ids,
                     } => {
                         if active_prompt_rpc_key.is_some() || active_turn_id.is_some() {
-                            if matches!(behavior, ActiveTurnBehavior::Queue) {
-                                pending_prompts.push_back((turn_id, prompt));
-                            } else if matches!(behavior, ActiveTurnBehavior::Interrupt) {
+                            // Generic ACP providers lack native non-destructive mid-turn steering;
+                            // degrade agent-originated `Steer` to `Queue`.
+                            let effective_behavior = if origin == PromptOrigin::Agent
+                                && matches!(behavior, ActiveTurnBehavior::Steer)
+                            {
+                                ActiveTurnBehavior::Queue
+                            } else {
+                                behavior
+                            };
+                            let blocking_tid = active_turn_id.clone();
+                            if matches!(effective_behavior, ActiveTurnBehavior::Queue) {
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &turn_id,
+                                    &message_ids,
+                                    AgentMessageDeliveryStatus::Queued,
+                                    blocking_tid,
+                                )
+                                .await;
+                                pending_prompts.push_back(QueuedDriverPrompt {
+                                    turn_id,
+                                    prompt,
+                                    message_ids,
+                                });
+                            } else if matches!(effective_behavior, ActiveTurnBehavior::Interrupt) {
                                 pending_perm_order.clear();
                                 finalize_stream_segments(&mut seg_state, &evt_tx).await;
                                 for (_, p) in pending_perms.drain() {
@@ -992,12 +1018,67 @@ async fn run_acp_actor(
                                 })
                                 .to_string();
                                 if shim.write_stdin_line(cancel).await.is_err() {
+                                    emit_dropped_queued_prompts(
+                                        &evt_tx,
+                                        pending_interrupt_replacement.take(),
+                                        &mut pending_prompts,
+                                    )
+                                    .await;
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &turn_id,
+                                        &message_ids,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
+                                    if let Some(ref tid) = active_turn_id {
+                                        let active_ids = std::mem::take(&mut active_turn_message_ids);
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            tid,
+                                            &active_ids,
+                                            AgentMessageDeliveryStatus::Dropped,
+                                            None,
+                                        )
+                                        .await;
+                                    }
                                     finalize_stream_segments(&mut seg_state, &evt_tx).await;
                                     let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                                     break;
                                 }
-                                pending_interrupt_replacement = Some((turn_id, prompt));
+                                if let Some(prev_rep) = pending_interrupt_replacement.take() {
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &prev_rep.turn_id,
+                                        &prev_rep.message_ids,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &turn_id,
+                                    &message_ids,
+                                    AgentMessageDeliveryStatus::Queued,
+                                    blocking_tid,
+                                )
+                                .await;
+                                pending_interrupt_replacement = Some(QueuedDriverPrompt {
+                                    turn_id,
+                                    prompt,
+                                    message_ids,
+                                });
                             } else if !pending_perms.is_empty() {
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &turn_id,
+                                    &message_ids,
+                                    AgentMessageDeliveryStatus::Dropped,
+                                    None,
+                                )
+                                .await;
                                 let _ = evt_tx
                                     .send(DriverEvent::Notice {
                                         level: "warning".into(),
@@ -1005,7 +1086,7 @@ async fn run_acp_actor(
                                     })
                                     .await;
                             } else {
-                                // `ActiveTurnBehavior::Steer` on generic ACP without native mid-RPC steer:
+                                // `ActiveTurnBehavior::Steer` for human prompts on generic ACP without native mid-RPC steer:
                                 // cancel active turn cleanly while preserving accepted FIFO `pending_prompts`.
                                 finalize_stream_segments(&mut seg_state, &evt_tx).await;
                                 cancelling_active_turn = true;
@@ -1019,11 +1100,58 @@ async fn run_acp_actor(
                                 })
                                 .to_string();
                                 if shim.write_stdin_line(cancel).await.is_err() {
+                                    emit_dropped_queued_prompts(
+                                        &evt_tx,
+                                        pending_interrupt_replacement.take(),
+                                        &mut pending_prompts,
+                                    )
+                                    .await;
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &turn_id,
+                                        &message_ids,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
+                                    if let Some(ref tid) = active_turn_id {
+                                        let active_ids = std::mem::take(&mut active_turn_message_ids);
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            tid,
+                                            &active_ids,
+                                            AgentMessageDeliveryStatus::Dropped,
+                                            None,
+                                        )
+                                        .await;
+                                    }
                                     finalize_stream_segments(&mut seg_state, &evt_tx).await;
                                     let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                                     break;
                                 }
-                                pending_interrupt_replacement = Some((turn_id, prompt));
+                                if let Some(prev_rep) = pending_interrupt_replacement.take() {
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &prev_rep.turn_id,
+                                        &prev_rep.message_ids,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &turn_id,
+                                    &message_ids,
+                                    AgentMessageDeliveryStatus::Queued,
+                                    blocking_tid,
+                                )
+                                .await;
+                                pending_interrupt_replacement = Some(QueuedDriverPrompt {
+                                    turn_id,
+                                    prompt,
+                                    message_ids,
+                                });
                             }
                             continue;
                         }
@@ -1039,8 +1167,12 @@ async fn run_acp_actor(
                         if let Some(sys) = pending_system_prompt.take() {
                             effective_prompt = format!("[System Instructions]\n{sys}\n\n{effective_prompt}");
                         }
-                        last_dispatched_prompt =
-                            Some((turn_id.clone(), effective_prompt.clone()));
+                        active_turn_message_ids = message_ids.clone();
+                        last_dispatched_prompt = Some(QueuedDriverPrompt {
+                            turn_id: turn_id.clone(),
+                            prompt: effective_prompt.clone(),
+                            message_ids,
+                        });
                         if dispatch_acp_prompt(
                             &shim,
                             &session_id,
@@ -1051,20 +1183,47 @@ async fn run_acp_actor(
                             &mut active_prompt_rpc_key,
                             &mut seg_state,
                             &evt_tx,
-                            turn_id,
+                            turn_id.clone(),
                             effective_prompt,
                         )
                         .await
                         .is_err()
                         {
+                            let dropped = std::mem::take(&mut active_turn_message_ids);
+                            emit_prompt_delivery(
+                                &evt_tx,
+                                &turn_id,
+                                &dropped,
+                                AgentMessageDeliveryStatus::Dropped,
+                                None,
+                            )
+                            .await;
+                            emit_dropped_queued_prompts(
+                                &evt_tx,
+                                pending_interrupt_replacement.take(),
+                                &mut pending_prompts,
+                            )
+                            .await;
                             finalize_stream_segments(&mut seg_state, &evt_tx).await;
                             let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                             break;
                         }
+                        emit_prompt_delivery(
+                            &evt_tx,
+                            &turn_id,
+                            &active_turn_message_ids,
+                            AgentMessageDeliveryStatus::Dispatched,
+                            None,
+                        )
+                        .await;
                     }
                     DriverCommand::Interrupt => {
-                        pending_prompts.clear();
-                        pending_interrupt_replacement = None;
+                        emit_dropped_queued_prompts(
+                            &evt_tx,
+                            pending_interrupt_replacement.take(),
+                            &mut pending_prompts,
+                        )
+                        .await;
                         pending_perm_order.clear();
                         finalize_stream_segments(&mut seg_state, &evt_tx).await;
                         let had_active =
@@ -1092,9 +1251,137 @@ async fn run_acp_actor(
                         })
                         .to_string();
                         if shim.write_stdin_line(cancel).await.is_err() {
+                            if let Some(ref tid) = active_turn_id {
+                                let active_ids = std::mem::take(&mut active_turn_message_ids);
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    tid,
+                                    &active_ids,
+                                    AgentMessageDeliveryStatus::Dropped,
+                                    None,
+                                )
+                                .await;
+                            }
                             finalize_stream_segments(&mut seg_state, &evt_tx).await;
                             let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                             break;
+                        }
+                    }
+                    DriverCommand::InterruptAndDrainQueue => {
+                        pending_perm_order.clear();
+                        finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                        for (_, p) in pending_perms.drain() {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": p.rpc_id,
+                                "result": {
+                                    "outcome": { "outcome": "cancelled" }
+                                }
+                            })
+                            .to_string();
+                            let _ = shim.write_stdin_line(resp).await;
+                        }
+                        let had_active =
+                            active_prompt_rpc_key.is_some() || active_turn_id.is_some();
+                        if had_active {
+                            cancelling_active_turn = true;
+                            cancel_deadline =
+                                Some(tokio::time::Instant::now() + Duration::from_secs(10));
+                            let cancel = json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/cancel",
+                                "params": { "sessionId": session_id }
+                            })
+                            .to_string();
+                            if shim.write_stdin_line(cancel).await.is_err() {
+                                emit_dropped_queued_prompts(
+                                    &evt_tx,
+                                    pending_interrupt_replacement.take(),
+                                    &mut pending_prompts,
+                                )
+                                .await;
+                                if let Some(ref tid) = active_turn_id {
+                                    let active_ids = std::mem::take(&mut active_turn_message_ids);
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        tid,
+                                        &active_ids,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                                let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                break;
+                            }
+                        } else if let Some(next_q) = pending_interrupt_replacement
+                            .take()
+                            .or_else(|| pending_prompts.pop_front())
+                        {
+                            let mut effective_prompt = if inject_handoff_on_next_prompt {
+                                inject_handoff_on_next_prompt = false;
+                                prepend_handoff_context(
+                                    pending_handoff_context.take(),
+                                    &next_q.prompt,
+                                )
+                            } else {
+                                next_q.prompt
+                            };
+                            if let Some(sys) = pending_system_prompt.take() {
+                                effective_prompt = format!(
+                                    "[System Instructions]\n{sys}\n\n{effective_prompt}"
+                                );
+                            }
+                            active_turn_message_ids = next_q.message_ids.clone();
+                            last_dispatched_prompt = Some(QueuedDriverPrompt {
+                                turn_id: next_q.turn_id.clone(),
+                                prompt: effective_prompt.clone(),
+                                message_ids: next_q.message_ids,
+                            });
+                            if dispatch_acp_prompt(
+                                &shim,
+                                &session_id,
+                                cfg.attachments_dir.as_deref(),
+                                prompt_media_caps,
+                                &mut next_rpc_id,
+                                &mut active_turn_id,
+                                &mut active_prompt_rpc_key,
+                                &mut seg_state,
+                                &evt_tx,
+                                next_q.turn_id.clone(),
+                                effective_prompt,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                let dropped = std::mem::take(&mut active_turn_message_ids);
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &next_q.turn_id,
+                                    &dropped,
+                                    AgentMessageDeliveryStatus::Dropped,
+                                    None,
+                                )
+                                .await;
+                                emit_dropped_queued_prompts(
+                                    &evt_tx,
+                                    pending_interrupt_replacement.take(),
+                                    &mut pending_prompts,
+                                )
+                                .await;
+                                finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                                let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                break;
+                            }
+                            emit_prompt_delivery(
+                                &evt_tx,
+                                &next_q.turn_id,
+                                &active_turn_message_ids,
+                                AgentMessageDeliveryStatus::Dispatched,
+                                None,
+                            )
+                            .await;
                         }
                     }
                     DriverCommand::SetMode { mode: new_mode } => {
@@ -1253,6 +1540,23 @@ async fn run_acp_actor(
 
             maybe_frame = shim.rx.recv() => {
                 let Some(frame) = maybe_frame else {
+                    emit_dropped_queued_prompts(
+                        &evt_tx,
+                        pending_interrupt_replacement.take(),
+                        &mut pending_prompts,
+                    )
+                    .await;
+                    if let Some(ref tid) = active_turn_id {
+                        let active_ids = std::mem::take(&mut active_turn_message_ids);
+                        emit_prompt_delivery(
+                            &evt_tx,
+                            tid,
+                            &active_ids,
+                            AgentMessageDeliveryStatus::Dropped,
+                            None,
+                        )
+                        .await;
+                    }
                     finalize_stream_segments(&mut seg_state, &evt_tx).await;
                     let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                     break;
@@ -1286,7 +1590,7 @@ async fn run_acp_actor(
                                     pending_perms.clear();
                                     pending_perm_order.clear();
                                     finalize_stream_segments(&mut seg_state, &evt_tx).await;
-                                    active_turn_id = None;
+                                    let finished_turn_id = active_turn_id.take();
 
                                     // Transparent missing-session recovery if `session/prompt` reports evicted session
                                     if let Some(err_obj) = val.get("error").filter(|v| !v.is_null()) {
@@ -1296,8 +1600,7 @@ async fn run_acp_actor(
                                             .unwrap_or("");
                                         if !recovered_missing_session
                                             && is_missing_session_error(err_msg)
-                                            && let Some((failed_tid, failed_prompt)) =
-                                                last_dispatched_prompt.take()
+                                            && let Some(failed_q) = last_dispatched_prompt.take()
                                         {
                                             recovered_missing_session = true;
                                             if let Ok(fresh) = open_acp_session(
@@ -1324,12 +1627,13 @@ async fn run_acp_actor(
                                                     .await;
                                                 let recovered_prompt = prepend_handoff_context(
                                                     pending_handoff_context.take(),
-                                                    &failed_prompt,
+                                                    &failed_q.prompt,
                                                 );
-                                                last_dispatched_prompt = Some((
-                                                    failed_tid.clone(),
-                                                    recovered_prompt.clone(),
-                                                ));
+                                                last_dispatched_prompt = Some(QueuedDriverPrompt {
+                                                    turn_id: failed_q.turn_id.clone(),
+                                                    prompt: recovered_prompt.clone(),
+                                                    message_ids: failed_q.message_ids,
+                                                });
                                                 if dispatch_acp_prompt(
                                                     &shim,
                                                     &session_id,
@@ -1340,12 +1644,29 @@ async fn run_acp_actor(
                                                     &mut active_prompt_rpc_key,
                                                     &mut seg_state,
                                                     &evt_tx,
-                                                    failed_tid,
+                                                    failed_q.turn_id.clone(),
                                                     recovered_prompt,
                                                 )
                                                 .await
                                                 .is_err()
                                                 {
+                                                    let dropped = std::mem::take(
+                                                        &mut active_turn_message_ids,
+                                                    );
+                                                    emit_prompt_delivery(
+                                                        &evt_tx,
+                                                        &failed_q.turn_id,
+                                                        &dropped,
+                                                        AgentMessageDeliveryStatus::Dropped,
+                                                        None,
+                                                    )
+                                                    .await;
+                                                    emit_dropped_queued_prompts(
+                                                        &evt_tx,
+                                                        pending_interrupt_replacement.take(),
+                                                        &mut pending_prompts,
+                                                    )
+                                                    .await;
                                                     finalize_stream_segments(&mut seg_state, &evt_tx).await;
                                                     let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                                                     break;
@@ -1355,14 +1676,25 @@ async fn run_acp_actor(
                                         }
                                     }
                                     last_dispatched_prompt = None;
+                                    let settled_msg_ids =
+                                        std::mem::take(&mut active_turn_message_ids);
+                                    if let Some(ref tid) = finished_turn_id {
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            tid,
+                                            &settled_msg_ids,
+                                            AgentMessageDeliveryStatus::Settled,
+                                            None,
+                                        )
+                                        .await;
+                                    }
 
-                                    if let Some((next_tid, next_prompt)) =
-                                        pending_interrupt_replacement
-                                            .take()
-                                            .or_else(|| pending_prompts.pop_front())
+                                    if let Some(next_q) = pending_interrupt_replacement
+                                        .take()
+                                        .or_else(|| pending_prompts.pop_front())
                                     {
-                                        last_dispatched_prompt =
-                                            Some((next_tid.clone(), next_prompt.clone()));
+                                        active_turn_message_ids = next_q.message_ids.clone();
+                                        last_dispatched_prompt = Some(next_q.clone());
                                         if dispatch_acp_prompt(
                                             &shim,
                                             &session_id,
@@ -1373,16 +1705,40 @@ async fn run_acp_actor(
                                             &mut active_prompt_rpc_key,
                                             &mut seg_state,
                                             &evt_tx,
-                                            next_tid,
-                                            next_prompt,
+                                            next_q.turn_id.clone(),
+                                            next_q.prompt,
                                         )
                                         .await
                                         .is_err()
                                         {
+                                            let dropped =
+                                                std::mem::take(&mut active_turn_message_ids);
+                                            emit_prompt_delivery(
+                                                &evt_tx,
+                                                &next_q.turn_id,
+                                                &dropped,
+                                                AgentMessageDeliveryStatus::Dropped,
+                                                None,
+                                            )
+                                            .await;
+                                            emit_dropped_queued_prompts(
+                                                &evt_tx,
+                                                pending_interrupt_replacement.take(),
+                                                &mut pending_prompts,
+                                            )
+                                            .await;
                                             finalize_stream_segments(&mut seg_state, &evt_tx).await;
                                             let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                                             break;
                                         }
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            &next_q.turn_id,
+                                            &active_turn_message_ids,
+                                            AgentMessageDeliveryStatus::Dispatched,
+                                            None,
+                                        )
+                                        .await;
                                     } else if let Some(err_obj) =
                                         val.get("error").filter(|v| !v.is_null())
                                     {
@@ -1440,6 +1796,23 @@ async fn run_acp_actor(
                         }
                     }
                     ShimFrame::Exited { code } => {
+                        emit_dropped_queued_prompts(
+                            &evt_tx,
+                            pending_interrupt_replacement.take(),
+                            &mut pending_prompts,
+                        )
+                        .await;
+                        if let Some(ref tid) = active_turn_id {
+                            let active_ids = std::mem::take(&mut active_turn_message_ids);
+                            emit_prompt_delivery(
+                                &evt_tx,
+                                tid,
+                                &active_ids,
+                                AgentMessageDeliveryStatus::Dropped,
+                                None,
+                            )
+                            .await;
+                        }
                         finalize_stream_segments(&mut seg_state, &evt_tx).await;
                         let _ = evt_tx.send(DriverEvent::Exited { code }).await;
                         break;
@@ -1459,7 +1832,18 @@ async fn run_acp_actor(
                 cancelling_active_turn = false;
                 reattached_turn_in_flight = false;
                 active_prompt_rpc_key = None;
-                active_turn_id = None;
+                let timed_out_tid = active_turn_id.take();
+                let settled_msg_ids = std::mem::take(&mut active_turn_message_ids);
+                if let Some(ref tid) = timed_out_tid {
+                    emit_prompt_delivery(
+                        &evt_tx,
+                        tid,
+                        &settled_msg_ids,
+                        AgentMessageDeliveryStatus::Settled,
+                        None,
+                    )
+                    .await;
+                }
                 pending_perms.clear();
                 pending_perm_order.clear();
                 finalize_stream_segments(&mut seg_state, &evt_tx).await;
@@ -1469,11 +1853,12 @@ async fn run_acp_actor(
                         message: "ACP cancel timed out waiting for turn settlement; resetting active turn state.".into(),
                     })
                     .await;
-                if let Some((next_tid, next_prompt)) = pending_interrupt_replacement
+                if let Some(next_q) = pending_interrupt_replacement
                     .take()
                     .or_else(|| pending_prompts.pop_front())
                 {
-                    last_dispatched_prompt = Some((next_tid.clone(), next_prompt.clone()));
+                    active_turn_message_ids = next_q.message_ids.clone();
+                    last_dispatched_prompt = Some(next_q.clone());
                     if dispatch_acp_prompt(
                         &shim,
                         &session_id,
@@ -1484,16 +1869,39 @@ async fn run_acp_actor(
                         &mut active_prompt_rpc_key,
                         &mut seg_state,
                         &evt_tx,
-                        next_tid,
-                        next_prompt,
+                        next_q.turn_id.clone(),
+                        next_q.prompt,
                     )
                     .await
                     .is_err()
                     {
+                        let dropped = std::mem::take(&mut active_turn_message_ids);
+                        emit_prompt_delivery(
+                            &evt_tx,
+                            &next_q.turn_id,
+                            &dropped,
+                            AgentMessageDeliveryStatus::Dropped,
+                            None,
+                        )
+                        .await;
+                        emit_dropped_queued_prompts(
+                            &evt_tx,
+                            pending_interrupt_replacement.take(),
+                            &mut pending_prompts,
+                        )
+                        .await;
                         finalize_stream_segments(&mut seg_state, &evt_tx).await;
                         let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                         break;
                     }
+                    emit_prompt_delivery(
+                        &evt_tx,
+                        &next_q.turn_id,
+                        &active_turn_message_ids,
+                        AgentMessageDeliveryStatus::Dispatched,
+                        None,
+                    )
+                    .await;
                 } else {
                     let _ = evt_tx
                         .send(DriverEvent::StatusChanged(AgentStatus::Idle))
@@ -2371,6 +2779,8 @@ done
                 turn_id: "turn_1".into(),
                 prompt: "run_perm".into(),
                 behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("send prompt");
@@ -2432,6 +2842,8 @@ done
                 turn_id: "turn_2".into(),
                 prompt: "long_turn".into(),
                 behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("send long_turn");
@@ -2476,6 +2888,8 @@ done
                 turn_id: "turn_3".into(),
                 prompt: "after_reattach".into(),
                 behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("send after_reattach");
@@ -2838,6 +3252,8 @@ done
                 turn_id: "t_edge".into(),
                 prompt: "edge_turn".into(),
                 behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("send edge_turn");
@@ -2924,6 +3340,8 @@ done
                 turn_id: "t_queued".into(),
                 prompt: "should_be_cleared".into(),
                 behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("queue prompt");
@@ -2960,5 +3378,388 @@ done
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generic_acp_agent_steer_degrades_to_queue_and_interrupt_and_drain_queue_preserves_fifo()
+     {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let short_id: String = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect();
+        let sock_path = std::env::temp_dir().join(format!("o_acpg_deliv_{short_id}.sock"));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+
+        let received_prompts: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let prompts_bg = Arc::clone(&received_prompts);
+        let cancel_count = Arc::new(AtomicU64::new(0));
+        let cancel_bg = Arc::clone(&cancel_count);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+            }
+
+            let mut inflight_prompt_id: Option<Value> = None;
+            while let Ok(Some(raw_line)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) =
+                    serde_json::from_str::<ShimFrame>(&raw_line)
+                else {
+                    continue;
+                };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req["id"],
+                                "result": { "protocolVersion": 1 }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req["id"],
+                                "result": { "sessionId": "sess-acpg-deliv" }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        let text = req
+                            .pointer("/params/prompt/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        prompts_bg.lock().await.push(text.clone());
+                        if text.starts_with("SLOW_") {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": "sess-acpg-deliv",
+                                        "update": {
+                                            "sessionUpdate": "agent_thought_chunk",
+                                            "content": { "type": "text", "text": "pondering" }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            inflight_prompt_id = Some(req["id"].clone());
+                        } else {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": "sess-acpg-deliv",
+                                        "update": {
+                                            "sessionUpdate": "agent_message_chunk",
+                                            "content": { "type": "text", "text": format!("ok:{text}") }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req["id"],
+                                    "result": { "stopReason": "end_turn" }
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    "session/cancel" => {
+                        cancel_bg.fetch_add(1, Ordering::SeqCst);
+                        if let Some(pid) = inflight_prompt_id.take() {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": pid,
+                                    "result": { "stopReason": "cancelled" }
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    _ => {
+                        if let Some(id) = req.get("id") {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {}
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let spec = AcpAgentSpec {
+            id: "deliv-acp".into(),
+            name: "Deliv ACP".into(),
+            description: String::new(),
+            command: "/bin/true".into(),
+            args: vec![],
+            env: HashMap::new(),
+            install_hint: None,
+            homepage: None,
+            version: None,
+            source: AcpAgentSource::Custom,
+            enabled: true,
+        };
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_acpg_deliv".into(),
+            provider: orbit_protocol::ProviderKind::Acp,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Default,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: Some("deliv-acp".into()),
+            acp_spec: Some(spec.clone()),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (evt_tx, mut evt_rx) = mpsc::channel(128);
+        let actor = tokio::spawn(run_acp_actor(cfg, spec, shim, false, cmd_rx, evt_tx));
+
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("boot")
+                    .expect("ev"),
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+            ) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t1".into(),
+                prompt: "SLOW_1".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("t1");
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("think")
+                    .expect("ev"),
+                DriverEvent::ThinkingText { .. }
+            ) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_ag".into(),
+                prompt: "AGENT_1".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Agent,
+                message_ids: vec!["msg_ag".into()],
+            })
+            .await
+            .expect("agent steer");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_hu".into(),
+                prompt: "HUMAN_1".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("human steer");
+        let mut ag_events = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("idle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status,
+                    ..
+                } if message_ids == vec!["msg_ag".to_string()] => ag_events.push(status),
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+                    if ag_events.contains(&AgentMessageDeliveryStatus::Settled) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ag_events,
+            vec![
+                AgentMessageDeliveryStatus::Queued,
+                AgentMessageDeliveryStatus::Dispatched,
+                AgentMessageDeliveryStatus::Settled,
+            ]
+        );
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t2".into(),
+                prompt: "SLOW_2".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("t2");
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("think 2")
+                    .expect("ev"),
+                DriverEvent::ThinkingText { .. }
+            ) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_q1".into(),
+                prompt: "Q1".into(),
+                behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: vec!["m_q1".into()],
+            })
+            .await
+            .expect("q1");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_q2".into(),
+                prompt: "Q2".into(),
+                behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: vec!["m_q2".into()],
+            })
+            .await
+            .expect("q2");
+        cmd_tx
+            .send(DriverCommand::InterruptAndDrainQueue)
+            .await
+            .expect("interrupt drain");
+
+        let mut q2_settled = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("drain idle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status,
+                    ..
+                } => {
+                    assert_ne!(status, AgentMessageDeliveryStatus::Dropped);
+                    if message_ids == vec!["m_q2".to_string()]
+                        && status == AgentMessageDeliveryStatus::Settled
+                    {
+                        q2_settled = true;
+                    }
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) if q2_settled => break,
+                _ => {}
+            }
+        }
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *received_prompts.lock().await,
+            vec!["SLOW_1", "HUMAN_1", "AGENT_1", "SLOW_2", "Q1", "Q2"]
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

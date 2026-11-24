@@ -1046,6 +1046,7 @@ async fn execute_tool_inner(
                         WireMessage::InterruptTurn {
                             request_id: req_id,
                             agent_id: agent_id.clone(),
+                            preserve_queue: false,
                         },
                         Duration::from_secs(15),
                     )
@@ -4306,10 +4307,11 @@ fn parse_session_mode(raw: &str) -> SessionMode {
 }
 
 fn parse_turn_behavior(raw: Option<&str>) -> ActiveTurnBehavior {
-    match raw.map(str::to_ascii_lowercase).as_deref() {
-        Some("queue") => ActiveTurnBehavior::Queue,
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("steer") => ActiveTurnBehavior::Steer,
         Some("interrupt") => ActiveTurnBehavior::Interrupt,
-        _ => ActiveTurnBehavior::Steer,
+        Some("queue") | None => ActiveTurnBehavior::Queue,
+        _ => ActiveTurnBehavior::Queue,
     }
 }
 
@@ -4448,7 +4450,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                     "properties": {
                         "handle": { "type": "string", "description": "Peer @handle or `all`." },
                         "message": { "type": "string" },
-                        "active_turn_behavior": { "type": "string", "enum": ["steer", "queue", "interrupt"], "default": "steer" },
+                        "active_turn_behavior": { "type": "string", "enum": ["queue", "steer", "interrupt"], "default": "queue", "description": "How to deliver when the recipient is mid-turn: `queue` waits without interrupting; `steer` injects natively only where supported (degrades to `queue` on ACP/Antigravity); `interrupt` explicitly preempts." },
                         "notify_on_finish": { "type": "boolean", "default": true },
                         "workspace_id": { "type": "string" }
                     },
@@ -4566,7 +4568,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                     "properties": {
                         "agent_id": { "type": "string" },
                         "prompt": { "type": "string" },
-                        "active_turn_behavior": { "type": "string", "enum": ["steer", "queue", "interrupt"], "default": "steer" },
+                        "active_turn_behavior": { "type": "string", "enum": ["queue", "steer", "interrupt"], "default": "queue", "description": "How to deliver when the recipient is mid-turn: `queue` waits without interrupting; `steer` injects natively only where supported (degrades to `queue` on ACP/Antigravity); `interrupt` explicitly preempts." },
                         "session_mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
                         "notify_on_finish": { "type": "boolean", "default": true },
                         "host_id": { "type": "string" },
@@ -5288,5 +5290,23 @@ mod tests {
 
         rt.browser.shutdown_all().await;
         let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn parse_turn_behavior_defaults_to_queue_and_respects_explicit_values() {
+        assert_eq!(parse_turn_behavior(None), ActiveTurnBehavior::Queue);
+        assert_eq!(parse_turn_behavior(Some("")), ActiveTurnBehavior::Queue);
+        assert_eq!(
+            parse_turn_behavior(Some("queue")),
+            ActiveTurnBehavior::Queue
+        );
+        assert_eq!(
+            parse_turn_behavior(Some("STEER")),
+            ActiveTurnBehavior::Steer
+        );
+        assert_eq!(
+            parse_turn_behavior(Some("interrupt")),
+            ActiveTurnBehavior::Interrupt
+        );
     }
 }

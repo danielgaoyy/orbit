@@ -95,6 +95,9 @@ final class StageTurnActions {
     func rewindAgent(toBeforeSeq seq: UInt64, restoreFiles: Bool) {
         store?.rewindAgent(toBeforeSeq: seq, restoreFiles: restoreFiles)
     }
+    func interruptAgentAndContinue() {
+        store?.interruptAgentAndContinue()
+    }
     func openGitDiff(focusFilePath: String? = nil) {
         store?.openGitDiff(focusFilePath: focusFilePath)
     }
@@ -269,7 +272,7 @@ struct StageTurnView: View, Equatable {
                     }
 
                     if let agentMsg = turn.agentMessage,
-                       case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, blocks, timestampMs) = agentMsg {
+                       case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, deliveryStatus, _, _, queuedAtMs, dispatchedAtMs, settledAtMs, blocks, timestampMs) = agentMsg {
                         AgentMessageCardView(
                             selectedHostId: selectedHostId,
                             actions: actions,
@@ -280,6 +283,10 @@ struct StageTurnView: View, Equatable {
                             event: event,
                             text: text,
                             permissionContext: permissionContext,
+                            deliveryStatus: deliveryStatus,
+                            queuedAtMs: queuedAtMs,
+                            dispatchedAtMs: dispatchedAtMs,
+                            settledAtMs: settledAtMs,
                             blocks: blocks,
                             timestampMs: timestampMs
                         )
@@ -535,7 +542,7 @@ struct StageTurnView: View, Equatable {
                     }
 
                 case let .agentMessage(_, item):
-                    if case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, blocks, timestampMs) = item {
+                    if case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, deliveryStatus, _, _, queuedAtMs, dispatchedAtMs, settledAtMs, blocks, timestampMs) = item {
                         AgentMessageCardView(
                             selectedHostId: selectedHostId,
                             actions: actions,
@@ -546,6 +553,10 @@ struct StageTurnView: View, Equatable {
                             event: event,
                             text: text,
                             permissionContext: permissionContext,
+                            deliveryStatus: deliveryStatus,
+                            queuedAtMs: queuedAtMs,
+                            dispatchedAtMs: dispatchedAtMs,
+                            settledAtMs: settledAtMs,
                             blocks: blocks,
                             timestampMs: timestampMs
                         )
@@ -1808,7 +1819,7 @@ struct StepRailListView: View {
             return id.isEmpty ? "q-seq-\(seq)" : "q-\(id)"
         case let .notice(seq, _, _, _):
             return "notice-\(seq)-\(fallbackIndex)"
-        case let .agentMessage(seq, id, _, _, _, _, _, _, _, _, _):
+        case let .agentMessage(seq, id, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _):
             return id.isEmpty ? "agmsg-seq-\(seq)" : "agmsg-\(id)"
         }
     }
@@ -1822,7 +1833,7 @@ struct StepRailListView: View {
         case let .permissionRequest(seq, _, _, _, _, _, _, _): return seq
         case let .questionRequest(seq, _, _, _, _): return seq
         case let .notice(seq, _, _, _): return seq
-        case let .agentMessage(seq, _, _, _, _, _, _, _, _, _, _): return seq
+        case let .agentMessage(seq, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _): return seq
         }
     }
 }
@@ -1877,7 +1888,7 @@ struct StepRowView: View {
             case let .notice(_, level, message, _):
                 TurnNoticeRow(level: level, message: message)
 
-            case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, blocks, timestampMs):
+            case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, deliveryStatus, _, _, queuedAtMs, dispatchedAtMs, settledAtMs, blocks, timestampMs):
                 AgentMessageCardView(
                     selectedHostId: selectedHostId,
                     actions: actions,
@@ -1888,6 +1899,10 @@ struct StepRowView: View {
                     event: event,
                     text: text,
                     permissionContext: permissionContext,
+                    deliveryStatus: deliveryStatus,
+                    queuedAtMs: queuedAtMs,
+                    dispatchedAtMs: dispatchedAtMs,
+                    settledAtMs: settledAtMs,
                     blocks: blocks,
                     timestampMs: timestampMs
                 )
@@ -2706,12 +2721,33 @@ struct AgentMessageCardView: View {
     let event: String?
     let text: String
     let permissionContext: FfiPermissionCheckpointRef?
+    var deliveryStatus: FfiAgentMessageDeliveryStatus? = nil
+    var queuedAtMs: Int64? = nil
+    var dispatchedAtMs: Int64? = nil
+    var settledAtMs: Int64? = nil
     let blocks: [FfiRichBlock]
     let timestampMs: Int64?
 
     @Environment(\.orbitPalette) private var palette
     @State private var isHeartbeatExpanded = false
     @State private var resolvedChildDecision: String? = nil
+
+    private var deliveryBadgeSpec: (label: String, color: Color)? {
+        guard let status = deliveryStatus else { return nil }
+        switch status {
+        case .queued:
+            return ("Queued", palette.warning)
+        case .dispatched:
+            return ("Processing", palette.primary)
+        case .settled:
+            if let q = queuedAtMs, let d = dispatchedAtMs, d - q >= 2000 {
+                return ("Delivered", palette.fgMuted)
+            }
+            return nil
+        case .dropped:
+            return ("Canceled", palette.danger)
+        }
+    }
 
     private var headerTitle: String {
         let sender = sourceTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2806,6 +2842,15 @@ struct AgentMessageCardView: View {
                         .font(OrbitTypography.subhead(.semibold))
                         .foregroundStyle(palette.fgPrimary)
                         .lineLimit(1)
+
+                    if let badge = deliveryBadgeSpec {
+                        Text(badge.label)
+                            .font(OrbitTypography.meta(.medium))
+                            .foregroundStyle(badge.color)
+                            .padding(.horizontal, 7)
+                            .frame(height: 20)
+                            .background(badge.color.opacity(0.14), in: Capsule())
+                    }
 
                     Spacer(minLength: 4)
 

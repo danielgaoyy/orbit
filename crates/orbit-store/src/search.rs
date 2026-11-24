@@ -367,6 +367,7 @@ pub(crate) fn extract_indexable_content(
         TimelinePayload::AssistantThinking { .. }
         | TimelinePayload::PermissionRequest { .. }
         | TimelinePayload::PermissionResolved { .. }
+        | TimelinePayload::AgentMessageDeliveryUpdated { .. }
         | TimelinePayload::StatusChanged { .. } => None,
     }
 }

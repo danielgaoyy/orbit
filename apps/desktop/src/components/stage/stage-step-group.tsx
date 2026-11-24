@@ -47,7 +47,11 @@ import {
   formatJsonPreview,
   stableStepItemKey,
 } from "./stage-helpers";
-import { InlineLiveElapsed, StepItemRow } from "./stage-tool-renderers";
+import {
+  InlineLiveElapsed,
+  LiveStallInterruptButton,
+  StepItemRow,
+} from "./stage-tool-renderers";
 
 type SubagentMaybeWithAvatar = ResolvedSubagentItem & {
   readonly character?: SubagentCharacterSpec;
@@ -627,6 +631,9 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   autoOpenForError,
   liveStartedAtMs,
   latestActivityMs,
+  latestVisibleProgressMs,
+  queuedNotificationCount = 0,
+  onInterruptAndContinue = null,
   isNetworkOffline = false,
   isBackgroundWait = false,
   settledDurationMs,
@@ -653,6 +660,9 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   autoOpenForError: boolean;
   liveStartedAtMs: number | null;
   latestActivityMs?: number | null;
+  latestVisibleProgressMs?: number | null;
+  queuedNotificationCount?: number;
+  onInterruptAndContinue?: (() => void) | null;
   isNetworkOffline?: boolean;
   isBackgroundWait?: boolean;
   settledDurationMs: number | null;
@@ -711,14 +721,26 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
 
   if (items.length === 0) {
     if (!isWorkActive) return null;
+    const emptyStallLabel = isBackgroundWait ? null : undefined;
     return (
-      <div className="text-ink-tertiary flex max-w-full items-center gap-1.5 py-0.5 text-[13px] font-normal">
+      <div className="text-ink-tertiary flex max-w-full flex-wrap items-center gap-1.5 py-0.5 text-[13px] font-normal">
         <span className="agent-text-shimmer truncate">{liveLabel || "Working…"}</span>
         <InlineLiveElapsed
           startedAtMs={effectiveLiveStartedAtMs}
           lastActivityMs={latestActivityMs}
+          lastVisibleProgressMs={latestVisibleProgressMs}
           isNetworkOffline={isNetworkOffline}
-          stallLabel={isBackgroundWait ? null : undefined}
+          stallLabel={emptyStallLabel}
+          queuedNotificationCount={queuedNotificationCount}
+        />
+        <LiveStallInterruptButton
+          startedAtMs={effectiveLiveStartedAtMs}
+          lastActivityMs={latestActivityMs}
+          lastVisibleProgressMs={latestVisibleProgressMs}
+          isNetworkOffline={isNetworkOffline}
+          stallLabel={emptyStallLabel}
+          queuedNotificationCount={queuedNotificationCount}
+          onInterruptAndContinue={onInterruptAndContinue}
         />
       </div>
     );
@@ -749,6 +771,8 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
     settledDurationMs >= 1000 &&
     !settledLabel.startsWith("Thought for ");
 
+  const activeStallLabel = isBackgroundWait ? "running in background" : undefined;
+
   const labelContent = isWorkActive ? (
     <>
       <span className={cn("agent-text-shimmer", liveDetail ? "shrink-0" : "truncate")}>
@@ -767,8 +791,10 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
       <InlineLiveElapsed
         startedAtMs={effectiveLiveStartedAtMs}
         lastActivityMs={latestActivityMs}
+        lastVisibleProgressMs={latestVisibleProgressMs}
         isNetworkOffline={isNetworkOffline}
-        stallLabel={isBackgroundWait ? "running in background" : undefined}
+        stallLabel={activeStallLabel}
+        queuedNotificationCount={queuedNotificationCount}
       />
       {showDiffNumbers && (
         <DiffStat
@@ -837,13 +863,26 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
             {labelContent}
           </button>
 
-          <IconButton
-            size="xs"
-            tooltip="Expand full list"
-            onClick={() => setFullHeightExpanded(true)}
-          >
-            <Maximize2 className="size-3" />
-          </IconButton>
+          <div className="flex shrink-0 items-center gap-1">
+            {isWorkActive && (
+              <LiveStallInterruptButton
+                startedAtMs={effectiveLiveStartedAtMs}
+                lastActivityMs={latestActivityMs}
+                lastVisibleProgressMs={latestVisibleProgressMs}
+                isNetworkOffline={isNetworkOffline}
+                stallLabel={activeStallLabel}
+                queuedNotificationCount={queuedNotificationCount}
+                onInterruptAndContinue={onInterruptAndContinue}
+              />
+            )}
+            <IconButton
+              size="xs"
+              tooltip="Expand full list"
+              onClick={() => setFullHeightExpanded(true)}
+            >
+              <Maximize2 className="size-3" />
+            </IconButton>
+          </div>
         </div>
 
         <div
@@ -887,13 +926,26 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
             {labelContent}
           </button>
 
-          <IconButton
-            size="xs"
-            tooltip="Use compact scroll box"
-            onClick={() => setFullHeightExpanded(false)}
-          >
-            <Minimize2 className="size-3" />
-          </IconButton>
+          <div className="flex shrink-0 items-center gap-1">
+            {isWorkActive && (
+              <LiveStallInterruptButton
+                startedAtMs={effectiveLiveStartedAtMs}
+                lastActivityMs={latestActivityMs}
+                lastVisibleProgressMs={latestVisibleProgressMs}
+                isNetworkOffline={isNetworkOffline}
+                stallLabel={activeStallLabel}
+                queuedNotificationCount={queuedNotificationCount}
+                onInterruptAndContinue={onInterruptAndContinue}
+              />
+            )}
+            <IconButton
+              size="xs"
+              tooltip="Use compact scroll box"
+              onClick={() => setFullHeightExpanded(false)}
+            >
+              <Minimize2 className="size-3" />
+            </IconButton>
+          </div>
         </div>
 
         <div className="orbit-stage-enter pt-1">
@@ -931,22 +983,36 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   // Collapsed or Short Expanded (<= 8 steps) — Crisp, Frameless Inline Disclosure
   return (
     <div>
-      <button
-        ref={foldBtnRef}
-        type="button"
-        aria-expanded={isExpanded}
-        {...bindTogglePointer}
-        className="group/fold text-ink-tertiary hover:text-ink-primary hover:bg-accent/65 -ml-1.5 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-[6px] px-1.5 py-0.5 text-[13px] font-normal transition-colors"
-      >
-        {labelContent}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          ref={foldBtnRef}
+          type="button"
+          aria-expanded={isExpanded}
+          {...bindTogglePointer}
+          className="group/fold text-ink-tertiary hover:text-ink-primary hover:bg-accent/65 -ml-1.5 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-[6px] px-1.5 py-0.5 text-[13px] font-normal transition-colors"
+        >
+          {labelContent}
 
-        <ChevronRight
-          className={cn(
-            "size-3.5 shrink-0 opacity-65 transition-transform duration-150 group-hover/fold:opacity-100",
-            isExpanded && "rotate-90",
-          )}
-        />
-      </button>
+          <ChevronRight
+            className={cn(
+              "size-3.5 shrink-0 opacity-65 transition-transform duration-150 group-hover/fold:opacity-100",
+              isExpanded && "rotate-90",
+            )}
+          />
+        </button>
+
+        {isWorkActive && (
+          <LiveStallInterruptButton
+            startedAtMs={effectiveLiveStartedAtMs}
+            lastActivityMs={latestActivityMs}
+            lastVisibleProgressMs={latestVisibleProgressMs}
+            isNetworkOffline={isNetworkOffline}
+            stallLabel={activeStallLabel}
+            queuedNotificationCount={queuedNotificationCount}
+            onInterruptAndContinue={onInterruptAndContinue}
+          />
+        )}
+      </div>
 
       {isExpanded && (
         <div className="orbit-stage-enter">

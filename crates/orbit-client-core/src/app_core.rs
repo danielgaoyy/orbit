@@ -14,26 +14,26 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
-    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
-    AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
-    BackgroundTaskInfo, BrowserPolicyConfig, BrowserSessionSummary, ConditionalTimerRecord,
-    ConditionalTimerState, ConnectedHostSummary, ContextOccupancyBreakdown, DirectoryEntry,
-    DiscoveredProject, EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult,
-    GitCreatePrResult, GitMutationOutcome, GitPushResult, GitStatusSnapshot, GoalRunRecord,
-    GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig, HookExecutionRecord, HookScope,
-    HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform, ImThreadBinding, KeepAwakeStatus,
-    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
-    ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord, OrchestrationConfig,
-    OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef,
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord, PushPlatform,
-    PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode,
-    ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope,
-    TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload, TimerCondition,
-    ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage, WorkflowRunRecord,
-    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
-    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
-    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior,
+    AgentMessageDeliveryStatus, AgentMessageKind, AgentProfile, AgentStatus, AgentSummary,
+    ArtifactDetail, ArtifactSummary, AttentionState, BackgroundTaskInfo, BrowserPolicyConfig,
+    BrowserSessionSummary, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
+    ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, EventTriggerDelivery,
+    ExternalMcpServerRecord, GitCommitResult, GitCreatePrResult, GitMutationOutcome, GitPushResult,
+    GitStatusSnapshot, GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
+    HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform,
+    ImThreadBinding, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation,
+    LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption,
+    MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
+    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem, QueuedPromptView,
+    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
+    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload,
+    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
+    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
+    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
+    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -689,6 +689,18 @@ pub enum TimelineItemView {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_context: Option<PermissionCheckpointRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_status: Option<AgentMessageDeliveryStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocking_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queued_at_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatched_at_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_at_ms: Option<i64>,
         blocks: Vec<RichBlockView>,
         #[serde(default)]
         timestamp_ms: Option<i64>,
@@ -2170,6 +2182,7 @@ impl OrbitAppCore {
                 aux_dirty: true,
             });
             let (all_resolved_perms, all_resolved_questions) = collect_resolved_gates(raw_events);
+            let delivery_updates = collect_delivery_updates(raw_events);
 
             let force_full = needs_build
                 || dirty_state.force_full
@@ -2200,6 +2213,7 @@ impl OrbitAppCore {
                         ev,
                         &all_resolved_perms,
                         &all_resolved_questions,
+                        &delivery_updates,
                         ev_idx >= highlight_floor,
                         &mut host_state.markdown_cache,
                         &mut host_state.streaming_markdown_cache,
@@ -2266,6 +2280,7 @@ impl OrbitAppCore {
                             ev,
                             &all_resolved_perms,
                             &all_resolved_questions,
+                            &delivery_updates,
                             true,
                             &mut host_state.markdown_cache,
                             &mut host_state.streaming_markdown_cache,
@@ -2848,6 +2863,8 @@ impl OrbitAppCore {
         let mut all_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
         let mut delta_resolved_perms: HashMap<String, String> = HashMap::new();
         let mut delta_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+        let mut delivery_updates = collect_delivery_updates(&events);
+        let mut touched_delivery_ids: HashSet<String> = HashSet::new();
         let mut latest_seq = if needs_reset {
             actual_max_seq
         } else {
@@ -2876,16 +2893,31 @@ impl OrbitAppCore {
                         delta_resolved_questions.insert(request_id.clone(), answers.clone());
                     }
                 }
+                TimelinePayload::AgentMessageDeliveryUpdated { message_id, .. }
+                    if effective_since_seq > 0 && ev.seq > effective_since_seq =>
+                {
+                    touched_delivery_ids.insert(message_id.clone());
+                }
                 _ => {}
             }
         }
+        let _ = &mut delivery_updates;
 
         let mut upserted_items = Vec::new();
         let highlight_floor = events.len().saturating_sub(48);
         for (ev_idx, ev) in events.iter().enumerate() {
             let is_local_notice =
                 ev.seq == 0 && matches!(ev.payload, TimelinePayload::Notice { .. });
-            if effective_since_seq > 0 && ev.seq <= effective_since_seq && !is_local_notice {
+            let is_updated_agent_msg = matches!(
+                &ev.payload,
+                TimelinePayload::AgentMessage { message_id, .. }
+                    if touched_delivery_ids.contains(message_id)
+            );
+            if effective_since_seq > 0
+                && ev.seq <= effective_since_seq
+                && !is_local_notice
+                && !is_updated_agent_msg
+            {
                 continue;
             }
             if let Some(item) = render_timeline_event_view(
@@ -2894,6 +2926,7 @@ impl OrbitAppCore {
                 ev,
                 &all_resolved_perms,
                 &all_resolved_questions,
+                &delivery_updates,
                 ev_idx >= highlight_floor,
                 &mut host_state.markdown_cache,
                 &mut host_state.streaming_markdown_cache,
@@ -8550,6 +8583,19 @@ impl OrbitAppCore {
     }
 
     pub fn interrupt_agent(&self, host_id: &str, agent_id: &str) {
+        self.interrupt_agent_with_options(host_id, agent_id, false);
+    }
+
+    pub fn interrupt_agent_and_continue(&self, host_id: &str, agent_id: &str) {
+        self.interrupt_agent_with_options(host_id, agent_id, true);
+    }
+
+    pub fn interrupt_agent_with_options(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        preserve_queue: bool,
+    ) {
         let req_id = Uuid::new_v4();
         if !agent_id.starts_with("opt_")
             && let Ok(mut guard) = self.hosts.write()
@@ -8563,6 +8609,7 @@ impl OrbitAppCore {
             WireMessage::InterruptTurn {
                 request_id: req_id,
                 agent_id: agent_id.to_string(),
+                preserve_queue,
             },
         );
     }
@@ -11172,6 +11219,7 @@ impl OrbitAppCore {
         }
 
         let (all_resolved_perms, all_resolved_questions) = collect_resolved_gates(&timeline_events);
+        let delivery_updates = collect_delivery_updates(&timeline_events);
         let cache_scope_id = format!("subagent:{parent_agent_id}:{subagent_id}");
         let mut items: Vec<TimelineItemView> = Vec::with_capacity(timeline_events.len());
         for ev in &timeline_events {
@@ -11181,6 +11229,7 @@ impl OrbitAppCore {
                 ev,
                 &all_resolved_perms,
                 &all_resolved_questions,
+                &delivery_updates,
                 false,
                 &mut host_state.markdown_cache,
                 &mut host_state.streaming_markdown_cache,
@@ -19577,8 +19626,112 @@ fn dirty_index_for_event(list: &[TimelineEvent], idx: usize, payload: &TimelineP
                 )
             })
             .map_or(idx, |found| found.min(idx)),
+        TimelinePayload::AgentMessageDeliveryUpdated { message_id, .. } => list
+            .iter()
+            .position(|e| {
+                matches!(
+                    &e.payload,
+                    TimelinePayload::AgentMessage { message_id: mid, .. }
+                        if mid == message_id
+                )
+            })
+            .map_or(idx, |found| found.min(idx)),
         _ => idx,
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentMessageDeliveryFold {
+    delivery_status: Option<AgentMessageDeliveryStatus>,
+    delivery_turn_id: Option<String>,
+    blocking_turn_id: Option<String>,
+    queued_at_ms: Option<i64>,
+    dispatched_at_ms: Option<i64>,
+    settled_at_ms: Option<i64>,
+}
+
+fn delivery_status_rank(status: AgentMessageDeliveryStatus) -> u8 {
+    match status {
+        AgentMessageDeliveryStatus::Queued => 0,
+        AgentMessageDeliveryStatus::Dispatched => 1,
+        AgentMessageDeliveryStatus::Settled | AgentMessageDeliveryStatus::Dropped => 2,
+    }
+}
+
+fn collect_delivery_updates(events: &[TimelineEvent]) -> HashMap<String, AgentMessageDeliveryFold> {
+    let mut map: HashMap<String, AgentMessageDeliveryFold> = HashMap::new();
+    for ev in events {
+        match &ev.payload {
+            TimelinePayload::AgentMessage {
+                message_id,
+                delivery_status,
+                delivery_turn_id,
+                blocking_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                let entry = map.entry(message_id.clone()).or_default();
+                if let Some(st) = delivery_status
+                    && entry
+                        .delivery_status
+                        .is_none_or(|prev| delivery_status_rank(*st) > delivery_status_rank(prev))
+                {
+                    entry.delivery_status = Some(*st);
+                }
+                if entry.delivery_turn_id.is_none() && delivery_turn_id.is_some() {
+                    entry.delivery_turn_id = delivery_turn_id.clone();
+                }
+                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
+                    entry.blocking_turn_id = blocking_turn_id.clone();
+                }
+                if entry.queued_at_ms.is_none() {
+                    entry.queued_at_ms = *queued_at_ms;
+                }
+                if entry.dispatched_at_ms.is_none() {
+                    entry.dispatched_at_ms = *dispatched_at_ms;
+                }
+                if entry.settled_at_ms.is_none() {
+                    entry.settled_at_ms = *settled_at_ms;
+                }
+            }
+            TimelinePayload::AgentMessageDeliveryUpdated {
+                message_id,
+                status,
+                delivery_turn_id,
+                blocking_turn_id,
+                timestamp_ms,
+            } => {
+                let entry = map.entry(message_id.clone()).or_default();
+                if entry
+                    .delivery_status
+                    .is_none_or(|prev| delivery_status_rank(*status) > delivery_status_rank(prev))
+                {
+                    entry.delivery_status = Some(*status);
+                }
+                if delivery_turn_id.is_some() {
+                    entry.delivery_turn_id = delivery_turn_id.clone();
+                }
+                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
+                    entry.blocking_turn_id = blocking_turn_id.clone();
+                }
+                match status {
+                    AgentMessageDeliveryStatus::Queued => {
+                        entry.queued_at_ms.get_or_insert(*timestamp_ms);
+                    }
+                    AgentMessageDeliveryStatus::Dispatched => {
+                        entry.dispatched_at_ms.get_or_insert(*timestamp_ms);
+                    }
+                    AgentMessageDeliveryStatus::Settled | AgentMessageDeliveryStatus::Dropped => {
+                        entry.settled_at_ms.get_or_insert(*timestamp_ms);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    map
 }
 
 type ResolvedGatesMap = (HashMap<String, String>, HashMap<String, Vec<Vec<String>>>);
@@ -19613,6 +19766,7 @@ fn render_timeline_event_view(
     ev: &TimelineEvent,
     all_resolved_perms: &HashMap<String, String>,
     all_resolved_questions: &HashMap<String, Vec<Vec<String>>>,
+    delivery_updates: &HashMap<String, AgentMessageDeliveryFold>,
     highlight_diff: bool,
     markdown_cache: &mut HashMap<(String, u64, usize), Vec<RichBlockView>>,
     streaming_markdown_cache: &mut HashMap<(String, String), (usize, Vec<RichBlockView>)>,
@@ -19780,6 +19934,12 @@ fn render_timeline_event_view(
             event,
             text,
             permission_context,
+            delivery_status,
+            delivery_turn_id,
+            blocking_turn_id,
+            queued_at_ms,
+            dispatched_at_ms,
+            settled_at_ms,
         } => {
             let key = (agent_id.to_string(), ev.seq, text.len());
             if markdown_cache.len() > 2048 {
@@ -19789,6 +19949,19 @@ fn render_timeline_event_view(
                 .entry(key)
                 .or_insert_with(|| parse_markdown_blocks(text, false))
                 .clone();
+            let folded = delivery_updates.get(message_id);
+            let resolved_status = match (delivery_status, folded.and_then(|f| f.delivery_status)) {
+                (Some(a), Some(b)) => {
+                    if delivery_status_rank(b) >= delivery_status_rank(*a) {
+                        Some(b)
+                    } else {
+                        Some(*a)
+                    }
+                }
+                (Some(a), None) => Some(*a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
             Some(TimelineItemView::AgentMessage {
                 seq: ev.seq,
                 message_id: message_id.clone(),
@@ -19799,6 +19972,18 @@ fn render_timeline_event_view(
                 event: event.clone(),
                 text: text.clone(),
                 permission_context: permission_context.clone(),
+                delivery_status: resolved_status,
+                delivery_turn_id: folded
+                    .and_then(|f| f.delivery_turn_id.clone())
+                    .or_else(|| delivery_turn_id.clone()),
+                blocking_turn_id: folded
+                    .and_then(|f| f.blocking_turn_id.clone())
+                    .or_else(|| blocking_turn_id.clone()),
+                queued_at_ms: queued_at_ms.or_else(|| folded.and_then(|f| f.queued_at_ms)),
+                dispatched_at_ms: folded
+                    .and_then(|f| f.dispatched_at_ms)
+                    .or(*dispatched_at_ms),
+                settled_at_ms: folded.and_then(|f| f.settled_at_ms).or(*settled_at_ms),
                 blocks,
                 timestamp_ms: ts_ms,
             })
@@ -19831,6 +20016,7 @@ fn render_timeline_event_view(
         }
         TimelinePayload::PermissionResolved { .. }
         | TimelinePayload::QuestionResolved { .. }
+        | TimelinePayload::AgentMessageDeliveryUpdated { .. }
         | TimelinePayload::StatusChanged { .. } => None,
     }
 }
@@ -22071,6 +22257,7 @@ mod tests {
             &settled_ev,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             true,
             &mut mem.markdown_cache,
             &mut mem.streaming_markdown_cache,
@@ -22095,6 +22282,7 @@ mod tests {
                 "ag_s",
                 None,
                 &stream_ev,
+                &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
                 true,
@@ -25888,5 +26076,350 @@ mod tests {
     fn open_in_memory_without_local_discovery_starts_empty() {
         let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
         assert!(core.fleet_overview().hosts.is_empty());
+    }
+
+    #[test]
+    fn agent_message_delivery_updates_fold_in_place_across_stage_and_stage_delta() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("lock hosts");
+            guard.insert(
+                "h_deliv".into(),
+                HostMemoryState::new(SavedHostProfile {
+                    host_id: "h_deliv".into(),
+                    hostname: "h_deliv".into(),
+                    custom_name: None,
+                    ssh_alias: None,
+                    route_mode: HostRouteMode::Auto,
+                    remote_daemon_port: 6868,
+                    custom_direct_endpoint: None,
+                    daemon_pubkey_b64: "pk_deliv".into(),
+                    direct_endpoints: vec![],
+                    relay_url: None,
+                    pairing_secret: String::new(),
+                    pairing_secret_updated_at_ms: 0,
+                    state: HostConnectionState::OnlineDirect,
+                }),
+            );
+        }
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::Welcome {
+                host: orbit_protocol::HostInfo {
+                    host_id: "h_deliv".into(),
+                    hostname: "h_deliv".into(),
+                    os: "macos".into(),
+                    arch: "aarch64".into(),
+                    public_key_b64: "pk_deliv".into(),
+                    protocol_version: orbit_protocol::PROTOCOL_VERSION,
+                    daemon_version: "0.10.0".into(),
+                    available_providers: vec![],
+                    relay_url: None,
+                },
+            },
+        );
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::WorkspacesSnapshot {
+                request_id: Uuid::nil(),
+                workspaces: vec![orbit_protocol::WorkspaceSummary {
+                    workspace_id: "ws_deliv".into(),
+                    source_cwd: Some("/tmp/ws".into()),
+                    cwd: "/tmp/ws".into(),
+                    title: "Delivery Fold".into(),
+                    is_worktree: false,
+                    git_branch: None,
+                    base_ref: None,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    project_root: None,
+                    mission_goal: None,
+                    is_curated: false,
+                    parent_workspace_id: None,
+                    setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                    board_revision: 0,
+                    title_locked: false,
+                    auto_clustered: false,
+                }],
+            },
+        );
+        let ag_summary = orbit_protocol::AgentSummary {
+            agent_id: "ag_deliv".into(),
+            workspace_id: "ws_deliv".into(),
+            cwd: "/tmp/ws".into(),
+            title: "Parent".into(),
+            provider: ProviderKind::Antigravity,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Default,
+            status: AgentStatus::Running {
+                turn_id: "turn_p1".into(),
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 3,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::AgentsSnapshot {
+                request_id: Uuid::nil(),
+                agents: vec![ag_summary],
+            },
+        );
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::nil(),
+                agent_id: "ag_deliv".into(),
+                has_more: false,
+                has_older_history: false,
+                events: vec![
+                    TimelineEvent {
+                        seq: 1,
+                        epoch: 1,
+                        agent_id: "ag_deliv".into(),
+                        turn_id: Some("turn_p1".into()),
+                        timestamp: now,
+                        payload: TimelinePayload::UserPrompt {
+                            message_id: "up_1".into(),
+                            text: "Initial task".into(),
+                            badges: Vec::new(),
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 2,
+                        epoch: 1,
+                        agent_id: "ag_deliv".into(),
+                        turn_id: Some("turn_p1".into()),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantThinking {
+                            item_id: "th_1".into(),
+                            text: "thinking".into(),
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 3,
+                        epoch: 1,
+                        agent_id: "ag_deliv".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::AgentMessage {
+                            message_id: "am_fold_1".into(),
+                            kind: orbit_protocol::AgentMessageKind::FinishNotification,
+                            source_agent_id: Some("ag_sub".into()),
+                            source_host_id: Some("h_deliv".into()),
+                            source_title: Some("Worker".into()),
+                            event: Some("finished".into()),
+                            text: "done".into(),
+                            permission_context: None,
+                            delivery_status: Some(
+                                orbit_protocol::AgentMessageDeliveryStatus::Queued,
+                            ),
+                            delivery_turn_id: None,
+                            blocking_turn_id: Some("turn_p1".into()),
+                            queued_at_ms: Some(1_000),
+                            dispatched_at_ms: None,
+                            settled_at_ms: None,
+                        },
+                    },
+                ],
+            },
+        );
+
+        fn find_agent_message(
+            turns: &[crate::stage::StageTurnView],
+            start_offset: usize,
+        ) -> Option<(usize, &TimelineItemView)> {
+            turns.iter().enumerate().find_map(|(offset, turn)| {
+                if let Some(item @ TimelineItemView::AgentMessage { .. }) =
+                    turn.agent_message.as_ref()
+                {
+                    return Some((start_offset + offset, item));
+                }
+                if let Some(item) = turn.live_segments.iter().find_map(|seg| match seg {
+                    crate::stage::TurnLiveSegmentView::AgentMessage { item, .. } => Some(item),
+                    _ => None,
+                }) {
+                    return Some((start_offset + offset, item));
+                }
+                turn.folded_steps
+                    .iter()
+                    .find(|it| matches!(it, TimelineItemView::AgentMessage { .. }))
+                    .map(|item| (start_offset + offset, item))
+            })
+        }
+
+        let stage0 = core.agent_stage("h_deliv", "ag_deliv");
+        let turns_len0 = stage0.turns.len();
+        let (msg_turn_idx, msg_item0) =
+            find_agent_message(&stage0.turns, 0).expect("queued agent_message turn present");
+        match msg_item0 {
+            TimelineItemView::AgentMessage {
+                message_id,
+                delivery_status,
+                delivery_turn_id,
+                blocking_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert_eq!(message_id, "am_fold_1");
+                assert_eq!(
+                    *delivery_status,
+                    Some(orbit_protocol::AgentMessageDeliveryStatus::Queued)
+                );
+                assert!(delivery_turn_id.is_none());
+                assert_eq!(blocking_turn_id.as_deref(), Some("turn_p1"));
+                assert_eq!(*queued_at_ms, Some(1_000));
+                assert!(dispatched_at_ms.is_none());
+                assert!(settled_at_ms.is_none());
+            }
+            other => panic!("unexpected agent_message view: {other:?}"),
+        }
+
+        // Incremental Dispatched delivery update folds onto the original turn via agent_stage_delta.
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 4,
+                    epoch: 1,
+                    agent_id: "ag_deliv".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::AgentMessageDeliveryUpdated {
+                        message_id: "am_fold_1".into(),
+                        status: orbit_protocol::AgentMessageDeliveryStatus::Dispatched,
+                        delivery_turn_id: Some("turn_p2".into()),
+                        blocking_turn_id: None,
+                        timestamp_ms: 2_500,
+                    },
+                },
+            },
+        );
+        let d1 = core.agent_stage_delta("h_deliv", "ag_deliv", stage0.revision);
+        assert_eq!(d1.total_turn_count as usize, turns_len0);
+        assert!(d1.replace_from_turn_index as usize <= msg_turn_idx);
+        let (found_delta_idx, delta_item) =
+            find_agent_message(&d1.changed_turns, d1.replace_from_turn_index as usize)
+                .expect("folded agent_message in delta");
+        assert_eq!(found_delta_idx, msg_turn_idx);
+        match delta_item {
+            TimelineItemView::AgentMessage {
+                delivery_status,
+                delivery_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert_eq!(
+                    *delivery_status,
+                    Some(orbit_protocol::AgentMessageDeliveryStatus::Dispatched)
+                );
+                assert_eq!(delivery_turn_id.as_deref(), Some("turn_p2"));
+                assert_eq!(*queued_at_ms, Some(1_000));
+                assert_eq!(*dispatched_at_ms, Some(2_500));
+                assert!(settled_at_ms.is_none());
+            }
+            other => panic!("unexpected delta agent_message: {other:?}"),
+        }
+
+        // Settled update advances status and timestamp in place across both stage and delta.
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 5,
+                    epoch: 1,
+                    agent_id: "ag_deliv".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::AgentMessageDeliveryUpdated {
+                        message_id: "am_fold_1".into(),
+                        status: orbit_protocol::AgentMessageDeliveryStatus::Settled,
+                        delivery_turn_id: Some("turn_p2".into()),
+                        blocking_turn_id: None,
+                        timestamp_ms: 4_000,
+                    },
+                },
+            },
+        );
+        let d2 = core.agent_stage_delta("h_deliv", "ag_deliv", d1.revision);
+        assert_eq!(d2.total_turn_count as usize, turns_len0);
+        let stage2 = core.agent_stage("h_deliv", "ag_deliv");
+        assert_eq!(stage2.turns.len(), turns_len0);
+        let (found_stage2_idx, stage2_item) =
+            find_agent_message(&stage2.turns, 0).expect("settled agent_message");
+        assert_eq!(found_stage2_idx, msg_turn_idx);
+        match stage2_item {
+            TimelineItemView::AgentMessage {
+                delivery_status,
+                delivery_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert_eq!(
+                    *delivery_status,
+                    Some(orbit_protocol::AgentMessageDeliveryStatus::Settled)
+                );
+                assert_eq!(delivery_turn_id.as_deref(), Some("turn_p2"));
+                assert_eq!(*queued_at_ms, Some(1_000));
+                assert_eq!(*dispatched_at_ms, Some(2_500));
+                assert_eq!(*settled_at_ms, Some(4_000));
+            }
+            other => panic!("unexpected settled agent_message: {other:?}"),
+        }
+
+        // interrupt_agent_and_continue dispatches InterruptTurn { preserve_queue: true }.
+        let (session_handle, mut out_rx) = crate::HostSessionHandle::new_test_channel();
+        {
+            let mut hosts = core.hosts.write().expect("write hosts");
+            hosts.get_mut("h_deliv").expect("h_deliv").session = Some(session_handle);
+        }
+        core.interrupt_agent_and_continue("h_deliv", "ag_deliv");
+        let sent = core.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), out_rx.recv())
+                .await
+                .expect("interrupt frame dispatched")
+                .expect("channel open")
+        });
+        match sent {
+            crate::OutboundPayload::Wire(WireMessage::InterruptTurn {
+                agent_id,
+                preserve_queue,
+                ..
+            }) => {
+                assert_eq!(agent_id, "ag_deliv");
+                assert!(preserve_queue);
+            }
+            other => panic!("unexpected outbound payload: {other:?}"),
+        }
     }
 }

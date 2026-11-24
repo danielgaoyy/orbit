@@ -185,6 +185,13 @@ pub struct StageTurnView {
     pub started_at_ms: Option<i64>,
     /// Epoch milliseconds when this turn completed (or latest body event timestamp).
     pub completed_at_ms: Option<i64>,
+    /// Latest timestamp across all events/items in this turn (including thinking updates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_activity_ms: Option<i64>,
+    /// Latest timestamp of non-thinking visible progress (`ToolCall` or `AssistantMessage`),
+    /// falling back to the turn opener timestamp (`started_at_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_visible_progress_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1432,12 +1439,29 @@ pub fn process_timeline_turns_slice(
 
         let starts_new_turn = match &item {
             TimelineItemView::UserPrompt { .. } => true,
-            TimelineItemView::AgentMessage { kind, .. } => {
-                !(has_open_turn
-                    && matches!(
+            TimelineItemView::AgentMessage {
+                kind,
+                delivery_status,
+                ..
+            } => {
+                let stay_inline = has_open_turn
+                    && (matches!(
                         kind,
                         AgentMessageKind::FinishNotification | AgentMessageKind::Heartbeat
-                    ))
+                    ) || matches!(
+                        delivery_status,
+                        Some(orbit_protocol::AgentMessageDeliveryStatus::Queued)
+                    ) || (delivery_status.is_some()
+                        && !current_body.iter().any(|it| {
+                            matches!(
+                                it,
+                                TimelineItemView::AssistantMessage {
+                                    streaming: false,
+                                    ..
+                                }
+                            )
+                        })));
+                !stay_inline
             }
             _ => false,
         };
@@ -1823,6 +1847,26 @@ fn finalize_turn(
         _ => None,
     };
 
+    let mut latest_activity_ms = started_at_ms;
+    let mut latest_visible_progress_ms = anchor_opener
+        .and_then(timeline_item_timestamp_ms)
+        .or(started_at_ms);
+    if let Some(ts) = anchor_opener.and_then(timeline_item_timestamp_ms) {
+        latest_activity_ms = Some(latest_activity_ms.map_or(ts, |prev| prev.max(ts)));
+    }
+    for it in &body_items {
+        if let Some(ts) = timeline_item_timestamp_ms(it) {
+            latest_activity_ms = Some(latest_activity_ms.map_or(ts, |prev| prev.max(ts)));
+            if matches!(
+                it,
+                TimelineItemView::ToolCall { .. } | TimelineItemView::AssistantMessage { .. }
+            ) {
+                latest_visible_progress_ms =
+                    Some(latest_visible_progress_ms.map_or(ts, |prev| prev.max(ts)));
+            }
+        }
+    }
+
     let last_assistant_reply = non_notice_body
         .iter()
         .rev()
@@ -1878,6 +1922,8 @@ fn finalize_turn(
         has_active_item,
         started_at_ms,
         completed_at_ms,
+        latest_activity_ms,
+        latest_visible_progress_ms,
     }
 }
 
@@ -5293,6 +5339,12 @@ Log: file:///tmp/spoofed.log\n";
                 event: Some("finished".into()),
                 text: "Subagent finished with 0 blockers.".into(),
                 permission_context: None,
+                delivery_status: None,
+                delivery_turn_id: None,
+                blocking_turn_id: None,
+                queued_at_ms: None,
+                dispatched_at_ms: None,
+                settled_at_ms: None,
                 blocks: Vec::new(),
                 timestamp_ms: Some(5_000),
             },
@@ -5306,6 +5358,12 @@ Log: file:///tmp/spoofed.log\n";
                 event: Some("heartbeat".into()),
                 text: "Still verifying CI".into(),
                 permission_context: None,
+                delivery_status: None,
+                delivery_turn_id: None,
+                blocking_turn_id: None,
+                queued_at_ms: None,
+                dispatched_at_ms: None,
+                settled_at_ms: None,
                 blocks: Vec::new(),
                 timestamp_ms: Some(6_000),
             },
@@ -5328,6 +5386,12 @@ Log: file:///tmp/spoofed.log\n";
                 event: None,
                 text: "API contract updated".into(),
                 permission_context: None,
+                delivery_status: None,
+                delivery_turn_id: None,
+                blocking_turn_id: None,
+                queued_at_ms: None,
+                dispatched_at_ms: None,
+                settled_at_ms: None,
                 blocks: Vec::new(),
                 timestamp_ms: Some(9_000),
             },
@@ -5409,6 +5473,42 @@ Log: file:///tmp/spoofed.log\n";
         let (leading_turns, _, _, _) = process_timeline_for_stage(&leading_only, Some("/repo"));
         assert_eq!(leading_turns.len(), 1);
         assert!(leading_turns[0].agent_message.is_some());
+
+        // A DirectMessage queued while an active turn is still in flight stays inline inside
+        // that turn (preserving `latest_activity_ms` / `latest_visible_progress_ms` tracking).
+        let mid_turn_queued_dm = vec![
+            items[0].clone(),
+            TimelineItemView::AssistantThinking {
+                seq: 2,
+                item_id: "th_mid".into(),
+                text: "still thinking".into(),
+                timestamp_ms: Some(2_500),
+            },
+            TimelineItemView::AgentMessage {
+                seq: 3,
+                message_id: "am_dm_queued".into(),
+                kind: AgentMessageKind::DirectMessage,
+                source_agent_id: Some("peer_backend".into()),
+                source_host_id: None,
+                source_title: Some("backend".into()),
+                event: None,
+                text: "Queued mid-turn ping".into(),
+                permission_context: None,
+                delivery_status: Some(orbit_protocol::AgentMessageDeliveryStatus::Queued),
+                delivery_turn_id: Some("turn_dm".into()),
+                blocking_turn_id: Some("turn_u1".into()),
+                queued_at_ms: Some(3_000),
+                dispatched_at_ms: None,
+                settled_at_ms: None,
+                blocks: Vec::new(),
+                timestamp_ms: Some(3_000),
+            },
+        ];
+        let (mid_turns, _, _, _) = process_timeline_for_stage(&mid_turn_queued_dm, Some("/repo"));
+        assert_eq!(mid_turns.len(), 1);
+        assert!(mid_turns[0].agent_message.is_none());
+        assert_eq!(mid_turns[0].latest_visible_progress_ms, Some(1_000));
+        assert_eq!(mid_turns[0].latest_activity_ms, Some(3_000));
     }
 
     #[test]
@@ -5698,5 +5798,57 @@ Log: file:///tmp/spoofed.log\n";
                 .any(|l| l.label == "Rust Book")
         );
         assert!(insights.detected_links.iter().any(|l| l.host == "docs.rs"));
+    }
+
+    #[test]
+    fn turn_progress_timestamps_distinguish_thinking_stall_from_visible_progress_and_silence() {
+        let opener = TimelineItemView::UserPrompt {
+            seq: 1,
+            message_id: "u1".into(),
+            text: "Do the thing".into(),
+            badges: Vec::new(),
+            blocks: Vec::new(),
+            timestamp_ms: Some(1_000),
+        };
+        // 1. Complete silence: only opener -> latest_activity_ms == latest_visible_progress_ms == 1_000
+        let (silent_turns, _, _, _) =
+            process_timeline_for_stage(std::slice::from_ref(&opener), Some("/repo"));
+        assert_eq!(silent_turns[0].latest_activity_ms, Some(1_000));
+        assert_eq!(silent_turns[0].latest_visible_progress_ms, Some(1_000));
+
+        // 2. Thinking-only updates advance latest_activity_ms, NOT latest_visible_progress_ms
+        let thinking = TimelineItemView::AssistantThinking {
+            seq: 2,
+            item_id: "th_1".into(),
+            text: "Analyzing options continuously...".into(),
+            timestamp_ms: Some(65_000),
+        };
+        let (thinking_turns, _, _, _) =
+            process_timeline_for_stage(&[opener.clone(), thinking.clone()], Some("/repo"));
+        assert_eq!(thinking_turns[0].latest_activity_ms, Some(65_000));
+        assert_eq!(thinking_turns[0].latest_visible_progress_ms, Some(1_000));
+        assert!(
+            thinking_turns[0].latest_visible_progress_ms < thinking_turns[0].latest_activity_ms,
+            "continuous thinking without tool/reply progress must keep visible_progress behind activity"
+        );
+
+        // 3. Emitting a ToolCall or AssistantMessage advances latest_visible_progress_ms
+        let tool = make_tool(
+            3,
+            ToolCallStatus::Completed,
+            "check",
+            ToolCallDetail::Shell {
+                command: "echo ok".into(),
+                cwd: Some("/repo".into()),
+                exit_code: Some(0),
+                output_preview: Some("ok".into()),
+            },
+            Vec::new(),
+            70_000,
+        );
+        let (progressed_turns, _, _, _) =
+            process_timeline_for_stage(&[opener, thinking, tool], Some("/repo"));
+        assert_eq!(progressed_turns[0].latest_activity_ms, Some(70_000));
+        assert_eq!(progressed_turns[0].latest_visible_progress_ms, Some(70_000));
     }
 }

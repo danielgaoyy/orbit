@@ -1027,6 +1027,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func interruptAgent(hostId: String, agentId: String) 
     
+    func interruptAgentAndContinue(hostId: String, agentId: String) 
+    
     func killTerminal(hostId: String, terminalId: String) 
     
     func listAcpAgents(hostId: String)  -> [FfiAcpAgentAvailability]
@@ -2060,6 +2062,16 @@ open func hostDetail(hostId: String) -> FfiHostDetail?  {
 open func interruptAgent(hostId: String, agentId: String)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_interrupt_agent(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),uniffiCallStatus
+    )
+}
+}
+    
+open func interruptAgentAndContinue(hostId: String, agentId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_interrupt_agent_and_continue(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(hostId),
         FfiConverterString.lower(agentId),uniffiCallStatus
@@ -10647,10 +10659,12 @@ public struct FfiStageTurn: Equatable, Hashable {
     public var hasActiveItem: Bool
     public var startedAtMs: Int64?
     public var completedAtMs: Int64?
+    public var latestActivityMs: Int64?
+    public var latestVisibleProgressMs: Int64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(key: String, turnIndex: UInt32, anchorSeq: UInt64, userPrompt: FfiTimelineItem?, agentMessage: FfiTimelineItem?, isCompactionCommand: Bool, foldedSteps: [FfiTimelineItem], workCounts: FfiTurnWorkCounts, workSummaryLabel: String, workSummaryLiveLabel: String, workSummaryLiveDetail: String?, workSummaryIncludesFailure: Bool, thoughtDurationMs: Int64?, workDurationMs: Int64?, turnDurationMs: Int64?, terminalReply: FfiTimelineItem?, lastAssistantReply: FfiTimelineItem?, notices: [FfiTimelineItem], compactions: [FfiTurnCompactionItem], liveSegments: [FfiTurnLiveSegment], turnDiffs: [FfiTurnFileDiffSummary], hasError: Bool, hasUnrecoveredError: Bool, hasActiveItem: Bool, startedAtMs: Int64?, completedAtMs: Int64?) {
+    public init(key: String, turnIndex: UInt32, anchorSeq: UInt64, userPrompt: FfiTimelineItem?, agentMessage: FfiTimelineItem?, isCompactionCommand: Bool, foldedSteps: [FfiTimelineItem], workCounts: FfiTurnWorkCounts, workSummaryLabel: String, workSummaryLiveLabel: String, workSummaryLiveDetail: String?, workSummaryIncludesFailure: Bool, thoughtDurationMs: Int64?, workDurationMs: Int64?, turnDurationMs: Int64?, terminalReply: FfiTimelineItem?, lastAssistantReply: FfiTimelineItem?, notices: [FfiTimelineItem], compactions: [FfiTurnCompactionItem], liveSegments: [FfiTurnLiveSegment], turnDiffs: [FfiTurnFileDiffSummary], hasError: Bool, hasUnrecoveredError: Bool, hasActiveItem: Bool, startedAtMs: Int64?, completedAtMs: Int64?, latestActivityMs: Int64?, latestVisibleProgressMs: Int64?) {
         self.key = key
         self.turnIndex = turnIndex
         self.anchorSeq = anchorSeq
@@ -10677,6 +10691,8 @@ public struct FfiStageTurn: Equatable, Hashable {
         self.hasActiveItem = hasActiveItem
         self.startedAtMs = startedAtMs
         self.completedAtMs = completedAtMs
+        self.latestActivityMs = latestActivityMs
+        self.latestVisibleProgressMs = latestVisibleProgressMs
     }
 
     
@@ -10720,7 +10736,9 @@ public struct FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer {
                 hasUnrecoveredError: FfiConverterBool.read(from: &buf), 
                 hasActiveItem: FfiConverterBool.read(from: &buf), 
                 startedAtMs: FfiConverterOptionInt64.read(from: &buf), 
-                completedAtMs: FfiConverterOptionInt64.read(from: &buf)
+                completedAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                latestActivityMs: FfiConverterOptionInt64.read(from: &buf), 
+                latestVisibleProgressMs: FfiConverterOptionInt64.read(from: &buf)
         )
     }
 
@@ -10751,6 +10769,8 @@ public struct FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer {
         FfiConverterBool.write(value.hasActiveItem, into: &buf)
         FfiConverterOptionInt64.write(value.startedAtMs, into: &buf)
         FfiConverterOptionInt64.write(value.completedAtMs, into: &buf)
+        FfiConverterOptionInt64.write(value.latestActivityMs, into: &buf)
+        FfiConverterOptionInt64.write(value.latestVisibleProgressMs, into: &buf)
     }
 }
 
@@ -13103,6 +13123,86 @@ public func FfiConverterTypeFfiAcpAgentSource_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeFfiAcpAgentSource_lower(_ value: FfiAcpAgentSource) -> RustBuffer {
     return FfiConverterTypeFfiAcpAgentSource.lower(value)
+}
+
+
+
+
+public enum FfiAgentMessageDeliveryStatus: Equatable, Hashable {
+    
+    case queued
+    case dispatched
+    case settled
+    case dropped
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiAgentMessageDeliveryStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAgentMessageDeliveryStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAgentMessageDeliveryStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAgentMessageDeliveryStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .queued
+        
+        case 2: return .dispatched
+        
+        case 3: return .settled
+        
+        case 4: return .dropped
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiAgentMessageDeliveryStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .queued:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .dispatched:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .settled:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .dropped:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAgentMessageDeliveryStatus_lift(_ buf: RustBuffer) throws -> FfiAgentMessageDeliveryStatus {
+    return try FfiConverterTypeFfiAgentMessageDeliveryStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAgentMessageDeliveryStatus_lower(_ value: FfiAgentMessageDeliveryStatus) -> RustBuffer {
+    return FfiConverterTypeFfiAgentMessageDeliveryStatus.lower(value)
 }
 
 
@@ -16279,7 +16379,7 @@ public enum FfiTimelineItem: Equatable, Hashable {
     )
     case notice(seq: UInt64, level: String, message: String, timestampMs: Int64?
     )
-    case agentMessage(seq: UInt64, messageId: String, kind: FfiAgentMessageKind, sourceAgentId: String?, sourceHostId: String?, sourceTitle: String?, event: String?, text: String, permissionContext: FfiPermissionCheckpointRef?, blocks: [FfiRichBlock], timestampMs: Int64?
+    case agentMessage(seq: UInt64, messageId: String, kind: FfiAgentMessageKind, sourceAgentId: String?, sourceHostId: String?, sourceTitle: String?, event: String?, text: String, permissionContext: FfiPermissionCheckpointRef?, deliveryStatus: FfiAgentMessageDeliveryStatus?, deliveryTurnId: String?, blockingTurnId: String?, queuedAtMs: Int64?, dispatchedAtMs: Int64?, settledAtMs: Int64?, blocks: [FfiRichBlock], timestampMs: Int64?
     )
 
 
@@ -16323,7 +16423,7 @@ public struct FfiConverterTypeFfiTimelineItem: FfiConverterRustBuffer {
         case 7: return .notice(seq: try FfiConverterUInt64.read(from: &buf), level: try FfiConverterString.read(from: &buf), message: try FfiConverterString.read(from: &buf), timestampMs: try FfiConverterOptionInt64.read(from: &buf)
         )
         
-        case 8: return .agentMessage(seq: try FfiConverterUInt64.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), kind: try FfiConverterTypeFfiAgentMessageKind.read(from: &buf), sourceAgentId: try FfiConverterOptionString.read(from: &buf), sourceHostId: try FfiConverterOptionString.read(from: &buf), sourceTitle: try FfiConverterOptionString.read(from: &buf), event: try FfiConverterOptionString.read(from: &buf), text: try FfiConverterString.read(from: &buf), permissionContext: try FfiConverterOptionTypeFfiPermissionCheckpointRef.read(from: &buf), blocks: try FfiConverterSequenceTypeFfiRichBlock.read(from: &buf), timestampMs: try FfiConverterOptionInt64.read(from: &buf)
+        case 8: return .agentMessage(seq: try FfiConverterUInt64.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), kind: try FfiConverterTypeFfiAgentMessageKind.read(from: &buf), sourceAgentId: try FfiConverterOptionString.read(from: &buf), sourceHostId: try FfiConverterOptionString.read(from: &buf), sourceTitle: try FfiConverterOptionString.read(from: &buf), event: try FfiConverterOptionString.read(from: &buf), text: try FfiConverterString.read(from: &buf), permissionContext: try FfiConverterOptionTypeFfiPermissionCheckpointRef.read(from: &buf), deliveryStatus: try FfiConverterOptionTypeFfiAgentMessageDeliveryStatus.read(from: &buf), deliveryTurnId: try FfiConverterOptionString.read(from: &buf), blockingTurnId: try FfiConverterOptionString.read(from: &buf), queuedAtMs: try FfiConverterOptionInt64.read(from: &buf), dispatchedAtMs: try FfiConverterOptionInt64.read(from: &buf), settledAtMs: try FfiConverterOptionInt64.read(from: &buf), blocks: try FfiConverterSequenceTypeFfiRichBlock.read(from: &buf), timestampMs: try FfiConverterOptionInt64.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -16405,7 +16505,7 @@ public struct FfiConverterTypeFfiTimelineItem: FfiConverterRustBuffer {
             FfiConverterOptionInt64.write(timestampMs, into: &buf)
             
         
-        case let .agentMessage(seq,messageId,kind,sourceAgentId,sourceHostId,sourceTitle,event,text,permissionContext,blocks,timestampMs):
+        case let .agentMessage(seq,messageId,kind,sourceAgentId,sourceHostId,sourceTitle,event,text,permissionContext,deliveryStatus,deliveryTurnId,blockingTurnId,queuedAtMs,dispatchedAtMs,settledAtMs,blocks,timestampMs):
             writeInt(&buf, Int32(8))
             FfiConverterUInt64.write(seq, into: &buf)
             FfiConverterString.write(messageId, into: &buf)
@@ -16416,6 +16516,12 @@ public struct FfiConverterTypeFfiTimelineItem: FfiConverterRustBuffer {
             FfiConverterOptionString.write(event, into: &buf)
             FfiConverterString.write(text, into: &buf)
             FfiConverterOptionTypeFfiPermissionCheckpointRef.write(permissionContext, into: &buf)
+            FfiConverterOptionTypeFfiAgentMessageDeliveryStatus.write(deliveryStatus, into: &buf)
+            FfiConverterOptionString.write(deliveryTurnId, into: &buf)
+            FfiConverterOptionString.write(blockingTurnId, into: &buf)
+            FfiConverterOptionInt64.write(queuedAtMs, into: &buf)
+            FfiConverterOptionInt64.write(dispatchedAtMs, into: &buf)
+            FfiConverterOptionInt64.write(settledAtMs, into: &buf)
             FfiConverterSequenceTypeFfiRichBlock.write(blocks, into: &buf)
             FfiConverterOptionInt64.write(timestampMs, into: &buf)
             
@@ -18041,6 +18147,30 @@ fileprivate struct FfiConverterOptionTypeFfiWorkspaceSummary: FfiConverterRustBu
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiWorkspaceSummary.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiAgentMessageDeliveryStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAgentMessageDeliveryStatus?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiAgentMessageDeliveryStatus.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiAgentMessageDeliveryStatus.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -20437,6 +20567,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_interrupt_agent() != 55703) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_interrupt_agent_and_continue() != 42475) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_kill_terminal() != 53980) {

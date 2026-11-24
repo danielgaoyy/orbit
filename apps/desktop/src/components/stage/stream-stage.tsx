@@ -31,6 +31,7 @@ import {
   type StageTurnView,
   type TimelineItemView,
   isAgentForegroundRunning,
+  orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isAgentInGitRepo } from "@/lib/projects";
 import {
@@ -317,6 +318,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   sessionSubagents,
   sessionSubagentMatcher,
   onOpenSubagent,
+  queuedNotificationCount,
+  onInterruptAndContinue,
 }: {
   selectedHostId: string;
   selectedAgentId: string;
@@ -348,6 +351,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   sessionSubagents: readonly ResolvedSubagentItem[];
   sessionSubagentMatcher: SubagentNameMatcher | null;
   onOpenSubagent: (subagent: ResolvedSubagentItem) => void;
+  queuedNotificationCount: number;
+  onInterruptAndContinue: (() => void) | null;
 }) {
   const widthBucket = stageMaxContentWidthPx ? Math.round(stageMaxContentWidthPx / 32) : 24;
   const selectionTurnsRef = useRef<number[]>([]);
@@ -825,6 +830,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
               sessionSubagents={sessionSubagents}
               sessionSubagentMatcher={sessionSubagentMatcher}
               onOpenSubagent={onOpenSubagent}
+              queuedNotificationCount={turnActive ? queuedNotificationCount : 0}
+              onInterruptAndContinue={turnActive ? onInterruptAndContinue : null}
             />
           </div>
         );
@@ -1151,6 +1158,32 @@ export function StreamStage() {
       setTimingTick((n) => n + 1);
     }
   }, [selectedAgentId, latestTurn, isLatestTurnActive]);
+
+  const queuedNotificationCount = useMemo(() => {
+    if (!isLatestTurnActive || !latestTurn) return 0;
+    let count = 0;
+    if (
+      latestTurn.agent_message?.item_type === "agent_message" &&
+      latestTurn.agent_message.delivery_status === "queued"
+    ) {
+      count += 1;
+    }
+    for (const seg of latestTurn.live_segments) {
+      if (
+        seg.kind === "agent_message" &&
+        seg.item.item_type === "agent_message" &&
+        seg.item.delivery_status === "queued"
+      ) {
+        count += 1;
+      }
+    }
+    return count;
+  }, [isLatestTurnActive, latestTurn]);
+
+  const handleInterruptAndContinue = useCallback(() => {
+    if (!selectedHostId || !selectedAgentId) return;
+    void orbitIpc.interruptAgentAndContinue(selectedHostId, selectedAgentId);
+  }, [selectedHostId, selectedAgentId]);
 
   const stagePushStyle = useMemo<CSSProperties>(
     () => ({
@@ -2238,6 +2271,8 @@ export function StreamStage() {
                   sessionSubagents={sessionSubagents}
                   sessionSubagentMatcher={sessionSubagentMatcher}
                   onOpenSubagent={handleOpenSubagent}
+                  queuedNotificationCount={queuedNotificationCount}
+                  onInterruptAndContinue={handleInterruptAndContinue}
                 />
 
                 {/* Dynamic Reading Runway: gives active streaming output a calm centered eye-zone cushion above Composer */}

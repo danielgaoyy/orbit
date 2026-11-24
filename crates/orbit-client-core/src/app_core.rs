@@ -31614,7 +31614,14 @@ mod tests {
                     other => panic!("unexpected listener close payload: {other:?}"),
                 }
             }
-            tokio::task::yield_now().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while !(accept_handle.is_finished()
+                && conn1_handle.is_finished()
+                && conn2_handle.is_finished())
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         });
         assert!(closed_tids.contains(&tid1));
         assert!(closed_tids.contains(&tid2));

@@ -16,11 +16,11 @@ import dev.orbit.android.MainActivity
 import dev.orbit.android.R
 
 /**
- * Android notification channel provisioning and deep-link notification dispatcher.
+ * Android notification channel provisioning and canonical deep-link notification dispatcher.
  *
  * Channels:
- * - [CHANNEL_APPROVALS]: High-priority tool approval & question prompts.
- * - [CHANNEL_COMPLETIONS]: Default-priority agent completion notices.
+ * - [CHANNEL_APPROVALS]: High-priority tool approvals, plan approvals, and agent questions.
+ * - [CHANNEL_COMPLETIONS]: Default-priority turn completions, goals, and fired timers.
  * - [CHANNEL_ERRORS]: High-priority agent / connection error alerts.
  */
 object OrbitNotificationHelper {
@@ -37,7 +37,7 @@ object OrbitNotificationHelper {
             "Approvals & Decisions",
             NotificationManager.IMPORTANCE_HIGH,
         ).apply {
-            description = "Tool permission requests and agent questions requiring your input."
+            description = "Tool permission requests, plan approvals, and agent questions requiring your input."
             enableVibration(true)
         }
 
@@ -46,7 +46,7 @@ object OrbitNotificationHelper {
             "Completed Runs",
             NotificationManager.IMPORTANCE_DEFAULT,
         ).apply {
-            description = "Notifications when an autonomous agent or automation finishes."
+            description = "Notifications when an autonomous agent, goal, or scheduled timer finishes."
         }
 
         val errors = NotificationChannel(
@@ -72,18 +72,50 @@ object OrbitNotificationHelper {
         return NotificationManagerCompat.from(context).areNotificationsEnabled()
     }
 
-    fun buildOpenThreadUri(hostId: String, agentId: String): Uri =
-        Uri.Builder()
-            .scheme("orbit")
-            .authority("open")
-            .appendQueryParameter("host", hostId)
-            .appendQueryParameter("agent", agentId)
-            .build()
+    fun buildOpenThreadUri(
+        hostId: String,
+        agentId: String?,
+        eventKind: OrbitPushEventKind? = null,
+    ): Uri = Uri.parse(OrbitPushRouter.buildCanonicalOpenUri(hostId, agentId, eventKind))
 
-    fun buildOpenThreadIntent(context: Context, hostId: String, agentId: String): Intent =
-        Intent(Intent.ACTION_VIEW, buildOpenThreadUri(hostId, agentId), context, MainActivity::class.java).apply {
+    fun buildOpenThreadIntent(
+        context: Context,
+        hostId: String,
+        agentId: String?,
+        eventKind: OrbitPushEventKind? = null,
+    ): Intent =
+        Intent(
+            Intent.ACTION_VIEW,
+            buildOpenThreadUri(hostId, agentId, eventKind),
+            context,
+            MainActivity::class.java,
+        ).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
+
+    fun dispatchPushRoute(context: Context, route: OrbitPushRoute) {
+        val channelId = when (route.channel) {
+            OrbitPushChannelRoute.APPROVALS -> CHANNEL_APPROVALS
+            OrbitPushChannelRoute.COMPLETIONS -> CHANNEL_COMPLETIONS
+            OrbitPushChannelRoute.ERRORS -> CHANNEL_ERRORS
+        }
+        val priority = when (route.channel) {
+            OrbitPushChannelRoute.APPROVALS, OrbitPushChannelRoute.ERRORS -> NotificationCompat.PRIORITY_HIGH
+            OrbitPushChannelRoute.COMPLETIONS -> NotificationCompat.PRIORITY_DEFAULT
+        }
+        val key = "${route.eventKind.slug}:${route.hostId}:${route.agentId.orEmpty()}"
+        postNotification(
+            context = context,
+            channelId = channelId,
+            notificationId = key.hashCode(),
+            hostId = route.hostId,
+            agentId = route.agentId,
+            eventKind = route.eventKind,
+            title = route.title,
+            body = route.body,
+            priority = priority,
+        )
+    }
 
     fun notifyApprovalRequired(
         context: Context,
@@ -98,7 +130,8 @@ object OrbitNotificationHelper {
             notificationId = ("approval:$hostId:$agentId").hashCode(),
             hostId = hostId,
             agentId = agentId,
-            title = title.ifBlank { "Approval Required" },
+            eventKind = OrbitPushEventKind.PERMISSION_REQUIRED,
+            title = title.ifBlank { "Approval required" },
             body = body.ifBlank { "An agent is waiting for your decision." },
             priority = NotificationCompat.PRIORITY_HIGH,
         )
@@ -117,7 +150,8 @@ object OrbitNotificationHelper {
             notificationId = ("completed:$hostId:$agentId").hashCode(),
             hostId = hostId,
             agentId = agentId,
-            title = title.ifBlank { "Run Completed" },
+            eventKind = OrbitPushEventKind.TURN_COMPLETED,
+            title = title.ifBlank { "Turn completed" },
             body = body.ifBlank { "Agent finished its task." },
             priority = NotificationCompat.PRIORITY_DEFAULT,
         )
@@ -136,7 +170,8 @@ object OrbitNotificationHelper {
             notificationId = ("error:$hostId:$agentId").hashCode(),
             hostId = hostId,
             agentId = agentId,
-            title = title.ifBlank { "Agent Error" },
+            eventKind = OrbitPushEventKind.AGENT_ERROR,
+            title = title.ifBlank { "Agent error" },
             body = body.ifBlank { "An agent encountered an error." },
             priority = NotificationCompat.PRIORITY_HIGH,
         )
@@ -147,7 +182,8 @@ object OrbitNotificationHelper {
         channelId: String,
         notificationId: Int,
         hostId: String,
-        agentId: String,
+        agentId: String?,
+        eventKind: OrbitPushEventKind,
         title: String,
         body: String,
         priority: Int,
@@ -158,7 +194,7 @@ object OrbitNotificationHelper {
         val pendingIntent = PendingIntent.getActivity(
             context,
             notificationId,
-            buildOpenThreadIntent(context, hostId, agentId),
+            buildOpenThreadIntent(context, hostId, agentId, eventKind),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 

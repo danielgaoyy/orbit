@@ -1,3 +1,200 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Orbit</string>
+
+    <!-- Navigation & Shell -->
+    <string name="nav_overview">Overview</string>
+    <string name="nav_new_session">New Conversation</string>
+    <string name="nav_search">Search</string>
+    <string name="nav_global_search">Global Search</string>
+    <string name="nav_files">Files</string>
+    <string name="nav_diff_review">Diff Review</string>
+    <string name="nav_hide_diff_review">Hide Diff Review</string>
+    <string name="nav_full_diff">Full Diff</string>
+    <string name="nav_terminal">Terminal</string>
+    <string name="nav_side_question">Side Question (/btw)</string>
+    <string name="nav_workspace_board">Mission Board &amp; Peers</string>
+    <string name="nav_automations">Automations</string>
+    <string name="nav_personal_router">Personal Agent &amp; Mesh</string>
+    <string name="nav_archived">Archived Sessions</string>
+    <string name="nav_settings">Settings</string>
+    <string name="nav_pair_host">Pair Host</string>
+    <string name="nav_fork_conversation">Fork Conversation</string>
+    <string name="nav_export_transcript">Export Transcript</string>
+    <string name="nav_archive">Archive</string>
+    <string name="nav_open_folder">Open Folder</string>
+    <string name="nav_copy_path">Copy Path</string>
+    <string name="nav_open_drawer">Open fleet sidebar</string>
+    <string name="nav_more_actions">More actions</string>
+    <string name="nav_close">Close</string>
+    <string name="nav_back">Back</string>
+    <string name="nav_refresh">Refresh</string>
+    <string name="nav_cancel">Cancel</string>
+    <string name="nav_confirm">Confirm</string>
+    <string name="nav_copy">Copy</string>
+    <string name="nav_copied">Copied</string>
+    <string name="nav_save">Save</string>
+    <string name="nav_delete">Delete</string>
+
+    <!-- Global Overview (Personal Agent) -->
+    <string name="overview_title">Personal Agent</string>
+    <string name="overview_status_calm">All quiet across %1$d %2$s</string>
+    <string name="overview_status_working">%1$d active %2$s across %3$d online</string>
+    <string name="overview_status_attention">%1$d %2$s waiting for your decision</string>
+    <string name="overview_status_offline">Fleet offline — tap to reconnect</string>
+    <string name="overview_status_empty">Pair a workstation to start your fleet</string>
+    <string name="overview_host_singular">host</string>
+    <string name="overview_host_plural">hosts</string>
+    <string name="overview_agent_singular">agent</string>
+    <string name="overview_agent_plural">agents</string>
+    <string name="overview_decision_singular">decision</string>
+    <string name="overview_decision_plural">decisions</string>
+    <string name="overview_needs_decision">Needs Your Decision</string>
+    <string name="overview_batch_approve_safe">Approve %1$d Safe</string>
+    <string name="overview_batch_approve_hint">Read-only &amp; safe checks only; edits and plans always require manual review.</string>
+    <string name="overview_live_fleet">Live Fleet</string>
+    <string name="overview_active_sessions">Active Sessions</string>
+    <string name="overview_no_active_sessions">No agents currently running.</string>
+    <string name="overview_router_badge">Personal Router</string>
+    <string name="overview_router_configure">Configure Router</string>
+    <string name="overview_composer_placeholder">Direct your Personal Agent across the fleet…</string>
+    <string name="overview_reconnect">Reconnect</string>
+
+    <!-- Stage, Pagination, Lineage, Delivery & Offline Banner -->
+    <string name="stage_hero_prompt">What would you like to build?</string>
+    <string name="stage_unpaired_title">Orbit Fleet</string>
+    <string name="stage_unpaired_subtitle">Zero-knowledge encrypted multi-host control plane for Claude Code, Codex, and Antigravity.</string>
+    <string name="stage_connect_local">Connect Local Daemon</string>
+    <string name="stage_load_older">Load earlier turns</string>
+    <string name="stage_loading_older">Loading earlier history…</string>
+    <string name="stage_scroll_bottom">Scroll to bottom</string>
+    <string name="stage_offline_banner">%1$s is offline</string>
+    <string name="stage_connecting_banner">Reconnecting to %1$s…</string>
+    <string name="stage_lineage_parent">Parent</string>
+    <string name="stage_lineage_subagents">Subagents</string>
+    <string name="stage_lineage_peers">Peers</string>
+    <string name="stage_delivery_queued">Queued</string>
+    <string name="stage_delivery_dispatched">Delivered</string>
+    <string name="stage_delivery_settled">Settled</string>
+    <string name="stage_delivery_dropped">Dropped</string>
+    <string name="stage_interrupt_deliver">Interrupt &amp; deliver</string>
+    <string name="stage_dismiss_error">Dismiss error</string>
+
+    <!-- Plan Shelf & Plan Review Card -->
+    <string name="plan_shelf_title">Session Plan</string>
+    <string name="plan_review_title">Implementation Plan</string>
+    <string name="plan_tab_preview">Preview</string>
+    <string name="plan_tab_edit">Edit</string>
+    <string name="plan_feedback_placeholder">Optional feedback or change requests…</string>
+    <string name="plan_approve_build">Approve &amp; Build</string>
+    <string name="plan_request_changes">Request Changes</string>
+    <string name="plan_dismiss">Dismiss</string>
+
+    <!-- Composer & Codex-Style Voice -->
+    <string name="composer_placeholder">Ask anything, @ to mention, / for actions</string>
+    <string name="composer_voice_start">Start voice input</string>
+    <string name="composer_voice_stop">Finish voice input</string>
+    <string name="composer_voice_cancel">Cancel voice input</string>
+    <string name="composer_voice_listening">Listening…</string>
+    <string name="composer_voice_unavailable">Voice recognition is unavailable on this device</string>
+    <string name="composer_voice_permission_denied">Microphone permission is required for voice input</string>
+    <string name="composer_send">Send prompt</string>
+    <string name="composer_queue">Queue follow-up</string>
+    <string name="composer_stop">Stop agent</string>
+    <string name="composer_add_attachment">Add attachment</string>
+    <string name="composer_photos">Photos</string>
+    <string name="composer_camera">Camera</string>
+    <string name="composer_files">Files</string>
+    <string name="composer_fast">Fast</string>
+    <string name="composer_access_permissions">Access Permissions</string>
+
+    <!-- Raw Terminal -->
+    <string name="terminal_mode_raw">Raw</string>
+    <string name="terminal_mode_line">Line</string>
+    <string name="terminal_raw_hint">Direct VT100 input active — tap terminal to type</string>
+    <string name="terminal_line_hint">Type shell command…</string>
+    <string name="terminal_connecting">Connecting to remote shim PTY…</string>
+    <string name="terminal_quote">Quote</string>
+
+    <!-- File Explorer & Code Viewer -->
+    <string name="files_title">Workspace Files</string>
+    <string name="files_search_placeholder">Filter files by path…</string>
+    <string name="files_touched_section">Touched in Session</string>
+    <string name="files_all_section">Repository Files</string>
+    <string name="files_empty">No workspace files indexed yet.</string>
+    <string name="files_loading">Reading file…</string>
+    <string name="files_truncated">Preview truncated at %1$d bytes</string>
+    <string name="files_quote_composer">Quote in Composer</string>
+
+    <!-- Git Review & Writes -->
+    <string name="git_unstaged">Unstaged</string>
+    <string name="git_staged">Staged</string>
+    <string name="git_stage_all">Stage All</string>
+    <string name="git_unstage_all">Unstage All</string>
+    <string name="git_stage_file">Stage</string>
+    <string name="git_unstage_file">Unstage</string>
+    <string name="git_commit">Commit</string>
+    <string name="git_commit_placeholder">Commit message…</string>
+    <string name="git_generate_commit">Generate</string>
+    <string name="git_amend">Amend previous commit</string>
+    <string name="git_pr_section">Pull Request</string>
+    <string name="git_create_pr">Create PR</string>
+    <string name="git_pr_title_placeholder">Pull request title…</string>
+    <string name="git_pr_body_placeholder">Summary of changes…</string>
+    <string name="git_pr_draft">Create as draft</string>
+    <string name="git_conflicts_banner">%1$d conflicted files</string>
+    <string name="git_resolve_ours">Use Ours</string>
+    <string name="git_resolve_theirs">Use Theirs</string>
+    <string name="git_stash_save">Stash Changes</string>
+    <string name="git_stash_pop">Pop Stash</string>
+
+    <!-- Global Search -->
+    <string name="search_title">Cross-Host Search</string>
+    <string name="search_placeholder">Search messages across all paired hosts…</string>
+    <string name="search_include_remote">Search remote daemons</string>
+    <string name="search_empty_prompt">Search turns, tool output, and decisions across your fleet.</string>
+    <string name="search_no_results">No matching messages found.</string>
+    <string name="search_remote_summary">%1$d remote hosts queried</string>
+
+    <!-- Automations (Schedules, Timers, Goals, Monitors, Workflows, Hooks) -->
+    <string name="auto_tab_schedules">Schedules</string>
+    <string name="auto_tab_timers">Timers</string>
+    <string name="auto_tab_goals">Goals</string>
+    <string name="auto_tab_monitors">Monitors</string>
+    <string name="auto_tab_workflows">Workflows</string>
+    <string name="auto_tab_hooks">Rules</string>
+    <string name="auto_start_goal">Start Goal</string>
+    <string name="auto_start_monitor">New Monitor</string>
+    <string name="auto_new_rule">Add Rule</string>
+    <string name="auto_guardian_title">Guardian Auto-Review</string>
+
+    <!-- Personal Router & Fleet Mesh -->
+    <string name="router_title">Personal Agent &amp; Mesh</string>
+    <string name="router_section">Personal Router</string>
+    <string name="router_mesh_section">Fleet Mesh Peers</string>
+    <string name="router_activate">Activate Router</string>
+    <string name="router_pause">Pause Router</string>
+    <string name="router_scope_global">Global Fleet</string>
+    <string name="router_scope_local">Local Host Only</string>
+    <string name="router_mesh_empty">No mesh peers registered on this host.</string>
+
+    <!-- Cloud Sync & Device Link QR -->
+    <string name="sync_title">Cloud Sync</string>
+    <string name="sync_instant_unlock">Instant Zero-Passphrase Unlock</string>
+    <string name="sync_instant_unlock_desc">Unlock synced hosts automatically using your hardware-protected session without typing a passphrase.</string>
+    <string name="sync_device_link_title">Link Another Device (1-Scan QR)</string>
+    <string name="sync_device_link_desc">Scan this QR code from Orbit on another phone, tablet, or desktop to join your synced fleet instantly.</string>
+    <string name="sync_show_qr">Show Device Link QR</string>
+    <string name="sync_hide_qr">Hide QR</string>
+    <string name="sync_copy_link">Copy Link URI</string>
+    <string name="sync_scan_device_link">Scan Device Link QR</string>
+
+    <!-- Push Settings & Transcript Export -->
+    <string name="push_section_title">Push Notifications (FCM)</string>
+    <string name="push_test_button">Send Test Push</string>
+    <string name="push_registered_devices">%1$d registered devices</string>
+    <string name="export_format_title">Export Transcript</string>
+    <string name="export_markdown">Markdown (.md)</string>
+    <string name="export_json">JSON (.json)</string>
+    <string name="export_html">HTML (.html)</string>
 </resources>

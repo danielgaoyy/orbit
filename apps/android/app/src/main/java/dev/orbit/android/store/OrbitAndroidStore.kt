@@ -11,8 +11,10 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.orbit.android.BuildConfig
+import dev.orbit.android.notifications.OrbitDeepLinkAction
 import dev.orbit.android.notifications.OrbitFirebaseMessagingBridge
 import dev.orbit.android.notifications.OrbitNotificationHelper
+import dev.orbit.android.notifications.OrbitPushRouter
 import dev.orbit.android.ui.sheets.SideQuestionEntry
 import dev.orbit.android.ui.theme.OrbitAppearanceMode
 import kotlinx.coroutines.CompletableDeferred
@@ -25,6 +27,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.orbit_ffi_uniffi.ConnectedHostSummary
+import uniffi.orbit_ffi_uniffi.ConversationSearchHit
+import uniffi.orbit_ffi_uniffi.DagStepSpec
 import uniffi.orbit_ffi_uniffi.FfiAgentCard
 import uniffi.orbit_ffi_uniffi.FfiAgentStage
 import uniffi.orbit_ffi_uniffi.FfiAgentStageDelta
@@ -61,13 +66,17 @@ import uniffi.orbit_ffi_uniffi.FfiMentionCandidate
 import uniffi.orbit_ffi_uniffi.FfiMentionRankRequest
 import uniffi.orbit_ffi_uniffi.FfiModelSelectionRequest
 import uniffi.orbit_ffi_uniffi.FfiOrbitException
+import uniffi.orbit_ffi_uniffi.FfiPermissionRequestId
 import uniffi.orbit_ffi_uniffi.FfiPromptBadge
 import uniffi.orbit_ffi_uniffi.FfiProviderKind
 import uniffi.orbit_ffi_uniffi.FfiProviderModelCatalog
 import uniffi.orbit_ffi_uniffi.FfiProviderModelSpec
+import uniffi.orbit_ffi_uniffi.FfiPushDevicesSnapshot
+import uniffi.orbit_ffi_uniffi.FfiPushPlatform
 import uniffi.orbit_ffi_uniffi.FfiPushRegistrationStatus
 import uniffi.orbit_ffi_uniffi.FfiQuestionItem
 import uniffi.orbit_ffi_uniffi.FfiReasoningEffort
+import uniffi.orbit_ffi_uniffi.FfiRegisterPushDeviceRequest
 import uniffi.orbit_ffi_uniffi.FfiRenderDiagramRequest
 import uniffi.orbit_ffi_uniffi.FfiRenderDiagramView
 import uniffi.orbit_ffi_uniffi.FfiResolvedModelSelection
@@ -84,9 +93,30 @@ import uniffi.orbit_ffi_uniffi.FfiThreadPrefSeed
 import uniffi.orbit_ffi_uniffi.FfiTimelineItem
 import uniffi.orbit_ffi_uniffi.FfiToolCallDetail
 import uniffi.orbit_ffi_uniffi.FfiToolStepDescriptor
+import uniffi.orbit_ffi_uniffi.FfiWorkspaceFile
+import uniffi.orbit_ffi_uniffi.GitConflictFile
+import uniffi.orbit_ffi_uniffi.GitConflictResolution
+import uniffi.orbit_ffi_uniffi.GitPrStatus
+import uniffi.orbit_ffi_uniffi.GitStashEntry
+import uniffi.orbit_ffi_uniffi.GuardianConfigSnapshotView
+import uniffi.orbit_ffi_uniffi.GuardianPolicyConfig
 import uniffi.orbit_ffi_uniffi.MobileCoreListener
+import uniffi.orbit_ffi_uniffi.MonitorKind
 import uniffi.orbit_ffi_uniffi.OrbitMobileCore
+import uniffi.orbit_ffi_uniffi.PermissionRuleRecord
+import uniffi.orbit_ffi_uniffi.PersonalRouterConfig
+import uniffi.orbit_ffi_uniffi.PlanApprovalAction
+import uniffi.orbit_ffi_uniffi.PushPreferences
+import uniffi.orbit_ffi_uniffi.RouterHostCapabilities
+import uniffi.orbit_ffi_uniffi.RouterStatusSnapshot
+import uniffi.orbit_ffi_uniffi.SearchMessagesRequest
 import uniffi.orbit_ffi_uniffi.SideQuestionListener
+import uniffi.orbit_ffi_uniffi.StartDagWorkflowRequest
+import uniffi.orbit_ffi_uniffi.StartGoalRunRequest
+import uniffi.orbit_ffi_uniffi.StartMonitorWatchRequest
+import uniffi.orbit_ffi_uniffi.TimerCondition
+import uniffi.orbit_ffi_uniffi.UpdatePushPreferencesRequest
+import uniffi.orbit_ffi_uniffi.UpsertPermissionRuleInput
 import uniffi.orbit_ffi_uniffi.defaultEffortDescription
 import uniffi.orbit_ffi_uniffi.fallbackProviderCatalog
 import uniffi.orbit_ffi_uniffi.formatCatalogModelLabel
@@ -265,9 +295,35 @@ data class OrbitUiState(
     val sideQuestionDraftsByScope: Map<String, String> = emptyMap(),
     val cloudSyncStatus: FfiCloudSyncStatus? = null,
     val cloudSyncDeviceFlow: FfiGitHubDeviceFlowStart? = null,
+    val cloudSyncDeviceLinkUri: String? = null,
     val cloudSyncBusy: Boolean = false,
     val cloudSyncError: String? = null,
     val pushRegistrationStatus: FfiPushRegistrationStatus? = null,
+    val pushDevicesSnapshot: FfiPushDevicesSnapshot? = null,
+    val showGlobalOverview: Boolean = false,
+    val stageHasOlderTurns: Boolean = false,
+    val stageOldestLoadedSeq: ULong = 0uL,
+    val stageAuxRevision: ULong = 0uL,
+    val isLoadingOlderTurns: Boolean = false,
+    val activeFilePreview: FfiWorkspaceFile? = null,
+    val isLoadingFilePreview: Boolean = false,
+    val filePreviewError: String? = null,
+    val gitPrStatus: GitPrStatus? = null,
+    val gitConflicts: List<GitConflictFile> = emptyList(),
+    val gitStashes: List<GitStashEntry> = emptyList(),
+    val gitMutationBusy: Boolean = false,
+    val generatedCommitMessage: String? = null,
+    val routerHosts: List<RouterHostCapabilities> = emptyList(),
+    val routerStatus: RouterStatusSnapshot? = null,
+    val fleetMeshSnapshot: Map<String, List<ConnectedHostSummary>> = emptyMap(),
+    val isLoadingRouterMesh: Boolean = false,
+    val globalSearchQuery: String = "",
+    val globalSearchHits: List<ConversationSearchHit> = emptyList(),
+    val globalSearchRemoteQueried: UInt = 0u,
+    val globalSearchRemoteFailed: UInt = 0u,
+    val isSearchingGlobal: Boolean = false,
+    val permissionRules: List<PermissionRuleRecord> = emptyList(),
+    val guardianSnapshot: GuardianConfigSnapshotView? = null,
     val pendingSheetTriggerId: Long = 0L,
     val pendingSheetTrigger: String? = null,
     val lastError: String? = null,
@@ -625,10 +681,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     init {
-        val dbFile = File(application.filesDir, "orbit_android_v3.sqlite")
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val instance = OrbitMobileCore.openWithOptions(dbFile.absolutePath, true)
+                val instance = OrbitRepository.openMobileCore(application)
                 core = instance
 
                 if (!prefs.getBoolean(KEY_MIGRATED_THREAD_PREFS_V1, false)) {
@@ -1003,31 +1058,18 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun handleDeepLinkUri(uriString: String?) {
-        val trimmed = uriString?.trim().orEmpty()
-        if (trimmed.isEmpty()) return
-        if (trimmed.startsWith("orbit://pair", ignoreCase = true)) {
-            pairHost(trimmed)
+        val action = OrbitPushRouter.parseDeepLink(uriString) ?: run {
+            val trimmed = uriString?.trim().orEmpty()
+            if (trimmed.startsWith("orbit://open", ignoreCase = true)) {
+                postToast("Invalid session link")
+            }
             return
         }
-        val parsed = runCatching { Uri.parse(trimmed) }.getOrNull() ?: return
-        if (parsed.scheme.equals("orbit", ignoreCase = true) &&
-            parsed.host.equals("open", ignoreCase = true)
-        ) {
-            val hostParam = parsed.getQueryParameter("host")?.trim().orEmpty()
-            val agentParam = parsed.getQueryParameter("agent")?.trim().orEmpty()
-            if (hostParam.isNotEmpty() && !SAFE_DEEP_LINK_ID_REGEX.matches(hostParam)) {
-                postToast("Invalid host link")
-                return
-            }
-            if (agentParam.isNotEmpty() && !SAFE_DEEP_LINK_ID_REGEX.matches(agentParam)) {
-                postToast("Invalid session link")
-                return
-            }
-            if (hostParam.isNotEmpty() && agentParam.isNotEmpty()) {
-                openThreadFromDeepLink(hostParam, agentParam)
-            } else if (hostParam.isNotEmpty()) {
-                openHostFromDeepLink(hostParam)
-            }
+        when (action) {
+            is OrbitDeepLinkAction.PairHost -> pairHost(action.uri)
+            is OrbitDeepLinkAction.ImportDeviceLink -> importCloudSyncDeviceLinkUri(action.uri)
+            is OrbitDeepLinkAction.OpenThread -> openThreadFromDeepLink(action.hostId, action.agentId)
+            is OrbitDeepLinkAction.OpenHost -> openHostFromDeepLink(action.hostId)
         }
     }
 
@@ -1355,50 +1397,22 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun mergeStageDelta(prevStage: FfiAgentStage?, hostId: String, agentId: String, delta: FfiAgentStageDelta): FfiAgentStage {
-        val sameStage = prevStage != null &&
-            prevStage.hostId == hostId &&
-            (prevStage.agent?.agentId ?: agentId) == agentId
-        return if (!delta.reset && sameStage && delta.replaceFromTurnIndex.toInt() <= prevStage!!.turns.size) {
-            val prefixCount = delta.replaceFromTurnIndex.toInt()
-            val mergedTurns = prevStage.turns.take(prefixCount) + delta.changedTurns
-            FfiAgentStage(
-                revision = delta.revision,
-                hostId = delta.hostId,
-                agent = delta.agent ?: prevStage.agent,
-                turns = mergedTurns,
-                pendingPermissions = delta.pendingPermissions,
-                pendingQuestions = delta.pendingQuestions,
-                sessionTurnDiffs = delta.sessionTurnDiffs,
-                insights = delta.insights,
-                latestSeq = delta.latestSeq,
-            )
-        } else {
-            FfiAgentStage(
-                revision = delta.revision,
-                hostId = delta.hostId,
-                agent = delta.agent,
-                turns = delta.changedTurns,
-                pendingPermissions = delta.pendingPermissions,
-                pendingQuestions = delta.pendingQuestions,
-                sessionTurnDiffs = delta.sessionTurnDiffs,
-                insights = delta.insights,
-                latestSeq = delta.latestSeq,
-            )
-        }
-    }
-
     private fun reloadStageInternal(hostId: String, agentId: String) {
-        val prevStage = _state.value.agentStage
+        val prevState = _state.value
+        val prevStage = prevState.agentStage
         val sameStage = prevStage != null &&
             prevStage.hostId == hostId &&
-            (prevStage.agent?.agentId ?: _state.value.selectedAgentId) == agentId
+            (prevStage.agent?.agentId ?: prevState.selectedAgentId) == agentId
         val sinceRev = if (sameStage) prevStage!!.revision else 0uL
-        var delta = runCatching { core?.agentStageDelta(hostId, agentId, sinceRev) }.getOrNull() ?: return
+        val sinceAuxRev = if (sameStage && prevState.stageAuxRevision > 0uL) prevState.stageAuxRevision else null
+        var delta = runCatching {
+            core?.agentStageDeltaWithAux(hostId, agentId, sinceRev, sinceAuxRev)
+        }.getOrNull() ?: return
         if (!delta.reset && sinceRev > 0uL && prevStage != null && delta.replaceFromTurnIndex.toInt() > prevStage.turns.size) {
-            delta = runCatching { core?.agentStageDelta(hostId, agentId, 0uL) }.getOrNull() ?: delta
+            delta = runCatching { core?.agentStageDeltaWithAux(hostId, agentId, 0uL, null) }.getOrNull() ?: delta
         }
-        val stage = mergeStageDelta(prevStage, hostId, agentId, delta)
+        val merged = StageDeltaReducer.merge(prevStage, hostId, agentId, delta)
+        val stage = merged.stage
 
         _state.update { prev ->
             val ag = stage.agent
@@ -1415,6 +1429,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             }
             prev.copy(
                 agentStage = stage,
+                stageHasOlderTurns = merged.hasOlderTurns,
+                stageOldestLoadedSeq = merged.oldestLoadedSeq,
+                stageAuxRevision = merged.auxRevision,
+                isLoadingOlderTurns = false,
                 activeCwd = ag?.cwd ?: prev.activeCwd,
                 composer = nextComposer,
             )
@@ -1564,6 +1582,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     fun pairHost(uri: String, onSuccess: (() -> Unit)? = null) {
         val trimmed = uri.trim()
         if (trimmed.isEmpty()) return
+        if (trimmed.startsWith("orbit://sync-login", ignoreCase = true)) {
+            importCloudSyncDeviceLinkUri(trimmed, onSuccess)
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val readyCore = core ?: coreReady.await()
@@ -1575,6 +1597,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 _state.update { it.copy(lastError = null) }
                 reloadFleetInternal()
                 selectHost(card.hostId)
+                OrbitFirebaseMessagingBridge.loadPersistedToken(getApplication())?.let { token ->
+                    registerPushToken(OrbitFirebaseMessagingBridge.PLATFORM_ANDROID_FCM, token)
+                }
                 postToast("Paired ${card.displayName}")
                 onSuccess?.let { viewModelScope.launch(Dispatchers.Main) { it() } }
             } catch (t: Throwable) {
@@ -1676,7 +1701,11 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             prev.copy(
                 selectedAgentId = null,
                 isNewSessionMode = true,
+                showGlobalOverview = false,
                 agentStage = null,
+                stageHasOlderTurns = false,
+                stageOldestLoadedSeq = 0uL,
+                stageAuxRevision = 0uL,
                 activeCwd = nextCwd,
                 composer = nextComposer,
                 lastError = null,
@@ -1736,6 +1765,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             prev.copy(
                 selectedAgentId = agentId,
                 isNewSessionMode = false,
+                showGlobalOverview = false,
+                stageHasOlderTurns = false,
+                stageOldestLoadedSeq = 0uL,
+                stageAuxRevision = 0uL,
                 lastError = null,
             )
         }
@@ -3672,6 +3705,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun exportActiveTranscriptMarkdown() {
+        exportActiveTranscript(FfiExportFormat.MARKDOWN)
+    }
+
+    fun exportActiveTranscript(format: FfiExportFormat) {
         val cur = _state.value
         val hostId = cur.selectedHostId ?: return
         val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: run {
@@ -3686,14 +3723,13 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     hostId = hostId,
                     agentId = agentId,
                     options = FfiExportOptions(
-                        format = FfiExportFormat.MARKDOWN,
+                        format = format,
                         includeThinking = false,
                         includeToolCalls = true,
                         includeTimestamps = true,
                     ),
                 )
                 val exportDir = File(app.cacheDir, "orbit_exports").apply { mkdirs() }
-                // Prune stale export artifacts so cacheDir does not grow unbounded.
                 val nowMs = System.currentTimeMillis()
                 exportDir.listFiles()
                     ?.sortedByDescending { it.lastModified() }
@@ -3703,15 +3739,20 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                         }
                     }
 
+                val ext = when (format) {
+                    FfiExportFormat.MARKDOWN -> "md"
+                    FfiExportFormat.JSON -> "json"
+                    FfiExportFormat.HTML -> "html"
+                }
                 val sanitizedStem = exported.suggestedFilename
                     .substringAfterLast('/')
                     .substringAfterLast('\\')
                     .replace(Regex("[^A-Za-z0-9._-]"), "_")
                     .trimStart('.')
-                    .removeSuffix(".md")
+                    .removeSuffix(".$ext")
                     .ifBlank { "orbit_transcript" }
                     .take(80)
-                val safeName = "$sanitizedStem.md"
+                val safeName = "$sanitizedStem.$ext"
                 val outFile = File(exportDir, safeName)
                 require(outFile.canonicalFile.parentFile == exportDir.canonicalFile) {
                     "Refused unsafe export path"
@@ -3722,8 +3763,13 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     "${app.packageName}.fileprovider",
                     outFile,
                 )
+                val fallbackMime = when (format) {
+                    FfiExportFormat.MARKDOWN -> "text/markdown"
+                    FfiExportFormat.JSON -> "application/json"
+                    FfiExportFormat.HTML -> "text/html"
+                }
                 val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                    type = exported.mimeType.ifBlank { "text/markdown" }
+                    type = exported.mimeType.ifBlank { fallbackMime }
                     putExtra(Intent.EXTRA_STREAM, uri)
                     putExtra(Intent.EXTRA_SUBJECT, safeName)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -3928,24 +3974,819 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    // --- Push Notification Registration Bridge ---
+    // --- Zero-Passphrase Cloud Sync & 1-Scan Device Link QR ---
+
+    fun setCloudManualPassphraseMode(requireManual: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.cloudSyncSetManualPassphraseMode(requireManual) }
+                .onSuccess { st ->
+                    if (st != null) {
+                        _state.update { it.copy(cloudSyncStatus = st) }
+                    }
+                }
+                .onFailure { t ->
+                    _state.update { it.copy(cloudSyncError = extractErrorMessage(t, "Failed to update unlock mode")) }
+                }
+        }
+    }
+
+    fun exportCloudSyncDeviceLinkUri() {
+        _state.update { it.copy(cloudSyncBusy = true, cloudSyncError = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val uri = core?.cloudSyncExportDeviceLinkUri()
+                    ?: throw IllegalStateException("Orbit core not ready")
+                _state.update { it.copy(cloudSyncDeviceLinkUri = uri, cloudSyncBusy = false) }
+            } catch (t: Throwable) {
+                _state.update {
+                    it.copy(
+                        cloudSyncBusy = false,
+                        cloudSyncError = extractErrorMessage(t, "Failed to export Device Link QR"),
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearCloudSyncDeviceLinkUri() {
+        _state.update { it.copy(cloudSyncDeviceLinkUri = null) }
+    }
+
+    fun importCloudSyncDeviceLinkUri(uri: String, onSuccess: (() -> Unit)? = null) {
+        val clean = uri.trim()
+        if (clean.isEmpty()) return
+        _state.update { it.copy(cloudSyncBusy = true, cloudSyncError = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val readyCore = core ?: coreReady.await() ?: throw IllegalStateException("Orbit core not ready")
+                val res = readyCore.cloudSyncImportDeviceLinkUri(clean)
+                val st = runCatching { readyCore.cloudSyncStatus() }.getOrNull()
+                _state.update {
+                    it.copy(
+                        cloudSyncStatus = st ?: it.cloudSyncStatus,
+                        cloudSyncBusy = false,
+                        cloudSyncError = null,
+                    )
+                }
+                reloadFleetInternal()
+                _state.value.selectedHostId?.let { reloadHostDetailInternal(it) }
+                postToast("Device linked · rev #${res.vaultRevision}")
+                onSuccess?.let { viewModelScope.launch(Dispatchers.Main) { it() } }
+            } catch (t: Throwable) {
+                val msg = extractErrorMessage(t, "Failed to import Device Link URI")
+                _state.update { it.copy(cloudSyncBusy = false, cloudSyncError = msg, lastError = msg) }
+            }
+        }
+    }
+
+    // --- Real Push Notification Device Registration (`registerPushDevice` UniFFI RPC) ---
 
     fun registerPushToken(platform: String, token: String) {
+        val cleanToken = token.trim()
+        if (cleanToken.isEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
             val activeCore = core ?: coreReady.await() ?: return@launch
-            runCatching { activeCore.registerPushToken(platform, token) }
-                .onSuccess { st ->
-                    _state.update { it.copy(pushRegistrationStatus = st) }
-                }
+            val app = getApplication<Application>()
+            val deviceId = OrbitRepository.getOrCreateDeviceId(app)
+            val deviceName = OrbitRepository.deviceDisplayName()
+            // Persist local push token metadata first
+            runCatching { activeCore.registerPushToken(platform, cleanToken) }
+                .onSuccess { st -> _state.update { it.copy(pushRegistrationStatus = st) } }
+            // Register across all paired hosts via canonical daemon RPC `registerPushDevice`
+            val hostIds = _state.value.hosts.map { it.hostId }
+            val req = FfiRegisterPushDeviceRequest(
+                deviceId = deviceId,
+                platform = FfiPushPlatform.FCM,
+                deviceName = deviceName,
+                deviceToken = cleanToken,
+                sandbox = BuildConfig.DEBUG,
+                liveActivityToken = null,
+            )
+            var latestSnapshot: FfiPushDevicesSnapshot? = null
+            hostIds.forEach { hostId ->
+                runCatching { activeCore.registerPushDevice(hostId, req) }
+                    .onSuccess { snap ->
+                        if (hostId == _state.value.selectedHostId || latestSnapshot == null) {
+                            latestSnapshot = snap
+                        }
+                    }
+            }
+            latestSnapshot?.let { snap ->
+                _state.update { it.copy(pushDevicesSnapshot = snap) }
+            }
+        }
+    }
+
+    fun refreshPushDevices(hostId: String? = _state.value.selectedHostId) {
+        val targetHost = hostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            runCatching { activeCore.listPushDevices(targetHost) }
+                .onSuccess { snap -> _state.update { it.copy(pushDevicesSnapshot = snap) } }
+        }
+    }
+
+    fun updateHostPushPreferences(prefsUpdate: PushPreferences) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            runCatching {
+                activeCore.updatePushPreferences(
+                    hostId = hostId,
+                    req = UpdatePushPreferencesRequest(
+                        preferences = prefsUpdate,
+                        gatewayAuthToken = null,
+                        keepExistingGatewayToken = true,
+                    ),
+                )
+            }.onSuccess { snap ->
+                _state.update { it.copy(pushDevicesSnapshot = snap) }
+                postToast("Push preferences saved")
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to save push preferences"))
+            }
+        }
+    }
+
+    fun sendTestPushNotification() {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            val deviceId = OrbitRepository.getOrCreateDeviceId(getApplication())
+            runCatching { activeCore.testPushNotification(hostId, deviceId) }
+                .onSuccess { res -> postToast(res.detail.ifBlank { "Test push sent (${res.delivered}/${res.attempted})" }) }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Test push failed")) }
         }
     }
 
     fun unregisterPushToken() {
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { core?.unregisterPushToken(OrbitFirebaseMessagingBridge.PLATFORM_ANDROID_FCM) }
+            val activeCore = core
+            val deviceId = OrbitRepository.getOrCreateDeviceId(getApplication())
+            _state.value.hosts.forEach { host ->
+                runCatching { activeCore?.unregisterPushDevice(host.hostId, deviceId) }
+            }
+            runCatching { activeCore?.unregisterPushToken(OrbitFirebaseMessagingBridge.PLATFORM_ANDROID_FCM) }
             OrbitFirebaseMessagingBridge.clearToken(getApplication())
-            val st = runCatching { core?.pushRegistrationStatus() }.getOrNull()
-            _state.update { it.copy(pushRegistrationStatus = st) }
+            val st = runCatching { activeCore?.pushRegistrationStatus() }.getOrNull()
+            _state.update { it.copy(pushRegistrationStatus = st, pushDevicesSnapshot = null) }
+        }
+    }
+
+    // --- Global Overview, Safe Batch Approvals & Personal Agent Dispatch ---
+
+    fun openGlobalOverview() {
+        _state.update { it.copy(showGlobalOverview = true, lastError = null) }
+        refreshRouterAndMesh()
+    }
+
+    fun closeGlobalOverview() {
+        _state.update { it.copy(showGlobalOverview = false) }
+    }
+
+    fun selectHostAndAgent(hostId: String, agentId: String) {
+        _state.update { it.copy(showGlobalOverview = false) }
+        if (_state.value.selectedHostId == hostId) {
+            selectAgent(agentId)
+        } else {
+            openThreadFromDeepLink(hostId, agentId)
+        }
+    }
+
+    fun resolvePermissionsBatchSafe(
+        hostId: String,
+        permissionsByAgent: List<Pair<String, FfiTimelineItem.PermissionRequest>>,
+    ) {
+        val safeItems = permissionsByAgent
+            .filter { (_, perm) -> OverviewSafetyReducer.isSafeLowRiskBatchCandidate(perm) }
+            .map { (agentId, perm) -> FfiPermissionRequestId(agentId = agentId, permissionRequestId = perm.requestId) }
+        if (safeItems.isEmpty()) {
+            postToast("No low-risk approvals eligible for batch approve")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val res = core?.resolvePermissionsBatch(hostId, safeItems, "allow")
+                    ?: throw IllegalStateException("Orbit core not ready")
+                reloadFleetInternal()
+                reloadHostDetailInternal(hostId)
+                _state.value.selectedAgentId?.let { aid ->
+                    if (_state.value.selectedHostId == hostId) reloadStageInternal(hostId, aid)
+                }
+                postToast("Approved ${res.resolvedCount} safe requests")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Batch approval failed"))
+            }
+        }
+    }
+
+    fun resolvePlanApproval(
+        requestId: String,
+        action: PlanApprovalAction,
+        originalMarkdown: String,
+        draftMarkdown: String,
+        feedback: String,
+    ) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId ?: return
+        val payload = PlanApprovalReducer.buildSubmitPayload(
+            action = action,
+            originalMarkdown = originalMarkdown,
+            draftMarkdown = draftMarkdown,
+            feedback = feedback,
+        )
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.resolvePlanApproval(
+                    hostId = hostId,
+                    agentId = agentId,
+                    permissionRequestId = requestId,
+                    action = payload.action,
+                    editedPlanMarkdown = payload.editedPlanMarkdown,
+                    feedback = payload.feedback,
+                    targetMode = payload.targetMode,
+                )
+                reloadStageInternal(hostId, agentId)
+                reloadHostDetailInternal(hostId)
+            } catch (t: Throwable) {
+                _state.update { it.copy(lastError = extractErrorMessage(t, "Failed to resolve plan approval")) }
+            }
+        }
+    }
+
+    fun sendPersonalAgentPrompt(promptText: String) {
+        val trimmed = promptText.trim()
+        if (trimmed.isEmpty()) return
+        val cur = _state.value
+        val routerHost = cur.routerHosts.firstOrNull { it.activeRouterAgentId != null && it.online }
+            ?: cur.routerHosts.firstOrNull { it.routerEnabled && it.online }
+        val activeRouterAgentId = cur.routerStatus?.routerAgent?.agentId ?: routerHost?.activeRouterAgentId
+        val targetHostId = routerHost?.hostId ?: cur.selectedHostId ?: cur.hosts.firstOrNull()?.hostId ?: return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                if (activeRouterAgentId != null) {
+                    activeCore.sendPrompt(targetHostId, activeRouterAgentId, trimmed)
+                    withContext(Dispatchers.Main) {
+                        selectHostAndAgent(targetHostId, activeRouterAgentId)
+                    }
+                } else {
+                    val agentId = activeCore.createSession(
+                        FfiCreateSessionRequest(
+                            hostId = targetHostId,
+                            cwd = cur.activeCwd,
+                            extraDirs = emptyList(),
+                            provider = cur.composer.provider,
+                            acpAgentId = null,
+                            model = cur.composer.model,
+                            effort = cur.composer.effort,
+                            mode = cur.composer.mode,
+                            initialPrompt = trimmed,
+                            initialDisplayPrompt = trimmed,
+                            initialBadges = emptyList(),
+                            worktreeBranch = null,
+                        )
+                    )
+                    reloadHostDetailInternal(targetHostId)
+                    withContext(Dispatchers.Main) {
+                        selectHostAndAgent(targetHostId, agentId)
+                    }
+                }
+            } catch (t: Throwable) {
+                _state.update { it.copy(lastError = extractErrorMessage(t, "Failed to send to Personal Agent")) }
+            }
+        }
+    }
+
+    // --- Tail Pagination & Delivery Interruption ---
+
+    fun loadOlderTimeline(limitEvents: UInt = 80u) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: return
+        if (cur.isLoadingOlderTurns || !cur.stageHasOlderTurns) return
+        _state.update { it.copy(isLoadingOlderTurns = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val loadedMore = core?.loadOlderAgentTimeline(hostId, agentId, limitEvents) ?: false
+                reloadStageInternal(hostId, agentId)
+                if (!loadedMore) {
+                    _state.update { it.copy(stageHasOlderTurns = false, isLoadingOlderTurns = false) }
+                }
+            } catch (t: Throwable) {
+                _state.update { it.copy(isLoadingOlderTurns = false) }
+                postToast(extractErrorMessage(t, "Failed to load earlier history"))
+            }
+        }
+    }
+
+    fun interruptAgentAndContinue() {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.interruptAgentAndContinue(hostId, agentId) }
+                .onSuccess {
+                    reloadStageInternal(hostId, agentId)
+                    postToast("Interrupted & delivering queued message")
+                }
+                .onFailure { t ->
+                    postToast(extractErrorMessage(t, "Failed to interrupt & deliver"))
+                }
+        }
+    }
+
+    // --- File Explorer & Syntax-Highlighted Code Viewer ---
+
+    fun openWorkspaceFile(path: String) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(isLoadingFilePreview = true, filePreviewError = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val file = core?.readWorkspaceFile(hostId, cwd, path)
+                    ?: throw IllegalStateException("Orbit core not ready")
+                _state.update {
+                    it.copy(
+                        activeFilePreview = file,
+                        isLoadingFilePreview = false,
+                        filePreviewError = null,
+                    )
+                }
+            } catch (t: Throwable) {
+                _state.update {
+                    it.copy(
+                        isLoadingFilePreview = false,
+                        filePreviewError = extractErrorMessage(t, "Failed to read file"),
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearWorkspaceFilePreview() {
+        _state.update { it.copy(activeFilePreview = null, filePreviewError = null, isLoadingFilePreview = false) }
+    }
+
+    // --- Git Write Operations (Stage, Unstage, Commit, Generate Message, PR, Conflicts, Stash) ---
+
+    fun refreshGitExtras() {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            val pr = runCatching { activeCore.gitPrStatus(hostId, cwd) }.getOrNull()
+            val conflicts = runCatching { activeCore.gitConflicts(hostId, cwd).files }.getOrDefault(emptyList())
+            val stashes = runCatching { activeCore.gitStashList(hostId, cwd).entries }.getOrDefault(emptyList())
+            _state.update {
+                it.copy(
+                    gitPrStatus = pr,
+                    gitConflicts = conflicts,
+                    gitStashes = stashes,
+                )
+            }
+        }
+    }
+
+    fun gitStagePaths(paths: List<String>, all: Boolean) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.gitStagePaths(hostId, cwd, paths, all)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                postToast(if (all) "Staged all changes" else "Staged ${paths.size} file(s)")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to stage files"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitUnstagePaths(paths: List<String>, all: Boolean) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.gitUnstagePaths(hostId, cwd, paths, all)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                postToast(if (all) "Unstaged all changes" else "Unstaged ${paths.size} file(s)")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to unstage files"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitGenerateCommitMessage() {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val res = core?.gitGenerateCommitMessage(hostId, cwd)
+                _state.update { it.copy(generatedCommitMessage = res?.message, gitMutationBusy = false) }
+            } catch (t: Throwable) {
+                _state.update { it.copy(gitMutationBusy = false) }
+                postToast(extractErrorMessage(t, "Failed to generate commit message"))
+            }
+        }
+    }
+
+    fun consumeGeneratedCommitMessage() {
+        _state.update { it.copy(generatedCommitMessage = null) }
+    }
+
+    fun gitCommit(message: String, amend: Boolean = false, onCommitted: () -> Unit = {}) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        val trimmed = message.trim()
+        if (trimmed.isEmpty()) return
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val res = core?.gitCommit(hostId, cwd, trimmed, amend)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                refreshGitExtras()
+                postToast("Committed ${res?.shortSha.orEmpty()}")
+                withContext(Dispatchers.Main) { onCommitted() }
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Git commit failed"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitCreatePr(title: String, body: String, base: String?, draft: Boolean, onCreated: () -> Unit = {}) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        if (title.isBlank()) return
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val res = core?.gitCreatePr(hostId, cwd, title.trim(), body.trim(), base?.trim()?.ifEmpty { null }, draft)
+                refreshGitExtras()
+                postToast("Created PR #${res?.number ?: ""}".trim())
+                withContext(Dispatchers.Main) { onCreated() }
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to create Pull Request"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitResolveConflict(path: String, resolution: GitConflictResolution, expectedSha256: String?) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.gitResolveConflict(hostId, cwd, path, null, resolution, true, expectedSha256)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                refreshGitExtras()
+                postToast("Resolved conflict in ${OrbitFormatters.shortPath(path)}")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to resolve conflict"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitStashSave(message: String? = null, includeUntracked: Boolean = true) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.gitStashSave(hostId, cwd, message?.trim()?.ifEmpty { null }, includeUntracked)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                refreshGitExtras()
+                postToast("Saved working tree to stash")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to stash changes"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitStashPop(stashRef: String, expectedOid: String?) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.gitStashPop(hostId, cwd, stashRef, expectedOid)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                refreshGitExtras()
+                postToast("Popped $stashRef")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to pop stash"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    // --- Automations Creation, Permission Rules (Hooks) & Guardian ---
+
+    fun startGoalRun(objective: String, criteria: List<String>, verifyCommand: String?, maxIterations: UInt?) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId ?: cur.hostDetail?.agents?.firstOrNull()?.agentId ?: run {
+            postToast("Open or create a session first to start a Goal")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.startGoal(
+                    StartGoalRunRequest(
+                        hostId = hostId,
+                        agentId = agentId,
+                        objective = objective.trim(),
+                        criteria = criteria.filter { it.isNotBlank() },
+                        verifyCommand = verifyCommand?.trim()?.ifEmpty { null },
+                        maxIterations = maxIterations,
+                        maxDurationSecs = null,
+                    )
+                )
+                refreshAutomations()
+                postToast("Goal started")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to start goal"))
+            }
+        }
+    }
+
+    fun createMonitorWatch(name: String, kind: MonitorKind, expiresInSecs: ULong? = null) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId ?: cur.hostDetail?.agents?.firstOrNull()?.agentId ?: run {
+            postToast("Open or create a session first to add a Monitor")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.createMonitor(
+                    StartMonitorWatchRequest(
+                        hostId = hostId,
+                        agentId = agentId,
+                        name = name.trim(),
+                        kind = kind,
+                        expiresInSecs = expiresInSecs,
+                    )
+                )
+                refreshAutomations()
+                postToast("Monitor created")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to create monitor"))
+            }
+        }
+    }
+
+    fun createConditionalTimer(durationSecs: ULong, prompt: String, condition: TimerCondition = TimerCondition.Never) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId ?: cur.hostDetail?.agents?.firstOrNull()?.agentId ?: run {
+            postToast("Open a session first to arm a timer")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.createTimer(hostId, agentId, durationSecs, prompt.trim(), condition)
+                refreshAutomations()
+                postToast("Timer armed")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to create timer"))
+            }
+        }
+    }
+
+    fun startSimpleDagWorkflow(name: String, prompt: String) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val step = DagStepSpec(
+                    stepId = "step_1",
+                    name = name.trim(),
+                    dependsOn = emptyList(),
+                    promptTemplate = prompt.trim(),
+                    provider = OrbitFfiTypeBridge.toProviderKind(cur.composer.provider),
+                    model = cur.composer.model,
+                    isolatedWorktree = false,
+                    retryCount = 0u,
+                    timeoutSecs = 900uL,
+                )
+                core?.startWorkflow(
+                    StartDagWorkflowRequest(
+                        hostId = hostId,
+                        name = name.trim(),
+                        cwd = cur.activeCwd,
+                        steps = listOf(step),
+                        defaultProvider = OrbitFfiTypeBridge.toProviderKind(cur.composer.provider),
+                        defaultMode = OrbitFfiTypeBridge.toSessionMode(cur.composer.mode),
+                        maxConcurrency = 1u,
+                    )
+                )
+                refreshAutomations()
+                postToast("Workflow launched")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to launch workflow"))
+            }
+        }
+    }
+
+    fun refreshPermissionRulesAndGuardian() {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val rules = runCatching { core?.listPermissionRules(hostId, cur.activeCwd) }.getOrNull().orEmpty()
+            val guardian = runCatching { core?.getGuardianConfig(hostId) }.getOrNull()
+            _state.update { it.copy(permissionRules = rules, guardianSnapshot = guardian) }
+        }
+    }
+
+    fun upsertPermissionRule(rule: UpsertPermissionRuleInput) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.upsertPermissionRule(hostId, rule) }
+                .onSuccess {
+                    refreshPermissionRulesAndGuardian()
+                    postToast("Rule saved")
+                }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Failed to save rule")) }
+        }
+    }
+
+    fun deletePermissionRule(ruleId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.deletePermissionRule(hostId, ruleId) }
+                .onSuccess {
+                    refreshPermissionRulesAndGuardian()
+                    postToast("Rule removed")
+                }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Failed to remove rule")) }
+        }
+    }
+
+    fun updateGuardianConfig(config: GuardianPolicyConfig) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.updateGuardianConfig(hostId, config) }
+                .onSuccess { snap ->
+                    _state.update { it.copy(guardianSnapshot = snap) }
+                    postToast("Guardian policy updated")
+                }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Failed to update Guardian policy")) }
+        }
+    }
+
+    // --- Personal Router & Fleet Mesh ---
+
+    fun refreshRouterAndMesh() {
+        _state.update { it.copy(isLoadingRouterMesh = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: run {
+                _state.update { it.copy(isLoadingRouterMesh = false) }
+                return@launch
+            }
+            val routerHosts = runCatching { activeCore.discoverFleetRouterHosts() }.getOrDefault(emptyList())
+            val primaryHostId = routerHosts.firstOrNull { it.routerEnabled }?.hostId
+                ?: _state.value.selectedHostId
+                ?: routerHosts.firstOrNull()?.hostId
+            val routerStatus = primaryHostId?.let { hid ->
+                runCatching { activeCore.getRouterConfig(hid) }.getOrNull()
+            }
+            val mesh = runCatching { activeCore.getFleetMeshSnapshot() }.getOrDefault(emptyMap())
+            _state.update {
+                it.copy(
+                    routerHosts = routerHosts,
+                    routerStatus = routerStatus,
+                    fleetMeshSnapshot = mesh,
+                    isLoadingRouterMesh = false,
+                )
+            }
+        }
+    }
+
+    fun updatePersonalRouterConfig(
+        hostId: String,
+        config: PersonalRouterConfig,
+        activate: Boolean,
+    ) {
+        _state.update { it.copy(isLoadingRouterMesh = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val snap = core?.updateRouterConfig(hostId, config, null, activate)
+                _state.update { it.copy(routerStatus = snap ?: it.routerStatus, isLoadingRouterMesh = false) }
+                refreshRouterAndMesh()
+                postToast(if (config.enabled) "Personal Router updated" else "Personal Router paused")
+            } catch (t: Throwable) {
+                _state.update { it.copy(isLoadingRouterMesh = false) }
+                postToast(extractErrorMessage(t, "Failed to update Personal Router"))
+            }
+        }
+    }
+
+    fun toggleMeshPeer(hostId: String, registrationId: String, label: String?, enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.updateMeshPeer(hostId, registrationId, label, enabled) }
+                .onSuccess {
+                    refreshRouterAndMesh()
+                    postToast(if (enabled) "Mesh peer enabled" else "Mesh peer disabled")
+                }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Failed to update mesh peer")) }
+        }
+    }
+
+    // --- Global Cross-Host Search (Local FTS5 + Remote Daemons) ---
+
+    fun runGlobalSearch(query: String, includeRemote: Boolean = true) {
+        val trimmed = query.trim()
+        _state.update { it.copy(globalSearchQuery = query) }
+        if (trimmed.length < 2) {
+            _state.update {
+                it.copy(
+                    globalSearchHits = emptyList(),
+                    globalSearchRemoteQueried = 0u,
+                    globalSearchRemoteFailed = 0u,
+                    isSearchingGlobal = false,
+                )
+            }
+            return
+        }
+        _state.update { it.copy(isSearchingGlobal = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            try {
+                if (includeRemote) {
+                    val res = activeCore.searchMessagesRemote(
+                        SearchMessagesRequest(
+                            query = trimmed,
+                            hostId = null,
+                            agentId = null,
+                            limit = 40u,
+                        )
+                    )
+                    _state.update {
+                        it.copy(
+                            globalSearchHits = res.hits,
+                            globalSearchRemoteQueried = res.remoteHostsQueried,
+                            globalSearchRemoteFailed = res.remoteHostsFailed,
+                            isSearchingGlobal = false,
+                        )
+                    }
+                } else {
+                    val localHits = activeCore.searchMessages(trimmed, 40u).map { h ->
+                        ConversationSearchHit(
+                            hostId = h.hostId,
+                            hostName = h.hostName,
+                            agentId = h.agentId,
+                            seq = h.seq,
+                            turnId = null,
+                            role = h.role,
+                            title = h.title,
+                            projectName = h.projectName,
+                            snippet = h.snippet,
+                            updatedAtRfc3339 = h.updatedAtRfc3339,
+                            isRemote = false,
+                            isUnloaded = false,
+                        )
+                    }
+                    _state.update {
+                        it.copy(
+                            globalSearchHits = localHits,
+                            globalSearchRemoteQueried = 0u,
+                            globalSearchRemoteFailed = 0u,
+                            isSearchingGlobal = false,
+                        )
+                    }
+                }
+            } catch (t: Throwable) {
+                _state.update { it.copy(isSearchingGlobal = false) }
+                postToast(extractErrorMessage(t, "Search failed"))
+            }
         }
     }
 

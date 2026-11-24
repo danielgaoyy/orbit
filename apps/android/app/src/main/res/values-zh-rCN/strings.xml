@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Orbit</string>
+
+    <!-- 导航与框架 -->
+    <string name="nav_overview">总览</string>
+    <string name="nav_new_session">新对话</string>
+    <string name="nav_search">搜索</string>
+    <string name="nav_global_search">跨主机搜索</string>
+    <string name="nav_files">工作区文件</string>
+    <string name="nav_diff_review">变更审查</string>
+    <string name="nav_hide_diff_review">收起变更审查</string>
+    <string name="nav_full_diff">全屏 Diff</string>
+    <string name="nav_terminal">终端</string>
+    <string name="nav_side_question">侧边追问 (/btw)</string>
+    <string name="nav_workspace_board">协作看板与成员</string>
+    <string name="nav_automations">自动化</string>
+    <string name="nav_personal_router">个人代理与 Mesh</string>
+    <string name="nav_archived">已归档会话</string>
+    <string name="nav_settings">设置</string>
+    <string name="nav_pair_host">配对主机</string>
+    <string name="nav_fork_conversation">分叉对话</string>
+    <string name="nav_export_transcript">导出记录</string>
+    <string name="nav_archive">归档</string>
+    <string name="nav_open_folder">切换目录</string>
+    <string name="nav_copy_path">复制路径</string>
+    <string name="nav_open_drawer">打开主机侧栏</string>
+    <string name="nav_more_actions">更多操作</string>
+    <string name="nav_close">关闭</string>
+    <string name="nav_back">返回</string>
+    <string name="nav_refresh">刷新</string>
+    <string name="nav_cancel">取消</string>
+    <string name="nav_confirm">确认</string>
+    <string name="nav_copy">复制</string>
+    <string name="nav_copied">已复制</string>
+    <string name="nav_save">保存</string>
+    <string name="nav_delete">删除</string>
+
+    <!-- 个人代理全局总览 -->
+    <string name="overview_title">个人代理</string>
+    <string name="overview_status_calm">全部安静 · %1$d 台%2$s在线</string>
+    <string name="overview_status_working">%1$d 个%2$s运行中 · %3$d 台主机在线</string>
+    <string name="overview_status_attention">%1$d 项%2$s等待你的决定</string>
+    <string name="overview_status_offline">主机队列离线 — 点击重连</string>
+    <string name="overview_status_empty">配对一台开发主机即可开始</string>
+    <string name="overview_host_singular">主机</string>
+    <string name="overview_host_plural">主机</string>
+    <string name="overview_agent_singular">代理</string>
+    <string name="overview_agent_plural">代理</string>
+    <string name="overview_decision_singular">决策</string>
+    <string name="overview_decision_plural">决策</string>
+    <string name="overview_needs_decision">需要你的决定</string>
+    <string name="overview_batch_approve_safe">批量批准 %1$d 项安全操作</string>
+    <string name="overview_batch_approve_hint">仅包含只读与安全检查；文件修改和计划审批始终需人工确认。</string>
+    <string name="overview_live_fleet">在线主机</string>
+    <string name="overview_active_sessions">运行中会话</string>
+    <string name="overview_no_active_sessions">当前没有运行中的代理。</string>
+    <string name="overview_router_badge">个人路由</string>
+    <string name="overview_router_configure">配置个人代理</string>
+    <string name="overview_composer_placeholder">向个人代理下达跨主机指令…</string>
+    <string name="overview_reconnect">重新连接</string>
+
+    <!-- 对话舞台、分页、谱系与离线横幅 -->
+    <string name="stage_hero_prompt">接下来想构建什么？</string>
+    <string name="stage_unpaired_title">Orbit 舰队</string>
+    <string name="stage_unpaired_subtitle">零知识端到端加密多主机控制台，统一管理 Claude Code、Codex 与 Antigravity。</string>
+    <string name="stage_connect_local">连接本地守护进程</string>
+    <string name="stage_load_older">加载更早的轮次</string>
+    <string name="stage_loading_older">正在加载历史记录…</string>
+    <string name="stage_scroll_bottom">回到底部</string>
+    <string name="stage_offline_banner">%1$s 已离线</string>
+    <string name="stage_connecting_banner">正在重连 %1$s…</string>
+    <string name="stage_lineage_parent">父会话</string>
+    <string name="stage_lineage_subagents">子代理</string>
+    <string name="stage_lineage_peers">同组节点</string>
+    <string name="stage_delivery_queued">排队中</string>
+    <string name="stage_delivery_dispatched">已投递</string>
+    <string name="stage_delivery_settled">已完成</string>
+    <string name="stage_delivery_dropped">已丢弃</string>
+    <string name="stage_interrupt_deliver">中断并投递</string>
+    <string name="stage_dismiss_error">关闭错误提示</string>
+
+    <!-- 计划货架与计划审查卡片 -->
+    <string name="plan_shelf_title">执行计划</string>
+    <string name="plan_review_title">实现计划审查</string>
+    <string name="plan_tab_preview">预览</string>
+    <string name="plan_tab_edit">编辑</string>
+    <string name="plan_feedback_placeholder">可选修改意见或补充说明…</string>
+    <string name="plan_approve_build">批准并执行</string>
+    <string name="plan_request_changes">要求修改</string>
+    <string name="plan_dismiss">忽略</string>
+
+    <!-- 输入框与 Codex 风格语音 -->
+    <string name="composer_placeholder">输入任何内容，@ 引用上下文，/ 执行操作</string>
+    <string name="composer_voice_start">开始语音输入</string>
+    <string name="composer_voice_stop">完成语音输入</string>
+    <string name="composer_voice_cancel">取消语音输入</string>
+    <string name="composer_voice_listening">正在聆听…</string>
+    <string name="composer_voice_unavailable">当前设备不支持语音识别</string>
+    <string name="composer_voice_permission_denied">语音输入需要麦克风权限</string>
+    <string name="composer_send">发送消息</string>
+    <string name="composer_queue">加入队列</string>
+    <string name="composer_stop">停止代理</string>
+    <string name="composer_add_attachment">添加附件</string>
+    <string name="composer_photos">相册</string>
+    <string name="composer_camera">拍照</string>
+    <string name="composer_files">文件</string>
+    <string name="composer_fast">极速</string>
+    <string name="composer_access_permissions">访问权限</string>
+
+    <!-- Raw PTY 终端 -->
+    <string name="terminal_mode_raw">原始</string>
+    <string name="terminal_mode_line">行模式</string>
+    <string name="terminal_raw_hint">原始 VT100 输入已启用 — 点击终端直接键入</string>
+    <string name="terminal_line_hint">输入 Shell 命令…</string>
+    <string name="terminal_connecting">正在连接远程 Shim PTY…</string>
+    <string name="terminal_quote">引用</string>
+
+    <!-- 文件浏览器与代码阅读器 -->
+    <string name="files_title">工作区文件</string>
+    <string name="files_search_placeholder">按路径筛选文件…</string>
+    <string name="files_touched_section">本次会话修改</string>
+    <string name="files_all_section">仓库文件</string>
+    <string name="files_empty">暂未索引到工作区文件。</string>
+    <string name="files_loading">正在读取文件…</string>
+    <string name="files_truncated">预览已截断（%1$d 字节）</string>
+    <string name="files_quote_composer">引用到输入框</string>
+
+    <!-- Git 审查与写操作 -->
+    <string name="git_unstaged">未暂存</string>
+    <string name="git_staged">已暂存</string>
+    <string name="git_stage_all">全部暂存</string>
+    <string name="git_unstage_all">取消暂存</string>
+    <string name="git_stage_file">暂存</string>
+    <string name="git_unstage_file">取消暂存</string>
+    <string name="git_commit">提交</string>
+    <string name="git_commit_placeholder">输入提交说明…</string>
+    <string name="git_generate_commit">生成</string>
+    <string name="git_amend">修正上次提交 (amend)</string>
+    <string name="git_pr_section">Pull Request</string>
+    <string name="git_create_pr">创建 PR</string>
+    <string name="git_pr_title_placeholder">PR 标题…</string>
+    <string name="git_pr_body_placeholder">变更摘要…</string>
+    <string name="git_pr_draft">创建为草稿 PR</string>
+    <string name="git_conflicts_banner">%1$d 个冲突文件</string>
+    <string name="git_resolve_ours">保留我方</string>
+    <string name="git_resolve_theirs">采用对方</string>
+    <string name="git_stash_save">储藏变更</string>
+    <string name="git_stash_pop">恢复储藏</string>
+
+    <!-- 跨主机全局搜索 -->
+    <string name="search_title">跨主机全局搜索</string>
+    <string name="search_placeholder">在所有已配对主机中搜索消息…</string>
+    <string name="search_include_remote">包含远程守护进程</string>
+    <string name="search_empty_prompt">跨主机检索对话轮次、工具输出与审批记录。</string>
+    <string name="search_no_results">未找到匹配消息。</string>
+    <string name="search_remote_summary">已查询 %1$d 台远程主机</string>
+
+    <!-- 自动化 -->
+    <string name="auto_tab_schedules">定时</string>
+    <string name="auto_tab_timers">触发器</string>
+    <string name="auto_tab_goals">目标</string>
+    <string name="auto_tab_monitors">监控</string>
+    <string name="auto_tab_workflows">工作流</string>
+    <string name="auto_tab_hooks">规则</string>
+    <string name="auto_start_goal">启动目标</string>
+    <string name="auto_start_monitor">新建监控</string>
+    <string name="auto_new_rule">添加规则</string>
+    <string name="auto_guardian_title">Guardian 自动审查</string>
+
+    <!-- 个人路由与 Fleet Mesh -->
+    <string name="router_title">个人代理与 Mesh</string>
+    <string name="router_section">个人路由配置</string>
+    <string name="router_mesh_section">Fleet Mesh 节点</string>
+    <string name="router_activate">启用路由</string>
+    <string name="router_pause">暂停路由</string>
+    <string name="router_scope_global">全局舰队</string>
+    <string name="router_scope_local">仅当前主机</string>
+    <string name="router_mesh_empty">当前主机暂未注册 Mesh 对等节点。</string>
+
+    <!-- 零口令云同步与设备链接二维码 -->
+    <string name="sync_title">云同步</string>
+    <string name="sync_instant_unlock">零口令即时解锁</string>
+    <string name="sync_instant_unlock_desc">使用硬件保护会话自动解锁云端主机，无需手动输入口令。</string>
+    <string name="sync_device_link_title">一扫接入新设备 (Device Link QR)</string>
+    <string name="sync_device_link_desc">在另一台手机、平板或桌面端打开 Orbit 扫描此二维码，即可瞬间同步全部主机。</string>
+    <string name="sync_show_qr">显示设备链接二维码</string>
+    <string name="sync_hide_qr">隐藏二维码</string>
+    <string name="sync_copy_link">复制链接 URI</string>
+    <string name="sync_scan_device_link">扫描设备链接二维码</string>
+
+    <!-- 推送与导出 -->
+    <string name="push_section_title">推送通知 (FCM)</string>
+    <string name="push_test_button">发送测试推送</string>
+    <string name="push_registered_devices">已注册 %1$d 台设备</string>
+    <string name="export_format_title">导出会话记录</string>
+    <string name="export_markdown">Markdown (.md)</string>
+    <string name="export_json">JSON (.json)</string>
+    <string name="export_html">HTML (.html)</string>
+</resources>
